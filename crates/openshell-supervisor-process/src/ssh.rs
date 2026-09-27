@@ -25,6 +25,7 @@ use tracing::warn;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
+const MAIN_DETACH_EOF: u8 = 0x04;
 
 fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
     let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
@@ -36,6 +37,9 @@ fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u
             }
             forward.push(MAIN_DETACH_PREFIX);
             *prefix_pending = false;
+        }
+        if byte == MAIN_DETACH_EOF {
+            return (forward, true);
         }
         if byte == MAIN_DETACH_PREFIX {
             *prefix_pending = true;
@@ -711,7 +715,7 @@ impl russh::server::Handler for SshHandler {
                     .extended_data(
                         channel,
                         1,
-                        format!("openshell: {error}; attached read-only; press Ctrl-C to exit{line_ending}").into_bytes(),
+                        format!("openshell: {error}; attached read-only; press Ctrl-C or Ctrl-D to exit{line_ending}").into_bytes(),
                     )
                     .await;
             }
@@ -1501,15 +1505,20 @@ mod tests {
 
     #[tokio::test]
     async fn main_attachment_occupied_stdin_still_attaches_read_only() {
-        assert_read_only_attachment(false, "\n").await;
+        assert_read_only_attachment(false, "\n", 0x03).await;
     }
 
     #[tokio::test]
     async fn main_attachment_read_only_pty_warning_returns_cursor_to_start_of_line() {
-        assert_read_only_attachment(true, "\r\n").await;
+        assert_read_only_attachment(true, "\r\n", 0x03).await;
     }
 
-    async fn assert_read_only_attachment(terminal: bool, line_ending: &str) {
+    #[tokio::test]
+    async fn main_attachment_read_only_ctrl_d_detaches_without_releasing_owner_lease() {
+        assert_read_only_attachment(false, "\n", MAIN_DETACH_EOF).await;
+    }
+
+    async fn assert_read_only_attachment(terminal: bool, line_ending: &str, detach_key: u8) {
         let main_session = MainSession::inert();
         let (owner, _input) = main_session.acquire_input().unwrap();
         let client = main_test_client(Some(main_session.clone())).await;
@@ -1537,14 +1546,17 @@ mod tests {
                 assert_eq!(
                     String::from_utf8_lossy(&data),
                     format!(
-                        "openshell: canonical main process already has an input owner; attached read-only; press Ctrl-C to exit{line_ending}"
+                        "openshell: canonical main process already has an input owner; attached read-only; press Ctrl-C or Ctrl-D to exit{line_ending}"
                     )
                 );
             }
             event => panic!("expected read-only warning, got {event:?}"),
         }
         assert!(main_session.acquire_input().is_err());
-        channel.data(&b"ignored\x03also ignored"[..]).await.unwrap();
+        let mut data = b"ignored".to_vec();
+        data.push(detach_key);
+        data.extend_from_slice(b"also ignored");
+        channel.data(&data[..]).await.unwrap();
         assert_viewer_closed(&mut channel).await;
         assert!(!main_session.finished());
         assert!(
@@ -1601,6 +1613,52 @@ mod tests {
             .acquire_input()
             .expect("viewer leaves stdin available");
         main_session.release_input(owner);
+    }
+
+    #[tokio::test]
+    async fn main_attachment_ctrl_d_detaches_without_closing_main_stdin() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+
+        channel.data(&b"hello\x04ignored"[..]).await.unwrap();
+        assert_eq!(input.recv().await.unwrap(), b"hello");
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(matches!(
+            input.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (owner, _) = main_session
+            .acquire_input()
+            .expect("detaching must release the input lease");
+        main_session.release_input(owner);
+    }
+
+    #[test]
+    fn main_detach_filter_preserves_prefix_before_ctrl_d() {
+        let mut prefix_pending = false;
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10"),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x04ignored"),
+            (vec![0x10], true)
+        );
+        assert!(!prefix_pending);
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10\x11"),
+            (Vec::new(), true)
+        );
     }
 
     #[tokio::test]

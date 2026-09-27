@@ -704,7 +704,8 @@ sandbox workload directly. The relay supports:
   subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
   buffer, and a single stdin lease across client disconnects. Ctrl-C interrupts
   the foreground process. For read-only attachments, Ctrl-C only exits the
-  current viewer.
+  current viewer. Ctrl-D or Ctrl-P followed by Ctrl-Q detaches without closing
+  the canonical process stdin.
 - Supervised CLI attachment. After an established SSH transport fails, the CLI
   remains alive, requests a fresh SSH session from the gateway, and reattaches
   to the same canonical main process within a bounded recovery window. It does

@@ -108,7 +108,7 @@ The agent will be prompted interactively if credentials are missing.
 
 ### Step 4: Exit and clean up
 
-Exit the sandbox shell (`exit` or Ctrl-D), then:
+Exit the sandbox shell with `exit`, or detach with Ctrl-D, then:
 
 ```bash
 openshell sandbox delete <name>
@@ -364,13 +364,13 @@ that process running; reconnecting targets the same process instance and replays
 recent output. If an established SSH transport is interrupted, such as when a
 laptop sleeps and wakes, the CLI retries transient failures for up to 60 seconds
 and reattaches to that same process. Use `sandbox exec --tty -- /bin/bash -l`
-for a new shell. Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating
-main. OpenSSH's `~.` escape looks like transport loss and therefore starts
-automatic recovery; after it reattaches, use `Ctrl-P`, then `Ctrl-Q` to exit, or
-press `Ctrl-C` between retry attempts to cancel recovery. When you own stdin,
-`Ctrl-C` interrupts the foreground process. In a read-only attachment, `Ctrl-C`
-exits the viewer and leaves main and other attachments running. Configure VS
-Code Remote-SSH with:
+for a new shell. Press `Ctrl-D` or `Ctrl-P`, then `Ctrl-Q` to disconnect without
+terminating main. OpenSSH's `~.` escape looks like transport loss and therefore
+starts automatic recovery; after it reattaches, use `Ctrl-D` or `Ctrl-P`, then
+`Ctrl-Q` to exit, or press `Ctrl-C` between retry attempts to cancel recovery.
+When you own stdin, `Ctrl-C` interrupts the foreground process. In a read-only
+attachment, `Ctrl-C` or `Ctrl-D` exits the viewer and leaves main and other
+attachments running. Configure VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config

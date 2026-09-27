@@ -1717,7 +1717,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
-    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
+    /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).

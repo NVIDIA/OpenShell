@@ -640,7 +640,7 @@ async fn sandbox_connect_supervised(
             recovery_deadline = Some(Instant::now() + CONNECT_RECOVERY_TIMEOUT);
             retry_delay = CONNECT_RETRY_INITIAL_DELAY;
             eprintln!(
-                "Connection to sandbox lost; reconnecting. To disconnect, press Ctrl-P then Ctrl-Q after reattachment; press Ctrl-C while retrying to cancel."
+                "Connection to sandbox lost; reconnecting. To disconnect, press Ctrl-D or Ctrl-P then Ctrl-Q after reattachment; press Ctrl-C while retrying to cancel."
             );
         }
 
