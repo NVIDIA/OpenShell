@@ -143,6 +143,23 @@ jobs:
         shell: nix develop -c bash -euo pipefail {0}
         run: tasks/scripts/check-cargo-lockfiles.sh
 
+  podman-e2e-coverage:
+    name: Podman e2e coverage
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Verify Podman e2e coverage
+        shell: nix develop -c bash -euo pipefail {0}
+        run: tasks/scripts/check-podman-e2e-coverage.sh
+
   rust-lint:
     name: Rust lint (${{ matrix.system }})
     needs: pr_metadata
