@@ -333,7 +333,7 @@ jobs:
       external-driver-binary: openshell-driver-podman
       conformance-artifact-prefix: openshell-conformance
       suite-matrix: >-
-        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver && mise run --no-deps --skip-deps e2e:podman:preflight"}]
+        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver; s1=$?; mise run --no-deps --skip-deps e2e:podman:preflight; s2=$?; [ \"$s1\" -eq 0 ] && [ \"$s2\" -eq 0 ]"}]
 
   vm-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-vm-driver]
