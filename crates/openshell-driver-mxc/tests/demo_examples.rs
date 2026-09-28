@@ -156,6 +156,11 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
     assert!(!cloud.contains("pass -ApiKey"));
     assert!(cloud.contains("nvidia/nemotron-3.5-lightning-30b-a3b"));
     assert!(!cloud.contains("nvidia/nvidia-nemotron-nano-9b-v2"));
+
+    let local = read_example("run-ollama-test.ps1");
+    assert!(local.contains("[switch] $Mock"));
+    assert!(local.contains("in-process wxc shim"));
+    assert!(local.contains("does not provide MXC or AppContainer isolation"));
 }
 
 #[cfg(target_os = "windows")]
