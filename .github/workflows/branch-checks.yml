@@ -44,7 +44,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:b77f5ddfc15869821bd18aef79263ed42dd41adf
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
