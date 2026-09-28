@@ -97,6 +97,25 @@ SSH sessions, sandbox provider attachment, configuration, and policy. Close
 operation-scoped streams and forwarding handles when finished. The root client
 does not retain a dedicated session and has no `close()` method.
 
+## Watch Logs and Events
+
+`watchLogs` streams a sandbox's log lines and platform events with automatic
+reconnect and loss-aware resume. Pass a previous item's `cursor` back in as
+`resumeAfterCursor` to continue after a restart without gaps or duplicates:
+
+```ts
+for await (const item of client.sandbox.watchLogs(sandbox.name, { followLogs: true })) {
+  if (item.kind === 'log') {
+    console.log(`${item.line.level} ${item.line.message}`)
+  } else if (item.kind === 'warning') {
+    console.warn(`gap: ${item.message}`)
+  }
+}
+```
+
+See [Accessing Logs](/observability/accessing-logs) for the cursor and resume
+contract this method implements.
+
 ## Use the Raw Client
 
 Use `client.raw` for RPCs that the curated clients do not yet wrap. Import
