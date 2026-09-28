@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Register OpenShell gateway for tmachine test client
+- name: Register OpenShell gateway for test client
   ansible.builtin.command:
     argv:
-      - /usr/local/bin/openshell
+      - openshell
       - gateway
       - add
-      - http://127.0.0.1:17670
+      - "{{ openshell_client_gateway_endpoint | default('http://127.0.0.1:17670') }}"
       - --local
       - --name
-      - tmachine
+      - "{{ openshell_client_gateway_name | default('tmachine') }}"

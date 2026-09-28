@@ -41,12 +41,17 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
 }
 
 func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
@@ -69,12 +74,28 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
+}
+
+func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxServiceExposure {
+	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
+	for _, exposure := range exposures {
+		result = append(result, &pb.SandboxServiceExposure{
+			Service:    exposure.Service,
+			TargetPort: exposure.TargetPort,
+		})
+	}
+	return result
 }
 
 func validateTemplateCreateSpec(spec *SandboxSpec) error {
@@ -207,20 +228,39 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 	}, nil
 }
 
-func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
-	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	})
+func (s *sandboxClient) ListProviders(workspace, sandboxName string, opts ...ListOptions) (*Pager[*Provider], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	pageToken := ""
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Provider], error) {
+		resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
+			Sandbox:        sandboxName,
+			WorkspaceScope: namedWorkspaceScope(workspace),
+			PageSize:       pageSize,
+			PageToken:      pageToken,
+		})
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		providers := make([]*Provider, 0, len(resp.GetProviders()))
+		for _, proto := range resp.GetProviders() {
+			providers = append(providers, converter.ProviderFromProto(proto))
+		}
+		return &Page[*Provider]{Items: providers, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	providers := make([]*Provider, 0, len(resp.GetProviders()))
-	for _, proto := range resp.GetProviders() {
-		providers = append(providers, converter.ProviderFromProto(proto))
+func (s *sandboxClient) ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*Provider, error) {
+	pager, err := s.ListProviders(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return providers, nil
+	return pager.All(ctx)
 }
 
 func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {

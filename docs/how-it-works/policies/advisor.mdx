@@ -1,0 +1,317 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Policy Advisor"
+sidebar-title: "Policy Advisor"
+description: "Let an agent in a sandbox propose the network rule it needs when OpenShell blocks a request, and control which proposals take effect."
+keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
+position: 5
+---
+
+The policy advisor lets an agent in a sandbox propose a new network rule when
+OpenShell blocks one of its network requests, and you decide which proposals
+take effect. It handles network access only. A proposal can add a network rule,
+but it cannot remove rules or change filesystem, Landlock, or process settings.
+
+Without the policy advisor, an agent whose request is blocked usually cannot
+finish its task until someone changes the policy by hand. With it, the agent can
+request the access it needs. Because network rules can change while a sandbox
+runs, an approved rule takes effect without a restart.
+
+The policy advisor is off by default. When you enable it, OpenShell gives the
+agent instructions and a local HTTP API for submitting proposals. A proposal
+never changes the policy on its own. By default, every proposal waits for your
+review. You can opt in to automatic approval, which approves a proposal when
+OpenShell's risk checks find nothing to flag.
+
+## How the Policy Advisor Works
+
+A proposal goes through these steps:
+
+1. A process in the sandbox makes a network request that the policy denies. When
+   OpenShell denies an inspected HTTP request, its response explains what was
+   blocked and tells the agent how to request access. The agent can also look up
+   recent denials itself.
+2. The agent reads the policy advisor guide in the sandbox, checks the current
+   policy, and submits a proposal. A proposal is a network rule scoped to the
+   host, port, and binary that need access and, for HTTP APIs, the method and
+   path.
+3. OpenShell validates the proposal and checks it for added risk in two ways.
+   The policy prover runs a proposal risk check, which compares what the
+   sandbox could reach with and without the rule. OpenShell also flags
+   destinations that are often risky, such as private network addresses and
+   wildcard hosts. OpenShell then adds the proposal and the results of both
+   checks to the sandbox's pending proposals. Refer to [Proposal Risk
+   Check](#proposal-risk-check).
+4. You approve or reject the proposal. With automatic approval turned on,
+   OpenShell approves a proposal that passes its risk checks without waiting for
+   you.
+5. The agent waits for the decision. After approval, the sandbox loads the new
+   rule and the agent retries the request. After a rejection, the agent receives
+   your reason and can submit a narrower proposal.
+
+OpenShell also drafts proposals on its own from connections that it blocks, in
+every sandbox, whether or not the policy advisor is enabled. This includes
+connections to hostnames that no rule names. Each draft allows one binary to
+reach one host and port. Drafts go through the same checks and review as
+proposals from the agent, and automatic approval applies to them too. The
+blocked request stays denied, so retry it after OpenShell approves the draft and
+loads the new rule.
+
+When the policy advisor is enabled, OpenShell adds the following to the sandbox
+so the agent can find and use it:
+
+- A guide at `/etc/openshell/skills/policy_advisor.md` that explains how to
+  write and submit a proposal. OpenShell also adds short pointers to the guide
+  where agent tools look for instructions: an agent skill at
+  `/etc/openshell/skills/policy-advisor/SKILL.md` and, if the image does not
+  already have one, `/AGENTS.md`.
+- The `policy.local` API, which the agent uses to read the current policy and
+  recent denials, submit proposals, and wait for decisions. OpenShell serves it
+  at `http://policy.local`, which is reachable only from inside the sandbox and
+  needs no network rule or proxy setting. Refer to [Agent API](#agent-api).
+- Instructions in the response to each denied HTTP request on an inspected
+  endpoint, which point the agent to the guide and the API.
+
+## Enable the Policy Advisor
+
+The `agent_policy_proposals_enabled` setting turns the policy advisor on or off.
+You can set it for every sandbox on the gateway or for a single sandbox. Enable
+it before you create a sandbox when you can. A running sandbox picks up the
+change without a restart, but many agents read instruction files such as
+`/AGENTS.md` only when they start, and an agent may already have given up on
+requests that were denied before you enabled the policy advisor.
+
+Enable the policy advisor for every sandbox on the gateway:
+
+```shell
+openshell settings set --global \
+  --key agent_policy_proposals_enabled \
+  --value true \
+  --yes
+```
+
+To enable it for one sandbox instead, set the key on that sandbox. This works
+only when the key has no gateway-wide value:
+
+```shell
+openshell settings set <sandbox-name> \
+  --key agent_policy_proposals_enabled \
+  --value true
+```
+
+To check the setting for a sandbox, run `openshell settings get <sandbox-name>`.
+The output shows whether the value comes from the gateway, the sandbox, or
+neither. To let individual sandboxes control the setting again, delete the
+gateway-wide value:
+
+```shell
+openshell settings delete --global \
+  --key agent_policy_proposals_enabled \
+  --yes
+```
+
+## Review Proposals
+
+Proposals that are not approved automatically wait for you to approve or reject
+them. List a sandbox's pending proposals with the rule each would add, the
+agent's reason, and the results of the risk checks:
+
+```shell
+openshell rule get <sandbox-name> --status pending
+```
+
+Approve a proposal when its rule grants only the access you intend. Use the ID
+from the proposal's `Chunk` line:
+
+```shell
+openshell rule approve <sandbox-name> --chunk-id <proposal-id>
+```
+
+Otherwise, reject it with a reason. OpenShell sends the reason and the risk
+check findings to the agent, which can submit a narrower proposal:
+
+```shell
+openshell rule reject <sandbox-name> \
+  --chunk-id <proposal-id> \
+  --reason "Scope this to docs/ paths only."
+```
+
+If the sandbox's policy or providers change after a proposal is submitted,
+OpenShell rechecks the proposal and asks you to review it again before you can
+approve it. While a global policy is active, OpenShell cannot approve proposals,
+including automatically. You can also review proposals in the terminal UI with
+`openshell term`, but it rejects proposals without a reason.
+
+## Approve Proposals Automatically
+
+By default, every proposal waits for your review. In automatic mode, OpenShell
+approves a proposal without review when both of these are true:
+
+- The proposal risk check finds none of the risks described in [Proposal Risk
+  Check](#proposal-risk-check).
+- OpenShell has not flagged the proposal's destination. OpenShell flags hosts
+  written as private IP addresses, wildcard hosts, `allowed_ips` entries that
+  include private ranges or have no host, ports above 49152, and well-known
+  database and cache ports, such as 5432 and 6379. Each flag appears on the
+  proposal's `Security` line.
+
+Every other proposal still waits for your review. These checks do not treat
+access to a new public host as a risk when no provider credential applies
+there. Automatic mode approves such proposals, including OpenShell's own drafts
+from blocked connections, so turn it on only if you accept that binaries in the
+sandbox can gain access to public hosts without your review.
+
+Turn on automatic mode for every sandbox on the gateway:
+
+```shell
+openshell settings set --global \
+  --key proposal_approval_mode \
+  --value auto \
+  --yes
+```
+
+To turn it on for one sandbox, set the key on that sandbox, or pass
+`--approval-mode auto` when you create it:
+
+```shell
+openshell sandbox create --name <name> --approval-mode auto
+```
+
+The accepted values are `manual`, the default, and `auto`. A gateway-wide value
+overrides sandbox values, so an administrator can require manual review for
+every sandbox by setting `manual` on the gateway.
+
+### Proposal Risk Check
+
+The policy advisor uses the [policy prover](/how-it-works/policies/prover) to
+run a proposal risk check on every proposal. Unlike the boundary check that the
+`openshell-prover` CLI runs, it does not compare a policy with a boundary that
+you write. It compares what the sandbox can reach with and without the proposed
+rule. The check accounts for the credentials of attached providers and for
+binaries whose traffic OpenShell cannot inspect. It reports a finding when the
+rule would give a binary new access of one of these kinds:
+
+| Finding | The proposed rule would let a binary |
+|---|---|
+| `link_local_reach` | Reach a link-local address (`169.254.0.0/16` or `fe80::/10`) or a cloud metadata hostname. |
+| `l7_bypass_credentialed` | Send traffic that OpenShell cannot inspect, as `git`, `ssh`, or `nc` do, to a host where a provider credential is available. |
+| `credential_reach_expansion` | Use a provider credential at a host and port that it could not reach before. |
+| `capability_expansion` | Use a new HTTP method at a host and port where it already uses a provider credential. |
+
+A proposal with any prover finding or flagged destination needs your review,
+even in automatic mode. When you reject a proposal, the agent receives the
+findings with your reason, so it can narrow its next attempt.
+
+## What Agents Can Propose
+
+An agent proposes endpoints and binaries. An endpoint can include an access
+preset, method and path allow rules, deny rules, `allowed_ips`, and
+`allow_encoded_slash`. A good proposal allows one method on the narrowest path
+the task needs:
+
+```json
+{
+  "intent_summary": "Allow gh to update documentation in NVIDIA/OpenShell.",
+  "operations": [
+    {
+      "addRule": {
+        "ruleName": "github_contents_docs_write",
+        "rule": {
+          "name": "github_contents_docs_write",
+          "endpoints": [
+            {
+              "host": "api.github.com",
+              "port": 443,
+              "protocol": "rest",
+              "enforcement": "enforce",
+              "rules": [
+                {
+                  "allow": {
+                    "method": "PUT",
+                    "path": "/repos/NVIDIA/OpenShell/contents/docs/**"
+                  }
+                }
+              ]
+            }
+          ],
+          "binaries": [
+            {
+              "path": "/usr/bin/gh"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+Agents cannot propose `protocol: tcp` or `tls: skip`, because OpenShell cannot
+inspect that traffic. The API also has no fields for GraphQL operation rules,
+MCP tool rules, query matchers, credential settings, or endpoint path selectors,
+and it ignores them if an agent sends them. Review the rule that
+`openshell rule get` shows, not the agent's description of it. Add rules that
+need those fields yourself, as described in [Manage Sandbox
+Policies](/how-it-works/policies/manage-policies).
+
+If a proposed hostname resolves to a private address, OpenShell still blocks the
+connection after approval until you add an `allowed_ips` entry or declare the
+endpoint in the policy yourself. This applies even when a provider rule already
+lists that hostname for a different binary. Loopback, link-local, and cloud
+metadata addresses are always blocked, and you cannot approve a proposal that
+targets them.
+
+OpenShell adds an approved proposal to the sandbox's own policy as a separate
+rule and never changes rules that providers contribute. If another rule covers
+the same host and port, a request is allowed when either rule allows it, and
+deny rules in either rule still apply. OpenShell refuses a proposal that
+disagrees with an overlapping endpoint on a setting that must have a single
+value, such as `tls` or `allowed_ips`.
+
+## Agent API
+
+The agent uses these endpoints at `http://policy.local`:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/policy/current` | Returns the sandbox's effective policy as YAML. |
+| `GET /v1/denials?last=10` | Returns recent denials as log lines, newest first, with query strings redacted. `last` defaults to 10 and can be up to 100. |
+| `POST /v1/proposals` | Submits proposals. The response lists the IDs of accepted proposals and the reasons for any that were refused. |
+| `GET /v1/proposals/{chunk_id}` | Returns a proposal's status: `pending`, `approved`, or `rejected`. |
+| `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Waits until the proposal is approved or rejected, or until the timeout expires. |
+
+After an approval, the `/wait` response reports `policy_reloaded: true` once the
+sandbox has loaded the new rule. OpenShell closes connections opened under the
+previous rules, so the agent's retry uses the new rule.
+
+When the policy advisor is disabled, every route returns `404 feature_disabled`,
+new sandboxes do not receive the guide, and denial responses do not mention
+`policy.local`. OpenShell still drafts proposals from blocked connections.
+
+## Logs
+
+To follow a proposal in the sandbox log, run:
+
+```shell
+openshell logs <sandbox-name> --since 10m
+```
+
+Look for the denied request (`HTTP:<method> ... DENIED`) or blocked connection
+(`NET:OPEN ... DENIED`), then `CONFIG:PROPOSED`, `CONFIG:APPROVED` or
+`CONFIG:REJECTED`, `CONFIG:LOADED`, and the retried request. `CONFIG:PROPOSED`
+appears only for proposals from the agent, and `CONFIG:REJECTED` appears only
+if the agent was waiting for the decision. An automatic approval's
+`CONFIG:APPROVED` entry includes `auto:true`, the proposal's `source`
+(`agent_authored`, or `mechanistic` for OpenShell's own drafts), and
+`resolved_from`, which shows where the approval mode setting came from.
+
+## Next Steps
+
+- Use [Manage Sandbox Policies](/how-it-works/policies/manage-policies) to
+  change policies yourself.
+- Use [Network Rules](/how-it-works/policies/network-rules) and the
+  [Policy Schema Reference](/how-it-works/policies/schema) for rules that agents
+  cannot propose.
+- Use the [Policy Prover](/how-it-works/policies/prover) to check a
+  complete policy against a boundary you define.

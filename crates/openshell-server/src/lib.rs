@@ -38,6 +38,7 @@ mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
 mod storage_proto;
+mod supervisor_owner;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -47,6 +48,7 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+mod watch_cursor;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -98,12 +100,8 @@ struct GatewayExtensionCredential {
     ttl: Duration,
 }
 
-fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    issuer
-        .sandbox_token_ttl()
-        .map_or(Duration::from_mins(15), |ttl| {
-            ttl.min(MAX_EXTENSION_TOKEN_TTL)
-        })
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::ExtensionJwtIssuer) -> Duration {
+    issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL)
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -113,7 +111,7 @@ fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration
 /// downgrades a security boundary, so it is reported once per registration at
 /// startup rather than being silently tolerated.
 fn mint_gateway_extension_credential(
-    issuer: &Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: &Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     kind: ExtensionKind,
     name: &str,
     audience: &str,
@@ -180,7 +178,7 @@ fn mint_gateway_extension_credential(
 }
 
 fn spawn_gateway_extension_token_refresh(
-    issuer: Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     credentials: Vec<GatewayExtensionCredential>,
 ) {
     if credentials.is_empty() {
@@ -304,29 +302,38 @@ pub struct ServerState {
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
 
+    /// Stable identity for this gateway process.
+    pub replica_id: String,
+
+    /// Internal endpoint other gateway replicas can dial for peer RPCs.
+    pub peer_endpoint: Option<String>,
+
+    /// Reused peer connections, peer token, and owner lookups for relay
+    /// forwarding. Keeps per-relay cost off the connection and auth paths.
+    pub peer_routes: Arc<supervisor_session::PeerRouteCache>,
+
+    /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
+    /// relay instead of opening one per request.
+    pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
-    /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
-    /// `Status::unavailable`. Populated at startup from the on-disk key
-    /// material that `certgen` writes.
-    pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
+    /// Typed extension JWT issuer and public verification metadata.
+    pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
 
-    /// Authenticator that validates gateway-minted sandbox JWTs on every
-    /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
-    /// presenting a freshly minted token are recognized.
-    pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
-
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
     pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
+
+    /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
+    pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -404,6 +411,8 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
     ) -> Self {
+        let replica_id = compute::lease::replica_id();
+        let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
             .oidc
@@ -423,13 +432,17 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            replica_id,
+            peer_endpoint,
+            peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
+            service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
-            sandbox_jwt_issuer: None,
+            extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
-            sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
+            peer_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -437,6 +450,55 @@ impl ServerState {
             admin_role,
         }
     }
+}
+
+fn derive_peer_endpoint(config: &Config) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        return Some(endpoint.trim().to_string());
+    }
+
+    let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
+    let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok()?;
+    let service = std::env::var("OPENSHELL_PEER_SERVICE_NAME").ok()?;
+    if pod_name.trim().is_empty() || namespace.trim().is_empty() || service.trim().is_empty() {
+        return None;
+    }
+
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{pod}.{service}.{namespace}.svc.cluster.local:{port}",
+        pod = pod_name.trim(),
+        service = service.trim(),
+        namespace = namespace.trim(),
+        port = config.bind_address.port()
+    ))
+}
+
+/// Reject a plaintext peer endpoint on a gateway that serves TLS.
+///
+/// Peer relay traffic carries whole supervisor sessions between replicas. The
+/// chart renders a plaintext peer endpoint only when the gateway itself serves
+fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result<()> {
+    if peer_endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    if config.tls.is_some() {
+        return Err(Error::config(format!(
+            "gateway peer endpoint {peer_endpoint} is plaintext but this gateway serves TLS; \
+             set an https:// OPENSHELL_PEER_ENDPOINT so peer relay traffic is not downgraded"
+        )));
+    }
+    warn!(
+        peer_endpoint,
+        "gateway peer relay traffic is plaintext because this gateway does not serve TLS"
+    );
+    Ok(())
 }
 
 /// Run the `OpenShell` server.
@@ -470,7 +532,7 @@ pub(crate) async fn run_server(
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
-    let (sandbox_jwt_issuer, sandbox_jwt_authenticator, sandbox_session_jwt_authority) =
+    let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
             let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
                 Error::config(format!(
@@ -500,19 +562,12 @@ pub(crate) async fn run_server(
                 )));
             }
             let issuer = Arc::new(
-                auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
                     &signing_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
-            let authenticator = Arc::new(
-                auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
                     &public_pem,
                     kid.clone(),
                     &jwt.gateway_id,
+                    jwt.token_ttl(),
                 )
                 .map_err(Error::config)?,
             );
@@ -522,7 +577,7 @@ pub(crate) async fn run_server(
                     &public_pem,
                     kid,
                     &jwt.gateway_id,
-                    jwt.sandbox_token_ttl().unwrap_or(Duration::from_mins(15)),
+                    jwt.sandbox_token_ttl(),
                 )
                 .map_err(Error::config)?,
             );
@@ -531,9 +586,9 @@ pub(crate) async fn run_server(
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
                 "gateway-minted sandbox JWT enabled"
             );
-            (Some(issuer), Some(authenticator), Some(session_authority))
+            (Some(issuer), Some(session_authority))
         } else {
-            (None, None, None)
+            (None, None)
         };
 
     let middleware_registrations = config_file
@@ -551,7 +606,7 @@ pub(crate) async fn run_server(
         .unwrap_or_default();
     let mut gateway_extension_credentials = Vec::new();
     let middleware_registry = Arc::new(
-        if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+        if let Some(issuer) = extension_jwt_issuer.as_ref() {
             let mut slots = HashMap::new();
             for registration in &middleware_registrations {
                 if let Some(credential) = mint_gateway_extension_credential(
@@ -631,7 +686,7 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+    let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
             let audience = interceptor.resolved_audience();
@@ -683,14 +738,15 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-    state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
-    state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
-    if let Some(issuer) = sandbox_jwt_issuer {
+    if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    if state.sandbox_jwt_issuer.is_some() && state.compute.supports_sandbox_authentication() {
+    if state.sandbox_session_jwt_authority.is_some()
+        && state.compute.supports_sandbox_authentication()
+    {
         state.compute_driver_authenticator = Some(Arc::new(
             auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
         ));
@@ -698,6 +754,91 @@ pub(crate) async fn run_server(
             driver = state.compute.configured_driver_name(),
             "compute-driver sandbox bootstrap authenticator enabled"
         );
+    }
+
+    let peer_routing_expected = state.peer_endpoint.is_some() && !state.store.is_single_replica();
+    if let Some(peer_endpoint) = state.peer_endpoint.as_deref()
+        && peer_routing_expected
+    {
+        validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+    }
+    if state.peer_endpoint.is_none() && !state.store.is_single_replica() {
+        warn!(
+            "no gateway peer endpoint configured; this replica owns its supervisor sessions but \
+             peers cannot reach it. Single-gateway deployments are unaffected; set \
+             OPENSHELL_PEER_ENDPOINT on every replica when running more than one."
+        );
+    }
+
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok();
+        let service_account = std::env::var("OPENSHELL_SERVICE_ACCOUNT_NAME").ok();
+        match (namespace, service_account) {
+            (Some(namespace), Some(service_account))
+                if !namespace.trim().is_empty() && !service_account.trim().is_empty() =>
+            {
+                let required_labels =
+                    auth::peer::required_pod_labels_from_env().map_err(Error::config)?;
+                match kube::Client::try_default().await {
+                    Ok(client) => {
+                        let audience = auth::peer::peer_token_audience_from_env();
+                        let resolver = Arc::new(auth::peer::LiveGatewayPeerResolver::new(
+                            client,
+                            namespace.trim(),
+                            audience.clone(),
+                            service_account.trim().to_string(),
+                            required_labels,
+                        ));
+                        let cache_ttl = auth::peer::peer_token_cache_ttl_from_env();
+                        let resolver = Arc::new(auth::peer::CachingGatewayPeerResolver::new(
+                            resolver, cache_ttl,
+                        ));
+                        let authenticator =
+                            auth::peer::PeerServiceAccountAuthenticator::new(resolver);
+                        state.peer_authenticator = Some(Arc::new(authenticator));
+                        info!(
+                            namespace = %namespace.trim(),
+                            service_account = %service_account.trim(),
+                            audience,
+                            token_cache_ttl_secs = cache_ttl.as_secs(),
+                            "gateway peer ServiceAccount TokenReview authentication enabled"
+                        );
+                    }
+                    Err(err) if peer_routing_expected => {
+                        return Err(Error::config(format!(
+                            "in-cluster K8s client construction failed ({err}); \
+                             gateway peer authentication is required because \
+                             OPENSHELL_PEER_ENDPOINT is configured"
+                        )));
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "in-cluster K8s client construction failed; \
+                         gateway peer ServiceAccount authentication is disabled"
+                    ),
+                }
+            }
+            _ if peer_routing_expected => {
+                return Err(Error::config(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     both are required for gateway peer authentication because \
+                     OPENSHELL_PEER_ENDPOINT is configured"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                debug!(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     gateway peer ServiceAccount authentication disabled"
+                );
+            }
+        }
+    } else if peer_routing_expected {
+        return Err(Error::config(
+            "OPENSHELL_PEER_ENDPOINT is configured but the gateway is not running in a \
+             Kubernetes cluster, so gateway peer authentication is unavailable"
+                .to_string(),
+        ));
     }
 
     let state = Arc::new(state);
@@ -839,6 +980,16 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
+    // The poller exists to observe writes made by other replicas. Single-
+    // replica backends have none, so it would only add load.
+    if !store.is_single_replica() {
+        sandbox_watch::spawn_store_poller(
+            store.clone(),
+            state.sandbox_watch_bus.clone(),
+            sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+    }
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
@@ -846,17 +997,26 @@ pub(crate) async fn run_server(
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
+    state.supervisor_sessions.close_admission();
     let _ = shutdown_tx.send(true);
 
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
 
-    state
-        .compute
-        .cleanup_on_shutdown()
-        .await
+    let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // A stopped supervisor may still have a detached task deleting its owner
+    // record. Drain it even when compute cleanup failed before exiting Tokio.
+    let session_cleanup = state
+        .supervisor_sessions
+        .shutdown(Duration::from_secs(10))
+        .await;
+    if let Err(err) = &session_cleanup {
+        warn!(error = %err, "Gateway supervisor session cleanup incomplete");
+    }
+    compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+    session_cleanup.map_err(Error::execution)?;
 
     Ok(())
 }
@@ -1494,18 +1654,9 @@ async fn build_compute_runtime(
         false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
+    let admission =
+        compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
     info!(driver = %driver.name(), "Using compute driver");
-    if config
-        .gateway_jwt
-        .as_ref()
-        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
-        && !driver.is_local_singleplayer(registry)
-    {
-        warn!(
-            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted); set gateway_jwt.ttl_secs > 0 for shared deployments"
-        );
-    }
-
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -1575,6 +1726,9 @@ async fn build_compute_runtime(
         }
     };
 
+    let runtime = runtime
+        .with_admission_policy(admission)
+        .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
 
@@ -1589,15 +1743,6 @@ impl ConfiguredComputeDriver {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
-        }
-    }
-
-    fn is_local_singleplayer(&self, registry: &ComputeDriverRegistry) -> bool {
-        match self {
-            Self::Registered(registration) => registration.is_local_singleplayer(),
-            Self::Remote { name } => registry
-                .get(name)
-                .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
         }
     }
 
@@ -1749,7 +1894,7 @@ mod tests {
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
         extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener,
+        serve_gateway_listener, validate_peer_endpoint_scheme,
     };
     use openshell_core::{
         Config,
@@ -1768,6 +1913,43 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn tls_enabled_config() -> Config {
+        Config::new(Some(openshell_core::TlsConfig {
+            cert_path: "/tmp/cert.pem".into(),
+            key_path: "/tmp/key.pem".into(),
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_rejected_on_a_tls_gateway() {
+        let error = validate_peer_endpoint_scheme(&tls_enabled_config(), "http://10.0.0.1:8080")
+            .expect_err("plaintext peer endpoint must not be accepted alongside gateway TLS");
+        assert!(
+            error.to_string().contains("plaintext"),
+            "error should name the downgrade: {error}"
+        );
+    }
+
+    #[test]
+    fn https_peer_endpoint_is_accepted_on_a_tls_gateway() {
+        validate_peer_endpoint_scheme(&tls_enabled_config(), "https://10.0.0.1:8080").unwrap();
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_allowed_on_a_plaintext_gateway() {
+        let config = Config::new(None);
+        assert!(config.tls.is_none());
+        validate_peer_endpoint_scheme(&config, "http://10.0.0.1:8080").unwrap();
+    }
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
@@ -1789,17 +1971,18 @@ mod tests {
         record_detection_probe("third", true)
     }
 
-    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
-        extension_test_issuer_with_ttl(Some(Duration::from_mins(15)))
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
+        extension_test_issuer_with_ttl(Duration::from_mins(15))
     }
 
     fn extension_test_issuer_with_ttl(
-        ttl: Option<Duration>,
-    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        ttl: Duration,
+    ) -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
-            crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
                 ttl,
@@ -1809,17 +1992,17 @@ mod tests {
     }
 
     #[test]
-    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
-        let issuer = extension_test_issuer_with_ttl(None);
+    fn gateway_ttl_bounds_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(Duration::from_mins(15));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
     }
 
     #[test]
     fn extension_token_ttl_is_capped_at_one_hour() {
-        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_hours(24)));
+        let issuer = extension_test_issuer_with_ttl(Duration::from_hours(24));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
 
-        let short = extension_test_issuer_with_ttl(Some(Duration::from_mins(5)));
+        let short = extension_test_issuer_with_ttl(Duration::from_mins(5));
         assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
     }
 
@@ -1992,6 +2175,27 @@ mod tests {
             Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_is_mounted_only_when_enabled() {
+        let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
+        let response = super::http_router(state.clone())
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled = state;
+        Arc::get_mut(&mut enabled)
+            .unwrap()
+            .config
+            .enable_websocket_tunnel = true;
+        let response = super::http_router(enabled)
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn start_tls_gateway_listener(

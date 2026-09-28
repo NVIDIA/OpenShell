@@ -12,6 +12,9 @@ import (
 // ServiceEndpoint represents an exposed HTTP service endpoint within a sandbox.
 type ServiceEndpoint = types.ServiceEndpoint
 
+// ServiceExposure describes a loopback HTTP service to expose during sandbox creation.
+type ServiceExposure = types.ServiceExposure
+
 // ServiceInterface defines operations for managing sandbox service endpoints.
 type ServiceInterface interface {
 	Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error)

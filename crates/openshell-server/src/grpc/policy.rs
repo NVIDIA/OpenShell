@@ -14,7 +14,9 @@ mod endpoint_status;
 mod provisioning_clock;
 pub use provisioning_clock::configuration_change;
 
-pub(super) use endpoint_status::handle_report_endpoint_status;
+pub(super) use endpoint_status::{
+    handle_peer_report_endpoint_status, handle_report_endpoint_status,
+};
 pub use endpoint_status::{
     invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
     retry_endpoint_status_after_supervisor_disconnect,
@@ -2528,6 +2530,9 @@ async fn resolve_sandbox_by_name_for_principal(
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals may not resolve sandbox configuration",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
         )),
@@ -2808,7 +2813,7 @@ pub(super) async fn load_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
-        state.sandbox_jwt_issuer.is_some(),
+        state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_binding_context(
@@ -2847,7 +2852,7 @@ pub(super) async fn load_sandbox_config(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
-        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
+        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
             .as_ref()
@@ -3598,7 +3603,9 @@ async fn handle_update_config_inner(
             ));
         }
         let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3787,7 +3794,9 @@ async fn handle_update_config_inner(
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -3882,7 +3891,9 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire policy mutation lock")
+    })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4413,7 +4424,9 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let _guard = state.compute.sandbox_sync_guard().await;
+    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire configuration admission lock")
+    })?;
     let mut sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
@@ -4613,7 +4626,9 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -4697,7 +4712,7 @@ pub(super) async fn handle_get_sandbox_logs(
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
                 if let Some(since_time) = since_time.as_ref() {
                     let event_time = log.event_time.as_ref()?;
@@ -10004,14 +10019,12 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn l7_scope_policy() -> ProtoSandboxPolicy {
         let endpoint = NetworkEndpoint {
             host: "api.example.com".to_string(),
             port: 443,
             ports: vec![443, 8443],
             protocol: "rest".to_string(),
-            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
             access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
@@ -10967,7 +10980,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = 2;
         endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -13032,7 +13044,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
-        bound_endpoint.tls = 2;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store

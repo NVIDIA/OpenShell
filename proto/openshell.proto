@@ -587,6 +587,41 @@ service OpenShell {
     };
   }
 
+  // Internal gateway-to-gateway relay forwarding.
+  //
+  // A gateway replica that receives a user request for a sandbox whose
+  // supervisor session is owned by a different replica opens this stream to the
+  // owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+  // bytes in either direction. This RPC is authenticated as a gateway peer, not
+  // as a user or sandbox supervisor.
+  rpc PeerRelay(stream PeerRelayFrame) returns (stream PeerRelayFrame) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
+  // Internal gateway-to-owner forwarding for supervisor-bound state.
+  rpc PeerReportProviderReadiness(ReportProviderReadinessRequest)
+      returns (ReportProviderReadinessResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
+  rpc PeerReportEndpointStatus(ReportEndpointStatusRequest)
+      returns (ReportEndpointStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
+  rpc PeerGetSandboxProviderStatus(GetSandboxProviderStatusRequest)
+      returns (GetSandboxProviderStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -792,7 +827,8 @@ message IssueSandboxTokenRequest {}
 message IssueSandboxTokenResponse {
   reserved 2;
   reserved "expires_at_ms";
-  // Gateway-minted JWT bound to the calling sandbox's UUID.
+  // Gateway-minted session JWT bound to the calling sandbox's UUID, active
+  // runtime generation, authorization epoch, and durable token lineage.
   string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the issued token. Absence means the token is non-expiring.
   google.protobuf.Timestamp expiration_time = 102;
@@ -823,7 +859,7 @@ message RefreshSandboxTokenResponse {
   repeated ExtensionServiceCredential extension_credentials = 3;
   // Fresh Sandbox Protocol bearer token from the same atomic refresh.
   string sandbox_token = 4 [(openshell.options.v1.secret) = true];
-  // Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+  // Absolute Sandbox Protocol token expiry. Absence means the token is non-expiring.
   google.protobuf.Timestamp sandbox_expiration_time = 105;
   // Launch generation to which both refreshed credentials are bound.
   string session_id = 6;
@@ -879,6 +915,34 @@ message GetGatewayInfoResponse {
   // Compute driver runtimes initialized by this gateway. Current gateways
   // return exactly one entry.
   repeated ComputeDriverInfo compute_drivers = 3;
+
+  // Negotiated non-secret metadata for every initialized extension.
+  repeated NegotiatedExtensionInfo extensions = 4;
+}
+
+enum ExtensionKind {
+  EXTENSION_KIND_UNSPECIFIED = 0;
+  EXTENSION_KIND_COMPUTE_DRIVER = 1;
+  EXTENSION_KIND_CREDENTIAL_DRIVER = 2;
+  EXTENSION_KIND_GATEWAY_INTERCEPTOR = 3;
+  EXTENSION_KIND_SUPERVISOR_MIDDLEWARE = 4;
+}
+
+// Public, non-secret snapshot of one successful startup negotiation.
+message NegotiatedExtensionInfo {
+  ExtensionKind kind = 1;
+  // Gateway/operator-selected registration name.
+  string configured_name = 2;
+  // Extension-reported implementation identity.
+  string implementation_name = 3;
+  // Extension build version, distinct from the protocol version.
+  string implementation_version = 4;
+  uint32 protocol_major = 5;
+  uint32 protocol_minor = 6;
+  // Extension-supported optional capabilities, sorted for stable output.
+  repeated string supported_capabilities = 7;
+  // Capabilities the extension requires from the gateway.
+  repeated string required_capabilities = 8;
 }
 
 // Info for one initialized compute driver runtime.
@@ -1194,6 +1258,10 @@ message CreateSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
+  // HTTP services to expose when the sandbox is created. Endpoints are
+  // registered after the sandbox has been persisted and route only while the
+  // sandbox is ready.
+  repeated SandboxServiceExposure service_exposures = 9;
 }
 
 message CreateSandboxTemplateRequest {
@@ -1305,6 +1373,12 @@ message ListSandboxProvidersRequest {
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string sandbox = 1;
+  // The maximum number of providers to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 3;
+  // Token from a previous ListSandboxProviders response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 4;
 }
 
 // Attach provider to sandbox request.
@@ -1378,6 +1452,9 @@ message StartSandboxRequest {
 // Sandbox response.
 message SandboxResponse {
   Sandbox sandbox = 1;
+  // Service URLs created by CreateSandbox, keyed by service name. The empty
+  // key identifies the unnamed service. Other sandbox RPCs return an empty map.
+  map<string, string> service_urls = 2;
 }
 
 // List sandboxes response.
@@ -1390,6 +1467,8 @@ message ListSandboxesResponse {
 // List providers attached to a sandbox response.
 message ListSandboxProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Attach provider to sandbox response.
@@ -1813,6 +1892,12 @@ message ExecSandboxRequest {
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
+
+  // Optional nonzero UUID for durable launch admission. Also applies to the
+  // initial ExecSandboxInteractive start message. Duplicates never relaunch,
+  // reattach, or replay output/stdin. Unconfirmed executions remain fenced;
+  // confirmed terminal executions retain the fence for 24 hours.
+  string request_id = 11;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1939,6 +2024,25 @@ message WatchSandboxRequest {
 
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
+
+  // Resume streaming after this cursor. Empty means no cursor resume: the
+  // server falls back to tail-limited replay controlled by log_tail_lines and
+  // event_tail. Otherwise set it to the highest `SandboxStreamEvent.cursor`
+  // already processed; the server replays only log and platform events after
+  // it, merged in cursor order, before resuming live delivery. If the requested
+  // cursor has already been trimmed from the server's buffer, the resume is
+  // unrecoverable and the stream terminates with OUT_OF_RANGE (see
+  // SandboxStreamWarning for the recoverable case).
+  //
+  // A cursor is bound to the cursor space that issued it. A gateway restart,
+  // teardown of the sandbox's buffers, or a reconnect to a different gateway
+  // replica starts a new space, and cursors from the previous one are rejected
+  // with OUT_OF_RANGE rather than silently suppressing live events beneath
+  // them. OUT_OF_RANGE is terminal for that cursor: restart the watch with an
+  // empty resume_after_cursor, because retrying the same token fails
+  // identically. A cursor this server could not have issued is rejected with
+  // INVALID_ARGUMENT.
+  string resume_after_cursor = 12;
 }
 
 // One event in a sandbox watch stream.
@@ -1950,11 +2054,25 @@ message SandboxStreamEvent {
     SandboxLogLine log = 2;
     // One platform event.
     PlatformEvent event = 3;
-    // Warning from the server (e.g. missed messages due to lag).
+    // Recoverable warning from the server, e.g. messages dropped because a
+    // broadcast receiver lagged. The stream continues after this warning; the
+    // client can detect the gap from the warning itself.
     SandboxStreamWarning warning = 4;
     // Draft policy update notification.
     DraftPolicyUpdate draft_policy_update = 5;
   }
+  // Opaque position in this sandbox's cursor space, shared across the resumable
+  // log and platform event sources. Empty for non-resumable events (status
+  // snapshots, warnings).
+  //
+  // Do not parse this token; its encoding is not part of the contract. The only
+  // supported operation is comparing two non-empty cursors observed on the same
+  // stream and keeping the greater one, then passing it as
+  // WatchSandboxRequest.resume_after_cursor to resume without loss or
+  // duplication. That comparison is a plain byte-wise string comparison. It is
+  // well defined only within one stream: a stream never spans two cursor
+  // spaces, because a reset ends it.
+  string cursor = 6;
 }
 
 // Log line correlated to a sandbox.
@@ -1973,6 +2091,11 @@ message SandboxLogLine {
   map<string, string> fields = 7;
 }
 
+// Recoverable loss notification on a watch stream. Emitted when the server
+// skips ahead after a broadcast lag instead of terminating; the stream keeps
+// running. Cursors are opaque, so this message is the only signal that events
+// were skipped. Unrecoverable loss (a trimmed or foreign resume cursor) is
+// reported as an OUT_OF_RANGE stream status, not this message.
 message SandboxStreamWarning {
   string message = 1;
 }
@@ -2844,6 +2967,9 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Monotonic counter scoped to instance_id. Incremented for each reconnect so
+  // gateways can distinguish a fresh supervisor connection from stale cleanup.
+  uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
 }
@@ -2933,6 +3059,25 @@ message RelayInit {
 message RelayFrame {
   oneof payload {
     RelayInit init = 1;
+    bytes data = 2;
+  }
+}
+
+// Initial frame for gateway peer relay forwarding.
+message PeerRelayInit {
+  // Stable sandbox UUID whose supervisor relay should be opened.
+  string sandbox_id = 1;
+  // Relay target to ask the owning gateway to open on its local supervisor
+  // session. The channel_id is assigned by the forwarding gateway.
+  RelayOpen relay_open = 2;
+  // Gateway replica id that initiated the peer relay.
+  string requester_replica_id = 3;
+}
+
+// A single frame on the gateway-to-gateway peer relay RPC.
+message PeerRelayFrame {
+  oneof payload {
+    PeerRelayInit init = 1;
     bytes data = 2;
   }
 }
@@ -3597,4 +3742,12 @@ message SandboxProvisioning {
   // Attachment edits have their own durable clock; status writes do not change it.
   string attachment_change_id = 10;
   google.protobuf.Timestamp attachment_change_time = 11;
+}
+
+// Create-time request to expose one loopback HTTP service in a sandbox.
+message SandboxServiceExposure {
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 1;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 2;
 }

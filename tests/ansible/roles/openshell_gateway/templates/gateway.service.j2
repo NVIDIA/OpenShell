@@ -11,7 +11,7 @@ User={{ openshell_gateway_user }}
 Group={{ openshell_gateway_user }}
 Environment=HOME={{ openshell_gateway_home }}
 {% block service %}{% endblock %}
-ExecStart=/usr/local/bin/openshell-gateway --config /etc/openshell/gateway.toml
+ExecStart=openshell-gateway --config /etc/openshell/gateway.toml
 Restart=on-failure
 
 [Install]

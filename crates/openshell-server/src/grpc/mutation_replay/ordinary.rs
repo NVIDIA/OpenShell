@@ -154,6 +154,8 @@ pub(in crate::grpc) enum Outcome {
     Sandbox {
         id: String,
         changed: bool,
+        #[serde(default)]
+        service_urls: HashMap<String, String>,
     },
     SandboxDeletion {
         id: String,
@@ -409,10 +411,15 @@ macro_rules! sandbox_scoped_mutation {
     };
 }
 
-fn sandbox_receipt(sandbox: Option<&Sandbox>, changed: bool) -> Result<Outcome, Status> {
+fn sandbox_receipt(
+    sandbox: Option<&Sandbox>,
+    changed: bool,
+    service_urls: HashMap<String, String>,
+) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
         id: sandbox.ok_or_else(uncertain)?.object_id().into(),
         changed,
+        service_urls,
     })
 }
 
@@ -426,7 +433,8 @@ macro_rules! sandbox_mutation {
             User,
             |response: &Response<SandboxResponse>| sandbox_receipt(
                 response.get_ref().sandbox.as_ref(),
-                false
+                false,
+                HashMap::new(),
             ),
             async |store: &Store, outcome: Outcome| {
                 let Outcome::Sandbox { id, .. } = outcome else {
@@ -434,6 +442,7 @@ macro_rules! sandbox_mutation {
                 };
                 Ok(SandboxResponse {
                     sandbox: Some(live(store, &id).await?),
+                    service_urls: HashMap::new(),
                 })
             }
         );
@@ -447,14 +456,19 @@ scoped_mutation!(
     User,
     |response: &Response<SandboxResponse>| sandbox_receipt(
         response.get_ref().sandbox.as_ref(),
-        false
+        false,
+        response.get_ref().service_urls.clone(),
     ),
     async |store: &Store, outcome: Outcome| {
-        let Outcome::Sandbox { id, .. } = outcome else {
+        let Outcome::Sandbox {
+            id, service_urls, ..
+        } = outcome
+        else {
             return Err(replay_unavailable());
         };
         Ok(SandboxResponse {
             sandbox: Some(live(store, &id).await?),
+            service_urls,
         })
     }
 );

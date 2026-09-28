@@ -17,6 +17,20 @@ use tokio::time::timeout;
 use super::binary::openshell_cmd;
 use super::output::{extract_field, strip_ansi};
 
+/// Tool-capable workload image used by the E2E harness.
+///
+/// Product defaults remain on the minimal NVIDIA Ubuntu image. Tests that
+/// explicitly pass `--from` or `--template` retain their requested workload.
+/// Docker and Podman setup build this Noble-based fixture before running the
+/// tests.
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
+
+/// Preserve the existing pullable fixture for E2E lanes that cannot build the
+/// local container-engine fixture.
+#[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
+pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3";
+
 /// Extract the sandbox name from CLI create output.
 ///
 /// The CLI prints `Created sandbox: <name>` (current format). Falls back to
@@ -26,10 +40,9 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
-/// In VM mode, the overlayfs snapshotter re-extracts all image layers
-/// from the content store on every boot (~250s for the 1GB sandbox
-/// base image), so 600s accommodates extraction + workspace-init + pod
-/// startup.
+/// In VM mode, the overlayfs snapshotter re-extracts image layers from the
+/// content store on every boot, so 600s accommodates cold image preparation,
+/// workspace initialization, and sandbox startup.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
@@ -37,6 +50,21 @@ static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
 fn has_explicit_sandbox_name(args: &[&str]) -> bool {
     args.iter()
         .any(|arg| *arg == "--name" || arg.starts_with("--name="))
+}
+
+fn has_explicit_sandbox_workload(args: &[&str]) -> bool {
+    args.iter().take_while(|arg| **arg != "--").any(|arg| {
+        *arg == "--from"
+            || arg.starts_with("--from=")
+            || *arg == "--template"
+            || arg.starts_with("--template=")
+    })
+}
+
+fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
+    if !has_explicit_sandbox_workload(args) {
+        command.arg("--from").arg(E2E_WORKLOAD_IMAGE);
+    }
 }
 
 fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
@@ -96,6 +124,18 @@ impl SandboxGuard {
     /// Returns an error if the CLI exits with a non-zero status or the sandbox
     /// name cannot be parsed from the output.
     pub async fn create(args: &[&str]) -> Result<Self, String> {
+        Self::create_inner(args, true).await
+    }
+
+    /// Create a sandbox using the gateway's configured default image.
+    ///
+    /// Most E2E tests use [`Self::create`], which supplies the tool-capable E2E
+    /// image. This variant is reserved for coverage of the product default.
+    pub async fn create_with_gateway_default(args: &[&str]) -> Result<Self, String> {
+        Self::create_inner(args, false).await
+    }
+
+    async fn create_inner(args: &[&str], use_test_image: bool) -> Result<Self, String> {
         let separator = args.iter().position(|arg| *arg == "--");
         let (create_args, command) = separator.map_or((args, &[][..]), |index| {
             (&args[..index], &args[index + 1..])
@@ -111,6 +151,9 @@ impl SandboxGuard {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, create_args);
+        if use_test_image {
+            add_test_image_if_missing(&mut cmd, create_args);
+        }
         for arg in create_args {
             cmd.arg(arg);
         }
@@ -187,6 +230,7 @@ impl SandboxGuard {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, &[]);
+        add_test_image_if_missing(&mut cmd, &[]);
         cmd.arg("--")
             .args(command)
             .stdout(Stdio::piped())
@@ -235,6 +279,7 @@ impl SandboxGuard {
         let mut create_cmd = openshell_cmd();
         create_cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut create_cmd, create_args);
+        add_test_image_if_missing(&mut create_cmd, create_args);
         for arg in create_args {
             create_cmd.arg(arg);
         }
@@ -374,6 +419,7 @@ impl SandboxGuard {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, &[]);
+        add_test_image_if_missing(&mut cmd, &[]);
         for (local, dest) in uploads {
             cmd.arg("--upload").arg(format!("{local}:{dest}"));
         }
@@ -703,12 +749,27 @@ impl Drop for SandboxGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::has_explicit_sandbox_name;
+    use super::{has_explicit_sandbox_name, has_explicit_sandbox_workload};
 
     #[test]
     fn detects_explicit_sandbox_names() {
         assert!(has_explicit_sandbox_name(&["--name", "example"]));
         assert!(has_explicit_sandbox_name(&["--name=example"]));
         assert!(!has_explicit_sandbox_name(&["--policy", "policy.yaml"]));
+    }
+
+    #[test]
+    fn detects_explicit_sandbox_workloads() {
+        assert!(has_explicit_sandbox_workload(&["--from", "example:latest"]));
+        assert!(has_explicit_sandbox_workload(&["--from=example:latest"]));
+        assert!(has_explicit_sandbox_workload(&["--template", "example"]));
+        assert!(has_explicit_sandbox_workload(&["--template=example"]));
+        assert!(!has_explicit_sandbox_workload(&["--policy", "policy.yaml"]));
+        assert!(!has_explicit_sandbox_workload(&["--", "echo", "--from=x"]));
+        assert!(!has_explicit_sandbox_workload(&[
+            "--",
+            "echo",
+            "--template=x"
+        ]));
     }
 }

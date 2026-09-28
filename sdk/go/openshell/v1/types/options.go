@@ -8,6 +8,8 @@ import "time"
 // CreateOptions configures resource creation.
 type CreateOptions struct {
 	Annotations map[string]string
+	// ServiceExposures are loopback HTTP services registered with the sandbox.
+	ServiceExposures []ServiceExposure
 }
 
 // ListOptions configures resource listing with pagination and filtering.

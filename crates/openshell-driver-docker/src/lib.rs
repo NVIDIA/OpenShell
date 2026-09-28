@@ -154,6 +154,10 @@ fn provisioning_span(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Docker API Unix socket. When unset, use the socket selected by gateway
     /// auto-detection, falling back to `/var/run/docker.sock` for an explicitly
     /// configured Docker driver.
@@ -225,6 +229,7 @@ pub struct DockerComputeConfig {
 impl DockerComputeConfig {
     /// Validate startup configuration without connecting to Docker.
     pub fn validate_configuration(&self, gateway_bind_address: SocketAddr) -> CoreResult<()> {
+        self.resource_admission.validate().map_err(Error::config)?;
         if let Some(socket_path) = self.socket_path.as_deref()
             && socket_path.to_str().is_none()
         {
@@ -254,6 +259,9 @@ impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: None,
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
@@ -283,6 +291,8 @@ pub(crate) struct DockerGuestTlsPaths {
 
 #[derive(Debug, Clone)]
 struct DockerDriverRuntimeConfig {
+    allow_driver_config: bool,
+    resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     default_image: String,
     image_pull_policy: ImagePullPolicy,
     sandbox_namespace: String,
@@ -293,7 +303,6 @@ struct DockerDriverRuntimeConfig {
     supervisor_grpc_endpoint: String,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
-    daemon_version: String,
     gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
@@ -630,9 +639,18 @@ fn resolve_docker_identity_from_accounts(
         requested_user
     };
     if user_selector.is_empty() {
-        return Err(Status::failed_precondition(
-            "the pinned image defaults to root; configure a non-root process.run_as_user",
-        ));
+        // The image declares no USER (for example, a minimal base image) and the policy
+        // requested none. Synthesize a numeric non-root identity instead of
+        // rejecting, matching the Podman driver's USER-less default and the
+        // numeric-identity behavior of the Kubernetes and VM drivers.
+        return ResolvedWorkloadIdentity::new(
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            Vec::new(),
+            "default".to_string(),
+            image.id.clone(),
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()));
     }
     let (uid, passwd_entry) = resolve_numeric_or_named_user(user_selector, &passwd)?;
     let username = passwd_entry.map(|entry| entry.name.as_str());
@@ -819,6 +837,10 @@ impl DockerComputeDriver {
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
     ) -> CoreResult<Self> {
+        docker_config
+            .resource_admission
+            .validate()
+            .map_err(Error::config)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -835,7 +857,7 @@ impl DockerComputeDriver {
                 .map_err(|err| {
                     Error::execution(format!("failed to create Docker client: {err}"))
                 })?;
-        let version = docker.version().await.map_err(|err| {
+        docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
         let info = docker.info().await.map_err(|err| {
@@ -919,10 +941,11 @@ impl DockerComputeDriver {
                 supervisor_grpc_endpoint,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
-                daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                allow_driver_config: docker_config.allow_driver_config,
+                resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
@@ -959,8 +982,13 @@ impl DockerComputeDriver {
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
+            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: self.config.allow_driver_config,
+                resource_admission: self.config.resource_admission.clone(),
+            }
+            .acknowledgement(),
             driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
+            driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
@@ -979,6 +1007,12 @@ impl DockerComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/docker",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 
@@ -995,6 +1029,10 @@ impl DockerComputeDriver {
         sandbox: &'a DriverSandbox,
         config: &DockerDriverRuntimeConfig,
     ) -> Result<ValidatedDockerSandbox<'a>, Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            config.allow_driver_config,
+            sandbox,
+        )?;
         let spec = sandbox
             .spec
             .as_ref()
@@ -1009,6 +1047,16 @@ impl DockerComputeDriver {
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
+        for mount in &driver_config.mounts {
+            if matches!(
+                mount,
+                DockerDriverMountConfig::Bind { .. } | DockerDriverMountConfig::Image { .. }
+            ) {
+                config
+                    .resource_admission
+                    .reject_unlabelable("host bind or image mount")?;
+            }
+        }
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
         Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
         Ok(ValidatedDockerSandbox {
@@ -1083,11 +1131,23 @@ impl DockerComputeDriver {
     async fn validate_user_volume_mounts_available(
         &self,
         driver_config: &DockerSandboxDriverConfig,
-    ) -> Result<(), Status> {
+        workspace: &str,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Status> {
+        let mut identities = std::collections::BTreeMap::new();
         for mount in &driver_config.mounts {
             if let DockerDriverMountConfig::Volume { source, .. } = mount {
                 match self.docker.inspect_volume(source).await {
                     Ok(volume) => {
+                        identities.insert(source.clone(), docker_volume_identity(&volume));
+                        self.config
+                            .resource_admission
+                            .admit(workspace, &volume.labels)
+                            .map_err(|error| {
+                                Status::new(
+                                    error.code(),
+                                    format!("docker volume '{source}': {}", error.message()),
+                                )
+                            })?;
                         if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
                         {
                             return Err(Status::failed_precondition(format!(
@@ -1106,7 +1166,7 @@ impl DockerComputeDriver {
                 }
             }
         }
-        Ok(())
+        Ok(identities)
     }
 
     async fn refresh_gpu_inventory(&self) -> Result<(), Status> {
@@ -1119,6 +1179,114 @@ impl DockerComputeDriver {
             docker_cdi_gpu_inventory(&info),
             self.config.gpu.wsl_all_gpu_fallback_enabled,
         );
+        Ok(())
+    }
+
+    async fn admit_container_resources(
+        &self,
+        container: &bollard::models::ContainerInspectResponse,
+    ) -> Result<(), Status> {
+        if self.config.allow_driver_config && !self.config.resource_admission.enabled {
+            return Ok(());
+        }
+        let labels = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .ok_or_else(|| Status::failed_precondition("sandbox lacks admission metadata"))?;
+        openshell_core::resource_admission::check_config_provenance(
+            self.config.allow_driver_config,
+            labels
+                .get(openshell_core::resource_admission::CONFIG_USED_LABEL)
+                .map(String::as_str),
+        )?;
+        if !self.config.resource_admission.enabled {
+            return Ok(());
+        }
+        let workspace = labels
+            .get(LABEL_SANDBOX_WORKSPACE)
+            .ok_or_else(|| Status::failed_precondition("sandbox lacks workspace"))?;
+        let sandbox_id = labels
+            .get(LABEL_SANDBOX_ID)
+            .ok_or_else(|| Status::failed_precondition("sandbox lacks identity"))?;
+        let expected: std::collections::BTreeMap<String, serde_json::Value> = labels
+            .get(openshell_core::resource_admission::IDENTITIES_LABEL)
+            .and_then(|value| serde_json::from_str(value).ok())
+            .ok_or_else(|| Status::failed_precondition("sandbox lacks resource identity record"))?;
+        let mut actual = std::collections::BTreeMap::new();
+        let anonymous_targets: Vec<String> = labels
+            .get("openshell.ai/private-image-volume-targets")
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default();
+        for mount in container.mounts.as_deref().unwrap_or_default() {
+            match mount.typ {
+                Some(bollard::models::MountPointTypeEnum::VOLUME) => {
+                    let name = mount
+                        .name
+                        .as_deref()
+                        .ok_or_else(|| Status::failed_precondition("volume lacks identity"))?;
+                    let volume = self.docker.inspect_volume(name).await.map_err(|error| {
+                        if is_not_found_error(&error) {
+                            Status::failed_precondition("attached volume no longer exists")
+                        } else {
+                            Status::unavailable("volume admission lookup failed")
+                        }
+                    })?;
+                    if name == docker_channel_volume_name_by_id(sandbox_id, &self.config) {
+                        if volume.driver != "local"
+                            || !volume.options.is_empty()
+                            || volume.labels.get(LABEL_SANDBOX_ID) != Some(sandbox_id)
+                            || volume.labels.get(LABEL_MANAGED_BY).map(String::as_str)
+                                != Some(LABEL_MANAGED_BY_VALUE)
+                        {
+                            return Err(Status::failed_precondition(
+                                "sandbox-private volume ownership changed",
+                            ));
+                        }
+                    } else if !expected.contains_key(name)
+                        && mount
+                            .destination
+                            .as_ref()
+                            .is_some_and(|destination| anonymous_targets.contains(destination))
+                    {
+                        // The immutable create spec requested a fresh anonymous
+                        // image volume at this target, never an existing name.
+                        if volume.driver != "local" || !volume.options.is_empty() {
+                            return Err(Status::failed_precondition(
+                                "image-private volume backing changed",
+                            ));
+                        }
+                    } else {
+                        actual.insert(name.to_string(), docker_volume_identity(&volume));
+                        self.config
+                            .resource_admission
+                            .admit(workspace, &volume.labels)
+                            .map_err(|error| {
+                                Status::new(
+                                    error.code(),
+                                    format!("docker volume '{name}': {}", error.message()),
+                                )
+                            })?;
+                        if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
+                        {
+                            return Err(Status::failed_precondition(
+                                "bind-backed volume is disabled",
+                            ));
+                        }
+                    }
+                }
+                Some(bollard::models::MountPointTypeEnum::TMPFS) => {}
+                _ => self
+                    .config
+                    .resource_admission
+                    .reject_unlabelable("effective container mount")?,
+            }
+        }
+        if actual != expected {
+            return Err(Status::failed_precondition(
+                "external volume identity or attachment inventory changed",
+            ));
+        }
         Ok(())
     }
 
@@ -1260,7 +1428,13 @@ impl DockerComputeDriver {
                         }
                     }
                     Ok(inspected) if summary.state == Some(ContainerSummaryStateEnum::RUNNING) => {
-                        if let Err(status) = validate_docker_outer_fence(&inspected) {
+                        let admission = match validate_docker_outer_fence(&inspected) {
+                            Ok(()) => self.admit_container_resources(&inspected).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(status) = admission
+                            && status.code() == tonic::Code::FailedPrecondition
+                        {
                             let context = self
                                 .control_failure_context(sandbox.clone(), container_id.to_string());
                             handle_docker_runtime_failure(
@@ -1300,7 +1474,7 @@ impl DockerComputeDriver {
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let validated = Self::validated_sandbox(sandbox, &self.config)?;
         Self::validate_sandbox_auth(sandbox)?;
-        self.validate_user_volume_mounts_available(&validated.driver_config)
+        self.validate_user_volume_mounts_available(&validated.driver_config, &sandbox.workspace)
             .await?;
         let _ = self
             .resolve_gpu_cdi_devices(
@@ -1459,7 +1633,7 @@ impl DockerComputeDriver {
                 ));
             }
         };
-        let create_body = match build_container_create_body_for_image(
+        let mut create_body = match build_container_create_body_for_image(
             sandbox,
             &self.config,
             &validated.driver_config,
@@ -1478,6 +1652,27 @@ impl DockerComputeDriver {
                 ));
             }
         };
+        let identities = match self
+            .validate_user_volume_mounts_available(&validated.driver_config, &sandbox.workspace)
+            .await
+        {
+            Ok(identities) => identities,
+            Err(status) => {
+                let _ = remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config)
+                    .await;
+                cleanup_docker_boundary_state(sandbox, &self.config);
+                return Err(DockerProvisioningFailure::from_admission_status(status));
+            }
+        };
+        create_body
+            .labels
+            .get_or_insert_with(Default::default)
+            .insert(
+                openshell_core::resource_admission::IDENTITIES_LABEL.into(),
+                serde_json::to_string(&identities).map_err(|error| {
+                    DockerProvisioningFailure::new("ResourceAdmissionDenied", error.to_string())
+                })?,
+            );
         let create_result = async {
             openshell_otel::record_error_result(
                 self.docker
@@ -1531,7 +1726,10 @@ impl DockerComputeDriver {
                 ));
             }
         };
-        let outer_fence_error = validate_docker_outer_fence(&inspected).err();
+        let outer_fence_error = match validate_docker_outer_fence(&inspected) {
+            Ok(()) => self.admit_container_resources(&inspected).await.err(),
+            Err(error) => Some(error),
+        };
         drop(inspected);
         if let Some(status) = outer_fence_error {
             let _ = self
@@ -2211,6 +2409,7 @@ impl DockerComputeDriver {
             .await
             .map_err(|error| internal_status("inspect Docker sandbox outer fence", error))?;
         validate_docker_outer_fence(&inspected)?;
+        self.admit_container_resources(&inspected).await?;
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         let previous_finished_at = if state == ContainerSummaryStateEnum::EXITED {
             inspected
@@ -3002,9 +3201,17 @@ impl ComputeDriver for DockerComputeDriver {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        Ok(Response::new(self.capabilities()))
+        let capabilities = self.capabilities();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "docker",
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn validate_sandbox_create(
@@ -3016,7 +3223,7 @@ impl ComputeDriver for DockerComputeDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         let validated = Self::validated_sandbox(&sandbox, &self.config)?;
-        self.validate_user_volume_mounts_available(&validated.driver_config)
+        self.validate_user_volume_mounts_available(&validated.driver_config, &sandbox.workspace)
             .await?;
         let _ = self
             .resolve_gpu_cdi_devices(
@@ -3080,7 +3287,7 @@ impl ComputeDriver for DockerComputeDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.create_sandbox_inner(&sandbox).await?;
-        span_status.finish(Ok(Response::new(CreateSandboxResponse {})))
+        span_status.finish(Ok(Response::new(CreateSandboxResponse::default())))
     }
 
     #[tracing::instrument(
@@ -3140,7 +3347,7 @@ impl ComputeDriver for DockerComputeDriver {
         }
         self.publish_container_snapshot(&request.sandbox_id, &request.name)
             .await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     #[tracing::instrument(
@@ -3250,6 +3457,15 @@ impl DockerProvisioningFailure {
 
     fn from_status(reason: &'static str, status: Status) -> Self {
         Self::new(reason, status.message())
+    }
+
+    fn from_admission_status(status: Status) -> Self {
+        let reason = if status.code() == tonic::Code::FailedPrecondition {
+            "ResourceAdmissionDenied"
+        } else {
+            "ResourceAdmissionLookupFailed"
+        };
+        Self::from_status(reason, status)
     }
 }
 
@@ -3756,6 +3972,11 @@ fn docker_tmpfs_option(option: &str) -> Result<Vec<String>, Status> {
     } else {
         Ok(vec![option.to_string()])
     }
+}
+
+fn docker_volume_identity(volume: &bollard::models::Volume) -> serde_json::Value {
+    serde_json::json!({"name": volume.name, "driver": volume.driver, "options": volume.options,
+        "created_at": volume.created_at, "mountpoint": volume.mountpoint})
 }
 
 fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
@@ -4349,7 +4570,8 @@ async fn prepare_docker_boundary_files(
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
     }
-    .provision();
+    .provision()
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let boundary_config = provisioning
         .boundary_config
         .encode()
@@ -5482,6 +5704,19 @@ fn build_container_create_body_for_image(
     });
     let mut labels = template.labels.clone();
     labels.insert(
+        "openshell.ai/private-image-volume-targets".into(),
+        serde_json::to_string(&image.volumes)
+            .map_err(|error| Status::internal(error.to_string()))?,
+    );
+    labels.insert(
+        openshell_core::resource_admission::CONFIG_USED_LABEL.into(),
+        template
+            .driver_config
+            .as_ref()
+            .is_some_and(|config| !config.fields.is_empty())
+            .to_string(),
+    );
+    labels.insert(
         LABEL_MANAGED_BY.to_string(),
         LABEL_MANAGED_BY_VALUE.to_string(),
     );
@@ -5561,6 +5796,10 @@ fn build_container_create_body_for_image(
             }),
             network_mode: Some("none".to_string()),
             dns: Some(vec!["127.0.0.53".to_string()]),
+            // Docker otherwise copies the host's search domains. Like the
+            // Podman, Kubernetes, and VM resolvers, send names to policy DNS
+            // exactly as written so short names never expand to host domains.
+            dns_search: Some(vec![".".to_string()]),
             tmpfs: Some(HashMap::from([(
                 openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
                 format!(

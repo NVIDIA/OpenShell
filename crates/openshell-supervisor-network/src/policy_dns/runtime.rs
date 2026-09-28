@@ -6,7 +6,7 @@
 use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
-use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -65,8 +65,14 @@ impl PolicyDnsRuntimeConfig {
         let ipv6_cidr = ipnet::Ipv6Net::new(Ipv6Addr::from(ipv6_start), IPV6_POOL_PREFIX)
             .map_err(|error| miette::miette!(error.to_string()))?;
 
+        // Keep the sandbox-local API address out of the external mapping pool.
+        let ipv4_pool_start = if ipv4_cidr.contains(&POLICY_LOCAL_ADDRESS) {
+            Ipv4Addr::from(u32::from(POLICY_LOCAL_ADDRESS) + 1)
+        } else {
+            ipv4_cidr.network()
+        };
         let pools = SyntheticPools::new(
-            ipv4_cidr.network()..=ipv4_cidr.broadcast(),
+            ipv4_pool_start..=ipv4_cidr.broadcast(),
             ipv6_cidr.network()..=ipv6_cidr.broadcast(),
         )
         .map_err(|error| miette::miette!(error.to_string()))?;

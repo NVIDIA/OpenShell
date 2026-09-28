@@ -20,7 +20,7 @@ mod linux {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::Path;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
@@ -36,11 +36,9 @@ mod linux {
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-        CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
-        SandboxConfirmEvidence,
+        BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
+        BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
     };
-    use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
@@ -51,20 +49,24 @@ mod linux {
         isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
-        SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
-        SandboxProtocolPrincipal,
+        SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
+        SandboxProtocolAuthenticator, SandboxProtocolPrincipal,
+    };
+    use openshell_sandbox_backend::{
+        ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, GPU_RESOURCE_CLAIM,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_stream::wrappers::ReceiverStream;
 
     use openshell_sandbox_backend::boundary_protocol::{
-        AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
+        AgentSpecWire, BOUNDARY_CONNECTION_WINDOW_BYTES, BOUNDARY_MAX_CONCURRENT_STREAMS,
+        BOUNDARY_STREAM_WINDOW_BYTES, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
-        ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
-        ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
-        STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT,
-        SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame, read_frame,
-        read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
+        ExitStatusWire, MediationTimingWire, NativeLinuxSandboxAuditEvidence, OutputWindowWire,
+        ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
+        STREAM_EXIT, STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED,
+        STREAM_STDOUT, SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame,
+        read_frame, read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,7 +83,12 @@ mod linux {
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
+    // NVML may traverse the persistenced socket directory during initialization;
+    // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
+    // CUDA opens device nodes read-write and writes thread names through
+    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
+    // to the launcher's inodes, not those of its workload children.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
@@ -96,8 +103,8 @@ mod linux {
     }
 
     /// Add the filesystem paths required by GPU devices visible inside the
-    /// workload container. The companion supervisor intentionally has no GPU
-    /// devices, so it cannot discover these paths on the sandbox's behalf.
+    /// workload. The supervisor's device namespace can differ from the
+    /// workload's, so discovery must happen here, gated by the resource claim.
     fn enrich_gpu_filesystem_paths(
         policy: &mut openshell_core::policy::SandboxPolicy,
         gpu_requested: bool,
@@ -178,8 +185,10 @@ mod linux {
             .map(|_| ControlConnectionSlot(active.clone()))
     }
     static BOUNDARY_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+    static BOUNDARY_TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-    extern "C" fn request_boundary_termination(_signal: libc::c_int) {
+    extern "C" fn request_boundary_termination(signal: libc::c_int) {
+        BOUNDARY_TERMINATION_SIGNAL.store(signal, Ordering::Release);
         BOUNDARY_TERMINATION_REQUESTED.store(true, Ordering::Release);
     }
 
@@ -271,6 +280,7 @@ mod linux {
 
     fn install_boundary_signal_handlers() -> Result<(), String> {
         BOUNDARY_TERMINATION_REQUESTED.store(false, Ordering::Release);
+        BOUNDARY_TERMINATION_SIGNAL.store(0, Ordering::Release);
         let action = nix::sys::signal::SigAction::new(
             nix::sys::signal::SigHandler::Handler(request_boundary_termination),
             nix::sys::signal::SaFlags::empty(),
@@ -304,8 +314,8 @@ mod linux {
         }
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
-            .driver_fence
-            .validate()
+            .outer_fence
+            .validate(&config.generation)
             .map_err(|error| error.to_string())?;
         for (claim, path) in &config.resource_claim_files {
             if !config.resource_claims.contains_key(claim) {
@@ -387,6 +397,10 @@ mod linux {
             .resource_claims
             .get(GPU_RESOURCE_CLAIM)
             .is_some_and(|value| value == "true")
+            || config
+                .resource_claims
+                .get(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true")
     }
 
     fn supplementary_groups_match(actual: &[u32], expected: &[u32], allow_extra: bool) -> bool {
@@ -484,7 +498,22 @@ mod linux {
         tracing::info!(?config, "Boundary control listener ready");
         loop {
             if BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
+                let signal = BOUNDARY_TERMINATION_SIGNAL.load(Ordering::Acquire);
+                let before_supervisor_confirmation = !matches!(
+                    *lock(&runtime.supervisor_connection),
+                    SupervisorConnectionState::Connected(_)
+                );
                 runtime.shutdown();
+                if before_supervisor_confirmation {
+                    return Err(format!(
+                        "sandbox boundary received {} before supervisor confirmation",
+                        boundary_termination_signal_name(signal)
+                    ));
+                }
+                tracing::info!(
+                    signal = boundary_termination_signal_name(signal),
+                    "Sandbox boundary received termination signal"
+                );
                 return Ok(());
             }
             match listener.accept() {
@@ -519,6 +548,14 @@ mod linux {
                 }
                 Err(error) => return Err(format!("accept boundary control connection: {error}")),
             }
+        }
+    }
+
+    fn boundary_termination_signal_name(signal: i32) -> &'static str {
+        match signal {
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGINT => "SIGINT",
+            _ => "unknown signal",
         }
     }
 
@@ -562,12 +599,9 @@ mod linux {
         let result = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
-            .max_concurrent_streams(
-                u32::try_from(MAX_CONTROL_CONNECTIONS)
-                    .map_err(|error| format!("invalid control connection limit: {error}"))?,
-            )
-            .initial_stream_window_size(16 * 1024 * 1024)
-            .initial_connection_window_size(16 * 1024 * 1024)
+            .max_concurrent_streams(BOUNDARY_MAX_CONCURRENT_STREAMS)
+            .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
                 IsolationBoundaryServer::new(GrpcBoundaryService {
                     runtime: runtime.clone(),
@@ -666,6 +700,10 @@ mod linux {
         }
 
         fn update(&self, expires_at: i64) {
+            if expires_at == 0 {
+                self.set_deadline(None);
+                return;
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs());
@@ -676,11 +714,15 @@ mod linux {
         }
 
         fn update_deadline(&self, deadline: tokio::time::Instant) {
+            self.set_deadline(Some(deadline));
+        }
+
+        fn set_deadline(&self, deadline: Option<tokio::time::Instant>) {
             let _ = self.deadline.send_if_modified(|current| {
-                if *current == Some(deadline) {
+                if *current == deadline {
                     false
                 } else {
-                    *current = Some(deadline);
+                    *current = deadline;
                     true
                 }
             });
@@ -1241,17 +1283,24 @@ mod linux {
         };
         let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
-        let response = ResponseEnvelope {
+        let mut response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
+        // Report commit failures to the supervisor: a silently closed stream
+        // is indistinguishable from transport loss.
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
             let supervisor_instance_id = supervisor_instance_id
                 .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            runtime.commit_attach(principal, supervisor_instance_id)?;
+            if let Err((kind, message)) = runtime.commit_attach(principal, supervisor_instance_id) {
+                response.response = guest_error(kind, message);
+            }
         }
-        if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
-            runtime.commit_confirm(principal)?;
+        if is_confirm
+            && matches!(&response.response, Response::Confirmed { .. })
+            && let Err((kind, message)) = runtime.commit_confirm(principal)
+        {
+            response.response = guest_error(kind, message);
         }
         write_frame(&mut stream, &response)
             .map_err(|error| format!("write control frame: {error}"))?;
@@ -1367,8 +1416,8 @@ mod linux {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: SandboxPolicyWire,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     }
@@ -1399,6 +1448,9 @@ mod linux {
 
     impl MainAttachment {
         fn exit_status(&self, fallback_code: i32) -> ExitStatusWire {
+            if self.session.output_failed() {
+                return ExitStatusWire::Exited(74);
+            }
             match &self.status {
                 AttachmentStatus::Main(process) => process
                     .exit_status()
@@ -1601,22 +1653,22 @@ mod linux {
             &self,
             principal: &SandboxProtocolPrincipal,
             supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
-        ) -> Result<(), String> {
+        ) -> Result<(), CommitError> {
             if let Some(replaced) = self
                 .connections
                 .attach(principal, supervisor_instance_id)
-                .map_err(|error| error.to_string())?
+                .map_err(connection_auth_error)?
             {
                 self.close_connection(replaced);
             }
             Ok(())
         }
 
-        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), CommitError> {
             let replaced = self
                 .connections
                 .confirm(principal)
-                .map_err(|error| error.to_string())?;
+                .map_err(connection_auth_error)?;
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -1633,13 +1685,19 @@ mod linux {
                     SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
                 ) {
                     self.connections.mark_terminal();
-                    return Err("sandbox session is terminating".to_string());
+                    return Err((
+                        BoundaryErrorKind::Terminated,
+                        "sandbox session is terminating".to_string(),
+                    ));
                 }
                 if matches!(*connection, SupervisorConnectionState::Frozen { .. })
                     && let Some(process) = process
                 {
                     if !process.boundary_runtime.resume() {
-                        return Err("frozen workload could not be resumed".to_string());
+                        return Err((
+                            BoundaryErrorKind::Process,
+                            "frozen workload could not be resumed".to_string(),
+                        ));
                     }
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
@@ -2021,6 +2079,7 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
+                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -2262,20 +2321,20 @@ mod linux {
                     if let Err(error) = prepared.confirm(&self.process_runtime) {
                         return guest_error(BoundaryErrorKind::Process, error);
                     }
-                    let evidence = match self.measure_confirmation_evidence() {
-                        Ok(evidence) => evidence,
+                    let confirmation = match self.measure_confirmation() {
+                        Ok(confirmation) => confirmation,
                         Err(error) => return guest_error(BoundaryErrorKind::Process, error),
                     };
                     *state = RuntimeState::Ready(prepared.clone());
                     Response::Confirmed {
-                        evidence: Box::new(evidence),
+                        confirmation: Box::new(confirmation),
                     }
                 }
                 RuntimeState::Ready(_) | RuntimeState::Running(_) => {
-                    self.measure_confirmation_evidence().map_or_else(
+                    self.measure_confirmation().map_or_else(
                         |error| guest_error(BoundaryErrorKind::Process, error),
-                        |evidence| Response::Confirmed {
-                            evidence: Box::new(evidence),
+                        |confirmation| Response::Confirmed {
+                            confirmation: Box::new(confirmation),
                         },
                     )
                 }
@@ -2286,7 +2345,7 @@ mod linux {
             }
         }
 
-        fn measure_confirmation_evidence(&self) -> Result<SandboxConfirmEvidence, String> {
+        fn measure_confirmation(&self) -> Result<BoundaryConfirmation, String> {
             validate_running_identity(
                 &self.config.workload_identity,
                 allows_runtime_supplementary_groups(&self.config),
@@ -2299,7 +2358,7 @@ mod linux {
             }
             let status = std::fs::read_to_string("/proc/self/status")
                 .map_err(|error| format!("read sandbox process status: {error}"))?;
-            let capabilities = CapabilityEvidence {
+            let capabilities = openshell_sandbox_backend::boundary_protocol::CapabilityEvidence {
                 inheritable: parse_status_hex(&status, "CapInh")?,
                 permitted: parse_status_hex(&status, "CapPrm")?,
                 effective: parse_status_hex(&status, "CapEff")?,
@@ -2320,9 +2379,7 @@ mod linux {
             // SAFETY: successful getrlimit initialized the value.
             let core_limit = unsafe { core_limit.assume_init() };
             let (native_architecture, kernel_release) = uname_values()?;
-            Ok(SandboxConfirmEvidence {
-                generation: self.config.generation.clone(),
-                identity: self.config.workload_identity.clone(),
+            let audit = NativeLinuxSandboxAuditEvidence {
                 capabilities,
                 no_new_privileges,
                 sandbox_dumpable,
@@ -2337,11 +2394,24 @@ mod linux {
                 tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
+            };
+            // The boundary reports mechanism evidence; the authenticated host
+            // backend validates it before constructing a ConfirmedBoundary.
+            // Keeping that decision at the verifier also lets lifecycle tests
+            // exercise the protocol without claiming host-kernel enforcement.
+            let properties = audit.properties();
+            let backend_audit = serde_json::to_value(audit)
+                .map_err(|error| format!("encode OpenShell sandbox audit evidence: {error}"))?;
+            Ok(BoundaryConfirmation {
+                generation: self.config.generation.clone(),
+                identity: self.config.workload_identity.clone(),
+                properties,
                 authenticated_supervisor: true,
                 session_id: self.config.session_id,
-                driver_fence: self.config.driver_fence.clone(),
+                outer_fence: self.config.outer_fence.clone(),
                 runtime_exit_terminates_workload: true,
                 resource_claims: self.config.resource_claims.clone(),
+                backend_audit,
             })
         }
 
@@ -2351,8 +2421,8 @@ mod linux {
             sandbox_id: String,
             spec: AgentSpecWire,
             policy: SandboxPolicyWire,
-            ca_cert: Option<Vec<u8>>,
-            ca_bundle: Option<Vec<u8>>,
+            ca_cert: Option<String>,
+            ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
         ) -> Response {
@@ -2631,8 +2701,8 @@ mod linux {
     }
 
     fn install_ca_material(
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
         let (ca_cert, ca_bundle) = match (ca_cert, ca_bundle) {
             (Some(ca_cert), Some(ca_bundle)) => (ca_cert, ca_bundle),
@@ -2645,8 +2715,8 @@ mod linux {
         };
         install_ca_material_at(
             Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
-            &ca_cert,
-            &ca_bundle,
+            ca_cert.as_bytes(),
+            ca_bundle.as_bytes(),
         )
     }
 
@@ -2936,15 +3006,14 @@ mod linux {
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
-                        let Some(input) = input.as_ref() else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "main process stdin already closed",
-                            ));
-                        };
-                        input.send(payload).await.map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "main process stdin closed")
-                        })?;
+                        // A process may close stdin before the client has
+                        // finished sending it. Keep relaying stdout, stderr,
+                        // and the final status after that write fails.
+                        if let Some(sender) = input.as_ref()
+                            && sender.send(payload).await.is_err()
+                        {
+                            input.take();
+                        }
                     }
                     // Keep reading after stdin closes so transport EOF still
                     // releases this control process's attachment lease.
@@ -2986,6 +3055,21 @@ mod linux {
                         .map_err(|error| format!("write main process exit: {error}"));
                 }
                 Err(error) => {
+                    if matches!(&attachment.status, AttachmentStatus::Exec(_)) {
+                        tracing::warn!(
+                            skipped_chunks = error.skipped,
+                            "exec output could not be delivered intact"
+                        );
+                        let message = b"openshell: exec output could not be delivered intact\n";
+                        let _ =
+                            write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
+                                .await;
+                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
+                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
+                            .await
+                            .map_err(|error| format!("write exec output failure: {error}"));
+                    }
                     tracing::warn!(
                         skipped_chunks = error.skipped,
                         "main process attachment resumed after dropping retained output"
@@ -3017,6 +3101,17 @@ mod linux {
             || ExitStatusWire::Exited(status.code()),
             ExitStatusWire::Signaled,
         )
+    }
+
+    type CommitError = (BoundaryErrorKind, String);
+
+    fn connection_auth_error(error: SandboxAuthError) -> CommitError {
+        let kind = match error {
+            SandboxAuthError::ConnectionStillActive => BoundaryErrorKind::Unavailable,
+            SandboxAuthError::TerminalSession => BoundaryErrorKind::Terminated,
+            _ => BoundaryErrorKind::Denied,
+        };
+        (kind, error.to_string())
     }
 
     fn guest_error(kind: BoundaryErrorKind, message: impl Into<String>) -> Response {
@@ -3609,7 +3704,7 @@ mod linux {
                 key.serialize_pem().as_bytes(),
                 "test-key",
                 "test-gateway",
-                DEFAULT_SESSION_TOKEN_TTL,
+                Some(DEFAULT_SESSION_TOKEN_TTL),
                 Arc::new(SystemJwtClock),
             )
             .expect("test session issuer");
@@ -3705,7 +3800,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
             let debug = format!("{config:?}");
@@ -3781,6 +3876,13 @@ mod linux {
         }
 
         #[test]
+        fn boundary_termination_signal_name_is_explicit() {
+            assert_eq!(boundary_termination_signal_name(libc::SIGTERM), "SIGTERM");
+            assert_eq!(boundary_termination_signal_name(libc::SIGINT), "SIGINT");
+            assert_eq!(boundary_termination_signal_name(0), "unknown signal");
+        }
+
+        #[test]
         fn supplementary_group_measurement_rejects_unexpected_groups_by_default() {
             assert!(!supplementary_groups_match(&[44, 992], &[], false));
         }
@@ -3789,6 +3891,33 @@ mod linux {
         fn gpu_runtime_groups_may_extend_but_not_replace_expected_groups() {
             assert!(supplementary_groups_match(&[44, 992, 1001], &[1001], true));
             assert!(!supplementary_groups_match(&[44, 992], &[1001], true));
+        }
+
+        #[test]
+        fn generic_identity_claim_allows_runtime_supplementary_groups() {
+            let config = BoundaryConfig {
+                boundary_id: "sandbox-1".to_string(),
+                generation: "generation-1".to_string(),
+                session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_id: "test-gateway".to_string(),
+                verification_keys: vec![],
+                listener: BoundaryListenerConfig::Vsock {
+                    control_port: 5500,
+                    tls: placeholder_server_tls(),
+                },
+                resource_claims: std::collections::BTreeMap::from([(
+                    ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.to_string(),
+                    "true".to_string(),
+                )]),
+                resource_claim_files: std::collections::BTreeMap::new(),
+                workload_identity: test_workload_identity(),
+                outer_fence: test_outer_fence(),
+                child_env: std::collections::HashMap::new(),
+            };
+            assert!(allows_runtime_supplementary_groups(&config));
         }
 
         #[test]
@@ -3856,7 +3985,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -3885,6 +4014,26 @@ mod linux {
             tokio::time::timeout(Duration::from_millis(250), closed.changed())
                 .await
                 .expect("updated connection deadline must fire")
+                .expect("expiry worker must keep the shutdown channel open");
+        }
+
+        #[tokio::test]
+        async fn non_expiring_connection_has_no_deadline() {
+            let (shutdown, mut closed) = tokio::sync::watch::channel(());
+            let expiry = ConnectionExpiry::new(shutdown);
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            expiry.update(0);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                    .await
+                    .is_err(),
+                "non-expiring credentials must clear the connection deadline"
+            );
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                .await
+                .expect("replacement connection deadline must fire")
                 .expect("expiry worker must keep the shutdown channel open");
         }
 
@@ -3951,6 +4100,19 @@ mod linux {
                 *lock(&runtime.supervisor_connection),
                 SupervisorConnectionState::Connected(first_id)
             );
+            let early = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .expect("early replacement principal");
+            assert!(
+                matches!(
+                    runtime.commit_attach(&early, supervisor_instance_id),
+                    Err((BoundaryErrorKind::Unavailable, _))
+                ),
+                "reattach before the old transport is retired must be retryable"
+            );
 
             runtime.transport_disconnected(first_id);
             let connection_state = *lock(&runtime.supervisor_connection);
@@ -3973,7 +4135,7 @@ mod linux {
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::ConnectionNotAttached)
+                Err(SandboxAuthError::ConnectionNotAttached)
             );
             runtime
                 .commit_confirm(&replacement)
@@ -4049,7 +4211,7 @@ mod linux {
             );
             assert_eq!(
                 runtime.connections.require_active(&principal),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::TerminalSession)
+                Err(SandboxAuthError::TerminalSession)
             );
         }
 
@@ -4258,16 +4420,25 @@ mod linux {
             .unwrap()
         }
 
-        fn test_driver_fence() -> openshell_isolation_interface::contract::DriverFenceEvidence {
-            openshell_isolation_interface::contract::DriverFenceEvidence::Vm {
-                generation: "generation-1".to_string(),
-                network_device_count: 0,
-            }
+        fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
+            use openshell_isolation_interface::contract::OuterFenceGuarantee;
+
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+                "generation-1",
+                [
+                    OuterFenceGuarantee::DefaultDenyEgress,
+                    OuterFenceGuarantee::NoUnmanagedEgressPath,
+                    OuterFenceGuarantee::RevocationVerified,
+                    OuterFenceGuarantee::ControllerLossFailsClosed,
+                ],
+                b"test-vm-fence",
+            )
+            .unwrap()
         }
 
         fn test_runtime_qualification() -> crate::RuntimeQualification {
             crate::RuntimeQualification {
-                seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+                seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
                     new_listener: true,
                     notification_round_trip: true,
                     id_validation: true,
@@ -4277,6 +4448,7 @@ mod linux {
                     task_memory_read: true,
                     task_memory_write: true,
                     cancellation: true,
+                    task_memory_writes_disabled: false,
                 },
                 landlock_abi: 6,
                 landlock_allow_deny: true,
@@ -4410,7 +4582,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -4445,7 +4617,7 @@ mod linux {
                     pod_uid_path,
                 )]),
                 workload_identity: test_workload_identity(),
-                driver_fence: test_driver_fence(),
+                outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -4485,7 +4657,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -4660,7 +4832,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -4838,6 +5010,8 @@ mod linux {
             let exec_spec = ExecSpecWire {
                 program: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), "printf '%s' \"$REPLAY_TEST\"".to_string()],
+                shell: None,
+                runtime_helper: None,
                 env: Vec::new(),
                 workdir: None,
                 pty: false,
@@ -4978,7 +5152,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        driver_fence: test_driver_fence(),
+                        outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -5118,6 +5292,8 @@ mod linux {
             let sleep_spec = ExecSpecWire {
                 program: "/bin/sleep".to_string(),
                 args: vec!["30".to_string()],
+                shell: None,
+                runtime_helper: None,
                 env: Vec::new(),
                 workdir: None,
                 pty: false,
@@ -5185,6 +5361,8 @@ mod linux {
                 let spec = ExecSpecWire {
                     program: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {exit_code}")],
+                    shell: None,
+                    runtime_helper: None,
                     env: Vec::new(),
                     workdir: None,
                     pty: false,
@@ -5222,6 +5400,8 @@ mod linux {
                                 "if [ -z \"${ROTATED_TOKEN+x}\" ]; then printf revoked; else printf 'unexpected:%s' \"$ROTATED_TOKEN\"; fi"
                                     .to_string(),
                             ],
+                            shell: None,
+                            runtime_helper: None,
                             env: Vec::new(),
                             workdir: None,
                             pty: false,

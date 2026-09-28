@@ -20,7 +20,7 @@ kid_path = ".cache/openshell-e2e/gateway-jwt/kid"
 gateway_id = "openshell-e2e"
 
 [openshell.drivers.docker]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present"
 sandbox_label = "openshell-e2e"
 sandbox_runtime_image = "localhost/openshell/sandbox:e2e-vm"

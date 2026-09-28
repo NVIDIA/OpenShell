@@ -86,7 +86,7 @@ spec:
       containers:
         - name: certgen
           image: {{ include "openshell.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -157,7 +157,7 @@ spec:
       containers:
         - name: certgen
           image: {{ include "openshell.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

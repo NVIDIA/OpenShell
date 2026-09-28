@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
+use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -18,8 +21,8 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
-pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
+pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";
+pub const WORKLOAD_FILTER: &str = "openshell.ai/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
@@ -27,11 +30,51 @@ pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 
+#[derive(Serialize)]
+struct PodmanOuterFenceEvidence<'a> {
+    container_id: &'a str,
+    network_mode: &'static str,
+    unexpected_networks: &'a [String],
+}
+
+impl PodmanOuterFenceEvidence<'_> {
+    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, ComputeDriverError> {
+        if self.container_id.is_empty() {
+            return Err(invalid("Podman outer fence evidence is incomplete"));
+        }
+        let mut established = Vec::new();
+        if self.network_mode == "none" {
+            // With no container network namespace attachment, workload egress
+            // remains denied both after revocation and if the supervisor exits.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.unexpected_networks.is_empty() {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
+        let encoded = serde_json::to_vec(self).map_err(invalid)?;
+        let projection =
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)
+                .map_err(invalid)?;
+        projection.validate(generation).map_err(invalid)?;
+        Ok(projection)
+    }
+}
+
 pub fn supervisor_name(id: &str) -> String {
     format!("openshell-supervisor-{id}")
 }
 pub fn channel_volume_name(id: &str) -> String {
     format!("openshell-channel-{id}")
+}
+
+/// `keep-id` may retain the gateway user's supplementary groups in the
+/// container. Other user-namespace modes, including `auto`, do not.
+pub fn userns_preserves_host_groups(userns: Option<&str>) -> bool {
+    userns.is_some_and(|mode| mode.split(':').next() == Some("keep-id"))
 }
 
 fn invalid(error: impl std::fmt::Display) -> ComputeDriverError {
@@ -87,6 +130,19 @@ pub fn resolve_identity(
     } else {
         requested_group
     };
+    if user.is_empty() && group.is_empty() {
+        // The image declares no OCI USER (for example, a minimal base image) and the
+        // policy requested no identity. Synthesize a numeric non-root identity
+        // instead of rejecting the image, matching Docker, Kubernetes, and VM.
+        return ResolvedWorkloadIdentity::new(
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            Vec::new(),
+            "default".into(),
+            image_id.into(),
+        )
+        .map_err(invalid);
+    }
     let account = accounts
         .iter()
         .find(|(name, uid, _)| *name == user || user.parse::<u32>().ok() == Some(*uid));
@@ -139,35 +195,59 @@ pub struct RestartMetadata {
     pub(crate) child_env: HashMap<String, String>,
 }
 
+pub struct BootstrapArchivesInput<'a> {
+    pub sandbox_id: &'a str,
+    pub container_id: &'a str,
+    pub generation: &'a str,
+    pub host_gateway_ip: std::net::IpAddr,
+    pub identity: &'a ResolvedWorkloadIdentity,
+    pub allow_extra_supplementary_groups: bool,
+    pub child_env: HashMap<String, String>,
+    pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+}
+
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
 /// gateway authorization, and the restart copy never enter that volume.
 pub fn bootstrap_archives(
-    sandbox_id: &str,
-    container_id: &str,
-    generation: &str,
-    identity: &ResolvedWorkloadIdentity,
-    child_env: HashMap<String, String>,
-    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    input: BootstrapArchivesInput<'_>,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
+    let BootstrapArchivesInput {
+        sandbox_id,
+        container_id,
+        generation,
+        host_gateway_ip,
+        identity,
+        allow_extra_supplementary_groups,
+        child_env,
+        launch_authentication,
+    } = input;
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
-    let resource_claims = BTreeMap::from([
+    let mut resource_claims = BTreeMap::from([
         ("podman.container_id".into(), container_id.into()),
         (
             "podman.image_identity".into(),
             identity.resource_digest.clone(),
         ),
     ]);
-    let driver_fence = DriverFenceEvidence::Podman {
-        container_id: container_id.into(),
-        network_mode: "none".into(),
-        unexpected_networks: Vec::new(),
-    };
+    if allow_extra_supplementary_groups {
+        resource_claims.insert(
+            ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.into(),
+            "true".into(),
+        );
+    }
     let runtime_generation = launch_authentication
         .supervisor
         .runtime_generation
         .to_string();
+    let unexpected_networks = Vec::new();
+    let outer_fence = PodmanOuterFenceEvidence {
+        container_id,
+        network_mode: "none",
+        unexpected_networks: &unexpected_networks,
+    }
+    .project(&runtime_generation)?;
     let verification_keys = launch_authentication
         .verification_keys
         .iter()
@@ -198,7 +278,7 @@ pub fn bootstrap_archives(
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
         workload_identity: identity.clone(),
-        driver_fence: driver_fence.clone(),
+        outer_fence: outer_fence.clone(),
         child_env: child_env.clone(),
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
@@ -212,10 +292,10 @@ pub fn bootstrap_archives(
             server_name: tls.server_name,
             trust_anchor_pem: tls.trust_anchor_pem,
         },
-        host_gateway_ip: None,
+        host_gateway_ip: Some(host_gateway_ip),
         resource_claims,
         workload_identity: identity.clone(),
-        driver_fence,
+        outer_fence,
     };
     // Libpod resolves the requested upload destination once for a stopped
     // container. Archive entries must be relative to the selected named volume,
@@ -327,6 +407,30 @@ mod tests {
         SupervisorAuthBundle,
     };
 
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["podman".to_string()];
+        for evidence in [
+            PodmanOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
+
     fn authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
@@ -361,8 +465,28 @@ mod tests {
         assert_eq!(identity.supplementary_gids, vec![2000]);
         assert_eq!(identity.resource_digest, "sha256:pinned");
         assert!(resolve_identity(&sandbox, "sha256:pinned", "root", passwd, groups).is_err());
-        assert!(resolve_identity(&sandbox, "sha256:pinned", "", passwd, groups).is_err());
         assert!(resolve_identity(&sandbox, "sha256:pinned", "2000", passwd, groups).is_err());
+    }
+
+    #[test]
+    fn identity_uses_numeric_default_for_userless_image() {
+        let identity = resolve_identity(
+            &DriverSandbox::default(),
+            "sha256:pinned",
+            "",
+            b"root:x:0:0:root:/root:/bin/sh\n",
+            b"root:x:0:\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            (identity.uid, identity.gid),
+            (
+                openshell_core::sandbox_env::DEFAULT_SANDBOX_UID,
+                openshell_core::sandbox_env::DEFAULT_SANDBOX_GID,
+            )
+        );
+        assert_eq!(identity.source, "default");
     }
 
     fn files(bytes: &[u8]) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -396,14 +520,16 @@ mod tests {
         .unwrap();
         let authentication = authentication();
         let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
-        let archives = bootstrap_archives(
-            "sandbox",
-            "container",
-            "generation-1",
-            &identity,
-            child_env.clone(),
-            &authentication,
-        )
+        let archives = bootstrap_archives(BootstrapArchivesInput {
+            sandbox_id: "sandbox",
+            container_id: "container",
+            generation: "generation-1",
+            host_gateway_ip: "127.0.0.1".parse().unwrap(),
+            identity: &identity,
+            allow_extra_supplementary_groups: false,
+            child_env: child_env.clone(),
+            launch_authentication: &authentication,
+        })
         .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
@@ -440,9 +566,21 @@ mod tests {
         .unwrap();
         assert_eq!(config.boundary_id, runtime_descriptor.boundary_id);
         assert_eq!(config.session_id, runtime_descriptor.session_id);
-        assert_eq!(config.driver_fence, runtime_descriptor.driver_fence);
+        assert_eq!(config.outer_fence, runtime_descriptor.outer_fence);
         assert_eq!(config.workload_identity, identity);
-        runtime_descriptor.driver_fence.validate().unwrap();
+        assert_eq!(
+            runtime_descriptor.host_gateway_ip,
+            Some("127.0.0.1".parse().unwrap())
+        );
+        runtime_descriptor
+            .outer_fence
+            .validate(&runtime_descriptor.generation)
+            .unwrap();
+        assert!(
+            !config
+                .resource_claims
+                .contains_key(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+        );
         let restart_metadata: RestartMetadata = serde_json::from_slice(
             supervisor
                 .get(&PathBuf::from(
@@ -459,5 +597,16 @@ mod tests {
                 .windows(b"PRIVATE KEY".len())
                 .any(|window| window == b"PRIVATE KEY")
         );
+    }
+
+    #[test]
+    fn keep_id_is_the_only_userns_mode_that_preserves_host_groups() {
+        assert!(userns_preserves_host_groups(Some("keep-id")));
+        assert!(userns_preserves_host_groups(Some(
+            "keep-id:uid=1000,gid=1000"
+        )));
+        assert!(!userns_preserves_host_groups(Some("auto")));
+        assert!(!userns_preserves_host_groups(Some("private")));
+        assert!(!userns_preserves_host_groups(None));
     }
 }

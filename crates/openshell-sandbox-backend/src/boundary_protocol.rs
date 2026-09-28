@@ -23,8 +23,9 @@ use openshell_core::policy::{
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal,
-    DriverFenceEvidence, ExecSpec, ResolveError, SandboxConfirmEvidence,
+    BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
+    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
+    OuterFenceGuarantees, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -41,6 +42,160 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+// Every relay, exec, and control exchange shares one HTTP/2 connection. The
+// connection window must exceed what all streams can hold unread, otherwise
+// stalled relays starve DNS and control traffic of connection-level credit.
+// h2 keeps at least two thirds of `connection - in-flight` advertised, so the
+// reserve stays usable even with every stream stalled at its window.
+pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const BOUNDARY_STREAM_WINDOW_BYTES: u32 = 256 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAMS
+    * BOUNDARY_STREAM_WINDOW_BYTES
+    + BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES;
+// HTTP/2 caps any flow-control window at 2^31 - 1.
+const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
+
+/// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
+/// co-located runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityEvidence {
+    pub inheritable: u64,
+    pub permitted: u64,
+    pub effective: u64,
+    pub bounding: u64,
+    pub ambient: u64,
+}
+
+impl CapabilityEvidence {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.inheritable == 0
+            && self.permitted == 0
+            && self.effective == 0
+            && self.bounding == 0
+            && self.ambient == 0
+    }
+}
+
+/// Active seccomp notification and socket-broker measurements specific to the
+/// `OpenShell` co-located runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each independently measured kernel operation is reported explicitly"
+)]
+pub struct SeccompEvidence {
+    pub new_listener: bool,
+    pub notification_round_trip: bool,
+    pub id_validation: bool,
+    pub addfd_send: bool,
+    pub retained_socket_operation: bool,
+    pub proc_fd_identity: bool,
+    pub task_memory_read: bool,
+    pub task_memory_write: bool,
+    pub cancellation: bool,
+    pub task_memory_writes_disabled: bool,
+}
+
+/// Mechanism-specific audit evidence for the native Linux sandbox adapter.
+///
+/// This schema belongs to this backend rather than the generic isolation
+/// interface. The host-side backend validates it before constructing a
+/// backend-neutral `ConfirmedBoundary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "audit evidence preserves independently measured security results"
+)]
+pub struct NativeLinuxSandboxAuditEvidence {
+    pub capabilities: CapabilityEvidence,
+    pub no_new_privileges: bool,
+    pub sandbox_dumpable: bool,
+    pub child_dumpable: bool,
+    pub core_limit_zero: bool,
+    pub native_architecture: String,
+    pub kernel_release: String,
+    pub seccomp: SeccompEvidence,
+    pub landlock_abi: u32,
+    pub landlock_allow_deny: bool,
+    pub udp_dns_round_trip: bool,
+    pub tcp_dns_round_trip: bool,
+    pub tcp_allow_round_trip: bool,
+    pub tcp_deny_round_trip: bool,
+}
+
+impl NativeLinuxSandboxAuditEvidence {
+    /// Validate the complete mechanism-specific posture required by this backend.
+    pub fn validate(&self) -> Result<(), BackendError> {
+        let complete = self.capabilities.is_empty()
+            && self.no_new_privileges
+            && !self.sandbox_dumpable
+            && self.child_dumpable
+            && self.core_limit_zero
+            && !self.native_architecture.is_empty()
+            && !self.kernel_release.is_empty()
+            && self.seccomp.new_listener
+            && self.seccomp.notification_round_trip
+            && self.seccomp.id_validation
+            && self.seccomp.addfd_send
+            && self.seccomp.retained_socket_operation
+            && self.seccomp.proc_fd_identity
+            && self.seccomp.task_memory_read
+            && self.seccomp.task_memory_write
+            && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
+            && self.landlock_abi >= 3
+            && self.landlock_allow_deny
+            && self.udp_dns_round_trip
+            && self.tcp_dns_round_trip
+            && self.tcp_allow_round_trip
+            && self.tcp_deny_round_trip;
+        if complete {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "native Linux sandbox audit evidence is incomplete".to_string(),
+            ))
+        }
+    }
+
+    /// Project backend measurements into the common property contract.
+    #[must_use]
+    pub fn properties(&self) -> BoundaryProperties {
+        BoundaryProperties {
+            filesystem_confinement: EnforcedProperty::new(
+                self.landlock_abi >= 3 && self.landlock_allow_deny,
+                format!("landlock-v{}", self.landlock_abi),
+            ),
+            egress_interception: EnforcedProperty::new(
+                self.seccomp.new_listener
+                    && self.seccomp.notification_round_trip
+                    && self.seccomp.addfd_send
+                    && self.udp_dns_round_trip
+                    && self.tcp_dns_round_trip
+                    && self.tcp_allow_round_trip
+                    && self.tcp_deny_round_trip,
+                "seccomp-notify",
+            ),
+            request_attribution: EnforcedProperty::new(
+                self.seccomp.id_validation
+                    && self.seccomp.proc_fd_identity
+                    && self.seccomp.task_memory_read
+                    && self.seccomp.task_memory_write,
+                "seccomp-notify-procfs",
+            ),
+            privilege_floor: EnforcedProperty::new(
+                self.capabilities.is_empty()
+                    && self.no_new_privileges
+                    && !self.sandbox_dumpable
+                    && self.child_dumpable
+                    && self.core_limit_zero,
+                "linux-capability-free",
+            ),
+        }
+    }
+}
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
 ///
@@ -286,8 +441,8 @@ pub struct SandboxRuntimeDescriptor {
     /// example pod UID, VM generation, or container ID).
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
-    /// Concrete outer-fence evidence validated by the driver.
-    pub driver_fence: DriverFenceEvidence,
+    /// Backend-neutral projection of the validated outer network fence.
+    pub outer_fence: OuterFenceGuarantees,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -301,7 +456,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
-            .field("driver_fence", &self.driver_fence)
+            .field("outer_fence", &self.outer_fence)
             .finish()
     }
 }
@@ -354,8 +509,8 @@ pub struct BoundaryConfig {
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Concrete outer-fence evidence validated by the driver.
-    pub driver_fence: DriverFenceEvidence,
+    /// Backend-neutral projection of the validated outer network fence.
+    pub outer_fence: OuterFenceGuarantees,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
@@ -383,7 +538,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
-            .field("driver_fence", &self.driver_fence)
+            .field("outer_fence", &self.outer_fence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -532,8 +687,8 @@ pub enum Request {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: Box<SandboxPolicyWire>,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     },
@@ -712,8 +867,9 @@ pub enum Response {
         snapshot: SessionSnapshotWire,
     },
     Confirmed {
-        /// Measured capability-free posture produced before workload launch.
-        evidence: Box<SandboxConfirmEvidence>,
+        /// Backend-neutral properties and backend-owned audit evidence produced
+        /// before workload launch.
+        confirmation: Box<BoundaryConfirmation>,
     },
     Started {
         process_id: String,
@@ -813,12 +969,36 @@ pub enum BoundaryErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableIdentityWire {
+    pub path: PathBuf,
+    pub digest: Option<Sha256Digest>,
+}
+
+impl From<ExecutableIdentity> for ExecutableIdentityWire {
+    fn from(identity: ExecutableIdentity) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+impl From<ExecutableIdentityWire> for ExecutableIdentity {
+    fn from(identity: ExecutableIdentityWire) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BinaryIdentityWire {
     Resolved {
-        binary_path: PathBuf,
-        binary_digest: Option<Sha256Digest>,
-        ancestors: Vec<PathBuf>,
+        executable: ExecutableIdentityWire,
+        ancestors: Vec<ExecutableIdentityWire>,
         cmdline_paths: Vec<PathBuf>,
     },
     Failed {
@@ -830,9 +1010,8 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
     fn from(identity: Result<BinaryIdentity, ResolveError>) -> Self {
         match identity {
             Ok(identity) => Self::Resolved {
-                binary_path: identity.binary_path,
-                binary_digest: identity.binary_digest,
-                ancestors: identity.ancestors,
+                executable: identity.executable.into(),
+                ancestors: identity.ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths: identity.cmdline_paths,
             },
             Err(error) => Self::Failed {
@@ -846,14 +1025,12 @@ impl BinaryIdentityWire {
     pub fn into_result(self) -> Result<BinaryIdentity, ResolveError> {
         match self {
             Self::Resolved {
-                binary_path,
-                binary_digest,
+                executable,
                 ancestors,
                 cmdline_paths,
             } => Ok(BinaryIdentity {
-                binary_path,
-                binary_digest,
-                ancestors,
+                executable: executable.into(),
+                ancestors: ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths,
             }),
             Self::Failed { message } => Err(ResolveError::Failed(message)),
@@ -865,9 +1042,43 @@ impl BinaryIdentityWire {
 pub struct ExecSpecWire {
     pub program: String,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub shell: Option<ShellSpecWire>,
+    #[serde(default)]
+    pub runtime_helper: Option<RuntimeHelperWire>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
     pub pty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHelperWire {
+    Sftp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellSpecWire {
+    pub command: Option<String>,
+    pub login: bool,
+}
+
+impl From<ShellSpec> for ShellSpecWire {
+    fn from(spec: ShellSpec) -> Self {
+        Self {
+            command: spec.command,
+            login: spec.login,
+        }
+    }
+}
+
+impl From<ShellSpecWire> for ShellSpec {
+    fn from(spec: ShellSpecWire) -> Self {
+        Self {
+            command: spec.command,
+            login: spec.login,
+        }
+    }
 }
 
 impl From<ExecSpec> for ExecSpecWire {
@@ -875,6 +1086,12 @@ impl From<ExecSpec> for ExecSpecWire {
         Self {
             program: spec.program,
             args: spec.args,
+            shell: spec.shell.map(ShellSpecWire::from),
+            runtime_helper: spec.runtime_helper.map(|helper| match helper {
+                openshell_isolation_interface::contract::RuntimeHelper::Sftp => {
+                    RuntimeHelperWire::Sftp
+                }
+            }),
             env: spec.env,
             workdir: spec.workdir,
             pty: spec.pty,
@@ -887,6 +1104,12 @@ impl From<ExecSpecWire> for ExecSpec {
         Self {
             program: spec.program,
             args: spec.args,
+            shell: spec.shell.map(ShellSpec::from),
+            runtime_helper: spec.runtime_helper.map(|helper| match helper {
+                RuntimeHelperWire::Sftp => {
+                    openshell_isolation_interface::contract::RuntimeHelper::Sftp
+                }
+            }),
             env: spec.env,
             workdir: spec.workdir,
             pty: spec.pty,
@@ -1196,19 +1419,97 @@ pub enum FrameError {
 mod tests {
     use super::*;
 
+    fn complete_audit_evidence() -> NativeLinuxSandboxAuditEvidence {
+        NativeLinuxSandboxAuditEvidence {
+            capabilities: CapabilityEvidence {
+                inheritable: 0,
+                permitted: 0,
+                effective: 0,
+                bounding: 0,
+                ambient: 0,
+            },
+            no_new_privileges: true,
+            sandbox_dumpable: false,
+            child_dumpable: true,
+            core_limit_zero: true,
+            native_architecture: "x86_64".to_string(),
+            kernel_release: "6.12.0".to_string(),
+            seccomp: SeccompEvidence {
+                new_listener: true,
+                notification_round_trip: true,
+                id_validation: true,
+                addfd_send: true,
+                retained_socket_operation: true,
+                proc_fd_identity: true,
+                task_memory_read: true,
+                task_memory_write: true,
+                cancellation: true,
+                task_memory_writes_disabled: false,
+            },
+            landlock_abi: 6,
+            landlock_allow_deny: true,
+            udp_dns_round_trip: true,
+            tcp_dns_round_trip: true,
+            tcp_allow_round_trip: true,
+            tcp_deny_round_trip: true,
+        }
+    }
+
+    #[test]
+    fn native_linux_audit_evidence_projects_backend_neutral_properties() {
+        let audit = complete_audit_evidence();
+        audit.validate().unwrap();
+        let properties = audit.properties();
+        assert!(properties.filesystem_confinement.enforced);
+        assert_eq!(properties.filesystem_confinement.mechanism, "landlock-v6");
+        assert!(properties.egress_interception.enforced);
+        assert!(properties.request_attribution.enforced);
+        assert!(properties.privilege_floor.enforced);
+    }
+
+    #[test]
+    fn native_linux_audit_evidence_rejects_mechanism_failure() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.addfd_send = false;
+        assert!(audit.validate().is_err());
+        assert!(!audit.properties().egress_interception.enforced);
+    }
+
+    #[test]
+    fn audit_evidence_accepts_legacy_read_only_listener() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = true;
+        assert!(audit.validate().is_ok());
+    }
+
+    #[test]
+    fn audit_evidence_rejects_plain_listener_with_writes_enabled() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = false;
+        assert!(audit.validate().is_err());
+    }
+
     #[test]
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
         for encoded in [
             r#"{"result":"resolved","ancestors":[],"cmdline_paths":[]}"#,
-            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"invalid","ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","executable":{"path":"/bin/tool","digest":"invalid"},"ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ancestors":[],"cmdline_paths":[]}"#,
             r#"{"result":"failed","message":"unavailable","binary_path":"/bin/tool"}"#,
         ] {
             assert!(serde_json::from_str::<BinaryIdentityWire>(encoded).is_err());
         }
         let identity = BinaryIdentityWire::from(Ok(BinaryIdentity {
-            binary_path: PathBuf::from("/bin/tool"),
-            binary_digest: Some("a".repeat(64).parse().unwrap()),
-            ancestors: Vec::new(),
+            executable: ExecutableIdentity {
+                path: PathBuf::from("/bin/tool"),
+                digest: Some("a".repeat(64).parse().unwrap()),
+            },
+            ancestors: vec![ExecutableIdentity {
+                path: PathBuf::from("/bin/launcher"),
+                digest: Some("b".repeat(64).parse().unwrap()),
+            }],
             cmdline_paths: Vec::new(),
         }));
         let encoded = serde_json::to_vec(&identity).unwrap();
@@ -1276,8 +1577,8 @@ mod tests {
                     landlock: LandlockPolicy::default(),
                     process: ProcessPolicy::default(),
                 })),
-                ca_cert: Some(b"test certificate".to_vec()),
-                ca_bundle: Some(b"test bundle".to_vec()),
+                ca_cert: Some("test certificate".to_string()),
+                ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
@@ -1328,6 +1629,35 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
+        let request = RequestEnvelope::new(Request::StartAgent {
+            sandbox_id: "sandbox-1".to_string(),
+            spec: AgentSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 5,
+                interactive: false,
+            },
+            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy::default(),
+                network: NetworkPolicy::default(),
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            })),
+            ca_cert: Some("A".repeat(16 * 1024)),
+            ca_bundle: Some("B".repeat(400 * 1024)),
+            provider_env_revision: 0,
+            provider_env: std::collections::HashMap::new(),
+        })
+        .expect("request envelope");
+        let frame = encode_frame(&request).expect("large CA bundle must fit in frame limit");
+        let decoded: RequestEnvelope = decode_frame(&frame).expect("round-trip");
+        assert_eq!(decoded, request);
     }
 
     #[test]
@@ -1394,5 +1724,35 @@ mod tests {
         let encoded = serde_json::to_vec(&transport).expect("encode transport");
         let decoded: SandboxTransport = serde_json::from_slice(&encoded).expect("decode transport");
         assert_eq!(decoded, transport);
+    }
+
+    #[test]
+    fn exec_wire_accepts_legacy_direct_exec_without_shell_intent() {
+        let wire: ExecSpecWire = serde_json::from_str(
+            r#"{"program":"/bin/true","args":[],"env":[],"workdir":null,"pty":false}"#,
+        )
+        .expect("decode legacy exec spec");
+
+        assert_eq!(wire.shell, None);
+        assert_eq!(wire.runtime_helper, None);
+    }
+
+    #[test]
+    fn exec_wire_preserves_trusted_runtime_helper_intent() {
+        let spec = ExecSpec {
+            program: String::new(),
+            args: Vec::new(),
+            shell: None,
+            runtime_helper: Some(openshell_isolation_interface::contract::RuntimeHelper::Sftp),
+            env: Vec::new(),
+            workdir: None,
+            pty: false,
+        };
+
+        let decoded = ExecSpec::from(ExecSpecWire::from(spec));
+        assert_eq!(
+            decoded.runtime_helper,
+            Some(openshell_isolation_interface::contract::RuntimeHelper::Sftp)
+        );
     }
 }

@@ -141,8 +141,6 @@ async fn create_running_sandbox(
             "create",
             "--name",
             sandbox_name,
-            "--from",
-            "base",
             "--detach",
             "--no-tty",
             "--",

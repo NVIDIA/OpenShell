@@ -146,6 +146,11 @@ struct QualificationReport {
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
     wait_killable_recv: bool,
+    /// Selected seccomp listener cancellation mode: `killable` (>= 5.19) or
+    /// `legacy_read_only` (< 5.19, broker output writes disabled).
+    seccomp_listener_mode: &'static str,
+    /// Whether the broker disables task-memory output writes (legacy mode).
+    task_memory_writes_disabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -192,6 +197,11 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     openshell_isolation_interface::linux::task_memory::probe_child_access()
         .into_diagnostic()
         .wrap_err("same-UID task-memory probe")?;
+    // The successful production-shaped parent-to-child round trip above is
+    // the task-memory evidence. Do not test /proc/self/mem here: this trusted
+    // broker is intentionally nondumpable, so that fallback is inaccessible
+    // even though /proc/<dumpable-child>/mem remains available to mediation.
+    let task_memory_copy = true;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
     let notification =
         openshell_isolation_interface::linux::seccomp_notify::probe_notification_api()
@@ -228,7 +238,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         landlock_allow_deny: true,
         seccomp_notification: notification.notification_round_trip(),
         seccomp_addfd_send: notification.addfd_send(),
-        task_memory_copy: notification.task_memory_copy(),
+        task_memory_copy,
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
         dns_relay_bind: true,
@@ -237,18 +247,27 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
         wait_killable_recv: notification.wait_killable_recv,
+        seccomp_listener_mode: if notification.wait_killable_recv {
+            "killable"
+        } else {
+            "legacy_read_only"
+        },
+        task_memory_writes_disabled: !notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
-        seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+        seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
             notification_round_trip: notification.notification_round_trip(),
             id_validation: notification.notification_round_trip(),
             addfd_send: notification.addfd_send(),
             retained_socket_operation: true,
             proc_fd_identity: true,
-            task_memory_read: notification.task_memory_copy(),
-            task_memory_write: notification.task_memory_copy(),
+            task_memory_read: task_memory_copy,
+            task_memory_write: task_memory_copy,
             cancellation: notification.wait_killable_recv,
+            // Legacy plain listener (< 5.19) disables broker output writes;
+            // satisfies the `cancellation || writes_disabled` launch invariant.
+            task_memory_writes_disabled: !notification.wait_killable_recv,
         },
         landlock_abi,
         landlock_allow_deny: true,
@@ -1518,13 +1537,37 @@ fn launch_capability_probe(_args: &[String]) -> Result<()> {
 fn launch_capability_free(args: &[String]) -> Result<()> {
     use miette::{Context as _, IntoDiagnostic as _};
 
-    let [uid, gid, bootstrap] = args else {
+    let [uid, gid, bootstrap, workspace @ ..] = args else {
         return Err(miette::miette!(
-            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} <UID> <GID> <BOOTSTRAP>"
+            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
         ));
     };
+    if workspace.len() > 1 {
+        return Err(miette::miette!(
+            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
+        ));
+    }
     let uid = uid.parse::<u32>().into_diagnostic().wrap_err("parse UID")?;
     let gid = gid.parse::<u32>().into_diagnostic().wrap_err("parse GID")?;
+    if let Some(workspace) = workspace.first() {
+        let workspace = Path::new(workspace);
+        let metadata = std::fs::symlink_metadata(workspace)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("read workspace metadata {}", workspace.display()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(miette::miette!(
+                "workspace {} must be a real directory",
+                workspace.display()
+            ));
+        }
+        nix::unistd::chown(
+            workspace,
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        )
+        .into_diagnostic()
+        .wrap_err_with(|| format!("set workspace ownership {}:{gid}", workspace.display()))?;
+    }
     enter_capability_free_identity(uid, gid)?;
     let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
         .unwrap_or_else(|_| "warn".to_string());

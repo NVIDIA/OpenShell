@@ -1,6 +1,6 @@
 # OpenShell Architecture
 
-OpenShell runs autonomous AI agents in sandboxed environments with explicit
+OpenShell runs fleets of autonomous AI agents in sandboxed environments with explicit
 policy, credential, identity, and network boundaries. The target architecture is
 built around three stable runtime components: the **CLI**, the **Gateway**, and
 the **Supervisor**.
@@ -29,6 +29,7 @@ flowchart TB
 
     subgraph CP["Control Plane"]
         GW["Gateway core"]
+        PROVER["Policy prover"]
         DB[("Shared persistence")]
         COMPUTE["Compute"]
         CREDS["Credentials"]
@@ -59,6 +60,7 @@ flowchart TB
     TUI -->|"gRPC / HTTP"| GW
 
     GW --> DB
+    GW -->|"proposed policy changes"| PROVER
     GW --> COMPUTE
     GW --> CREDS
     GW --> CPIDENT
@@ -89,6 +91,7 @@ flowchart TB
 |---|---|
 | CLI, SDK, TUI | User-facing management surfaces. They talk to the gateway and do not need to know which infrastructure drivers are active. |
 | Gateway | Authenticated control plane, API server, durable state, policy and settings delivery, provider config, supervisor session ownership, and relay coordination. |
+| Policy prover | Gateway-linked formal verification of proposed policy changes. It reports categorical findings (new credentialed reach, new HTTP methods, L7 bypass, link-local reach); any finding blocks auto-approval. The same crate backs the standalone `openshell-prover check` boundary command, which runs on local files without a gateway. See [Security Policy](security-policy.md). |
 | Compute subsystem | Sandbox lifecycle semantics: creation, deletion, watching, reconciliation, and state transitions. Platform provisioning details belong to the compute driver. |
 | Credentials subsystem | Logical provider and credential resolution. Secret storage and platform-native credential access belong to credentials drivers. |
 | Control-plane identity | Authentication and authorization for users, operators, and API clients. External identity verification belongs to identity drivers. |

@@ -69,6 +69,8 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { workspace = true }
+russh-sftp = "3.0"
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capctl = "0.2.4"

@@ -92,9 +92,17 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
+  podmanDriverArchive = mkTestArchive {
+    name = "podman-driver";
+    workspacePath = "tests/suites/drivers";
+    manifestPath = "tests/suites/drivers/Cargo.toml";
+    package = "openshell-test-suite-podman";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
+  };
 in
 rec {
-  inherit conformanceCliArchive providerRefreshKeycloakArchive;
+  inherit conformanceCliArchive providerRefreshKeycloakArchive podmanDriverArchive;
 
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
@@ -139,10 +147,12 @@ rec {
     runtimeInputs = [
       conformanceCliArchive
       providerRefreshKeycloakArchive
+      podmanDriverArchive
     ];
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-podman-driver-test-archive
     '';
   };
 

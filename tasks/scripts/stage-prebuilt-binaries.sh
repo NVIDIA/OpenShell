@@ -28,9 +28,7 @@ target_triple() {
   local suffix
   case "$libc" in
     musl) suffix=musl ;;
-    # gnu-static builds the GNU target with +crt-static, so it shares the
-    # gnu triple.
-    gnu|gnu-static) suffix=gnu ;;
+    gnu) suffix=gnu ;;
     *)
       echo "unsupported libc: $libc" >&2
       exit 1

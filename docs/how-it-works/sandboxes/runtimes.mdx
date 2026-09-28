@@ -1,0 +1,268 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Sandbox Runtimes"
+sidebar-title: "Runtimes"
+description: "Configure the Docker, Podman, MicroVM, or Kubernetes runtime that runs OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, MXC, Reference"
+position: 4
+---
+
+Each gateway runs agent workloads on one compute runtime, selected by its compute driver. Pick the runtime that matches the isolation boundary and infrastructure you need. The CLI workflow stays the same across runtimes: you create, connect to, stop, start, and delete sandboxes through the gateway.
+
+| Runtime | Driver | Use when |
+|---|---|---|
+| [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |
+| [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
+| [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
+| [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
+| Windows MXC | `mxc` | Coming soon. |
+
+## Select a Compute Driver
+
+Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
+
+```toml
+[openshell.gateway]
+compute_driver = "docker"
+```
+
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
+
+Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
+
+### Extension Drivers
+
+Any name other than a built-in driver selects an extension driver. Point the gateway at the Unix socket where the driver listens:
+
+```toml
+[openshell.gateway]
+compute_driver = "kyma"
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma.sock"
+```
+
+The gateway does not start or supervise extension drivers. Restrict the socket so only the gateway user can access it.
+
+## Size Sandboxes
+
+Use `--cpu`, `--memory`, and `--gpu` on `openshell sandbox create` to request resources. `--gpu` alone requests one GPU; `--gpu COUNT` requests more.
+
+| Driver | CPU and memory | GPU |
+|---|---|---|
+| Docker, Podman | Runtime limits | NVIDIA CDI devices |
+| Kubernetes | Container requests and limits | `nvidia.com/gpu` resource limit |
+| MicroVM | Ignored; use `vcpus` and `mem_mib` | One GPU through `gpu_device_ids` |
+
+## Pass Driver Config
+
+`--driver-config-json` passes driver-specific settings that have no dedicated flag. The value is a JSON object keyed by driver name, and the gateway forwards only the block for the active driver:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}' \
+  -- claude
+```
+
+Driver config is disabled by default. Enable it with `allow_driver_config = true` in the driver's gateway configuration. Attached resources such as volumes must carry operator-approved labels. See [External Resource Admission](/how-it-works/gateways/configuration#external-resource-admission).
+
+To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_ids` for MicroVM, together with `--gpu`:
+
+```shell
+--gpu --driver-config-json '{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}'
+--gpu --driver-config-json '{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}'
+```
+
+## Docker Driver
+
+[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the gateway host. Docker is also required to build sandbox images from local directories or Dockerfiles.
+
+```toml
+[openshell.gateway]
+compute_driver = "docker"
+
+[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+```
+
+Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
+
+Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+
+### Docker Mounts
+
+Mount existing named volumes or `tmpfs` through driver config. Label volumes so resource admission accepts them:
+
+```shell
+docker volume create --label openshell.ai/sandbox-attachable=true \
+  --label openshell.ai/sandbox-attachable-workspace=default openshell-work
+
+openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+| Type | Fields |
+|---|---|
+| `volume` | `source`, `target`, optional `read_only` (default `true`), optional `subpath`. |
+| `tmpfs` | `target`, optional `options`, `size_bytes`, `mode`. |
+| `bind` | `source` (absolute host path), `target`, optional `read_only` (default `true`), optional `selinux_label`. |
+
+<Warning>
+Bind mounts expose gateway-host files to the sandbox and can bypass workspace isolation and filesystem policy. They require `enable_bind_mounts = true` and disabling resource admission for the driver:
+
+```toml
+[openshell.drivers.docker]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.docker.resource_admission]
+enabled = false
+```
+
+</Warning>
+
+Mount targets cannot replace the workspace root, the container root, or OpenShell paths under `/opt/openshell`, `/etc/openshell`, and `/run/openshell`.
+
+## Podman Driver
+
+[Podman](https://podman.io/) runs sandboxes as rootless containers on the gateway host. It requires Podman 5.x, cgroups v2, and an active Podman user socket:
+
+```shell
+systemctl --user start podman.socket
+```
+
+```toml
+[openshell.gateway]
+compute_driver = "podman"
+```
+
+Common options in `[openshell.drivers.podman]` are `socket_path`, `network_name`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, `stop_timeout_secs`, and `grpc_endpoint`. When `socket_path` is unset, the driver finds the socket automatically, including `podman machine` sockets on macOS.
+
+On macOS, set `host_gateway_ip` only if your Podman machine uses a non-standard host-loopback address. Set `grpc_endpoint` when the gateway is remote.
+
+For networks that require a corporate proxy, set `https_proxy`, `no_proxy`, and related `proxy_*` options. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
+
+### Podman Mounts
+
+Podman supports the same `volume`, `tmpfs`, and `bind` mounts as [Docker](#docker-mounts), using the `podman` key in driver config, and the same bind-mount warning applies. Podman `volume` mounts do not support `subpath`.
+
+Podman also supports `image` mounts, which mount a container image read-only at `target`. Image mounts require disabling resource admission.
+
+## MicroVM Driver
+
+The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
+
+The VM driver is opt-in. Enable it in the gateway TOML file:
+
+```toml
+[openshell.gateway]
+compute_driver = "vm"
+
+[openshell.drivers.vm]
+default_image = "registry.example.com/team/agent-base:1.0"
+vcpus = 4
+mem_mib = 8192
+```
+
+You can also set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment.
+
+Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `state_dir`, and `grpc_endpoint`. The default image is `nvcr.io/nvidia/base/ubuntu:24.04`. Use an image that includes the agents and tools your workloads need.
+
+The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
+
+VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
+
+## Kubernetes Driver
+
+The Kubernetes driver runs sandboxes as pods in a sandbox namespace. It requires the [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller. Install the gateway with the Helm chart; see [Kubernetes setup](/kubernetes/setup).
+
+<Warning>
+The cluster CNI must enforce `NetworkPolicy` in every sandbox namespace. Without it, sandbox pods can bypass OpenShell network policy.
+
+Only the OpenShell gateway and the Agent Sandbox controller should be able to manage sandbox pods and the sandbox ServiceAccount in those namespaces.
+</Warning>
+
+| Gateway option | Helm value | Description |
+|---|---|---|
+| `namespace` | `server.sandboxNamespace` | Namespace for sandbox resources. Defaults to the release namespace. |
+| `service_account_name` | `sandboxServiceAccount.name` | ServiceAccount for sandbox pods. |
+| `default_image` | `sandbox.image.repository` / `.tag` / `.digest` | Default sandbox image. |
+| `image_pull_policy` | `sandbox.image.pullPolicy` | `always`, `if_not_present`, or `never`. |
+| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Image-pull Secrets for sandbox pods. |
+| `grpc_endpoint` | `server.grpcEndpoint` | Gateway endpoint reachable from sandbox pods. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Secret with sandbox client TLS material. |
+| `sandbox_runtime_image` | `sandboxRuntime.image.*` | Override the sandbox runtime image. |
+| `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
+| `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
+| `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
+| `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
+| `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |
+| `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |
+| `proxy_ca_bundle` | `upstreamProxy.caBundle.configMapName` / `.key` | ConfigMap with the proxy's CA certificate. |
+
+For the full list, see the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
+
+On OpenShift, copy the cluster proxy's CA into the gateway namespace and set `upstreamProxy.caBundle.configMapName` to `corporate-proxy-ca`:
+
+```shell
+CORP_CA=$(oc get proxy/cluster -o jsonpath='{.spec.trustedCA.name}')
+oc -n openshift-config get cm "$CORP_CA" -o jsonpath='{.data.ca-bundle\.crt}' > corp-ca.pem
+oc -n openshell create configmap corporate-proxy-ca --from-file=ca.crt=corp-ca.pem
+```
+
+After upgrading Agent Sandbox, restart the gateway.
+
+<Note>
+Workspace storage settings cannot change after a sandbox is created. Delete and recreate the sandbox to change them.
+</Note>
+
+### Kubernetes PVC Mounts
+
+Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {"claim_name": "pvc-user-data-123", "read_only": false}
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {"name": "user-data", "mount_path": "/sandbox/.openshell/workspace", "sub_path": "workspace", "read_only": false}
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
+
+| Field | Description |
+|---|---|
+| `volumes[].name` | Volume name. |
+| `volumes[].persistent_volume_claim.claim_name` | Existing PVC in the sandbox namespace. |
+| `volumes[].persistent_volume_claim.read_only` | Defaults to `true`. |
+| `containers.agent.volume_mounts[].name` | Volume to mount. |
+| `containers.agent.volume_mounts[].mount_path` | Absolute path in the agent container. |
+| `containers.agent.volume_mounts[].sub_path` | Optional relative path within the PVC. |
+| `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write volume. |
+
+## Sandbox User Identity
+
+Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to choose the sandbox user. Any non-root UID or GID is allowed. When a field is unset, the driver supplies it:
+
+| Driver | Default identity |
+|---|---|
+| Docker, Podman | The image's `USER`. Images without `USER` must set both fields in policy. |
+| Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
+| MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
+
+On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Podman, Kubernetes, and MicroVM always use `/sandbox`.

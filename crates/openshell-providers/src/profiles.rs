@@ -5516,7 +5516,6 @@ endpoints:
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:
@@ -5563,10 +5562,6 @@ binaries:
         let rest_ep = &proto.endpoints[1];
         assert_eq!(rest_ep.port, 0);
         assert_eq!(rest_ep.ports, vec![443, 8443]);
-        assert_eq!(
-            rest_ep.tls,
-            openshell_core::proto::NetworkTlsMode::Terminate as i32
-        );
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
         assert!(rest_ep.allow_uninspected_credentials);

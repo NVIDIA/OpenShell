@@ -145,6 +145,9 @@ impl FakeComputeDriver {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
                 capabilities: GetCapabilitiesResponse {
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
                     driver_name: "fake-compute-driver".to_string(),
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
@@ -154,6 +157,12 @@ impl FakeComputeDriver {
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),
                     rootfs_tar_max_bytes: 0,
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                        "openshell/fake-compute-driver",
+                        "test",
+                        [],
+                    )),
                 },
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
@@ -198,6 +207,10 @@ impl FakeComputeDriver {
 
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
+    }
+
+    pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
+        self.with_state(|state| state.capabilities.resource_admission_policy = acknowledgement);
     }
 
     #[cfg(unix)]
@@ -362,7 +375,7 @@ impl ComputeDriver for FakeComputeDriver {
                 .calls
                 .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(
@@ -392,7 +405,7 @@ impl ComputeDriver for FakeComputeDriver {
                 sandbox_name: request.name,
             });
         });
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(

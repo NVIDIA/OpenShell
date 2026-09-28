@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_ref:
-        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        description: Release tag to scan; Codex runs only for pre-release tags
         required: true
         type: string
       stable_ref:
@@ -18,9 +18,13 @@ on:
         description: Allow a full Codex scan when no previous stable tag exists
         default: false
         type: boolean
-      allow-high-critical:
-        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
-        default: false
+      fail-on-codex-findings:
+        description: Fail when Codex Security reports findings
+        default: true
+        type: boolean
+      fail-on-static-findings:
+        description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
+        default: true
         type: boolean
       images:
         description: Newline-separated image references for Trivy
@@ -33,7 +37,7 @@ on:
   workflow_call:
     inputs:
       candidate_ref:
-        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        description: Release tag to scan; Codex runs only for pre-release tags
         required: true
         type: string
       stable_ref:
@@ -44,9 +48,13 @@ on:
         description: Allow a full Codex scan when no previous stable tag exists
         default: false
         type: boolean
-      allow-high-critical:
-        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
-        default: false
+      fail-on-codex-findings:
+        description: Fail when Codex Security reports findings
+        default: true
+        type: boolean
+      fail-on-static-findings:
+        description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
+        default: true
         type: boolean
       images:
         description: Newline-separated image references for Trivy
@@ -69,6 +77,7 @@ permissions:
 jobs:
   codex:
     name: Codex Security
+    if: contains(inputs.candidate_ref, '-pre.')
     uses: ./.github/workflows/codex-security.yml
     permissions:
       actions: read
@@ -78,7 +87,7 @@ jobs:
       candidate_ref: ${{ inputs.candidate_ref }}
       stable_ref: ${{ inputs.stable_ref }}
       allow_full_bootstrap: ${{ inputs.allow_full_bootstrap }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-codex-findings }}
       upload_sarif: true
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
@@ -91,7 +100,7 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
 
   trivy:
     name: Trivy
@@ -102,7 +111,7 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
       severity: HIGH,CRITICAL
       ignore-unfixed: false
       images: ${{ inputs.images }}
@@ -128,6 +137,6 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

@@ -52,7 +52,10 @@ func (r *stubSandboxResolver) AttachProvider(context.Context, string, string, st
 func (r *stubSandboxResolver) DetachProvider(context.Context, string, string, string, uint64) (*DetachProviderResult, error) {
 	panic("not implemented")
 }
-func (r *stubSandboxResolver) ListProviders(context.Context, string, string) ([]*Provider, error) {
+func (r *stubSandboxResolver) ListProviders(string, string, ...ListOptions) (*Pager[*Provider], error) {
+	panic("not implemented")
+}
+func (r *stubSandboxResolver) ListAllProviders(context.Context, string, string, ...ListOptions) ([]*Provider, error) {
 	panic("not implemented")
 }
 func (r *stubSandboxResolver) WaitReady(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {
@@ -85,6 +88,8 @@ type mockExecServer struct {
 	interactiveErr       error
 	interactiveWaitInput bool
 	interactiveBlock     bool
+	interactiveWaitEOF   bool
+	interactiveFinalErr  error
 	receivedInputs       []*pb.ExecSandboxInput
 }
 
@@ -116,6 +121,8 @@ func (s *mockExecServer) ExecSandboxInteractive(stream grpc.BidiStreamingServer[
 	s.mu.Lock()
 	interactiveErr := s.interactiveErr
 	interactiveBlock := s.interactiveBlock
+	waitEOF := s.interactiveWaitEOF
+	finalErr := s.interactiveFinalErr
 	events := make([]*pb.ExecSandboxEvent, len(s.interactiveEvents))
 	copy(events, s.interactiveEvents)
 	s.mu.Unlock()
@@ -135,6 +142,17 @@ func (s *mockExecServer) ExecSandboxInteractive(stream grpc.BidiStreamingServer[
 	if interactiveBlock {
 		<-stream.Context().Done()
 		return stream.Context().Err()
+	}
+	if waitEOF {
+		for {
+			_, recvErr := stream.Recv()
+			if recvErr == io.EOF {
+				break
+			}
+			if recvErr != nil {
+				return recvErr
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -170,7 +188,7 @@ func (s *mockExecServer) ExecSandboxInteractive(stream grpc.BidiStreamingServer[
 			return err
 		}
 	}
-	return nil
+	return finalErr
 }
 
 func setupExecTest(t *testing.T, mock *mockExecServer) (*execClient, func()) {
@@ -404,6 +422,86 @@ func TestExecInteractive_CloseCancelsReceiveStream(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("InteractiveSession.Close did not cancel the receive stream")
+	}
+}
+
+func TestExecInteractive_CloseWriteDrainsOutput(t *testing.T) {
+	mock := newMockExecServer()
+	mock.interactiveWaitEOF = true
+	mock.interactiveEvents = []*pb.ExecSandboxEvent{
+		{Payload: &pb.ExecSandboxEvent_Stdout{Stdout: &pb.ExecSandboxStdout{Data: []byte("after EOF")}}},
+		{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 7}}},
+	}
+	client, cleanup := setupExecTest(t, mock)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	session, err := client.Interactive(ctx, "default", "test-sandbox", []string{"cat"}, 0, 0)
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+	require.Implements(t, (*InteractiveSessionControl)(nil), session)
+	require.NoError(t, CloseInteractiveInput(session))
+	require.NoError(t, CloseInteractiveInput(session))
+	_, err = session.Write([]byte("late"))
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+	require.ErrorIs(t, session.Resize(80, 24), io.ErrClosedPipe)
+	output, err := io.ReadAll(session)
+	require.NoError(t, err)
+	require.Equal(t, "after EOF", string(output))
+	code, err := session.ExitCode()
+	require.NoError(t, err)
+	require.Equal(t, 7, code)
+}
+
+func TestExecInteractive_RetainsExitOnTerminalFailure(t *testing.T) {
+	for _, finalErr := range []error{status.Error(codes.Unavailable, "connection lost"), status.Error(codes.Canceled, "cancelled")} {
+		t.Run(status.Code(finalErr).String(), func(t *testing.T) {
+			mock := newMockExecServer()
+			mock.interactiveEvents = []*pb.ExecSandboxEvent{
+				{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 7}}},
+			}
+			mock.interactiveFinalErr = finalErr
+			client, cleanup := setupExecTest(t, mock)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			defer cancel()
+			session, err := client.Interactive(ctx, "default", "test-sandbox", []string{"true"}, 0, 0)
+			require.NoError(t, err)
+			defer func() { _ = session.Close() }()
+			code, err := session.ExitCode()
+			require.Error(t, err)
+			require.Equal(t, 7, code)
+			var sdkErr *StatusError
+			require.ErrorAs(t, err, &sdkErr)
+			require.Equal(t, status.Code(finalErr), status.Code(sdkErr.Cause))
+			codeAgain, errAgain := session.ExitCode()
+			require.Equal(t, code, codeAgain)
+			require.Equal(t, err, errAgain)
+		})
+	}
+}
+
+func TestExecInteractive_RejectsEventsAfterExit(t *testing.T) {
+	for name, event := range map[string]*pb.ExecSandboxEvent{
+		"duplicate exit": {Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 1}}},
+		"late output":    {Payload: &pb.ExecSandboxEvent_Stdout{Stdout: &pb.ExecSandboxStdout{Data: []byte("late")}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := newMockExecServer()
+			mock.interactiveEvents = []*pb.ExecSandboxEvent{
+				{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 0}}}, event,
+			}
+			client, cleanup := setupExecTest(t, mock)
+			defer cleanup()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			defer cancel()
+			session, err := client.Interactive(ctx, "default", "test-sandbox", []string{"true"}, 0, 0)
+			require.NoError(t, err)
+			defer func() { _ = session.Close() }()
+			code, err := session.ExitCode()
+			require.Equal(t, 0, code)
+			require.ErrorContains(t, err, "after exit")
+		})
 	}
 }
 

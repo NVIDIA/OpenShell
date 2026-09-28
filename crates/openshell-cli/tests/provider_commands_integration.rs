@@ -29,13 +29,13 @@ use openshell_core::proto::{
     ProviderReadinessReason, ProviderReadinessState, ProviderReadinessStatus, ProviderResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
     RotateProviderCredentialResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, WorkspaceSelector,
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -46,6 +46,8 @@ use tonic::{Code, Response, Status};
 
 type ReadinessScript = HashMap<String, VecDeque<ReadinessReply>>;
 type ReceiptCorruption = fn(&mut ProviderMutationReceipt);
+type ProfileListRequestLog = (Option<WorkspaceSelector>, i32, String);
+type ProfileGetRequestLog = (Option<WorkspaceSelector>, String);
 
 #[derive(Clone)]
 enum ReadinessReply {
@@ -62,7 +64,7 @@ const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
 const SYNTHETIC_MUTATION_ERROR_METADATA: &str = "fixture-mutation-error-metadata";
 const STORAGE_UNCERTAIN_REASON: &str = "CONFIG_OPERATION_STORAGE_UNCERTAIN";
 
-fn selected_workspace(scope: &Option<openshell_core::proto::WorkspaceSelector>) -> Option<&str> {
+fn selected_workspace(scope: &Option<WorkspaceSelector>) -> Option<&str> {
     scope
         .as_ref()
         .and_then(|scope| match scope.selection.as_ref() {
@@ -87,6 +89,12 @@ struct ProviderState {
     fail_sandbox_reads: Arc<AtomicBool>,
     profile_read_errors: Arc<Mutex<HashMap<String, Code>>>,
     profile_read_requests: Arc<Mutex<Vec<String>>>,
+    // Preserve selector presence so platform requests cannot pass with an
+    // explicitly empty workspace instead of omitting the selector.
+    profile_list_requests: Arc<Mutex<Vec<ProfileListRequestLog>>>,
+    profile_page_size_cap: Arc<AtomicUsize>,
+    profile_get_requests: Arc<Mutex<Vec<ProfileGetRequestLog>>>,
+    omit_profile_response: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
     delete_provider_profile_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
@@ -95,6 +103,7 @@ struct ProviderState {
     fail_delete_provider_profile_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+    sandbox_provider_next_page_token: Arc<Mutex<String>>,
     readiness_receipts: Arc<Mutex<HashMap<String, ProviderMutationReceipt>>>,
     readiness_scripts: Arc<Mutex<ReadinessScript>>,
     readiness_requests: Arc<Mutex<Vec<GetSandboxProviderStatusRequest>>>,
@@ -131,6 +140,8 @@ enum ProviderRefreshRequestLog {
 enum SandboxProviderRequestLog {
     List {
         sandbox_name: String,
+        page_size: i32,
+        page_token: String,
     },
     Attach {
         sandbox_name: String,
@@ -221,6 +232,27 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
@@ -322,6 +354,7 @@ impl OpenShell for TestOpenShell {
                 status: None,
                 ..Sandbox::default()
             }),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -346,6 +379,8 @@ impl OpenShell for TestOpenShell {
             .await
             .push(SandboxProviderRequestLog::List {
                 sandbox_name: sandbox_name.clone(),
+                page_size: request.page_size,
+                page_token: request.page_token,
             });
         let provider_names = self
             .state
@@ -360,7 +395,15 @@ impl OpenShell for TestOpenShell {
             .iter()
             .filter_map(|name| providers_by_name.get(name).cloned())
             .collect();
-        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+        Ok(Response::new(ListSandboxProvidersResponse {
+            providers,
+            next_page_token: self
+                .state
+                .sandbox_provider_next_page_token
+                .lock()
+                .await
+                .clone(),
+        }))
     }
 
     async fn attach_sandbox_provider(
@@ -750,17 +793,66 @@ impl OpenShell for TestOpenShell {
 
     async fn list_provider_profiles(
         &self,
-        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+        request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        let request = request.into_inner();
+        self.state.profile_list_requests.lock().await.push((
+            request.workspace_scope.clone(),
+            request.page_size,
+            request.page_token.clone(),
+        ));
         let mut profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
         profiles.extend(self.state.profiles.lock().await.values().cloned());
+        profiles.extend(
+            self.state
+                .scoped_profiles
+                .lock()
+                .await
+                .iter()
+                .filter(|((workspace, _), _)| {
+                    workspace == selected_workspace(&request.workspace_scope).unwrap_or_default()
+                })
+                .map(|(_, profile)| profile.clone()),
+        );
+        // The fixture owns token interpretation. The CLI must forward opaque
+        // tokens unchanged and follow them even when the server caps page size.
+        profiles.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.scope.cmp(&right.scope))
+        });
+        let offset = if request.page_token.is_empty() {
+            0
+        } else {
+            request
+                .page_token
+                .strip_prefix("profile-page:")
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| Status::invalid_argument("unknown profile page token"))?
+        };
+        let mut page_size = usize::try_from(request.page_size)
+            .map_err(|_| Status::invalid_argument("negative profile page size"))?;
+        if page_size == 0 {
+            page_size = 100;
+        }
+        let cap = self.state.profile_page_size_cap.load(Ordering::SeqCst);
+        if cap > 0 {
+            page_size = page_size.min(cap);
+        }
+        let next_offset = offset.saturating_add(page_size);
+        let next_page_token = if next_offset < profiles.len() {
+            format!("profile-page:{next_offset:04}")
+        } else {
+            String::new()
+        };
+        let profiles = profiles.into_iter().skip(offset).take(page_size).collect();
         Ok(Response::new(
             openshell_core::proto::ListProviderProfilesResponse {
                 profiles,
-                next_page_token: String::new(),
+                next_page_token,
             },
         ))
     }
@@ -770,6 +862,16 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let request = request.into_inner();
+        self.state
+            .profile_get_requests
+            .lock()
+            .await
+            .push((request.workspace_scope.clone(), request.id.clone()));
+        if self.state.omit_profile_response.load(Ordering::SeqCst) {
+            return Ok(Response::new(
+                openshell_core::proto::ProviderProfileResponse { profile: None },
+            ));
+        }
         let id = request.id;
         self.state
             .profile_read_requests
@@ -1432,6 +1534,17 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::PeerRelayFrame, Status>,
+    >;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -3347,12 +3460,252 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 }
 
 #[tokio::test]
-async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
+async fn profile_list_reads_all_pages_in_the_requested_workspace() {
     let ts = run_server().await;
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let example_count = helpers::example_profiles().len();
 
-    run::provider_list_profiles(&ts.endpoint, "table", "default", &ts.tls)
+    // A full terminal page stops immediately. A short nonterminal page must
+    // continue, including across more than two server-issued tokens.
+    for (count, page_size) in [
+        (100_usize.saturating_sub(example_count), 100),
+        (105, 100),
+        (105, 37),
+    ] {
+        ts.state
+            .profile_page_size_cap
+            .store(page_size, Ordering::SeqCst);
+        ts.state.profiles.lock().await.clear();
+        ts.state.profile_list_requests.lock().await.clear();
+        for i in 0..count {
+            install_test_profile(&ts, &format!("custom-{i:03}"), "CUSTOM_TOKEN").await;
+        }
+        let rendered = run::provider_list_profiles_text(&ts.endpoint, "json", "team", &ts.tls)
+            .await
+            .expect("profile catalog");
+        let profiles: Vec<serde_json::Value> =
+            serde_json::from_str(&rendered).expect("profile JSON");
+        assert_eq!(profiles.len(), example_count + count);
+        for i in 0..count {
+            assert!(
+                profiles
+                    .iter()
+                    .any(|profile| profile["id"] == format!("custom-{i:03}"))
+            );
+        }
+        let requests = ts.state.profile_list_requests.lock().await;
+        assert_eq!(requests.len(), (example_count + count).div_ceil(page_size));
+        for (page, (workspace, requested_size, token)) in requests.iter().enumerate() {
+            assert_eq!(selected_workspace(workspace), Some("team"));
+            assert_eq!(*requested_size, 100);
+            let expected_token = if page == 0 {
+                String::new()
+            } else {
+                format!("profile-page:{:04}", page * page_size)
+            };
+            assert_eq!(token, &expected_token);
+        }
+    }
+}
+
+#[tokio::test]
+async fn profile_describe_preserves_scope_and_structured_definition() {
+    let ts = run_server().await;
+    ts.state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let mut scoped = helpers::example_profiles()
+        .iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile")
+        .to_proto();
+    scoped.display_name = "Team-only OpenAI".to_string();
+    scoped.scope = "workspace".to_string();
+    scoped.source = "custom".to_string();
+    ts.state
+        .scoped_profiles
+        .lock()
         .await
-        .expect("provider list-profiles");
+        .insert(("team".to_string(), "openai".to_string()), scoped);
+
+    let human =
+        run::provider_profile_describe_text(&ts.endpoint, "openai", "table", "team", &ts.tls)
+            .await
+            .expect("scoped description");
+    assert!(human.contains("Team-only OpenAI"));
+    assert!(human.contains("OPENAI_API_KEY"));
+    assert!(!human.contains('\u{1b}'));
+    let global = run::provider_profile_describe_text(&ts.endpoint, "openai", "table", "", &ts.tls)
+        .await
+        .expect("platform description");
+    assert!(!global.contains("Team-only OpenAI"));
+    for format in ["json", "yaml"] {
+        let description =
+            run::provider_profile_describe_text(&ts.endpoint, "openai", format, "team", &ts.tls)
+                .await
+                .expect("structured description");
+        let exported =
+            run::provider_profile_export_text(&ts.endpoint, "openai", format, "team", &ts.tls)
+                .await
+                .expect("profile export");
+        assert_eq!(description, exported);
+    }
+    let missing =
+        run::provider_profile_describe_text(&ts.endpoint, "missing", "table", "team", &ts.tls)
+            .await
+            .expect_err("unknown profile must fail");
+    assert!(missing.to_string().contains("not found"));
+    ts.state.omit_profile_response.store(true, Ordering::SeqCst);
+    let absent =
+        run::provider_profile_describe_text(&ts.endpoint, "openai", "json", "team", &ts.tls)
+            .await
+            .expect_err("empty successful response must fail");
+    assert!(absent.to_string().contains("openai"));
+}
+
+#[tokio::test]
+async fn profile_commands_dispatch_scope_and_output_to_gateway() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("test address"));
+    let state = ProviderState::default();
+    state.deny_provider_reads.store(true, Ordering::SeqCst);
+    let service = TestOpenShell {
+        state: state.clone(),
+    };
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(OpenShellServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("test gateway");
+    });
+    let config = tempfile::tempdir().expect("isolated CLI config");
+    // The subprocess uses an explicit local endpoint and isolated config so
+    // profile dispatch cannot accidentally consult the developer's gateway.
+    for (verb, global, format) in [
+        ("list", false, "json"),
+        ("list", true, "yaml"),
+        ("describe", false, "json"),
+        ("describe", true, "table"),
+        ("export", false, "yaml"),
+        ("export", true, "json"),
+    ] {
+        let mut outputs = Vec::new();
+        for legacy in [false, true] {
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+            command
+                .env("XDG_CONFIG_HOME", config.path())
+                .env("OPENSHELL_TELEMETRY_ENABLED", "false")
+                .env_remove("OPENSHELL_GATEWAY")
+                .env_remove("COMPLETE")
+                .args([
+                    "--gateway-endpoint",
+                    &endpoint,
+                    "--workspace",
+                    "team",
+                    "--color",
+                    "never",
+                ]);
+            if legacy && verb == "list" {
+                command.args(["provider", "list-profiles"]);
+            } else {
+                if legacy {
+                    command.arg("provider");
+                }
+                command.args(["profile", verb]);
+                if verb == "list" {
+                    command.args(["--type", "provider"]);
+                } else {
+                    command.arg("openai");
+                }
+            }
+            if global {
+                command.arg("--global");
+            }
+            let output = command
+                .args(["-o", format])
+                .output()
+                .await
+                .expect("profile subprocess");
+            assert!(
+                output.status.success(),
+                "profile {verb} (legacy={legacy}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+            match (verb, format) {
+                ("list", "json") => assert!(
+                    serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+                        .expect("JSON list")
+                        .iter()
+                        .any(|p| p["id"] == "openai")
+                ),
+                ("list", "yaml") => assert!(
+                    serde_yml::from_str::<Vec<serde_json::Value>>(&stdout)
+                        .expect("YAML list")
+                        .iter()
+                        .any(|p| p["id"] == "openai")
+                ),
+                (_, "json") => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&stdout).expect("JSON profile")["id"],
+                    "openai"
+                ),
+                (_, "yaml") => assert_eq!(
+                    serde_yml::from_str::<serde_json::Value>(&stdout).expect("YAML profile")["id"],
+                    "openai"
+                ),
+                _ => assert!(stdout.contains("openai (provider)")),
+            }
+            outputs.push(stdout);
+        }
+        // Both entry points must produce identical output, including structure
+        // and human-readable formatting, rather than only parsing successfully.
+        assert_eq!(outputs[0], outputs[1], "profile {verb} output differs");
+    }
+    assert_eq!(
+        *state.profile_list_requests.lock().await,
+        [
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                100,
+                String::new()
+            ),
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                100,
+                String::new()
+            ),
+            (None, 100, String::new()),
+            (None, 100, String::new()),
+        ]
+    );
+    assert_eq!(
+        *state.profile_get_requests.lock().await,
+        [
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                "openai".to_string()
+            ),
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                "openai".to_string()
+            ),
+            (None, "openai".to_string()),
+            (None, "openai".to_string()),
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                "openai".to_string()
+            ),
+            (
+                Some(openshell_core::proto::workspace_selector("team")),
+                "openai".to_string()
+            ),
+            (None, "openai".to_string()),
+            (None, "openai".to_string()),
+        ]
+    );
+    // The listener belongs to this fixture and must not outlive the test.
+    server.abort();
 }
 
 #[tokio::test]
@@ -3820,9 +4173,17 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
     )
     .await
     .expect("sandbox provider attach is idempotent");
-    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", "table", "default", &ts.tls)
-        .await
-        .expect("sandbox provider list");
+    run::sandbox_provider_list(
+        &ts.endpoint,
+        "dev-sandbox",
+        100,
+        "",
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider list");
     run::sandbox_provider_detach(
         &ts.endpoint,
         "dev-sandbox",
@@ -3858,6 +4219,8 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
             },
             SandboxProviderRequestLog::List {
                 sandbox_name: "dev-sandbox".to_string(),
+                page_size: 100,
+                page_token: String::new(),
             },
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
@@ -3872,6 +4235,85 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
 
     let providers = ts.state.sandbox_providers.lock().await;
     assert!(providers.get("dev-sandbox").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn sandbox_provider_list_cli_forwards_pagination_and_emits_envelopes() {
+    let ts = run_server().await;
+    ts.state.providers.lock().await.insert(
+        "work-github".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-work-github".to_string(),
+                name: "work-github".to_string(),
+                workspace: "default".to_string(),
+                resource_version: 1,
+                ..Default::default()
+            }),
+            r#type: "github".to_string(),
+            ..Default::default()
+        },
+    );
+    ts.state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("dev-sandbox".to_string(), vec!["work-github".to_string()]);
+    *ts.state.sandbox_provider_next_page_token.lock().await = "next-page".to_string();
+
+    for format in ["json", "yaml"] {
+        let output = run_readiness_cli(
+            &ts,
+            &[
+                "sandbox",
+                "provider",
+                "list",
+                "dev-sandbox",
+                "--page-size",
+                "1",
+                "--page-token",
+                "prior-page",
+                "--output",
+                format,
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "sandbox provider list {format} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "structured output wrote to stderr"
+        );
+
+        let value: serde_json::Value = match format {
+            "json" => serde_json::from_slice(&output.stdout).expect("parse JSON envelope"),
+            "yaml" => serde_yml::from_slice(&output.stdout).expect("parse YAML envelope"),
+            _ => unreachable!(),
+        };
+        assert_eq!(value["next_page_token"], "next-page");
+        assert_eq!(value["providers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["providers"][0]["name"], "work-github");
+    }
+
+    let requests = ts.state.sandbox_provider_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+                page_size: 1,
+                page_token: "prior-page".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+                page_size: 1,
+                page_token: "prior-page".to_string(),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -3925,12 +4367,26 @@ binaries: [/usr/bin/custom]
     )
     .unwrap();
 
-    run::provider_profile_lint(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
-        .await
-        .expect("profile lint");
-    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
-        .await
-        .expect("profile import");
+    run::provider_profile_lint(
+        &ts.endpoint,
+        Some(&profile_path),
+        None,
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile lint");
+    run::provider_profile_import(
+        &ts.endpoint,
+        Some(&profile_path),
+        None,
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile import");
     let exported_yaml =
         run::provider_profile_export_text(&ts.endpoint, "custom-api", "yaml", "default", &ts.tls)
             .await
@@ -3967,7 +4423,7 @@ binaries: [/usr/bin/custom]
         .expect("profile export");
     run::provider_list_profiles(&ts.endpoint, "json", "default", &ts.tls)
         .await
-        .expect("provider list-profiles json");
+        .expect("profile list json");
     run::provider_create(
         &ts.endpoint,
         "custom-provider",
@@ -4496,9 +4952,16 @@ binaries: [/usr/bin/yaml-client]
     .unwrap();
     std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
 
-    run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
-        .await
-        .expect("profile import --from");
+    run::provider_profile_import(
+        &ts.endpoint,
+        None,
+        Some(dir.path()),
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile import --from");
 
     run::provider_profile_export(&ts.endpoint, "custom-yaml", "yaml", "default", &ts.tls)
         .await
@@ -4506,6 +4969,108 @@ binaries: [/usr/bin/yaml-client]
     run::provider_profile_export(&ts.endpoint, "custom-json", "json", "default", &ts.tls)
         .await
         .expect("custom-json should be imported");
+}
+
+#[tokio::test]
+async fn provider_profile_lint_and_import_from_http_url() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ts = run_server().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/remote.yaml?revision=1",
+        listener.local_addr().unwrap()
+    );
+    tokio::spawn(async move {
+        let body = "id: remote-api\ndisplay_name: Remote API\ncategory: other\n";
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    run::provider_profile_lint(&ts.endpoint, None, None, Some(&url), "default", &ts.tls)
+        .await
+        .expect("remote profile lint");
+    run::provider_profile_import(&ts.endpoint, None, None, Some(&url), "default", &ts.tls)
+        .await
+        .expect("remote profile import");
+    run::provider_profile_export(&ts.endpoint, "remote-api", "yaml", "default", &ts.tls)
+        .await
+        .expect("remote profile should be imported");
+}
+
+#[tokio::test]
+async fn provider_profile_import_rejects_unsupported_remote_url() {
+    let ts = run_server().await;
+    let err = run::provider_profile_import(
+        &ts.endpoint,
+        None,
+        None,
+        Some("file:///tmp/profile.yaml"),
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("file URL must fail");
+    assert!(err.to_string().contains("http or https"));
+}
+
+#[tokio::test]
+async fn provider_profile_import_rejects_oversized_http_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ts = run_server().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/large.yaml", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let err =
+        run::provider_profile_import(&ts.endpoint, None, None, Some(&url), "default", &ts.tls)
+            .await
+            .expect_err("oversized profile must fail");
+    assert!(err.to_string().contains("1 MiB download limit"));
+}
+
+#[tokio::test]
+async fn provider_profile_import_redacts_url_query_from_http_errors() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ts = run_server().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/missing.yaml?token=private-value",
+        listener.local_addr().unwrap()
+    );
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let err =
+        run::provider_profile_import(&ts.endpoint, None, None, Some(&url), "default", &ts.tls)
+            .await
+            .expect_err("missing remote profile must fail");
+    let message = err.to_string();
+    assert!(message.contains("404"));
+    assert!(!message.contains("private-value"));
 }
 
 #[tokio::test]
@@ -4523,7 +5088,6 @@ endpoints:
   - host: api.advanced.example
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:
@@ -4541,9 +5105,16 @@ binaries:
     )
     .unwrap();
 
-    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
-        .await
-        .expect("profile import");
+    run::provider_profile_import(
+        &ts.endpoint,
+        Some(&profile_path),
+        None,
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile import");
 
     let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
         .await
@@ -4586,10 +5157,16 @@ endpoints:
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
 
-    let err =
-        run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
-            .await
-            .expect_err("profile import --from should fail on parse errors");
+    let err = run::provider_profile_import(
+        &ts.endpoint,
+        None,
+        Some(dir.path()),
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("profile import --from should fail on parse errors");
     assert!(
         err.to_string().contains("provider profile import failed"),
         "unexpected error: {err}"
@@ -4618,9 +5195,16 @@ endpoints:
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
 
-    let err = run::provider_profile_lint(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
-        .await
-        .expect_err("profile lint --from should fail on parse errors");
+    let err = run::provider_profile_lint(
+        &ts.endpoint,
+        None,
+        Some(dir.path()),
+        None,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("profile lint --from should fail on parse errors");
     assert!(
         err.to_string().contains("provider profile lint failed"),
         "unexpected error: {err}"

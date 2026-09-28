@@ -23,7 +23,12 @@ OpenShell builds these main artifacts:
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
-Sandbox community images are built outside this repository.
+Release Tag publishes the same tagged docs commit as an immutable `vX.Y.Z`
+snapshot and the mutable `latest` alias. Release Dev updates `dev`. The Fern
+selector pins `latest` and `dev`, then lists versioned snapshots newest first.
+The current release workflows do not request availability badges.
+
+Workload images are standard OCI images supplied by operators or users.
 
 ## Build Features
 
@@ -101,6 +106,12 @@ image's libc. The separate `openshell-supervisor` binary is dynamically linked
 with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
+
+Docker E2E tool-dependent workloads use a dedicated Noble-based fixture,
+separate from the product's minimal default image. The fixture supplies the
+test identity and tools, with Python aligned to the host test runner for
+serialized callable compatibility. Default-image coverage retains the product
+image. Other compute-driver test lanes retain their existing workload fixtures.
 
 The Docker image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
@@ -215,6 +226,8 @@ The Homebrew service keeps gateway TLS under the Homebrew state directory but
 mirrors Docker sandbox client TLS into `$HOME/.local/state/openshell/homebrew/tls`
 at service start, because Docker Desktop bind mounts must use paths visible to
 the macOS user's shared home directory.
+On upgrade, the formula atomically replaces only exact package-generated
+schema-v1 gateway configs, leaving user-edited configs untouched.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
@@ -266,8 +279,29 @@ revocation and the gateway's reauthorization-required recovery state.
 Tmachine environments define the guest machine and runtime setup, while named
 installers define how OpenShell is installed. This keeps the runtime mode
 independent from binary or package installation and lets multiple installers
-reuse the same prepared setup disk. The test command is
-`tmachine test <environment> <installer> <testsuite>`.
+reuse the same prepared setup disk. The `none` installer skips OpenShell
+installation and boots the prepared environment directly.
+
+### Interactive tmachine shell
+
+The test command is `tmachine test <environment> <installer> <testsuite>`. The
+`shell` testsuite prepares the selected environment and installer, then opens an
+interactive SSH session in the disposable guest for manual debugging.
+
+Start an Ubuntu Docker guest without installing OpenShell:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful none shell
+```
+
+Replace `none` with `deb` to install the locally staged Debian package before
+opening the shell:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb shell
+```
+
+Exit the SSH session to shut down and discard the disposable guest.
 
 The `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task
@@ -275,7 +309,7 @@ includes, templates, inventory, and requirements. The digest uses sorted
 relative paths, file contents, and executable permissions; source symlinks
 are unsupported. Both keys also retain the ordered playbook paths and contents,
 their base disk contents, and whether Galaxy is enabled; install keys
-include named binary inputs. The top-level `.roles` directory is excluded:
+include named artifact inputs. The top-level `.roles` directory is excluded:
 Galaxy release pins in `requirements.yaml` are treated as immutable, including
 any transitive dependency pins. Cache misses with Galaxy enabled reinstall
 the required roles and their dependencies before running playbooks.
@@ -286,7 +320,42 @@ the gateway, sandbox, and supervisor as separate binaries for their respective
 Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
 CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
 Docker and Fedora Podman environments import both local runtime images and
-configure the gateway to use them.
+configure the gateway to use them. The Ubuntu `deb` installer consumes
+`artifacts/packages/openshell.deb`; the `binaries` installer remains available
+for direct executable installation on every environment. Release Dev and
+Release Tag run Ubuntu conformance through the Debian package, while Fedora
+continues using direct executable installation until RPM coverage is available.
+The release canary separately exercises the public installer on Ubuntu. The
+installer selects the OpenShell Snap only with `OPENSHELL_INSTALL_METHOD=snap`
+or when the Snap is already installed; otherwise it uses the native Debian or
+RPM package. The Snap requires a compatible, preinstalled non-Snap Docker
+daemon. Its positive canary uses system Docker; negative preflight coverage
+verifies that the installer rejects both missing Docker and the Docker Snap
+before installing OpenShell.
+Explicit release tags and the `pre` alias always use the native Debian or RPM
+package path. The `pre` alias
+checks matching Git tags in version order, then looks up the exact platform
+artifact and verifies the release run instead of listing every repository
+artifact.
+
+Snapd runs the gateway as a root-owned system service. Its generated client
+certificates reside in root-owned snap state. The installer copies the client
+bundle into the target user's private Snap state and registers the TLS endpoint;
+direct Snap installs require the same enrollment. The install and post-refresh
+hooks replace configs that explicitly enable plaintext or unauthenticated access
+with the secure default. Snap refreshes
+restart the gateway so the migrated config takes effect immediately.
+
+Debian and RPM packages instead run systemd user services with user-owned mTLS
+material. Sandbox-to-gateway sessions remain authenticated with gateway-minted
+JWTs.
+
+The Debian qualification profile keeps candidate-image overrides outside the
+operator-owned gateway configuration: it writes a harness-owned file under
+`/var/lib/openshell-qualification` and selects it through the packaged systemd
+unit's `gateway.env` hook. Ordinary package installations continue to use the
+gateway's built-in runtime-image defaults unless the operator configures an
+override.
 
 ## Python Wheel Packaging
 
@@ -321,6 +390,10 @@ the release tag.
 ## CI and E2E
 
 Required checks run on GitHub Actions. Pull-request workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
+
+For PRs that need manual admission, copy-pr-bot accepts `/ok to test <SHA>`
+only from the explicit `vetters_override` list in `.github/copy-pr-bot.yaml`.
+This list is maintained separately from the bot's automatic PR trust policy.
 
 The high-level CI model:
 
@@ -358,8 +431,9 @@ Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `merge_group` only, because it needs a base and head commit to compare;
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
 `schedule`, with `workflow_dispatch` kept for manual diagnostics; and
-`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
-also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
+`.github/workflows/codex-security.yml` is called by the aggregate release scan
+for pre-release tags and is also callable through `workflow_call` and
+`workflow_dispatch`. CodeQL does
 not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
@@ -465,10 +539,34 @@ job republishes the analysis job's outcome as the
 `OpenShell / Codex Security (informational)` status. None of these checks are
 required statuses, so they do not gate merges.
 
-Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Gating stable promotion
-on qualification results remains proposed in
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+The workflow only reports on candidates that already exist. It incrementally
+implements the qualification model from
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md): failed
+checks do not prevent publication of an immutable pre-release candidate. The
+summary explicitly records that the current profile does not yet provide the
+RFC's complete qualification coverage.
+
+The tagged release workflow calls the aggregate Security Scan after publishing
+the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
+Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
+also runs for pre-release tags. Scanner failures, Cargo Deny advisories, and
+High or Critical Codex Security findings fail qualification. CodeQL, Trivy, and
+Zizmor findings are temporarily informational while the findings accepted for
+v0.1.0 are addressed in 0.1.x releases.
+
+The `Release Qualification` job aggregates security, conformance, feature,
+Docker E2E, and VM E2E results. The currently implemented profile gates stable
+publication, but it does not represent complete RFC 0014 qualification. For a
+pre-release it records a failed result without blocking artifact assembly,
+image tagging, or Helm publication; the failing underlying suite keeps the
+workflow visibly red. Every attempt writes a summary to the Actions run summary
+and a 90-day Actions artifact. After release assembly succeeds, the workflow
+publishes the same result to
+`ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
+`tasks/scripts/generate-qualification-summary.sh` generates qualification
+metadata only. Artifact identity remains the responsibility of the separate
+release manifest. Including both the run ID and attempt preserves the result of
+each rerun.
 
 `release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
 saving time changes) and supports manual dispatch. Maintainers start weekday
@@ -486,10 +584,16 @@ See `CI.md` for the contributor workflow, labels, and maintainer merge-queue wor
 Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
 configuration, components, theme assets, and publish settings live in `fern/`.
 
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
+Use `mise run docs` for Fern validation and navigation-to-file-path consistency,
+and `mise run docs:serve` for local preview. The docs PR workflow also runs the
+navigation check's unit tests (`mise run test:docs-nav`).
+PR previews are produced by `.github/workflows/branch-docs.yml` when
 Fern credentials are available. Production docs publish from the release tag
-workflow.
+workflow. Redirect rules follow the mutable snapshot that owns their source URL
+(or destination for unversioned aliases). Syncing replaces that channel's rules,
+including deletions; `dev` owns shared fallback rules. Stable promotion updates
+`latest` routing together with its content, while older maintenance releases
+preserve both.
 
 ## Validation Expectations
 

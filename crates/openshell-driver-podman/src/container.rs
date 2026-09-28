@@ -53,6 +53,7 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
 const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
+const RESOLVER_SECRET_PREFIX: &str = "openshell-resolver-";
 const TLS_CA_SECRET_PREFIX: &str = "openshell-tls-ca-";
 const TLS_CERT_SECRET_PREFIX: &str = "openshell-tls-cert-";
 const TLS_KEY_SECRET_PREFIX: &str = "openshell-tls-key-";
@@ -64,6 +65,7 @@ const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PAT
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
@@ -85,6 +87,23 @@ pub struct PodmanSandboxDriverConfig {
 }
 
 impl PodmanSandboxDriverConfig {
+    pub(crate) fn admit_mount_types(
+        &self,
+        policy: &openshell_core::resource_admission::ResourceAdmissionConfig,
+    ) -> Result<(), ComputeDriverError> {
+        for mount in &self.mounts {
+            if matches!(
+                mount,
+                PodmanDriverMountConfig::Bind { .. } | PodmanDriverMountConfig::Image { .. }
+            ) {
+                policy
+                    .reject_unlabelable("host bind or image mount")
+                    .map_err(|error| ComputeDriverError::Precondition(error.message().into()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_sandbox(sandbox: &DriverSandbox) -> Result<Self, ComputeDriverError> {
         let Some(template) = sandbox
             .spec
@@ -176,6 +195,12 @@ pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
     format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
 }
 
+/// Build the per-sandbox Podman secret name for the mediated DNS resolver.
+#[must_use]
+pub fn resolver_secret_name(sandbox_id: &str) -> String {
+    format!("{RESOLVER_SECRET_PREFIX}{sandbox_id}")
+}
+
 /// Build per-sandbox Podman secret names for TLS CA, cert, and key.
 #[must_use]
 pub fn tls_secret_names(sandbox_id: &str) -> [String; 3] {
@@ -236,14 +261,17 @@ pub struct ContainerSpec {
     /// File-mounted Podman secrets.
     secrets: Vec<SecretMount>,
     stop_timeout: u32,
-    /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
-    /// via Podman's `host-gateway` magic so sandbox containers can reach
-    /// the gateway server running on the host in rootless mode.
+    /// Extra /etc/hosts entries for the networked supervisor container.
+    /// The isolated workload resolves host aliases through policy DNS.
     hostadd: Vec<String>,
     /// Search domains written to `/etc/resolv.conf` by Podman.
     dns_search: Vec<String>,
     /// Resolver options written to `/etc/resolv.conf` by Podman.
     dns_option: Vec<String>,
+    /// Preserve the image resolver path so a driver-owned read-only resolver
+    /// file can be mounted there without Podman replacing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_image_resolve_conf: Option<bool>,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -593,18 +621,37 @@ fn build_env(
     // hostname could otherwise present a certificate for a name they control
     // and intercept the sandbox JWT.
     env.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
-    env.insert(
-        openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
-        oci_user.to_string(),
-    );
-    env.insert(
-        openshell_core::sandbox_env::SANDBOX_UID.into(),
-        String::new(),
-    );
-    env.insert(
-        openshell_core::sandbox_env::SANDBOX_GID.into(),
-        String::new(),
-    );
+    if oci_user.is_empty() {
+        // The image declares no OCI USER (for example, a minimal base image). Assign a
+        // numeric non-root identity like the Kubernetes and VM drivers so the
+        // supervisor synthesizes the account instead of rejecting the image.
+        env.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            String::new(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.into(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_UID.to_string(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.into(),
+            openshell_core::sandbox_env::DEFAULT_SANDBOX_GID.to_string(),
+        );
+    } else {
+        // The image declares a USER; preserve the OCI resolution path.
+        env.insert(
+            openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+            oci_user.to_string(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_UID.into(),
+            String::new(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_GID.into(),
+            String::new(),
+        );
+    }
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.
@@ -634,6 +681,13 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
         }
     }
     // Managed labels (highest priority -- always overwrite).
+    labels.insert(
+        openshell_core::resource_admission::CONFIG_USED_LABEL.into(),
+        template
+            .and_then(|t| t.driver_config.as_ref())
+            .is_some_and(|config| !config.fields.is_empty())
+            .to_string(),
+    );
     labels.insert(LABEL_SANDBOX_ID.into(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.into(), sandbox.name.clone());
     labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
@@ -1064,7 +1118,13 @@ fn build_base_spec(
     let vol = volume_name(&sandbox.id);
 
     let env = build_env(sandbox, config, requested_image, oci_user)?;
-    let labels = build_labels(sandbox);
+    let mut labels = build_labels(sandbox);
+    labels.insert(
+        "openshell.ai/runtime-binary-source".into(),
+        supervisor_bin_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
@@ -1128,7 +1188,7 @@ fn build_base_spec(
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
         // Override the image's ENTRYPOINT so the supervisor binary runs
-        // directly. Sandbox images (e.g. the community base image) set
+        // directly. Workload images can set
         // ENTRYPOINT ["/bin/bash"], and Podman's `command` field only
         // overrides CMD — which gets appended as args to the entrypoint.
         // Without this, the container would run the entrypoint binary with
@@ -1220,15 +1280,16 @@ fn build_base_spec(
             secrets
         },
         stop_timeout: config.stop_timeout_secs,
-        // Inject stable host aliases into /etc/hosts so sandbox containers can
-        // reach services on the host. `host.openshell.internal` is the driver-
-        // neutral alias used by policies and e2e tests.
+        // Inject stable host aliases into the networked supervisor container.
+        // The workload clears these entries and resolves the driver-neutral
+        // alias through the policy-DNS relay instead.
         hostadd: hostadd_entries(config),
         // Preserve Podman's resolver defaults for both policy-DNS and ordinary
         // sandboxes. Namespace-local capture supports UDP and TCP, so it must
         // not depend on a libc-specific option or alter short-name searches.
         dns_search: Vec::new(),
         dns_option: Vec::new(),
+        use_image_resolve_conf: None,
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1375,6 +1436,7 @@ pub struct IsolationSpecInput<'a> {
     pub sandbox: &'a DriverSandbox,
     pub config: &'a PodmanComputeConfig,
     pub token_secret: Option<&'a str>,
+    pub resolver_secret: &'a str,
     pub gpu_devices: Option<&'a [String]>,
     pub requested_image: &'a str,
     pub image_id: &'a str,
@@ -1383,11 +1445,27 @@ pub struct IsolationSpecInput<'a> {
     pub supervisor_bin: Option<&'a Path>,
     pub tls_secrets: Option<&'a [String; 3]>,
     pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
+    /// Whether this workload is created by a rootless Podman service.
+    pub rootless: bool,
 }
 
 pub struct IsolationSpecs {
     pub workload: ContainerSpec,
     pub supervisor: ContainerSpec,
+}
+
+impl IsolationSpecs {
+    pub(crate) fn record_resource_identities(
+        &mut self,
+        identities: &BTreeMap<String, Value>,
+    ) -> Result<(), ComputeDriverError> {
+        self.workload.labels.insert(
+            openshell_core::resource_admission::IDENTITIES_LABEL.into(),
+            serde_json::to_string(identities)
+                .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
+        );
+        Ok(())
+    }
 }
 
 pub fn build_isolation_specs(
@@ -1420,19 +1498,44 @@ pub fn build_isolation_specs(
         .iter()
         .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
         .collect();
-    workload.command = vec![
-        "--bootstrap".into(),
-        crate::isolation::BOOTSTRAP_PATH.into(),
-    ];
-    workload.user.clone_from(&user);
-    workload.groups = input
-        .identity
-        .supplementary_gids
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    workload.cap_drop = vec!["ALL".into()];
-    workload.cap_add.clear();
+    if input.rootless || input.identity.source == "default" {
+        // Podman's archive endpoint leaves named-volume contents owned by
+        // container root for rootless services and for a rootful USER-less
+        // image's newly-created workspace. Start the trusted runtime as root
+        // only long enough to chown the workspace, then irreversibly drop to
+        // the resolved workload identity before reading bootstrap material or
+        // accepting a control connection.
+        workload.command = vec![
+            "launch-capability-free".into(),
+            input.identity.uid.to_string(),
+            input.identity.gid.to_string(),
+            crate::isolation::BOOTSTRAP_PATH.into(),
+            driver_mounts::DEFAULT_WORKSPACE_ROOT.into(),
+        ];
+        workload.user = "0:0".into();
+        workload.groups.clear();
+        workload.cap_drop = vec!["ALL".into()];
+        workload.cap_add = vec![
+            "CHOWN".into(),
+            "SETGID".into(),
+            "SETUID".into(),
+            "SETPCAP".into(),
+        ];
+    } else {
+        workload.command = vec![
+            "--bootstrap".into(),
+            crate::isolation::BOOTSTRAP_PATH.into(),
+        ];
+        workload.user.clone_from(&user);
+        workload.groups = input
+            .identity
+            .supplementary_gids
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        workload.cap_drop = vec!["ALL".into()];
+        workload.cap_add.clear();
+    }
     workload.apparmor_profile = input
         .config
         .app_armor_profile
@@ -1449,6 +1552,14 @@ pub fn build_isolation_specs(
     workload.hostadd.clear();
     workload.secret_env.clear();
     workload.secrets.clear();
+    workload.secrets.push(SecretMount {
+        source: input.resolver_secret.to_string(),
+        target: RESOLV_CONF_PATH.into(),
+        uid: 0,
+        gid: 0,
+        mode: 0o444,
+    });
+    workload.use_image_resolve_conf = Some(true);
     workload.healthconfig.test = vec!["NONE".into()];
     workload
         .mounts
@@ -1713,6 +1824,7 @@ mod tests {
             sandbox: &sandbox,
             config: &config,
             token_secret: Some("jwt"),
+            resolver_secret: "resolver",
             gpu_devices: None,
             requested_image: "image:latest",
             image_id: "sha256:image",
@@ -1721,16 +1833,33 @@ mod tests {
             supervisor_bin: None,
             tls_secrets: None,
             identity: &identity,
+            rootless: true,
         })
         .unwrap();
         for spec in [&specs.workload, &specs.supervisor] {
-            assert_eq!(spec.user, "1000:1001");
-            assert_eq!(spec.groups, vec!["2000"]);
             assert_eq!(spec.cap_drop, vec!["ALL"]);
-            assert!(spec.cap_add.is_empty());
             assert!(spec.seccomp_profile_path.is_empty());
             assert!(spec.no_new_privileges);
         }
+        assert_eq!(specs.workload.user, "0:0");
+        assert!(specs.workload.groups.is_empty());
+        assert_eq!(
+            specs.workload.cap_add,
+            vec!["CHOWN", "SETGID", "SETUID", "SETPCAP"]
+        );
+        assert_eq!(
+            specs.workload.command,
+            vec![
+                "launch-capability-free",
+                "1000",
+                "1001",
+                crate::isolation::BOOTSTRAP_PATH,
+                driver_mounts::DEFAULT_WORKSPACE_ROOT,
+            ]
+        );
+        assert_eq!(specs.supervisor.user, "1000:1001");
+        assert_eq!(specs.supervisor.groups, vec!["2000"]);
+        assert!(specs.supervisor.cap_add.is_empty());
         assert_eq!(specs.workload.netns.nsmode, "none");
         assert_eq!(
             specs
@@ -1745,6 +1874,43 @@ mod tests {
             Some("openshell-sandbox")
         );
         assert_eq!(specs.supervisor.apparmor_profile, None);
+
+        let default_identity =
+            openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+                1000,
+                1000,
+                Vec::new(),
+                "default".into(),
+                "sha256:image".into(),
+            )
+            .unwrap();
+        let rootful_specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: Some("jwt"),
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            requested_image: "image:latest",
+            image_id: "sha256:image",
+            image_user: "",
+            image_env: &env,
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &default_identity,
+            rootless: false,
+        })
+        .unwrap();
+        assert_eq!(rootful_specs.workload.user, "0:0");
+        assert_eq!(
+            rootful_specs.workload.command,
+            vec![
+                "launch-capability-free",
+                "1000",
+                "1000",
+                crate::isolation::BOOTSTRAP_PATH,
+                driver_mounts::DEFAULT_WORKSPACE_ROOT,
+            ]
+        );
         let workload_json = serde_json::to_string(&specs.workload).unwrap();
         assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));
         assert_eq!(specs.supervisor.healthconfig.test, vec!["NONE"]);
@@ -1764,7 +1930,14 @@ mod tests {
         assert!(specs.supervisor.portmappings.is_empty());
         assert!(specs.workload.env.is_empty());
         assert_eq!(specs.workload.unsetenv, vec!["LD_PRELOAD", "HTTP_PROXY"]);
-        assert!(specs.workload.secrets.is_empty());
+        assert_eq!(specs.workload.secrets.len(), 1);
+        assert_eq!(specs.workload.secrets[0].source, "resolver");
+        assert_eq!(specs.workload.secrets[0].target, RESOLV_CONF_PATH);
+        assert_eq!(specs.workload.secrets[0].uid, 0);
+        assert_eq!(specs.workload.secrets[0].gid, 0);
+        assert_eq!(specs.workload.secrets[0].mode, 0o444);
+        assert_eq!(specs.workload.use_image_resolve_conf, Some(true));
+        assert_eq!(specs.supervisor.use_image_resolve_conf, None);
         assert!(
             specs
                 .workload

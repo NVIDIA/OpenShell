@@ -104,7 +104,7 @@ gateway_id = "podman-dev"
 ttl_secs = 3600
 
 [openshell.drivers.podman]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 supervisor_image = "localhost/openshell/supervisor:dev"
 image_pull_policy = "if_not_present"
 health_check_interval_secs = 10

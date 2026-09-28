@@ -14,6 +14,7 @@ mod service;
 mod validation;
 pub mod workspace;
 
+use openshell_core::extension_protocol::{ExtensionFamily, NegotiatedExtension};
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
@@ -30,14 +31,14 @@ use openshell_core::proto::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
     DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
-    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
-    GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, ExtensionKind,
+    FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse, GatewayMessage,
+    GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
@@ -49,20 +50,21 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, ProviderProfileResponse, ProviderResponse,
-    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
-    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ReportProviderReadinessRequest,
-    ReportProviderReadinessResponse, ResourceCapabilities, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus,
-    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
-    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
+    ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
+    ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
+    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
+    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -249,6 +251,28 @@ impl OpenShell for OpenShellService {
         &self,
         _request: Request<GetGatewayInfoRequest>,
     ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        let mut negotiated_extensions = self
+            .state
+            .compute
+            .driver_info_snapshots()
+            .iter()
+            .map(|driver| driver.negotiated_extension.clone())
+            .collect::<Vec<_>>();
+        negotiated_extensions.extend_from_slice(self.state.credentials.negotiated_extensions());
+        negotiated_extensions
+            .extend_from_slice(self.state.middleware_registry.negotiated_extensions());
+        if let Some(interceptors) = self.state.gateway_interceptors.as_ref() {
+            negotiated_extensions.extend_from_slice(interceptors.negotiated_extensions());
+        }
+        negotiated_extensions.sort_by(|left, right| {
+            left.family
+                .cmp(&right.family)
+                .then_with(|| left.configured_name.cmp(&right.configured_name))
+        });
+        let extensions = negotiated_extensions
+            .iter()
+            .map(public_extension_info)
+            .collect();
         let compute_drivers = self
             .state
             .compute
@@ -271,6 +295,7 @@ impl OpenShell for OpenShellService {
             status: ServiceStatus::Healthy.into(),
             gateway_version: openshell_core::VERSION.to_string(),
             compute_drivers,
+            extensions,
         }))
     }
 
@@ -405,7 +430,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
-        sandbox::handle_exec_sandbox(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     type ForwardTcpStream =
@@ -833,6 +858,56 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<ListWorkspaceMembersResponse>, Status> {
         workspace::handle_list_workspace_members(&self.state, request).await
     }
+
+    type PeerRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>>;
+
+    async fn peer_relay(
+        &self,
+        request: Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        crate::supervisor_session::handle_peer_relay(&self.state, request).await
+    }
+
+    async fn peer_report_provider_readiness(
+        &self,
+        request: Request<ReportProviderReadinessRequest>,
+    ) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+        provider_readiness::handle_peer_report_provider_readiness(&self.state, request).await
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        request: Request<ReportEndpointStatusRequest>,
+    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+        policy::handle_peer_report_endpoint_status(&self.state, request).await
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        request: Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
+    }
+}
+
+fn public_extension_info(extension: &NegotiatedExtension) -> NegotiatedExtensionInfo {
+    let kind = match extension.family {
+        ExtensionFamily::Compute => ExtensionKind::ComputeDriver,
+        ExtensionFamily::Credentials => ExtensionKind::CredentialDriver,
+        ExtensionFamily::GatewayInterceptor => ExtensionKind::GatewayInterceptor,
+        ExtensionFamily::SupervisorMiddleware => ExtensionKind::SupervisorMiddleware,
+    };
+    NegotiatedExtensionInfo {
+        kind: kind.into(),
+        configured_name: extension.configured_name.clone(),
+        implementation_name: extension.implementation_name.clone(),
+        implementation_version: extension.implementation_version.clone(),
+        protocol_major: extension.protocol_major,
+        protocol_minor: extension.protocol_minor,
+        supported_capabilities: extension.supported_capabilities.clone(),
+        required_capabilities: extension.required_capabilities.clone(),
+    }
 }
 
 fn public_resource_capabilities(
@@ -951,6 +1026,32 @@ pub mod test_support {
         test_server_state_for_driver(driver_name, true).await
     }
 
+    pub async fn test_server_state_with_compute_driver(
+        driver_name: &str,
+        driver: Arc<NoopTestDriver>,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        seed_example_provider_profiles(&store).await;
+        let compute = new_test_runtime_with_driver(store.clone(), driver_name, driver);
+        with_test_provider_profile_sources(Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        )))
+    }
+
     async fn test_server_state_for_driver(
         driver_name: &str,
         seed_profiles: bool,
@@ -1062,5 +1163,27 @@ mod tests {
     fn public_resource_capabilities_preserves_absence() {
         let absent: Option<DriverResourceCapabilities> = None;
         assert!(absent.map(public_resource_capabilities).is_none());
+    }
+
+    #[test]
+    fn public_extension_snapshot_contains_only_negotiated_metadata() {
+        let negotiated = NegotiatedExtension {
+            family: ExtensionFamily::Credentials,
+            configured_name: "vault".to_string(),
+            implementation_name: "openshell/vault".to_string(),
+            implementation_version: "1.2.3".to_string(),
+            protocol_major: 1,
+            protocol_minor: 2,
+            supported_capabilities: vec!["openshell.credentials.contract".to_string()],
+            required_capabilities: vec!["openshell.credentials.contract".to_string()],
+        };
+
+        let public = public_extension_info(&negotiated);
+
+        assert_eq!(public.kind, i32::from(ExtensionKind::CredentialDriver));
+        assert_eq!(public.configured_name, "vault");
+        assert_eq!(public.implementation_name, "openshell/vault");
+        assert_eq!(public.protocol_major, 1);
+        assert_eq!(public.protocol_minor, 2);
     }
 }

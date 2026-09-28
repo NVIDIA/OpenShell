@@ -343,7 +343,7 @@ cargo build -p openshell-prover-cli --features bundled-z3
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
-  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  pinned Z3 5.1.0 GitHub release for the target architecture on the first
   build. Cargo reuses the extracted archive from its target directory. Windows
   CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
   preserves the archive in the architecture-specific Cargo target cache. For
@@ -381,8 +381,8 @@ To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
-$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
-$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-5.1.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-5.1.0-x64-win\include\z3.h'
 mise run --skip-tools windows:build:x64
 ```
 
@@ -487,7 +487,7 @@ field design, and schema-evolution rules.
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides. Keep every page URL equal to its file path under `docs/`; `mise run docs` checks this with `docs:nav`.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs-from-commits` skill.
 It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.

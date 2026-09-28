@@ -5,7 +5,8 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use openshell_core::proto::pagination::v1::{
-    ObjectCursor as ProtoObjectCursor, PageToken, PolicyCursor, ProfileCursor, page_token::Cursor,
+    ObjectCursor as ProtoObjectCursor, PageToken, PolicyCursor, ProfileCursor, ProviderCursor,
+    page_token::Cursor,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -110,6 +111,16 @@ impl Pagination {
         }
     }
 
+    pub fn provider_cursor(&self) -> Result<Option<&str>, Status> {
+        match &self.cursor {
+            None => Ok(None),
+            Some(Cursor::Provider(cursor)) => Ok(Some(&cursor.name)),
+            Some(_) => Err(Status::invalid_argument(
+                "page_token has the wrong cursor type",
+            )),
+        }
+    }
+
     pub fn next_object_token(&self, cursor: Option<&ObjectCursor>) -> String {
         cursor.map_or_else(String::new, |cursor| {
             self.encode(Cursor::Object(ProtoObjectCursor {
@@ -131,6 +142,14 @@ impl Pagination {
         key.map_or_else(String::new, |key| {
             self.encode(Cursor::Profile(ProfileCursor {
                 key: key.to_string(),
+            }))
+        })
+    }
+
+    pub fn next_provider_token(&self, name: Option<&str>) -> String {
+        name.map_or_else(String::new, |name| {
+            self.encode(Cursor::Provider(ProviderCursor {
+                name: name.to_string(),
             }))
         })
     }
@@ -164,6 +183,72 @@ fn fingerprint(parameters: &[&str]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message_body<'a>(proto: &'a str, message: &str) -> &'a str {
+        let marker = format!("message {message} {{");
+        let start = proto
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{message} message must exist"))
+            + marker.len();
+        proto[start..]
+            .split_once("\n}")
+            .unwrap_or_else(|| panic!("{message} message must close"))
+            .0
+    }
+
+    #[test]
+    fn every_public_list_rpc_is_paginated() {
+        let proto = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../proto/openshell.proto"
+        ));
+        let normalized = proto.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        let mut remaining = normalized.as_str();
+
+        while let Some(start) = remaining.find("rpc List") {
+            remaining = &remaining[start + "rpc ".len()..];
+            let (method, after_request) = remaining
+                .split_once('(')
+                .expect("List RPC must declare a request type");
+            let (_, after_returns) = after_request
+                .split_once("returns (")
+                .expect("List RPC must declare a response type");
+            let (response, after_response) = after_returns
+                .split_once(')')
+                .expect("List RPC response type must close");
+            let request = format!("{method}Request");
+
+            let request_body = message_body(proto, &request);
+            assert!(
+                request_body.contains("int32 page_size"),
+                "{request} must declare page_size"
+            );
+            assert!(
+                request_body.contains("string page_token"),
+                "{request} must declare page_token"
+            );
+            assert!(
+                message_body(proto, response).contains("string next_page_token"),
+                "{response} must declare next_page_token"
+            );
+
+            remaining = after_response;
+        }
+    }
+
+    #[test]
+    fn provider_token_round_trips() {
+        let first =
+            Pagination::new(1, "", "ListSandboxProviders", &["default", "sandbox"]).unwrap();
+        let token = first.next_provider_token(Some("provider-a"));
+        assert_eq!(
+            Pagination::new(1, &token, "ListSandboxProviders", &["default", "sandbox"])
+                .unwrap()
+                .provider_cursor()
+                .unwrap(),
+            Some("provider-a")
+        );
+    }
 
     #[test]
     fn page_size_defaults_clamps_and_rejects_negative_values() {

@@ -55,15 +55,7 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
         .step("create")
         .description("sandbox creation succeeds")
         .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            &sandbox_name,
-            "--from",
-            "base",
-            "--detach",
-        ])
+        .run(&["sandbox", "create", "--name", &sandbox_name, "--detach"])
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;

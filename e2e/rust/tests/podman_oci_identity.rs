@@ -18,7 +18,7 @@ use openshell_e2e::harness::container::{ContainerEngine, is_e2e_driver};
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const READY_MARKER: &str = "podman-oci-identity-ready";
 const OCI_UID: &str = "2345";
 const OCI_GID: &str = "2346";
@@ -137,7 +137,7 @@ fn container_id_for_role(
     role: &str,
 ) -> Result<String, String> {
     let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
-    let role_filter = format!("label=openshell.io/isolation-role={role}");
+    let role_filter = format!("label=openshell.ai/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[
@@ -182,7 +182,7 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     }
 
     let image = ImageGuard::build().expect("build Podman OCI identity image");
-    // The community base image contains a baked default policy with an
+    // The fixture image contains a policy with an
     // explicit `sandbox` process identity. Supply a complete policy that
     // intentionally omits `process` so this test exercises OCI fallback.
     let policy = tempfile::NamedTempFile::new().expect("create OCI fallback policy");
@@ -252,23 +252,30 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
         .expect("find separate supervisor companion");
     assert_ne!(supervisor_id, container_id);
-    for id in [container_id, &supervisor_id] {
-        let user = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.Config.User}}", id],
-        )
-        .unwrap();
-        assert_eq!(user, format!("{OCI_UID}:{OCI_GID}"));
-        let caps = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.EffectiveCaps}}", id],
-        )
-        .unwrap();
-        assert_eq!(
-            caps, "[]",
-            "neither container may have effective capabilities"
-        );
-    }
+    let workload_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", container_id],
+    )
+    .unwrap();
+    assert_eq!(
+        workload_user, "0:0",
+        "the trusted rootless boundary starts as container root before dropping to the OCI identity"
+    );
+    let supervisor_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(supervisor_user, format!("{OCI_UID}:{OCI_GID}"));
+    let supervisor_caps = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.EffectiveCaps}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(
+        supervisor_caps, "[]",
+        "the supervisor companion may not have effective capabilities"
+    );
     let network = run_engine(
         &image.engine,
         &[

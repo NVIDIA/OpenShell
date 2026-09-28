@@ -57,20 +57,29 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 # shellcheck source=e2e/support/podman-gateway-config.sh
 source "${ROOT}/e2e/support/podman-gateway-config.sh"
 mkdir -p "${WORKDIR}/pki/client" "${WORKDIR}/jwt"
-e2e_write_podman_gateway_config "${WORKDIR}/v1.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
-e2e_write_podman_gateway_config "${WORKDIR}/v2.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v1.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v2.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v2-external.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 1 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
 assert_contains "${WORKDIR}/v1.toml" 'version = 1'
 assert_contains "${WORKDIR}/v1.toml" 'compute_drivers = ["podman"]'
 assert_contains "${WORKDIR}/v1.toml" 'image_pull_policy = "missing"'
 assert_contains "${WORKDIR}/v1.toml" 'health_check_interval_secs = 0'
+assert_contains "${WORKDIR}/v1.toml" 'sandbox_runtime_image = "sandbox:test"'
 assert_contains "${WORKDIR}/v1.toml" 'guest_tls_ca = '
 assert_contains "${WORKDIR}/v2.toml" 'version = 2'
 assert_contains "${WORKDIR}/v2.toml" 'compute_driver = "podman"'
 assert_contains "${WORKDIR}/v2.toml" 'image_pull_policy = "if_not_present"'
+assert_contains "${WORKDIR}/v2.toml" 'allow_driver_config = true'
+assert_contains "${WORKDIR}/v2.toml" 'sandbox_runtime_image = "sandbox:test"'
+assert_contains "${WORKDIR}/v2.toml" '[openshell.drivers.podman.resource_admission]'
 assert_not_contains "${WORKDIR}/v2.toml" 'health_check_interval_secs = 0'
+assert_contains "${WORKDIR}/v2-external.toml" 'socket_path = "socket"'
+assert_not_contains "${WORKDIR}/v2-external.toml" 'sandbox_runtime_image = "sandbox:test"'
+assert_not_contains "${WORKDIR}/v2-external.toml" 'allow_driver_config = true'
+assert_not_contains "${WORKDIR}/v2-external.toml" '[openshell.drivers.podman.resource_admission]'
 # V2 guest TLS is emitted before its driver table; V1 is driver-local.
-OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v1-options.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
-OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v2-options.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v1-options.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test "" "" 0 ""
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v2-options.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test "" "" 0 ""
 for config in "${WORKDIR}/v1-options.toml" "${WORKDIR}/v2-options.toml"; do
   assert_contains "${config}" 'sandbox_pids_limit = 31'
   assert_contains "${config}" 'health_check_interval_secs = 7'
@@ -138,10 +147,9 @@ for variable in \
   OPENSHELL_OTLP_ENDPOINT OPENSHELL_GATEWAY_NAME OPENSHELL_COMPUTE_DRIVER_BIND; do
   [ -z "${!variable:-}" ] || exit 23
 done
-expected_sandbox="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:$(printf '%064d' 0)"
+expected_sandbox="nvcr.io/nvidia/base/ubuntu@sha256:$(printf '%064d' 0)"
 [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = 1 ] || exit 24
 [ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" = "${expected_sandbox}" ] || exit 25
-[ "${OPENSHELL_COMMUNITY_REGISTRY:-}" = "ghcr.io/nvidia/openshell-community/sandboxes" ] || exit 28
 expected_base="docker.io/library/debian@sha256:$(printf '%064d' 0)"
 [ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = "${OPENSHELL_PARITY_TEST_SUPERVISOR_BASE}" ] || exit 26
 [ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" = "${expected_base}" ] || exit 27
@@ -159,7 +167,7 @@ schema = int(os.environ["OPENSHELL_E2E_CONFIG_SCHEMA_VERSION"])
 external = os.environ.get("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER") == "1"
 zero = "0" * 64
 image_digest = f"sha256:{zero}"
-sandbox_runtime = f"ghcr.io/nvidia/openshell-community/sandboxes/base@{image_digest}"
+sandbox_runtime = f"nvcr.io/nvidia/base/ubuntu@{image_digest}"
 sandbox_boundary = "localhost/openshell/sandbox:dev"
 supervisor_runtime = f"localhost/openshell/supervisor@{image_digest}"
 base_runtime = f"docker.io/library/debian@{image_digest}"
@@ -218,7 +226,7 @@ launch = {
     "sandbox_image_digest": image_digest,
     "sandbox_runtime_image": sandbox_runtime,
     "sandbox_boundary_image": sandbox_boundary,
-    "sandbox_client_image_alias": "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
+    "sandbox_client_image_alias": "nvcr.io/nvidia/base/ubuntu:24.04",
     "sandbox_client_image_alias_id": zero,
     "gateway_sha256_before_execution": os.environ[
         "OPENSHELL_E2E_EXPECTED_GATEWAY_SHA256"
@@ -292,7 +300,7 @@ done
 printf '%s %064d sha256:%064d %s %s %s %s\n' \
   "${expected_sandbox}" 0 0 "${expected_base}" \
   "localhost/openshell/supervisor@sha256:$(printf '%064d' 0)" \
-  "ghcr.io/nvidia/openshell-community/sandboxes/base:latest" \
+  "nvcr.io/nvidia/base/ubuntu:24.04" \
   "${package_hash}" >&2
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
   printf 'fixture external driver log\n' >"${OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE}"
@@ -422,7 +430,6 @@ OPENSHELL_SANDBOX_PROXY_CA_BUNDLE=/tmp/untrusted-proxy-ca \
 OPENSHELL_OTLP_ENDPOINT=http://untrusted.invalid:4317 \
 OPENSHELL_GATEWAY_NAME=untrusted \
 OPENSHELL_COMPUTE_DRIVER_BIND=192.0.2.2:50061 \
-OPENSHELL_COMMUNITY_REGISTRY=untrusted.invalid/community \
   run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/results/artifacts/candidate/gateway|${WORKDIR}/results/artifacts/candidate/cli|${WORKDIR}/results/artifacts/candidate/conformance"
@@ -439,7 +446,7 @@ assert_contains "${WORKDIR}/results/semantic-verification.json" '"accepted": tru
 assert_not_contains "${WORKDIR}/results/baseline.json" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.log" '"scenarios"'
 assert_contains "${WORKDIR}/results/baseline.conformance.json" '"passed":true'
-assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
+assert_contains "${WORKDIR}/podman-calls" 'pull nvcr.io/nvidia/base/ubuntu:24.04'
 assert_contains "${WORKDIR}/podman-calls" "pull ${TEST_SUPERVISOR_BASE}"
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'

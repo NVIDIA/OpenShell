@@ -16,6 +16,22 @@ the common protocol owns process, identity, TCP, DNS, and forwarding semantics.
 
 ## Driver Contract
 
+External resource admission is an operator-owned boundary shared by drivers.
+The gateway gates caller driver JSON independently from attachment approval.
+Drivers resolve the complete effective attachment inventory against authoritative
+resource labels before launch and on reuse. Missing labels or an unsupported
+resolver deny access; GPU attachments are an explicit temporary exception.
+Fresh sandbox-private resources instead require verified provisioning ownership.
+Workload metadata must not grant approval or override admission evidence.
+
+The shared evaluator lives in `openshell-core`; native resolution remains in
+each driver. External drivers acknowledge the effective versioned policy through
+capabilities, and policy mismatch prevents activation or new launch operations.
+Trusted deployment configuration can explicitly disable label admission, but
+that opt-out does not waive other ownership and isolation checks. This boundary
+assumes operators control approval metadata and runtime resource replacement;
+it does not provide atomic mount authorization or instantaneous revocation.
+
 Each runtime receives a sandbox spec and canonical policy from the gateway and
 is responsible for:
 
@@ -98,15 +114,14 @@ shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
 composition rule treats a connected session as the stronger signal and keeps `Ready`
 in that case, preventing a lagging snapshot from undoing the session-driven promotion.
 
-**Known HA limitation:** Supervisor sessions are process-local while the public
-sandbox phase is shared. A replica that reconciles a driver snapshot without owning
-the active supervisor session can demote the shared phase to `Provisioning`. The
-session-owning replica may not receive another connection event to restore `Ready`,
-so a usable sandbox can remain unavailable through the public phase gate. Reliable
-HA readiness requires persisted or leased supervisor presence plus routing to the
-session-owning replica. That work is deferred to GitHub issue #1868. Until then,
-deployments that require reliable readiness composition must run a single gateway
-replica.
+**HA session composition:** Live relay handles remain process-local, while the
+session-owning gateway publishes a short-lived owner record in shared PostgreSQL.
+Driver reconciliation treats a fresh local or remote owner as connected, so a
+non-owner replica cannot demote the shared sandbox phase merely because it lacks the
+in-memory stream. Session-bound requests are forwarded to the owning gateway; a
+supervisor reconnect publishes a higher connection epoch before stale-session cleanup
+can demote readiness. Multi-replica deployments therefore require shared PostgreSQL
+and the gateway peer Service configured by the Helm chart.
 
 **Extension point:** Driver-reported readiness is a capability, not an
 operator-configurable hook. A driver may enable it only when it owns workload
@@ -119,9 +134,12 @@ The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
 
-The gateway records driver identity and version from the startup capability
-response. Elevated gateway info reports that initialized driver snapshot instead
-of re-querying drivers on each request.
+The gateway sends its common extension peer metadata with the startup capability
+request. The driver validates that metadata before responding, and the gateway
+rejects a driver whose protocol major or capability requirements are
+incompatible. It records the negotiated protocol, implementation identity and
+version, capability sets, and typed resource support once. Elevated gateway info
+reports that immutable snapshot instead of re-querying drivers on each request.
 
 ## Compiled Driver Selection
 
@@ -182,6 +200,10 @@ supervisor or Sandbox Runtime process replacement does not resume a running
 generation. Planned upgrades stop the sandbox first; the following start mints
 a fresh session, TLS identity, and credential pair. An unexpected replacement
 leaves the old workload on the normal fail-closed disconnect path.
+The gateway commits the new authorization identity and the durable `Starting`
+phase in one resource-version update. A concurrent start that loses that update
+reuses the winning identity, so every idempotent driver retry receives credentials
+that match the persisted sandbox.
 
 A driver stop operation does not complete while its backend still reports an
 in-progress stop. This prevents an immediate start from racing the previous
@@ -220,11 +242,13 @@ conservative operator-managed behavior.
 Drivers that can verify a platform-native sandbox credential advertise
 `GetCapabilities.supports_sandbox_authentication`. On the path-scoped
 `IssueSandboxToken` exchange, the gateway forwards the opaque bearer credential
-to that selected driver through `AuthenticateSandbox`. The driver returns only
-the authenticated sandbox ID. The gateway then verifies that its durable
-sandbox record exists and mints the gateway JWT. The driver socket is therefore
-a sandbox-identity trust boundary, but it does not grant user or administrator
-authority.
+to that selected driver through `AuthenticateSandbox`. The driver returns the
+authenticated sandbox ID and opaque runtime identity. The gateway verifies
+that both match its durable sandbox record and returns a generation-bound
+session JWT whose lineage is checked on every subsequent sandbox RPC. Legacy
+unbound sandbox JWTs are not admitted when session authentication is enabled.
+The driver socket is therefore a sandbox-identity trust boundary, but it does
+not grant user or administrator authority.
 
 ## Deletion Lifecycle
 
@@ -277,7 +301,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Capability-free workload container. | Uses `network_mode=none`; a separate capability-free supervisor container mediates egress and access over a private daemon-local Unix socket volume. |
 | Podman | Existing rootless driver. | Container. | Not converted by this isolation stack. |
-| Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Uses one namespace-wide empty-egress workload NetworkPolicy and a separate capability-free supervisor Pod over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace. |
+| Kubernetes | Cluster deployment through Helm. | Capability-free sandbox Pod. | Always creates a namespace-wide empty-egress workload NetworkPolicy and a separate capability-free supervisor Pod over mutually authenticated TLS. It requires an enforcing CNI and trusted sandbox namespace; the Kubernetes API does not attest policy enforcement. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun or QEMU VM. | The NIC-less guest runs `openshell-sandbox` as PID 1; host `openshell-supervisor` owns gateway networking and reaches the guest over vsock. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
@@ -332,7 +356,16 @@ VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone
 unauthenticated TCP mode is disabled unless explicitly enabled for local
-development.
+development. The VM image cache is owner-only. When the host assembles a
+bootstrap rootfs from OCI layers, cross-layer symlinks may resolve only within
+that rootfs; absolute or escaping targets reject the image before a later layer
+can write through them. Rootfs traversal and mutation use opened directory
+handles with no-follow file creation, so later copies, permission changes, and
+whiteouts cannot be redirected by replacing a validated pathname component.
+The bootstrap rootfs comes only from the operator-configured `bootstrap_image`
+or `default_image`; a sandbox-requested image never becomes the VM bootstrap
+image. The gateway rejects configurations without either trusted source, and
+the standalone driver independently fails startup for the same condition.
 
 Runtime-specific implementation notes belong in the driver crate README:
 
@@ -384,6 +417,30 @@ and explicit `/sandbox` values select `/sandbox`; other paths must already
 exist without symlink or reserved-mount collisions and must be usable by the
 resolved identity. Kubernetes and VM use `/sandbox`.
 
+### Executable Identity Binding
+
+Every mediated network open carries a connection-bound `BinaryIdentity` from
+the isolation backend. The identity contains the socket-owning executable and
+each executable ancestor, nearest first, as an absolute workload path plus a
+SHA-256 digest. The backend resolves these values for the accepted connection
+and hashes already-open live executable objects rather than reopening their
+paths. Command-line paths remain diagnostic context and cannot authorize a
+request.
+
+Before policy evaluation, the supervisor validates and pins the complete leaf
+and ancestor chain in one runtime-scoped trust-on-first-use cache. It rejects
+missing digests, invalid paths, conflicting evidence within a chain, or a
+digest that differs from an existing path pin. Validation and insertion are
+atomic, so a rejected chain cannot leave partial pins.
+
+The cache is shared across authorization paths for the lifetime of the
+supervisor network runtime. Policy reloads replace policy state without
+clearing executable pins; restarting the runtime creates a new cache. OPA
+receives executable and ancestor paths plus endpoint policy context. Digests
+remain supervisor-side integrity evidence and are not policy inputs. Any
+unavailable, incomplete, or conflicting executable evidence fails closed
+before OPA can authorize the connection.
+
 The Kubernetes driver creates the namespace-wide empty-egress workload fence
 before a suspended Sandbox CR, then provisions split immutable bootstrap
 Secrets, the private runtime Service, and a gated supervisor Pod. A
@@ -395,9 +452,8 @@ readiness.
 
 ## Images
 
-The gateway image and Helm chart are built from this repository. Sandbox images
-are maintained separately in the OpenShell Community repository or supplied by
-users.
+The gateway image and Helm chart are built from this repository. Users supply
+workload images as standard OCI images.
 
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
@@ -416,7 +472,9 @@ database-backed installs can render a Deployment with `workload.kind=deployment`
 HA deployments must point `server.externalDbSecret` at an operator-managed
 PostgreSQL database. Agent Sandbox CRDs and controller lifecycle remain
 operator-owned; the chart can optionally preflight for a served supported API
-but does not install the cluster-scoped dependency.
+but does not install the cluster-scoped dependency. OpenShell's Kubernetes test
+clusters install the upstream core manifest; Agent Sandbox extensions are not
+required by the gateway.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.
@@ -440,27 +498,32 @@ management. RBAC uses a namespace-scoped Role.
 
 **Managed** auto-creates a K8s namespace per workspace on first sandbox create.
 Each new namespace receives a ServiceAccount and the configured gateway-only
-SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
-driver's source namespace on every sandbox create so registry credential
-rotations propagate. The namespace also copies OpenShift SCC UID-range and
-supplemental-group annotations from the gateway namespace when present. The
-driver deletes the namespace during workspace deletion. The workspace remains
-durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
-transient failure can be retried. Namespace deletion uses the fetched UID as a
+SSH ingress NetworkPolicy. Each sandbox runtime generation gets immutable copies
+of the configured image-pull Secrets, read from the driver's source namespace and
+named after the generation, so a sandbox picks up rotated registry credentials
+on its next start. Their sources are operator-selected gateway configuration,
+not caller attachments. An existing Secret with a generation name fails the
+create and is never adopted. The namespace also copies
+OpenShift SCC UID-range and supplemental-group annotations from the gateway
+namespace when present. The driver deletes the namespace during workspace
+deletion. The workspace remains durably `Terminating` until the Kubernetes API
+accepts namespace cleanup, so a transient failure can be retried. Namespace
+deletion uses the fetched UID as a
 precondition to avoid deleting a replacement namespace. Requires a non-empty
 `gateway_id` (validated as a
 DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
 limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
 `create`/`delete` and ServiceAccount `create`/`get` permissions.
 
-Secret copies use server-side apply. Kubernetes authorizes an apply to an
-existing Secret as `patch`, but also requires `create` authorization when the
-target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
-managed mode grants cluster-wide Secret `create`, `list`, and `delete` for
-generation-scoped bootstrap Secret creation and rollback recovery while keeping
-source reads and subsequent patches restricted to the explicitly configured TLS
-and image-pull Secret names. Recovery lists bootstrap Secrets by sandbox and
-component labels, then deletes stale generations with UID preconditions. The
+Outside shared mode, the gateway client TLS material is staged into each
+generation's supervisor bootstrap Secret rather than mounted from a Secret in
+the workspace namespace. Every Secret the driver writes into a workspace
+namespace is therefore generation-scoped, immutable, and created with `create`
+only. RBAC cannot constrain `create` by `resourceNames`, so managed mode grants
+cluster-wide Secret `create` and `delete`; source reads use a Role in the
+driver's source namespace. Recovery deletes the Secrets of the recorded and
+target runtime generations by exact name; Pod owner references let garbage
+collection remove any other generation. The
 driver exercises these broad permissions only in gateway-owned managed
 namespaces. This depends on the managed-mode ownership invariant described below;
 the gateway ServiceAccount must not be shared with unrelated workloads.
@@ -468,6 +531,9 @@ the gateway ServiceAccount must not be shared with unrelated workloads.
 Operator mode does not create NetworkPolicies or copy image-pull Secrets.
 Platform teams must apply the gateway ingress boundary and provision configured
 image-pull Secrets in every operator-managed namespace.
+The gateway ClusterRole grants no Secret permissions in operator mode. The
+`openshell-workspace` chart Role installed in each operator-managed namespace
+grants bootstrap Secret `create` and `delete`.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
@@ -500,26 +566,37 @@ The Kubernetes driver's `AuthenticateSandbox` implementation applies its named
   until the first watcher update.
 
 It validates the projected token with Kubernetes `TokenReview`, checks the live
-pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID before
-returning the identity to the gateway. These checks rely on an ownership
-invariant. In shared and managed modes, the Kubernetes driver and its trusted
-Agent Sandbox controller exclusively administer the sandbox namespace, Sandbox
-CRs, sandbox pods, and configured sandbox ServiceAccount. Other principals must
-not create or mutate those resources or use that ServiceAccount. In operator
-mode, the platform operator retains
-namespace lifecycle ownership, but must preserve the same exclusive control of
-Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
-An allowlisted namespace is therefore a trust grant, not a tenant isolation
-boundary. Kubernetes owner references alone do not prove which controller
-created a pod, so admitting principals that can fabricate that resource chain
-would allow them to claim an existing sandbox identity.
+pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID. The
+driver returns both the sandbox ID and an opaque runtime identity derived from
+the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID.
+Advertising sandbox authentication includes the runtime-binding contract. The
+gateway requires non-empty runtime identities from successful create, start,
+and authentication responses. It records the runtime identity when provisioning
+succeeds and requires an exact match before issuing a sandbox JWT. If binding
+validation or storage fails after a lifecycle call succeeds, the gateway
+compensates that call before returning the error. This correlates credential
+authentication with the durable runtime record rather than authorizing from the
+sandbox ID alone.
+
+`StartSandbox` carries the previously recorded opaque identity. Kubernetes
+requires exactly one label-selected Sandbox CR and verifies that its namespace
+and immutable UID match that identity before replacing the supervisor Pod. The
+new Pod UID becomes the updated binding only after the continuity check passes.
+
+Shared and managed modes still reserve the sandbox namespace, Sandbox CRs,
+sandbox pods, and configured sandbox ServiceAccount for the Kubernetes driver
+and trusted Agent Sandbox controller. In operator mode, the platform operator
+retains namespace lifecycle ownership and must preserve the same control of
+those resources. An allowlisted namespace is a trust grant, not a tenant
+isolation boundary.
 
 ### Credential Driver Integration
 
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
-stores secrets in workspace-specific namespaces when `workspace_mode` is managed
-or operator. In shared mode, all secrets render into the single configured
-namespace.
+stores every provider credential in its single configured namespace, in every
+workspace mode, and rejects handles that reference another namespace. The
+gateway reaches those Secrets through a namespaced Role; the gateway
+ClusterRole grants no credential Secret permissions.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

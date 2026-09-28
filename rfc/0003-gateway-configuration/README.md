@@ -122,7 +122,7 @@ scopes_claim  = ""                     # empty disables scope enforcement
 
 [openshell.drivers.kubernetes]
 namespace                    = "openshell"
-default_image                = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image                = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy            = "if_not_present"
 supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:latest"
 supervisor_image_pull_policy = "if_not_present"
@@ -132,7 +132,7 @@ host_gateway_ip              = "10.0.0.1"
 ssh_socket_path              = "/run/openshell/ssh.sock"
 
 [openshell.drivers.docker]
-default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present"
 sandbox_label     = "docker-dev"
 grpc_endpoint     = "https://host.openshell.internal:8080"
@@ -142,7 +142,7 @@ supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"      # used to 
 
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
-default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present" # always | if_not_present | never | newer
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
@@ -225,7 +225,7 @@ disable_tls = true
 
 [openshell.drivers.kubernetes]
 namespace        = "agents"
-default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:0.9.0"
 grpc_endpoint    = "https://openshell-gateway.agents.svc:8080"
 ```
@@ -245,7 +245,7 @@ gateway:
     drivers:
       kubernetes:
         namespace: agents
-        default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+        default_image: nvcr.io/nvidia/base/ubuntu:24.04
         supervisor_image: ghcr.io/nvidia/openshell/supervisor:0.9.0
 ```
 

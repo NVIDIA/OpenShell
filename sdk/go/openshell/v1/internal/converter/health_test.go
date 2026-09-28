@@ -32,6 +32,17 @@ func TestGatewayInfoFromProto(t *testing.T) {
 				},
 			},
 		},
+		Extensions: []*pb.NegotiatedExtensionInfo{
+			{
+				Kind:                  pb.ExtensionKind_EXTENSION_KIND_COMPUTE_DRIVER,
+				ConfiguredName:        "k8s",
+				ImplementationName:    "openshell/kubernetes",
+				ImplementationVersion: "1.5.0",
+				ProtocolMajor:         1,
+				SupportedCapabilities: []string{"openshell.compute.contract"},
+				RequiredCapabilities:  []string{"openshell.compute.contract"},
+			},
+		},
 	}
 
 	info := GatewayInfoFromProto(proto)
@@ -45,6 +56,10 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
 	assert.Equal(t, "docker", info.ComputeDrivers[1].Name)
 	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].DriverName)
+	require.Len(t, info.Extensions, 1)
+	assert.Equal(t, v1.ExtensionKindComputeDriver, info.Extensions[0].Kind)
+	assert.Equal(t, "openshell/kubernetes", info.Extensions[0].ImplementationName)
+	assert.Equal(t, uint32(1), info.Extensions[0].ProtocolMajor)
 }
 
 func TestGatewayInfoFromProto_NoDrivers(t *testing.T) {
@@ -72,12 +87,20 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 		ComputeDrivers: []*pb.ComputeDriverInfo{
 			{Name: "k8s", Capabilities: &pb.ComputeDriverCapabilities{DriverName: "kubernetes"}},
 		},
+		Extensions: []*pb.NegotiatedExtensionInfo{{
+			ConfiguredName:        "k8s",
+			SupportedCapabilities: []string{"openshell.compute.contract"},
+		}},
 	}
 
 	info := GatewayInfoFromProto(proto)
 	proto.ComputeDrivers[0].Name = "mutated"
+	proto.Extensions[0].ConfiguredName = "mutated"
+	proto.Extensions[0].SupportedCapabilities[0] = "mutated"
 
 	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
+	assert.Equal(t, "k8s", info.Extensions[0].ConfiguredName)
+	assert.Equal(t, "openshell.compute.contract", info.Extensions[0].SupportedCapabilities[0])
 }
 
 func TestServiceStatusFromProto(t *testing.T) {

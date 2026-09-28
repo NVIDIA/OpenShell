@@ -25,6 +25,7 @@ use crate::isolation::{
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
 pub const SUPERVISOR_SECRET_COMPONENT: &str = "supervisor-bootstrap";
+pub const IMAGE_PULL_SECRET_COMPONENT: &str = "image-pull";
 pub const BOUNDARY_CONFIG_KEY: &str = "boundary.json";
 pub const BACKEND_DESCRIPTOR_KEY: &str = "runtime-descriptor.json";
 pub const BOUNDARY_CERTIFICATE_KEY: &str = "tls.crt";
@@ -32,6 +33,13 @@ pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
 pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
+/// Optional bootstrap-Secret key holding the operator's corporate proxy CA
+/// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
+/// which is the sandbox's own generated TLS-interception CA.
+pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
+pub const CLIENT_TLS_CERTIFICATE_KEY: &str = "client-tls.crt";
+pub const CLIENT_TLS_PRIVATE_KEY: &str = "client-tls.key";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
@@ -40,10 +48,37 @@ pub const BACKEND_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descri
 pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
+/// Where [`UPSTREAM_PROXY_CA_BUNDLE_KEY`] lands in the supervisor container.
+///
+/// The `bootstrap` volume mounts the whole Secret read-only at
+/// `/.openshell/supervisor` with no `items` filter, so the key appears here
+/// without a dedicated volume or mount.
+pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
+pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
+pub const CLIENT_TLS_CERTIFICATE_PATH: &str = "/.openshell/supervisor/client-tls.crt";
+pub const CLIENT_TLS_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/client-tls.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
+
+/// Gateway client TLS material staged into the supervisor bootstrap Secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientTlsMaterial {
+    pub ca_certificate: Vec<u8>,
+    pub certificate: Vec<u8>,
+    pub private_key: Vec<u8>,
+}
+
+/// Where the supervisor reads its gateway client TLS material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisorClientTls<'a> {
+    Disabled,
+    /// A Secret in the sandbox namespace, mounted by name.
+    Secret(&'a str),
+    /// Keys staged into the supervisor bootstrap Secret.
+    Bootstrap,
+}
 
 pub struct ProxyCaMaterial {
     pub certificate_pem: String,
@@ -78,6 +113,7 @@ pub struct SandboxRuntimeNames {
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
+    image_pull_secret_prefix: String,
 }
 
 impl SandboxRuntimeNames {
@@ -91,6 +127,7 @@ impl SandboxRuntimeNames {
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
+            image_pull_secret_prefix: format!("os-pull-{suffix}"),
         }
     }
 
@@ -107,7 +144,17 @@ impl SandboxRuntimeNames {
             .to_ascii_lowercase();
         names.sandbox_secret = format!("{}-{generation}", names.sandbox_secret);
         names.supervisor_secret = format!("{}-{generation}", names.supervisor_secret);
+        names.image_pull_secret_prefix = format!("{}-{generation}", names.image_pull_secret_prefix);
         names
+    }
+
+    /// Names of the image-pull Secrets staged for this generation, one per
+    /// configured source Secret.
+    #[must_use]
+    pub fn image_pull_secrets(&self, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{}-{index}", self.image_pull_secret_prefix))
+            .collect()
     }
 }
 
@@ -176,7 +223,7 @@ pub fn supervisor_pod(
     control_gid: u32,
     image_pull_secrets: &[String],
     grpc_endpoint: &str,
-    client_tls_secret_name: &str,
+    client_tls: SupervisorClientTls<'_>,
     main_process_spec: &str,
     log_level: &str,
     sa_token_ttl_secs: i64,
@@ -185,6 +232,7 @@ pub fn supervisor_pod(
     proxy_auth_secret: Option<(&str, &str)>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
+    upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
 ) -> Result<Pod, String> {
@@ -249,24 +297,32 @@ pub fn supervisor_pod(
         empty_dir_volume("run"),
         empty_dir_volume("logs"),
     ];
-    if !client_tls_secret_name.is_empty() {
-        environment.extend([
-            env_var("OPENSHELL_TLS_CA", "/var/run/secrets/openshell-tls/ca.crt"),
-            env_var(
-                "OPENSHELL_TLS_CERT",
-                "/var/run/secrets/openshell-tls/tls.crt",
-            ),
-            env_var(
-                "OPENSHELL_TLS_KEY",
-                "/var/run/secrets/openshell-tls/tls.key",
-            ),
-        ]);
-        volume_mounts.push(volume_mount(
-            "client-tls",
-            "/var/run/secrets/openshell-tls",
-            true,
-        ));
-        volumes.push(secret_volume("client-tls", client_tls_secret_name, None));
+    match client_tls {
+        SupervisorClientTls::Disabled => {}
+        SupervisorClientTls::Secret(secret_name) => {
+            environment.extend([
+                env_var("OPENSHELL_TLS_CA", "/var/run/secrets/openshell-tls/ca.crt"),
+                env_var(
+                    "OPENSHELL_TLS_CERT",
+                    "/var/run/secrets/openshell-tls/tls.crt",
+                ),
+                env_var(
+                    "OPENSHELL_TLS_KEY",
+                    "/var/run/secrets/openshell-tls/tls.key",
+                ),
+            ]);
+            volume_mounts.push(volume_mount(
+                "client-tls",
+                "/var/run/secrets/openshell-tls",
+                true,
+            ));
+            volumes.push(secret_volume("client-tls", secret_name, None));
+        }
+        SupervisorClientTls::Bootstrap => environment.extend([
+            env_var("OPENSHELL_TLS_CA", CLIENT_TLS_CA_PATH),
+            env_var("OPENSHELL_TLS_CERT", CLIENT_TLS_CERTIFICATE_PATH),
+            env_var("OPENSHELL_TLS_KEY", CLIENT_TLS_PRIVATE_KEY_PATH),
+        ]),
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
@@ -296,6 +352,14 @@ pub fn supervisor_pod(
     }
     if proxy_connect_by_hostname {
         command.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    // The bundle rides in the bootstrap Secret already mounted at
+    // /.openshell/supervisor, so this needs no volume of its own.
+    if upstream_proxy_ca_bundle_staged {
+        command.extend([
+            "--upstream-proxy-ca-bundle".to_string(),
+            UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
+        ]);
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
@@ -466,8 +530,49 @@ pub fn supervisor_bootstrap_secret(
     supervisor_auth_bundle: Vec<u8>,
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
+    upstream_proxy_ca_bundle: Option<Vec<u8>>,
+    client_tls: Option<ClientTlsMaterial>,
     owner: OwnerReference,
 ) -> Secret {
+    let mut data = BTreeMap::from([
+        (
+            BACKEND_DESCRIPTOR_KEY.to_string(),
+            ByteString(backend_descriptor),
+        ),
+        (
+            SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
+            ByteString(supervisor_auth_bundle),
+        ),
+        (
+            PROXY_CA_CERTIFICATE_KEY.to_string(),
+            ByteString(proxy_ca_certificate),
+        ),
+        (
+            PROXY_CA_PRIVATE_KEY.to_string(),
+            ByteString(proxy_ca_private_key),
+        ),
+    ]);
+    // Staged only when the operator configured `proxy_ca_bundle`; the
+    // supervisor keys its behavior off the argument, not the file's presence.
+    if let Some(bundle) = upstream_proxy_ca_bundle {
+        data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
+    }
+    if let Some(tls) = client_tls {
+        data.extend([
+            (
+                CLIENT_TLS_CA_KEY.to_string(),
+                ByteString(tls.ca_certificate),
+            ),
+            (
+                CLIENT_TLS_CERTIFICATE_KEY.to_string(),
+                ByteString(tls.certificate),
+            ),
+            (
+                CLIENT_TLS_PRIVATE_KEY.to_string(),
+                ByteString(tls.private_key),
+            ),
+        ]);
+    }
     Secret {
         metadata: ObjectMeta {
             name: Some(names.supervisor_secret.clone()),
@@ -476,26 +581,34 @@ pub fn supervisor_bootstrap_secret(
             labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([
-            (
-                BACKEND_DESCRIPTOR_KEY.to_string(),
-                ByteString(backend_descriptor),
-            ),
-            (
-                SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
-                ByteString(supervisor_auth_bundle),
-            ),
-            (
-                PROXY_CA_CERTIFICATE_KEY.to_string(),
-                ByteString(proxy_ca_certificate),
-            ),
-            (
-                PROXY_CA_PRIVATE_KEY.to_string(),
-                ByteString(proxy_ca_private_key),
-            ),
-        ])),
+        data: Some(data),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Copy a configured image-pull Secret into an immutable Secret for one
+/// runtime generation.
+#[must_use]
+pub fn image_pull_secret_copy(
+    namespace: &str,
+    name: &str,
+    sandbox_id: &str,
+    source: &Secret,
+    owners: Vec<OwnerReference>,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(owners),
+            labels: Some(common_labels(sandbox_id, IMAGE_PULL_SECRET_COMPONENT)),
+            ..Default::default()
+        },
+        data: source.data.clone(),
+        immutable: Some(true),
+        type_: source.type_.clone(),
         ..Default::default()
     }
 }
@@ -612,6 +725,171 @@ mod tests {
     }
 
     #[test]
+    fn generation_names_include_per_generation_image_pull_secrets() {
+        let first = SandboxRuntimeNames::for_generation("pair", "ABCdef123456789");
+        let second = SandboxRuntimeNames::for_generation("pair", "zyx987654321000");
+        assert_eq!(
+            first.image_pull_secrets(2),
+            ["os-pull-pair-abcdef123456-0", "os-pull-pair-abcdef123456-1"]
+        );
+        assert!(second.image_pull_secrets(1)[0] != first.image_pull_secrets(1)[0]);
+        assert!(first.image_pull_secrets(0).is_empty());
+    }
+
+    #[test]
+    fn image_pull_secret_copy_is_immutable_and_owned_by_both_pods() {
+        let names = SandboxRuntimeNames::for_generation("pair", "gen7");
+        let source = Secret {
+            metadata: ObjectMeta {
+                name: Some("regcred".to_string()),
+                namespace: Some("openshell".to_string()),
+                labels: Some(BTreeMap::from([("team".to_string(), "a".to_string())])),
+                uid: Some("source-uid".to_string()),
+                resource_version: Some("42".to_string()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+            data: Some(BTreeMap::from([(
+                ".dockerconfigjson".to_string(),
+                ByteString(b"{}".to_vec()),
+            )])),
+            ..Default::default()
+        };
+        let owners = vec![owner(), owner()];
+        let copy = image_pull_secret_copy(
+            "workspace",
+            &names.image_pull_secrets(1)[0],
+            "pair",
+            &source,
+            owners.clone(),
+        );
+        assert_eq!(copy.metadata.name.as_deref(), Some("os-pull-pair-gen7-0"));
+        assert_eq!(copy.metadata.namespace.as_deref(), Some("workspace"));
+        assert_eq!(copy.metadata.owner_references, Some(owners));
+        assert_eq!(
+            copy.metadata.labels.as_ref().unwrap()["openshell.ai/component"],
+            IMAGE_PULL_SECRET_COMPONENT
+        );
+        assert!(copy.metadata.uid.is_none());
+        assert!(copy.metadata.resource_version.is_none());
+        assert_eq!(copy.immutable, Some(true));
+        assert_eq!(copy.type_, source.type_);
+        assert_eq!(copy.data, source.data);
+    }
+
+    #[test]
+    fn supervisor_bootstrap_secret_carries_client_tls_material() {
+        let names = SandboxRuntimeNames::new("pair");
+        let secret = supervisor_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(ClientTlsMaterial {
+                ca_certificate: b"ca".to_vec(),
+                certificate: b"cert".to_vec(),
+                private_key: b"key".to_vec(),
+            }),
+            owner(),
+        );
+        let data = secret.data.expect("Secret data");
+        assert_eq!(data[CLIENT_TLS_CA_KEY].0, b"ca");
+        assert_eq!(data[CLIENT_TLS_CERTIFICATE_KEY].0, b"cert");
+        assert_eq!(data[CLIENT_TLS_PRIVATE_KEY].0, b"key");
+    }
+
+    fn supervisor_pod_with_client_tls(client_tls: SupervisorClientTls<'_>) -> Pod {
+        supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            client_tls,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            owner(),
+        )
+        .expect("render supervisor Pod")
+    }
+
+    fn tls_env_and_volumes(pod: &Pod) -> (BTreeMap<String, String>, Vec<String>) {
+        let spec = pod.spec.as_ref().expect("Pod spec");
+        let env = spec.containers[0]
+            .env
+            .as_ref()
+            .expect("env")
+            .iter()
+            .filter(|variable| variable.name.starts_with("OPENSHELL_TLS_"))
+            .map(|variable| {
+                (
+                    variable.name.clone(),
+                    variable.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let volumes = spec
+            .volumes
+            .as_ref()
+            .expect("volumes")
+            .iter()
+            .map(|volume| volume.name.clone())
+            .collect();
+        (env, volumes)
+    }
+
+    #[test]
+    fn supervisor_pod_reads_client_tls_from_the_bootstrap_secret() {
+        let (env, volumes) = tls_env_and_volumes(&supervisor_pod_with_client_tls(
+            SupervisorClientTls::Bootstrap,
+        ));
+        assert_eq!(env["OPENSHELL_TLS_CA"], CLIENT_TLS_CA_PATH);
+        assert_eq!(env["OPENSHELL_TLS_CERT"], CLIENT_TLS_CERTIFICATE_PATH);
+        assert_eq!(env["OPENSHELL_TLS_KEY"], CLIENT_TLS_PRIVATE_KEY_PATH);
+        assert!(CLIENT_TLS_CA_PATH.starts_with("/.openshell/supervisor/"));
+        assert!(!volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
+    fn supervisor_pod_mounts_a_client_tls_secret_by_name() {
+        let pod = supervisor_pod_with_client_tls(SupervisorClientTls::Secret("client-tls"));
+        let (env, volumes) = tls_env_and_volumes(&pod);
+        assert_eq!(
+            env["OPENSHELL_TLS_CA"],
+            "/var/run/secrets/openshell-tls/ca.crt"
+        );
+        assert!(volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
+    fn supervisor_pod_omits_client_tls_when_disabled() {
+        let (env, volumes) = tls_env_and_volumes(&supervisor_pod_with_client_tls(
+            SupervisorClientTls::Disabled,
+        ));
+        assert!(env.is_empty());
+        assert!(!volumes.contains(&"client-tls".to_string()));
+    }
+
+    #[test]
     fn owner_reference_does_not_require_finalizer_mutation_permission() {
         assert_eq!(owner().block_owner_deletion, Some(false));
     }
@@ -632,13 +910,14 @@ mod tests {
             1000,
             &["registry-credentials".to_string()],
             "https://gateway:8080",
-            "client-tls",
+            SupervisorClientTls::Secret("client-tls"),
             "{}",
             "info",
             600,
             None,
             None,
             None,
+            false,
             false,
             false,
             None,
@@ -792,6 +1071,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
+            None,
             owner(),
         );
         assert_eq!(
@@ -812,6 +1093,134 @@ mod tests {
                 SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
                 BACKEND_DESCRIPTOR_KEY.to_string(),
             ])
+        );
+
+        // With `proxy_ca_bundle` configured the operator bundle rides along in
+        // the same immutable Secret, so kubelet cannot live-update the trust
+        // anchor underneath a running sandbox.
+        let staged = supervisor_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(b"-----BEGIN CERTIFICATE-----\n".to_vec()),
+            None,
+            owner(),
+        );
+        assert_eq!(staged.immutable, Some(true));
+        let staged_data = staged.data.expect("Secret data");
+        assert_eq!(
+            staged_data
+                .get(UPSTREAM_PROXY_CA_BUNDLE_KEY)
+                .map(|value| value.0.clone()),
+            Some(b"-----BEGIN CERTIFICATE-----\n".to_vec())
+        );
+        // The generated interception CA is a separate key and must not be
+        // overwritten by the operator bundle.
+        assert!(staged_data.contains_key(PROXY_CA_CERTIFICATE_KEY));
+    }
+
+    /// Render a supervisor Pod configured for an `https://` corporate proxy,
+    /// varying only whether the operator CA bundle was staged.
+    fn supervisor_pod_with_staged_proxy_ca(staged: bool) -> Pod {
+        let names = SandboxRuntimeNames::new("pair");
+        supervisor_pod(
+            "sandbox",
+            &names,
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Secret("client-tls"),
+            "{}",
+            "info",
+            600,
+            Some("https://proxy.corp.example:3130"),
+            None,
+            None,
+            false,
+            false,
+            staged,
+            None,
+            owner(),
+        )
+        .expect("render supervisor Pod")
+    }
+
+    #[test]
+    fn supervisor_pod_passes_upstream_proxy_ca_bundle_argument() {
+        let pod = supervisor_pod_with_staged_proxy_ca(true);
+        let spec = pod.spec.as_ref().expect("Pod spec");
+        let container = &spec.containers[0];
+        let command = container.command.as_ref().expect("supervisor command");
+        assert!(
+            command
+                .windows(2)
+                .any(|args| args == ["--upstream-proxy-ca-bundle", UPSTREAM_PROXY_CA_BUNDLE_PATH]),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_pod_omits_the_ca_bundle_argument_when_unstaged() {
+        // The supervisor keys its behavior off the argument, so an unstaged
+        // bundle must not leave a dangling path on the argv.
+        let pod = supervisor_pod_with_staged_proxy_ca(false);
+        let spec = pod.spec.as_ref().expect("Pod spec");
+        let command = spec.containers[0]
+            .command
+            .as_ref()
+            .expect("supervisor command");
+        assert!(
+            !command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-ca-bundle"),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn staging_the_ca_bundle_adds_no_volume_or_mount() {
+        // The bundle rides in the bootstrap Secret, whose volume already
+        // mounts every key at /.openshell/supervisor. A new volume here would
+        // mean the Secret is being projected with an `items` filter that would
+        // silently drop the new key.
+        let staged = supervisor_pod_with_staged_proxy_ca(true);
+        let bare = supervisor_pod_with_staged_proxy_ca(false);
+        let volume_names = |pod: &Pod| {
+            pod.spec
+                .as_ref()
+                .expect("Pod spec")
+                .volumes
+                .as_ref()
+                .expect("volumes")
+                .iter()
+                .map(|volume| volume.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mount_paths = |pod: &Pod| {
+            pod.spec.as_ref().expect("Pod spec").containers[0]
+                .volume_mounts
+                .as_ref()
+                .expect("volume mounts")
+                .iter()
+                .map(|mount| mount.mount_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(volume_names(&staged), volume_names(&bare));
+        assert_eq!(mount_paths(&staged), mount_paths(&bare));
+        assert!(
+            UPSTREAM_PROXY_CA_BUNDLE_PATH.starts_with("/.openshell/supervisor/"),
+            "the bundle must land inside the bootstrap mount"
         );
     }
 

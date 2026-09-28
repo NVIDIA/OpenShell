@@ -85,7 +85,7 @@ STEP_10_CANDIDATE_COMMIT = EXPECTED_EXECUTED_CANDIDATE_COMMITS[
     "compute-driver-boundary-parity"
 ]
 STEP_10_REPORT_SHA256 = (
-    "65541eec5f642461a88b04b5459474fd7a475adeb7071a65a53fe183caad6a01"
+    "3c1297eef6c0a3b22530b980b571bda2d967a39a79a3e3286bcc09e30df84bf3"
 )
 STEP_10_EVIDENCE_BUNDLES = {
     "in_tree": "target/parity/step10-intree-4a39da51",

@@ -220,7 +220,7 @@ overrides that persist across package upgrades.
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
-| `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
+| `[openshell.drivers.podman].default_image` | `nvcr.io/nvidia/base/ubuntu:24.04` | Default sandbox image. |
 | `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Static musl sandbox runtime image mounted into Podman workloads. |
 | `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Dynamic glibc supervisor image used outside the workload. |
 | `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
@@ -229,6 +229,10 @@ overrides that persist across package upgrades.
 
 The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
 the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
+The SQLite database runs in WAL mode with `synchronous=FULL` (SSH session
+issuance alone uses `NORMAL`), so
+`openshell.db-wal` and `openshell.db-shm` sit next to it and must be kept
+together with it; back it up with `sqlite3 openshell.db ".backup <copy>"`.
 
 ### Driver TOML settings
 
@@ -244,7 +248,7 @@ compute_driver = "podman"
 
 [openshell.drivers.podman]
 network_name = "openshell"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present"
 health_check_interval_secs = 10
 stop_timeout_secs = 10
@@ -260,7 +264,7 @@ To update cached images:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 Or set `image_pull_policy = "always"` in
@@ -272,7 +276,7 @@ To pin specific image versions instead of `:latest`, set these values in
 ```toml
 sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:v0.0.37"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 ```
 
 For air-gapped environments:
@@ -281,9 +285,9 @@ For air-gapped environments:
 
    ```shell
    podman pull ghcr.io/nvidia/openshell/supervisor:latest
-   podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman pull nvcr.io/nvidia/base/ubuntu:24.04
    podman save -o supervisor.tar ghcr.io/nvidia/openshell/supervisor:latest
-   podman save -o sandbox.tar ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman save -o sandbox.tar nvcr.io/nvidia/base/ubuntu:24.04
    ```
 
 1. Transfer the tarballs to the air-gapped host and load them:

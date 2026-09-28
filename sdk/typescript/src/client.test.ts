@@ -24,6 +24,7 @@ import {
 } from './client.js';
 import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
+import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
   const transport: Transport = createRouterTransport((router) => {
@@ -274,6 +275,36 @@ describe('exec / execStream', () => {
 });
 
 describe('create', () => {
+  it('sends create-time service exposures', async () => {
+    let created: { serviceExposures?: Array<{ service?: string; targetPort?: number }> } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return {
+          ...readySandbox('sb', 'sb-id'),
+          serviceUrls: {
+            '': 'https://sb.example.test/',
+            metrics: 'https://metrics.sb.example.test/',
+          },
+        };
+      },
+    });
+
+    const result = await sandbox.create({
+      image: 'img',
+      serviceExposures: [{ targetPort: 4500 }, { service: 'metrics', targetPort: 9090 }],
+    });
+
+    expect(created.serviceExposures?.map(({ service, targetPort }) => ({ service, targetPort }))).toEqual([
+      { service: '', targetPort: 4500 },
+      { service: 'metrics', targetPort: 9090 },
+    ]);
+    expect(result.serviceUrls).toEqual({
+      '': 'https://sb.example.test/',
+      metrics: 'https://metrics.sb.example.test/',
+    });
+  });
+
   it('sends the curated policy through spec.policy', async () => {
     let created: { spec?: { policy?: { version?: number } } } = {};
     const sandbox = client({
@@ -509,7 +540,7 @@ describe('create', () => {
     await sandbox.createSshSession('ssh', { workspace: 'staging' });
     const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
-    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
     await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
@@ -584,6 +615,44 @@ describe('create', () => {
     await expect(pager.nextPage()).rejects.toThrow('temporary failure');
     await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: '' });
     expect(tokens).toEqual(['resume', 'resume']);
+  });
+
+  it('rejects a repeated continuation token', async () => {
+    const pager = new Pager<number>(async (token) => ({ items: [1], nextPageToken: token }), 'resume');
+
+    await expect(pager.nextPage()).rejects.toThrow('pager received a repeated continuation token');
+  });
+
+  it('prevents a request when the token-count budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: 'next' };
+      },
+      'first',
+      1,
+    );
+
+    await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: 'next' });
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual(['first']);
+  });
+
+  it('prevents a request when the token-byte budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: '' };
+      },
+      'too-large',
+      10,
+      1,
+    );
+
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual([]);
   });
 
   it('createFromTemplate rejects an empty template name locally', async () => {
@@ -677,7 +746,7 @@ describe('sandbox templates', () => {
         metadata: { name: 'python', labels: { team: 'runtime' } },
         spec: {
           workload: {
-            image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+            image: 'registry.example.com/agents/python:latest',
             environment: { FEATURE_FLAG: 'on' },
             resources: { cpu: '1', memory: '512Mi', gpu: { count: 1 } },
           },
@@ -926,6 +995,35 @@ describe('Pushable', () => {
 });
 
 describe('execInteractive', () => {
+  it('preserves legacy session implementations and exposes SDK lifecycle controls', async () => {
+    // These are exactly the original required members, checked through the
+    // public package exports so downstream wrappers can keep their old types.
+    const legacy: ExecInteractiveSession = {
+      output: (async function* () {
+        yield { type: 'exit' as const, exitCode: 0 };
+      })(),
+      write() {},
+      resize() {},
+      close() {},
+      done: Promise.resolve(0),
+    };
+    const wrap = (session: ExecInteractiveSession): ExecInteractiveSession => session;
+    expect(wrap(legacy)).toBe(legacy);
+
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const controlled: ExecInteractiveSessionControl = await sandbox.execInteractive('sb', ['true']);
+    expect(wrap(controlled)).toBe(controlled);
+    controlled.closeInput();
+    expect(await controlled.done).toBe(0);
+    expect(controlled.exitCode).toBe(0);
+    controlled.cancel();
+  });
+
   it('sends start first with tty/cols/rows, streams output, and resolves done', async () => {
     const cases: string[] = [];
     let started: (ScopedRequest & { tty?: boolean; cols?: number; rows?: number }) | undefined;
@@ -979,6 +1077,184 @@ describe('execInteractive', () => {
 });
 
 describe('exec done settlement', () => {
+  it('starts the command and observes completion before output is consumed', async () => {
+    let started = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        started = true;
+        yield { payload: { case: 'stdout', value: { data: enc('started') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect.poll(() => started).toBe(true);
+    expect(await session.done).toBe(0);
+    const events = [];
+    for await (const event of session.output) events.push(event);
+    expect(events).toEqual([
+      { stream: 'stdout', data: Buffer.from('started') },
+      { type: 'exit', exitCode: 0 },
+    ]);
+  });
+
+  it('observes early transport failures without output consumption', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: () => {
+        throw new ConnectError('early failure', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toMatchObject({ connectCode: Code.Unavailable });
+  });
+
+  it('cancels a receiver blocked by output backpressure', async () => {
+    let released = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (_requests, ctx) {
+        ctx.signal.addEventListener('abort', () => {
+          released = true;
+        });
+        // More than the SDK queue budget, in one transport event.
+        yield { payload: { case: 'stdout', value: { data: new Uint8Array(4 * 1024 * 1024) } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(session.exitCode).toBeUndefined();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await expect.poll(() => released).toBe(true);
+    await expect(session.output[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'canceled' });
+  });
+
+  it('drains output larger than the queue budget without losing bytes', async () => {
+    const data = Buffer.alloc(2 * 1024 * 1024 + 7, 'x');
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data } } };
+        yield { payload: { case: 'stderr', value: { data: enc('last') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 3 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    const chunks: Buffer[] = [];
+    for await (const event of session.output) {
+      if ('type' in event) expect(await session.done).toBe(3);
+      else chunks.push(event.data);
+    }
+    const actual = Buffer.concat(chunks);
+    const expected = Buffer.concat([data, Buffer.from('last')]);
+    expect(actual.length).toBe(expected.length);
+    // Compare bytes natively: deep equality on a multi-MiB Buffer can exhaust
+    // the test timeout on CI even when the stream drains promptly.
+    expect(actual.equals(expected)).toBe(true);
+  });
+
+  it('retains the exit code but rejects completion on a later transport error', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 7 } } };
+        throw new ConnectError('connection lost after exit', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain through trailers */
+        }
+      })(),
+    ).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    expect(session.exitCode).toBe(7);
+  });
+
+  it.each(['stdout', 'exit'] as const)('rejects %s after an exit event', async (payload) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+        if (payload === 'stdout') yield { payload: { case: 'stdout', value: { data: enc('late') } } };
+        else yield { payload: { case: 'exit', value: { exitCode: 1 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain */
+        }
+      })(),
+    ).rejects.toThrow('after exit');
+    await expect(session.done).rejects.toThrow('after exit');
+    expect(session.exitCode).toBe(0);
+  });
+
+  it('closes input idempotently and rejects later stdin and resize', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (requests) {
+        for await (const _input of requests) {
+          /* wait for request EOF */
+        }
+        yield { payload: { case: 'stdout', value: { data: enc('drained') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.closeInput();
+    session.close();
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+    const output = [];
+    for await (const event of session.output) output.push(event);
+    expect(output).toHaveLength(2);
+    expect(await session.done).toBe(0);
+  });
+
+  it('cancel settles completion even before output is consumed', async () => {
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.cancel();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion before output is consumed', async () => {
+    const controller = new AbortController();
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion while output is paused', async () => {
+    const controller = new AbortController();
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await iterator.next();
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await iterator.return?.();
+  });
+
   it('resolves done even when the consumer breaks right after the exit event', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
@@ -992,7 +1268,7 @@ describe('exec done settlement', () => {
     for await (const event of session.output) {
       if ('type' in event) break; // break on exit: the generator never resumes
     }
-    // Without settling `done` before the exit yield, this would hang forever.
+    // The public exit is yielded only after successful terminal status.
     expect(await session.done).toBe(3);
   });
 
@@ -1070,23 +1346,66 @@ describe('providers', () => {
     expect(detach.changed).toBe(false);
   });
 
-  it('lists providers with u64 resourceVersion rendered as a string', async () => {
+  it('lists one provider page with its continuation token', async () => {
+    const pageTokens: string[] = [];
     const sandbox = client({
-      listSandboxProviders: () => ({
-        providers: [
-          {
-            metadata: {
-              id: 'p1',
-              name: 'claude',
-              labels: { a: 'b' },
-              resourceVersion: 99n,
+      listSandboxProviders: ({ pageToken, pageSize }) => {
+        pageTokens.push(pageToken);
+        expect(pageSize).toBe(1);
+        return {
+          providers: [
+            {
+              metadata: { id: 'p1', name: 'claude', resourceVersion: 99n },
+              type: 'claude',
             },
-            type: 'claude',
-          },
-        ],
-      }),
+          ],
+          nextPageToken: 'page-2',
+        };
+      },
     });
-    const providers = await sandbox.listProviders('sb');
+
+    const page = await sandbox.listProviders('sb', { pageSize: 1 }).nextPage();
+    expect(page).toMatchObject({ nextPageToken: 'page-2' });
+    expect(page?.items.map((provider) => provider.name)).toEqual(['claude']);
+    expect(pageTokens).toEqual(['']);
+  });
+
+  it('lists all providers with u64 resourceVersion rendered as a string', async () => {
+    const pageTokens: string[] = [];
+    const sandbox = client({
+      listSandboxProviders: ({ pageToken }) => {
+        pageTokens.push(pageToken);
+        return pageToken === ''
+          ? {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p1',
+                    name: 'claude',
+                    labels: { a: 'b' },
+                    resourceVersion: 99n,
+                  },
+                  type: 'claude',
+                },
+              ],
+              nextPageToken: 'page-2',
+            }
+          : {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p2',
+                    name: 'github',
+                    resourceVersion: 100n,
+                  },
+                  type: 'github',
+                },
+              ],
+              nextPageToken: '',
+            };
+      },
+    });
+    const providers = await sandbox.listAllProviders('sb');
     expect(providers).toEqual([
       {
         id: 'p1',
@@ -1095,7 +1414,15 @@ describe('providers', () => {
         labels: { a: 'b' },
         resourceVersion: '99',
       },
+      {
+        id: 'p2',
+        name: 'github',
+        type: 'github',
+        labels: {},
+        resourceVersion: '100',
+      },
     ]);
+    expect(pageTokens).toEqual(['', 'page-2']);
   });
 });
 

@@ -20,7 +20,7 @@ use std::time::Duration;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::{ContainerEngine, e2e_network_name};
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1312,18 +1312,6 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
     std::fs::create_dir(&context).map_err(|_| "could not allocate public image context")?;
     let backend_tls = directory.path().join("backend-tls");
     std::fs::create_dir(&backend_tls).map_err(|_| "could not allocate backend TLS directory")?;
-    let base = std::env::var("OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string());
-    if base.chars().any(char::is_whitespace) {
-        return Err("fixture image reference contains whitespace".to_string());
-    }
-    let binaries = base_binaries(&base).await?;
-    let python = binaries["python"]
-        .as_str()
-        .ok_or("Python executable was absent")?;
-    let curl = binaries["curl"]
-        .as_str()
-        .ok_or("curl executable was absent")?;
     let image = FixtureImage::new()?;
     let supervisor_image = FixtureImage::new()?;
     // Each backend has its own network namespace, so fixed internal ports need
@@ -1340,7 +1328,28 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
     let result = async {
         // Begin container mutation inside this scope so certificate, image,
         // and enrollment failures still reach explicit bounded teardown.
-        let [host, other_host] = backend.spawn(&base, &backend_tls).await?;
+        std::fs::write(context.join("client.py"), CLIENT)
+            .map_err(|_| "could not write client source")?;
+        let dockerfile = context.join("Dockerfile");
+        std::fs::write(
+            &dockerfile,
+            format!(
+                "FROM {E2E_WORKLOAD_IMAGE}\nCOPY client.py /opt/provider-readiness-client.py\nUSER 1000:1000\n",
+            ),
+        )
+        .map_err(|_| "could not write fixture Dockerfile")?;
+        image
+            .build(&dockerfile, &context, "build workload fixture image")
+            .await?;
+        let binaries = base_binaries(image.tag()).await?;
+        let python = binaries["python"]
+            .as_str()
+            .ok_or("Python executable was absent")?;
+        let curl = binaries["curl"]
+            .as_str()
+            .ok_or("curl executable was absent")?;
+
+        let [host, other_host] = backend.spawn(image.tag(), &backend_tls).await?;
         let (certificate, private_key) =
             generate_certificates(directory.path(), &host, &other_host).await?;
         std::fs::copy(&certificate, backend_tls.join("backend.crt"))
@@ -1362,12 +1371,6 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
             .await?;
         std::fs::copy(directory.path().join("ca.crt"), context.join("fixture-ca.crt"))
             .map_err(|_| "could not copy public fixture CA")?;
-        std::fs::write(context.join("client.py"), CLIENT)
-            .map_err(|_| "could not write client source")?;
-        let dockerfile = context.join("Dockerfile");
-        std::fs::write(&dockerfile, format!(
-            "FROM {base}\nUSER root\nCOPY client.py /opt/provider-readiness-client.py\nUSER sandbox\n"
-        )).map_err(|_| "could not write fixture Dockerfile")?;
         let supervisor_dockerfile = context.join("Dockerfile.supervisor");
         // Outbound TLS belongs to the separate supervisor. Assemble its combined
         // public trust bundle in the shell-capable workload image because the
@@ -1375,13 +1378,11 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
         // image's user setting: Docker's archive upload applies an explicit image
         // user to the supervisor's private bootstrap files.
         std::fs::write(&supervisor_dockerfile, format!(
-            "FROM {} AS supervisor\nFROM {base} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/readiness-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
+            "FROM {} AS supervisor\nFROM {} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/readiness-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
             gateway_config.supervisor_image,
+            image.tag(),
             gateway_config.supervisor_image,
         )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
-        image
-            .build(&dockerfile, &context, "build workload fixture image")
-            .await?;
         supervisor_image
             .build(
                 &supervisor_dockerfile,

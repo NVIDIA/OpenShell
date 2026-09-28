@@ -42,10 +42,16 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(None);
         };
 
-        let sandbox_id = self.compute.authenticate_sandbox(credential).await?;
+        let authenticated = self.compute.authenticate_sandbox(credential).await?;
+        let sandbox_id = authenticated.sandbox_id;
         if sandbox_id.is_empty() {
             return Err(Status::permission_denied(
                 "compute driver returned an empty sandbox identity",
+            ));
+        }
+        if authenticated.runtime_identity.is_empty() {
+            return Err(Status::permission_denied(
+                "compute driver returned an empty runtime identity",
             ));
         }
 
@@ -53,6 +59,7 @@ impl Authenticator for ComputeDriverAuthenticator {
             sandbox_id,
             source: SandboxIdentitySource::ComputeDriver {
                 driver_name: self.compute.configured_driver_name().to_string(),
+                runtime_identity: authenticated.runtime_identity,
             },
             trust_domain: Some("openshell".to_string()),
         })))
@@ -102,8 +109,12 @@ mod tests {
         assert_eq!(principal.sandbox_id, "sandbox-a");
         assert!(matches!(
             principal.source,
-            SandboxIdentitySource::ComputeDriver { ref driver_name }
+            SandboxIdentitySource::ComputeDriver {
+                ref driver_name,
+                ref runtime_identity,
+            }
                 if driver_name == "external-kubernetes"
+                    && runtime_identity == "test-runtime"
         ));
     }
 
@@ -149,6 +160,25 @@ mod tests {
             )
             .await
             .expect_err("empty identity must fail closed");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_identity_is_rejected() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox_with_runtime(
+            "sandbox-a",
+            "",
+        ))
+        .await;
+
+        let error = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                ISSUE_SANDBOX_TOKEN_PATH,
+            )
+            .await
+            .expect_err("empty runtime identity must fail closed");
 
         assert_eq!(error.code(), Code::PermissionDenied);
     }

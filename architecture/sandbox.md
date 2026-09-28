@@ -27,6 +27,12 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+Both ends size HTTP/2 flow control so the connection window exceeds the
+per-stream window times the concurrent-stream limit plus a reserve. Relays whose
+workload stops reading therefore stall only their own streams and cannot starve
+DNS, exec, or control traffic of connection-level credit. The supervisor caps
+concurrent TCP relay and pending-accept streams below the stream limit, so new
+workload connections queue before control exchanges lose stream slots.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
@@ -39,9 +45,21 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+A failed stream alone does not trigger reconnection. The supervisor first
+reconfirms on the current connection and keeps it if the boundary answers.
+Otherwise it closes that transport before replaying attach, and retries while
+the sandbox still reports the equal-epoch connection as active, until the
+boundary observes the disconnect. The sandbox reports attach and confirm
+rejections as typed errors rather than closing the stream.
 TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
+
+Local single-player Docker, Podman, and VM gateways propagate an omitted
+`gateway_jwt.ttl_secs` value to both launch-scoped credential profiles. Those
+credentials use `exp = 0`, so host suspension cannot strand the supervisor
+after a refresh deadline passes. Shared deployments retain expiring credentials
+and a durable compute-platform bootstrap identity.
 
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
@@ -63,24 +81,61 @@ replacement from granting authority.
 ## Startup Flow
 
 1. The driver resolves the immutable workload identity, installs the outer
-   network fence, and starts `openshell-sandbox` with one-use bootstrap state.
+   network fence, validates its native evidence, and starts `openshell-sandbox`
+   with one-use bootstrap state. Docker inspects container networking,
+   Kubernetes verifies its NetworkPolicy, and VM drivers inspect the guest
+   device model; those native schemas remain in their driver crates.
 2. The sandbox consumes and unlinks bootstrap material, proves the admitted
    runtime posture, and listens on the protected driver channel. It does not
    run untrusted code yet.
 3. `openshell-supervisor` loads policy and runtime settings from the gateway,
    attaches to the sandbox, and verifies the driver's generation and evidence.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   then reports measured confirmation. The supervisor must accept that evidence
-before it sends the launch permit.
+   validates its mechanism-specific audit evidence, and reports backend-neutral
+   enforcement properties. The supervisor must accept those properties and
+   their immutable session and resource binding before it sends the launch
+   permit. Other isolation backends may establish the same properties with
+   different mechanisms and retain their detailed evidence in backend-owned
+   audit data.
 5. The sandbox starts the canonical process through its single workload
    launcher. The supervisor starts SSH and registers its gateway session.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
    authenticated channel for the lifetime of the sandbox generation.
 
+The shared isolation contract receives only normalized outer-fence guarantees:
+egress is default-deny, there is no unmanaged egress path, the evidence is bound
+to the sandbox generation, revocation has been verified, and controller loss
+fails closed. A digest commits those guarantees to the native
+evidence without teaching the shared contract about container networks,
+Kubernetes objects, VM devices, or accelerator resources.
+
+The component that owns the outer fence also validates its native evidence and
+makes that projection explicitly. In the current Docker, Podman, Kubernetes,
+and VM placements, that component is the compute driver. A delegated isolation
+backend may own the fence and make the same projection instead. Non-empty native
+evidence alone does not establish a guarantee:
+
+| Current enforcement owner | Native evidence | Guarantees projected by the owner |
+|---|---|---|
+| Docker | Pinned container ID, `network_mode=none`, and no unexpected network attachments | No workload route establishes default-deny, revocation, and controller-loss behavior; the attachment inspection establishes that no unmanaged route exists. |
+| Podman | Pinned container ID, `--network=none`, and no unexpected network attachments | The same container-network facts establish the same four guarantees. |
+| Kubernetes | NetworkPolicy UID and resource version, ingress and egress isolation, and zero workload egress rules | The persisted, selecting policy establishes default-deny and continued denial after revocation or controller loss; zero egress rules establish that no unmanaged route is permitted. |
+| VM | Generation and zero guest network devices | The absent NIC establishes all four guarantees; approved traffic uses the separate supervisor-owned channel. |
+
+The shared contract checks that all four guarantees are present, that the
+projection names the admitted generation, and that its evidence digest matches
+the value passed to the workload-side runtime. It does not infer guarantees or
+interpret the native fields.
+
 When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
 to serve policy-authorized exec and loopback forwarding until explicit stop or
 delete tears down the boundary and terminates any remaining workload processes.
+When the sandbox is PID 1, it reaps adopted workload children after child-exit
+notifications, with a low-frequency recovery sweep. Children owned by an
+explicit process waiter remain registered and are never consumed by the orphan
+reaper. This keeps idle sandboxes from scanning procfs continuously while
+preserving wait results and eventual zombie cleanup.
 
 Completed exec output handles can be reclaimed, but execution request IDs remain
 reserved for the boundary generation. The sandbox accepts at most 4,096 exec
@@ -90,6 +145,16 @@ While an exec handle is retained, independent waits return its stable exit or
 signal status, whether or not an output attachment is open or the main process
 has exited. Waiting never holds the exec registry lock, so other operations can
 still signal or attach to the process.
+Exec output uses a bounded queue that backpressures the process reader until its
+attachment consumes the bytes. An attached reader can apply backpressure
+without losing bytes; an absent reader that leaves the queue full eventually
+fails the exec and terminates its process. The final stream status carries
+delivery failures separately from the process handle's stable wait result.
+After the exec parent exits, output drains until its pipes close. If a
+descendant keeps a pipe open beyond 30 seconds, the exec reports an output
+delivery failure and drains later writes without retaining them. This avoids
+guessing which bytes belong to the parent.
+Canonical main-process output retains its bounded replay log.
 
 ## Isolation Layers
 
@@ -100,11 +165,14 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Filesystem policy | Landlock restricts the paths the agent can read or write. |
 | Process policy | Sandbox and children run as one immutable non-root identity with zero capabilities. |
 | Seccomp notification | Virtualizes supported INET sockets and sends DNS/TCP decisions to the supervisor without nftables or proxy environment variables. |
-| Driver outer fence | Docker `network_mode=none`, a NIC-less VM, or Kubernetes NetworkPolicy prevents any missed or unsupported kernel path from escaping. |
+| Outer network fence | The component that owns network enforcement prevents any missed or unsupported kernel path from escaping. Current examples are Docker `network_mode=none`, a NIC-less VM, and Kubernetes NetworkPolicy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
 
-The supervisor may enrich baseline filesystem allowances for runtime-required
-paths, such as proxy support files or GPU device paths when a GPU is present.
+The supervisor may enrich baseline filesystem allowances for proxy support
+files. GPU allowances are added by the workload-side sandbox only when the
+immutable driver resource claims request a GPU and GPU devices are visible
+inside the workload. Host supervisor device discovery must not influence these
+allowances; a CPU-only VM preserves read-only `/proc` even on a GPU host.
 These internal allowances must stay sandbox-scoped and avoid exposing host
 secrets. For example, MXC governed egress grants the generated public CA bundle
 while the ephemeral CA private key remains in the host proxy's memory.
@@ -173,13 +241,49 @@ The sandbox reserves `SIGUSR2` with a non-restarting no-op handler for these
 broker threads; startup rejects a conflicting handler. This signal disposition
 is process-global kernel state, while registrations and cancellation state are
 owned by the broker. Workload exec resets the caught handler to its default.
-This sandbox runtime requires Linux 6.2 or newer for Landlock ABI v3 and treats
-`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` as mandatory so cancelled
-notifications cannot race task-memory writes.
+The broker copies pointer-bearing syscall arguments from a same-UID workload
+child with `process_vm_readv` / `process_vm_writev`, falling back to
+`/proc/<pid>/mem` when those system calls are unavailable or blocked. Runtime
+qualification keeps the trusted broker non-dumpable and proves read/write
+access against a dumpable child, matching the production process topology.
+It never treats access to the broker's own memory as workload evidence.
 
-DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
-nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
+This sandbox runtime requires Landlock ABI v3 (Linux 6.2, or an equivalent
+vendor backport). The seccomp listener is installed in one of two cancellation
+modes, and the launch confirmation enforces the invariant
+`cancellation || task_memory_writes_disabled`:
+
+- **Killable** (`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`, Linux 5.19+): the
+  notified workload thread waits kill-only, so a non-fatal signal cannot resume
+  a mediated syscall between notification validation and the broker's result
+  write. Full mediation, including task-memory output writes.
+- **LegacyReadOnly** (kernels < 5.19, e.g. RHEL 9.x / 5.14): the flag is
+  unavailable (`EINVAL`), so the listener falls back to a plain notifier and the
+  broker refuses every task-memory *output* write to stay cancellation-safe.
+  Concretely, in this mode `getpeername`, `accept`/`accept4` **with a non-null
+  peer-address argument**, and `sendmmsg` paths that write per-message lengths
+  fail closed with `EOPNOTSUPP`. `accept` with a null address, and socket
+  creation, `connect`, `bind`, `listen`, `sendto`, and `sendmsg` continue to
+  work — they use copied inputs, scalar responses, or atomic `ADDFD_SEND`, none
+  of which write into workload memory. Some server workloads whose accept
+  wrappers request the peer address will therefore not run until the kernel
+  provides `WAIT_KILLABLE_RECV` (a distribution backport); outbound-oriented
+  workloads are unaffected.
+
+Input mediation, DNS/TCP authorization, and outer-fence enforcement are
+identical in both modes. The selected mode is emitted in the sandbox
+qualification output (`seccomp_listener_mode`).
+
+DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets that
+nameserver without search domains, so names reach policy DNS as the workload
+wrote them, and permits an unprivileged bind to port 53. UDP and TCP DNS requests
 are forwarded through the supervisor, which applies hostname-based DNS policy.
+The Podman driver supplies that resolver configuration as a driver-owned,
+read-only secret mounted at `/etc/resolv.conf`; the workload remains on
+`network=none` and receives no host aliases directly. For
+`host.openshell.internal`, the supervisor returns the trusted concrete host
+destination carried in its runtime descriptor rather than relying on Podman's
+workload-side host-gateway injection.
 DNS sender identity is explicitly unavailable: native writes can come from an
 inheriting process or after exec, and neither the connecting binary nor a later
 descriptor-owner snapshot proves who sent an already queued query. Consumers
@@ -201,7 +305,7 @@ cannot transfer that approval to another socket.
 
 The outer fence remains mandatory. If notification handling misses a syscall,
 loses the supervisor, exceeds a bound, or encounters an unsupported socket
-type, the request fails and the driver-owned fence still blocks direct egress.
+type, the request fails and the outer fence still blocks direct egress.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
@@ -216,16 +320,34 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+HTTP response framing and connection persistence are separate decisions. After
+forwarding a complete closing response (explicit `Connection: close` or HTTP/1.0
+without keep-alive), the relay flushes and shuts down downstream writes before
+ending the exchange, including TLS close notification. Response middleware
+preserves this lifetime rule; persistent responses remain eligible for reuse.
+
 An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
 DNS and transparent TCP when the selected runtime advertises that substrate.
 Hostless `allowed_ips` and literal-IP selectors remain available only to the
-legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
-answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+legacy explicit-proxy path when `protocol` is omitted. For an eligible DNS
+name, the shared supervisor returns an epoch-scoped synthetic address and
 publishes the expiring name, endpoint, ports, policy generation, and validated
-real addresses as one correlation. A connection to that synthetic address is
+real addresses as one correlation. A name absent from policy receives at most a
+contract-free observation address for policy advisor proposals; see
+[Security Policy](security-policy.md). A connection to that synthetic address is
 captured before the bypass fence, mapped back to its workload process, authorized
 through the same egress pipeline, and dialed only through the pinned addresses.
 Omitted protocol endpoints retain explicit-proxy behavior.
+
+Policy DNS reserves `policy.local` inside each sandbox without requiring an
+authored network endpoint or a trusted external lookup. The source-backed TCP
+boundary routes plain HTTP on the reserved address and port 80 to the
+supervisor's sandbox-local policy API; it does not open an upstream connection.
+The API checks the effective agent proposal setting for every request. Policy
+denials at the staged TCP authorization gate enter the supervisor's denial
+aggregator with the resolved binary and destination, so the mechanistic mapper
+can propose a scoped rule. Invalid mappings and destination validation failures
+do not become policy proposals.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
@@ -348,8 +470,9 @@ against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
 security logs. See
-[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
-configuration and protocol details.
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware/index.mdx) for
+an introduction, or the [configuration guide](../docs/extensibility/supervisor-middleware/configure.mdx)
+for service registration and policy attachment.
 
 Inference providers use the same egress path as other external services. An
 attached provider profile contributes endpoint and binary policy. The proxy
@@ -428,6 +551,15 @@ certificates; trusting it only for the proxy-listener handshake would leave
 every intercepted upstream connection failing. The bundle is valid with either
 an `http://` or `https://` proxy (an intercepting proxy can be reached over
 plain HTTP) and is fail-closed: an unreadable or certificate-free file is fatal.
+
+How the bundle reaches the supervisor is driver-specific. Drivers that run the
+supervisor locally bind-mount the operator's file. The Kubernetes driver cannot:
+the supervisor Pod is scheduled remotely, and a trust anchor for every upstream
+the sandbox reaches must not be sourced from the workload namespace, where it
+would widen to anyone holding write access there. The gateway instead reads the
+PEM from its own filesystem and stages it into the per-generation supervisor
+bootstrap Secret, which is immutable, so the anchor cannot change underneath a
+running sandbox.
 
 Proxy credentials are never embedded in the URL: an inline `user:pass@` is
 rejected because it would be stored in `gateway.toml` and exposed in container
@@ -575,7 +707,15 @@ sandbox workload directly. The relay supports:
 
 - Attachment to the canonical main process through the `openshell-main` SSH
   subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
-  buffer, and a single stdin lease across client disconnects.
+  buffer, and a single stdin lease across client disconnects. Ctrl-C interrupts
+  the foreground process. For read-only attachments, Ctrl-C only exits the
+  current viewer.
+- Supervised CLI attachment. After an established SSH transport fails, the CLI
+  remains alive, requests a fresh SSH session from the gateway, and reattaches
+  to the same canonical main process within a bounded recovery window. It does
+  not stop or restart the sandbox to recover the client connection. The same
+  deadline bounds replacement-session RPCs. Process-targeted termination is
+  forwarded to the SSH child, which the CLI reaps before exiting.
 - Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
@@ -586,6 +726,14 @@ sandbox workload directly. The relay supports:
   `BASH_ENV` when the child environment sets it.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
+- Persistent HTTP and WebSocket service routing through gateway-managed
+  `ServiceEndpoint` records. `CreateSandboxRequest.service_exposures` registers
+  named or unnamed endpoints as part of sandbox creation, and the gateway
+  returns their routed URLs keyed by service name. The empty key identifies the
+  unnamed endpoint. Routing starts only while the sandbox is ready. `sandbox
+  create --expose PORT` uses the unnamed create-time endpoint and keeps the
+  sandbox. The standalone service API can add, update, or remove endpoints
+  later.
 
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
@@ -596,6 +744,11 @@ HTTP Activity records contain a request or response; early rejections with only
 connection context use Network Activity. Producer regression tests validate
 required fields and `at_least_one` constraints against the vendored OCSF 1.8
 schemas.
+Network Activity records identify at least one observed endpoint; connection
+failures retain their known peer or listening endpoint.
+Configuration diagnostics use Config State Change.
+Unix socket relay and relay-control notifications, plus proxy and mediation
+failures without an observed network endpoint, use Base Event.
 
 ## Policy Proposals
 

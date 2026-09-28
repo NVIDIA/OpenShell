@@ -10,8 +10,8 @@
 //! with an opaque `No such file or directory`.
 //!
 //! These helpers resolve a shell that actually exists in the current root
-//! filesystem. They must run inside the sandbox (i.e. in the supervisor), not
-//! on the gateway, because the answer depends on the sandbox image's contents.
+//! filesystem. They must run inside the workload boundary, not in the external
+//! supervisor or gateway, because the answer depends on the workload image.
 
 /// Preferred interactive shell when the image provides it.
 pub const BASH: &str = "/bin/bash";
@@ -62,13 +62,19 @@ pub fn is_executable(path: &str) -> bool {
 /// that footgun.
 #[must_use]
 pub fn detect_login_shell() -> String {
+    find_login_shell().unwrap_or_else(|| POSIX_SH.to_string())
+}
+
+/// Resolve an executable shell in the current root filesystem.
+///
+/// Unlike [`detect_login_shell`], this reports absence explicitly so boundary
+/// exec can return a useful error for shell-free images.
+#[must_use]
+pub fn find_login_shell() -> Option<String> {
     SHELL_CANDIDATES
         .iter()
         .find(|candidate| is_executable(candidate))
-        .map_or_else(
-            || POSIX_SH.to_string(),
-            |candidate| (*candidate).to_string(),
-        )
+        .map(|candidate| (*candidate).to_string())
 }
 
 #[cfg(test)]

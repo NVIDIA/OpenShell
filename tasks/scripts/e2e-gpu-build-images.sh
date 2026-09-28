@@ -12,7 +12,7 @@ source "${SCRIPT_DIR}/container-engine.sh"
 
 IMAGES_ROOT="${ROOT}/e2e/gpu/images"
 BUILD_DIR="${IMAGES_ROOT}/.build"
-BASE_IMAGE="${OPENSHELL_SANDBOX_BASE_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+BASE_IMAGE="${OPENSHELL_SANDBOX_BASE_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 CUDA_BUILD_IMAGE="${CUDA_BUILD_IMAGE:-nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04}"
 CUDA_SAMPLES_REPO="${CUDA_SAMPLES_REPO:-https://github.com/NVIDIA/cuda-samples}"
 CUDA_SAMPLES_REF="${CUDA_SAMPLES_REF:-v12.8}"

@@ -43,7 +43,7 @@
   become_user: "{{ openshell_gateway_user }}"
   ansible.builtin.command:
     argv:
-      - /usr/local/bin/openshell-gateway
+      - openshell-gateway
       - generate-certs
       - --output-dir
       - /var/lib/openshell/pki

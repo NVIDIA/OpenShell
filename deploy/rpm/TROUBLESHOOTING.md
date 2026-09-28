@@ -176,7 +176,7 @@ sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 **Image pull failure.** Verify ghcr.io is reachable:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 ### Images not updating
@@ -185,7 +185,7 @@ The default image pull policy is `if_not_present` -- images are pulled once
 and cached. To update:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 ```
 
@@ -231,7 +231,7 @@ the schema-v2 upgrade, the user service replaces only an exact copy of the v1
 file previously seeded by the RPM. If you edited that file, migrate it manually
 before restarting the service; direct `dnf` or `rpm` upgrades do not use the
 breaking-upgrade guard in `install.sh`. See the
-[Gateway Configuration File](https://docs.nvidia.com/openshell/latest/reference/gateway-config#migrate-to-schema-version-2)
+[Gateway Configuration File](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2)
 for the field-by-field migration steps. New gateway process options are listed
 in CONFIGURATION.md and `openshell-gateway --help`.
 
@@ -239,7 +239,7 @@ To pick up new container images after an upgrade:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 ### Migrating a TLS-enabled local driver to schema version 2

@@ -68,10 +68,11 @@ e2e_write_podman_gateway_config() {
   local sandbox_image=${11}
   local stop_timeout_secs=${12}
   local supervisor_image=${13}
-  local provider_spiffe_socket=${14}
-  local podman_socket=${15}
-  local oidc_mode=${16}
-  local oidc_issuer=${17}
+  local sandbox_runtime_image=${14}
+  local provider_spiffe_socket=${15}
+  local podman_socket=${16}
+  local oidc_mode=${17}
+  local oidc_issuer=${18}
   local configured_with_tls option_profile
 
   case "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" in
@@ -109,6 +110,7 @@ e2e_write_podman_gateway_config() {
           fi
           printf 'stop_timeout_secs = %s\n' "${stop_timeout_secs}"
           printf 'supervisor_image = %s\n' "$(e2e_podman_toml_string "${supervisor_image}")"
+          printf 'sandbox_runtime_image = %s\n' "$(e2e_podman_toml_string "${sandbox_runtime_image}")"
           printf 'guest_tls_ca = %s\n' "$(e2e_podman_toml_string "${pki_dir}/ca.crt")"
           printf 'guest_tls_cert = %s\n' "$(e2e_podman_toml_string "${pki_dir}/client/tls.crt")"
           printf 'guest_tls_key = %s\n' "$(e2e_podman_toml_string "${pki_dir}/client/tls.key")"
@@ -151,6 +153,7 @@ e2e_write_podman_gateway_config() {
         if [ "${external_driver}" = "1" ]; then
           printf 'socket_path = %s\n' "$(e2e_podman_toml_string "${driver_socket}")"
         else
+          printf 'allow_driver_config = true\n'
           printf 'network_name = %s\n' "$(e2e_podman_toml_string "${network_name}")"
           printf 'gateway_port = %s\n' "${gateway_port}"
           printf 'default_image = %s\n' "$(e2e_podman_toml_string "${sandbox_image}")"
@@ -161,6 +164,7 @@ e2e_write_podman_gateway_config() {
           fi
           printf 'stop_timeout_secs = %s\n' "${stop_timeout_secs}"
           printf 'supervisor_image = %s\n' "$(e2e_podman_toml_string "${supervisor_image}")"
+          printf 'sandbox_runtime_image = %s\n' "$(e2e_podman_toml_string "${sandbox_runtime_image}")"
           printf 'enable_bind_mounts = true\n'
           if [ -n "${provider_spiffe_socket}" ]; then
             printf 'provider_spiffe_workload_api_socket = %s\n' "$(e2e_podman_toml_string "${provider_spiffe_socket}")"
@@ -168,6 +172,8 @@ e2e_write_podman_gateway_config() {
           if [ -n "${podman_socket}" ]; then
             printf 'socket_path = %s\n' "$(e2e_podman_toml_string "${podman_socket}")"
           fi
+          printf '\n[openshell.drivers.podman.resource_admission]\n'
+          printf 'enabled = false\n'
         fi
         e2e_write_gateway_jwt_config "${jwt_dir}" "${gateway_id}"
         if [ "${oidc_mode}" != "1" ]; then

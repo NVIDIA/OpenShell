@@ -205,6 +205,15 @@ impl SocketRegistry {
         self.entries.is_empty()
     }
 
+    /// Number of entries that still retain a broker-owned descriptor.
+    #[must_use]
+    pub fn retained_preconnect_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.retained_preconnect.is_some())
+            .count()
+    }
+
     /// Whether another socket would exceed the configured bound.
     #[must_use]
     pub fn is_full(&self) -> bool {
@@ -457,5 +466,32 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(registry.remove_inode(first.inode));
         assert!(!registry.remove_inode(second.inode));
+    }
+
+    #[test]
+    fn retained_count_excludes_connected_metadata() {
+        let mut registry = SocketRegistry::new(13, 2).unwrap();
+        let retained = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        let connected = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+
+        assert_eq!(registry.retained_preconnect_count(), 2);
+
+        let entry = registry.entries.get_mut(&connected.inode).unwrap();
+        entry.set_state(SocketState::Connected {
+            original_peer: "127.0.0.1:443".parse().unwrap(),
+        });
+        entry.release_preconnect();
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.retained_preconnect_count(), 1);
+        assert!(
+            registry.entries[&retained.inode]
+                .retained_preconnect
+                .is_some()
+        );
     }
 }

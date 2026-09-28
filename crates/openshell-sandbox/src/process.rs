@@ -249,8 +249,8 @@ fn apply_canonical_process_environment(
 ) {
     cmd.envs(user_environment);
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
-    // Resolve a shell present in the sandbox image (minimal images such as
-    // Alpine ship only `/bin/sh`, not bash). Runs in the supervisor.
+    // Resolve a shell present in the workload image. This code runs inside the
+    // workload boundary, where the image filesystem is visible.
     let shell = openshell_core::shell::detect_login_shell();
 
     for (key, value) in [
