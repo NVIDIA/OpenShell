@@ -177,7 +177,10 @@ impl LocalBoundaryExec {
                 command.env(key, value);
             }
         }
-        for (key, value) in self.provider_credentials.child_env_with_gcp_resolved() {
+        for (key, value) in self
+            .provider_credentials
+            .child_env_with_non_secret_resolved()
+        {
             if !crate::process::is_supervisor_only_env_var(&key) {
                 command.env(key, value);
             }

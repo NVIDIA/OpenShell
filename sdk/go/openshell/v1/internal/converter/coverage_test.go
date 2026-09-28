@@ -308,20 +308,22 @@ func TestConverterCoversAllProtoFields_SandboxPolicyRevision(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
 	handled := fieldSet{
-		"id":                true,
-		"display_name":      true,
-		"description":       true,
-		"category":          true,
-		"credentials":       true,
-		"files":             true,
-		"endpoints":         true,
-		"binaries":          true,
-		"inference_capable": true,
-		"discovery":         true,
-		"resource_version":  true,
-		"annotations":       true,
-		"source":            true,
-		"scope":             true,
+		"id":                        true,
+		"display_name":              true,
+		"description":               true,
+		"category":                  true,
+		"credentials":               true,
+		"files":                     true,
+		"endpoints":                 true,
+		"binaries":                  true,
+		"inference_capable":         true,
+		"discovery":                 true,
+		"resource_version":          true,
+		"annotations":               true,
+		"source":                    true,
+		"scope":                     true,
+		"environment":               true,
+		"required_platform_adapter": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.ProviderProfile{}).ProtoReflect().Descriptor(), handled, nil)

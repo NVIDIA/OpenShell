@@ -1,34 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    DiscoveredProvider, DiscoveryContext, ProviderDiscoverySpec, ProviderError, ProviderTypeProfile,
-};
+use crate::{DiscoveredProvider, DiscoveryContext, ProviderError, ProviderTypeProfile};
 use std::collections::HashSet;
-
-pub fn discover_with_spec(
-    spec: &ProviderDiscoverySpec,
-    context: &dyn DiscoveryContext,
-) -> Result<Option<DiscoveredProvider>, ProviderError> {
-    let mut discovered = DiscoveredProvider::default();
-
-    for key in spec.credential_env_vars {
-        if let Some(value) = context.env_var(key)
-            && !value.trim().is_empty()
-        {
-            discovered
-                .credentials
-                .entry((*key).to_string())
-                .or_insert(value);
-        }
-    }
-
-    if discovered.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(discovered))
-    }
-}
 
 pub fn discover_from_profile(
     profile: &ProviderTypeProfile,
@@ -66,13 +40,11 @@ pub fn discover_from_profile(
         }
     }
 
-    if profile.id == "google-vertex-ai" {
-        for key in crate::VERTEX_AI_CONFIG_KEY_NAMES {
-            if let Some(value) = context.env_var(key)
-                && !value.trim().is_empty()
-            {
-                discovered.config.entry((*key).to_string()).or_insert(value);
-            }
+    for key in &profile.discovery.config_env_vars {
+        if let Some(value) = context.env_var(key)
+            && !value.trim().is_empty()
+        {
+            discovered.config.entry(key.clone()).or_insert(value);
         }
     }
 
@@ -88,7 +60,7 @@ mod tests {
     use super::discover_from_profile;
     use crate::profiles::{CredentialProfile, DiscoveryProfile};
     use crate::test_helpers::MockDiscoveryContext;
-    use crate::{ProviderError, ProviderTypeProfile};
+    use crate::{EnvironmentProfile, ProviderError, ProviderTypeProfile};
 
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
@@ -130,7 +102,10 @@ mod tests {
             inference_capable: false,
             discovery: DiscoveryProfile {
                 credentials: vec!["api_key".to_string(), "secondary".to_string()],
+                config_env_vars: Vec::new(),
             },
+            environment: EnvironmentProfile::default(),
+            required_platform_adapter: String::new(),
             source: String::new(),
             scope: String::new(),
         }
@@ -178,9 +153,10 @@ mod tests {
     }
 
     #[test]
-    fn vertex_profile_discovery_includes_supported_configuration() {
+    fn profile_discovery_includes_declared_configuration() {
         let mut profile = profile();
-        profile.id = "google-vertex-ai".to_string();
+        profile.discovery.config_env_vars =
+            vec!["VERTEX_AI_PROJECT_ID".into(), "VERTEX_AI_REGION".into()];
         let ctx = MockDiscoveryContext::new()
             .with_env("CUSTOM_API_KEY", "vertex-token")
             .with_env("VERTEX_AI_PROJECT_ID", "project-a")

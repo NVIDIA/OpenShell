@@ -342,15 +342,16 @@ func ProviderProfileFromProto(p *pb.ProviderProfile) *types.ProviderProfile {
 	}
 
 	result := &types.ProviderProfile{
-		ID:               p.GetId(),
-		DisplayName:      p.GetDisplayName(),
-		Description:      p.GetDescription(),
-		Category:         ProfileCategoryFromProto(p.GetCategory()),
-		InferenceCapable: p.GetInferenceCapable(),
-		ResourceVersion:  p.GetResourceVersion(),
-		Annotations:      CopyStringMap(p.GetAnnotations()),
-		Source:           p.GetSource(),
-		Scope:            p.GetScope(),
+		ID:                      p.GetId(),
+		DisplayName:             p.GetDisplayName(),
+		Description:             p.GetDescription(),
+		Category:                ProfileCategoryFromProto(p.GetCategory()),
+		InferenceCapable:        p.GetInferenceCapable(),
+		ResourceVersion:         p.GetResourceVersion(),
+		Annotations:             CopyStringMap(p.GetAnnotations()),
+		Source:                  p.GetSource(),
+		Scope:                   p.GetScope(),
+		RequiredPlatformAdapter: p.GetRequiredPlatformAdapter(),
 	}
 
 	// Credentials
@@ -398,7 +399,14 @@ func ProviderProfileFromProto(p *pb.ProviderProfile) *types.ProviderProfile {
 	// Discovery
 	if d := p.GetDiscovery(); d != nil {
 		result.Discovery = types.ProfileDiscovery{
-			Credentials: CopyStringSlice(d.GetCredentials()),
+			Credentials:   CopyStringSlice(d.GetCredentials()),
+			ConfigEnvVars: CopyStringSlice(d.GetConfigEnvVars()),
+		}
+	}
+	if e := p.GetEnvironment(); e != nil {
+		result.Environment = &types.ProfileEnvironment{
+			Config: CopyStringMap(e.GetConfig()),
+			Fixed:  CopyStringMap(e.GetFixed()),
 		}
 	}
 
@@ -412,15 +420,16 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 	}
 
 	result := &pb.ProviderProfile{
-		Id:               p.ID,
-		DisplayName:      p.DisplayName,
-		Description:      p.Description,
-		Category:         ProfileCategoryToProto(p.Category),
-		InferenceCapable: p.InferenceCapable,
-		ResourceVersion:  p.ResourceVersion,
-		Annotations:      CopyStringMap(p.Annotations),
-		Source:           p.Source,
-		Scope:            p.Scope,
+		Id:                      p.ID,
+		DisplayName:             p.DisplayName,
+		Description:             p.Description,
+		Category:                ProfileCategoryToProto(p.Category),
+		InferenceCapable:        p.InferenceCapable,
+		ResourceVersion:         p.ResourceVersion,
+		Annotations:             CopyStringMap(p.Annotations),
+		Source:                  p.Source,
+		Scope:                   p.Scope,
+		RequiredPlatformAdapter: p.RequiredPlatformAdapter,
 	}
 
 	// Credentials
@@ -458,9 +467,16 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 	}
 
 	// Discovery
-	if len(p.Discovery.Credentials) > 0 {
+	if len(p.Discovery.Credentials) > 0 || len(p.Discovery.ConfigEnvVars) > 0 {
 		result.Discovery = &pb.ProviderProfileDiscovery{
-			Credentials: CopyStringSlice(p.Discovery.Credentials),
+			Credentials:   CopyStringSlice(p.Discovery.Credentials),
+			ConfigEnvVars: CopyStringSlice(p.Discovery.ConfigEnvVars),
+		}
+	}
+	if p.Environment != nil {
+		result.Environment = &pb.ProviderProfileEnvironment{
+			Config: CopyStringMap(p.Environment.Config),
+			Fixed:  CopyStringMap(p.Environment.Fixed),
 		}
 	}
 
