@@ -1,0 +1,494 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway peer transport contract. Kept in its own suite so that a rewrite of
+# the gateway workload template, or of gateway_config_test.yaml, cannot drop
+# the peer env block or its assertions without failing here.
+suite: gateway peer transport
+templates:
+  - templates/gateway-config.yaml
+  - templates/deployment.yaml
+  - templates/statefulset.yaml
+  - templates/certgen.yaml
+  - templates/cert-manager-pki.yaml
+  - templates/backend-tls-policy.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders the full peer env contract for a TLS Deployment on PostgreSQL
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_REPLICA_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SERVICE_ACCOUNT_NAME
+            value: openshell
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: https://$(OPENSHELL_POD_IP):8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_NAME
+            value: openshell-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TOKEN_AUDIENCE
+            value: openshell-gateway-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE
+            value: /var/run/secrets/openshell-peer/token
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_POD_LABELS
+            value: app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CERT_FILE
+            value: /etc/openshell-tls/peer-client/tls.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_KEY_FILE
+            value: /etc/openshell-tls/peer-client/tls.key
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-peer-token
+            mountPath: /var/run/secrets/openshell-peer
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-cert
+            mountPath: /etc/openshell-tls/server
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: peer-client-tls
+            mountPath: /etc/openshell-tls/peer-client
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-peer-token
+            projected:
+              defaultMode: 0400
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: openshell-gateway-peer
+                    expirationSeconds: 3600
+
+  - it: renders the peer env contract for the default StatefulSet
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_NAME
+            value: openshell-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TOKEN_AUDIENCE
+            value: openshell-gateway-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE
+            value: /var/run/secrets/openshell-peer/token
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_POD_LABELS
+            value: app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+
+  - it: pins the peer CA to the server Secret in cert-manager mode
+    template: templates/statefulset.yaml
+    values:
+      - ../ci/values-cert-manager.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-cert
+            secret:
+              secretName: openshell-server-tls
+
+  - it: keeps the internal chart CA for peers when cert-manager also issues an external certificate
+    template: templates/statefulset.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt
+      certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.serverDnsNames:
+        - openshell.example.com
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+
+  - it: pins the peer CA to a custom server Secret when the chart does not manage TLS
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      pkiInitJob.enabled: false
+      certManager.enabled: false
+      server.tls.certSecretName: my-server-tls
+      server.tls.clientCaSecretName: my-client-ca
+      server.tls.clientTlsSecretName: my-client-tls
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-cert
+            secret:
+              secretName: my-server-tls
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: peer-client-tls
+            secret:
+              secretName: my-client-tls
+
+  - it: uses one-way peer TLS with the chart CA when mTLS is off for BackendTLSPolicy
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.tls.enableMtls: false
+      grpcRoute.backendTLSPolicy.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: https://$(OPENSHELL_POD_IP):8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CERT_FILE
+            value: /etc/openshell-tls/peer-client/tls.crt
+
+  - it: renders the full mTLS peer contract for the HA TLS overlay over the Skaffold base
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-skaffold.yaml
+      - ../ci/values-high-availability.yaml
+      - ../ci/values-high-availability-tls.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: https://$(OPENSHELL_POD_IP):8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CERT_FILE
+            value: /etc/openshell-tls/peer-client/tls.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_KEY_FILE
+            value: /etc/openshell-tls/peer-client/tls.key
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: peer-client-tls
+            mountPath: /etc/openshell-tls/peer-client
+            readOnly: true
+
+  - it: renders no BackendTLSPolicy for the HA TLS overlay
+    template: templates/backend-tls-policy.yaml
+    values:
+      - ../ci/values-skaffold.yaml
+      - ../ci/values-high-availability.yaml
+      - ../ci/values-high-availability-tls.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the insecure peer opt-out for a plaintext PostgreSQL gateway
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+      server.peer.allowInsecureTransport: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: http://$(OPENSHELL_POD_IP):8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+
+  - it: keeps the plaintext HA Skaffold lane rendering through its explicit opt-out
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-skaffold.yaml
+      - ../ci/values-high-availability.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+
+  - it: ignores the insecure peer opt-out on a TLS gateway
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.peer.allowInsecureTransport: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: https://$(OPENSHELL_POD_IP):8080
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+
+  - it: fails a plaintext PostgreSQL Deployment without the opt-out
+    # Both workload templates run the validation; the StatefulSet renders first.
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.disableTls=true with PostgreSQL (server.externalDbSecret or a postgres:// server.dbUrl) sends gateway peer traffic and peer ServiceAccount tokens in plaintext. For an existing plaintext release, set server.peer.allowInsecureTransport=true to keep its current behavior on a trusted network; turning gateway TLS on in place strands existing sandboxes. For a new install, keep server.disableTls=false, or behind a Gateway API proxy with an HTTPS listener set grpcRoute.backendTLSPolicy.enabled=true and server.tls.enableMtls=false. See https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#secure-peer-transport"
+
+  - it: fails a plaintext single-replica PostgreSQL StatefulSet without the opt-out
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.peer.allowInsecureTransport=true"
+
+  - it: fails a plaintext multi-replica PostgreSQL StatefulSet without the opt-out
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+      workload.allowMultiReplicaStatefulSet: true
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "sends gateway peer traffic and peer ServiceAccount tokens in plaintext"
+
+  - it: fails a plaintext gateway whose dbUrl selects PostgreSQL
+    template: templates/statefulset.yaml
+    set:
+      server.dbUrl: postgresql://openshell@db.example.com:5432/openshell
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "sends gateway peer traffic and peer ServiceAccount tokens in plaintext"
+
+  - it: fails a plaintext gateway whose postgres:// dbUrl selects PostgreSQL
+    template: templates/statefulset.yaml
+    set:
+      server.dbUrl: postgres://openshell@db.example.com:5432/openshell
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "sends gateway peer traffic and peer ServiceAccount tokens in plaintext"
+
+  - it: fails closed when a release predates the opt-out value
+    # Both workload templates run the validation; the StatefulSet renders first.
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+      server.peer: null
+    asserts:
+      - failedTemplate:
+          errorPattern: "sends gateway peer traffic and peer ServiceAccount tokens in plaintext"
+
+  - it: rejects a non-boolean opt-out
+    # Both workload templates run the validation; the StatefulSet renders first.
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+      server.peer.allowInsecureTransport: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.peer.allowInsecureTransport must be true or false, got false"
+
+  - it: allows a plaintext SQLite gateway without the opt-out
+    template: templates/statefulset.yaml
+    set:
+      server.disableTls: true
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT
+            value: "true"
+
+  - it: allows a TLS PostgreSQL gateway without the opt-out
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-high-availability.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+
+  - it: verifies a peer server name that the generated PKI certificate includes
+    template: templates/certgen.yaml
+    release:
+      name: team-a
+      namespace: tenant-a
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --server-san=team-a-openshell.tenant-a.svc.cluster.local
+
+  - it: verifies a peer server name that the cert-manager server certificate includes
+    template: templates/cert-manager-pki.yaml
+    release:
+      name: team-a
+      namespace: tenant-a
+    set:
+      certManager.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: team-a-openshell-server
+    asserts:
+      - contains:
+          path: spec.dnsNames
+          content: team-a-openshell.tenant-a.svc.cluster.local
+
+  - it: renders the matching peer server name for a non-default release
+    template: templates/statefulset.yaml
+    release:
+      name: team-a
+      namespace: tenant-a
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: team-a-openshell.tenant-a.svc.cluster.local

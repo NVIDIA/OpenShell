@@ -192,6 +192,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
+- [`ci/values-high-availability-tls.yaml`](ci/values-high-availability-tls.yaml) - CI overlay for the TLS HA e2e lane: gateway pods serve TLS and mTLS so peers use HTTPS, layered on the high-availability overlay
 
 ### Database backend
 
@@ -249,10 +250,14 @@ disables the default credential-storage key-encryption key Secret and env inject
 Append these flags to any of the PostgreSQL commands above for OpenShift:
 
 ```
---set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
 ```
+
+Keep pod TLS on PostgreSQL gateways. The chart refuses to render
+`server.disableTls=true` with PostgreSQL (see [High availability](#high-availability)).
+On OpenShift 4.22+, re-encrypt at the router with `BackendTLSPolicy`, as described in the
+[OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift#end-to-end-tls-using-gateway-api-and-backendtlspolicy-openshift-422).
 
 ### High availability
 
@@ -267,14 +272,27 @@ Gateway peer traffic uses Kubernetes ServiceAccount identity. Each gateway pod
 mounts a projected, pod-bound ServiceAccount token with audience
 `openshell-gateway-peer`; receiving replicas validate that token with the
 Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
-and authorize only the internal `PeerRelay` RPC. The chart does not create or
-accept a shared gateway peer Secret.
+and authorize only the internal peer RPCs: `PeerRelay` and the peer provider
+readiness, endpoint status, and provider status calls. The chart does not
+create or accept a shared gateway peer Secret.
 
-With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
-server verification and mTLS. The client verifies the stable gateway Service
-DNS name while connecting directly to the owning pod. Custom TLS Secrets must
-include that Service DNS name in the server certificate and provide the CA and
-client credentials configured by `server.tls`.
+A gateway on PostgreSQL requires TLS for peer calls. Peer clients trust only
+the `ca.crt` key of the `server.tls.certSecretName` Secret, never platform
+roots, and verify the stable gateway Service DNS name
+(`<fullname>.<namespace>.svc.cluster.local`) while connecting directly to the
+owning pod. When the gateway verifies client certificates, peers also present
+the `server.tls.clientTlsSecretName` certificate. The generated PKI and
+cert-manager modes provide all of this. Custom TLS Secrets must carry `ca.crt`
+and include that Service DNS name in the server certificate, or a gateway on
+PostgreSQL refuses to start.
+
+The chart refuses to render `server.disableTls=true` with PostgreSQL, because
+peer calls share the gateway listener. Behind a Gateway API proxy with an HTTPS
+listener, keep pod TLS and re-encrypt with
+`grpcRoute.backendTLSPolicy.enabled=true` and `server.tls.enableMtls=false`.
+`server.peer.allowInsecureTransport=true` accepts plaintext peer traffic,
+including the peer ServiceAccount token. Use it only on a trusted network, such
+as local development or CI.
 
 Set `autoscaling.enabled=true` to render an `autoscaling/v2`
 HorizontalPodAutoscaler for the gateway workload. The Deployment or
@@ -370,7 +388,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
 | grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
+| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). With PostgreSQL, keep pod TLS instead: set grpcRoute.backendTLSPolicy.enabled=true and server.tls.enableMtls=false. |
 | grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
 | grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
@@ -443,7 +461,7 @@ discovery endpoint or its TLS CA.
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). SQLite runs in WAL mode and needs a local block-backed volume, not NFS or other network filesystems. |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
-| server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
+| server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. Gateway peer traffic shares this listener, so with PostgreSQL (server.externalDbSecret) the chart refuses to render unless server.peer.allowInsecureTransport is also true. |
 | server.drivers.kubernetes.allowDriverConfig | bool | `false` | Allow caller driver JSON; external resources still require approval. |
 | server.drivers.kubernetes.operatorNamespaceFile | string | `""` | Path to a JSON file containing an array of namespace names allowed in operator mode. Hot-reloaded on change. |
 | server.drivers.kubernetes.operatorNamespaceLabel | string | `""` | K8s label selector for namespace discovery in operator mode. The driver watches namespaces matching this label. |
@@ -481,6 +499,7 @@ discovery endpoint or its TLS CA.
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
 | server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
+| server.peer.allowInsecureTransport | bool | `false` | UNSAFE: accept plaintext gateway peer traffic, including the peer ServiceAccount bearer token, when server.disableTls=true and the gateway uses PostgreSQL. Use only on a trusted network such as local development or CI. Ignored when gateway TLS is enabled. The gateway logs a warning at every startup while it is active. |
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods. |
@@ -494,7 +513,7 @@ discovery endpoint or its TLS CA.
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.sandboxUid | string | `""` | UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift SCC namespace annotation if present, otherwise the driver default. Must be an integer between 1 and 4294967294. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
-| server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
+| server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. With PostgreSQL it must also contain ca.crt, the CA that signs tls.crt; gateway peers trust only that CA. `kubectl create secret tls` does not add ca.crt. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
 | server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
