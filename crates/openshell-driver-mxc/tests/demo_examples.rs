@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Drift guards for the two shipped Windows inference demos.
+//! Drift guards for the shipped Windows MXC demos.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,41 @@ fn read_example(name: &str) -> String {
     let path = examples_root().join(name);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+#[test]
+fn shipped_provider_credential_assets_support_mock_wiring_validation() {
+    for name in [
+        "mxc-provider-credential.toml",
+        "mxc-provider-credential-policy.yaml",
+        "mxc-github-provider-profile.yml",
+        "mxc-provider-credential-probe.ps1",
+        "run-provider-credential-test.ps1",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped provider-credential asset is missing: {name}"
+        );
+    }
+
+    let runner = read_example("run-provider-credential-test.ps1");
+    let probe = read_example("mxc-provider-credential-probe.ps1");
+    let config: Value = toml::from_str(&read_example("mxc-provider-credential.toml"))
+        .expect("provider-credential config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+    assert!(runner.contains("--provider"));
+    assert!(runner.contains("--credential"));
+    assert!(probe.contains("revision-scoped GITHUB_TOKEN placeholder"));
+    assert!(probe.contains("no external network request"));
 }
 
 #[test]
@@ -161,7 +196,12 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
 #[cfg(target_os = "windows")]
 #[test]
 fn shipped_runners_parse_in_windows_powershell() {
-    for name in ["run-ollama-test.ps1", "run-inference-test.ps1"] {
+    for name in [
+        "run-ollama-test.ps1",
+        "run-inference-test.ps1",
+        "run-provider-credential-test.ps1",
+        "mxc-provider-credential-probe.ps1",
+    ] {
         let path = examples_root().join(name);
         let script = r"
 $errors = $null

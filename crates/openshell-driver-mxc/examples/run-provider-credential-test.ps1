@@ -24,6 +24,10 @@
 #     -GatewayPath .\target\x86_64-pc-windows-msvc\release\openshell-gateway.exe `
 #     -CliPath .\target\x86_64-pc-windows-msvc\release\openshell.exe
 #
+# Hosted CI can pass -Mock with a synthetic GITHUB_TOKEN. That mode proves the
+# provider/profile/policy wiring and placeholder-only child environment without
+# making an external request. It is not proxy-substitution or MXC evidence.
+#
 # PowerShell 5.1-compatible. The script never prints GITHUB_TOKEN and scans all
 # result artifacts for accidental raw-token leakage before creating the bundle.
 
@@ -34,7 +38,8 @@ param(
     [string] $GatewayPath,
     [string] $CliPath,
     [int]    $Port         = 17670,
-    [string] $GatewayName  = "openshell-mxc-provider-e2e"
+    [string] $GatewayName  = "openshell-mxc-provider-e2e",
+    [switch] $Mock
 )
 
 $ErrorActionPreference = "Stop"
@@ -212,13 +217,16 @@ $artifactScanFailed = $false
 $failureReason = ""
 $failureStage = "initialization"
 $githubToken = $env:GITHUB_TOKEN
+$oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 
 try {
     Step "Validate prerequisites"
     if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
         throw "GITHUB_TOKEN is not set. Set it in this PowerShell session; do not pass it on the command line."
     }
-    foreach ($file in @($gateway, $cli, $powerShellExe, $probeTemplate, $tomlTemplate, $policyTemplate, $profileTemplate, $WxcExecPath)) {
+    $requiredFiles = @($gateway, $cli, $powerShellExe, $probeTemplate, $tomlTemplate, $policyTemplate, $profileTemplate)
+    if (-not $Mock) { $requiredFiles += $WxcExecPath }
+    foreach ($file in $requiredFiles) {
         if (-not (Test-Path $file)) { throw "missing artifact: $file" }
         Info "found $file"
     }
@@ -227,24 +235,30 @@ try {
     if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
         throw "gateway port $Port is already in use"
     }
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $wxcProbeLines = & $WxcExecPath --probe 2>&1
-        $wxcProbeExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    $wxcProbeText = (($wxcProbeLines | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $_.Exception.Message
-        } else {
-            $_.ToString()
+    if ($Mock) {
+        $WxcExecPath = Join-Path $here "mock-wxc-exec.exe"
+        [System.IO.File]::WriteAllText($wxcProbeFile, "mock mode: wxc-exec was not invoked`r`n", $utf8NoBom)
+        Info "mock mode: using the in-process wxc shim"
+    } else {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $wxcProbeLines = & $WxcExecPath --probe 2>&1
+            $wxcProbeExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previous
         }
-    }) -join [Environment]::NewLine).Trim()
-    [System.IO.File]::WriteAllText($wxcProbeFile, $wxcProbeText, $utf8NoBom)
-    if ($wxcProbeExit -ne 0) {
-        throw "wxc-exec --probe failed (exit $wxcProbeExit); inspect $wxcProbeFile"
+        $wxcProbeText = (($wxcProbeLines | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $_.Exception.Message
+            } else {
+                $_.ToString()
+            }
+        }) -join [Environment]::NewLine).Trim()
+        [System.IO.File]::WriteAllText($wxcProbeFile, $wxcProbeText, $utf8NoBom)
+        if ($wxcProbeExit -ne 0) {
+            throw "wxc-exec --probe failed (exit $wxcProbeExit); inspect $wxcProbeFile"
+        }
     }
     Ok "prerequisites available; token value was not printed"
 
@@ -276,18 +290,20 @@ try {
     $profileText = [System.IO.File]::ReadAllText($profileTemplate, [System.Text.Encoding]::UTF8)
     $profileText = $profileText.Replace("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", $powerShellFwd)
     [System.IO.File]::WriteAllText($profileUsed, $profileText, $utf8NoBom)
+    $probeCommand = @(
+        $powerShellFwd,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "$shareFwd/mxc-provider-credential-probe.ps1",
+        $shareFwd
+    )
+    if ($Mock) { $probeCommand += "-Mock" }
     $driverConfig = @{
         mxc = @{
-            command = @(
-                $powerShellFwd,
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                "$shareFwd/mxc-provider-credential-probe.ps1",
-                $shareFwd
-            )
+            command = $probeCommand
             cwd = $shareFwd
         }
     } | ConvertTo-Json -Compress -Depth 4
@@ -296,7 +312,11 @@ try {
     Step "Start gateway"
     $env:OPENSHELL_DRIVERS = "mxc"
     $env:OPENSHELL_GATEWAY_CONFIG = $tomlUsed
-    Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    if ($Mock) {
+        $env:OPENSHELL_MXC_MOCK_WXC = "1"
+    } else {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    }
     # The CLI, not the gateway process environment, supplies the provider
     # credential. Temporarily remove GITHUB_TOKEN while spawning the gateway so
     # a successful test cannot be attributed to gateway environment inheritance.
@@ -304,7 +324,7 @@ try {
     try {
         try {
             $gw = Start-Process -FilePath $gateway `
-                -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info") `
+                -ArgumentList @("--disable-tls", "--port", "$Port", "--db-url", "sqlite::memory:", "--log-level", "info") `
                 -WorkingDirectory $here -PassThru -NoNewWindow `
                 -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
         } catch {
@@ -380,7 +400,11 @@ try {
         throw "effective policy did not contain the attached provider's GitHub rule"
     }
     $passed = $true
-    Ok "placeholder isolation, authorized rewrite, and endpoint mismatch all passed"
+    if ($Mock) {
+        Ok "provider attachment and placeholder-only child environment passed"
+    } else {
+        Ok "placeholder isolation, authorized rewrite, and endpoint mismatch all passed"
+    }
 }
 catch {
     $failureReason = ($_.Exception.Message -replace '\r?\n', ' | ').Trim()
@@ -397,6 +421,12 @@ finally {
     if ($gw -and -not $gw.HasExited) {
         Stop-Process -Id $gw.Id -Force -ErrorAction SilentlyContinue
         try { $gw.WaitForExit(5000) | Out-Null } catch {}
+    }
+
+    if ($null -eq $oldMockWxc) {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    } else {
+        $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
     }
 
     # Preserve probe output on both success and failure. These files contain
@@ -431,6 +461,7 @@ finally {
 OpenShell MXC provider credential example
 =========================================
 verdict    : $verdict
+mode       : $(if ($Mock) { "mock-wiring" } else { "real-mxc" })
 sandbox    : $sandboxName
 backend    : process_container
 provider   : $providerName
@@ -438,11 +469,19 @@ share_path : $ShareDir
 stage      : $failureStage
 failure    : $(if ([string]::IsNullOrWhiteSpace($failureReason)) { "none" } else { $failureReason })
 
-PASS proves:
+$(if ($Mock) {
+"PASS proves:
+  - provider/profile/policy attachment produced a revision-scoped placeholder.
+  - the mock child received the placeholder instead of the raw token.
+  - the raw synthetic token did not appear in collected result artifacts.
+  - no external request was made; proxy substitution and MXC enforcement remain untested."
+} else {
+"PASS proves:
   - MXC received a revision-scoped GITHUB_TOKEN placeholder, not the token.
   - api.github.com accepted the credential after host-proxy substitution.
   - policy-allowed github.com could not resolve the api.github.com-bound placeholder.
-  - the raw token did not appear in collected result artifacts.
+  - the raw token did not appear in collected result artifacts."
+})
 "@
     [System.IO.File]::WriteAllText((Join-Path $resultDir "summary.txt"), $summary, $utf8NoBom)
     Write-Host "`n$summary" -ForegroundColor ($(if ($passed) { "Green" } else { "Red" }))

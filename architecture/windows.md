@@ -248,6 +248,10 @@ Windows validation separates source correctness from host capability:
   workspace and unsupported-driver contract tests for x64 and ARM64.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but
   is not evidence of OS enforcement.
+- Hosted Windows CI runs the shipped provider-credential example with a
+  synthetic value. It verifies provider/profile/policy attachment and that the
+  mock workload receives only a revision-scoped placeholder. It makes no
+  external request and does not prove proxy substitution or MXC enforcement.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.

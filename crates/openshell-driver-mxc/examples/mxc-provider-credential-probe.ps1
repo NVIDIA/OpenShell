@@ -7,7 +7,8 @@
 
 [CmdletBinding()]
 param(
-    [string] $OutputDir = "C:\work\openshell-mxc-provider"
+    [string] $OutputDir = "C:\work\openshell-mxc-provider",
+    [switch] $Mock
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,6 +128,11 @@ try {
     }
 
     $checks += "[PASS] MXC received only a revision-scoped GITHUB_TOKEN placeholder"
+    if ($Mock) {
+        $checks += "[PASS] no external network request was made in mock mode"
+        Complete-Probe $checks
+    }
+
     $curlPath = Join-Path $env:SystemRoot "System32\curl.exe"
     if (-not (Test-Path $curlPath)) {
         $checks += "[FAIL] inbox curl.exe is unavailable"
