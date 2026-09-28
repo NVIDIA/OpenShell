@@ -689,6 +689,9 @@ openshell forward start 8080 my-app -d
 ```
 
 The service is now reachable at `localhost:8080`.
+CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
+user's SSH config. Only background forwards are tracked by `forward list` and
+managed by `forward stop`; foreground forwards end when the command exits.
 
 Manage or iterate on the sandbox:
 
