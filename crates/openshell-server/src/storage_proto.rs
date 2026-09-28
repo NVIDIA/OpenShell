@@ -126,15 +126,19 @@ mod tests {
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
+    // Service authorization also extends both schemas additively. Legacy
+    // payloads retain the safe Strip default.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2ed66dbc38c60eb96c7461c76d02813c177facfad93753b180534477270ad240";
+        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
     const DURABLE_SCHEMA_SHA256: &str =
-        "399737f2a367d2e3a9d78cf84e2a97eef041835554599790788e4bbf318116c3";
+        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d3c444ecdb42306af8a81791481fdfc147ddc54bf344e1c8e69bd06745c6cc3c";
+        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
+    // ServiceEndpoint encoded before authorization_mode field 7 existed.
+    const SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE: &str = "0a260a0b656e64706f696e742d6964120c73616e64626f782d2d77656228073a0764656661756c74120a73616e64626f782d69641a0773616e64626f78220377656228903f3001";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -594,14 +598,38 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 26),
-                (93, 20),
-                (81, 20),
+                (306, 27),
+                (93, 21),
+                (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
+        );
+    }
+
+    #[test]
+    fn service_endpoint_without_authorization_mode_decodes_as_strip() {
+        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+
+        let endpoint = ServiceEndpoint::decode(
+            legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
+        )
+        .expect("stored service endpoint without authorization mode must decode");
+
+        assert_eq!(endpoint.sandbox_id, "sandbox-id");
+        assert_eq!(endpoint.sandbox, "sandbox");
+        assert_eq!(endpoint.name, "web");
+        assert_eq!(endpoint.target_port, 8080);
+        assert!(endpoint.domain);
+        assert_eq!(
+            endpoint.authorization_mode(),
+            ServiceAuthorizationMode::Unspecified
+        );
+        assert_eq!(
+            crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
+            ServiceAuthorizationMode::Strip
         );
     }
 

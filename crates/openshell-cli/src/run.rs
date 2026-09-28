@@ -58,9 +58,9 @@ use openshell_core::proto::{
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
     SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
     SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
-    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -443,6 +443,7 @@ pub struct SandboxCreateConfig<'a> {
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
+    pub expose_authorization_mode: ServiceAuthorizationMode,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -472,6 +473,7 @@ impl Default for SandboxCreateConfig<'_> {
             policy: None,
             forward: None,
             expose: None,
+            expose_authorization_mode: ServiceAuthorizationMode::Strip,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -509,6 +511,7 @@ pub async fn sandbox_create(
         policy,
         forward,
         expose,
+        expose_authorization_mode,
         command,
         tty_override,
         auto_providers_override,
@@ -693,6 +696,7 @@ pub async fn sandbox_create(
             .map(|target_port| SandboxServiceExposure {
                 service: String::new(),
                 target_port: u32::from(target_port),
+                authorization_mode: expose_authorization_mode as i32,
             })
             .into_iter()
             .collect(),
@@ -3823,11 +3827,20 @@ pub async fn service_expose(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let response =
-        expose_service_endpoint(server, sandbox, service, target_port, workspace, tls).await?;
+    let response = expose_service_endpoint(
+        server,
+        sandbox,
+        service,
+        target_port,
+        authorization_mode,
+        workspace,
+        tls,
+    )
+    .await?;
 
     if service.is_empty() {
         println!(
@@ -3857,6 +3870,7 @@ async fn expose_service_endpoint(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<ServiceEndpointResponse> {
@@ -3868,6 +3882,7 @@ async fn expose_service_endpoint(
             name: service.to_string(),
             target_port: u32::from(target_port),
             domain: true,
+            authorization_mode: authorization_mode as i32,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -4040,6 +4055,7 @@ fn print_service_endpoint_table(
                 .map_or("", |m| m.workspace.as_str());
             let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
             let url = if response.url.is_empty() {
                 String::new()
             } else {
@@ -4050,6 +4066,7 @@ fn print_service_endpoint_table(
                 endpoint.sandbox.clone(),
                 service,
                 target,
+                authorization,
                 url,
             ))
         })
@@ -4061,7 +4078,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -4070,50 +4087,52 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _)| service.len())
+        .map(|(_, _, service, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _)| target.len())
+        .map(|(_, _, _, target, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, url) in rows {
+    for (workspace, sandbox, service, target, authorization, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         }
     }
@@ -4139,12 +4158,20 @@ fn service_endpoint_to_json(
         "sandbox": endpoint.sandbox,
         "service": endpoint.name,
         "target_port": endpoint.target_port,
+        "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
     }))
 }
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
+}
+
+fn service_authorization_mode_name(mode: i32) -> &'static str {
+    match ServiceAuthorizationMode::try_from(mode).unwrap_or(ServiceAuthorizationMode::Strip) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
 }
 
 /// Read gcloud Application Default Credentials from disk.
@@ -6521,8 +6548,9 @@ mod tests {
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
         SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
         SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceEndpoint,
-        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6639,6 +6667,7 @@ mod tests {
                 sandbox: "api".to_string(),
                 name: String::new(),
                 target_port: 8080,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                 ..Default::default()
             }),
             url: "https://api.openshell.localhost:3000/".to_string(),
@@ -6653,6 +6682,7 @@ mod tests {
                 "sandbox": "api",
                 "service": "",
                 "target_port": 8080,
+                "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
             })
         );

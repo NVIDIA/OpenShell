@@ -9,9 +9,11 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
-use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
-use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
+use openshell_core::proto::{
+    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
+};
+use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
@@ -428,6 +430,19 @@ async fn proxy_to_endpoint(
         );
         return Err(err);
     }
+    let authorization_mode = effective_authorization_mode(endpoint.authorization_mode);
+    if validate_application_authorization(&req, authorization_mode).is_err() {
+        let err = ServiceRouteError::invalid_request();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
 
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
@@ -446,7 +461,7 @@ async fn proxy_to_endpoint(
         None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
     };
 
-    let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
+    let upstream = build_upstream_request(req, target_port, websocket_upgrade, authorization_mode)?;
     let replay = reused.then(|| replayable_request(&upstream)).flatten();
     let first_attempt = if reused {
         sender.try_send_request(upstream).await.map_err(|mut err| {
@@ -626,6 +641,7 @@ fn build_upstream_request(
     req: Request<Body>,
     target_port: u16,
     preserve_upgrade_headers: bool,
+    authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Request<Body>, ServiceRouteError> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
@@ -644,7 +660,7 @@ fn build_upstream_request(
     for (name, value) in &parts.headers {
         if (is_hop_by_hop_header(name)
             && !(preserve_upgrade_headers && is_websocket_hop_by_hop_header(name)))
-            || is_gateway_auth_header(name)
+            || is_gateway_auth_header(name, authorization_mode)
         {
             continue;
         }
@@ -724,15 +740,83 @@ fn is_websocket_hop_by_hop_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "connection" | "upgrade")
 }
 
-fn is_gateway_auth_header(name: &header::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "authorization"
-            | "cf-access-jwt-assertion"
-            | "x-forwarded-client-cert"
-            | "x-ssl-client-cert"
-            | "x-client-cert"
-    )
+pub fn effective_authorization_mode(value: i32) -> ServiceAuthorizationMode {
+    match ServiceAuthorizationMode::try_from(value) {
+        Ok(ServiceAuthorizationMode::BearerPassthrough) => {
+            ServiceAuthorizationMode::BearerPassthrough
+        }
+        Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip) | Err(_) => {
+            ServiceAuthorizationMode::Strip
+        }
+    }
+}
+
+fn authorization_mode_label(value: i32) -> &'static str {
+    match effective_authorization_mode(value) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
+}
+
+fn validate_application_authorization<B>(
+    req: &Request<B>,
+    authorization_mode: ServiceAuthorizationMode,
+) -> Result<(), ServiceRouteError> {
+    if authorization_mode != ServiceAuthorizationMode::BearerPassthrough {
+        return Ok(());
+    }
+
+    let mut values = req.headers().get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(ServiceRouteError::invalid_request());
+    }
+
+    let value = value
+        .to_str()
+        .map_err(|_| ServiceRouteError::invalid_request())?;
+    let Some((scheme, credential)) = value.split_once(' ') else {
+        return Err(ServiceRouteError::invalid_request());
+    };
+    let credential = credential.trim_start_matches(' ');
+    if !scheme.eq_ignore_ascii_case("bearer") || !is_bearer_token68(credential) {
+        return Err(ServiceRouteError::invalid_request());
+    }
+    Ok(())
+}
+
+fn is_bearer_token68(value: &str) -> bool {
+    let mut saw_data = false;
+    let mut saw_padding = false;
+    for byte in value.bytes() {
+        if byte == b'=' {
+            saw_padding = true;
+        } else if !saw_padding
+            && (byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+        {
+            saw_data = true;
+        } else {
+            return false;
+        }
+    }
+    saw_data
+}
+
+fn is_gateway_auth_header(
+    name: &header::HeaderName,
+    authorization_mode: ServiceAuthorizationMode,
+) -> bool {
+    match name.as_str() {
+        "authorization" => authorization_mode != ServiceAuthorizationMode::BearerPassthrough,
+        "cf-access-jwt-assertion"
+        | "x-forwarded-client-cert"
+        | "x-ssl-client-cert"
+        | "x-client-cert" => true,
+        _ => false,
+    }
 }
 
 fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
@@ -830,7 +914,11 @@ fn build_service_endpoint_config_event(
         ))
         .unmapped("endpoint_name", endpoint_name(endpoint))
         .unmapped("service_name", endpoint.name.clone())
-        .unmapped("target_port", u64::from(endpoint.target_port));
+        .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        );
 
     if !url.is_empty() {
         builder = builder.unmapped("url", url.to_string());
@@ -849,6 +937,10 @@ fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent 
         .unmapped("endpoint_name", endpoint_name(endpoint))
         .unmapped("service_name", endpoint.name.clone())
         .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        )
         .build()
 }
 
@@ -990,6 +1082,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         }
     }
 
@@ -1233,6 +1326,7 @@ mod tests {
         assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
         assert_eq!(json["unmapped"]["service_name"], "web");
         assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
         assert!(
             event
                 .format_shorthand()
@@ -1249,6 +1343,7 @@ mod tests {
         assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
         assert_eq!(json["unmapped"]["service_name"], "web");
         assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
         assert!(
             event
                 .format_shorthand()
@@ -1309,7 +1404,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, false).unwrap();
+        let upstream =
+            build_upstream_request(request, 8080, false, ServiceAuthorizationMode::Strip).unwrap();
 
         assert_eq!(upstream.uri(), "/path");
         assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
@@ -1320,6 +1416,145 @@ mod tests {
             "theme=dark; app=session"
         );
         assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn unspecified_endpoint_authorization_mode_strips_authorization() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = effective_authorization_mode(ServiceAuthorizationMode::Unspecified as i32);
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(mode, ServiceAuthorizationMode::Strip);
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_valid_authorization_and_strips_gateway_identity() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "bEaReR application-token")
+            .header("cf-access-jwt-assertion", "edge-token")
+            .header("x-forwarded-client-cert", "cert")
+            .header(header::PROXY_AUTHORIZATION, "Basic proxy-secret")
+            .header(
+                header::COOKIE,
+                "theme=dark; CF_Authorization=edge-cookie; app=session",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "bEaReR application-token"
+        );
+        assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
+        assert!(!upstream.headers().contains_key("x-forwarded-client-cert"));
+        assert!(!upstream.headers().contains_key(header::PROXY_AUTHORIZATION));
+        assert_eq!(
+            upstream.headers()[header::COOKIE],
+            "theme=dark; app=session"
+        );
+    }
+
+    #[test]
+    fn bearer_passthrough_allows_missing_authorization() {
+        let request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_rejects_ambiguous_or_malformed_authorization() {
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            "Basic abc",
+            "Bearer abc extra",
+            "Bearer abc,def",
+            "Bearer abc=def",
+            "Bearer\tabc",
+            " Bearer abc",
+        ] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            assert!(
+                validate_application_authorization(
+                    &request,
+                    ServiceAuthorizationMode::BearerPassthrough,
+                )
+                .is_err()
+            );
+        }
+
+        for value in ["Bearer abc", "bearer abc-._~+/==", "Bearer  abc"] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .unwrap();
+        }
+
+        let mut request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert!(
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authorization_value_is_not_in_service_routing_events() {
+        const SENTINEL: &str = "never-log-this-capability";
+        let request = Request::builder()
+            .uri("/private")
+            .header(header::AUTHORIZATION, format!("Bearer {SENTINEL}"))
+            .body(Body::empty())
+            .unwrap();
+        let err = ServiceRouteError::invalid_request();
+        let event = build_service_http_failure_event(
+            18080,
+            &request,
+            "my-sandbox",
+            "web",
+            Some(&endpoint()),
+            &err,
+        );
+
+        assert!(!event.to_json().unwrap().to_string().contains(SENTINEL));
+        assert!(!event.format_shorthand().contains(SENTINEL));
     }
 
     #[test]
@@ -1346,13 +1581,38 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, true).unwrap();
+        let upstream =
+            build_upstream_request(request, 8080, true, ServiceAuthorizationMode::Strip).unwrap();
 
         assert_eq!(upstream.uri(), "/chat?session=main");
         assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
         assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
         assert_eq!(upstream.headers()["sec-websocket-key"], "abc");
         assert_eq!(upstream.headers()[header::HOST], "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_authorization_on_websocket_upgrade() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/chat")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "abc")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, true, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "Bearer application-token"
+        );
+        assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
     }
 
     #[tokio::test]
@@ -1375,6 +1635,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         };
         store.put_message(&ep).await.unwrap();
 

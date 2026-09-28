@@ -1774,6 +1774,8 @@ message ExposeServiceRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 6;
+  // Application authorization behavior. Omission resolves to STRIP.
+  ServiceAuthorizationMode authorization_mode = 7;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -1840,6 +1842,8 @@ message ServiceEndpoint {
   uint32 target_port = 5;
   // Whether browser-facing service routing is enabled for this endpoint.
   bool domain = 6;
+  // Effective application authorization behavior for ingress requests.
+  ServiceAuthorizationMode authorization_mode = 7;
 }
 
 // Response containing a service endpoint and, when available, its local URL.
@@ -3785,4 +3789,17 @@ message SandboxServiceExposure {
   string service = 1;
   // Loopback TCP port inside the sandbox.
   uint32 target_port = 2;
+  // Application authorization behavior. Omission resolves to STRIP.
+  ServiceAuthorizationMode authorization_mode = 3;
+}
+
+// Controls whether an exposed service receives the request's application
+// Authorization header.
+enum ServiceAuthorizationMode {
+  // Omission preserves the secure legacy behavior and resolves to STRIP.
+  SERVICE_AUTHORIZATION_MODE_UNSPECIFIED = 0;
+  // Remove Authorization before forwarding to the sandbox service.
+  SERVICE_AUTHORIZATION_MODE_STRIP = 1;
+  // Forward one syntactically valid bearer Authorization header unchanged.
+  SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
 }

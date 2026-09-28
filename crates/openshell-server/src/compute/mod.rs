@@ -25,6 +25,8 @@ use hyper_util::rt::TokioIo;
 use openshell_core::extension_protocol::{
     ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
 };
+#[cfg(test)]
+use openshell_core::proto::ServiceAuthorizationMode;
 use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
@@ -9509,6 +9511,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         }
     }
 
