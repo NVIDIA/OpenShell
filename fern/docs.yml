@@ -90,6 +90,10 @@ redirects:
   - source: "/openshell/latest/sandboxes/providers-v2"
     destination: "/openshell/latest/how-it-works/providers/profiles"
   # Preserve published URLs when page names and slugs change.
+  - source: "/openshell/about/why-open-shell"
+    destination: "/openshell/latest/about/overview"
+  - source: "/openshell/sdk/type-script"
+    destination: "/openshell/latest/sdk/typescript"
   - source: "/openshell/latest/about/why-open-shell"
     destination: "/openshell/latest/about/overview"
   - source: "/openshell/dev/about/why-open-shell"
