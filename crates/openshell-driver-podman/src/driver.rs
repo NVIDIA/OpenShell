@@ -25,6 +25,7 @@ use openshell_core::proto::compute::v1::{
     GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,8 @@ use tracing::{Instrument as _, debug, info, warn};
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+const MAX_PING_RETRIES: u32 = 5;
+const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 const POLICY_DNS_RESOLV_CONF: &[u8] = b"nameserver 127.0.0.53\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,12 +412,33 @@ fn resolve_socket_path(
     })
 }
 
+async fn ping_with_retry<F, Fut>(mut ping: F) -> Result<(), PodmanApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), PodmanApiError>>,
+{
+    let mut retries = 0;
+    loop {
+        match ping().await {
+            Ok(()) => return Ok(()),
+            Err(error) if retries < MAX_PING_RETRIES => {
+                retries += 1;
+                warn!(
+                    attempt = retries,
+                    max_retries = MAX_PING_RETRIES,
+                    error = %error,
+                    "Podman socket not ready, retrying"
+                );
+                tokio::time::sleep(PING_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
-        const MAX_PING_RETRIES: u32 = 5;
-        const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
-
         let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
 
@@ -445,23 +469,7 @@ impl PodmanComputeDriver {
         // unavailability (e.g. podman.socket restarting after a package
         // upgrade). The systemd unit uses Wants=podman.socket (not Requires),
         // so the gateway may start while the socket is briefly re-activating.
-        let mut attempts = 0;
-        loop {
-            match client.ping().await {
-                Ok(()) => break,
-                Err(e) if attempts < MAX_PING_RETRIES => {
-                    attempts += 1;
-                    warn!(
-                        attempt = attempts,
-                        max_retries = MAX_PING_RETRIES,
-                        error = %e,
-                        "Podman socket not ready, retrying"
-                    );
-                    tokio::time::sleep(PING_RETRY_DELAY).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        ping_with_retry(|| client.ping()).await?;
 
         // Verify cgroups v2, detect rootless mode, and log system info.
         let rootless = match client.system_info().await {
@@ -2044,7 +2052,7 @@ mod tests {
     use openshell_core::proto::compute::v1::{
         DriverSandboxSpec, DriverSandboxTemplate, ResourceRequirements,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -2103,6 +2111,63 @@ mod tests {
         let err = resolve_socket_path(None, || None).unwrap_err();
 
         assert!(err.to_string().contains("no responsive Podman API socket"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_retries_transient_failures() {
+        let mut outcomes = VecDeque::from([
+            Err(PodmanApiError::Connection("first".to_string())),
+            Err(PodmanApiError::Connection("second".to_string())),
+            Ok(()),
+        ]);
+        let started = tokio::time::Instant::now();
+
+        ping_with_retry(|| std::future::ready(outcomes.pop_front().expect("ping outcome")))
+            .await
+            .expect("a later successful ping should stop retries");
+
+        assert!(outcomes.is_empty());
+        assert_eq!(started.elapsed(), PING_RETRY_DELAY * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_failure_is_bounded_by_retry_policy() {
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+
+        let error = ping_with_retry(|| {
+            attempts += 1;
+            std::future::ready(Err(PodmanApiError::Connection(format!(
+                "attempt {attempts}"
+            ))))
+        })
+        .await
+        .expect_err("persistent connection failures should be returned");
+
+        assert_eq!(attempts, MAX_PING_RETRIES + 1);
+        assert_eq!(started.elapsed(), PING_RETRY_DELAY * MAX_PING_RETRIES);
+        assert_eq!(
+            error.to_string(),
+            format!("connection error: attempt {}", MAX_PING_RETRIES + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_socket_connection_error_names_configured_path() {
+        let tempdir = tempfile::tempdir().expect("create isolated socket directory");
+        let missing_socket = tempdir.path().join("missing-podman.sock");
+
+        let error = PodmanClient::new(missing_socket.clone())
+            .ping()
+            .await
+            .expect_err("a missing socket should fail to connect");
+
+        assert!(matches!(error, PodmanApiError::Connection(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(&missing_socket.display().to_string())
+        );
     }
 
     fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
