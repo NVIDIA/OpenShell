@@ -18,6 +18,7 @@ depends = [
   "test:e2e-parity",
   "test:packaging-assets",
   "test:qualification-summary",
+  "test:proto-breaking",
   "test:codex-security-release-range",
   "test:docs-website",
   "test:docs-nav",
@@ -72,6 +73,12 @@ hide = true
 description = "Test release qualification summary generation"
 run = "tasks/scripts/test-qualification-summary.sh"
 run_windows = "echo Skipping test:qualification-summary: the release workflow runs on Unix hosts."
+hide = true
+
+["test:proto-breaking"]
+description = "Test public protobuf breaking-change detection"
+run = "bash tasks/scripts/test-proto-breaking.sh"
+run_windows = "echo Skipping test:proto-breaking: the Branch Checks workflow runs on Unix hosts."
 hide = true
 
 ["test:codex-security-release-range"]

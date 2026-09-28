@@ -17,6 +17,31 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Protobuf API compatibility
+
+The `Protobuf API compatibility` job in `Branch Checks` compares the candidate's
+`proto/` module with the PR target branch commit. This covers SDK and extension
+contracts. Merge-queue runs compare with the merge group's base commit. The job
+uses the `FILE` breaking policy in `buf.yaml` and fails with a file and symbol
+diagnostic for an incompatible change. It runs on every branch check so changes
+to imported messages cannot be missed by a changed-file filter. The gateway's
+storage-only protobuf module is outside this comparison and has separate
+durability checks.
+
+Fetch the target branch and reproduce the comparison locally, replacing
+`origin/main` if the PR targets another branch:
+
+```shell
+git fetch origin main
+PROTO_BREAKING_BASE_REF=origin/main mise run proto:breaking
+```
+
+For an intentional incompatibility, record the Buf finding, linked issue,
+consumer impact, and migration plan in the PR. The check stays failed; a
+maintainer must explicitly decide whether to version the API or authorize an
+exception through repository merge policy. Do not suppress the finding by
+disabling the job or adding a broad Buf ignore rule.
+
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.

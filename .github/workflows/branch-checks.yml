@@ -30,11 +30,64 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
+      base_sha: ${{ steps.gate.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
         uses: ./.github/actions/pr-gate
+
+  proto-breaking:
+    name: Protobuf API compatibility
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Resolve and fetch target branch baseline
+        id: baseline
+        env:
+          PR_BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            base_sha="$MERGE_GROUP_BASE_SHA"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            base_sha="$PR_BASE_SHA"
+          else
+            git fetch --no-tags --depth=1 origin "refs/heads/$DEFAULT_BRANCH"
+            base_sha="$(git rev-parse FETCH_HEAD)"
+          fi
+
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::No valid target branch baseline SHA was available."
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            git fetch --no-tags --depth=1 origin "$base_sha"
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Comparing protobuf API with $base_sha"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check protobuf API compatibility
+        env:
+          PROTO_BREAKING_BASE_REF: ${{ steps.baseline.outputs.sha }}
+        run: mise run proto:breaking
 
   mise-lockfile:
     name: mise Lockfile

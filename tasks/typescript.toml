@@ -29,6 +29,10 @@ depends = ["sdk:ts:install"]
 run = "./sdk/typescript/node_modules/.bin/buf lint"
 run_windows = "sdk\\typescript\\node_modules\\.bin\\buf.cmd lint"
 
+["proto:breaking"]
+description = "Compare proto/ contracts against PROTO_BREAKING_BASE_REF"
+run = "bash tasks/scripts/check-proto-breaking.sh"
+
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
 depends = ["sdk:ts:proto"]
