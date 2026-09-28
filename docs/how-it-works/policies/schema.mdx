@@ -50,6 +50,8 @@ that are not listed are inaccessible. When the effective policy has at least one
 network rule, OpenShell also adds the baseline paths described in [Default
 Policy](/how-it-works/policies/default-policy#baseline-filesystem-paths).
 
+These filesystem defaults also apply when the supervisor or standalone proxy loads local policy files directly. Local loading rejects invalid filesystem, Landlock, and process field types, unknown fields in those sections, and explicit `null` JSON-RPC or MCP options.
+
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
 

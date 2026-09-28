@@ -16,6 +16,10 @@ use openshell_core::policy::{
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
+use openshell_policy_schema::{
+    FilesystemPolicy as AuthoredFilesystemPolicy, LandlockPolicy as AuthoredLandlockPolicy,
+    ProcessPolicy as AuthoredProcessPolicy,
+};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -1482,6 +1486,32 @@ fn validate_opa_object_array<'a>(
     Ok(entries)
 }
 
+/// Validate static sections with the authored types while retaining OPA-only data.
+/// Keep schema errors and their source chains out of load diagnostics because
+/// they can contain authored keys, paths, or values.
+fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
+    if let Some(filesystem) = data.get_mut("filesystem_policy") {
+        let settings: AuthoredFilesystemPolicy = serde_json::from_value(filesystem.clone())
+            .map_err(|_| miette::miette!("invalid filesystem policy settings"))?;
+        // A present stanza defaults to false; an absent stanza must stay absent
+        // so Rego's undefined result retains the runtime workdir default.
+        filesystem["include_workdir"] = settings.include_workdir.into();
+    }
+    if let Some(landlock) = data.get_mut("landlock") {
+        let settings: AuthoredLandlockPolicy = serde_json::from_value(landlock.clone())
+            .map_err(|_| miette::miette!("invalid Landlock policy settings"))?;
+        // Serde also accepts a map for a unit enum variant. Runtime consumers
+        // read a string, so retain the validated meaning in canonical form.
+        *landlock = serde_json::to_value(settings)
+            .map_err(|_| miette::miette!("failed to serialize Landlock policy settings"))?;
+    }
+    if let Some(process) = data.get("process") {
+        serde_json::from_value::<AuthoredProcessPolicy>(process.clone())
+            .map_err(|_| miette::miette!("invalid process policy settings"))?;
+    }
+    Ok(())
+}
+
 /// Select a fixed category without formatting authored fields or nested reasons.
 /// Keep this match exhaustive so new validator variants require an explicit
 /// decision before their diagnostics can cross the supervisor load boundary.
@@ -1597,6 +1627,7 @@ fn preprocess_yaml_data(
         )
     })?;
     validate_opa_data_structure(&data)?;
+    validate_opa_static_settings(&mut data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
     normalize_endpoint_protocols(&mut data);
 
@@ -1811,13 +1842,8 @@ fn normalize_l7_config_alias(
     let Some(config) = ep.get(key).cloned() else {
         return;
     };
-    if config.is_null() {
-        ep.remove(key);
-        if stanza == L7ConfigStanza::Mcp {
-            errors.push(format!("{loc}.{key}: mcp config must be an object"));
-        }
-        return;
-    }
+    // Explicit null must reach the canonical parser: it is invalid authored
+    // configuration, while an omitted stanza may select protocol defaults.
     match openshell_policy::l7_config_alias_runtime_fields(stanza, config) {
         Ok(fields) => {
             ep.remove(key);
@@ -4297,6 +4323,48 @@ process:
         );
     }
 
+    #[test]
+    fn yaml_and_proto_landlock_policy_have_compatibility_parity() {
+        for (stanza, hard_requirement) in [
+            ("{}", false),
+            ("{compatibility: best_effort}", false),
+            ("{compatibility: hard_requirement}", true),
+            ("{compatibility: {best_effort: null}}", false),
+            ("{compatibility: {hard_requirement: null}}", true),
+        ] {
+            let versionless = format!("landlock: {stanza}\n");
+            let versioned = format!("version: 1\n{versionless}");
+            let proto = openshell_policy::parse_sandbox_policy(&versioned)
+                .expect("valid typed Landlock representation");
+            let typed = OpaEngine::from_proto(&proto)
+                .expect("typed engine")
+                .query_sandbox_config()
+                .expect("typed sandbox config");
+            assert_eq!(
+                matches!(
+                    typed.landlock.compatibility,
+                    LandlockCompatibility::HardRequirement
+                ),
+                hard_requirement,
+                "typed contract for {stanza}"
+            );
+            for data in [&versioned, &versionless] {
+                let raw = OpaEngine::from_strings(TEST_POLICY, data)
+                    .expect("valid raw Landlock representation")
+                    .query_sandbox_config()
+                    .expect("raw sandbox config");
+                assert_eq!(
+                    matches!(
+                        raw.landlock.compatibility,
+                        LandlockCompatibility::HardRequirement
+                    ),
+                    hard_requirement,
+                    "raw OPA loading for {data}"
+                );
+            }
+        }
+    }
+
     /// Nested values that the typed schema rejects must also be rejected when
     /// the same policy is loaded directly into OPA, with or without a
     /// `version` key, instead of being replaced by defaults
@@ -4334,9 +4402,39 @@ process:
                 "filesystem_policy: {read_only: [\"/usr\"]}\n".to_owned(),
             ),
             (
+                "non-string read_write entry",
+                "filesystem_policy: {read_write: [false]}\n".to_owned(),
+                "filesystem_policy: {read_write: [\"/tmp\"]}\n".to_owned(),
+            ),
+            (
+                "unknown filesystem field",
+                "filesystem_policy: {private_typo: false}\n".to_owned(),
+                "filesystem_policy: {}\n".to_owned(),
+            ),
+            (
                 "unknown Landlock compatibility",
                 "landlock: {compatibility: required}\n".to_owned(),
                 "landlock: {compatibility: hard_requirement}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock field",
+                "landlock: {private_typo: true}\n".to_owned(),
+                "landlock: {}\n".to_owned(),
+            ),
+            (
+                "non-string process identity",
+                "process: {run_as_user: 7}\n".to_owned(),
+                "process: {run_as_user: sandbox}\n".to_owned(),
+            ),
+            (
+                "null process group",
+                "process: {run_as_group: null}\n".to_owned(),
+                "process: {run_as_group: sandbox}\n".to_owned(),
+            ),
+            (
+                "unknown process field",
+                "process: {private_typo: sandbox}\n".to_owned(),
+                "process: {}\n".to_owned(),
             ),
             (
                 "explicit null json_rpc options",
@@ -4365,8 +4463,9 @@ process:
                 "typed schema must reject the {case} fixture"
             );
             for (form, data) in [("versioned", versioned.as_str()), ("versionless", invalid)] {
-                if OpaEngine::from_strings(TEST_POLICY, data).is_ok() {
-                    accepted_by_raw_opa.push(format!("{case} ({form})"));
+                match OpaEngine::from_strings(TEST_POLICY, data) {
+                    Ok(_) => accepted_by_raw_opa.push(format!("{case} ({form})")),
+                    Err(error) => assert_safe_load_error(&error, &["private_typo"]),
                 }
             }
         }
@@ -4387,6 +4486,80 @@ process:
             accepted_by_raw_opa.is_empty(),
             "raw OPA loading accepted fixtures that the typed schema rejects: {accepted_by_raw_opa:?}"
         );
+    }
+
+    #[test]
+    fn raw_opa_nested_validation_preserves_file_loads_and_rejected_reload() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("policy.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).expect("write policy rules");
+        let valid = opa_container_policy();
+        std::fs::write(&data_path, valid.to_string()).expect("write valid policy");
+        let engine = OpaEngine::from_files(&rules_path, &data_path).expect("valid file policy");
+        let proxy = OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+            .expect("valid endpoint-only policy");
+        for loaded in [&engine, &proxy] {
+            assert!(
+                !loaded
+                    .query_sandbox_config()
+                    .expect("filesystem config")
+                    .filesystem
+                    .include_workdir,
+                "file loaders must retain the typed default for an empty filesystem stanza"
+            );
+        }
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        let generation = engine.current_generation();
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+
+        // Malformed nested settings must fail before replacing any installed
+        // decisions or notifying consumers of a new generation.
+        for (pointer, replacement) in [
+            (
+                "/filesystem_policy",
+                serde_json::json!({"include_workdir": "private-value-秘密".repeat(1024)}),
+            ),
+            (
+                "/landlock",
+                serde_json::json!({"compatibility": "private-value-秘密".repeat(1024)}),
+            ),
+            ("/process", serde_json::json!({"run_as_user": 7})),
+        ] {
+            let mut malformed = valid.clone();
+            *malformed
+                .pointer_mut(pointer)
+                .expect("existing static section") = replacement;
+            let data = malformed.to_string();
+            std::fs::write(&data_path, &data).expect("write malformed policy");
+            for error in [
+                OpaEngine::from_files(&rules_path, &data_path)
+                    .err()
+                    .expect("file loader must reject malformed nested values"),
+                OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+                    .err()
+                    .expect("endpoint-only file loader must reject malformed nested values"),
+                engine
+                    .reload(TEST_POLICY, &data)
+                    .expect_err("reload must reject malformed nested values"),
+            ] {
+                assert_safe_load_error(&error, &["private-value", "秘密", "admin.example.test"]);
+            }
+            assert_eq!(engine.current_generation(), generation);
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+
+        let mut repaired = valid;
+        repaired["network_policies"]["admin"]["endpoints"][0]["deny_rules"][0]["path"] =
+            "/other/**".into();
+        engine
+            .reload(TEST_POLICY, &repaired.to_string())
+            .expect("valid replacement after rejected reloads");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(eval_l7(&engine, &denied));
     }
 
     #[test]
