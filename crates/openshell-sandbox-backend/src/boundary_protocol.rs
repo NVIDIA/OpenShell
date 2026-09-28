@@ -1644,12 +1644,9 @@ mod tests {
         // Pin the canonical bytes, including the nested environment object.
         // Two randomized HashMaps can otherwise happen to iterate identically
         // and conceal a serializer that preserves insertion order.
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}"#
-            )
-        );
+        // SHA-256 of:
+        // {"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}
+        let expected = "223bc65c4068e4fbdfccc19d562b69fe5966c8931ffaf10c205cd4159fb79673";
         for provider_env in [first, second] {
             let request = build(provider_env);
             assert_eq!(request_payload_digest(&request).expect("digest"), expected);
