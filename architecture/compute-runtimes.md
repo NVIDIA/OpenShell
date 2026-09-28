@@ -107,6 +107,11 @@ whose compute resource is still provisioning without exposing contradictory publ
 readiness signals. When the driver reports runtime readiness, its ready condition
 is published without waiting for a supervisor session.
 
+The supervisor keeps retrying session establishment while the gateway is unavailable.
+Its control readiness socket remains absent until the gateway accepts a session and
+is removed if that session disconnects. A transient gateway delay during startup
+therefore leaves the sandbox provisioning without terminating the supervisor.
+
 **Session precedence over lagging driver snapshots:** A supervisor session can only be
 established by a running workload. When `set_supervisor_session_state` promotes the
 store record to `Ready` on session connect, a driver watch event may still arrive

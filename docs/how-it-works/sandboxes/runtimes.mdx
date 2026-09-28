@@ -176,6 +176,8 @@ The driver looks up sandbox images in local Docker or Podman before pulling from
 
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
+If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
+
 ## Kubernetes Driver
 
 The Kubernetes driver runs sandboxes as pods in a sandbox namespace. It requires the [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller. Install the gateway with the Helm chart; see [Kubernetes setup](/kubernetes/setup).

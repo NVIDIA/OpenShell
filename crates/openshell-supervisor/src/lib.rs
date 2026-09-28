@@ -100,21 +100,24 @@ impl ControlReadiness {
         path: std::path::PathBuf,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if session_readiness
+        prepare_control_readiness_path(&path)?;
+        let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
         {
-            return Err(miette::miette!(
-                "supervisor session is not ready when starting health listener"
-            ));
-        }
-        prepare_control_readiness_path(&path)?;
-        let listener = tokio::net::UnixListener::bind(&path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("bind supervisor readiness socket on {}", path.display()))?;
+            None
+        } else {
+            Some(
+                tokio::net::UnixListener::bind(&path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("bind supervisor readiness socket on {}", path.display())
+                    })?,
+            )
+        };
         let task_path = path.clone();
         let task = tokio::spawn(async move {
-            let mut listener = Some(listener);
+            let mut listener = listener;
             loop {
                 let session_unready = session_readiness
                     .as_ref()
@@ -4754,10 +4757,19 @@ mod tests {
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
         let _readiness = ControlReadiness::start(path.clone(), Some(session_rx))
             .expect("start readiness listener");
-        check_control_readiness(&path).expect("accepted session is ready");
+        assert!(check_control_readiness(&path).is_err());
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while check_control_readiness(&path).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first accepted session creates readiness socket");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
