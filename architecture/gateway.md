@@ -858,8 +858,9 @@ with it.
 fetches the current object, applies a mutation closure, and writes with a
 `MatchResourceVersion` condition. On conflict the persistence layer returns a
 `Conflict` error, which gRPC handlers map to `ABORTED` status so the client
-(or the next watch/reconcile event) can retry with fresh state. There is no
-automatic retry loop.
+(or the next watch/reconcile event) can retry with fresh state. Provider
+attach/detach handlers retry bounded server-driven conflicts around this helper;
+an explicit client version still fails on its first conflict.
 
 The helper accepts an `expected_version` parameter that selects between two
 modes:

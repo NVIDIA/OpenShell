@@ -448,7 +448,7 @@ class Openshell < Formula
       # Keep any user-edited config untouched.
       if gateway_config.read == legacy_empty_gateway_config_contents ||
          gateway_config.read == legacy_ipv6_gateway_config_contents
-        gateway_config.write gateway_config_contents
+        gateway_config.atomic_write gateway_config_contents
       end
     end
 

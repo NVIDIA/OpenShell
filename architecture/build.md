@@ -226,6 +226,8 @@ The Homebrew service keeps gateway TLS under the Homebrew state directory but
 mirrors Docker sandbox client TLS into `$HOME/.local/state/openshell/homebrew/tls`
 at service start, because Docker Desktop bind mounts must use paths visible to
 the macOS user's shared home directory.
+On upgrade, the formula atomically replaces only exact package-generated
+schema-v1 gateway configs, leaving user-edited configs untouched.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
@@ -268,7 +270,9 @@ for explicit publication.
 
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
-lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+lifecycle by creating, inspecting, executing in, and deleting a sandbox. The
+file-transfer scenario verifies portable upload and download behavior, Git-aware
+filtering, and sandbox workspace path safety.
 Feature suites use the same disposable guest but may provision isolated
 dependencies after installation. The Keycloak provider-refresh suite starts a
 guest-local Keycloak realm and verifies a successful OAuth refresh followed by
@@ -582,10 +586,16 @@ See `CI.md` for the contributor workflow, labels, and maintainer merge-queue wor
 Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
 configuration, components, theme assets, and publish settings live in `fern/`.
 
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
+Use `mise run docs` for Fern validation and navigation-to-file-path consistency,
+and `mise run docs:serve` for local preview. The docs PR workflow also runs the
+navigation check's unit tests (`mise run test:docs-nav`).
+PR previews are produced by `.github/workflows/branch-docs.yml` when
 Fern credentials are available. Production docs publish from the release tag
-workflow.
+workflow. Redirect rules follow the mutable snapshot that owns their source URL
+(or destination for unversioned aliases). Syncing replaces that channel's rules,
+including deletions; `dev` owns shared fallback rules. Stable promotion updates
+`latest` routing together with its content, while older maintenance releases
+preserve both.
 
 ## Validation Expectations
 

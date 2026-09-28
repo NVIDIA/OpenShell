@@ -574,6 +574,16 @@ complete request checks. To serve clients of both revisions on one endpoint,
 list both revisions and combine the rules from the two examples. OpenShell
 inspects each request under the revision that the request selects.
 
+MCP and JSON-RPC endpoints carry only HTTP requests, because their rules apply
+to each request. OpenShell answers a request to these endpoints that carries an
+`Upgrade` header, such as a WebSocket upgrade, with `403 Forbidden` before it
+reaches the server, in both `enforce` and `audit` mode. If the server also
+accepts WebSocket connections, allow them with a separate
+`protocol: websocket` endpoint, which applies `GET` and `WEBSOCKET_TEXT` rules,
+not MCP method or tool rules. For an MCP server, put that endpoint on a
+different host or port. A JSON-RPC endpoint can share its host and port with a
+WebSocket endpoint that uses a different `path`.
+
 ### Allow Native TCP
 
 Use `protocol: tcp` for a client that speaks a protocol other than HTTP, such

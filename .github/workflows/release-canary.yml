@@ -242,7 +242,7 @@ jobs:
       - name: Create and exercise a sandbox
         run: |
           set -euo pipefail
-          sandbox="rc-system-docker-${GITHUB_RUN_ID}"
+          sandbox="rc-${GITHUB_RUN_ID}"
           openshell sandbox create --name "$sandbox" --detach
           openshell sandbox exec --name "$sandbox" --no-tty -- true
           openshell sandbox delete "$sandbox"

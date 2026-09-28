@@ -320,7 +320,10 @@ The chart creates the following RBAC resources in the release namespace:
 | ServiceAccount | Namespace | `openshell` |
 | ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
 | Role + RoleBinding | Namespace | `openshell-sandbox` |
-| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader` |
+| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader-<release namespace>` |
+
+Every other object the chart creates is namespaced. The `ClusterRole` and
+`ClusterRoleBinding` in the last row are the only cluster-scoped objects.
 
 When the Kubernetes Secrets credential driver is enabled, the chart also creates
 an `openshell-credential-secrets` Role and RoleBinding in the credential
@@ -362,6 +365,118 @@ helm upgrade --install openshell \
 ```
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
+
+### Installing without cluster-admin
+
+By default the release creates the `ClusterRole` and `ClusterRoleBinding`, so
+the installer needs cluster-scoped permissions. When cluster-scoped RBAC is
+owned by a different team, or the installer is a namespace-admin GitOps
+controller, split the install into a cluster-admin step and a namespace-admin
+step.
+
+A cluster-admin applies the cluster-scoped objects once per gateway
+ServiceAccount. Render them from the same values the release uses, so the rules
+match the configured workspace mode and credential driver:
+
+```shell
+helm template openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
+```
+
+A namespace-admin then installs and upgrades the chart with cluster-scoped
+objects omitted. The release renders only namespaced objects and needs no
+permission on `clusterroles` or `clusterrolebindings`:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.clusterScoped.create=false
+```
+
+The gateway ServiceAccount name and namespace are unchanged by this flag, so
+the pre-created `ClusterRoleBinding` still binds the ServiceAccount the
+namespaced release creates. The same holds with `serviceAccount.create=false`:
+the binding subject follows `serviceAccount.name`, so pass the same values to
+both steps.
+
+#### Migrating an existing release
+
+Helm deletes objects that leave a release manifest, so setting
+`rbac.clusterScoped.create=false` on a release that already owns the
+`ClusterRole` and `ClusterRoleBinding` deletes them. The gateway then loses
+TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
+cluster-admin, so nothing is deleted:
+
+```shell
+kubectl annotate clusterrole "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+```
+
+The objects then survive the upgrade that sets the flag, and the cluster-admin
+owns them from that point on. Fresh installs need no such step.
+
+`rbac.clusterScoped.create` is independent of the workspace mode. `managed` and
+`operator` modes change what the `ClusterRole` grants, but they never require a
+namespace-admin to apply it. Re-run the cluster-admin step after changing any
+value that affects the `ClusterRole` rules.
+
+Set `rbac.clusterScoped.clusterRoleName` and
+`rbac.clusterScoped.clusterRoleBindingName` when the cluster-admin owns the
+naming.
+
+#### Which flag the installer needs
+
+In the default `shared` workspace mode the release also creates a namespaced
+sandbox `Role` granting Agent Sandbox (`agents.x-k8s.io`) permissions.
+Kubernetes forbids granting permissions you do not hold, and the built-in
+`admin` ClusterRole does not cover that CRD, so an installer holding only
+`admin` cannot create it. `rbac.clusterScoped.create=false` alone is then not
+enough, and the install fails with `attempting to grant RBAC permissions not
+currently held`.
+
+| Workspace mode | Installer holds | Use |
+|---|---|---|
+| `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
+| `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+
+`managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
+is needed there.
+
+With `rbac.create=false`, the cluster-admin applies the namespaced RBAC in the
+same step by adding it to the render:
+
+```shell
+helm template openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  -f my-values.yaml \
+  --set rbac.create=true \
+  --set rbac.clusterScoped.create=true \
+  --set agentSandbox.preflight.enabled=false \
+  --show-only templates/clusterrole.yaml \
+  --show-only templates/clusterrolebinding.yaml \
+  --show-only templates/role.yaml \
+  --show-only templates/rolebinding.yaml \
+  --show-only templates/peer-role.yaml | kubectl apply -f -
+```
+
+To grant the installer the sandbox permissions instead, bind it to a Role
+carrying the same rules as the chart's `openshell-sandbox` Role.
 
 ## Probes
 

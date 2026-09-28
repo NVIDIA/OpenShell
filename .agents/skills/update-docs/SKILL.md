@@ -108,6 +108,7 @@ Write the doc update following the rules in `docs/CONTRIBUTING.mdx`. Key reminde
 - **Use `sidebar-title` for short nav labels**. For explicit navigation entries, keep relative `slug` values in `docs/index.yml` instead of page frontmatter.
 - **Keep explicit `page:` entries in `docs/index.yml`**. Fern still requires them. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the page frontmatter `title`.
 - **Use `skip-slug: true` in `docs/index.yml`** when a child page should live at the parent section path.
+- **Keep each page URL equal to its file path** under `docs/`. Rename the file when you rename a page, add a `fern/docs.yml` redirect for the old URL, and set a relative `slug:` when the nav label does not produce the file name. `mise run docs` runs `docs:nav`, which fails otherwise.
 - **Use `keywords` as a comma-separated string**.
 - **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.
@@ -121,6 +122,7 @@ When updating an existing page:
 - Add content in the logical place within the existing structure.
 - Do not reorganize sections unless the change requires it.
 - Update any cross-references or "Next Steps" links if relevant.
+- When moving published URLs, update `fern/docs.yml` redirects and run `mise run test:docs-website`. Redirects reach production through the owning channel's snapshot sync; changing source configuration alone does not republish existing snapshots. See `fern/README.md` for channel ownership and repair instructions.
 
 When creating a new page:
 

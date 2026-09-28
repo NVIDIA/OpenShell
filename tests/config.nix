@@ -134,6 +134,14 @@ let
         };
       }
       {
+        name = "e2e-podman";
+        playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
+        inputs = {
+          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
+          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
+        };
+      }
+      {
         name = "driver-podman";
         playbooks = [
           "ansible/playbooks/drivers/podman/default-userns-baseline.yaml"
