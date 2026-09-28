@@ -160,16 +160,21 @@ pub fn network_prefixes() -> Vec<Nat64Prefix> {
 
 /// The IPv4 address `addr` translates to under the well-known prefix or any
 /// registered network-specific prefix.
+///
+/// When prefixes overlap, the longest matching prefix wins, as it does for
+/// the route that carries the packet: a `/96` discovered inside a configured
+/// `/32` embeds the IPv4 address in its last 32 bits, whatever order the two
+/// were registered in.
 #[must_use]
 pub fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
-    if let Some(v4) = WELL_KNOWN_PREFIX.embedded_ipv4(addr) {
-        return Some(v4);
-    }
-    NETWORK_PREFIXES
+    let prefixes = NETWORK_PREFIXES
         .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find_map(|prefix| prefix.embedded_ipv4(addr))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::iter::once(&WELL_KNOWN_PREFIX)
+        .chain(prefixes.iter())
+        .filter(|prefix| prefix.0.contains(&addr))
+        .max_by_key(|prefix| prefix.0.prefix_len())
+        .and_then(|prefix| prefix.embedded_ipv4(addr))
 }
 
 #[cfg(test)]
@@ -261,5 +266,23 @@ mod tests {
         assert!(!register_network_prefix(nsp));
         assert!(network_prefixes().contains(&nsp));
         assert_eq!(embedded_ipv4(addr), Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn overlapping_prefixes_use_the_longest_match() {
+        // Only this test registers these documentation prefixes (RFC 9637).
+        // The broad prefix goes in first, as a configured prefix would before
+        // RFC 7050 discovers the nested one.
+        register_network_prefix(prefix("3fff:64::/32"));
+        register_network_prefix(prefix("3fff:64:8c52:7003::/96"));
+        assert_eq!(
+            embedded_ipv4("3fff:64:8c52:7003::7f00:1".parse().unwrap()),
+            Some(Ipv4Addr::LOCALHOST)
+        );
+        // Outside the /96, the /32 still applies.
+        assert_eq!(
+            embedded_ipv4("3fff:64:a00:5::".parse().unwrap()),
+            Some(Ipv4Addr::new(10, 0, 0, 5))
+        );
     }
 }

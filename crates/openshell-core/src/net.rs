@@ -880,6 +880,29 @@ mod tests {
     }
 
     #[test]
+    fn nat64_nested_prefix_registered_last_classifies_by_the_nested_prefix() {
+        // Only this test registers these documentation prefixes (RFC 9637).
+        // Under the broad /32 alone every address below embeds 140.82.112.3,
+        // which is public.
+        let broad = nat64::Nat64Prefix::new("3fff:6464::/32".parse().unwrap()).unwrap();
+        let nested = nat64::Nat64Prefix::new("3fff:6464:8c52:7003::/96".parse().unwrap()).unwrap();
+        let loopback: IpAddr = "3fff:6464:8c52:7003::7f00:1".parse().unwrap();
+        let metadata: IpAddr = "3fff:6464:8c52:7003::a9fe:a9fe".parse().unwrap();
+        let private: IpAddr = "3fff:6464:8c52:7003::a00:5".parse().unwrap();
+        nat64::register_network_prefix(broad);
+        assert!(!is_internal_ip(loopback), "only the /32 is known");
+        nat64::register_network_prefix(nested);
+        assert!(is_always_blocked_ip(loopback));
+        assert!(is_always_blocked_ip(metadata));
+        assert!(is_internal_ip(private));
+        assert!(!is_always_blocked_ip(private));
+        let public: IpNet = "140.82.112.0/20".parse().unwrap();
+        let rfc1918: IpNet = "10.0.0.0/8".parse().unwrap();
+        assert!(!allowed_net_contains(&public, private));
+        assert!(allowed_net_contains(&rfc1918, private));
+    }
+
+    #[test]
     fn nat64_local_use_range_is_internal_without_a_registered_prefix() {
         assert!(is_internal_ip("64:ff9b:1::8c52:7003".parse().unwrap()));
         assert!(!is_always_blocked_ip(
