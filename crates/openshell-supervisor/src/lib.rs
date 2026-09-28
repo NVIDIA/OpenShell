@@ -653,7 +653,7 @@ pub async fn run_sandbox(
         loaded_policy_origin,
         initial_agent_proposals_enabled,
         initial_extension_authentication_enabled,
-        captured_provider_credentials,
+        captured_provider_environment,
     ) = load_policy_with_gateway(
         sandbox_id.clone(),
         sandbox.clone(),
@@ -678,8 +678,8 @@ pub async fn run_sandbox(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(credentials) = captured_provider_credentials {
-        credentials
+    let provider_credentials = if let Some(environment) = captured_provider_environment {
+        environment.install(&provider_readiness)
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -1987,6 +1987,35 @@ enum LocalPolicyIdentity {
     EndpointOnly,
 }
 
+struct CapturedProviderEnvironment {
+    credentials: ProviderCredentialState,
+    expires_at_ms: Option<i64>,
+    identity: EnvironmentIdentity,
+}
+
+impl CapturedProviderEnvironment {
+    fn install(self, readiness: &ProviderReadinessTracker) -> ProviderCredentialState {
+        readiness.credentials_installed(self.identity, &self.credentials, self.expires_at_ms);
+        self.credentials
+    }
+
+    fn new(
+        credentials: ProviderCredentialState,
+        provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
+    ) -> Self {
+        Self {
+            credentials,
+            expires_at_ms: provider
+                .credential_expires_at_ms
+                .values()
+                .copied()
+                .filter(|expiry| *expiry > 0)
+                .min(),
+            identity: EnvironmentIdentity::from_environment(provider),
+        }
+    }
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -2003,7 +2032,7 @@ async fn load_policy(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     load_policy_with_gateway(
         sandbox_id,
@@ -2043,7 +2072,7 @@ async fn load_policy_with_gateway(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
     // File mode: load OPA engine from rego rules + YAML data (dev override)
@@ -2406,7 +2435,10 @@ async fn load_policy_with_gateway(
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
-                Some(captured_provider_credentials),
+                Some(CapturedProviderEnvironment::new(
+                    captured_provider_credentials,
+                    &provider,
+                )),
             ));
         }
     }
@@ -5441,6 +5473,22 @@ network_policies:
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
+    }
+
+    #[test]
+    fn startup_environment_seeds_provider_readiness() {
+        let mut provider = startup_provider(10);
+        provider.provider_attachment_epoch = "epoch".to_string();
+        provider.policy_hash = "policy".to_string();
+        let identity = EnvironmentIdentity::from_environment(&provider);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        let readiness = ProviderReadinessTracker::new();
+
+        let credentials =
+            CapturedProviderEnvironment::new(credentials, &provider).install(&readiness);
+
+        assert_eq!(credentials.revision(), 10);
+        assert!(!readiness.needs_environment(&identity));
     }
 
     #[test]
