@@ -7,13 +7,10 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")]
-    [string] $Target,
-
     [string] $GatewayPath,
     [string] $CliPath,
     [string] $ArtifactRoot,
+    [switch] $Mock,
     [switch] $KeepArtifacts
 )
 
@@ -23,6 +20,15 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
     throw "windows-mxc-aggregate-e2e.ps1 requires Windows."
+}
+if (-not $Mock) {
+    throw "windows-mxc-aggregate-e2e.ps1 only supports mock mode; pass -Mock."
+}
+
+$Target = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+    "X64" { "x86_64-pc-windows-msvc" }
+    "Arm64" { "aarch64-pc-windows-msvc" }
+    default { throw "unsupported native Windows architecture: $($_)" }
 }
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
