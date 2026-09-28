@@ -819,6 +819,8 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
+If a configuration change makes a startup policy write or rejection report stale, the gateway can return `ABORTED`. The supervisor then reads the latest configuration and resumes startup. You do not need to recreate the sandbox for that conflict.
+
 The gateway enforces a 300-second provisioning repair window, independently of
 the CLI wait timeout. An effective policy, settings, provider, profile, or
 attachment change resets the window from its stored change time. The first
