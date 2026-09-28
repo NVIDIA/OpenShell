@@ -28,9 +28,32 @@ If you run OpenShell for a team, start here.
 
 - **Export provider profiles before upgrading.** The gateway no longer includes built-in profiles. Import the saved profiles after the upgrade at the same global or workspace scope. Replace profile aliases such as `claude` and `gh` with the canonical IDs `claude-code` and `github` ([PR #2962](https://github.com/NVIDIA/OpenShell/pull/2962), [PR #3383](https://github.com/NVIDIA/OpenShell/pull/3383)).
 
+  Google Cloud and Vertex profiles must also declare their environment and
+  discovery effects. Merge `environment.config`, `environment.fixed`, and
+  `discovery.config_env_vars` from the current examples into existing profiles.
+  Their IDs no longer activate SDK defaults or discovery keys. Keep credentials
+  out of these non-secret fields; lint rejects collisions with credential
+  `env_vars`. For Vertex service accounts, create with `--runtime-credentials`
+  and configure refresh material directly. Remove the obsolete
+  `GOOGLE_SERVICE_ACCOUNT_KEY` credential declaration. See
+  [profile environment declarations](/how-it-works/providers/profiles#declare-environment-and-discovery-behavior).
+  New imports reject that legacy credential key. Gateways also withhold it
+  from workloads when an older profile remains stored, but operators should
+  remove the obsolete declaration and migrate its private key to refresh
+  material. A stored provider record may retain the old key during the upgrade;
+  it remains excluded from the workload without withholding the provider's
+  access token or non-secret SDK settings. The key is also rejected in
+  `environment.config` and `environment.fixed`.
+
+  The Google Cloud metadata example also declares
+  `required_platform_adapter: gcp-metadata`. The supervisor provides this
+  adapter for Linux sandboxes using Docker, Podman, Kubernetes, or VM.
+  Windows/MXC rejects that requirement during import or attachment. Native
+  Vertex bearer-token authentication does not require this adapter.
+
   ```shell
   openshell provider profile export <id> -o yaml --global > <id>.yaml
-  openshell profile import --from ./profiles --global
+  openshell profile import -f <reviewed-profile.yaml> --global
   ```
 
 - **Migrate `gateway.toml` to schema version 2.** Add the version, replace the plural compute-driver selector, move driver settings under `[openshell.drivers.<name>]`, and apply the renamed Docker, Podman, and VM fields. Validate the file before restarting. See [Gateway Configuration](/how-it-works/gateways/configuration#migrate-to-schema-version-2) for the complete field mapping and [PR #2814](https://github.com/NVIDIA/OpenShell/pull/2814) for the implementation.
