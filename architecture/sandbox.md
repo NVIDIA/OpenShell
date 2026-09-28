@@ -131,6 +131,11 @@ When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
 to serve policy-authorized exec and loopback forwarding until explicit stop or
 delete tears down the boundary and terminates any remaining workload processes.
+When the sandbox is PID 1, it reaps adopted workload children after child-exit
+notifications, with a low-frequency recovery sweep. Children owned by an
+explicit process waiter remain registered and are never consumed by the orphan
+reaper. This keeps idle sandboxes from scanning procfs continuously while
+preserving wait results and eventual zombie cleanup.
 
 Completed exec output handles can be reclaimed, but execution request IDs remain
 reserved for the boundary generation. The sandbox accepts at most 4,096 exec
