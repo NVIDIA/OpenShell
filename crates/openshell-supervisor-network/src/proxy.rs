@@ -8458,6 +8458,9 @@ network_policies: {}
 
         // Every case uses the complete forwarding and middleware path. Sessionless
         // requests carry their own metadata, and subscription responses retain SSE bytes.
+        // Share the proxy's identity cache across requests from this client binary
+        // so each profile does not hash the entire test executable again.
+        let identity_cache = Arc::new(BinaryIdentityCache::new());
         for (body, mcp_headers, response_content_type, response_body) in [
             (
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
@@ -8603,7 +8606,7 @@ network_policies:
                     None,
                     socket_addrs,
                     engine,
-                    Arc::new(BinaryIdentityCache::new()),
+                    Arc::clone(&identity_cache),
                     Arc::new(AtomicU32::new(std::process::id())),
                     None,
                     AgentProposals::default(),
