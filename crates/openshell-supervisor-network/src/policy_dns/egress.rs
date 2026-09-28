@@ -500,7 +500,7 @@ mod tests {
             match &self.0 {
                 Ok(addresses) => Ok(TrustedAnswer {
                     addresses: addresses.clone(),
-                    ttl: Duration::from_secs(60),
+                    ttl: Duration::from_mins(1),
                 }),
                 Err(error) => Err(error()),
             }
