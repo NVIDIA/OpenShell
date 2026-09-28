@@ -116,23 +116,24 @@ async fn sandbox_labels_are_stored_and_filterable() {
     let prod_frontend = format!("lbl-pf-{suffix}");
     let dev_data = format!("lbl-dd-{suffix}");
 
-    // Create sandboxes with different labels. Each guard deletes its sandbox
-    // on drop, even if a later assertion panics.
+    // Arm guards before create so a partial create still cleans up.
+    let _cleanup: Vec<_> = [&dev_backend, &staging_backend, &prod_frontend, &dev_data]
+        .into_iter()
+        .map(|name| SandboxGuard::manage_existing(name.clone()))
+        .collect();
+
+    // Create sandboxes with different labels
     let name1 =
         create_sandbox_with_labels(&dev_backend, &[("env", "dev"), ("team", "backend")]).await;
-    let _cleanup1 = SandboxGuard::manage_existing(name1.clone());
 
     let name2 =
         create_sandbox_with_labels(&staging_backend, &[("env", "staging"), ("team", "backend")])
             .await;
-    let _cleanup2 = SandboxGuard::manage_existing(name2.clone());
 
     let name3 =
         create_sandbox_with_labels(&prod_frontend, &[("env", "prod"), ("team", "frontend")]).await;
-    let _cleanup3 = SandboxGuard::manage_existing(name3.clone());
 
     let name4 = create_sandbox_with_labels(&dev_data, &[("env", "dev"), ("team", "data")]).await;
-    let _cleanup4 = SandboxGuard::manage_existing(name4.clone());
 
     // Test 1: Verify labels are stored in sandbox metadata
     let details = get_sandbox_details(&name1).await;

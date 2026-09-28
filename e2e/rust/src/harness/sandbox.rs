@@ -67,13 +67,18 @@ fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str
     }
 }
 
+/// Generate a sandbox name that is unique within and across test processes.
+pub fn unique_sandbox_name() -> String {
+    format!(
+        "e2e-{}-{}",
+        std::process::id(),
+        NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
     if !has_explicit_sandbox_name(args) {
-        command.arg("--name").arg(format!(
-            "e2e-{}-{}",
-            std::process::id(),
-            NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
-        ));
+        command.arg("--name").arg(unique_sandbox_name());
     }
 }
 
