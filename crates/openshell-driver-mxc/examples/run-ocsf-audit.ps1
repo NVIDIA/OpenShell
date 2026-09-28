@@ -23,6 +23,11 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-ocsf-audit.ps1 `
 #     -WxcExecPath C:\mxc-kit\bin\wxc-exec.exe
 #
+# Hosted CI can pass -Mock. That mode runs the complete gateway/CLI/script path
+# with the in-process wxc shim, then requires the ETW consumer's durable
+# mxc-etw-zero-events OCSF finding. It does not prove real provider events,
+# attribution, or MXC enforcement.
+#
 # By default the per-sandbox egress proxy is ON so the full event set (including
 # SandboxProxyConfigured) is produced. Pass -NoProxy to omit only that one event.
 #
@@ -34,6 +39,8 @@
 param(
   # Real wxc-exec on the test box.
   [string] $WxcExecPath  = "C:\mxc-kit\bin\wxc-exec.exe",
+  [string] $GatewayPath,
+  [string] $CliPath,
   # Host folder granted read-write in the disposable sandbox policy.
   [string] $ShareDir     = "C:\work\openshell-mxc-demo",
   # How many sandboxes to create (each drives a full event burst).
@@ -48,6 +55,10 @@ param(
   # Optional: copy the results bundle to this path (e.g. a shared drive) for
   # pickup. Empty by default (no copy); pass -ShareOut '\\server\share' to enable.
   [string] $ShareOut     = "",
+  # Run with the in-process wxc shim and score the zero-event audit diagnostic.
+  [switch] $Mock,
+  [ValidateRange(31, 120)]
+  [int]    $MockAuditWaitSeconds = 35,
   # Leave the gateway running afterward (for inspection).
   [switch] $KeepRunning
 )
@@ -71,6 +82,63 @@ function Info([string]$m) { Write-Host "    $m" }
 function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host "[FAIL] $m" -ForegroundColor Red }
 
+function Quote-NativeArgument([string]$value) {
+  if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+
+  $quoted = New-Object System.Text.StringBuilder
+  [void]$quoted.Append('"')
+  $backslashes = 0
+  foreach ($ch in $value.ToCharArray()) {
+    if ($ch -eq '\') {
+      $backslashes++
+      continue
+    }
+    if ($ch -eq '"') {
+      [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+      [void]$quoted.Append('"')
+    } else {
+      if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
+      [void]$quoted.Append($ch)
+    }
+    $backslashes = 0
+  }
+  if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
+  [void]$quoted.Append('"')
+  return $quoted.ToString()
+}
+
+function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = $cli
+  $startInfo.Arguments = (($CommandArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) { throw "failed to start $cli" }
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+  $process.WaitForExit()
+  $text = (@($stdout.Result, $stderr.Result) | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+  }) -join [Environment]::NewLine
+  $text = $text.Trim()
+  if (-not $AllowFailure -and $process.ExitCode -ne 0) {
+    throw "openshell $($CommandArgs -join ' ') failed (exit $($process.ExitCode)): $text"
+  }
+  return @{ ExitCode = $process.ExitCode; Text = $text }
+}
+
+function Resolve-Artifact([string]$explicit, [string]$leaf) {
+  if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($explicit)
+  }
+  return (Join-Path $here $leaf)
+}
+
 function Get-MxcEtwSessions {
   $pattern = [regex]::Escape($SessionName) + '-(?<pid>[0-9]+)-[0-9a-fA-F]{32}-[0-9a-fA-F]{8}'
   foreach ($line in @(logman query -ets 2>$null)) {
@@ -84,8 +152,8 @@ function Get-MxcEtwSessions {
   }
 }
 
-$gateway = Join-Path $here "openshell-gateway.exe"
-$cli     = Join-Path $here "openshell.exe"
+$gateway = Resolve-Artifact $GatewayPath "openshell-gateway.exe"
+$cli     = Resolve-Artifact $CliPath "openshell.exe"
 $policySrc = Join-Path $here "ocsf-audit.yaml"
 $policy    = Join-Path $resultDir "ocsf-audit.used.yaml"   # disposable policy matching -ShareDir
 $tomlSrc = Join-Path $here "mxc-ocsf-audit.toml"
@@ -96,6 +164,7 @@ $gw       = $null
 $gatewayEtwSessions = @()
 $passed   = $true
 $proxyOn  = -not $NoProxy
+$oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 
 try {
   # 1. Validate artifacts + privilege.
@@ -116,7 +185,10 @@ try {
     throw "This run must open a real-time ETW session, which needs elevation. Re-run from an elevated shell (Run as administrator) or add this account to 'Performance Log Users'."
   }
 
-  if (-not (Test-Path $WxcExecPath)) {
+  if ($Mock) {
+    $WxcExecPath = Join-Path $here "mock-wxc-exec.exe"
+    Info "mock mode: using the in-process wxc shim"
+  } elseif (-not (Test-Path $WxcExecPath)) {
     throw "wxc-exec not found at '$WxcExecPath'. Pass -WxcExecPath pointing at the real binary."
   }
   Info "wxc-exec: $WxcExecPath"
@@ -163,14 +235,6 @@ try {
       cwd = $shareDirPolicy
     }
   } | ConvertTo-Json -Compress -Depth 4
-  # Windows PowerShell 5.1 strips embedded quotes when constructing a native
-  # command line. Escape them so openshell.exe receives valid JSON.
-  $driverConfigArg = if ($PSVersionTable.PSVersion.Major -lt 7) {
-    $driverConfig.Replace('"', '\"')
-  } else {
-    $driverConfig
-  }
-
   Info "backend=process_container  etw_audit=true  egress_proxy=$proxyVal"
   Info "workload cwd=$shareDirPolicy  policy grant=$shareDirPolicy"
 
@@ -218,14 +282,18 @@ try {
   # --config token: Start-Process -ArgumentList does not quote array elements, so a
   # config path containing a space gets split and the gateway's arg parser rejects it.
   $env:OPENSHELL_GATEWAY_CONFIG = $toml
-  Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+  if ($Mock) {
+    $env:OPENSHELL_MXC_MOCK_WXC = "1"
+  } else {
+    Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+  }
 
   # 7. Start the gateway (background, TLS disabled on the loopback control plane).
   Step "Start gateway (OCSF audit on)"
   $gwLog    = Join-Path $resultDir "gateway.log"
   $gwErrLog = Join-Path $resultDir "gateway.err.log"
   $gw = Start-Process -FilePath $gateway `
-    -ArgumentList @("--disable-tls", "--port", $Port, "--log-level", "info") `
+    -ArgumentList @("--disable-tls", "--port", $Port, "--db-url", "sqlite::memory:", "--log-level", "info") `
     -WorkingDirectory $here -PassThru -NoNewWindow `
     -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
   Info "gateway pid $($gw.Id); logs -> $(Split-Path $gwLog -Leaf) (+ .err)"
@@ -252,10 +320,13 @@ try {
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
   $env:OPENSHELL_GATEWAY = ""
-  try { & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 | ForEach-Object { Info $_ } }
-  catch { Info "gateway add: $($_.Exception.Message) (continuing - likely already registered)" }
-  try { & $cli gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ } }
-  catch { Info "gateway select: $($_.Exception.Message) (continuing)" }
+  $gatewayAdd = Invoke-Cli @("gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName) -AllowFailure
+  if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
+  if ($gatewayAdd.ExitCode -ne 0 -and $gatewayAdd.Text -notmatch '(?i)already exists') {
+    throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
+  }
+  $gatewaySelect = Invoke-Cli @("gateway", "select", $GatewayName)
+  if ($gatewaySelect.Text) { Info $gatewaySelect.Text }
   Ok "selected gateway '$GatewayName'"
 
   # 10. Create N sandboxes. Each drives the Sandboxing provider -> a full OCSF
@@ -265,10 +336,21 @@ try {
   for ($i = 1; $i -le $SandboxCount; $i++) {
     $name = "ocsf$i"
     Info "-- creating $name --"
-    try { & $cli sandbox create --name $name --policy $policy --driver-config-json $driverConfigArg --no-tty 2>&1 | ForEach-Object { Info $_ } }
-    catch { Info "sandbox create attach: $($_.Exception.Message) (expected on MXC - agent ran in-driver; continuing)" }
+    $create = Invoke-Cli @(
+      "sandbox", "create", "--name", $name, "--policy", $policy,
+      "--driver-config-json", $driverConfig, "--no-tty"
+    ) -AllowFailure
+    if ($create.Text) { Info $create.Text }
+    if ($create.ExitCode -ne 0) {
+      Info "sandbox create returned exit $($create.ExitCode); workload and audit evidence will determine the verdict"
+    }
     Start-Sleep -Seconds 3
-    try { & $cli sandbox delete $name 2>&1 | Out-Null } catch {}
+    try { Invoke-Cli @("sandbox", "delete", $name) -AllowFailure | Out-Null } catch {}
+  }
+  if ($Mock) {
+    Step "Wait for the ETW zero-event audit diagnostic"
+    Info "waiting $MockAuditWaitSeconds seconds for mxc-etw-zero-events"
+    Start-Sleep -Seconds $MockAuditWaitSeconds
   }
 }
 catch {
@@ -295,6 +377,11 @@ finally {
       logman stop $session.Name -ets 2>&1 | Out-Null
     }
   }
+  if ($null -eq $oldMockWxc) {
+    Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+  } else {
+    $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
+  }
 
   # ---- summarise the OCSF audit trail --------------------------------------
   $logText = @()
@@ -314,7 +401,7 @@ finally {
   $jsonlPath  = if ($jsonlFiles.Count) { $jsonlFiles[0].FullName } else { $null }
   $classNames = @{ 6002 = "Application Lifecycle"; 5019 = "Device Config State Change"; 1007 = "Process Activity"; 2004 = "Detection Finding" }
   $classCounts = @{ 6002 = 0; 5019 = 0; 1007 = 0; 2004 = 0 }
-  $jsonlCount = 0; $jsonlBad = 0; $sids = @(); $hosts = @()
+  $jsonlCount = 0; $jsonlBad = 0; $sids = @(); $hosts = @(); $zeroEventFinding = $false
   if ($jsonlPath) {
     $raw = @(Get-Content $jsonlPath -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" })
     $jsonlCount = $raw.Count
@@ -322,8 +409,9 @@ finally {
       try {
         $o = $line | ConvertFrom-Json
         if ($o.class_uid -ne $null -and $classCounts.ContainsKey([int]$o.class_uid)) { $classCounts[[int]$o.class_uid]++ }
-        if ($o.metadata -and $o.metadata.uid) { $sids += [string]$o.metadata.uid }
+        if ($o.container -and $o.container.uid) { $sids += [string]$o.container.uid }
         if ($o.device -and $o.device.hostname) { $hosts += [string]$o.device.hostname }
+        if ($o.finding_info -and $o.finding_info.uid -eq "mxc-etw-zero-events") { $zeroEventFinding = $true }
       } catch { $jsonlBad++ }
     }
     $sids  = @($sids  | Select-Object -Unique)
@@ -359,7 +447,17 @@ finally {
   $findingsObserved = @($findingEvents.Values | Where-Object { $_ }).Count
   $classesSeen      = @($classCounts.Keys | Where-Object { $classCounts[$_] -gt 0 }).Count
   $workloadCompleted = Test-Path $helloPath -PathType Leaf
-  if ($passed) { $passed = $consumerStarted -and (-not $consumerOverloaded) -and $workloadCompleted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
+  $zeroEventWarning = Seen "(?i)MXC ETW->OCSF consumer has received zero events"
+  if ($passed) {
+    if ($Mock) {
+      $passed = $consumerStarted -and (-not $consumerFailed) -and (-not $consumerOverloaded) -and
+        $workloadCompleted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and
+        $zeroEventWarning -and $zeroEventFinding
+    } else {
+      $passed = $consumerStarted -and (-not $consumerOverloaded) -and $workloadCompleted -and
+        ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected)
+    }
+  }
 
   $verdict      = if ($passed) { "PASS" } else { "FAIL" }
   $classLines   = foreach ($uid in @(6002, 5019, 1007, 2004)) { "  [{0}] {1,-28} : {2}" -f $uid, $classNames[$uid], $classCounts[$uid] }
@@ -374,7 +472,9 @@ timestamp        : $stamp
 machine          : $env:COMPUTERNAME
 user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
+mode             : $(if ($Mock) { 'mock-wiring' } else { 'real-mxc' })
 event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
+zero-event audit : $(if ($zeroEventWarning -and $zeroEventFinding) { 'warning + durable finding observed' } else { 'not observed' })
 queue overload   : $(if ($consumerOverloaded) { 'YES - ETW records dropped; audit coverage gap' } else { 'no dropped ETW records observed' })
 proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
 workload output  : $(if ($workloadCompleted) { $helloPath } else { '(missing)' })
@@ -403,12 +503,19 @@ Files in this bundle ($resultDir):
   mxc-ocsf-audit.used.toml    the exact gateway config used (wxc path patched)
   ocsf-audit.used.yaml        the exact sandbox policy used
 
-What PASS means: the gateway launched sandbox(es), the in-process ETW consumer
+$(if ($Mock) {
+"What PASS means: the gateway launched the mock workload, the ETW consumer
+started, detected that sandbox activity produced zero provider events, and
+wrote the mxc-etw-zero-events finding to durable OCSF JSONL. This does not
+validate real Sandboxing-provider events, sandbox attribution, or MXC enforcement."
+} else {
+"What PASS means: the gateway launched sandbox(es), the in-process ETW consumer
 started, decoded the Sandboxing provider, attributed each event to a sandbox_id,
 reported no callback-queue overload, mapped events to OCSF, and wrote a durable
-JSONL audit log covering all $coreExpected
-expected event types across $classesSeen OCSF class(es) - the full Windows OCSF path
-end-to-end, at parity with the Linux pipeline.
+JSONL audit log covering all $coreExpected expected event types across
+$classesSeen OCSF class(es) - the full Windows OCSF path end-to-end, at parity
+with the Linux pipeline."
+})
 "@
   Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
   Write-Host $summary -ForegroundColor ($(if ($passed) { "Green" } else { "Red" }))

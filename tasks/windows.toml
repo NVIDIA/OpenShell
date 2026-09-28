@@ -118,3 +118,13 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Run the shipped MXC provider-credential example with a synthetic credential and the in-process wxc mock on Windows ARM64"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-provider-credential-e2e.ps1 -Target aarch64-pc-windows-msvc"
+
+["windows:e2e:mxc:ocsf-mock:x64"]
+description = "Run the shipped MXC OCSF audit example and validate the zero-provider-events finding with the in-process wxc mock on Windows x64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-ocsf-audit-e2e.ps1 -Target x86_64-pc-windows-msvc"
+
+["windows:e2e:mxc:ocsf-mock:arm64"]
+description = "Run the shipped MXC OCSF audit example and validate the zero-provider-events finding with the in-process wxc mock on Windows ARM64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-ocsf-audit-e2e.ps1 -Target aarch64-pc-windows-msvc"

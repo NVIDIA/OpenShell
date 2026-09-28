@@ -102,6 +102,8 @@ jobs:
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: Run shipped MXC provider-credential example in mock mode
         run: mise run --skip-tools windows:e2e:mxc:provider-mock:${{ matrix.arch }}
+      - name: Run shipped MXC OCSF audit example in mock mode
+        run: mise run --skip-tools windows:e2e:mxc:ocsf-mock:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats
@@ -217,6 +219,8 @@ jobs:
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: Run shipped MXC provider-credential example in mock mode
         run: mise run --skip-tools windows:e2e:mxc:provider-mock:${{ matrix.arch }}
+      - name: Run shipped MXC OCSF audit example in mock mode
+        run: mise run --skip-tools windows:e2e:mxc:ocsf-mock:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats

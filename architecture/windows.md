@@ -252,6 +252,10 @@ Windows validation separates source correctness from host capability:
   synthetic value. It verifies provider/profile/policy attachment and that the
   mock workload receives only a revision-scoped placeholder. It makes no
   external request and does not prove proxy substitution or MXC enforcement.
+- The shipped OCSF audit example also runs with mock MXC. It verifies ETW
+  consumer startup, mock workload wiring, durable JSONL output, and the
+  zero-provider-events finding. Real provider events and attribution still
+  require native MXC qualification.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.

@@ -74,6 +74,35 @@ fn shipped_provider_credential_assets_support_mock_wiring_validation() {
 }
 
 #[test]
+fn shipped_ocsf_audit_assets_support_mock_diagnostic_validation() {
+    for name in [
+        "mxc-ocsf-audit.toml",
+        "ocsf-audit.yaml",
+        "run-ocsf-audit.ps1",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped OCSF audit asset is missing: {name}"
+        );
+    }
+
+    let config: Value =
+        toml::from_str(&read_example("mxc-ocsf-audit.toml")).expect("OCSF audit config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    let runner = read_example("run-ocsf-audit.ps1");
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("mxc-etw-zero-events"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+}
+
+#[test]
 fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
@@ -201,6 +230,7 @@ fn shipped_runners_parse_in_windows_powershell() {
         "run-inference-test.ps1",
         "run-provider-credential-test.ps1",
         "mxc-provider-credential-probe.ps1",
+        "run-ocsf-audit.ps1",
     ] {
         let path = examples_root().join(name);
         let script = r"
