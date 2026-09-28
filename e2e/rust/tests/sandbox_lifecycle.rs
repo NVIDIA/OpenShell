@@ -521,23 +521,6 @@ async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
     })
     .await
     .unwrap_or_else(|_| panic!("process with arguments {expected_args:?} did not start"))
-    let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "get", name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = cmd.output().await.expect("spawn openshell sandbox get");
-    let combined = normalize_output(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    ));
-    assert!(
-        output.status.success(),
-        "sandbox get should succeed (exit {:?}):\n{combined}",
-        output.status.code(),
-    );
-    combined
 }
 
 #[tokio::test]

@@ -204,6 +204,14 @@ restart a completed or failed canonical process. Before an explicit restart,
 the gateway disconnects the prior supervisor session and deletes its SSH
 sessions so credentials cannot cross runtime generations.
 
+When the sandbox restart policy selects replacement, the gateway instead
+persists `Starting` with the previous exit result, restart count, and backoff
+deadline. The leader claims each due attempt before stopping compute, rotates
+launch credentials, starts the driver with the persisted generation, and waits
+for a different supervisor instance. Stop and delete intent fence late driver
+starts. A fresh supervisor clears the deadline and returns the sandbox to
+`Ready`; a successful main process exit under `OnFailure` remains `Completed`.
+
 `StopSandbox` and `StartSandbox` are idempotent driver operations. Stop
 retains the driver resource and its persistent workspace boundary while making
 exec, SSH, forwarding, and exposed services unavailable. Start reactivates the

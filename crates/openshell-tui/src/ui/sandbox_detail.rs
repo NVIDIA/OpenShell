@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
 
-const BASE_CONTENT_ROWS: u16 = 6;
+const BASE_CONTENT_ROWS: u16 = 7;
 const BORDER_ROWS: u16 = 2;
 
 fn pending_draft_count(app: &App) -> usize {
@@ -172,7 +172,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(providers_str, t.text),
     ]);
 
-    let mut lines = vec![row1, row2, row3, row4, row5];
+    let mut lines = vec![row1, row2, row_restart, row3, row4, row5];
     lines.extend(
         note_lines(app, area.width)
             .into_iter()

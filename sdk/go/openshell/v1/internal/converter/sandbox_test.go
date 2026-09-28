@@ -96,13 +96,16 @@ func TestSandboxFromProto(t *testing.T) {
 			ResourceVersion: "7",
 		},
 		Status: &pb.SandboxStatus{
-			AgentPod:              "agent-pod-xyz",
-			AgentFd:               "fd-agent",
-			SandboxFd:             "fd-sandbox",
-			Phase:                 pb.SandboxPhase_SANDBOX_PHASE_READY,
-			CurrentPolicyVersion:  7,
-			MainProcessInstanceId: "instance-1",
-			ExitCode:              &exitCode,
+			AgentPod:               "agent-pod-xyz",
+			AgentFd:                "fd-agent",
+			SandboxFd:              "fd-sandbox",
+			Phase:                  pb.SandboxPhase_SANDBOX_PHASE_READY,
+			CurrentPolicyVersion:   7,
+			MainProcessInstanceId:  "instance-1",
+			ExitCode:               &exitCode,
+			RestartCount:           3,
+			NextRestartTime:        TimestampFromMillis(1700000070000),
+			MainProcessStartedTime: TimestampFromMillis(1700000010000),
 			Conditions: []*pb.SandboxCondition{
 				{
 					Type:           "Ready",

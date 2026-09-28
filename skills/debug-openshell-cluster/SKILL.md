@@ -311,6 +311,14 @@ the associated persistence errors: a stopped supervisor's owner record may
 remain until its lease expires and temporarily block reconnection. Successful
 compute stop alone does not confirm that session cleanup finished.
 
+For a sandbox with `--restart-policy on-failure` or `always`, inspect
+`openshell sandbox get <name>` for the policy, exit code, restart count, and
+next restart time. `Starting` can mean the gateway is waiting for backoff or
+for a replacement supervisor. Check gateway logs for stop or start errors if
+the deadline passes without a transition to `Ready`. Docker, Podman,
+Kubernetes, and VM native restart policies remain disabled; the gateway owns
+the replacement.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash

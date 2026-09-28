@@ -102,7 +102,7 @@ match app.screen {
 }
 ```
 
-Within the `Sandbox` screen, the top 11 rows render sandbox metadata and restart status (`sandbox_detail`), and the remaining area dispatches based on focus and tab state:
+Within the `Sandbox` screen, `sandbox_detail::required_height` sizes the metadata and restart status pane to its contents. The remaining area dispatches based on focus and tab state:
 
 ```rust
 match app.focus {

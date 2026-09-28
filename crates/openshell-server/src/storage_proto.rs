@@ -118,16 +118,15 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Carries this branch's exec request IDs together with main's opaque watch
-    // cursor and well-known time types. These unreleased public-only fields add
-    // no messages or enums and touch no stored type, so the durable and overlap
-    // fingerprints below remain unchanged.
+    // Restart policy is stored in SandboxSpec, and the count and well-known
+    // timestamps are stored in SandboxStatus. Legacy payloads decode with
+    // Unspecified (treated as Never), zero count, and absent timestamps.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8fb59b0932ec2f227fdec2d46b6204925e79595695810a247bef731ddd632594";
+        "b1f9b34f035234e1032685eb4fc829950acad63a971b3abd37a2ccbbec783531";
     const DURABLE_SCHEMA_SHA256: &str =
-        "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
+        "517561b578c88d28ffd74d128faf668e65aef03c784dd794aeb5208e1dbf6de3";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "a6e97fdde30c439ffaa03c2952a43033f8ea338fed6b1456ebe2d7d8af14e834";
+        "d60c0a91163bcdd6c29e24c64e0f00555f914240465f94295d800e9063171bef";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -590,9 +589,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (304, 25),
-                (92, 19),
-                (80, 19),
+                (304, 26),
+                (92, 20),
+                (80, 20),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -651,6 +650,9 @@ mod tests {
         assert_eq!(status.current_policy_version, 7);
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
+        assert_eq!(status.restart_count, 0);
+        assert!(status.next_restart_time.is_none());
+        assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);
         assert_eq!(status.conditions[0].r#type, "Ready");
         assert_eq!(status.conditions[0].status, "True");

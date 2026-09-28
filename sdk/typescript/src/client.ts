@@ -84,7 +84,6 @@ export type SandboxPhaseName =
   | 'stopped'
   | 'starting'
   | 'completed';
-  | 'restarting';
 
 /** Restart behavior after the canonical main process exits. */
 export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
@@ -461,7 +460,6 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
   [SandboxPhase.COMPLETED]: 'completed',
-  [SandboxPhase.RESTARTING]: 'restarting',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -510,6 +508,8 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
+  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -527,12 +527,8 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
       : undefined,
     serviceUrls,
     restartCount: sandbox.status?.restartCount ?? 0,
-    nextRestartAtMs:
-      sandbox.status && sandbox.status.nextRestartAtMs > 0n ? Number(sandbox.status.nextRestartAtMs) : undefined,
-    mainProcessStartedAtMs:
-      sandbox.status && sandbox.status.mainProcessStartedAtMs > 0n
-        ? Number(sandbox.status.mainProcessStartedAtMs)
-        : undefined,
+    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
+    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
   };
 }
 

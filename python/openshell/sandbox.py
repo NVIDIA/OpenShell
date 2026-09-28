@@ -1771,11 +1771,11 @@ def _sandbox_ref(
             if status is not None and status.HasField("exit_code")
             else None,
             restart_count=status.restart_count if status is not None else 0,
-            next_restart_at_ms=status.next_restart_at_ms
-            if status is not None and status.next_restart_at_ms > 0
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
             else None,
-            main_process_started_at_ms=status.main_process_started_at_ms
-            if status is not None and status.main_process_started_at_ms > 0
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},

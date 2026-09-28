@@ -40,10 +40,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxTemplate, SshSession,
-};
-use openshell_core::proto::{
-    Sandbox, SandboxPhase, SandboxRestartPolicy, SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -429,19 +426,6 @@ async fn handle_create_sandbox_inner(
     let workload_template_name = request.workload_template.trim().to_string();
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
-    // Every newly persisted sandbox has one explicit canonical process. This
-    // portable default also preserves compatibility with callers compiled
-    // before the main-process field was introduced.
-    if spec.command.is_empty() {
-        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
-        spec.tty = true;
-    }
-    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
-        spec.restart_policy = SandboxRestartPolicy::Never as i32;
-    }
-
-    // Validate field sizes before any I/O (fail fast on oversized payloads).
-    validate_sandbox_spec(&request.name, &spec)?;
 
     // Validate labels (keys and values must meet Kubernetes requirements).
     for (key, value) in &request.labels {
@@ -484,12 +468,16 @@ async fn handle_create_sandbox_inner(
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
         resolved.tty = governance_spec.tty;
+        resolved.restart_policy = governance_spec.restart_policy;
         (resolved, Some(provenance))
     };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
     spec.provider_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
 
     // Leave an omitted command empty rather than persisting a concrete shell:
     // the sandbox boundary resolves the default login shell against the agent image
@@ -7579,7 +7567,7 @@ mod tests {
     fn template_create_sandbox_spec_field_policy_is_exhaustive() {
         assert_proto_fields_classified(
             "openshell.v1.SandboxSpec",
-            &["policy", "providers", "command", "tty"],
+            &["policy", "providers", "command", "tty", "restart_policy"],
             &[
                 "log_level",
                 "environment",

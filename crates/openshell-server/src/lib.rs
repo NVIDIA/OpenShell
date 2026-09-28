@@ -949,9 +949,11 @@ pub(crate) async fn run_server(
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
-    state
-        .compute
-        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+    state.compute.spawn_watchers(
+        shutdown_rx.clone(),
+        startup_rx,
+        state.sandbox_session_jwt_authority.clone(),
+    );
 
     // Serve the gateway before reconciling persisted sandboxes so restored
     // supervisors can fetch policy and register their sessions.

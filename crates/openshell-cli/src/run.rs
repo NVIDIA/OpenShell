@@ -56,27 +56,11 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceExposure, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    exec_sandbox_event, tcp_forward_init,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxRestartPolicy, SandboxSpec, SandboxTemplate,
-    ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope, StartSandboxRequest,
+    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
     StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -1751,7 +1735,10 @@ where
         println!(
             "  {} {}",
             "Next restart:".dimmed(),
-            format_optional_epoch_ms(status.next_restart_at_ms)
+            status.next_restart_time.as_ref().map_or_else(
+                || "-".to_string(),
+                |time| format_epoch_ms(proto_timestamp_ms(Some(time))),
+            )
         );
     }
 
@@ -2937,11 +2924,13 @@ fn sandbox_detail_to_json(
         );
         obj.insert(
             "next_restart_at_ms".into(),
-            serde_json::json!(status.next_restart_at_ms),
+            serde_json::json!(proto_timestamp_ms(status.next_restart_time.as_ref())),
         );
         obj.insert(
             "main_process_started_at_ms".into(),
-            serde_json::json!(status.main_process_started_at_ms),
+            serde_json::json!(proto_timestamp_ms(
+                status.main_process_started_time.as_ref()
+            )),
         );
     }
 
@@ -6530,16 +6519,10 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
-        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
-        WorkspaceRole, datamodel::v1::ObjectMeta,
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxRestartPolicy, SandboxSpec, SandboxStatus, datamodel::v1::ObjectMeta,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
+        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceEndpoint,
+        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7822,8 +7805,11 @@ mod tests {
             main_process_instance_id: "main-2".to_string(),
             exit_code: Some(9),
             restart_count: 2,
-            next_restart_at_ms: 1_700_000_000_000,
-            main_process_started_at_ms: 1_699_999_000_000,
+            next_restart_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            main_process_started_time: openshell_core::time::timestamp_from_millis(
+                1_699_999_000_000,
+            )
+            .ok(),
             ..Default::default()
         });
 

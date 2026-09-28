@@ -855,23 +855,25 @@ describe('sandbox templates', () => {
     await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
   it('maps restart controller status', async () => {
     const sandbox = client({
       getSandbox: () => ({
         sandbox: {
           metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
           status: {
-            phase: SandboxPhase.RESTARTING,
+            phase: SandboxPhase.STARTING,
             restartCount: 3,
-            nextRestartAtMs: 1_700_000_000_000n,
-            mainProcessStartedAtMs: 1_699_999_000_000n,
+            nextRestartTime: { seconds: 1_700_000_000n, nanos: 0 },
+            mainProcessStartedTime: { seconds: 1_699_999_000n, nanos: 0 },
           },
         },
       }),
     });
 
     await expect(sandbox.get('sb')).resolves.toMatchObject({
-      phase: 'restarting',
+      phase: 'starting',
       restartCount: 3,
       nextRestartAtMs: 1_700_000_000_000,
       mainProcessStartedAtMs: 1_699_999_000_000,

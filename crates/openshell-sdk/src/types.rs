@@ -240,6 +240,25 @@ impl From<i32> for SandboxPhase {
     }
 }
 
+/// Gateway policy for replacing the canonical main process after it exits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SandboxRestartPolicy {
+    #[default]
+    Never,
+    OnFailure,
+    Always,
+}
+
+impl From<SandboxRestartPolicy> for proto::SandboxRestartPolicy {
+    fn from(value: SandboxRestartPolicy) -> Self {
+        match value {
+            SandboxRestartPolicy::Never => Self::Never,
+            SandboxRestartPolicy::OnFailure => Self::OnFailure,
+            SandboxRestartPolicy::Always => Self::Always,
+        }
+    }
+}
+
 /// Caller intent for a new sandbox.
 ///
 /// Only the most commonly used fields are exposed. Callers that need the
@@ -266,6 +285,8 @@ pub struct SandboxSpec {
     pub tty: bool,
     /// Loopback HTTP services to expose when the sandbox is created.
     pub service_exposures: Vec<ServiceExposure>,
+    /// Restart behavior after the canonical main process exits.
+    pub restart_policy: SandboxRestartPolicy,
 }
 
 /// A loopback HTTP service to expose during sandbox creation.
@@ -346,6 +367,9 @@ pub struct SandboxRef {
     /// Service URLs returned by sandbox creation, keyed by service name. The
     /// empty key identifies the unnamed service. Non-create reads leave this empty.
     pub service_urls: HashMap<String, String>,
+    pub restart_count: u32,
+    pub next_restart_at_ms: Option<i64>,
+    pub main_process_started_at_ms: Option<i64>,
 }
 
 /// Reusable workload template revision used to create a sandbox.
@@ -359,7 +383,6 @@ pub struct SandboxWorkloadTemplateProvenance {
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
-        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
         let created_from_workload_template =
             sandbox
                 .created_from_workload_template
@@ -374,9 +397,14 @@ impl SandboxRef {
                 (
                     status.exit_code,
                     status.restart_count,
-                    (status.next_restart_at_ms > 0).then_some(status.next_restart_at_ms),
-                    (status.main_process_started_at_ms > 0)
-                        .then_some(status.main_process_started_at_ms),
+                    status
+                        .next_restart_time
+                        .as_ref()
+                        .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+                    status
+                        .main_process_started_time
+                        .as_ref()
+                        .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
                 )
             });
         let meta = sandbox.metadata.unwrap_or_default();

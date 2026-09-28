@@ -145,8 +145,8 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 		}
 	}
 	result.RestartCount = status.GetRestartCount()
-	result.NextRestartAtMs = status.GetNextRestartAtMs()
-	result.MainProcessStartedAtMs = status.GetMainProcessStartedAtMs()
+	result.NextRestartAtMs = MillisFromProto(status.GetNextRestartTime())
+	result.MainProcessStartedAtMs = MillisFromProto(status.GetMainProcessStartedTime())
 
 	return result
 }

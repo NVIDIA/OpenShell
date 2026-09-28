@@ -10,6 +10,11 @@ position: 4
 
 Each gateway runs agent workloads on one compute runtime, selected by its compute driver. Pick the runtime that matches the isolation boundary and infrastructure you need. The CLI workflow stays the same across runtimes: you create, connect to, stop, start, and delete sandboxes through the gateway.
 
+The gateway owns main-process restart policy. Docker, Podman, Kubernetes, and
+MicroVM native restart mechanisms remain disabled. When policy selects a
+replacement, the gateway stops and starts the compute resource while retaining
+the sandbox record and driver-supported persistent storage.
+
 | Runtime | Driver | Use when |
 |---|---|---|
 | [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |

@@ -1188,10 +1188,10 @@ message SandboxStatus {
   SandboxProvisioning provisioning = 13;
   // Consecutive policy-driven restart number in the current crash loop.
   uint32 restart_count = 14;
-  // Unix epoch deadline for the next restart attempt or recovery check.
-  int64 next_restart_at_ms = 15;
-  // Unix epoch time when the current main process became ready.
-  int64 main_process_started_at_ms = 16;
+  // Deadline for the next restart attempt or recovery check.
+  google.protobuf.Timestamp next_restart_time = 15;
+  // Time when the current main process became ready.
+  google.protobuf.Timestamp main_process_started_time = 16;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
