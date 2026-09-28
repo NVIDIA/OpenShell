@@ -75,6 +75,7 @@ SIDECAR_LICENSE_FILES: set[str] = {
 EXCLUDE_DIRS: set[str] = {
     "target",
     "e2e/rust/target",
+    "plans",
     "architecture/plans",
     "scripts/lint-mermaid/node_modules",
     ".venv",
