@@ -6129,6 +6129,65 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn provider_readiness_startup_environment_avoids_unchanged_refresh() {
+        let policy = proto_policy_fixture();
+        let mut settings = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        settings.provider_env_revision = 6;
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let mut provider = static_provider_environment(6, Some("initial"));
+        provider.policy_hash.clone_from(&settings.policy_hash);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        ctx.provider_credentials = CapturedProviderEnvironment::new(credentials, &provider)
+            .install(&ctx.provider_readiness);
+        let generation = engine.current_generation();
+        let guard = engine.generation_guard(generation).unwrap();
+        let (policy_gateway, polls, mut reports) = scripted_policy_gateway();
+        let observed_polls = policy_gateway.polled_sandboxes.clone();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway {
+                policy: policy_gateway,
+                requests,
+            },
+        ));
+
+        polls.send(settings.clone()).unwrap();
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(settings).unwrap();
+        timeout(Duration::from_secs(1), async {
+            while observed_polls.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), received.recv())
+                .await
+                .is_err(),
+            "unchanged settings must not refetch the startup environment"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(!guard.is_stale());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn provider_poll_installs_fail_closed_environment_and_acknowledges_policy() {
         let policy = proto_policy_fixture();
         let initial = settings_poll_result(
