@@ -31,6 +31,7 @@ mod multiplex;
 mod ocsf_log;
 mod otel_tracing;
 mod pagination;
+mod peer_transport;
 mod persistence;
 pub(crate) mod policy_store;
 mod provider_profile_sources;
@@ -458,7 +459,9 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
     if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
         && !endpoint.trim().is_empty()
     {
-        return Some(endpoint.trim().to_string());
+        // The chart's Deployment endpoint embeds `$(OPENSHELL_POD_IP)`, which
+        // Kubernetes substitutes without IPv6 brackets.
+        return Some(peer_transport::bracket_ipv6_endpoint_host(endpoint.trim()));
     }
 
     let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
@@ -486,6 +489,9 @@ fn derive_peer_endpoint(config: &Config) -> Option<String> {
 ///
 /// Peer relay traffic carries whole supervisor sessions between replicas. The
 /// chart renders a plaintext peer endpoint only when the gateway itself serves
+/// plaintext, so `http://` next to gateway TLS is a downgrade. Whether a
+/// plaintext gateway may route peers over `http://` at all is decided by
+/// [`peer_transport::PeerTransportPolicy::validate_own_endpoint`].
 fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result<()> {
     if peer_endpoint.starts_with("https://") {
         return Ok(());
@@ -496,10 +502,6 @@ fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result
              set an https:// OPENSHELL_PEER_ENDPOINT so peer relay traffic is not downgraded"
         )));
     }
-    warn!(
-        peer_endpoint,
-        "gateway peer relay traffic is plaintext because this gateway does not serve TLS"
-    );
     Ok(())
 }
 
@@ -716,11 +718,19 @@ pub(crate) async fn run_server(
     }
 
     let peer_routing_expected = state.peer_endpoint.is_some() && !state.store.is_single_replica();
+    let peer_transport = peer_transport::PeerTransportPolicy::from_env(
+        &state.config,
+        !state.store.is_single_replica(),
+    )?;
     if let Some(peer_endpoint) = state.peer_endpoint.as_deref()
         && peer_routing_expected
     {
         validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+        peer_transport.validate_own_endpoint(peer_endpoint, state.config.tls.as_ref())?;
     }
+    state.peer_routes = Arc::new(supervisor_session::PeerRouteCache::with_transport(
+        peer_transport,
+    ));
     if state.peer_endpoint.is_none() && !state.store.is_single_replica() {
         warn!(
             "no gateway peer endpoint configured; this replica owns its supervisor sessions but \

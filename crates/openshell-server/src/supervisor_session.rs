@@ -74,16 +74,20 @@ const OWNER_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// The kubelet rotates the file hourly, so this only bounds staleness.
 const PEER_TOKEN_CACHE_TTL: Duration = Duration::from_mins(5);
 
+/// Gateway peer TLS client settings from the `OPENSHELL_PEER_TLS_*` env vars.
+///
+/// The paths are read once at startup; the files themselves are read whenever
+/// a new peer channel is created, so rotated material reaches new channels.
 #[derive(Debug, Default)]
-struct PeerTlsClientConfig {
-    ca_file: Option<std::path::PathBuf>,
-    cert_file: Option<std::path::PathBuf>,
-    key_file: Option<std::path::PathBuf>,
-    server_name: Option<String>,
+pub(crate) struct PeerTlsClientConfig {
+    pub(crate) ca_file: Option<std::path::PathBuf>,
+    pub(crate) cert_file: Option<std::path::PathBuf>,
+    pub(crate) key_file: Option<std::path::PathBuf>,
+    pub(crate) server_name: Option<String>,
 }
 
 impl PeerTlsClientConfig {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         Self {
             ca_file: nonempty_env(PEER_TLS_CA_FILE_ENV).map(Into::into),
             cert_file: nonempty_env(PEER_TLS_CERT_FILE_ENV).map(Into::into),
@@ -92,41 +96,70 @@ impl PeerTlsClientConfig {
         }
     }
 
-    fn load(&self) -> Result<ClientTlsConfig, Status> {
-        let mut tls = if let Some(path) = self.ca_file.as_deref() {
-            let pem = std::fs::read(path).map_err(|err| {
+    /// The CA that https peers must chain to. Peer TLS trusts only this CA:
+    /// do NOT add `.with_native_roots()` / `.with_webpki_roots()` to the peer
+    /// client config.
+    pub(crate) fn require_ca_file(&self) -> Result<&std::path::Path, Status> {
+        self.ca_file.as_deref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{PEER_TLS_CA_FILE_ENV} is required to dial https gateway peers; peer TLS does \
+                 not fall back to platform trust roots"
+            ))
+        })
+    }
+
+    /// The client certificate and key presented to peers, if configured.
+    pub(crate) fn identity_files(
+        &self,
+    ) -> Result<Option<(&std::path::Path, &std::path::Path)>, Status> {
+        match (self.cert_file.as_deref(), self.key_file.as_deref()) {
+            (Some(cert_path), Some(key_path)) => Ok(Some((cert_path, key_path))),
+            (None, None) => Ok(None),
+            _ => Err(Status::failed_precondition(format!(
+                "{PEER_TLS_CERT_FILE_ENV} and {PEER_TLS_KEY_FILE_ENV} must be configured together"
+            ))),
+        }
+    }
+
+    /// Rejects a configured server name that rustls cannot verify against.
+    pub(crate) fn validate_server_name(&self) -> Result<(), Status> {
+        let Some(server_name) = self.server_name.as_deref() else {
+            return Ok(());
+        };
+        rustls::pki_types::ServerName::try_from(server_name)
+            .map(|_| ())
+            .map_err(|_| {
                 Status::failed_precondition(format!(
-                    "failed to read gateway peer TLS CA {}: {err}",
-                    path.display()
+                    "{PEER_TLS_SERVER_NAME_ENV} {server_name:?} is not a valid DNS name or IP address"
+                ))
+            })
+    }
+
+    pub(crate) fn load(&self) -> Result<ClientTlsConfig, Status> {
+        let identity = self.identity_files()?;
+        let ca_path = self.require_ca_file()?;
+        let pem = std::fs::read(ca_path).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to read gateway peer TLS CA {}: {err}",
+                ca_path.display()
+            ))
+        })?;
+        let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem));
+
+        if let Some((cert_path, key_path)) = identity {
+            let cert = std::fs::read(cert_path).map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to read gateway peer TLS certificate {}: {err}",
+                    cert_path.display()
                 ))
             })?;
-            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem))
-        } else {
-            ClientTlsConfig::new().with_native_roots()
-        };
-
-        match (self.cert_file.as_deref(), self.key_file.as_deref()) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert = std::fs::read(cert_path).map_err(|err| {
-                    Status::failed_precondition(format!(
-                        "failed to read gateway peer TLS certificate {}: {err}",
-                        cert_path.display()
-                    ))
-                })?;
-                let key = std::fs::read(key_path).map_err(|err| {
-                    Status::failed_precondition(format!(
-                        "failed to read gateway peer TLS key {}: {err}",
-                        key_path.display()
-                    ))
-                })?;
-                tls = tls.identity(Identity::from_pem(cert, key));
-            }
-            (None, None) => {}
-            _ => {
-                return Err(Status::failed_precondition(format!(
-                    "{PEER_TLS_CERT_FILE_ENV} and {PEER_TLS_KEY_FILE_ENV} must be configured together"
-                )));
-            }
+            let key = std::fs::read(key_path).map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to read gateway peer TLS key {}: {err}",
+                    key_path.display()
+                ))
+            })?;
+            tls = tls.identity(Identity::from_pem(cert, key));
         }
 
         if let Some(server_name) = self.server_name.as_deref() {
@@ -153,6 +186,10 @@ pub struct PeerRouteCache {
     channels: Mutex<HashMap<String, Channel>>,
     token: Mutex<Option<CachedPeerToken>>,
     owners: Mutex<OwnerCache>,
+    /// Which peer endpoints may be dialed, and the TLS materials for https.
+    /// Installed once at startup; the default refuses plaintext and, having no
+    /// CA, https too.
+    transport: crate::peer_transport::PeerTransportPolicy,
 }
 
 #[derive(Default)]
@@ -179,15 +216,25 @@ struct CachedOwner {
 }
 
 impl PeerRouteCache {
+    /// A route cache that dials peers only as `transport` allows.
+    pub(crate) fn with_transport(transport: crate::peer_transport::PeerTransportPolicy) -> Self {
+        Self {
+            transport,
+            ..Self::default()
+        }
+    }
+
     /// Cloning a `Channel` shares the existing connection, so concurrent relays
     /// to the same peer multiplex as HTTP/2 streams instead of dialing again.
+    /// Only `build_peer_channel` fills the cache, under the same immutable
+    /// transport policy, so a cached channel was admitted by that policy.
     async fn channel(&self, endpoint: &str) -> Result<Channel, Status> {
         let cached = self.channels.lock().unwrap().get(endpoint).cloned();
         if let Some(channel) = cached {
             return Ok(channel);
         }
 
-        let connected = build_peer_channel(endpoint).await?;
+        let connected = build_peer_channel(endpoint, &self.transport).await?;
         let mut channels = self.channels.lock().unwrap();
         // Two relays can miss together; keep whichever landed first so both
         // end up on one connection and the loser's channel is dropped.
@@ -1347,7 +1394,15 @@ impl tonic::service::Interceptor for PeerAuthInterceptor {
     }
 }
 
-async fn build_peer_channel(endpoint: &str) -> Result<Channel, Status> {
+/// Dials a peer endpoint allowed by `transport`. The only path that opens a
+/// gateway-to-gateway connection; every peer RPC reaches it through
+/// [`PeerRouteCache::channel`].
+pub(crate) async fn build_peer_channel(
+    endpoint: &str,
+    transport: &crate::peer_transport::PeerTransportPolicy,
+) -> Result<Channel, Status> {
+    // Refuse before any I/O: peer RPCs carry the gateway ServiceAccount token.
+    let scheme = transport.check_dial(endpoint)?;
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .map_err(|err| Status::internal(format!("invalid gateway peer endpoint: {err}")))?
         .connect_timeout(Duration::from_secs(10))
@@ -1356,16 +1411,34 @@ async fn build_peer_channel(endpoint: &str) -> Result<Channel, Status> {
         .keep_alive_timeout(Duration::from_secs(20))
         .http2_adaptive_window(true);
 
-    if endpoint.starts_with("https://") {
-        let peer_tls = PeerTlsClientConfig::from_env().load()?;
-        ep = ep
-            .tls_config(peer_tls)
-            .map_err(|err| Status::internal(format!("failed to configure peer TLS: {err}")))?;
+    if scheme == crate::peer_transport::PeerDialScheme::Https {
+        let mut peer_tls = transport.tls().load()?;
+        // tonic verifies against `uri.host()`, which keeps IPv6 brackets that
+        // rustls cannot parse; verify the bare address, as startup does.
+        if transport.tls().server_name.is_none()
+            && let Some(address) = ep
+                .uri()
+                .host()
+                .and_then(|host| host.strip_prefix('[')?.strip_suffix(']'))
+        {
+            peer_tls = peer_tls.domain_name(address);
+        }
+        ep = ep.tls_config(peer_tls).map_err(|err| {
+            Status::failed_precondition(format!(
+                "gateway peer TLS configuration is invalid: {}",
+                crate::peer_transport::error_chain(&err)
+            ))
+        })?;
     }
 
-    ep.connect()
-        .await
-        .map_err(|err| Status::unavailable(format!("gateway peer connection failed: {err}")))
+    // tonic's transport error prints only "transport error"; the TLS cause
+    // (unknown issuer, name mismatch) is in its source chain.
+    ep.connect().await.map_err(|err| {
+        Status::unavailable(format!(
+            "gateway peer connection failed: {}",
+            crate::peer_transport::error_chain(&err)
+        ))
+    })
 }
 
 async fn peer_rpc_client(
