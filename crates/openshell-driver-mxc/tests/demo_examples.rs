@@ -103,6 +103,41 @@ fn shipped_ocsf_audit_assets_support_mock_diagnostic_validation() {
 }
 
 #[test]
+fn shipped_aggregate_e2e_assets_support_mock_wiring_validation() {
+    for name in [
+        "mxc-gateway.toml",
+        "run-mxc-e2e.ps1",
+        "e2e-policies/fs-rw.yaml",
+        "e2e-policies/fs-readonly.yaml",
+        "e2e-policies/fs-empty.yaml",
+        "e2e-policies/network-reject.yaml",
+    ] {
+        assert!(
+            examples_root().join(name).is_file(),
+            "shipped aggregate E2E asset is missing: {name}"
+        );
+    }
+
+    let config: Value =
+        toml::from_str(&read_example("mxc-gateway.toml")).expect("MXC E2E config must parse");
+    assert_eq!(
+        config
+            .get("openshell")
+            .and_then(Value::as_table)
+            .and_then(|openshell| openshell.get("version"))
+            .and_then(Value::as_integer),
+        Some(2)
+    );
+    let runner = read_example("run-mxc-e2e.ps1");
+    assert!(runner.contains("[switch] $Mock"));
+    assert!(runner.contains("OPENSHELL_MXC_MOCK_WXC"));
+    for scenario in ["fs-rw", "fs-readonly", "fs-default-deny", "network-reject"] {
+        assert!(runner.contains(scenario));
+    }
+    assert!(runner.contains("not evidence of native MXC or OS enforcement"));
+}
+
+#[test]
 fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
@@ -231,6 +266,7 @@ fn shipped_runners_parse_in_windows_powershell() {
         "run-provider-credential-test.ps1",
         "mxc-provider-credential-probe.ps1",
         "run-ocsf-audit.ps1",
+        "run-mxc-e2e.ps1",
     ] {
         let path = examples_root().join(name);
         let script = r"

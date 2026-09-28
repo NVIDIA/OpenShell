@@ -36,9 +36,31 @@ fn mock_enabled() -> bool {
 }
 
 /// Normalize a path/command fragment to lowercase backslash form for the mock's
-/// in-policy substring check.
+/// in-policy path check.
 fn mock_normalize(s: &str) -> String {
     s.replace('/', "\\").to_lowercase()
+}
+
+fn mock_command_references_grant(command: &str, grant: &str) -> bool {
+    if grant.is_empty() {
+        return false;
+    }
+
+    command.match_indices(grant).any(|(start, _)| {
+        let before = command[..start].chars().next_back();
+        let after = command[start + grant.len()..].chars().next();
+        let is_shell_boundary = |ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\'' | '=' | '>' | '<' | '(' | ')' | '&' | '|' | ';'
+                )
+        };
+        let starts_at_boundary = before.is_none_or(is_shell_boundary);
+        let ends_at_boundary =
+            grant.ends_with('\\') || after.is_none_or(|ch| ch == '\\' || is_shell_boundary(ch));
+        starts_at_boundary && ends_at_boundary
+    })
 }
 
 /// Per-process mock state: `iso:` sandbox id → granted read-write paths
@@ -658,7 +680,9 @@ impl WxcExecInvoker {
         grants: &[String],
     ) -> Result<tokio::process::Child, InvokerError> {
         let cmd_norm = mock_normalize(&process.command_line);
-        let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
+        let in_policy = grants
+            .iter()
+            .any(|grant| mock_command_references_grant(&cmd_norm, grant));
 
         let command_shell = std::env::var_os("COMSPEC")
             .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows\System32\cmd.exe"));
@@ -1007,6 +1031,33 @@ mod tests {
             std::fs::read_to_string(output).expect("mock output").trim(),
             "process-value"
         );
+    }
+
+    #[test]
+    fn mock_grant_matching_respects_path_component_boundaries() {
+        let grant = mock_normalize(r"C:\work\demo");
+
+        for command in [
+            r"echo ok > C:\work\demo",
+            r"echo ok > C:\work\demo\result.txt",
+            r#"echo ok > "C:/work/demo/result.txt""#,
+        ] {
+            assert!(mock_command_references_grant(
+                &mock_normalize(command),
+                &grant
+            ));
+        }
+
+        for command in [
+            r"echo denied > C:\work\demo-ro-src\result.txt",
+            r"echo denied > C:\work\demonstration\result.txt",
+            r"echo denied > XC:\work\demo\result.txt",
+        ] {
+            assert!(!mock_command_references_grant(
+                &mock_normalize(command),
+                &grant
+            ));
+        }
     }
 
     #[test]

@@ -40,6 +40,8 @@
 param(
     [string] $DemoDir     = "C:\work\openshell-mxc-e2e",
     [string] $WxcExecPath = "C:\mxc-kit\bin\wxc-exec.exe",
+    [string] $GatewayPath,
+    [string] $CliPath,
     [ValidateSet("isolation_session", "process_container")]
     [string] $Backend     = "process_container",
     [string] $Scenario,
@@ -139,8 +141,16 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
 
 # --- Path variables -----------------------------------------------------------
 
-$gateway   = Join-Path $here "openshell-gateway.exe"
-$cli       = Join-Path $here "openshell.exe"
+$gateway   = if ([string]::IsNullOrWhiteSpace($GatewayPath)) {
+    Join-Path $here "openshell-gateway.exe"
+} else {
+    [System.IO.Path]::GetFullPath($GatewayPath)
+}
+$cli       = if ([string]::IsNullOrWhiteSpace($CliPath)) {
+    Join-Path $here "openshell.exe"
+} else {
+    [System.IO.Path]::GetFullPath($CliPath)
+}
 $toml      = Join-Path $here "mxc-gateway.toml"
 $policyDir = Join-Path $here "e2e-policies"
 
@@ -534,6 +544,8 @@ try {
             $gwErrLog = Join-Path $resultDir "gateway.$($sc.Name).err.log"
 
             # Build the per-sandbox workload command and clean prior artifacts.
+            $mockDenySandboxName = $null
+            $mockDenyAttempted = $true
             if ($sc.Kind -eq "positive") {
                 Remove-Item $sc.PosTarget -Force -ErrorAction SilentlyContinue
                 $command = @($cmdExe, "/c", "echo ok 1> $($sc.PosTarget.Replace('\', '/'))")
@@ -543,7 +555,14 @@ try {
                 if ($sc.ControlTarget) {
                     Remove-Item $sc.ControlTarget -Force -ErrorAction SilentlyContinue
                     $control = $sc.ControlTarget.Replace('\', '/')
-                    $command = @($cmdExe, "/c", "echo ok 1> $control & echo denied 1> $denied")
+                    if ($Mock) {
+                        # The in-process shim authorizes or denies a whole command.
+                        # Use a separate denied-only launch below so mock CI exercises
+                        # both branches instead of allowing both redirects together.
+                        $command = @($cmdExe, "/c", "echo ok 1> $control")
+                    } else {
+                        $command = @($cmdExe, "/c", "echo ok 1> $control & echo denied 1> $denied")
+                    }
                 } else {
                     $command = @($cmdExe, "/c", "echo denied 1> $denied")
                 }
@@ -592,6 +611,34 @@ try {
 
             $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
 
+            if ($Mock -and $sc.Kind -eq "deny" -and $sc.ControlTarget) {
+                # Run the negative half separately because the mock shim makes a
+                # whole-command decision. A new launch message proves the denied
+                # command reached the shim; absence of its artifact scores denial.
+                $controlReady = Wait-File $sc.ControlTarget 30
+                $launchCountBefore = ([regex]::Matches($gwText, 'MXC agent launched')).Count
+                $denyDriverConfig = @{
+                    mxc = @{
+                        command = @($cmdExe, "/c", "echo denied 1> $denied")
+                        cwd = $demoDirFwd
+                    }
+                } | ConvertTo-Json -Compress -Depth 4
+                $mockDenySandboxName = "mxc-rd-$runId"
+                $denyCreateResult = Invoke-NativeCaptured $cli @(
+                    "sandbox", "create", "--name", $mockDenySandboxName,
+                    "--policy", [string]$policyUsed,
+                    "--driver-config-json", $denyDriverConfig,
+                    "--no-tty"
+                )
+                Start-Sleep -Seconds 3
+                $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join "`n"
+                $launchCountAfter = ([regex]::Matches($gwText, 'MXC agent launched')).Count
+                $mockDenyAttempted = $controlReady -and
+                    $denyCreateResult.ExitCode -eq 0 -and
+                    $launchCountAfter -gt $launchCountBefore
+                Info "mock deny create exit: $($denyCreateResult.ExitCode); launch observed: $($launchCountAfter -gt $launchCountBefore)"
+            }
+
             # Evaluate.
             if ($sc.Kind -eq "create-fail") {
                 # A non-zero exit alone is NOT sufficient: gateway-registration,
@@ -638,7 +685,7 @@ try {
                     # late denied write (enforcement regression racing the control write)
                     # cannot be recorded as PASS.
                     $denyPresent = Test-Path $sc.DenyTarget
-                    if ($controlPresent -and -not $denyPresent) {
+                    if ($controlPresent -and $mockDenyAttempted -and -not $denyPresent) {
                         Ok "$($sc.Name): control write succeeded; denied write correctly blocked"
                         $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "control present, deny absent" }
                     } elseif (-not $controlPresent) {
@@ -646,6 +693,9 @@ try {
                         Info "createOut: $createOutStr"
                         if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure" }
                         $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "control absent (agent did not run)" }
+                    } elseif (-not $mockDenyAttempted) {
+                        Bad "$($sc.Name): mock deny launch was not observed - denial is inconclusive"
+                        $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "mock deny launch not confirmed" }
                     } else {
                         Bad "$($sc.Name): denied write was NOT blocked (artifact present)"
                         $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "deny target present (not enforced)" }
@@ -683,6 +733,9 @@ try {
                 # Real MXC startup is asynchronous and can otherwise be canceled
                 # before the workload writes its positive/control proof.
                 try { Invoke-NativeCaptured $cli @("sandbox", "delete", $sandboxName) | Out-Null } catch {}
+                if ($mockDenySandboxName) {
+                    try { Invoke-NativeCaptured $cli @("sandbox", "delete", $mockDenySandboxName) | Out-Null } catch {}
+                }
                 Stop-Gw $gw
                 $gw = $null
             }
@@ -735,6 +788,7 @@ Files in this bundle ($resultDir):
 What PASS means: every non-skipped scenario met its expected verdict - positive
 writes produced their artifact, deny writes were blocked with either a control
 write or driver-launch evidence, and network-reject was refused by policy.
+$(if ($Mock) { 'Mock mode validates runner/gateway/driver wiring against the in-process shim; it is not evidence of native MXC or OS enforcement.' })
 "@
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))

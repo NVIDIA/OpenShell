@@ -256,6 +256,9 @@ Windows validation separates source correctness from host capability:
   consumer startup, mock workload wiring, durable JSONL output, and the
   zero-provider-events finding. Real provider events and attribution still
   require native MXC qualification.
+- The aggregate example runs its read-write, read-only, default-deny, and
+  unsupported-network-policy scenarios in mock mode. This validates the
+  shipped runner and expected policy paths without claiming native enforcement.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.
