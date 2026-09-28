@@ -261,6 +261,7 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"driver-podman"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 
