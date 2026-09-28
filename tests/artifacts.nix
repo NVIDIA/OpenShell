@@ -143,6 +143,42 @@ let
     in
     "kind(test) and not (${pkgs.lib.concatStringsSep " or " excludedBinaries})";
 
+  podmanE2eCiTests = pkgs.writeShellApplication {
+    name = "generate-podman-e2e-ci-tests";
+    runtimeInputs = [
+      pkgs.cargo-nextest
+      pkgs.git
+      pkgs.jq
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      cargo nextest list \
+        --manifest-path e2e/rust/Cargo.toml \
+        --target ${muslToolchain.target} \
+        -p openshell-e2e \
+        --features e2e-podman \
+        --list-type binaries-only \
+        --message-format json \
+        | jq -r --argjson excluded ${pkgs.lib.escapeShellArg (builtins.toJSON podmanE2eFollowUpBinaries)} '
+          [
+            .["rust-binaries"]
+            | to_entries[]
+            | select(.value.kind == "test")
+            | .value["binary-name"]
+            | select(. as $name | $excluded | index($name) | not)
+          ]
+          | sort
+          | "PODMAN_CI_TESTS=(\n"
+            + (map("  " + @sh) | join("\n"))
+            + "\n)"
+        '
+    '';
+  };
+
   podmanDriverArchive = mkTestArchive {
     name = "podman-driver";
     workspacePath = "tests/suites/drivers";
@@ -168,6 +204,7 @@ rec {
     providerRefreshKeycloakArchive
     podmanDriverArchive
     podmanE2eArchive
+    podmanE2eCiTests
     ;
 
   binaries = pkgs.writeShellApplication {

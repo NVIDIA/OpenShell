@@ -262,6 +262,12 @@ nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
 nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
 ```
 
+Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
+
+```shell
+nix run .#generate-podman-e2e-ci-tests
+```
+
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
@@ -269,8 +275,9 @@ Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, host fixtures, missing guest tools, or nondeterministic relay
 setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit so those
-binaries cannot appear as false passes or silently re-enter the archive.
+binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+the same filter for the generated inventory, so excluded binaries cannot appear
+as false passes or silently re-enter the archive.
 
 Run the VM-backed Rust CLI e2e suite:
 
