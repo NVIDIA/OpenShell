@@ -1,7 +1,5 @@
-# No broad ownership rule. A wildcard rule requested review from the whole
-# codeowners team plus three individuals on every pull request, regardless of
-# what the change touched. Reviewers opt in manually until area/topic labeling
-# and per-area maintainer rosters replace it with targeted routing.
+# No wildcard rule. Instead, uses the `maintainer-approval` workflow as a required check
+# before changes are allowed to merge.
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
