@@ -157,6 +157,25 @@ def imported_provider_profile(
         _delete_provider_profile(stub, profile.id)
 
 
+def _endpointless_credential_profile(profile_id: str) -> openshell_pb2.ProviderProfile:
+    """Build an endpointless credential profile without a platform adapter."""
+    return openshell_pb2.ProviderProfile(
+        id=profile_id,
+        display_name=f"{profile_id} display",
+        category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+        credentials=[
+            openshell_pb2.ProviderProfileCredential(
+                name="api_token",
+                description="E2E endpointless credential",
+                env_vars=["E2E_ENDPOINTLESS_TOKEN"],
+                required=True,
+                auth_style="bearer",
+                header_name="authorization",
+            )
+        ],
+    )
+
+
 def _native_inference_profile(
     *,
     profile_id: str,
@@ -346,24 +365,33 @@ def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
     sandbox_client: SandboxClient,
 ) -> None:
     """Endpointless profile credentials are withheld without an explicit binding."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-google-cloud-without-policy-binding",
-        provider_type="google-cloud",
-        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
-    ) as provider_name:
+    profile_id = "e2e-endpointless-without-policy-binding"
+    with (
+        imported_provider_profile(
+            sandbox_client._stub,
+            profile=_endpointless_credential_profile(profile_id),
+            source=f"{profile_id}.yaml",
+        ),
+        provider(
+            sandbox_client._stub,
+            name="e2e-test-endpointless-without-policy-binding",
+            provider_type=profile_id,
+            credentials={"E2E_ENDPOINTLESS_TOKEN": "e2e-token"},
+            profile_workspace="default",
+        ) as provider_name,
+    ):
         spec = datamodel_pb2.SandboxSpec(
             policy=_default_policy(),
             providers=[provider_name],
         )
 
-        def read_gcp_token() -> str:
+        def read_token() -> str:
             import os
 
-            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+            return os.environ.get("E2E_ENDPOINTLESS_TOKEN", "NOT_SET")
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(read_gcp_token)
+            result = sb.exec_python(read_token)
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "NOT_SET"
 
@@ -393,19 +421,28 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox_client: SandboxClient,
 ) -> None:
     """An endpointless profile emits credentials only with an explicit binding."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-google-cloud-policy-binding",
-        provider_type="google-cloud",
-        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
-    ) as provider_name:
+    profile_id = "e2e-endpointless-policy-binding"
+    with (
+        imported_provider_profile(
+            sandbox_client._stub,
+            profile=_endpointless_credential_profile(profile_id),
+            source=f"{profile_id}.yaml",
+        ),
+        provider(
+            sandbox_client._stub,
+            name="e2e-test-endpointless-policy-binding",
+            provider_type=profile_id,
+            credentials={"E2E_ENDPOINTLESS_TOKEN": "e2e-token"},
+            profile_workspace="default",
+        ) as provider_name,
+    ):
         policy = _default_policy()
-        policy.network_policies["gcp_storage"].CopyFrom(
+        policy.network_policies["endpointless_api"].CopyFrom(
             sandbox_pb2.NetworkPolicyRule(
-                name="gcp_storage",
+                name="endpointless_api",
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(
-                        host="storage.googleapis.com",
+                        host="api.example.com",
                         port=443,
                         protocol="rest",
                         access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
@@ -421,16 +458,16 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
             providers=[provider_name],
         )
 
-        def read_gcp_token() -> str:
+        def read_token() -> str:
             import os
 
-            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+            return os.environ.get("E2E_ENDPOINTLESS_TOKEN", "NOT_SET")
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(read_gcp_token)
+            result = sb.exec_python(read_token)
             assert result.exit_code == 0, result.stderr
             assert _is_placeholder_for_env_key(
-                result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
+                result.stdout.strip(), "E2E_ENDPOINTLESS_TOKEN"
             )
 
 
