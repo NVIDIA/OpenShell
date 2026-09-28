@@ -1959,6 +1959,36 @@ where
     ))
 }
 
+/// Retry transport failures while preserving the snapshot used by the request.
+/// `None` means the gateway returned `ABORTED`: the caller must back off and
+/// fetch fresh configuration instead of resending this snapshot's request.
+async fn grpc_retry_snapshot<T, F, Fut>(op_name: &str, f: F) -> Result<Option<T>>
+where
+    T: Send,
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    grpc_retry(op_name, || async {
+        match f().await {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                let mut source: Option<&dyn std::error::Error> = Some(error.as_ref());
+                while let Some(cause) = source {
+                    if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+                        if status.code() == tonic::Code::Aborted {
+                            return Ok(None);
+                        }
+                        break;
+                    }
+                    source = cause.source();
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
 #[tonic::async_trait]
 trait StartupGateway: Send + Sync {
     async fn snapshot(
@@ -2326,12 +2356,19 @@ async fn load_policy_with_gateway(
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
                 let ws = snapshot.workspace.clone();
-                let synced = grpc_retry("Image policy synchronization", || {
+                let synced = grpc_retry_snapshot("Image policy synchronization", || {
                     gateway.sync(sandbox, &discovered, &ws)
                 })
                 .await;
                 snapshot = match synced {
-                    Ok(synced) => synced,
+                    Ok(Some(synced)) => synced,
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_secs(
+                            1u64 << reconciliation_attempts.min(2),
+                        ))
+                        .await;
+                        continue;
+                    }
                     Err(error) => {
                         // The gateway stored nothing, so report the rejection
                         // against the snapshot this upload was built from and
@@ -2386,12 +2423,19 @@ async fn load_policy_with_gateway(
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
-                let synced = grpc_retry("Enriched policy synchronization", || {
+                let synced = grpc_retry_snapshot("Enriched policy synchronization", || {
                     gateway.sync(sandbox, &sync_policy, &snapshot.workspace)
                 })
                 .await;
                 let canonical = match synced {
-                    Ok(canonical) => canonical,
+                    Ok(Some(canonical)) => canonical,
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_secs(
+                            1u64 << reconciliation_attempts.min(2),
+                        ))
+                        .await;
+                        continue;
+                    }
                     Err(error) => {
                         // The stored policy is unchanged, so report the
                         // rejection against the snapshot it was read from and
@@ -6403,6 +6447,231 @@ network_policies:
         );
         assert_eq!(bundle.2, Some(repaired));
     }
+
+    async fn assert_startup_write_aborted_refetches(image_upload: bool) {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        // An operator installs a policy after startup reads its snapshot but
+        // before either startup write completes. The next write would replace
+        // that policy, so the gateway's conflict must force a fresh read.
+        let operator_policy = proto_policy_fixture();
+        let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = WriteRefusingStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                unset_policy_snapshot()
+            } else {
+                settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+            })),
+            refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                SyncRefusal::new(
+                    tonic::Code::Aborted,
+                    "persist policy revision failed due to concurrent modification",
+                ),
+            ]))),
+            repair_after_refusal: Some(settings_poll_result(
+                Some(operator_policy.clone()),
+                2,
+                PolicySource::Sandbox,
+            )),
+            rejection_report_errors: Arc::default(),
+            calls,
+        };
+        let started = tokio::time::Instant::now();
+        let policy = load_startup_test_policy(&gateway)
+            .await
+            .expect("startup accepts the operator's policy");
+        let mut trace = Vec::new();
+        while let Ok(call) = observed.try_recv() {
+            trace.push(call);
+        }
+        let refused = trace
+            .iter()
+            .position(|call| *call == StartupCall::Sync)
+            .expect("startup attempts the policy write");
+        assert_eq!(
+            trace.get(refused + 1),
+            Some(&StartupCall::Snapshot),
+            "after ABORTED, startup must fetch a fresh snapshot instead of resending the stale payload; calls: {trace:?}"
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|call| **call == StartupCall::Sync)
+                .count(),
+            1,
+            "startup must not resend the payload built from the stale read; calls: {trace:?}"
+        );
+        assert!(
+            !trace.iter().any(|call| matches!(
+                call,
+                StartupCall::Report(report)
+                    if report.state == ConfigurationAdmissionState::Rejected
+            )),
+            "a stale write is not a configuration error; calls: {trace:?}"
+        );
+        assert_eq!(
+            policy, operator_policy,
+            "startup must install the operator's policy, not the stale write-back"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(gateway.desired.lock().unwrap().version, 2);
+        let accepted = trace.last().expect("startup reports acceptance");
+        assert!(matches!(accepted, StartupCall::Report(report)
+            if report.state == ConfigurationAdmissionState::Accepted
+                && report.generation == Some((2, "hash-v2".to_string(), 200, 0))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_image_write_refetches() {
+        assert_startup_write_aborted_refetches(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_baseline_write_refetches() {
+        assert_startup_write_aborted_refetches(false).await;
+    }
+
+    /// Load through the production startup loop, retaining a timeout so a
+    /// mistaken conflict retry cannot leave a test waiting for repair forever.
+    async fn load_startup_test_policy(
+        gateway: &impl StartupGateway,
+    ) -> Result<openshell_core::proto::SandboxPolicy> {
+        let bundle = timeout(
+            Duration::from_mins(1),
+            load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some("http://unused.invalid".to_string()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Policy(Box::new(
+                    proto_tcp_policy_fixture(),
+                ))),
+                gateway,
+            ),
+        )
+        .await
+        .expect("startup must finish within its retry budget")?;
+        Ok(bundle
+            .2
+            .expect("gateway startup returns its accepted policy"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_write_transport_errors_keep_retry_budget() {
+        use openshell_core::proto::PolicySource;
+        for image_upload in [true, false] {
+            for code in [
+                tonic::Code::Unavailable,
+                tonic::Code::DeadlineExceeded,
+                tonic::Code::ResourceExhausted,
+                tonic::Code::Internal,
+                tonic::Code::Unknown,
+            ] {
+                for failures in [1, 5] {
+                    let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+                    let gateway = WriteRefusingStartupGateway {
+                        desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                            unset_policy_snapshot()
+                        } else {
+                            settings_poll_result(
+                                Some(proto_tcp_policy_fixture()),
+                                1,
+                                PolicySource::Sandbox,
+                            )
+                        })),
+                        refusals: Arc::new(std::sync::Mutex::new(
+                            std::collections::VecDeque::from(vec![
+                                SyncRefusal::new(
+                                    code,
+                                    "transport failed"
+                                );
+                                failures
+                            ]),
+                        )),
+                        repair_after_refusal: None,
+                        rejection_report_errors: Arc::default(),
+                        calls,
+                    };
+                    let result = load_startup_test_policy(&gateway).await;
+                    if failures == 5 {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .to_string()
+                                .contains("failed after 5 attempts")
+                        );
+                    } else {
+                        result.expect("startup must recover after one transient failure");
+                    }
+                    let trace: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
+                    assert_eq!(
+                        trace
+                            .iter()
+                            .filter(|call| **call == StartupCall::Sync)
+                            .count(),
+                        if failures == 5 { 5 } else { 2 }
+                    );
+                    assert_eq!(
+                        trace
+                            .iter()
+                            .filter(|call| **call == StartupCall::Snapshot)
+                            .count(),
+                        2
+                    );
+                }
+            }
+        }
+    }
+
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_conflict_writes_keep_reconciliation_budget() {
+        use openshell_core::proto::PolicySource;
+        for image_upload in [true, false] {
+            let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(if image_upload {
+                    unset_policy_snapshot()
+                } else {
+                    settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox)
+                })),
+                refusals: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                    vec![SyncRefusal::new(tonic::Code::Aborted, "configuration keeps changing"); 5],
+                ))),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let error = load_startup_test_policy(&gateway)
+                .await
+                .expect_err("conflicts must have a bounded retry budget");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not stabilize after 5 attempts"),
+                "{error}"
+            );
+            let trace: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|call| **call == StartupCall::Sync)
+                    .count(),
+                5
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|call| **call == StartupCall::Snapshot)
+                    .count(),
+                6
+            );
+        }
+    }
+
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_image_repair_before_report_refetches() {
