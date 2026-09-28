@@ -53,10 +53,10 @@ fn mock_grants() -> &'static Mutex<HashMap<String, Vec<String>>> {
 
 /// Filesystem shares for the sandbox.
 ///
-/// `isolation_session` honors `readwrite`/`readonly` (grant-only — it has no
-/// deny primitive). `processContainer` additionally honors `denied_paths`
-/// because the `AppContainer` backend can stamp deny ACEs; it is also genuinely
-/// default-deny, so anything not granted is already inaccessible.
+/// `processContainer` honors `readwrite`/`readonly` and `denied_paths`. The
+/// `AppContainer` backend is genuinely default-deny, so anything not granted is
+/// already inaccessible. `isolation_session` rejects non-empty filesystem
+/// grants; its backend defaults determine visibility when no grants are present.
 #[derive(Debug, Default)]
 #[allow(clippy::struct_field_names)]
 pub struct MxcFilesystem {

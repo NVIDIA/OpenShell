@@ -16,8 +16,8 @@ version = 2
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
 # process_container is the default because AppContainer enforces default-deny
-# filesystem access. isolation_session is an explicit grant-only compatibility
-# mode and does not deny access to paths omitted from the sandbox policy.
+# filesystem access. isolation_session does not support OpenShell filesystem-
+# policy grants; MXC rejects non-empty grants during provisioning.
 backend = "process_container"
 
 # process_container only: request a Less-Privileged AppContainer.

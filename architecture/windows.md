@@ -72,7 +72,7 @@ sandbox request.
 |---|---|---|
 | Runtime model | One-shot AppContainer process; default backend | Persistent MXC session used to run one configured process |
 | Driver lifecycle | Launch and monitor `wxc-exec` | `provision` -> `start` -> `exec`; stop/delete issue `stop` and `deprovision` |
-| Filesystem | Read-only/read-write grants with default-deny behavior | Explicit grant-only compatibility mode; not equivalent to ProcessContainer default deny |
+| Filesystem | Read-only/read-write grants with default-deny behavior | OpenShell filesystem-policy grants are unsupported; MXC rejects non-empty read-only/read-write grants |
 | Portable UI policy | Supported completely | Every explicit `ui` section is rejected before provisioning |
 | Governed network policy | Supported through the host proxy when enabled | Rejected because the backend cannot enforce the loopback-only proxy path; without an explicit network policy, the backend retains MXC's default-allow egress |
 | Supervisor relay and dynamic forwarding | Optional | Optional |
@@ -111,7 +111,7 @@ The production mapping in
 
 | Policy area | Windows enforcement |
 |---|---|
-| Filesystem | `read_only` and `read_write` become MXC path grants. `include_workdir` adds the resolved working directory as read-write. The mapper normalizes separators but does not translate Linux-rooted locations into Windows paths. ProcessContainer supplies the default-deny boundary; IsolationSession supplies only the requested grants. |
+| Filesystem | On ProcessContainer, `read_only` and `read_write` become MXC path grants, and `include_workdir` adds the resolved working directory as read-write. The mapper normalizes separators but does not translate Linux-rooted locations into Windows paths. ProcessContainer supplies the default-deny boundary. IsolationSession cannot accept non-empty filesystem grants; without them, its backend defaults determine filesystem visibility. |
 | Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
 | UI | ProcessContainer maps graphical UI, directional clipboard access, and input injection into MXC's top-level `ui` object. An absent section maps to the restrictive UI posture. Within an explicit section, omitted fields deny. IsolationSession rejects even an empty explicit section. |
 | Process | MXC supplies the Windows process-isolation boundary, but the mapper has no portable equivalent for `run_as_user` or `run_as_group`; callers must not treat those fields as enforced Windows identity controls. The canonical command, environment, and working directory are launch inputs rather than process-policy grants. |

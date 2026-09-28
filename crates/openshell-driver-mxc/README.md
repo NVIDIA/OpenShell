@@ -21,7 +21,7 @@ it does not implement the Linux `ConnectSupervisor` protocol.
 
 | Capability | MXC driver |
 |---|---|
-| Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces default-deny; `isolation_session` is an explicit grant-only compatibility mode. |
+| Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces them with default-deny behavior. `isolation_session` does not support OpenShell filesystem-policy grants; MXC rejects non-empty grants during provisioning. |
 | UI policy | `process_container` advertises complete support and maps portable graphical UI, clipboard-direction, and input-injection controls to MXC; omitted fields inside an explicit section deny. `isolation_session` advertises no support, so the gateway rejects any explicit section before provisioning. |
 | Network policy | With `egress_proxy = true` on `process_container`, an explicit `network_policies` rule activates MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. A policy without network rules does not activate the proxy. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
 | Provider credentials | The child receives revision-scoped placeholders and non-secret provider environment only. The per-sandbox host proxy retains the resolver and substitutes credentials only for their bound endpoints. |
@@ -44,7 +44,8 @@ Gateway configuration contains only host runtime settings:
 ```toml
 [openshell.drivers.mxc]
 wxc_exec_path = "C:\\path\\to\\wxc-exec.exe"
-# Default: process_container. isolation_session is grant-only and opt-in.
+# Default: process_container. isolation_session is opt-in and does not support
+# OpenShell filesystem-policy grants.
 backend = "process_container"
 default_configuration_id = "composable"
 pc_least_privilege = false
