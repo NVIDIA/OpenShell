@@ -100,8 +100,8 @@ jobs:
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: Build MXC example E2E binaries
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
-      - name: Run shipped MXC Ollama example with mock API
-        run: mise run --skip-tools windows:e2e:mxc:ollama-mock:${{ matrix.arch }}
+      - name: Run shipped MXC inference examples with mock API
+        run: mise run --skip-tools windows:e2e:mxc:inference-mock:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats
@@ -215,8 +215,8 @@ jobs:
           cache-bin: "false"
       - name: Build release binaries
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
-      - name: Run shipped MXC Ollama example with mock API
-        run: mise run --skip-tools windows:e2e:mxc:ollama-mock:${{ matrix.arch }}
+      - name: Run shipped MXC inference examples with mock API
+        run: mise run --skip-tools windows:e2e:mxc:inference-mock:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats

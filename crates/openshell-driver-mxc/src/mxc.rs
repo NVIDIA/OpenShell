@@ -660,7 +660,15 @@ impl WxcExecInvoker {
         let cmd_norm = mock_normalize(&process.command_line);
         let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
 
-        let mut cmd = Command::new("cmd");
+        let command_shell = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let mut cmd = Command::new(command_shell);
+        cmd.env_clear();
+        for entry in &process.env {
+            if let Some((key, value)) = entry.split_once('=') {
+                cmd.env(key, value);
+            }
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -973,6 +981,32 @@ mod tests {
 
         assert!(config.get("network").is_none());
         assert!(config.get("ui").is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_exec_uses_only_the_mxc_process_environment() {
+        const KEY: &str = "OPENSHELL_MXC_MOCK_ENV_TEST";
+        let workdir = tempfile::tempdir().expect("temporary workdir");
+        let output = workdir.path().join("mock-env.txt");
+        let process = MxcProcess {
+            command_line: format!("echo %{KEY}%,%SystemRoot% 1> \"{}\"", output.display()),
+            cwd: workdir.path().to_string_lossy().into_owned(),
+            env: vec![format!("{KEY}=process-value")],
+            timeout: 0,
+        };
+
+        let mut child = WxcExecInvoker::mock_spawn_with_grants(
+            &process,
+            &[mock_normalize(&workdir.path().to_string_lossy())],
+        )
+        .expect("mock process should launch");
+        let status = child.wait().await.expect("mock process should finish");
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(output).expect("mock output").trim(),
+            "process-value,%SystemRoot%"
+        );
     }
 
     #[test]

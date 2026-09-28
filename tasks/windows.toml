@@ -109,12 +109,12 @@ description = "Run MXC Tier-3 e2e scenario runner in mock/wiring-only mode (no r
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File crates/openshell-driver-mxc/examples/run-mxc-e2e.ps1 -Mock"
 
-["windows:e2e:mxc:ollama-mock:x64"]
-description = "Run the shipped MXC Ollama demo against the in-process wxc mock and a local API stub on Windows x64"
+["windows:e2e:mxc:inference-mock:x64"]
+description = "Run the shipped MXC inference demos against the in-process wxc mock and a local API stub on Windows x64"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
-run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-ollama-e2e.ps1 -Target x86_64-pc-windows-msvc"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-inference-examples-e2e.ps1 -Target x86_64-pc-windows-msvc"
 
-["windows:e2e:mxc:ollama-mock:arm64"]
-description = "Run the shipped MXC Ollama demo against the in-process wxc mock and a local API stub on Windows ARM64"
+["windows:e2e:mxc:inference-mock:arm64"]
+description = "Run the shipped MXC inference demos against the in-process wxc mock and a local API stub on Windows ARM64"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
-run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-ollama-e2e.ps1 -Target aarch64-pc-windows-msvc"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-inference-examples-e2e.ps1 -Target aarch64-pc-windows-msvc"

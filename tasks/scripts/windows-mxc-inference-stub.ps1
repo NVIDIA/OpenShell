@@ -11,7 +11,10 @@ param(
     [string] $RequestLog,
 
     [Parameter(Mandatory = $true)]
-    [string] $ReadyPath
+    [string] $ReadyPath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ExpectedBearerToken
 )
 
 Set-StrictMode -Version Latest
@@ -38,11 +41,14 @@ try {
             if ([string]::IsNullOrWhiteSpace($requestLine)) { continue }
 
             $contentLength = 0
+            $authorization = ""
             while ($true) {
                 $line = $reader.ReadLine()
                 if ([string]::IsNullOrEmpty($line)) { break }
                 if ($line -match '^Content-Length:\s*(\d+)\s*$') {
                     $contentLength = [int] $Matches[1]
+                } elseif ($line -match '^Authorization:\s*(.+)\s*$') {
+                    $authorization = $Matches[1]
                 }
             }
             if ($contentLength -gt 0) {
@@ -55,9 +61,20 @@ try {
                 }
             }
 
-            [System.IO.File]::AppendAllText($RequestLog, "$requestLine`r`n", $utf8)
             $parts = $requestLine.Split(' ')
             $path = if ($parts.Count -ge 2) { $parts[1] } else { "/" }
+            $authorizationStatus = if ([string]::IsNullOrWhiteSpace($authorization)) {
+                "absent"
+            } elseif ($authorization -ceq "Bearer $ExpectedBearerToken") {
+                "synthetic"
+            } else {
+                "mismatch"
+            }
+            [System.IO.File]::AppendAllText(
+                $RequestLog,
+                "$requestLine authorization=$authorizationStatus`r`n",
+                $utf8
+            )
             switch ($path) {
                 "/api/tags" {
                     $status = "200 OK"
@@ -66,6 +83,15 @@ try {
                 "/api/generate" {
                     $status = "200 OK"
                     $body = '{"model":"openshell-ci-mock","response":"Hello from the CI mock.","done":true}'
+                }
+                "/v1/chat/completions" {
+                    if ($authorizationStatus -eq "synthetic") {
+                        $status = "200 OK"
+                        $body = '{"choices":[{"message":{"role":"assistant","content":"Hello from the CI mock."}}]}'
+                    } else {
+                        $status = "401 Unauthorized"
+                        $body = '{"error":{"message":"invalid mock credential"}}'
+                    }
                 }
                 default {
                     $status = "404 Not Found"

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Cloud inference (T1) demo for OpenShell on MXC. PowerShell 5.1 compatible.
+# -Mock runs the workload on the host through the in-process wxc shim. It is for
+# CI wiring coverage only and does not provide MXC or AppContainer isolation.
 
 [CmdletBinding()]
 param(
@@ -11,8 +13,10 @@ param(
     [string] $ShareDir,
     [string] $Model = "nvidia/nemotron-3.5-lightning-30b-a3b",
     [string] $Prompt = "Say hello in exactly five words.",
+    [string] $ApiUrl = "https://integrate.api.nvidia.com/v1/chat/completions",
     [ValidateRange(0, 65535)] [int] $Port = 0,
     [string] $SandboxName,
+    [switch] $Mock,
     [switch] $KeepArtifacts
 )
 
@@ -133,6 +137,7 @@ $success = $false
 $failure = $null
 $oldGatewayConfig = $env:OPENSHELL_GATEWAY_CONFIG
 $oldComputeDriver = $env:OPENSHELL_COMPUTE_DRIVER
+$oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 $oldApiKey = $env:NV_API_KEY
 $apiKey = $env:NV_API_KEY
 
@@ -142,11 +147,28 @@ try {
     }
     $gateway = Resolve-Executable $GatewayPath "openshell-gateway.exe" ""
     $cli = Resolve-Executable $CliPath "openshell.exe" ""
-    $wxc = Resolve-Executable $WxcExecPath "wxc-exec.exe" "OPENSHELL_WXC_EXEC_PATH"
+    if ($Mock) {
+        # The gateway still validates that wxc_exec_path is absolute. The
+        # in-process mock never launches this placeholder.
+        $wxc = Join-Path $here "mock-wxc-exec.exe"
+    } else {
+        $wxc = Resolve-Executable $WxcExecPath "wxc-exec.exe" "OPENSHELL_WXC_EXEC_PATH"
+    }
     foreach ($fixture in @("mxc-inference.toml", "inference.yaml")) {
         if (-not (Test-Path -LiteralPath (Join-Path $here $fixture) -PathType Leaf)) {
             throw "required demo fixture '$fixture' is missing beside the runner"
         }
+    }
+    if ($ApiUrl.IndexOfAny([char[]]@('"', '%', '!', '&', '|', '<', '>', '^', [char] 13, [char] 10)) -ge 0) {
+        throw "ApiUrl contains a character that cannot be rendered safely into the sandbox command"
+    }
+    try {
+        $apiUri = [System.Uri] $ApiUrl
+    } catch {
+        throw "ApiUrl is not a valid absolute URI: $ApiUrl"
+    }
+    if (-not $apiUri.IsAbsoluteUri -or $apiUri.Scheme -notin @("http", "https")) {
+        throw "ApiUrl must be an absolute HTTP or HTTPS URI"
     }
     if ($Port -eq 0) { $Port = Get-AvailablePort }
     $endpoint = "http://127.0.0.1:$Port"
@@ -163,8 +185,9 @@ try {
 
     Info "gateway: $gateway"
     Info "CLI: $cli"
-    Info "wxc-exec: $wxc"
+    Info "wxc-exec: $(if ($Mock) { 'in-process mock (no MXC isolation)' } else { $wxc })"
     Info "share: $ShareDir"
+    Info "inference API: $ApiUrl"
     Info "NV_API_KEY: present (value redacted)"
 
     $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
@@ -187,6 +210,8 @@ try {
     $policyText = [System.IO.File]::ReadAllText((Join-Path $here "inference.yaml"))
     $policyText = $policyText.Replace("__OPENSHELL_DEMO_SHARE__", $sharePolicy)
     $policyText = $policyText.Replace("__CMD_EXE__", $cmdExe)
+    $policyText = $policyText.Replace("__INFERENCE_HOST__", $apiUri.DnsSafeHost)
+    $policyText = $policyText.Replace("__INFERENCE_PORT__", [string] $apiUri.Port)
     Write-Utf8 $policyUsed $policyText
 
     $requestPath = Join-Path $ShareDir "inference-request.json"
@@ -198,11 +223,21 @@ try {
     Write-Utf8 $requestPath $requestJson
 
     $probePath = Join-Path $ShareDir "inference-probe.cmd"
-    $probeLines = @(
-        "@echo off",
+    $tlsArgs = if ($apiUri.Scheme -eq "https") {
         # Inbox curl uses Schannel and does not honor CURL_CA_BUNDLE by itself.
         # Point --cacert at the public bundle staged by the governed proxy.
-        "`"$curlExe`" --silent --show-error --fail-with-body --ssl-no-revoke --cacert `"%CURL_CA_BUNDLE%`" --max-time 120 -D `"$headersPath`" -H `"Authorization: Bearer %NV_API_KEY%`" -H `"Content-Type: application/json`" --data-binary `"@$requestPath`" -o `"$responsePath`" `"https://integrate.api.nvidia.com/v1/chat/completions`" 2> `"$errorPath`" || exit /b 31",
+        '--ssl-no-revoke --cacert "%CURL_CA_BUNDLE%"'
+    } else {
+        ""
+    }
+    $proxyBypassArgs = if ($apiUri.IsLoopback) {
+        "--noproxy `"$($apiUri.DnsSafeHost)`""
+    } else {
+        ""
+    }
+    $probeLines = @(
+        "@echo off",
+        "`"$curlExe`" $proxyBypassArgs --silent --show-error --fail-with-body $tlsArgs --max-time 120 -D `"$headersPath`" -H `"Authorization: Bearer %NV_API_KEY%`" -H `"Content-Type: application/json`" --data-binary `"@$requestPath`" -o `"$responsePath`" `"$ApiUrl`" 2> `"$errorPath`" || exit /b 31",
         "`"$findStrExe`" /C:`"choices`" `"$responsePath`" >nul || exit /b 32",
         "echo PASS> `"$donePath`""
     )
@@ -214,6 +249,11 @@ try {
     $gwErrLog = Join-Path $resultDir "gateway.err.log"
     $env:OPENSHELL_GATEWAY_CONFIG = $tomlUsed
     $env:OPENSHELL_COMPUTE_DRIVER = "mxc"
+    if ($Mock) {
+        $env:OPENSHELL_MXC_MOCK_WXC = "1"
+    } else {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    }
     # The credential belongs to sandbox creation, not gateway configuration.
     Remove-Item Env:NV_API_KEY -ErrorAction SilentlyContinue
     try {
@@ -280,6 +320,11 @@ try {
     }
     $env:OPENSHELL_GATEWAY_CONFIG = $oldGatewayConfig
     $env:OPENSHELL_COMPUTE_DRIVER = $oldComputeDriver
+    if ([string]::IsNullOrWhiteSpace($oldMockWxc)) {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    } else {
+        $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
+    }
     if ([string]::IsNullOrWhiteSpace($oldApiKey)) { Remove-Item Env:NV_API_KEY -ErrorAction SilentlyContinue } else { $env:NV_API_KEY = $oldApiKey }
     if (-not $KeepArtifacts -and $createdShare -and $ShareDir -and (Test-Path -LiteralPath $ShareDir)) {
         Remove-Item -LiteralPath $ShareDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -287,7 +332,7 @@ try {
 }
 
 $verdict = if ($success) { "PASS" } else { "FAIL" }
-$summary = "verdict=$verdict`r`nbase=cloud-inference`r`nsandbox=$SandboxName`r`ngateway=$endpoint`r`nbackend=process_container`r`nresult=$failure`r`n"
+$summary = "verdict=$verdict`r`nbase=cloud-inference`r`nmode=$(if ($Mock) { 'mock-wiring' } else { 'real-mxc' })`r`nsandbox=$SandboxName`r`ngateway=$endpoint`r`nbackend=process_container`r`nresult=$failure`r`n"
 Write-Utf8 (Join-Path $resultDir "summary.txt") $summary
 Write-Host "`n$summary"
 Write-Host "Results: $resultDir"

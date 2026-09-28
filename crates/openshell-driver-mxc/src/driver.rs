@@ -151,7 +151,7 @@ async fn wait_for_target_listener(port: u16) -> std::io::Result<()> {
 ///
 /// - `IsolationSession`: persistent, attachable session
 ///   (provision → start → exec → stop → deprovision). Does not support
-///   OpenShell filesystem-policy grants; backend defaults determine visibility.
+///   `OpenShell` filesystem-policy grants; backend defaults determine visibility.
 /// - `ProcessContainer` (default): one-shot `AppContainer`. Genuinely default-deny: a
 ///   write to any ungranted path is denied by the OS. No persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2847,6 +2847,8 @@ mod lifecycle_tests {
             .replace("__OPENSHELL_DEMO_SHARE__", share)
             .replace("__OLLAMA_HOST__", "127.0.0.1")
             .replace("__OLLAMA_PORT__", "11434")
+            .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
+            .replace("__INFERENCE_PORT__", "443")
             .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
         parse_sandbox_policy(&rendered).expect("parse rendered shipped demo policy")
     }

@@ -248,10 +248,11 @@ Windows validation separates source correctness from host capability:
   workspace and unsupported-driver contract tests for x64 and ARM64.
 - Mock MXC E2E validates gateway, CLI, driver, lifecycle, and policy wiring but
   is not evidence of OS enforcement.
-- Hosted Windows CI runs the shipped Ollama demo against that mock and a local
-  Ollama-compatible API. This proves the complete demo script and response path
-  without a model or credential, but it does not prove MXC isolation or network
-  enforcement.
+- Hosted Windows CI runs the shipped Ollama and cloud-inference demos against
+  that mock and a local compatible API. This proves both complete demo scripts,
+  sandbox-scoped credential propagation, and response paths without a model or
+  external credential, but it does not prove MXC isolation, proxy substitution,
+  or network enforcement.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.

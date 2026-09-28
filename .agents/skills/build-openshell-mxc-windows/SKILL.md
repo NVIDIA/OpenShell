@@ -1,6 +1,6 @@
 ---
 name: build-openshell-mxc-windows
-description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
+description: Maintain and validate OpenShell's Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, MXC example wiring checks, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
 metadata:
   internal: true
 ---
@@ -12,8 +12,8 @@ OpenShell repository. The Windows lane is already present in `main`; do not
 treat this skill as a first-time porting recipe unless the user explicitly asks
 for a new fork or a from-scratch bring-up.
 
-The lane is build-only. It validates that OpenShell can compile and test on
-Windows MSVC for the supported deliverables:
+The lane validates that OpenShell can compile and test on Windows MSVC for the
+supported deliverables:
 
 - `openshell-gateway.exe`
 - `openshell.exe`
@@ -51,6 +51,8 @@ In scope:
   `openshell`.
 - Running workspace tests on a native x64 or ARM64 host.
 - Running focused unsupported-driver contract tests.
+- Running the shipped Ollama and cloud-inference MXC examples against the
+  in-process `wxc` mock and a local API stub.
 - Reporting test counts, skipped/gated areas, warnings, artifacts, and logs.
 - Keeping Linux and macOS build paths unchanged.
 - Keeping unsupported Windows compute drivers explicit and testable.
@@ -158,7 +160,14 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
+mise run --skip-tools windows:e2e:mxc:inference-mock:x64
 ```
+
+Use the `arm64` form of the inference task on a native ARM64 host. It exercises
+the real gateway, CLI, and shipped PowerShell runners with an in-process `wxc`
+mock and local HTTP responses. It proves example wiring, request execution, and
+sandbox-scoped credential propagation; it does not prove MXC, AppContainer,
+filesystem, or network enforcement.
 
 The two `windows:test:mxc-real:*` tasks are host-specific and mutually
 exclusive on a single host (each rejects the other architecture -- see the
@@ -220,14 +229,17 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
-Windows-supported workspace and e2e crates plus Rust tests. Pushes to `main` and
-manual dispatches run the same lint and test commands in a cache-seed job,
-followed by a dependent release-binary build job. The seed and PR jobs use the
-same cache namespaces. Merge queues do not run this workflow. Main/manual seed
-and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
-failures normally. Applying the label alone does not start a run: re-run all
-jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
+dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy
+for the Windows-supported workspace and e2e crates plus Rust tests, build
+release binaries, and run both shipped MXC inference examples through the mock
+task. Pushes to `main` and manual dispatches run the same lint and test commands
+in a cache-seed job, followed by a dependent release-binary build and
+mock-example job. The seed and PR jobs use the same cache namespaces. Merge
+queues do not run this workflow. Main/manual seed and build jobs use job-level
+`continue-on-error: true`; opt-in PR jobs report failures normally. Applying
+the label alone does not start a run: re-run all jobs in the current mirror
+push run, or push a new mirrored commit. The binaries are not uploaded or
+published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -272,6 +284,8 @@ crypto dependency builds.
 | `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
 | `windows:test:mxc-real:arm64` | Runs the same real-`wxc-exec` suite natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:test:mxc-gb300:arm64` | Runs the required native ARM64 ProcessContainer subset and fails when a test skips. |
+| `windows:e2e:mxc:inference-mock:x64` | Runs the shipped Ollama and cloud-inference demos on native x64 through the real gateway and CLI, in-process `wxc` mock, and local API stub. This is wiring evidence, not MXC enforcement evidence. |
+| `windows:e2e:mxc:inference-mock:arm64` | Runs the same mock-wiring checks on native ARM64 with ARM64 release binaries. |
 | `windows:qualify:mxc:gb300:contract` | Validates the required/optional/unsupported/architecture-constrained GB300 matrix. |
 | `windows:qualify:mxc:gb300` | Runs the fail-closed GB300 ARM64 gate and validates hash-bound evidence. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
@@ -324,6 +338,8 @@ When reporting `windows:ci`, distinguish these categories:
 - Passed tests from the full ARM64 workspace test log when run on a native
   ARM64 host.
 - The focused unsupported-contract re-run.
+- The architecture-matched MXC inference-example mock task and its explicit
+  wiring-only limitation.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.
@@ -385,6 +401,7 @@ Every substantial Windows build run should report:
 | ARM64 check/build | Pass/fail/skipped and log path. |
 | Native tests | Passed/failed/ignored/filtered counts and log path for the host architecture. |
 | Unsupported contracts | Which focused tests ran and their result. |
+| MXC example mock E2E | Architecture, result, artifact directory on failure, and the wiring-only limitation. |
 | Artifacts | Binary paths, size, and SHA256 when available. |
 | Skips | Explicitly explain tests not run for a non-native architecture, unsupported driver package exclusions, and Windows cfg-gated tests. |
 | Follow-ups | Only concrete follow-ups tied to failures or requested scope. |

@@ -102,6 +102,8 @@ fn shipped_inference_policies_are_narrow_and_valid_after_rendering() {
             .replace("__OPENSHELL_DEMO_SHARE__", share)
             .replace("__OLLAMA_HOST__", "127.0.0.1")
             .replace("__OLLAMA_PORT__", "11434")
+            .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
+            .replace("__INFERENCE_PORT__", "443")
             .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
         let policy = parse_sandbox_policy(&rendered)
             .unwrap_or_else(|error| panic!("failed to parse rendered {name}: {error}"));
@@ -161,6 +163,14 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
     assert!(local.contains("[switch] $Mock"));
     assert!(local.contains("in-process wxc shim"));
     assert!(local.contains("does not provide MXC or AppContainer isolation"));
+
+    let cloud = read_example("run-inference-test.ps1");
+    assert!(cloud.contains("[switch] $Mock"));
+    assert!(cloud.contains("[string] $ApiUrl"));
+    assert!(cloud.contains("$apiUri.IsLoopback"));
+    assert!(cloud.contains("--noproxy"));
+    assert!(cloud.contains("in-process wxc shim"));
+    assert!(cloud.contains("does not provide MXC or AppContainer isolation"));
 }
 
 #[cfg(target_os = "windows")]
