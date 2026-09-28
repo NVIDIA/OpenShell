@@ -2,22 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::auth::peer::test_support::FakeGatewayPeerResolver;
+use crate::auth::peer::{PeerServiceAccountAuthenticator, ResolvedGatewayPeerIdentity};
+use crate::compute::new_test_runtime;
 use crate::gateway_listener::BoundGatewayListener;
 use crate::grpc::test_support::test_server_state;
-use crate::supervisor_session::build_peer_channel;
+use crate::sandbox_index::SandboxIndex;
+use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_owner::{OWNER_TTL, OwnerRecord, SupervisorOwnerIndex};
+use crate::supervisor_session::{
+    PeerRouteCache, SupervisorSessionRegistry, build_peer_channel,
+    forward_endpoint_status_to_owner, forward_provider_readiness_to_owner,
+    open_routed_relay_with_message,
+};
 use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
+use crate::tracing_bus::TracingLogBus;
 use crate::{MultiplexService, ServerState, TlsAcceptor};
+use bytes::Bytes;
+use http_body_util::Empty;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use openshell_core::proto::open_shell_client::OpenShellClient;
-use openshell_core::proto::{HealthRequest, ServiceStatus};
+use openshell_core::proto::{
+    HealthRequest, PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayOpen,
+    ReportEndpointStatusRequest, ReportProviderReadinessRequest, ServiceStatus, gateway_message,
+    peer_relay_frame,
+};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Code;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+use uuid::Uuid;
 
 /// Mirrors the chart's `OPENSHELL_PEER_TLS_SERVER_NAME`.
 const PEER_SERVER_NAME: &str = "openshell.openshell.svc.cluster.local";
@@ -338,6 +361,57 @@ fn dial_rule_refuses_non_http_schemes_even_with_opt_out() {
             );
         }
     }
+}
+
+/// The relay loop stops retrying exactly when `preflight` refuses, so it must
+/// refuse what no dial can reach and nothing that only I/O could decide.
+#[test]
+fn preflight_refuses_endpoints_no_dial_can_reach() {
+    let pki = Pki::new();
+    let half_identity = PeerTransportPolicy::new(
+        false,
+        PeerTlsClientConfig {
+            ca_file: Some(pki.ca.clone()),
+            cert_file: Some(pki.client_cert.clone()),
+            key_file: None,
+            server_name: None,
+        },
+    );
+    for (case, policy, endpoint) in [
+        (
+            "plaintext",
+            PeerTransportPolicy::default(),
+            "http://10.0.0.5:8080",
+        ),
+        (
+            "no CA",
+            PeerTransportPolicy::default(),
+            "https://10.0.0.5:8080",
+        ),
+        ("half identity", half_identity, "https://10.0.0.5:8080"),
+        ("scheme", plaintext_policy(), "grpc://10.0.0.5:8080"),
+    ] {
+        let err = policy
+            .preflight(endpoint)
+            .expect_err("no dial can reach this endpoint");
+        assert_eq!(err.code(), Code::FailedPrecondition, "{case}");
+    }
+
+    assert_eq!(
+        plaintext_policy()
+            .preflight("http://10.0.0.5:8080")
+            .unwrap(),
+        PeerDialScheme::Http
+    );
+    // A CA file that is missing at dial time is I/O: the dial reports it and
+    // the relay keeps retrying.
+    let missing_ca = pki.ca.with_file_name("missing.pem");
+    assert_eq!(
+        policy(&missing_ca, None, None)
+            .preflight("https://10.0.0.5:8080")
+            .unwrap(),
+        PeerDialScheme::Https
+    );
 }
 
 // ---- opt-out ----------------------------------------------------------------
@@ -1165,4 +1239,423 @@ async fn https_dial_rejects_untrusted_client_identity() {
             .await
             .expect_err("a client certificate from another CA must be refused");
     }
+}
+
+// ---- two replicas and the relay loop ----------------------------------------
+
+/// A requester replica `replica-a` dialing peers under `transport`, with no
+/// peer token.
+async fn requester_without_token(transport: PeerTransportPolicy) -> Arc<ServerState> {
+    let mut state = test_server_state().await;
+    let requester = Arc::get_mut(&mut state).expect("test state should be uniquely owned");
+    requester.replica_id = "replica-a".to_string();
+    requester.peer_routes = Arc::new(PeerRouteCache::with_transport(transport));
+    state
+}
+
+/// `requester_without_token` with its peer token already cached.
+async fn requester_state(transport: PeerTransportPolicy) -> Arc<ServerState> {
+    let state = requester_without_token(transport).await;
+    state.peer_routes.set_peer_token_for_test("peer-token-a");
+    state
+}
+
+/// Requester A and owner B on one store. A dials https with the peer CA, the
+/// Service name and the client certificate; B serves TLS, requires a client
+/// certificate like chart mTLS, and resolves every peer token to
+/// `resolved_pod` (no identity when `None`).
+struct TwoReplicas {
+    a: Arc<ServerState>,
+    b: Arc<ServerState>,
+    b_endpoint: String,
+    resolver: Arc<FakeGatewayPeerResolver>,
+    _shutdown: watch::Sender<bool>,
+}
+
+async fn two_replicas(pki: &Pki, resolved_pod: Option<&str>) -> TwoReplicas {
+    let a = requester_state(policy(
+        &pki.ca,
+        Some(PEER_SERVER_NAME),
+        Some((&pki.client_cert, &pki.client_key)),
+    ))
+    .await;
+    let mut b = ServerState::new(
+        a.config.clone(),
+        a.store.clone(),
+        new_test_runtime(a.store.clone()).await,
+        SandboxIndex::new(),
+        SandboxWatchBus::new(),
+        TracingLogBus::new(),
+        Arc::new(SupervisorSessionRegistry::new()),
+        None,
+    );
+    b.replica_id = "replica-b".to_string();
+    let resolver = Arc::new(FakeGatewayPeerResolver::returning(Ok(resolved_pod.map(
+        |pod_name| ResolvedGatewayPeerIdentity {
+            pod_name: pod_name.to_string(),
+            pod_uid: "uid-a".to_string(),
+        },
+    ))));
+    b.peer_authenticator = Some(Arc::new(PeerServiceAccountAuthenticator::new(
+        resolver.clone(),
+    )));
+    let b = Arc::new(b);
+    let (address, shutdown) = spawn_tls_gateway(b.clone(), pki, true).await;
+    TwoReplicas {
+        a,
+        b,
+        b_endpoint: format!("https://127.0.0.1:{}", address.port()),
+        resolver,
+        _shutdown: shutdown,
+    }
+}
+
+/// Publishes `replica-b` at `endpoint` as the owner of `sandbox_id` and
+/// returns the stored record.
+async fn publish_owner(state: &ServerState, sandbox_id: &str, endpoint: &str) -> OwnerRecord {
+    let owners = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    owners
+        .publish(
+            sandbox_id,
+            "session-b",
+            "instance-b",
+            1,
+            "replica-b",
+            endpoint,
+        )
+        .await
+        .expect("failed to publish owner");
+    owners
+        .read(sandbox_id)
+        .await
+        .expect("failed to read owner")
+        .expect("owner record should exist")
+}
+
+/// Registers a supervisor session on `state` that echoes every relay.
+fn register_echo_supervisor(state: &ServerState, sandbox_id: &str) {
+    let (tx, mut rx) = mpsc::channel(8);
+    state.supervisor_sessions.register(
+        sandbox_id.to_string(),
+        Uuid::new_v4().to_string(),
+        tx,
+        oneshot::channel().0,
+    );
+    let registry = state.supervisor_sessions.clone();
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            let Some(gateway_message::Payload::RelayOpen(open)) = message.payload else {
+                continue;
+            };
+            let relay = registry
+                .claim_relay(&open.channel_id, None)
+                .expect("the owner should hand the relay to its supervisor");
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(relay.stream);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+}
+
+fn relay_open() -> RelayOpen {
+    RelayOpen {
+        channel_id: Uuid::new_v4().to_string(),
+        ..Default::default()
+    }
+}
+
+/// A plaintext h2c peer on `127.0.0.1` that answers every request with a
+/// trailers-only gRPC `code` and counts the requests. Only test builds may
+/// dial it.
+async fn spawn_h2c_fake_owner(code: Code) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind fake owner");
+    let address = listener.local_addr().expect("failed to read local addr");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let service =
+                    hyper::service::service_fn(move |_: http::Request<hyper::body::Incoming>| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            Ok::<_, Infallible>(
+                                http::Response::builder()
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", i32::from(code).to_string())
+                                    .body(Empty::<Bytes>::new())
+                                    .expect("valid fake owner response"),
+                            )
+                        }
+                    });
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{address}"), requests)
+}
+
+/// `PeerRelay` over https with the peer CA, the server name override, the
+/// client certificate, the `ServiceAccount` token, the replica header and the
+/// requester check, end to end into the owner's supervisor session.
+#[tokio::test]
+async fn peer_relay_reaches_owner_session_over_tls() {
+    let pki = Pki::new();
+    let replicas = two_replicas(&pki, Some("replica-a")).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    register_echo_supervisor(&replicas.b, &sandbox_id);
+    publish_owner(&replicas.a, &sandbox_id, &replicas.b_endpoint).await;
+
+    let (_, relay) = open_routed_relay_with_message(
+        &replicas.a,
+        &sandbox_id,
+        relay_open(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the requester should reach the owner's session");
+    let mut stream = relay
+        .await
+        .expect("relay sender dropped")
+        .expect("relay failed");
+    stream.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+        .await
+        .expect("the echo should come back through both replicas")
+        .unwrap();
+    assert_eq!(&echoed, b"ping");
+    let seen_tokens = replicas.resolver.seen_tokens.lock().unwrap().clone();
+    assert!(
+        !seen_tokens.is_empty() && seen_tokens.iter().all(|token| token == "peer-token-a"),
+        "B must authenticate A's peer token: {seen_tokens:?}"
+    );
+}
+
+/// `PeerReportEndpointStatus` has no end-to-end driver, so this is its peer
+/// routing proof.
+#[tokio::test]
+async fn peer_endpoint_status_forwarding_reaches_owner_over_tls() {
+    let pki = Pki::new();
+    let replicas = two_replicas(&pki, Some("replica-a")).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    let owner = publish_owner(&replicas.a, &sandbox_id, &replicas.b_endpoint).await;
+
+    let err = forward_endpoint_status_to_owner(
+        &replicas.a,
+        &owner,
+        ReportEndpointStatusRequest {
+            sandbox_id,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("B rejects a report without a policy hash");
+    // Only B's handler returns this, so the call crossed the TLS peer hop.
+    assert_eq!(err.code(), Code::InvalidArgument, "{}", err.message());
+    assert_eq!(err.message(), "policy_hash is required");
+}
+
+#[tokio::test]
+async fn peer_provider_readiness_forwarding_reaches_owner_over_tls() {
+    let pki = Pki::new();
+    let replicas = two_replicas(&pki, Some("replica-a")).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    let owner = publish_owner(&replicas.a, &sandbox_id, &replicas.b_endpoint).await;
+
+    let err = forward_provider_readiness_to_owner(
+        &replicas.a,
+        &owner,
+        ReportProviderReadinessRequest {
+            sandbox_id,
+            observation: Some(ProviderReadinessObservation {
+                session_id: Uuid::new_v4().to_string(),
+                ..Default::default()
+            }),
+        },
+    )
+    .await
+    .expect_err("B knows no such sandbox");
+    assert_eq!(err.code(), Code::NotFound, "{}", err.message());
+    assert_eq!(err.message(), "sandbox not found");
+}
+
+#[tokio::test]
+async fn peer_rpc_rejects_replica_mismatch_over_tls() {
+    let pki = Pki::new();
+    // The token belongs to `replica-x`, but A claims `replica-a` in its header.
+    let replicas = two_replicas(&pki, Some("replica-x")).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    let owner = publish_owner(&replicas.a, &sandbox_id, &replicas.b_endpoint).await;
+
+    let err = forward_endpoint_status_to_owner(
+        &replicas.a,
+        &owner,
+        ReportEndpointStatusRequest {
+            sandbox_id,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("B must refuse a replica header that is not the token's pod");
+    assert_eq!(err.code(), Code::PermissionDenied, "{}", err.message());
+    assert_eq!(
+        err.message(),
+        "gateway peer replica does not match authenticated pod"
+    );
+}
+
+#[tokio::test]
+async fn peer_relay_rejects_requester_mismatch() {
+    let pki = Pki::new();
+    let replicas = two_replicas(&pki, Some("replica-a")).await;
+    let channel = build_peer_channel(
+        &replicas.b_endpoint,
+        &policy(
+            &pki.ca,
+            Some(PEER_SERVER_NAME),
+            Some((&pki.client_cert, &pki.client_key)),
+        ),
+    )
+    .await
+    .expect("A should reach B over TLS");
+    let mut client =
+        OpenShellClient::with_interceptor(channel, |mut request: tonic::Request<()>| {
+            request.metadata_mut().insert(
+                "authorization",
+                MetadataValue::from_static("Bearer peer-token-a"),
+            );
+            request.metadata_mut().insert(
+                "x-openshell-peer-replica",
+                MetadataValue::from_static("replica-a"),
+            );
+            Ok(request)
+        });
+    // Struct update keeps the literal compiling when PeerRelayInit gains fields.
+    #[allow(clippy::needless_update)]
+    let init = PeerRelayFrame {
+        payload: Some(peer_relay_frame::Payload::Init(PeerRelayInit {
+            sandbox_id: Uuid::new_v4().to_string(),
+            relay_open: Some(relay_open()),
+            requester_replica_id: "replica-other".to_string(),
+            ..Default::default()
+        })),
+    };
+
+    let err = client
+        .peer_relay(tokio_stream::iter([init]))
+        .await
+        .expect_err("B must refuse a requester that is not the authenticated replica");
+    assert_eq!(err.code(), Code::PermissionDenied, "{}", err.message());
+    assert_eq!(
+        err.message(),
+        "peer relay requester does not match authenticated gateway replica"
+    );
+}
+
+#[tokio::test]
+async fn peer_rpc_without_peer_identity_is_rejected_over_tls() {
+    let pki = Pki::new();
+    let replicas = two_replicas(&pki, None).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    let owner = publish_owner(&replicas.a, &sandbox_id, &replicas.b_endpoint).await;
+
+    let err = forward_endpoint_status_to_owner(
+        &replicas.a,
+        &owner,
+        ReportEndpointStatusRequest {
+            sandbox_id,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("a token that resolves to no peer must not reach B's handler");
+    // `InvalidArgument` would mean B's handler ran.
+    assert_eq!(err.code(), Code::Unauthenticated, "{}", err.message());
+}
+
+#[tokio::test]
+async fn routed_relay_fails_fast_on_plaintext_owner() {
+    let state = requester_state(PeerTransportPolicy::default()).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    publish_owner(&state, &sandbox_id, "http://10.255.255.1:9").await;
+
+    let started = Instant::now();
+    let err =
+        open_routed_relay_with_message(&state, &sandbox_id, relay_open(), Duration::from_secs(15))
+            .await
+            .expect_err("the local policy refuses plaintext owners");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a local refusal must not wait for the session timeout: {elapsed:?}"
+    );
+    assert_eq!(err.code(), Code::FailedPrecondition, "{}", err.message());
+    assert!(
+        err.message()
+            .starts_with("gateway peer transport refused a plaintext http:// peer endpoint"),
+        "{}",
+        err.message()
+    );
+}
+
+/// Only a LOCAL policy refusal fails fast: whatever code the remote owner
+/// returns, the relay keeps retrying until the session wait timeout.
+#[tokio::test]
+async fn routed_relay_retries_remote_failed_precondition() {
+    let state = requester_state(PeerTransportPolicy::default()).await;
+    let (endpoint, requests) = spawn_h2c_fake_owner(Code::FailedPrecondition).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    publish_owner(&state, &sandbox_id, &endpoint).await;
+
+    let started = Instant::now();
+    let err =
+        open_routed_relay_with_message(&state, &sandbox_id, relay_open(), Duration::from_secs(2))
+            .await
+            .expect_err("the fake owner refuses every relay");
+    let elapsed = started.elapsed();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    // The loop sleeps 1.5 s in total before it gives up; a fail-fast returns
+    // in milliseconds.
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "a remote refusal must be retried: {elapsed:?}"
+    );
+    assert!(
+        requests.load(Ordering::SeqCst) >= 2,
+        "the relay must reach the remote owner more than once"
+    );
+}
+
+/// A missing peer token is also `FailedPrecondition`, but it is not a
+/// transport policy refusal, so the relay keeps retrying as before.
+#[tokio::test]
+async fn routed_relay_retries_when_peer_token_is_missing() {
+    // Only meaningful where no projected peer token exists, as on any host
+    // outside a gateway pod.
+    if crate::auth::peer::peer_service_account_token_file_from_env().is_some() {
+        return;
+    }
+    let state = requester_without_token(PeerTransportPolicy::default()).await;
+    let sandbox_id = Uuid::new_v4().to_string();
+    let endpoint = format!("http://127.0.0.1:{}", closed_local_port());
+    publish_owner(&state, &sandbox_id, &endpoint).await;
+
+    let started = Instant::now();
+    let err =
+        open_routed_relay_with_message(&state, &sandbox_id, relay_open(), Duration::from_secs(2))
+            .await
+            .expect_err("no peer token is configured");
+    let elapsed = started.elapsed();
+    assert_eq!(err.code(), Code::Unavailable, "{}", err.message());
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "a missing token must be retried: {elapsed:?}"
+    );
 }

@@ -137,6 +137,18 @@ impl PeerTransportPolicy {
         self.check_dial_with(endpoint, cfg!(test))
     }
 
+    /// `check_dial` plus the https settings every dial needs: a peer CA and,
+    /// if configured, a complete client identity. A refusal here means no
+    /// dial to `endpoint` can succeed under this policy. No I/O.
+    pub fn preflight(&self, endpoint: &str) -> std::result::Result<PeerDialScheme, Status> {
+        let scheme = self.check_dial(endpoint)?;
+        if scheme == PeerDialScheme::Https {
+            self.tls.identity_files()?;
+            self.tls.require_ca_file()?;
+        }
+        Ok(scheme)
+    }
+
     fn check_dial_with(
         &self,
         endpoint: &str,

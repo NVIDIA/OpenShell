@@ -224,6 +224,21 @@ impl PeerRouteCache {
         }
     }
 
+    /// True when the local transport policy refuses `endpoint` outright, so
+    /// no retry can reach it. Pure string and path checks; never dials.
+    fn refuses_dial(&self, endpoint: &str) -> bool {
+        self.transport.preflight(endpoint).is_err()
+    }
+
+    /// Seeds the peer token so tests never set process env.
+    #[cfg(test)]
+    pub(crate) fn set_peer_token_for_test(&self, token: &str) {
+        *self.token.lock().unwrap() = Some(CachedPeerToken {
+            token: token.to_string(),
+            refresh_at: Instant::now() + PEER_TOKEN_CACHE_TTL,
+        });
+    }
+
     /// Cloning a `Channel` shares the existing connection, so concurrent relays
     /// to the same peer multiplex as HTTP/2 streams instead of dialing again.
     /// Only `build_peer_channel` fills the cache, under the same immutable
@@ -1709,6 +1724,22 @@ pub async fn open_routed_relay_with_message(
                 .await
                 {
                     Ok(relay) => return Ok(relay),
+                    // The local transport policy refuses this owner endpoint
+                    // (plaintext without the opt-out, bad scheme, missing peer CA
+                    // or half-configured identity). Retrying cannot fix local
+                    // configuration, so fail now. Keyed on the immutable local
+                    // policy, never on the status code a remote peer returned.
+                    Err(status) if state.peer_routes.refuses_dial(&owner.owner_peer_endpoint) => {
+                        warn!(
+                            sandbox_id,
+                            owner_replica_id = %owner.owner_replica_id,
+                            owner_peer_endpoint = %owner.owner_peer_endpoint,
+                            error = %status,
+                            "gateway peer owner relay refused by local peer transport policy"
+                        );
+                        state.peer_routes.evict_owner(sandbox_id);
+                        return Err(status);
+                    }
                     Err(status) => {
                         warn!(
                             sandbox_id,
