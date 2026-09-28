@@ -869,30 +869,7 @@ async fn discover_existing_provider_data(
     Ok(discovered)
 }
 
-/// Canonical provider type string for Google Vertex AI.
-const VERTEX_AI_PROVIDER_TYPE: &str = "google-vertex-ai";
-
-/// Canonical provider type string for Google Cloud (GCP APIs).
-const GOOGLE_CLOUD_PROVIDER_TYPE: &str = "google-cloud";
-
 fn missing_credentials_error(provider_type: &str) -> miette::Report {
-    if provider_type == VERTEX_AI_PROVIDER_TYPE {
-        return miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
-             GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
-             or use --from-gcloud-adc or --from-existing with those env vars set."
-        );
-    }
-
-    if provider_type == GOOGLE_CLOUD_PROVIDER_TYPE {
-        return miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Set GCP_ADC_ACCESS_TOKEN or GCP_SA_ACCESS_TOKEN; \
-             or use --from-gcloud-adc / --from-existing with those env vars set."
-        );
-    }
-
     miette::miette!(
         "no credentials resolved for provider type '{provider_type}'. \
          Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, or --from-existing \

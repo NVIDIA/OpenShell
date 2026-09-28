@@ -972,6 +972,51 @@ mod tests {
     }
 
     #[test]
+    fn environment_profile_fingerprints_survive_storage_round_trips() {
+        let profile = openshell_providers::example_profiles::load("google-vertex-ai").to_proto();
+        let encoded = profile.encode_to_vec();
+        let revision = profile_snapshot_revision(std::slice::from_ref(&profile));
+        let fingerprint = |profile| {
+            let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "external/test".to_string(),
+                revision: "same-revision".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile,
+                }],
+                user_managed: false,
+                allow_empty: false,
+            }])
+            .expect("valid environment profile");
+            let mut hash = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("google-vertex-ai", "", &mut hash);
+            hash.finalize()
+        };
+        let original_fingerprint = fingerprint(profile.clone());
+        for _ in 0..16 {
+            let decoded = ProviderProfile::decode(encoded.as_slice()).unwrap();
+            assert_eq!(
+                profile_snapshot_revision(std::slice::from_ref(&decoded)),
+                revision
+            );
+            assert_eq!(fingerprint(decoded), original_fingerprint);
+        }
+
+        let mut changed = profile;
+        changed
+            .environment
+            .as_mut()
+            .unwrap()
+            .fixed
+            .insert("GOOSE_PROVIDER".to_string(), "custom_vertex".to_string());
+        assert_ne!(
+            profile_snapshot_revision(std::slice::from_ref(&changed)),
+            revision
+        );
+        assert_ne!(fingerprint(changed), original_fingerprint);
+    }
+
+    #[test]
     fn equivalent_mcp_version_order_produces_identical_source_profile_fingerprints() {
         let catalog = |versions: &[&str]| {
             build_effective_profiles(vec![CollectedProviderProfileSnapshot {

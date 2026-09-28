@@ -26,15 +26,25 @@ type ProviderProfile struct {
 	Category    ProfileCategory
 	Credentials []ProfileCredential
 	// Files is EXPERIMENTAL. This API and its behavior may change or be removed.
-	Files            []ProfileFile
-	Endpoints        []NetworkEndpoint
-	Binaries         []NetworkBinary
-	InferenceCapable bool
-	Discovery        ProfileDiscovery
-	ResourceVersion  uint64
-	Annotations      map[string]string
-	Source           string
-	Scope            string
+	Files                   []ProfileFile
+	Endpoints               []NetworkEndpoint
+	Binaries                []NetworkBinary
+	InferenceCapable        bool
+	Discovery               ProfileDiscovery
+	ResourceVersion         uint64
+	Annotations             map[string]string
+	Source                  string
+	Scope                   string
+	Environment             *ProfileEnvironment
+	RequiredPlatformAdapter string
+}
+
+// ProfileEnvironment declares non-secret workload environment defaults.
+type ProfileEnvironment struct {
+	// Config maps destination environment keys to provider config keys.
+	Config map[string]string
+	// Fixed maps destination environment keys to literal values.
+	Fixed map[string]string
 }
 
 // ProfileFile declares non-secret content served at a virtual sandbox path.
@@ -149,7 +159,8 @@ type NetworkBinary struct {
 
 // ProfileDiscovery holds local discovery configuration for a profile.
 type ProfileDiscovery struct {
-	Credentials []string
+	Credentials   []string
+	ConfigEnvVars []string
 }
 
 // ProfileImportItem is an item submitted for profile import or lint validation.

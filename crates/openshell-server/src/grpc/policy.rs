@@ -3580,6 +3580,21 @@ pub(super) async fn load_sandbox_provider_environment(
         )
         .await?;
 
+    // Sandbox template and spec values are caller-owned. Drop only non-secret
+    // profile defaults for those keys before sending the snapshot to either
+    // the canonical process or later execs. Credential keys keep their
+    // existing binding and placeholder precedence.
+    let caller_has_key = |key: &str| {
+        spec.environment.contains_key(key)
+            || spec
+                .template
+                .as_ref()
+                .is_some_and(|template| template.environment.contains_key(key))
+    };
+    provider_environment.environment.retain(|key, _| {
+        provider_environment.static_credential_keys.contains(key) || !caller_has_key(key)
+    });
+
     let mut readiness_reason = provider_environment.readiness_reason;
 
     if supports_static_credential_bindings {
@@ -11478,6 +11493,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -11585,6 +11601,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -11644,6 +11661,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await
@@ -12802,6 +12820,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             }
         }
@@ -13089,6 +13108,74 @@ mod tests {
                 .get("/run/openshell/providers/work-config/client.toml"),
             Some(&"endpoint = 'https://config.example'".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn caller_environment_wins_over_non_secret_profile_defaults_only() {
+        let state = test_server_state().await;
+        let mut profile = openshell_providers::example_profiles::load("github");
+        profile.id = "declared-env".to_string();
+        profile
+            .environment
+            .config
+            .insert("CUSTOM_PROJECT".to_string(), "project".to_string());
+        profile
+            .environment
+            .fixed
+            .insert("CUSTOM_MODE".to_string(), "native".to_string());
+        profile
+            .environment
+            .fixed
+            .insert("CUSTOM_UNSET".to_string(), "default".to_string());
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile.to_proto(),
+            ))
+            .await
+            .unwrap();
+
+        let mut provider = test_provider("work-env", "declared-env");
+        provider
+            .config
+            .insert("project".to_string(), "profile-project".to_string());
+        state.store.put_message(&provider).await.unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-caller-env",
+            "caller-env",
+            ProtoSandboxPolicy::default(),
+            vec!["work-env".to_string()],
+        );
+        let spec = sandbox.spec.as_mut().unwrap();
+        spec.environment
+            .insert("CUSTOM_PROJECT".to_string(), "caller-project".to_string());
+        spec.environment
+            .insert("GITHUB_TOKEN".to_string(), "caller-token".to_string());
+        spec.template
+            .get_or_insert_with(Default::default)
+            .environment
+            .insert("CUSTOM_MODE".to_string(), String::new());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let snapshot = load_sandbox_provider_environment(&state, &sandbox, true)
+            .await
+            .unwrap();
+        assert!(!snapshot.environment.contains_key("CUSTOM_PROJECT"));
+        assert!(!snapshot.environment.contains_key("CUSTOM_MODE"));
+        assert_eq!(
+            snapshot.environment.get("CUSTOM_UNSET").map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            snapshot.environment.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp-test")
+        );
+        assert!(
+            snapshot
+                .static_credential_bindings
+                .contains_key("GITHUB_TOKEN")
+        );
+        assert_eq!(snapshot.non_secret_environment_keys, ["CUSTOM_UNSET"]);
     }
 
     #[tokio::test]
@@ -14018,6 +14105,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             }
         }
@@ -14354,6 +14442,7 @@ mod tests {
                         discovery: None,
                         source: String::new(),
                         scope: String::new(),
+                        ..Default::default()
                     }),
                 }],
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -18469,6 +18558,7 @@ mod tests {
                     discovery: None,
                     source: String::new(),
                     scope: String::new(),
+                    ..Default::default()
                 }),
             })
             .await

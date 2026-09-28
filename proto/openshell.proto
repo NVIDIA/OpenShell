@@ -2382,6 +2382,17 @@ message ProviderCredentialRefreshStatus {
 message ProviderProfileDiscovery {
   // Credential names from ProviderProfile.credentials eligible for local discovery.
   repeated string credentials = 1;
+  // Non-secret environment keys copied into provider config under the same key.
+  repeated string config_env_vars = 2;
+}
+
+// Bounded, non-secret environment defaults. Existing workload values win.
+// Values are literal strings; interpolation and scripts are not supported.
+message ProviderProfileEnvironment {
+  // Destination environment key -> provider config key. Blank config is skipped.
+  map<string, string> config = 1;
+  // Destination environment key -> literal non-secret value.
+  map<string, string> fixed = 2;
 }
 
 message GetProviderRefreshStatusRequest {
@@ -2472,13 +2483,13 @@ message ProviderProfile {
   repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
   bool inference_capable = 8;
   ProviderProfileDiscovery discovery = 9;
-  // Storage resource version for custom profiles. Built-in profiles and new
-  // profile files use 0. Gateway responses set this for stored custom profiles.
+  // Storage resource version. New profile files use 0; gateway responses set
+  // this for stored profiles.
   // Update calls use this for optimistic concurrency.
   uint64 resource_version = 10;
   // Optional non-secret annotations attached by profile sources or importers.
   map<string, string> annotations = 11;
-  // Server-set provenance: "builtin", "user", or "interceptor/{name}".
+  // Server-set provenance: "user" or "interceptor/{name}".
   // Ignored on import/update payloads.
   string source = 12;
   // Server-set visibility: "platform", "workspace", or empty for
@@ -2487,6 +2498,11 @@ message ProviderProfile {
   // EXPERIMENTAL: Non-secret files rendered from provider configuration for the
   // workload. This API and its behavior may change or be removed.
   repeated ProviderProfileFile files = 14;
+  // Non-secret environment defaults declared by this profile.
+  ProviderProfileEnvironment environment = 15;
+  // Named runtime capability required by this profile. Empty requires none.
+  // Import and attachment reject requirements unavailable in this deployment.
+  string required_platform_adapter = 16;
 }
 
 // EXPERIMENTAL: Provider file templates may change or be removed.
