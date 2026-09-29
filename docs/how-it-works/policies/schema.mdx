@@ -404,19 +404,21 @@ Here, `tools/call` is the JSON-RPC method, and `search_web` is the tool name in 
 
 #### Core MCP Methods
 
-The following list covers client-to-server requests and notifications, which OpenShell inspects. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that recognize those methods in the client-to-server direction.
+The following list covers client-to-server requests and notifications that OpenShell inspects over HTTP. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that accept those methods over HTTP in the client-to-server direction.
 
 | Methods or notifications | MCP revisions |
 |---|---|
 | `tools/list`, `tools/call` | All supported revisions. |
 | `resources/list`, `resources/templates/list`, `resources/read` | All supported revisions. |
 | `prompts/list`, `prompts/get`, `completion/complete` | All supported revisions. |
-| `notifications/cancelled` | All supported revisions. |
+| `notifications/cancelled` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
 | `initialize`, `ping`, `logging/setLevel` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
 | `resources/subscribe`, `resources/unsubscribe` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
 | `notifications/initialized`, `notifications/progress`, `notifications/roots/list_changed` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
 | `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`, `notifications/tasks/status` | `2025-11-25` only; experimental. |
 | `server/discover`, `subscriptions/listen` | `2026-07-28` only. |
+
+For `2026-07-28` HTTP requests, cancel a request by closing its response stream. OpenShell rejects `notifications/cancelled` over HTTP in that revision.
 
 MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
 
