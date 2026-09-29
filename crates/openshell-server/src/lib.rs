@@ -54,6 +54,12 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
+use axum::Router;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -859,17 +865,38 @@ pub(crate) async fn run_server(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
             ))
         })?;
-        info!(address = %metrics_bind_address, "Metrics server listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
+        if let Some(metrics_tls) = &config.metrics_tls {
+            let metrics_tls_acceptor = TlsAcceptor::from_files(
+                &metrics_tls.cert_path,
+                &metrics_tls.key_path,
+                metrics_tls.client_ca_path.as_deref(),
+                metrics_tls.require_client_auth,
+                None,
+                None,
+                Vec::new(),
+            )?;
+            metrics_tls_acceptor.spawn_reload_worker(shutdown_rx.clone());
+
+            info!(address = %metrics_bind_address, "Metrics TLS server listening");
+            tokio::spawn(serve_tls_metrics_listener(
                 metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
-                error!("Metrics server error: {e}");
-            }
-        });
+                metrics_router(prometheus_handle),
+                metrics_tls_acceptor,
+                shutdown_rx.clone(),
+            ));
+        } else {
+            info!(address = %metrics_bind_address, "Metrics server listening");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(
+                    metrics_listener,
+                    metrics_router(prometheus_handle).into_make_service(),
+                )
+                .await
+                {
+                    error!("Metrics server error: {e}");
+                }
+            });
+        }
     } else {
         info!("Metrics server disabled");
     }
@@ -980,6 +1007,68 @@ pub(crate) async fn run_server(
     session_cleanup.map_err(Error::execution)?;
 
     Ok(())
+}
+
+/// Serve the metrics endpoint through a dedicated TLS listener.
+///
+/// This listener exists only when `metrics_tls` is configured. The default
+/// metrics listener remains plaintext for backwards compatibility.
+async fn serve_tls_metrics_listener(
+    listener: TcpListener,
+    router: Router,
+    tls_acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(error = %error, "Failed to accept metrics connection");
+                continue;
+            }
+        };
+        set_tcp_nodelay_best_effort(&stream);
+
+        let acceptor = tls_acceptor.clone();
+        let service = TowerToHyperService::new(router.clone());
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
+                .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    if let Err(error) = Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
+                        .await
+                    {
+                        if is_benign_connection_close(error.as_ref()) {
+                            debug!(error = %error, client = %addr, "Metrics connection closed");
+                        } else {
+                            error!(error = %error, client = %addr, "Metrics connection error");
+                        }
+                    }
+                }
+                Ok(Err(error)) if is_benign_tls_handshake_failure(&error) => {
+                    debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
+                }
+                Ok(Err(error)) => {
+                    error!(error = %error, client = %addr, "Metrics TLS handshake failed");
+                }
+                Err(_) => {
+                    warn!(client = %addr, "Metrics TLS handshake timed out");
+                }
+            }
+        });
+    }
 }
 
 async fn serve_gateway_listener(
@@ -1852,14 +1941,17 @@ mod tests {
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
         extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener, validate_peer_endpoint_scheme,
+        serve_gateway_listener, serve_tls_metrics_listener, validate_peer_endpoint_scheme,
     };
+    use axum::{Router, routing::get};
     use openshell_core::{
         Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
-    use std::io::{Error, ErrorKind};
+    use std::fs::File;
+    use std::io::{BufReader, Error, ErrorKind};
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1869,6 +1961,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
+    use tokio_rustls::TlsConnector;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
     use axum::body::Body;
@@ -1885,6 +1978,22 @@ mod tests {
             external_key_path: None,
             external_server_names: Vec::new(),
         }))
+    }
+
+    fn test_tls_connector(ca_path: &Path) -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let file = File::open(ca_path).expect("failed to open test CA certificate");
+        for certificate in rustls_pemfile::certs(&mut BufReader::new(file)) {
+            roots
+                .add(certificate.expect("failed to parse test CA certificate"))
+                .expect("failed to add test CA certificate");
+        }
+
+        TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ))
     }
 
     #[test]
@@ -2229,6 +2338,75 @@ mod tests {
     async fn stop_listener(shutdown: watch::Sender<bool>, handle: tokio::task::JoinHandle<()>) {
         let _ = shutdown.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn tls_metrics_listener_serves_https_and_rejects_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (tls_dir, tls_acceptor) = test_tls_acceptor();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"));
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect to metrics listener");
+        let mut tls_stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics TLS handshake failed");
+        tls_stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics over TLS");
+        let mut response = Vec::new();
+        tls_stream
+            .read_to_end(&mut response)
+            .await
+            .expect("failed to read metrics TLS response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "expected a successful HTTPS metrics response"
+        );
+
+        let mut plaintext = TcpStream::connect(address)
+            .await
+            .expect("failed to connect for plaintext request");
+        plaintext
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to write plaintext metrics request");
+        let mut plaintext_response = Vec::new();
+        let plaintext_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            plaintext.read_to_end(&mut plaintext_response),
+        )
+        .await
+        .expect("timed out waiting for plaintext metrics connection to close");
+        if let Err(error) = plaintext_result {
+            assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+        }
+        assert!(
+            !String::from_utf8_lossy(&plaintext_response).starts_with("HTTP/"),
+            "TLS metrics listener must not serve plaintext HTTP"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
     }
 
     #[test]
