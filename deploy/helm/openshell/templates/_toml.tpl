@@ -315,6 +315,17 @@ boundary from the gateway listener so its client CA can stay independent. */}}
 {{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
 {{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}
 {{- end -}}
+{{- $gatewayClientCaSecretName := "" -}}
+{{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" -}}
+{{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.certSecretName -}}
+{{- else -}}
+{{- $gatewayClientCaSecretName = .Values.server.tls.clientCaSecretName -}}
+{{- end -}}
+{{- end -}}
+{{- if and (get $metricsTls "clientCaSecretName") (eq (get $metricsTls "clientCaSecretName") $gatewayClientCaSecretName) -}}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" -}}
+{{- end -}}
 {{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
 {{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}
 {{- $_ := set $metricsTlsConfig "key_path" "/etc/openshell-metrics/server/tls.key" -}}

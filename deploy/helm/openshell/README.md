@@ -478,7 +478,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
 | metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
-| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. Required when requireClientCert is true. |
+| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. Required when requireClientCert is true. |
 | metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
 | metrics.tls.requireClientCert | bool | `false` | Require a client certificate signed by clientCaSecretName to scrape metrics. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
