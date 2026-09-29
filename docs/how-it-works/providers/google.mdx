@@ -218,6 +218,14 @@ endpoints by default. You must add endpoint rules to your sandbox policy
 for each GCP API the sandbox needs to reach. See "Using with GCP APIs"
 above for an example.
 
+For a client that accepts bearer-token authentication directly, you can author
+a [provider profile](/how-it-works/providers/profiles) with the needed Google
+API endpoints, client `binaries`, project and region defaults, and an ADC or
+service-account refresh strategy. Configure refresh on the provider and send
+the token placeholder in an `Authorization: Bearer` header. If the profile has
+no endpoints, bind the attached provider to each allowed host in the
+[sandbox policy](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
+
 ## Vertex AI
 
 The `google-vertex-ai` provider gives selected sandboxes access to native
@@ -237,11 +245,23 @@ native Vertex endpoint and request format for its selected model.
 
 ### Create a Vertex AI Provider
 
-Import the `google-vertex-ai` profile first:
+Copy the example profile and set its top-level `binaries` to the absolute paths
+of the clients that will call Vertex AI from your sandbox image. The example
+declares no binaries, so importing it unchanged does not authorize a client.
+For a Claude Code installation, use the resolved executable path inside the
+image; `command -v claude` may return a symlink to a versioned binary. Include
+the path to `curl` if you plan to use the native API example below.
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml --global
+curl -fsSLo google-vertex-ai.yaml https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml
+# Edit google-vertex-ai.yaml and add, for example:
+# binaries: [/usr/bin/curl, /path/to/resolved/claude]
+openshell profile lint -f google-vertex-ai.yaml
+openshell profile import -f google-vertex-ai.yaml --global
 ```
+
+To find the resolved path, run `readlink -f "$(command -v claude)"` inside the
+image.
 
 #### Service Account Key
 
@@ -251,6 +271,7 @@ Create the provider for runtime credentials:
 openshell provider create \
   --name vertex-prod \
   --type google-vertex-ai \
+  --global-profile \
   --runtime-credentials \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
@@ -290,6 +311,7 @@ gcloud auth application-default login
 openshell provider create \
   --name vertex-local \
   --type google-vertex-ai \
+  --global-profile \
   --from-gcloud-adc \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
@@ -330,6 +352,35 @@ openshell sandbox provider attach vertex-agent vertex-local
 Launch a new process after runtime attachment so it receives the provider
 environment. Existing processes do not gain newly attached environment
 variables.
+
+### Run Claude Code with Vertex AI
+
+Use an image with Claude Code installed and include its resolved executable
+path in the imported profile's `binaries`. After attaching the provider, start
+an interactive shell:
+
+```shell
+openshell sandbox connect vertex-agent
+```
+
+Then start Claude Code inside the sandbox:
+
+```shell
+vertex_token=${GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN:-${GOOGLE_VERTEX_AI_TOKEN:-}}
+test -n "$vertex_token" || { echo "Vertex token unavailable" >&2; exit 1; }
+ANTHROPIC_AUTH_TOKEN="$vertex_token" \
+  CLAUDE_CODE_USE_VERTEX=1 \
+  CLAUDE_CODE_SKIP_VERTEX_AUTH=1 \
+  claude
+```
+
+Run these commands in the sandbox shell so the token comes from the attached
+provider. The project and region variables come from the profile. Claude Code
+uses `ANTHROPIC_AUTH_TOKEN` for the bearer Authorization header and
+`CLAUDE_CODE_SKIP_VERTEX_AUTH=1` to skip its own Google credential lookup.
+OpenShell replaces the token placeholder on authorized Vertex requests. See
+[Claude Code's gateway authentication settings](https://docs.anthropic.com/en/docs/claude-code/llm-gateway)
+for the client environment variables.
 
 ### Call the Native Vertex API
 
@@ -380,8 +431,13 @@ Common failures:
   provider profile's endpoint binding.
 - A Vertex 400 or 404 usually means the model, location, publisher path, or
   request body does not match the native API.
-- A Vertex 401 or 403 can indicate an expired refresh grant or missing GCP IAM
-  permission. Check `provider refresh status` and the Vertex AI User role.
+- A Vertex 401 with `CREDENTIALS_MISSING` means the request reached Google
+  without a usable Authorization header. For Claude Code, pass the provider
+  token through `ANTHROPIC_AUTH_TOKEN` as shown above; setting only
+  `CLAUDE_CODE_SKIP_VERTEX_AUTH=1` leaves the request unauthenticated.
+- Other 401 responses can indicate an expired refresh grant. Check
+  `provider refresh status`. A 403 can indicate missing GCP IAM permission or
+  model access; check the Vertex AI User role and access to the selected model.
 
 Provider creation does not verify model access. The native request is the
 end-to-end check.
