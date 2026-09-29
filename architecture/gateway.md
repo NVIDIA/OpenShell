@@ -66,6 +66,8 @@ it does not establish that a mutation is safe to repeat. SDKs retain the origina
 transport status, metadata, and unknown details alongside decoded fields.
 SDK deletion waits recognize missing-resource status through typed error wrappers
 without suppressing other failures.
+TypeScript exec streams expose the command exit only after consuming the final
+RPC status, so stopping at the exit event cannot hide a transport failure.
 
 Ordinary user-callable unary mutations explicitly opt into durable request
 admission when the client supplies a UUID. Typed adapters

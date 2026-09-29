@@ -197,6 +197,44 @@ describe('exec / execStream', () => {
     expect(result.stdout.toString()).toBe('boom');
   });
 
+  it('checks the terminal RPC status before exposing exit to a caller that stops there', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+        throw new ConnectError('relay failed', Code.Unavailable);
+      },
+    });
+
+    const output: string[] = [];
+    await expect(
+      (async () => {
+        for await (const event of sandbox.execStream('sb', ['x'])) {
+          if ('type' in event) break;
+          output.push(event.data.toString());
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'rpc', connectCode: Code.Unavailable });
+    expect(output).toEqual(['partial']);
+  });
+
+  it.each(['stdout', 'exit'] as const)('rejects %s received after an exit event', async (payloadCase) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+        if (payloadCase === 'stdout') {
+          yield { payload: { case: 'stdout', value: { data: enc('too late') } } };
+        } else {
+          yield { payload: { case: 'exit', value: { exitCode: 7 } } };
+        }
+      },
+    });
+
+    await expect(sandbox.exec('sb', ['x'])).rejects.toMatchObject({ code: 'rpc' });
+  });
+
   it('execStream throws when the stream ends without an exit event', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),

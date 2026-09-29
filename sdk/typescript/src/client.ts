@@ -1184,8 +1184,11 @@ export class SandboxClient {
         { signal: options?.signal },
       );
 
-      let sawExit = false;
+      let exitCode: number | undefined;
       for await (const event of stream) {
+        if (exitCode !== undefined) {
+          throw new SdkError('rpc', 'ExecSandbox received an event after exit');
+        }
         switch (event.payload.case) {
           case 'stdout':
             yield {
@@ -1200,12 +1203,13 @@ export class SandboxClient {
             };
             break;
           case 'exit':
-            sawExit = true;
-            yield { type: 'exit', exitCode: event.payload.value.exitCode };
+            exitCode = event.payload.value.exitCode;
             break;
         }
       }
-      if (!sawExit) throw new SdkError('rpc', 'ExecSandbox stream ended without an exit event');
+      if (exitCode === undefined) throw new SdkError('rpc', 'ExecSandbox stream ended without an exit event');
+      // Consume the final RPC status before callers can stop at the exit event.
+      yield { type: 'exit', exitCode };
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
