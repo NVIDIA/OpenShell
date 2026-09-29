@@ -129,6 +129,8 @@ navigation:
     path: sdk/api-errors.mdx
   - page: "Protobuf Time Types"
     path: sdk/protobuf-time-types.mdx
+   - page: "Forwarding Stream Lifecycle"
+     path: reference/stream-lifecycle.mdx
 - folder: security
   title: "Security"
 - section: "Upgrade Guides"

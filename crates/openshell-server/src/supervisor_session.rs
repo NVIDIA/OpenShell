@@ -867,6 +867,23 @@ impl SupervisorSessionRegistry {
         {
             return false;
         }
+        // Keep the session lock through cancellation so a concurrent claim
+        // cannot move the channel from pending to active between these checks.
+        {
+            let mut pending = self.pending_relays.lock().unwrap();
+            if let Some(relay) = pending.get(&close.channel_id) {
+                if relay.sandbox_id != sandbox_id {
+                    return false;
+                }
+                let relay = pending
+                    .remove(&close.channel_id)
+                    .expect("pending relay existed before removal");
+                let _ = relay
+                    .sender
+                    .send(Err(stream_lifecycle::close_status(close)));
+                return true;
+            }
+        }
         let active = self.active_relays.lock().unwrap();
         let Some(relay) = active
             .get(&close.channel_id)
@@ -3060,6 +3077,112 @@ mod tests {
         assert!(!registry.abort_relay("sbx-test", "replacement", &close));
         drop(claimed);
         assert!(registry.active_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_close_before_claim_reports_error_and_releases_capacity() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register("sbx-test".into(), "current".into(), tx, make_shutdown());
+        {
+            let mut pending = registry.pending_relays.lock().unwrap();
+            for i in 0..MAX_PENDING_RELAYS_PER_SANDBOX - 1 {
+                let (sender, _) = oneshot::channel();
+                pending.insert(
+                    format!("channel-{i}"),
+                    pending_relay("sbx-test", sender, Instant::now()),
+                );
+            }
+        }
+        let (channel_id, mut relay_rx) = registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .open_relay("sbx-test", Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+
+        let close = stream_lifecycle::close_message(
+            channel_id.clone(),
+            &Status::deadline_exceeded("relay setup failed"),
+        );
+        assert!(registry.abort_relay("sbx-test", "current", &close));
+        let error = relay_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(error.message(), "relay setup failed");
+        assert!(
+            !registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id)
+        );
+        assert_eq!(
+            registry
+                .claim_relay_for_session(
+                    &channel_id,
+                    Some(&sandbox_principal("sbx-test")),
+                    "current",
+                    true,
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+        assert!(!registry.abort_relay("sbx-test", "current", &close));
+        registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .expect("closing a pending relay should immediately free capacity");
+    }
+
+    #[tokio::test]
+    async fn typed_close_before_claim_requires_current_session_and_matching_sandbox() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register("sbx-test".into(), "old".into(), tx.clone(), make_shutdown());
+        let (channel_id, mut relay_rx) = registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .unwrap();
+        registry.register(
+            "sbx-test".into(),
+            "current".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        registry.register("other".into(), "other-session".into(), tx, make_shutdown());
+        let close = stream_lifecycle::close_message(
+            channel_id.clone(),
+            &Status::cancelled("relay setup cancelled"),
+        );
+
+        assert!(!registry.abort_relay("sbx-test", "old", &close));
+        assert!(!registry.abort_relay("other", "other-session", &close));
+        assert!(
+            registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id)
+        );
+        assert!(matches!(
+            relay_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Pending relays survive session replacement and can be replayed to
+        // the current session, which owns their cancellation before claim.
+        assert!(registry.abort_relay("sbx-test", "current", &close));
+        assert_eq!(
+            relay_rx.try_recv().unwrap().unwrap_err().code(),
+            tonic::Code::Cancelled
+        );
     }
 
     // ---- claim_relay: expiry, drop, wiring ----

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Forwarding Stream Lifecycle"
+slug: reference/stream-lifecycle
 description: "Directional closure, cancellation, and compatibility for TCP forwarding and supervisor relays."
 position: 12
 ---
@@ -27,6 +28,8 @@ Gateways also require downstream support before emitting response FIN. A `PeerRe
 ## Abort a relay
 
 `RelayClose` on `ConnectSupervisor` aborts a channel owned by that sandbox and supervisor session. Its typed code distinguishes `CANCELLED`, `DEADLINE_EXCEEDED`, `INVALID_ARGUMENT`, and `UNAVAILABLE`. Unknown or unspecified codes map to `UNAVAILABLE`; the human-readable reason is diagnostic.
+
+If the current supervisor session closes a channel before its relay stream is established, the gateway immediately reports the close status to the waiting caller and frees the pending relay slot.
 
 An abort interrupts blocked I/O and can discard buffered bytes. The first observed abort wins. The data stream's final status remains authoritative; a control message that arrives after completion cannot revise it. If a transport disconnect prevents delivery of the typed reason, the transport error remains the fallback.
 
