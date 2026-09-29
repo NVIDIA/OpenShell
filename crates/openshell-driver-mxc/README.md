@@ -168,6 +168,27 @@ The MXC credential handoff is also fixed at sandbox creation. The gateway reject
   `openshell.exe`. Diagnose executable blocks with event 3077 in the
   `Microsoft-Windows-CodeIntegrity/Operational` log.
 
+Place `wxc-exec.exe` in a regular directory outside any installed MSIX or
+`WindowsApps` package directory. A package directory's ACLs can prevent the
+gateway from starting the executable outside its package context, even when
+the same binary runs after it is copied elsewhere. If sandbox creation fails
+with `wxc-exec spawn failed: Access is denied. (os error 5)`, verify that
+`wxc_exec_path` points to the standalone copy.
+
+Before the first live `process_container` run, obtain `wxc-host-prep.exe` from
+the MXC binaries distribution and run this command once in an elevated
+PowerShell session:
+
+```powershell
+& "C:\path\to\wxc-host-prep.exe" prepare-system-drive
+```
+
+This command makes a persistent, host-wide ACL change that gives the
+AppContainer well-known SIDs the minimum access needed to inspect the system
+drive root. If `wxc-exec.exe` starts but the agent exits with
+`wxc-exec stderr: Access is denied.` or exit code 1, confirm that the elevated
+host-preparation command completed successfully.
+
 For off-box smoke tests against the in-process mock shim (no `wxc-exec`,
 no isolation session needed), set `OPENSHELL_MXC_MOCK_WXC=1`.
 

@@ -17,7 +17,18 @@ Prerequisites
   - openshell-gateway.exe and openshell.exe beside these files, or explicit
     -GatewayPath and -CliPath arguments.
   - wxc-exec.exe beside these files, on PATH, named by
-    OPENSHELL_WXC_EXEC_PATH, or passed with -WxcExecPath.
+    OPENSHELL_WXC_EXEC_PATH, or passed with -WxcExecPath. Use a standalone
+    copy in a regular directory. Do not use a copy from an installed MSIX or
+    WindowsApps package directory; its package ACLs can make CreateSandbox
+    fail with "wxc-exec spawn failed: Access is denied. (os error 5)".
+  - Before the first process_container run, obtain wxc-host-prep.exe from the
+    MXC binaries distribution. In an elevated PowerShell session, run this
+    one-time host setup command:
+      & "C:\path\to\wxc-host-prep.exe" prepare-system-drive
+    This makes a persistent, host-wide ACL change for the AppContainer
+    well-known SIDs. If wxc-exec starts but the agent exits with
+    "wxc-exec stderr: Access is denied." or exit code 1, confirm this command
+    completed successfully.
   - Local demo: an Ollama-compatible service on 127.0.0.1:11434 by default.
     Override -OllamaHost, -OllamaPort, and -Model when needed.
   - Cloud demo: NV_API_KEY and outbound HTTPS to integrate.api.nvidia.com.

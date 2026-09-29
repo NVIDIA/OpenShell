@@ -21,7 +21,16 @@ WHAT THIS PROVES / PRODUCES
     [2004] Detection Finding            - MXC setup activity errors (informational)
 
 PREREQUISITES (on this test box)
-  - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe)
+  - wxc-exec.exe present (default expected: C:\mxc-kit\bin\wxc-exec.exe).
+    Use a standalone copy in a regular directory, not a copy inside an
+    installed MSIX or WindowsApps package directory. If CreateSandbox reports
+    "wxc-exec spawn failed: Access is denied. (os error 5)", check this path.
+  - Before the first process_container run, obtain wxc-host-prep.exe from the
+    MXC binaries distribution and run this once in elevated PowerShell:
+      & "C:\path\to\wxc-host-prep.exe" prepare-system-drive
+    This makes a persistent, host-wide ACL change for the AppContainer
+    well-known SIDs. If the agent exits with "wxc-exec stderr: Access is
+    denied." or exit code 1, confirm this command completed successfully.
   - process_container backend live (it was for our earlier runs)
   - Run ELEVATED (Run as administrator) OR from an account in the
     'Performance Log Users' group. Opening the real-time ETW session needs this;
