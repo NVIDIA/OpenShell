@@ -10036,6 +10036,147 @@ network_policies:
         .await
     }
 
+    #[tokio::test]
+    async fn chunked_jsonrpc_family_pipeline_authorizes_each_request() {
+        for protocol in ["mcp", "json-rpc"] {
+            for route_selected in [false, true] {
+                for second_allowed in [false, true] {
+                    let rules = if protocol == "mcp" {
+                        "method: tools/call, tool: echo"
+                    } else {
+                        "method: echo"
+                    };
+                    let data = format!(
+                        r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: {protocol}
+        enforcement: enforce
+        rules:
+          - allow: {{ {rules} }}
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"
+                    );
+                    let (config, tunnel_engine, ctx) = mcp_relay_context_from_data(&data);
+                    let body = |id, name| {
+                        if protocol == "mcp" {
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                                "params": {"name": name, "arguments": {}}
+                            })
+                        } else {
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": name})
+                        }
+                        .to_string()
+                    };
+                    let first = body(1, "echo");
+                    let second = body(2, if second_allowed { "echo" } else { "blocked" });
+                    let mut wire = String::new();
+                    for body in [&first, &second] {
+                        write!(
+                            wire,
+                            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+                    let (mut relay_upstream, upstream) = tokio::io::duplex(8192);
+                    // Queue both requests before the relay reads. A normal
+                    // sequential exchange cannot expose chunked read-ahead loss.
+                    app.write_all(wire.as_bytes()).await.unwrap();
+                    app.shutdown().await.unwrap();
+                    let relay = async move {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    };
+                    let server = async move {
+                        let mut upstream = tokio::io::BufReader::new(upstream);
+                        let provider = crate::l7::rest::RestProvider::with_options(
+                            crate::l7::path::CanonicalizeOptions::default(),
+                        );
+                        let mut forwarded = Vec::new();
+                        while let Some(mut request) =
+                            provider.parse_request(&mut upstream).await.unwrap()
+                        {
+                            assert!(matches!(
+                                request.body_length,
+                                crate::l7::provider::BodyLength::ContentLength(_)
+                            ));
+                            let body = crate::l7::http::read_body_for_inspection(
+                                &mut upstream,
+                                &mut request,
+                                1024,
+                            )
+                            .await
+                            .unwrap();
+                            forwarded.push(String::from_utf8(body).unwrap());
+                            upstream
+                                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                        forwarded
+                    };
+                    let client = async move {
+                        let mut response = String::new();
+                        app.read_to_string(&mut response).await.unwrap();
+                        response
+                    };
+                    let (result, forwarded, response) = Box::pin(tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async { tokio::join!(relay, server, client) },
+                    ))
+                    .await
+                    .expect("pipelined requests must finish without losing a request");
+                    result.unwrap();
+                    let expected = if second_allowed {
+                        vec![first, second]
+                    } else {
+                        vec![first]
+                    };
+                    assert_eq!(
+                        forwarded, expected,
+                        "{protocol}, route_selected={route_selected}"
+                    );
+                    assert_eq!(
+                        response.matches("HTTP/1.1 204 No Content").count(),
+                        if second_allowed { 2 } else { 1 },
+                        "{response}"
+                    );
+                    assert_eq!(
+                        response.contains("403 Forbidden"),
+                        !second_allowed,
+                        "{response}"
+                    );
+                }
+            }
+        }
+    }
+
     async fn run_mcp_relay_case(
         context: (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
         route_selected: bool,
