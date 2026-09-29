@@ -50,7 +50,7 @@ that are not listed are inaccessible. When the effective policy has at least one
 network rule, OpenShell also adds the baseline paths described in [Default
 Policy](/how-it-works/policies/default-policy#baseline-filesystem-paths).
 
-These filesystem defaults also apply when the supervisor or standalone proxy loads local policy files directly. Local loading rejects invalid filesystem, Landlock, and process field types, unknown fields in those sections, and explicit `null` JSON-RPC or MCP options.
+These defaults and the filesystem path restrictions below also apply when the supervisor or standalone proxy loads local policy files directly. Local loading enforces the same non-root process identities as typed policy. It rejects invalid filesystem, Landlock, and process field types, unknown fields in those sections, and explicit `null` JSON-RPC or MCP options. Network settings must also use the declared types: for example, `allow_encoded_slash: "true"` and an array-valued deny-rule `method` are rejected. A rejected reload keeps the active OPA policy and its generation unchanged.
 
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.

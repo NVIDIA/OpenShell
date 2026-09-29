@@ -29,6 +29,8 @@ use std::sync::{
 use tokio::sync::watch;
 use tracing::info;
 
+mod raw_schema;
+
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
@@ -929,22 +931,24 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        // Query filesystem policy
+        // Evaluation errors can include authored Rego source. Regorus may
+        // evaluate other rules while resolving any one query, so report the
+        // static-settings operation without attributing it to a single rule.
         let fs_val = engine
             .eval_rule("data.openshell.sandbox.filesystem_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let filesystem = parse_filesystem_policy(&fs_val);
 
         // Query landlock policy
         let ll_val = engine
             .eval_rule("data.openshell.sandbox.landlock_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let landlock = parse_landlock_policy(&ll_val);
 
         // Query process policy
         let proc_val = engine
             .eval_rule("data.openshell.sandbox.process_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let process = parse_process_policy(&proc_val);
 
         Ok(SandboxConfig {
@@ -1493,6 +1497,13 @@ fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
     if let Some(filesystem) = data.get_mut("filesystem_policy") {
         let settings: AuthoredFilesystemPolicy = serde_json::from_value(filesystem.clone())
             .map_err(|_| miette::miette!("invalid filesystem policy settings"))?;
+        openshell_policy::validate_filesystem_paths(&settings.read_only, &settings.read_write)
+            .map_err(|violations| {
+                miette::miette!(render_bounded_validation_diagnostics(
+                    "invalid filesystem policy settings",
+                    violations.iter().map(redacted_policy_violation_category),
+                ))
+            })?;
         // A present stanza defaults to false; an absent stanza must stay absent
         // so Rego's undefined result retains the runtime workdir default.
         filesystem["include_workdir"] = settings.include_workdir.into();
@@ -1506,8 +1517,17 @@ fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
             .map_err(|_| miette::miette!("failed to serialize Landlock policy settings"))?;
     }
     if let Some(process) = data.get("process") {
-        serde_json::from_value::<AuthoredProcessPolicy>(process.clone())
+        let settings = serde_json::from_value::<AuthoredProcessPolicy>(process.clone())
             .map_err(|_| miette::miette!("invalid process policy settings"))?;
+        // Omitted identities are resolved by the compute runtime. Explicit
+        // values follow the same non-root identity contract as typed policy.
+        for identity in [&settings.run_as_user, &settings.run_as_group] {
+            if !identity.is_empty() && !openshell_policy::is_valid_sandbox_identity(identity) {
+                return Err(miette::miette!(
+                    "invalid process policy settings: invalid process identity"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1627,6 +1647,7 @@ fn preprocess_yaml_data(
         )
     })?;
     validate_opa_data_structure(&data)?;
+    raw_schema::validate_network_settings(&data)?;
     validate_opa_static_settings(&mut data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
     normalize_endpoint_protocols(&mut data);
@@ -4489,6 +4510,149 @@ process:
     }
 
     #[test]
+    fn raw_opa_network_leaves_reject_typed_schema_errors() {
+        let valid = opa_container_policy();
+        let mut accepted = Vec::new();
+        for (field, invalid, control) in [
+            (
+                "allow_encoded_slash",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            (
+                "websocket_credential_rewrite",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            ("port", serde_json::json!("443"), serde_json::json!(443)),
+            (
+                "deny_rules",
+                serde_json::json!([{"method": ["DELETE"], "path": "/admin/**"}]),
+                serde_json::json!([{"method": "DELETE", "path": "/admin/**"}]),
+            ),
+        ] {
+            let mut policy = valid.clone();
+            policy["version"] = 1.into();
+            policy["network_policies"]["admin"]["endpoints"][0][field] = control;
+            openshell_policy::parse_sandbox_policy(&policy.to_string()).expect("typed valid twin");
+            OpaEngine::from_strings(TEST_POLICY, &policy.to_string()).expect("raw valid twin");
+            policy["network_policies"]["admin"]["endpoints"][0][field] = invalid;
+            assert!(
+                openshell_policy::parse_sandbox_policy(&policy.to_string()).is_err(),
+                "typed {field}"
+            );
+            for versioned in [true, false] {
+                if !versioned {
+                    policy.as_object_mut().expect("object").remove("version");
+                }
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(format!("{field} (versioned={versioned})")),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"])
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted invalid network fields: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn raw_opa_static_semantics_match_typed_validation() {
+        let mut accepted = Vec::new();
+        for invalid in [
+            serde_json::json!({"process": {"run_as_user": "root"}}),
+            serde_json::json!({"process": {"run_as_group": "0"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967295"}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["/"]}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["///"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["relative-private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/tmp/../private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4096))]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 257]}}),
+        ] {
+            let mut versioned = invalid.clone();
+            versioned["version"] = 1.into();
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned.to_string()).map_or(
+                    true,
+                    |policy| openshell_policy::validate_sandbox_policy(&policy).is_err()
+                ),
+                "typed invalid static settings"
+            );
+            for policy in [&invalid, &versioned] {
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(invalid.clone()),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["root", "private-path", "4294967295"])
+                    }
+                }
+            }
+        }
+        for valid in [
+            serde_json::json!({"process": {}}),
+            serde_json::json!({"process": {"run_as_user": "sandbox", "run_as_group": "1"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967294", "run_as_group": "sandbox"}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/"], "read_write": ["/tmp"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 256]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4095))]}}),
+        ] {
+            let mut versioned = valid.clone();
+            versioned["version"] = 1.into();
+            let typed = openshell_policy::parse_sandbox_policy(&versioned.to_string())
+                .expect("typed static control");
+            openshell_policy::validate_sandbox_policy(&typed).expect("valid typed static settings");
+            for policy in [&valid, &versioned] {
+                OpaEngine::from_strings(TEST_POLICY, &policy.to_string())
+                    .expect("raw static control")
+                    .query_sandbox_config()
+                    .expect("static config");
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted {} invalid static policies",
+            accepted.len()
+        );
+    }
+
+    #[test]
+    fn startup_evaluation_errors_discard_authored_rego_and_sources() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("private-rules.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&data_path, "{}").expect("write data");
+        for rule in ["filesystem_policy", "landlock_policy", "process_policy"] {
+            for repetitions in [1, 20] {
+                let marker = "private-eval-marker-".repeat(repetitions);
+                let rules = format!(
+                    "package openshell.sandbox\n{rule} := {{\"value\": \"{marker}one\"}}\n{rule} := {{\"value\": \"{marker}two\"}}\n"
+                );
+                std::fs::write(&rules_path, &rules).expect("write conflicting rules");
+                for engine in [
+                    OpaEngine::from_strings(&rules, "{}").expect("conflict is an evaluation error"),
+                    OpaEngine::from_files(&rules_path, &data_path).expect("file rules compile"),
+                ] {
+                    let error = engine
+                        .query_sandbox_config()
+                        .err()
+                        .expect("conflicting complete rules must fail");
+                    assert_safe_load_error(
+                        &error,
+                        &["private-eval-marker", "private-rules.rego", "value"],
+                    );
+                    assert_eq!(
+                        error.to_string(),
+                        "failed to evaluate static sandbox settings"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn raw_opa_nested_validation_preserves_file_loads_and_rejected_reload() {
         let directory = tempfile::tempdir().expect("temporary policy directory");
         let rules_path = directory.path().join("policy.rego");
@@ -4527,6 +4691,19 @@ process:
                 serde_json::json!({"compatibility": "private-value-秘密".repeat(1024)}),
             ),
             ("/process", serde_json::json!({"run_as_user": 7})),
+            ("/process", serde_json::json!({"run_as_user": "root"})),
+            (
+                "/filesystem_policy",
+                serde_json::json!({"read_write": ["/"]}),
+            ),
+            (
+                "/network_policies/admin/endpoints/0/deny_rules/0/method",
+                serde_json::json!(["DELETE"]),
+            ),
+            (
+                "/network_policies/admin/binaries/0/path",
+                serde_json::json!(["/usr/bin/curl"]),
+            ),
         ] {
             let mut malformed = valid.clone();
             *malformed
