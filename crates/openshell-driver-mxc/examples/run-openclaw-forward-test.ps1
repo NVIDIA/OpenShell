@@ -137,6 +137,60 @@ function Copy-ItemRetry([string]$src, [string]$dst, [int]$attempts = 10, [int]$d
 function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host "[FAIL] $m" -ForegroundColor Red }
 
+# Build one CreateProcess-compatible command-line argument. Windows PowerShell
+# 5.1 removes embedded quotes and can split JSON values at embedded spaces when
+# invoking native commands through the call operator.
+function Quote-NativeArgument([string]$value) {
+  if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+
+  $quoted = New-Object System.Text.StringBuilder
+  [void]$quoted.Append('"')
+  $backslashes = 0
+  foreach ($ch in $value.ToCharArray()) {
+    if ($ch -eq '\') {
+      $backslashes++
+      continue
+    }
+    if ($ch -eq '"') {
+      [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+      [void]$quoted.Append('"')
+    } else {
+      if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
+      [void]$quoted.Append($ch)
+    }
+    $backslashes = 0
+  }
+  if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
+  [void]$quoted.Append('"')
+  return $quoted.ToString()
+}
+
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = $filePath
+  $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) { throw "failed to start $filePath" }
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+  $process.WaitForExit()
+  $output = @($stdout.Result, $stderr.Result) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    ForEach-Object { $_ -split "`r?`n" } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+  return @{
+    ExitCode = $process.ExitCode
+    Output = @($output)
+  }
+}
+
 function Grant-AppContainerWritableDirectory([string]$Path) {
   # AppContainer access is a dual check: the generated package SID grant from
   # MXC is necessary, but OpenClaw's SQLite staging also needs the two built-in
@@ -453,14 +507,14 @@ try {
     "--env", "NEMOCLAW_MXC_EGRESS_LOOPBACK_PORT=29999",
     "--no-tty", "--", "exit"
   )
-  # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects. Keep
-  # warnings in the captured diagnostic without letting them terminate the
-  # command before its real exit code and output are collected.
-  $createPrevEAP = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try { $createOut = & $cli @createArgs 2>&1; $createCode = $LASTEXITCODE }
-  catch { $createOut = $_.Exception.Message; $createCode = 1 }
-  finally { $ErrorActionPreference = $createPrevEAP }
+  try {
+    $createResult = Invoke-NativeCaptured $cli $createArgs
+    $createOut = $createResult.Output
+    $createCode = $createResult.ExitCode
+  } catch {
+    $createOut = $_.Exception.Message
+    $createCode = 1
+  }
   $createBenign = Show-SandboxCreate $createOut $SandboxName
   if ($createCode -ne 0 -and -not $createBenign) {
     throw "sandbox create '$SandboxName' failed (exit $createCode): $($createOut | Out-String)"
