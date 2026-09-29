@@ -25,10 +25,6 @@ on:
         required: false
         type: string
         default: ""
-      conformance-artifact-prefix:
-        required: false
-        type: string
-        default: ""
       suite-matrix:
         required: false
         type: string
@@ -71,8 +67,6 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e-cli
-        with:
-          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:

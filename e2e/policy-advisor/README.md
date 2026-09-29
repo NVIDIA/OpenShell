@@ -55,20 +55,16 @@ contents write on the repository. The test auto-resolves the token from
 
 ## Conformance coverage
 
-The `mechanistic-proposal` and `new-hostname-proposal` conformance scenarios
-check draft generation for a denied IP address and for a hostname absent from
-policy. The `policy-local` scenario uses `policy.local` to inspect policy, submit
-a narrow permission request, and read the resulting proposal. Run them against a configured gateway
-with `--openshell-bin` pointing to the CLI under test:
+The portable CLI conformance suite may include policy-related scenarios. The
+current coverage checks draft generation for denied IP addresses and hostnames
+absent from policy, plus sandbox-local policy inspection and permission
+requests through `policy.local`. See [TESTING.md](../../TESTING.md#rust-cli-e2e)
+for the supported source and installed-artifact test paths.
 
-```bash
-openshell-conformance run mechanistic-proposal new-hostname-proposal policy-local --openshell-bin target/debug/openshell
-```
-
-Run `openshell-conformance list` to see all scenario names. A manual
-`Integration Tests` workflow run can select the `policy-advisor` testsuite to
-run only these three scenarios against an installed candidate. Set
-`artifact-run-id` to the candidate build's workflow run ID and `test-matrix` to:
+A manual `Integration Tests` workflow run can select the `policy-advisor`
+testsuite to run the policy-related subset against an installed candidate. Set
+`artifact-run-id` to the candidate build's workflow run ID and `test-matrix`
+to:
 
 ```json
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
