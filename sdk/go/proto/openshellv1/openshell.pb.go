@@ -10067,7 +10067,8 @@ type ProviderProfile struct {
 	// Server-set visibility: "platform", "workspace", or empty for
 	// non-scoped sources. Ignored on import/update payloads.
 	Scope string `protobuf:"bytes,13,opt,name=scope,proto3" json:"scope,omitempty"`
-	// Non-secret files rendered from provider configuration for the workload.
+	// EXPERIMENTAL: Non-secret files rendered from provider configuration for the
+	// workload. This API and its behavior may change or be removed.
 	Files         []*ProviderProfileFile `protobuf:"bytes,14,rep,name=files,proto3" json:"files,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -10201,6 +10202,7 @@ func (x *ProviderProfile) GetFiles() []*ProviderProfileFile {
 	return nil
 }
 
+// EXPERIMENTAL: Provider file templates may change or be removed.
 type ProviderProfileFile struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// One virtual file name below /run/openshell/providers/<provider>/.

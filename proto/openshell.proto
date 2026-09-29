@@ -2480,10 +2480,12 @@ message ProviderProfile {
   // Server-set visibility: "platform", "workspace", or empty for
   // non-scoped sources. Ignored on import/update payloads.
   string scope = 13;
-  // Non-secret files rendered from provider configuration for the workload.
+  // EXPERIMENTAL: Non-secret files rendered from provider configuration for the
+  // workload. This API and its behavior may change or be removed.
   repeated ProviderProfileFile files = 14;
 }
 
+// EXPERIMENTAL: Provider file templates may change or be removed.
 message ProviderProfileFile {
   // One virtual file name below /run/openshell/providers/<provider>/.
   string path = 1;

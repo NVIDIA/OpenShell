@@ -697,6 +697,8 @@ pub struct ProviderTypeProfile {
     pub category: ProviderProfileCategory,
     #[serde(default)]
     pub credentials: Vec<CredentialProfile>,
+    /// EXPERIMENTAL: Non-secret files served to sandbox workloads on demand.
+    /// This API and its behavior may change or be removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<ProviderFileProfile>,
     #[serde(default)]
@@ -713,6 +715,7 @@ pub struct ProviderTypeProfile {
     pub scope: String,
 }
 
+/// EXPERIMENTAL: A non-secret provider file template. This API may change or be removed.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderFileProfile {
     pub path: String,

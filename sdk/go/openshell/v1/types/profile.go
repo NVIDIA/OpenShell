@@ -25,6 +25,7 @@ type ProviderProfile struct {
 	Description      string
 	Category         ProfileCategory
 	Credentials      []ProfileCredential
+	// Files is EXPERIMENTAL. This API and its behavior may change or be removed.
 	Files            []ProfileFile
 	Endpoints        []NetworkEndpoint
 	Binaries         []NetworkBinary
@@ -37,6 +38,7 @@ type ProviderProfile struct {
 }
 
 // ProfileFile declares non-secret content served at a virtual sandbox path.
+// EXPERIMENTAL: This API and its behavior may change or be removed.
 type ProfileFile struct {
 	Path    string
 	Content string
