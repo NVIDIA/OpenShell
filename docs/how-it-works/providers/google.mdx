@@ -248,20 +248,28 @@ native Vertex endpoint and request format for its selected model.
 Copy the example profile and set its top-level `binaries` to the absolute paths
 of the clients that will call Vertex AI from your sandbox image. The example
 declares no binaries, so importing it unchanged does not authorize a client.
-For a Claude Code installation, use the resolved executable path inside the
-image; `command -v claude` may return a symlink to a versioned binary. Include
-the path to `curl` if you plan to use the native API example below.
+For a native Claude Code installation, use the resolved executable path inside
+the image; `command -v claude` may return a symlink to a versioned binary. For
+an npm or other script installation, use the resolved Node.js interpreter path
+instead. OpenShell authorizes the executable and its trusted executable
+ancestors, not the script path from the process command line. Include the path
+to `curl` if you plan to use the native API example below.
 
 ```shell
 curl -fsSLo google-vertex-ai.yaml https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml
 # Edit google-vertex-ai.yaml and add, for example:
+# Native Claude Code:
 # binaries: [/usr/bin/curl, /path/to/resolved/claude]
+# npm-installed Claude Code:
+# binaries: [/usr/bin/curl, /path/to/resolved/node]
 openshell profile lint -f google-vertex-ai.yaml
 openshell profile import -f google-vertex-ai.yaml --global
 ```
 
-To find the resolved path, run `readlink -f "$(command -v claude)"` inside the
-image.
+For a native installation, find the resolved path with
+`readlink -f "$(command -v claude)"`. For an npm installation, find the Node.js
+interpreter with `readlink -f "$(command -v node)"`. Run the applicable command
+inside the image.
 
 #### Service Account Key
 
@@ -355,9 +363,10 @@ variables.
 
 ### Run Claude Code with Vertex AI
 
-Use an image with Claude Code installed and include its resolved executable
-path in the imported profile's `binaries`. After attaching the provider, start
-an interactive shell:
+Use an image with Claude Code installed. In the imported profile's `binaries`,
+include the resolved Claude executable for a native installation or the
+resolved Node.js interpreter for an npm installation. After attaching the
+provider, start an interactive shell:
 
 ```shell
 openshell sandbox connect vertex-agent
