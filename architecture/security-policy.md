@@ -107,16 +107,7 @@ unattached, profileless, endpointful, and gateway-global uses of that policy
 binding. Policy endpoint changes rotate the provider-environment revision so
 the supervisor installs policy and credential binding snapshots atomically.
 
-Raw streams and long-lived response bodies are connection scoped. Policy
-generation changes close relays pinned to the previous generation instead of
-allowing them to continue under stale authorization. HTTP upgrades switch to
-raw relay by default. A `protocol: rest` endpoint can opt in to
-`websocket_credential_rewrite` for client-to-server WebSocket text messages
-after an allowed `101` upgrade; server-to-client traffic and all other upgraded
-protocols remain raw passthrough. JSON-RPC and MCP endpoints refuse every
-request that carries an `Upgrade` header with `403` before forwarding,
-whatever the enforcement mode, because their rules apply to individual HTTP
-requests and a raw relay would bypass them.
+Raw streams and long-lived response bodies are connection scoped. Policy generation changes close relays pinned to the previous generation instead of allowing them to continue under stale authorization. HTTP upgrades switch to raw relay by default. A `protocol: rest` endpoint can opt in to `websocket_credential_rewrite` for client-to-server WebSocket text messages after an allowed `101` upgrade; server-to-client traffic and all other upgraded protocols remain raw passthrough. GraphQL, JSON-RPC and MCP endpoints refuse every request that carries an `Upgrade` header with `403` before forwarding, whatever the enforcement mode, because their rules apply to individual HTTP requests and a raw relay would bypass them. GraphQL over WebSocket belongs on a separate `protocol: websocket` endpoint with GraphQL operation rules, which inspects each client operation message.
 
 A `protocol: tcp` hostname is a connection-routing constraint, not an
 application-authority boundary. Transparent capture validates the approved DNS

@@ -152,7 +152,7 @@ the gateway host.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `mcp` and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
+| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `graphql`, `mcp`, and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
 | `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
