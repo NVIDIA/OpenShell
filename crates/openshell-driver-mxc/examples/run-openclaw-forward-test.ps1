@@ -48,13 +48,13 @@ param(
   [string] $WxcExecPath = "C:\mxc-kit\bin\wxc-exec.exe",
   # Your existing Node.js binary. Copied (not run in place) into share_dir --
   # the AppContainer cannot read paths outside it.
-  [Parameter(Mandatory = $true)]
   [string] $NodeExePath,
   # Root directory of your OpenClaw npm package install -- the directory that
   # directly contains openclaw.mjs and its own node_modules. Copied
   # (recursively, via robocopy) into share_dir\runtime\node_modules\openclaw.
-  [Parameter(Mandatory = $true)]
   [string] $OpenClawInstallDir,
+  [string] $GatewayPath,
+  [string] $CliPath,
   # Must be a DIRECT CHILD of a drive root (e.g. C:\openshell-openclaw, not
   # C:\work\openshell-openclaw). The staged Node invocation below uses
   # --preserve-symlinks-main so Node does not realpath the main module before
@@ -92,7 +92,10 @@ param(
   # this switch was meant to test around. Left in for whoever investigates
   # next (a different wxc-exec build may behave differently), but don't
   # expect it to work today.
-  [switch] $UseLocalNetwork
+  [switch] $UseLocalNetwork,
+  # CI wiring mode uses the in-process wxc shim and an in-policy proof command.
+  # It does not launch OpenClaw or exercise forwarding or OS enforcement.
+  [switch] $Mock
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,6 +108,23 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+if ($Mock) {
+  if ($Backend -ne "process_container" -or $UseLocalNetwork) {
+    throw "-Mock supports only the default process_container configuration"
+  }
+  if (-not $PSBoundParameters.ContainsKey("ShareDir")) {
+    $ShareDir = Join-Path ([System.IO.Path]::GetTempPath()) "openshell-openclaw-mock-$PID"
+  }
+  & (Join-Path $here "run-openclaw-forward-mock.ps1") `
+    -GatewayPath $GatewayPath -CliPath $CliPath -ShareDir $ShareDir `
+    -Port $Port -SandboxName $SandboxName
+  exit $LASTEXITCODE
+}
+
+if ([string]::IsNullOrWhiteSpace($NodeExePath) -or [string]::IsNullOrWhiteSpace($OpenClawInstallDir)) {
+  throw "-NodeExePath and -OpenClawInstallDir are required for real MXC runs"
+}
 
 if ([string]::IsNullOrWhiteSpace($SandboxName)) {
   $SandboxName = "openclaw-$PID"
@@ -233,8 +253,8 @@ function Show-SandboxCreate([object]$out, [string]$name) {
   }
 }
 
-$gateway     = Join-Path $here "openshell-gateway.exe"
-$cli         = Join-Path $here "openshell.exe"
+$gateway     = if ($GatewayPath) { [System.IO.Path]::GetFullPath($GatewayPath) } else { Join-Path $here "openshell-gateway.exe" }
+$cli         = if ($CliPath) { [System.IO.Path]::GetFullPath($CliPath) } else { Join-Path $here "openshell.exe" }
 $relayExe    = Join-Path $here "openshell-supervisor-relay.exe"
 $policy      = Join-Path $here "e2e-policies\openclaw-gateway.yaml"
 if ($UseLocalNetwork -and $Backend -eq "isolation_session") {

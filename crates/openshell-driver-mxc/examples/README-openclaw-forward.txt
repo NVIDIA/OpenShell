@@ -139,11 +139,15 @@ FILES IN THIS PACKAGE
   openclaw-gateway.yaml          sandbox policy (read-write grant to share_dir
                                   only -- see the comment at its top for why)
   run-openclaw-forward-test.ps1  the orchestrator you run
+  run-openclaw-forward-mock.ps1  helper used by -Mock for hosted CI wiring
   install-nodejs-openclaw.ps1    optional prerequisite: fetches Node.js +
                                   OpenClaw if you don't already have them
   README-openclaw-forward.txt    this file
 
 NOTES
+  - -Mock runs the gateway, CLI, policy, and an in-policy proof command with
+    the in-process wxc shim. It needs no Node.js or OpenClaw install and does
+    not test the relay, WebSocket forwarding, OpenClaw, proxy behavior, or MXC.
   - The control plane between CLI and gateway runs with --disable-tls on
     loopback (that's a separate test point, T2). This test's relay traffic
     (host <-> sandbox) is a separate, unrelated WebSocket tunnel.

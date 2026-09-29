@@ -133,3 +133,18 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Run the shipped MXC inference demos against the in-process wxc mock and a local API stub on Windows ARM64"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-inference-examples-e2e.ps1 -Target aarch64-pc-windows-msvc"
+
+["windows:e2e:mxc:host-probe"]
+description = "Run the shipped MXC host probe against an explicitly absent wxc-exec on hosted Windows"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-host-probe-e2e.ps1"
+
+["windows:e2e:mxc:ws-agent-mock"]
+description = "Run the shipped MXC WebSocket agent example in hosted Windows mock mode"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-ws-agent-mock-e2e.ps1"
+
+["windows:e2e:mxc:openclaw-forward-mock"]
+description = "Run the shipped MXC OpenClaw forward example in hosted Windows mock mode"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-openclaw-forward-mock-e2e.ps1"

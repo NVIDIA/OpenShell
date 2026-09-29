@@ -98,7 +98,10 @@ jobs:
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
+      - name: Probe MXC host capabilities
+        run: mise run --skip-tools windows:e2e:mxc:host-probe
       - name: Build MXC example E2E binaries
+        id: mxc_build
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: Run shipped MXC provider-credential example in mock mode
         run: mise run --skip-tools windows:e2e:mxc:provider-mock
@@ -108,6 +111,12 @@ jobs:
         run: mise run --skip-tools windows:e2e:mxc:aggregate-mock
       - name: Run shipped MXC inference examples with mock API
         run: mise run --skip-tools windows:e2e:mxc:inference-mock:${{ matrix.arch }}
+      - name: Run MXC WebSocket agent example in mock mode
+        if: ${{ !cancelled() && steps.mxc_build.outcome == 'success' }}
+        run: mise run --skip-tools windows:e2e:mxc:ws-agent-mock
+      - name: Run MXC OpenClaw forward example in mock mode
+        if: ${{ !cancelled() && steps.mxc_build.outcome == 'success' }}
+        run: mise run --skip-tools windows:e2e:mxc:openclaw-forward-mock
       - name: sccache stats
         if: always()
         run: sccache --show-stats
@@ -219,7 +228,10 @@ jobs:
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
+      - name: Probe MXC host capabilities
+        run: mise run --skip-tools windows:e2e:mxc:host-probe
       - name: Build release binaries
+        id: mxc_build
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: Run shipped MXC provider-credential example in mock mode
         run: mise run --skip-tools windows:e2e:mxc:provider-mock
@@ -229,6 +241,12 @@ jobs:
         run: mise run --skip-tools windows:e2e:mxc:aggregate-mock
       - name: Run shipped MXC inference examples with mock API
         run: mise run --skip-tools windows:e2e:mxc:inference-mock:${{ matrix.arch }}
+      - name: Run MXC WebSocket agent example in mock mode
+        if: ${{ !cancelled() && steps.mxc_build.outcome == 'success' }}
+        run: mise run --skip-tools windows:e2e:mxc:ws-agent-mock
+      - name: Run MXC OpenClaw forward example in mock mode
+        if: ${{ !cancelled() && steps.mxc_build.outcome == 'success' }}
+        run: mise run --skip-tools windows:e2e:mxc:openclaw-forward-mock
       - name: sccache stats
         if: always()
         run: sccache --show-stats

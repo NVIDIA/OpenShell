@@ -254,6 +254,14 @@ the label alone does not start a run: re-run all jobs in the current mirror
 push run, or push a new mirrored commit. The binaries are not uploaded or
 published.
 
+Native x64 and ARM64 jobs run `windows:e2e:mxc:host-probe` separately, then
+build release binaries and run `windows:e2e:mxc:ws-agent-mock` and
+`windows:e2e:mxc:openclaw-forward-mock` as independent steps. The probe
+reports an explicitly absent `wxc-exec`; the other runners use the in-process
+mock to verify gateway, CLI, driver, and workload-proof wiring. A pass is not
+evidence of WebSocket forwarding, OpenClaw behavior, proxy substitution, or
+MXC enforcement.
+
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
 ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
@@ -302,6 +310,9 @@ crypto dependency builds.
 | `windows:e2e:mxc:provider-mock` | Runs the shipped provider-credential demo with a synthetic credential and verifies placeholder propagation without leaking the credential. |
 | `windows:e2e:mxc:ocsf-mock` | Runs the shipped OCSF audit demo and verifies the durable zero-provider-events finding. |
 | `windows:e2e:mxc:aggregate-mock` | Runs the four aggregate MXC scenarios through the mock, including a staging path containing spaces. |
+| `windows:e2e:mxc:host-probe` | Runs the shipped MXC host probe against an explicitly absent `wxc-exec`. |
+| `windows:e2e:mxc:ws-agent-mock` | Runs the shipped WebSocket agent example in wiring-only mode on the native Windows host. |
+| `windows:e2e:mxc:openclaw-forward-mock` | Runs the shipped OpenClaw forward example in wiring-only mode on the native Windows host. |
 | `windows:qualify:mxc:gb300:contract` | Validates the required/optional/unsupported/architecture-constrained GB300 matrix. |
 | `windows:qualify:mxc:gb300` | Runs the fail-closed GB300 ARM64 gate and validates hash-bound evidence. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |

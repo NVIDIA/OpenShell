@@ -25,9 +25,9 @@
 #      freed.
 #   6. Verify port 22000 is freed within the drain timeout.
 #
-# In -Mock mode: steps 3-4 and 6 are skipped because wxc-exec is not invoked
-# and the server never starts.  The test validates gateway startup, sandbox
-# create, and sandbox delete only.
+# In -Mock mode: the disposable policy permits a proof write and the runner
+# verifies it. WebSocket connectivity, relay forwarding, and OS isolation are
+# not exercised because wxc-exec is not invoked.
 #
 # PowerShell 5.1-compatible (no && / || / ternary operators).  ASCII only.
 #
@@ -48,6 +48,10 @@
 param(
     # Path to wxc-exec.exe.  Required for real runs; ignored in mock mode.
     [string] $WxcExecPath = "",
+
+    # Optional paths to CI-built binaries; defaults to binaries beside this script.
+    [string] $GatewayPath,
+    [string] $CliPath,
 
     # Working directory the AppContainer can read/write. mxc-ws-agent.exe is
     # expected alongside this script;
@@ -106,65 +110,49 @@ function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host "[FAIL] $m" -ForegroundColor Red }
 function Warn([string]$m) { Write-Host "[WARN] $m" -ForegroundColor Yellow }
 
+function Quote-NativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append('"')
+    $slashes = 0
+    foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq '\') { $slashes++; continue }
+        if ($ch -eq '"') {
+            [void]$quoted.Append(('\' * (2 * $slashes + 1)))
+            [void]$quoted.Append('"')
+        } else {
+            if ($slashes -gt 0) { [void]$quoted.Append(('\' * $slashes)) }
+            [void]$quoted.Append($ch)
+        }
+        $slashes = 0
+    }
+    if ($slashes -gt 0) { [void]$quoted.Append(('\' * (2 * $slashes))) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-Cli([string[]]$CommandArgs) {
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $cli
+    $start.Arguments = (($CommandArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    if (-not $process.Start()) { throw "failed to start OpenShell CLI" }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    return @{ ExitCode = $process.ExitCode; Text = ((@($stdout.Result, $stderr.Result) | Where-Object { $_ }) -join [Environment]::NewLine).Trim() }
+}
+
 # Escape backslashes for TOML basic strings.
 function Esc([string]$p) { return $p.Replace('\', '\\') }
 
 # Convert Windows path to forward-slash form (TOML values).
 function Fwd([string]$p) { return $p.Replace('\', '/') }
-
-# Build one CreateProcess-compatible command-line argument. Windows PowerShell
-# 5.1 removes embedded quotes and can split JSON values at embedded spaces when
-# invoking native commands through the call operator.
-function Quote-NativeArgument([string]$value) {
-    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
-
-    $quoted = New-Object System.Text.StringBuilder
-    [void]$quoted.Append('"')
-    $backslashes = 0
-    foreach ($ch in $value.ToCharArray()) {
-        if ($ch -eq '\') {
-            $backslashes++
-            continue
-        }
-        if ($ch -eq '"') {
-            [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
-            [void]$quoted.Append('"')
-        } else {
-            if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
-            [void]$quoted.Append($ch)
-        }
-        $backslashes = 0
-    }
-    if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
-    [void]$quoted.Append('"')
-    return $quoted.ToString()
-}
-
-function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $filePath
-    $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw "failed to start $filePath" }
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
-    $output = @($stdout.Result, $stderr.Result) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object { $_ -split "`r?`n" } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-    return @{
-        ExitCode = $process.ExitCode
-        Output = @($output)
-    }
-}
 
 # -WsPort is NOT actually wired through end to end: the in-sandbox server's
 # port is a compile-time const (WS_PORT = 22000 in mxc-ws-agent.rs) -- the
@@ -179,8 +167,8 @@ if ($WsPort -ne 22000) {
 
 # --- Path variables -----------------------------------------------------------
 
-$gateway    = Join-Path $here "openshell-gateway.exe"
-$cli        = Join-Path $here "openshell.exe"
+$gateway    = if ($GatewayPath) { [System.IO.Path]::GetFullPath($GatewayPath) } else { Join-Path $here "openshell-gateway.exe" }
+$cli        = if ($CliPath) { [System.IO.Path]::GetFullPath($CliPath) } else { Join-Path $here "openshell.exe" }
 $tomlSrc    = Join-Path $here "mxc-ws-gateway.toml"
 $toml       = Join-Path $resultDir "mxc-ws-gateway.toml"
 $policyFile = Join-Path $here "e2e-policies\ws-agent.yaml"
@@ -188,6 +176,7 @@ $policyUsed = Join-Path $resultDir "ws-agent.yaml"
 
 $agentExeSrc = Join-Path $here "mxc-ws-agent.exe"
 $agentExe    = Join-Path $AgentDir "mxc-ws-agent.exe"
+$mockProof   = Join-Path $AgentDir "mock-workload-pass.txt"
 
 # openshell-supervisor-relay.exe wraps the per-sandbox command (see mxc-ws-gateway.toml's
 # pc_relay_spawner_path) so the driver has a control channel into the sandbox,
@@ -210,7 +199,7 @@ $sandboxName    = "mxc-ws-$runId"
 function Start-Gw {
     Remove-Item $gwLog, $gwErrLog -Force -ErrorAction SilentlyContinue
     $env:OPENSHELL_GATEWAY_CONFIG = $toml
-    $env:OPENSHELL_DRIVERS        = "mxc"
+    $env:OPENSHELL_COMPUTE_DRIVER = "mxc"
     $env:OPENSHELL_MXC_SHARE_DIR  = $AgentDir
     $p = Start-Process -FilePath $gateway `
         -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info", "--port", $Port) `
@@ -357,6 +346,12 @@ function Render-Toml {
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*pc_relay_spawner_path\s*=.*$',
         "pc_relay_spawner_path = `"$relayExeFwd`"")
 
+    if ($Mock) {
+        # The wxc shim has no control-channel handshake. Run the proof command
+        # directly while still parsing the shipped MXC settings.
+        $t = [regex]::Replace($t, '(?m)^\s*pc_relay_spawner_path\s*=.*$', 'pc_relay_spawner_path = ""')
+    }
+
     Set-Content $toml -Value $t -Encoding UTF8
 }
 
@@ -375,6 +370,12 @@ function Render-Policy {
     $agentDirPolicy = (Fwd $AgentDir)
     if ($agentDirPolicy -ne $defaultAgentDirPolicy) {
         $p = $p.Replace($defaultAgentDirPolicy, $agentDirPolicy)
+    }
+    if ($Mock) {
+        # The proof is a host file; this disposable mock policy grants only
+        # that directory so the shim can materialize it.
+        $p = [regex]::Replace($p, '(?m)^  read_only:\r?\n    - "[^"]+"\s*$', '  read_only: []')
+        $p = $p.Replace('read_write: []', "read_write: [`"$agentDirPolicy`"]")
     }
     Set-Content $policyUsed -Value $p -Encoding UTF8
 }
@@ -439,7 +440,10 @@ try {
     Remove-Item (Join-Path $AgentDir "appcontainer-sid.txt")      -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $AgentDir "outbound-probe.txt")        -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $AgentDir "outbound-probe-addr.txt")   -Force -ErrorAction SilentlyContinue
-    if (Test-Path $agentExeSrc) {
+    if ($Mock) {
+        Remove-Item -LiteralPath $mockProof -Force -ErrorAction SilentlyContinue
+        Info "mock workload will write $mockProof; WS server binary is not needed"
+    } elseif (Test-Path $agentExeSrc) {
         try {
             Copy-Item $agentExeSrc $agentExe -Force
             Ok "mxc-ws-agent.exe copied from release build"
@@ -462,7 +466,9 @@ try {
         Info "mxc-ws-agent.exe already in $AgentDir (using existing)"
     }
 
-    if (Test-Path $relayExeSrc) {
+    if ($Mock) {
+        Info "mock mode does not launch openshell-supervisor-relay.exe"
+    } elseif (Test-Path $relayExeSrc) {
         try {
             Copy-Item $relayExeSrc $relayExe -Force
             Ok "openshell-supervisor-relay.exe copied from release build"
@@ -491,17 +497,19 @@ try {
     }
     Ok "gateway port $Port is free"
 
-    $busyWs = Get-NetTCPConnection -State Listen -LocalPort $WsPort -ErrorAction SilentlyContinue
-    if ($busyWs) {
-        throw "WebSocket port $WsPort already in use (pid $($busyWs.OwningProcess)). Free it before running this test."
-    }
-    Ok "WebSocket port $WsPort is free"
+    if (-not $Mock) {
+        $busyWs = Get-NetTCPConnection -State Listen -LocalPort $WsPort -ErrorAction SilentlyContinue
+        if ($busyWs) {
+            throw "WebSocket port $WsPort already in use (pid $($busyWs.OwningProcess)). Free it before running this test."
+        }
+        Ok "WebSocket port $WsPort is free"
 
-    $busyRelay = Get-NetTCPConnection -State Listen -LocalPort $RelayPort -ErrorAction SilentlyContinue
-    if ($busyRelay) {
-        throw "relay port $RelayPort already in use (pid $($busyRelay.OwningProcess)). Free it before running this test."
+        $busyRelay = Get-NetTCPConnection -State Listen -LocalPort $RelayPort -ErrorAction SilentlyContinue
+        if ($busyRelay) {
+            throw "relay port $RelayPort already in use (pid $($busyRelay.OwningProcess)). Free it before running this test."
+        }
+        Ok "relay port $RelayPort is free"
     }
-    Ok "relay port $RelayPort is free"
 
     # --- Render TOML + start gateway ------------------------------------------
 
@@ -527,27 +535,25 @@ try {
 
     Step "Create sandbox '$sandboxName'"
     $createOut = $null; $createExitCode = 0
+    $workloadCommand = if ($Mock) {
+        @((Join-Path $env:SystemRoot "System32\cmd.exe"), "/d", "/s", "/c", "echo PASS 1> `"$mockProof`"")
+    } else {
+        @((Fwd $agentExe), "server")
+    }
     $driverConfigJson = @{
         mxc = @{
-            command = @((Fwd $agentExe), "server")
+            command = $workloadCommand
             cwd = (Fwd $AgentDir)
         }
     } | ConvertTo-Json -Compress -Depth 4
     try {
-        # MXC exec-in-driver has no SSH server, so any `sandbox create` invocation
-        # that attempts SSH will fail with connection-refused and exit non-zero.
-        # Use the same pattern as run-mxc-e2e.ps1: pass --no-tty with a no-op
-        # command so the CLI fires the SSH attempt, fails quickly (connection
-        # refused), and returns.  Do NOT gate on exit code here.
-        $createResult = Invoke-NativeCaptured $cli @(
-            "sandbox", "create",
-            "--name", $sandboxName,
-            "--policy", $policyUsed,
-            "--driver-config-json", $driverConfigJson,
-            "--no-tty", "--", "cmd.exe", "/c", "exit", "0"
-        )
-        $createOut = $createResult.Output
-        $createExitCode = $createResult.ExitCode
+        # ProcessStartInfo preserves JSON quoting under Windows PowerShell 5.1.
+        # MXC has no SSH server, so the CLI can still exit non-zero after create.
+        $create = Invoke-Cli @("sandbox", "create", "--name", $sandboxName,
+            "--policy", $policyUsed, "--driver-config-json", $driverConfigJson,
+            "--no-tty", "--", "cmd.exe", "/c", "exit", "0")
+        $createOut = $create.Text
+        $createExitCode = $create.ExitCode
     } catch {
         $createOut = $_.Exception.Message; $createExitCode = 1
     }
@@ -558,8 +564,9 @@ try {
     Start-Sleep -Milliseconds 500
     $getOut = $null; $getExitCode = 0
     try {
-        $getOut = & $cli sandbox get $sandboxName 2>&1
-        $getExitCode = $LASTEXITCODE
+        $get = Invoke-Cli @("sandbox", "get", $sandboxName)
+        $getOut = $get.Text
+        $getExitCode = $get.ExitCode
     } catch {
         $getOut = $_.Exception.Message; $getExitCode = 1
     }
@@ -574,6 +581,20 @@ try {
         Info "create output: $createStr"
         Info "get output:    $getStr"
         throw "sandbox create failed: sandbox does not exist or is not Ready after create"
+    }
+
+    if ($Mock) {
+        $proofDeadline = (Get-Date).AddSeconds(15)
+        $proofText = ""
+        while ((Get-Date) -lt $proofDeadline) {
+            if (Test-Path -LiteralPath $mockProof) {
+                $proofText = Get-Content -LiteralPath $mockProof -Raw
+                if ($null -ne $proofText -and $proofText.Trim() -eq "PASS") { break }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        $proofOk = $null -ne $proofText -and $proofText.Trim() -eq "PASS"
+        Record "mock-workload" $proofOk "in-policy proof command completed in the shared directory"
     }
 
     # --- WebSocket connectivity (real mode only) ------------------------------
@@ -678,8 +699,9 @@ try {
     Step "Delete sandbox '$sandboxName'"
     $deleteOut = $null; $deleteExitCode = 0
     try {
-        $deleteOut = & $cli sandbox delete $sandboxName 2>&1
-        $deleteExitCode = $LASTEXITCODE
+        $delete = Invoke-Cli @("sandbox", "delete", $sandboxName)
+        $deleteOut = $delete.Text
+        $deleteExitCode = $delete.ExitCode
     } catch {
         $deleteOut = $_.Exception.Message; $deleteExitCode = 1
     }
@@ -736,10 +758,16 @@ try {
 
     $verdict    = if ($harnessError -or $failCount -gt 0) { "FAIL" } else { "PASS" }
     $checkLines = ($checks | ForEach-Object { "  " + $_.Result + "  " + $_.Check + ": " + $_.Detail }) -join "`n"
-    $modeStr    = if ($Mock) { "MOCK (no wxc-exec, no WS connectivity)" } else { "REAL" }
+    $modeStr    = if ($Mock) { "mock-wiring" } else { "real-mxc" }
     $wxcStr     = if ($Mock) { "(mock)" } else { $WxcExecPath }
     $errStr     = if ($harnessError) { "harness_error: $harnessError" } else { "" }
 
+    $agentDescription = if ($Mock) { "(not launched in mock mode)" } else { $agentExe }
+    $relayDescription = if ($Mock) { "(not launched in mock mode)" } else { $relayExe }
+    $wsDescription = if ($Mock) { "(not exercised in mock mode)" } else { "$WsPort" }
+    $relayPortDescription = if ($Mock) { "(not exercised in mock mode)" } else { "$RelayPort (on this host)" }
+    $messageDescription = if ($Mock) { "(not sent in mock mode)" } else { $WsMessage }
+    $forwardArtifactLine = if ($Mock) { "" } else { "  forward.log / forward.err.log   'openshell forward service' stdout / stderr`n" }
     $summary = "OpenShell MXC WebSocket agent test`n" +
                "====================================`n" +
                "timestamp   : $stamp`n" +
@@ -748,13 +776,13 @@ try {
                "mode        : $modeStr`n" +
                "gateway     : $gateway (port $Port)`n" +
                "agent_dir   : $AgentDir`n" +
-               "agent_exe   : $agentExe`n" +
-               "relay_exe   : $relayExe`n" +
+               "agent_exe   : $agentDescription`n" +
+               "relay_exe   : $relayDescription`n" +
                "policy      : $policyUsed`n" +
                "sandbox     : $sandboxName`n" +
-               "ws_port     : $WsPort`n" +
-               "relay_port  : $RelayPort (on this host)`n" +
-               "ws_message  : $WsMessage`n" +
+               "ws_port     : $wsDescription`n" +
+               "relay_port  : $relayPortDescription`n" +
+               "ws_message  : $messageDescription`n" +
                "wxc_exec    : $wxcStr`n" +
                "totals      : PASS=$passCount  FAIL=$failCount`n" +
                "$errStr`n" +
@@ -762,18 +790,24 @@ try {
                "`nFiles in this bundle ($resultDir):`n" +
                "  transcript.txt                  full console transcript`n" +
                "  gateway.log / gateway.err.log   gateway stdout / stderr`n" +
-               "  forward.log / forward.err.log   'openshell forward service' stdout / stderr`n" +
+               $forwardArtifactLine +
                "  mxc-ws-gateway.rendered.toml    exact gateway config used`n" +
                "  ws-agent.yaml                   sandbox policy used`n" +
                "`nWhat PASS means:`n" +
                "  gateway-start     gateway bound port $Port within 30 s`n" +
-               "  sandbox-create    sandbox reached Ready after create (CLI exit may be non-zero on MXC without SSH)`n" +
-               "  server-port-open   WS server bound port $WsPort within 30 s`n" +
-               "  ws-server-marker   spawner logged its own port-ready confirmation in the gateway log`n" +
-               "  ws-echo            '$WsMessage' echoed via a dynamic 'openshell forward service' relay at 127.0.0.1:$RelayPort`n" +
-               "                     (fresh, on-demand relay for this one call -- no static bridge, nothing pre-declared)`n" +
-               "  sandbox-delete     CLI returned exit 0 for sandbox delete`n" +
-               "  port-freed         port $WsPort released within 30 s of sandbox delete`n"
+               "  sandbox-create    sandbox reached Ready after create (CLI exit may be non-zero on MXC without SSH)`n"
+    if ($Mock) {
+        $summary += "  mock-workload    an in-policy proof command wrote its file`n" +
+                    "  sandbox-delete   CLI returned exit 0 for sandbox delete`n" +
+                    "Mock mode does not validate WebSocket connectivity, dynamic forwarding, or MXC enforcement.`n"
+    } else {
+        $summary += "  server-port-open   WS server bound port $WsPort within 30 s`n" +
+                    "  ws-server-marker   spawner logged its own port-ready confirmation in the gateway log`n" +
+                    "  ws-echo            '$WsMessage' echoed via a dynamic 'openshell forward service' relay at 127.0.0.1:$RelayPort`n" +
+                    "                     (fresh, on-demand relay for this one call -- no static bridge, nothing pre-declared)`n" +
+                    "  sandbox-delete     CLI returned exit 0 for sandbox delete`n" +
+                    "  port-freed         port $WsPort released within 30 s of sandbox delete`n"
+    }
 
     Set-Content (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     $color = if ($verdict -eq "PASS") { "Green" } else { "Red" }

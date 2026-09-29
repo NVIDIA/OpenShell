@@ -264,6 +264,13 @@ Windows validation separates source correctness from host capability:
   sandbox-scoped credential propagation, and response paths without a model or
   external credential, but it does not prove MXC isolation, proxy substitution,
   or network enforcement.
+- Hosted Windows CI runs the shipped MXC host probe, WebSocket example, and
+  OpenClaw example as separate steps. The probe uses an explicitly absent
+  `wxc-exec`; the other two use the in-process mock. They check the
+  unavailable-backend report, sandbox lifecycle, and workload proof files.
+  The mock disables relay wrapping because it has no control channel. These
+  runs do not validate WebSocket connectivity, OpenClaw, dynamic forwarding,
+  proxy behavior, or MXC isolation.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.

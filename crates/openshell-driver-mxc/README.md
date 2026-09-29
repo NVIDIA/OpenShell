@@ -276,6 +276,9 @@ is deliberately strict and fails on every required skip.
 | `windows:test:mxc-gb300:arm64` | Required ARM64 ProcessContainer cases from `tests/wxc_exec_real.rs`; rejects x64 and every required `SKIP` | GB300 qualification only; requires a live backend and all prerequisites |
 | `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
 | `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
+| `windows:e2e:mxc:host-probe` | Runs the shipped host probe with an absent `wxc-exec` | Hosted Windows x64 and ARM64; validates unavailable-backend diagnostics |
+| `windows:e2e:mxc:ws-agent-mock` | Runs the shipped WebSocket agent script in mock mode | Hosted Windows x64 and ARM64; validates gateway/CLI/driver lifecycle and a workload proof, not WebSocket forwarding or MXC enforcement |
+| `windows:e2e:mxc:openclaw-forward-mock` | Runs the shipped OpenClaw forward script in mock mode | Hosted Windows x64 and ARM64; validates gateway/CLI/driver lifecycle and a workload proof, not OpenClaw forwarding or MXC enforcement |
 | `windows:qualify:mxc:gb300` | Complete source, host, ARM64 build/test, strict MXC, policy E2E, OpenClaw, and hash-bound evidence contract | Review/release evidence on a native GB300 Windows ARM64 host |
 
 The exact required, optional, unsupported, and architecture-constrained GB300
