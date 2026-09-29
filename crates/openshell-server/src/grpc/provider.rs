@@ -5122,6 +5122,7 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
         Some("deepinfra") => TelemetryProviderProfile::Deepinfra,
         Some("github") => TelemetryProviderProfile::Github,
         Some("nvidia") => TelemetryProviderProfile::Nvidia,
+        Some("oci-genai") => TelemetryProviderProfile::OciGenai,
         Some("openai") => TelemetryProviderProfile::Openai,
         _ => TelemetryProviderProfile::Custom,
     }
@@ -6301,6 +6302,7 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "oci-genai",
                 "openai",
                 "openrouter",
                 "pypi"

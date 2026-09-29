@@ -1,0 +1,193 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Oracle"
+sidebar-title: "Oracle"
+description: "Reach OCI Generative AI from OpenShell sandboxes with a compartment-scoped Generative AI API key that the proxy injects only at the OCI inference endpoint."
+keywords: "Generative AI, Oracle Cloud, OCI, OCI Generative AI, API Key, OpenAI-compatible, Credentials, Sandbox"
+---
+
+The `oci-genai` provider gives sandboxes governed access to
+[OCI Generative AI](https://docs.oracle.com/en-us/iaas/Content/generative-ai/home.htm)
+through its OpenAI-compatible endpoint. The sandbox receives a placeholder in
+`OCI_GENAI_API_KEY`; the sandbox proxy swaps in the real Generative AI API key
+only on requests to the regional OCI inference host, and only under
+`/openai/v1`. The agent never holds the key, and the key is useless anywhere
+else.
+
+## OCI Authentication Transports
+
+OCI clients authenticate in several ways. This table shows how each maps to
+OpenShell today.
+
+| OCI transport | Typical client | OpenShell support |
+|---|---|---|
+| Generative AI API key (`sk-...`, bearer token on `/openai/v1`) | OpenAI SDKs, curl, any OpenAI-compatible agent | Supported by the `oci-genai` profile on this page. |
+| API key request signing (user principal, RSA HTTP `Signature` header) | OCI CLI, OCI SDKs, `langchain-oci` `auth_type=API_KEY` | Not yet. Needs proxy-side OCI request signing, similar to [AWS SigV4](/how-it-works/providers/aws). |
+| Security token (session from `oci session authenticate`) | OCI CLI, `langchain-oci` `auth_type=SECURITY_TOKEN` | Not yet. Same signing gap, plus an `external` refresh of the token file. |
+| Instance principal, resource principal, OKE workload identity | Compute, Functions, OKE workloads | Not yet. Same signing gap, plus a gateway refresh strategy that federates the principal. |
+
+Use the Generative AI API key transport for inference. For the native
+`/20231130` Generative AI API, Object Storage, or any other OCI service, wait
+for proxy-side request signing or front the service with a bridge that signs in
+its own workload and exposes a bearer-authenticated endpoint to the sandbox.
+
+## Prerequisites
+
+- An OCI tenancy with Generative AI available in your region. Regional
+  availability and the model list served through the OpenAI-compatible
+  endpoint are in the
+  [OCI Generative AI documentation](https://docs.oracle.com/en-us/iaas/Content/generative-ai/home.htm).
+- The [OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/cliconcepts.htm)
+  configured with an identity that can manage policies and Generative AI API
+  keys in the target compartment.
+- A running OpenShell gateway (see [Quick Start](/about/quickstart)).
+
+## Create the IAM Policy First
+
+A Generative AI API key is an IAM principal of type `generativeaiapikey`. It
+only works after a policy admits that principal type. Create the policy before
+the key: a key created before its policy can stay unauthorized well after the
+policy lands, and OCI returns the same `401` for an unknown key and an
+unauthorized one, so the response will not tell you which it is.
+
+Scope the policy to one compartment and the one principal type. Do not grant
+`manage` when `use` is enough:
+
+```shell
+COMPARTMENT_ID=ocid1.compartment.oc1..example
+
+oci iam policy create \
+  --compartment-id "$COMPARTMENT_ID" \
+  --name openshell-genai-api-keys \
+  --description "Generative AI API keys in this compartment may call Generative AI" \
+  --statements "[\"allow any-user to use generative-ai-family in compartment id $COMPARTMENT_ID where ALL {request.principal.type='generativeaiapikey'}\"]"
+```
+
+To pin the policy to a single key after it exists, add
+`request.principal.id='<api-key-ocid>'` to the `where` clause.
+
+## Create the Generative AI API Key
+
+Create the key in the same compartment the policy covers, in the region you
+will call. Set an expiry; the secret is returned once, in the create response,
+and cannot be retrieved later:
+
+```shell
+REGION=us-chicago-1
+
+oci generative-ai api-key create \
+  --compartment-id "$COMPARTMENT_ID" \
+  --region "$REGION" \
+  --display-name openshell-agents \
+  --key-details '[{"keyName":"primary","timeExpiry":"2027-01-01T00:00:00Z"}]'
+```
+
+Copy the `sk-...` secret from the response into a password manager or a
+gateway credential store. Rotate it with
+`oci generative-ai api-key renew` and disable it with
+`oci generative-ai api-key set-api-key-state`; both take effect without
+touching sandboxes because the gateway, not the sandbox, holds the value.
+
+## Import the Profile and Create a Provider
+
+Import the `oci-genai` profile; a gateway serves only the profiles you imported:
+
+```shell
+openshell provider profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/oci-genai.yaml --global
+```
+
+Create a provider from the key. Read the secret from your password manager or
+an environment variable rather than typing it into the shell history:
+
+```shell
+openshell provider create \
+  --name my-oci-genai \
+  --type oci-genai \
+  --credential OCI_GENAI_API_KEY="$OCI_GENAI_API_KEY"
+```
+
+The key is compartment-scoped, so no `opc-compartment-id` header or
+compartment configuration is needed.
+
+## Use from a Sandbox
+
+Create a sandbox with the provider attached and call the endpoint. The proxy
+resolves the `OCI_GENAI_API_KEY` placeholder only for the OCI host declared by
+the profile:
+
+```shell
+openshell sandbox create --name oci-demo --provider my-oci-genai
+
+openshell sandbox exec --name oci-demo -- sh -c '
+  curl -sS --compressed \
+    https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1/chat/completions \
+    -H "Authorization: Bearer $OCI_GENAI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"meta.llama-3.3-70b-instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK\"}]}"
+'
+```
+
+Any OpenAI SDK works unchanged. Point it at the regional base URL and pass the
+placeholder as the API key:
+
+```shell
+export OPENAI_BASE_URL=https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1
+export OPENAI_API_KEY="$OCI_GENAI_API_KEY"
+```
+
+Model identifiers use the OCI form, such as `meta.llama-3.3-70b-instruct`,
+`openai.gpt-oss-120b`, or `xai.grok-4`. The Chat Completions and Responses
+APIs are served under `/openai/v1`. Not every model behind the native API is
+reachable through the OpenAI-compatible endpoint with an API key; check the
+OCI documentation for the current list.
+
+The profile ships `curl` as its only client binary. Add your interpreter or
+agent CLI to `binaries` in a copy of the profile before importing it, or the
+credential is never injected for that process.
+
+## Regions and Realms
+
+The profile's host pattern `inference.generativeai.*.oci.oraclecloud.com`
+matches every region in the commercial realm; `*` matches exactly one DNS
+label, which is the region identifier. Tenancies in other realms, such as
+government realms, use a different domain. Copy the profile and add an endpoint
+entry with that realm's host before importing.
+
+Dedicated AI cluster endpoints use the same regional host, so the profile
+covers them as well.
+
+## Security Notes
+
+- **Least privilege on both sides.** The IAM policy admits only
+  `generativeaiapikey` principals in one compartment, and the profile grants
+  only `/openai/v1` on the regional inference host. A leaked placeholder cannot
+  be used from outside the sandbox, and the real key cannot reach any other
+  OCI service.
+- **Expiry and rotation.** Set `timeExpiry` on every key. Rotate with
+  `oci generative-ai api-key renew` and update the provider with
+  `openshell provider update`; running sandboxes pick up the new value through
+  the normal placeholder path.
+- **Auditing.** Calls made with the key are attributed to the key's OCID in
+  OCI Audit. Use one key per agent fleet or per workspace so audit entries map
+  to an OpenShell provider.
+- **No compartment header.** Because the key is compartment-scoped, sandboxes
+  never learn a compartment OCID. Keep it that way; do not add
+  `opc-compartment-id` to the endpoint rules.
+
+## Troubleshooting
+
+- **`401` on every request.** Either the key is unknown or it is not yet
+  authorized. Confirm the policy exists in the key's compartment and was
+  created before the key. If the key was created first, mint a new key rather
+  than waiting.
+- **Binary garbage instead of JSON.** The endpoint compresses responses. Pass
+  `--compressed` to curl, or let your SDK negotiate encoding.
+- **`GET /openai/v1/models` returns `404`.** Model listing is not served on
+  this endpoint. Do not use it as a health check; send a small chat request
+  instead.
+- **Request denied by the sandbox proxy.** Check that the calling binary is in
+  the profile's `binaries` list and that the request path starts with
+  `/openai/v1`. Use `openshell sandbox logs` to see the denial.
+- **Native API calls fail.** `/20231130` endpoints require OCI request
+  signing, which this profile does not provide. See the transport table above.

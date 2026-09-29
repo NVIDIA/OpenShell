@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-genai.yaml
+#   openshell provider profile import -f providers/oci-genai.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl. Add the interpreter or agent CLI that calls the
+#                    OpenAI-compatible endpoint (python, node, ...) before
+#                    relying on binary-scoped attribution for this profile.
+# Reference layout:  any image with curl or an OpenAI SDK. Point the SDK at
+#                    https://inference.generativeai.<region>.oci.oraclecloud.com/openai/v1
+#                    and pass OCI_GENAI_API_KEY as the API key; the sandbox
+#                    proxy resolves the placeholder only at the hosts below.
+# Credential scope:  one OCI Generative AI API key (sk-...), created with
+#                    `oci generative-ai api-key create`. The key is scoped to
+#                    the compartment it was created in, so requests do not
+#                    need an opc-compartment-id header. Create the IAM policy
+#                    that admits `request.principal.type='generativeaiapikey'`
+#                    BEFORE creating the key; a key minted before its policy
+#                    can stay unauthorized for a long time.
+# Endpoint access:   the regional OCI Generative AI inference hosts in the
+#                    commercial realm (oraclecloud.com), TLS terminated, L7
+#                    enforced, limited to the OpenAI-compatible /openai/v1
+#                    surface. Generative AI API keys are only valid there;
+#                    the native /20231130 API requires OCI request signing,
+#                    which this profile does not grant. Other realms use their
+#                    realm domain: add a matching endpoint entry.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS --compressed \
+#                        https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1/chat/completions \
+#                        -H "Authorization: Bearer $OCI_GENAI_API_KEY" \
+#                        -H 'Content-Type: application/json' \
+#                        -d '{"model":"meta.llama-3.3-70b-instruct","messages":[{"role":"user","content":"Reply with OK"}]}'
+
+id: oci-genai
+display_name: Oracle Cloud Infrastructure Generative AI
+description: OCI Generative AI inference through the OpenAI-compatible endpoint with a compartment-scoped Generative AI API key
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OCI Generative AI API key (compartment-scoped, sent as a bearer token)
+    env_vars: [OCI_GENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  # `*` matches exactly one DNS label, which is the region identifier, for
+  # example us-chicago-1, eu-frankfurt-1, or ap-osaka-1.
+  - host: "inference.generativeai.*.oci.oraclecloud.com"
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: POST, path: "/openai/v1/**" }
+      - allow: { method: GET, path: "/openai/v1/**" }
+      - allow: { method: DELETE, path: "/openai/v1/**" }
+binaries: [/usr/bin/curl, /usr/local/bin/curl]
