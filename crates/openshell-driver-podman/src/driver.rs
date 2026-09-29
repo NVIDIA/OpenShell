@@ -77,6 +77,36 @@ fn select_grpc_endpoint(
     )
 }
 
+/// Point a loopback collector endpoint at the desktop host on Podman Machine,
+/// where supervisor loopback is the VM's.
+fn select_supervisor_otlp_endpoint(
+    config: &PodmanComputeConfig,
+    environment: PodmanEndpointEnvironment,
+) -> Option<String> {
+    let endpoint = config.supervisor_otlp_endpoint.as_deref()?;
+    if environment == PodmanEndpointEnvironment::LinuxHost {
+        return Some(endpoint.to_string());
+    }
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return Some(endpoint.to_string());
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !loopback || url.set_host(Some(environment.gateway_host())).is_err() {
+        return Some(endpoint.to_string());
+    }
+    let rewritten = String::from(url);
+    if endpoint.ends_with('/') {
+        Some(rewritten)
+    } else {
+        Some(rewritten.trim_end_matches('/').to_string())
+    }
+}
+
 fn decode_launch_authentication(
     encoded: &[u8],
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, ComputeDriverError> {
@@ -509,6 +539,8 @@ impl PodmanComputeDriver {
         // standard desktop-host alias.
         let endpoint_was_selected = config.grpc_endpoint.is_empty();
         config.grpc_endpoint = select_grpc_endpoint(&config, PodmanEndpointEnvironment::current());
+        config.supervisor_otlp_endpoint =
+            select_supervisor_otlp_endpoint(&config, PodmanEndpointEnvironment::current());
         if endpoint_was_selected {
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -2700,6 +2732,67 @@ mod tests {
         assert_eq!(
             select_grpc_endpoint(&cfg, PodmanEndpointEnvironment::PodmanMachine),
             "https://host.containers.internal:8080"
+        );
+    }
+
+    fn otlp_config(endpoint: Option<&str>) -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            supervisor_otlp_endpoint: endpoint.map(str::to_string),
+            ..PodmanComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_stays_unset_without_gateway_export() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(None),
+                PodmanEndpointEnvironment::PodmanMachine
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_keeps_loopback_on_linux() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(Some("http://127.0.0.1:4317")),
+                PodmanEndpointEnvironment::LinuxHost
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4317")
+        );
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_uses_host_alias_for_loopback_on_podman_machine() {
+        for endpoint in [
+            "http://127.0.0.1:4317",
+            "http://localhost:4317",
+            "http://[::1]:4317",
+        ] {
+            assert_eq!(
+                select_supervisor_otlp_endpoint(
+                    &otlp_config(Some(endpoint)),
+                    PodmanEndpointEnvironment::PodmanMachine
+                )
+                .as_deref(),
+                Some("http://host.containers.internal:4317"),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_otlp_endpoint_keeps_routable_hosts_on_podman_machine() {
+        assert_eq!(
+            select_supervisor_otlp_endpoint(
+                &otlp_config(Some("https://collector.example.com:4317")),
+                PodmanEndpointEnvironment::PodmanMachine
+            )
+            .as_deref(),
+            Some("https://collector.example.com:4317")
         );
     }
 

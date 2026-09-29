@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
     if let Some(image) = args.supervisor_image {
         docker_config.supervisor_image = Some(image);
     }
+    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;

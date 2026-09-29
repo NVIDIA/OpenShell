@@ -375,6 +375,10 @@ Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce s
 
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
 
+Sandbox supervisors export spans to the same collector, so the endpoint must also be reachable from sandboxes.
+
+Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. Set the gateway or sandbox log level to `debug` to include them.
+
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
 driver service names remain fixed.

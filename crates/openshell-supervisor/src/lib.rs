@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
 
@@ -764,8 +764,18 @@ async fn run_sandbox_with_backend(
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    // Startup joins the trace that created the sandbox when the driver passes
+    // one, and ends once the access plane is up.
+    let startup = tracing::info_span!(
+        "supervisor.startup",
+        sandbox.id = sandbox_id.as_deref().unwrap_or_default(),
+        otel.status_code = tracing::field::Empty,
+    );
+    openshell_otel::set_parent_from_environment(&startup);
+    let startup_status = startup.in_scope(openshell_otel::ErrorStatusGuard::current);
     let (image_yaml, invalid_image) = selected_backend
         .discover_policy(sandbox_bearer.clone())
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.discover_policy"))
         .await?;
     let image_discovery = if invalid_image {
         ImagePolicyDiscovery::Invalid
@@ -806,6 +816,7 @@ async fn run_sandbox_with_backend(
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
         },
     )
+    .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
     .await?;
 
     // Normalize the active driver's identity contract once, while both the
@@ -824,7 +835,10 @@ async fn run_sandbox_with_backend(
         // This is done after loading the policy so the sandbox can still start
         // even if provider env fetch fails (graceful degradation).
         let environment = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id)
+                .instrument(startup.clone())
+                .await
+            {
                 Ok(result) => {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -915,6 +929,7 @@ async fn run_sandbox_with_backend(
                 interactive,
             },
         )
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
         .await?;
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
@@ -988,6 +1003,7 @@ async fn run_sandbox_with_backend(
         let (bound, backend_name, ca_file_paths) = remote_boundary;
         let ready = bound
             .confirm()
+            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
@@ -1216,6 +1232,7 @@ async fn run_sandbox_with_backend(
         let running = confirmed
             .into_boundary()
             .start_agent()
+            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         workload_started_tx.send_replace(true);
@@ -1234,8 +1251,11 @@ async fn run_sandbox_with_backend(
             agent.clone(),
             Some(supervisor_session_updates),
         )
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
+        startup_status.finish(Ok::<_, ()>(())).ok();
+        drop(startup);
         let _provider_reporter =
             sandbox_id
                 .as_ref()

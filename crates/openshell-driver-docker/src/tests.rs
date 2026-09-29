@@ -210,6 +210,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        supervisor_otlp_endpoint: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -1387,6 +1388,21 @@ fn docker_child_environment_strips_supervisor_control_keys() {
     assert!(env.contains_key("TEMPLATE_ENV"));
     assert!(env.contains_key("SPEC_ENV"));
     assert!(!env.values().any(|value| value == "spoofed"));
+}
+
+#[test]
+fn supervisor_tracing_environment_requires_an_endpoint() {
+    let mut config = runtime_config();
+    assert!(supervisor_tracing_environment(&config).is_empty());
+
+    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    assert_eq!(
+        supervisor_tracing_environment(&config),
+        [format!(
+            "{}=http://127.0.0.1:4317",
+            openshell_core::sandbox_env::OTLP_ENDPOINT
+        )]
+    );
 }
 
 #[test]

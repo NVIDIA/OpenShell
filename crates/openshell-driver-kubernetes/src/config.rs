@@ -244,6 +244,10 @@ pub struct KubernetesComputeConfig {
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
@@ -352,6 +356,7 @@ impl Default for KubernetesComputeConfig {
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
