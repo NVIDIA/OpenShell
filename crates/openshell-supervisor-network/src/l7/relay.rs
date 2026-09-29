@@ -10037,14 +10037,21 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn chunked_jsonrpc_family_pipeline_authorizes_each_request() {
-        for protocol in ["mcp", "json-rpc"] {
+    async fn chunked_http_pipeline_authorizes_each_request() {
+        for protocol in ["mcp", "json-rpc", "graphql", "rest"] {
             for route_selected in [false, true] {
                 for second_allowed in [false, true] {
-                    let rules = if protocol == "mcp" {
-                        "method: tools/call, tool: echo"
+                    let rules = match protocol {
+                        "mcp" => "method: tools/call, tool: echo",
+                        "json-rpc" => "method: echo",
+                        "graphql" => "operation_type: query, fields: [echo]",
+                        "rest" => "method: POST, path: /mcp/allowed",
+                        _ => unreachable!(),
+                    };
+                    let endpoint_path = if protocol == "rest" {
+                        "/mcp/**"
                     } else {
-                        "method: echo"
+                        "/mcp"
                     };
                     let data = format!(
                         r"
@@ -10054,7 +10061,7 @@ network_policies:
     endpoints:
       - host: mcp.example.test
         port: 8000
-        path: /mcp
+        path: {endpoint_path}
         protocol: {protocol}
         enforcement: enforce
         rules:
@@ -10065,23 +10072,38 @@ network_policies:
                     );
                     let (config, tunnel_engine, ctx) = mcp_relay_context_from_data(&data);
                     let body = |id, name| {
-                        if protocol == "mcp" {
-                            serde_json::json!({
+                        match protocol {
+                            "mcp" => serde_json::json!({
                                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
                                 "params": {"name": name, "arguments": {}}
-                            })
-                        } else {
-                            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": name})
+                            }),
+                            "json-rpc" => {
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": name})
+                            }
+                            "graphql" => {
+                                serde_json::json!({"query": format!("query {{ {name} }}")})
+                            }
+                            "rest" => serde_json::json!({"id": id, "value": name}),
+                            _ => unreachable!(),
                         }
                         .to_string()
                     };
                     let first = body(1, "echo");
                     let second = body(2, if second_allowed { "echo" } else { "blocked" });
                     let mut wire = String::new();
-                    for body in [&first, &second] {
+                    for (index, body) in [&first, &second].into_iter().enumerate() {
+                        let target = if protocol == "rest" {
+                            if index == 0 || second_allowed {
+                                "/mcp/allowed"
+                            } else {
+                                "/mcp/blocked"
+                            }
+                        } else {
+                            "/mcp"
+                        };
                         write!(
                             wire,
-                            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                            "POST {target} HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
                             body.len()
                         )
                         .unwrap();
@@ -10122,10 +10144,19 @@ network_policies:
                         while let Some(mut request) =
                             provider.parse_request(&mut upstream).await.unwrap()
                         {
-                            assert!(matches!(
-                                request.body_length,
-                                crate::l7::provider::BodyLength::ContentLength(_)
-                            ));
+                            // REST streams chunked framing; the body inspectors
+                            // normalize the same message to Content-Length.
+                            if protocol == "rest" {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::Chunked
+                                ));
+                            } else {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::ContentLength(_)
+                                ));
+                            }
                             let body = crate::l7::http::read_body_for_inspection(
                                 &mut upstream,
                                 &mut request,
