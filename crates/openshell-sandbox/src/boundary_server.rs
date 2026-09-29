@@ -1420,6 +1420,7 @@ mod linux {
         ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        provider_files: std::collections::HashMap<String, String>,
     }
 
     impl StartedAgent {
@@ -1945,6 +1946,10 @@ mod linux {
                     }
                 }
                 Request::Confirm => self.confirm(),
+                Request::ProbeProviderFiles => self.network_broker.confirm_healthy().map_or_else(
+                    |error| guest_error(BoundaryErrorKind::Unavailable, error.to_string()),
+                    |()| Response::ProviderFilesSupported,
+                ),
                 Request::StartAgent {
                     sandbox_id,
                     spec,
@@ -1953,6 +1958,7 @@ mod linux {
                     ca_bundle,
                     provider_env_revision,
                     provider_env,
+                    provider_files,
                 } => self.start_agent(
                     sandbox_id,
                     spec,
@@ -1961,12 +1967,19 @@ mod linux {
                     ca_bundle,
                     provider_env_revision,
                     provider_env,
+                    provider_files,
                 ),
                 Request::UpdateProviderEnvironment {
                     generation,
                     revision,
                     provider_env,
-                } => self.update_provider_environment(generation, revision, provider_env),
+                    provider_files,
+                } => self.update_provider_environment(
+                    generation,
+                    revision,
+                    provider_env,
+                    provider_files,
+                ),
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
@@ -2425,6 +2438,7 @@ mod linux {
             ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
+            provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
@@ -2439,6 +2453,7 @@ mod linux {
                 ca_bundle: ca_bundle.clone(),
                 provider_env_revision,
                 provider_env: provider_env.clone(),
+                provider_files: provider_files.clone(),
             };
             if let RuntimeState::Running(process) = &*state {
                 return if lock(&self.started_agent)
@@ -2498,6 +2513,13 @@ mod linux {
                 provider_env,
                 ca_file_paths,
             };
+            let provider_file_count = provider_files.len();
+            if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Process,
+                    format!("install provider files: {error}"),
+                );
+            }
             let process = match ManagedProcess::spawn(
                 &self.process_runtime,
                 &self.workload_launcher,
@@ -2510,6 +2532,15 @@ mod linux {
             let process_id = process.process_id();
             *lock(&self.started_agent) = Some(requested);
             *state = RuntimeState::Running(process);
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .message(format!(
+                        "Provider file snapshot loaded [file_count:{provider_file_count}]"
+                    ))
+                    .build()
+            );
             Response::Started {
                 process_id,
                 provider_env_revision,
@@ -2522,6 +2553,7 @@ mod linux {
             generation: u64,
             revision: u64,
             provider_env: std::collections::HashMap<String, String>,
+            provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
             let process = {
                 let state = lock(&self.state);
@@ -2548,6 +2580,13 @@ mod linux {
                     applied: false,
                 };
             }
+            if let Err(error) = crate::provider_files::ProviderFiles::validate(&provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    format!("invalid provider files: {error}"),
+                );
+            }
+            let requested_revision = revision;
             let revision = match process
                 .provider_credentials
                 .compare_and_install_child_env_snapshot(current.revision, revision, provider_env)
@@ -2555,7 +2594,29 @@ mod linux {
                 Ok(revision) => revision,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error.to_string()),
             };
+            if revision != requested_revision {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "provider environment changed during update",
+                );
+            }
+            let provider_file_count = provider_files.len();
+            if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Process,
+                    format!("install provider files: {error}"),
+                );
+            }
             *installed_generation = generation;
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .message(format!(
+                        "Provider file snapshot updated [file_count:{provider_file_count}]"
+                    ))
+                    .build()
+            );
             Response::ProviderEnvironmentUpdated {
                 revision,
                 generation,
@@ -4871,6 +4932,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 )
             };
             let Response::Started {
@@ -4883,6 +4945,7 @@ mod linux {
             };
 
             let update = RequestEnvelope::new(Request::UpdateProviderEnvironment {
+                provider_files: std::collections::HashMap::new(),
                 generation: 1,
                 revision: 7,
                 provider_env: std::collections::HashMap::from([(
@@ -4968,6 +5031,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
@@ -4976,7 +5040,12 @@ mod linux {
             // fingerprint. Distinct publications must still replace the map,
             // while a delayed older clear must never undo the repair.
             assert_eq!(
-                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
+                boundary.update_provider_environment(
+                    2,
+                    7,
+                    std::collections::HashMap::default(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 2,
@@ -4990,7 +5059,8 @@ mod linux {
                     std::collections::HashMap::from([(
                         "REPLAY_TEST".to_string(),
                         "reconnected".to_string()
-                    ),])
+                    ),]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
@@ -4999,7 +5069,12 @@ mod linux {
                 }
             );
             assert_eq!(
-                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
+                boundary.update_provider_environment(
+                    2,
+                    7,
+                    std::collections::HashMap::default(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 3,
@@ -5165,6 +5240,7 @@ mod linux {
             *lock(&boundary.state) = RuntimeState::Running(process.clone());
             *lock(&boundary.attached_policy) = Some(wire_policy.clone());
             *lock(&boundary.started_agent) = Some(StartedAgent {
+                provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-retained".to_string(),
                 spec: agent_spec.clone(),
                 policy: wire_policy.clone(),
@@ -5190,6 +5266,7 @@ mod linux {
                     None,
                     0,
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Started {
                     process_id: process.process_id(),
@@ -5206,6 +5283,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "refreshed".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 2,
@@ -5221,6 +5299,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "stale".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 2,
@@ -5229,7 +5308,12 @@ mod linux {
                 }
             );
             assert_eq!(
-                boundary.update_provider_environment(2, 1, std::collections::HashMap::new()),
+                boundary.update_provider_environment(
+                    2,
+                    1,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
                     generation: 2,
@@ -5245,6 +5329,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "out-of-order".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
@@ -5254,7 +5339,12 @@ mod linux {
                 "a stale publication must not overwrite current state"
             );
             assert_eq!(
-                boundary.update_provider_environment(1, 1, std::collections::HashMap::new()),
+                boundary.update_provider_environment(
+                    1,
+                    1,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new()
+                ),
                 Response::ProviderEnvironmentUpdated {
                     revision: 1,
                     generation: 2,
@@ -5280,6 +5370,7 @@ mod linux {
                         "ROTATED_TOKEN".to_string(),
                         "replacement-control-snapshot".to_string(),
                     )]),
+                    std::collections::HashMap::new(),
                 ),
                 Response::Started {
                     process_id: process.process_id(),

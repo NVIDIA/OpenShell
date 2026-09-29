@@ -45,6 +45,45 @@ Provider profiles include these user-facing features:
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 - Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile or explicitly bound in sandbox policy for an endpointless profile.
+- Non-secret file templates rendered from provider `--config` values and installed in attached sandboxes.
+
+## Serve Non-Secret Configuration Files
+
+A profile can declare up to 16 files. Each `path` is one file name below
+`/run/openshell/providers/<provider-name>/`. Templates can reference only
+`{{config.KEY}}` values supplied with `openshell provider create --config` or
+`openshell provider update --config`. Set `env_var` to expose the installed path
+to new workload processes.
+
+```yaml
+id: acme-config
+display_name: Acme client configuration
+category: other
+files:
+  - path: client.toml
+    env_var: ACME_CONFIG_FILE
+    content: |
+      endpoint = "{{config.endpoint}}"
+      project = "{{config.project}}"
+```
+
+Import the profile, create a provider, and attach it with `sandbox create
+--provider` or `sandbox provider attach`. The sandbox boundary holds file
+content in memory and serves read-only opens at the declared path. No file or
+directory is created on disk. A provider update replaces the in-memory
+snapshot; `openshell provider update --wait` waits for the boundary to
+acknowledge it. Applications must reopen the absolute path to see new content;
+already open descriptors retain the old content. Detaching the provider makes
+subsequent opens fail with `ENOENT`.
+
+Only read-only `open`, `openat`, and `openat2` calls with an absolute path
+are supported. Path metadata calls, directory listing, and inotify do not
+see these virtual files. Use this feature only with applications that open
+their config path directly and reload it by reopening the path.
+
+File templates are for non-secret configuration. Credential values remain on
+the endpoint-bound credential path; a workload-readable file would expose the
+real value directly. See the complete [provider-managed files example](https://github.com/NVIDIA/OpenShell/tree/main/examples/provider-managed-files).
 
 ## Understand Static Credential Endpoint Binding
 

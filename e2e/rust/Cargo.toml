@@ -44,6 +44,11 @@ path = "tests/policy_activation.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "provider_files"
+path = "tests/provider_files.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]

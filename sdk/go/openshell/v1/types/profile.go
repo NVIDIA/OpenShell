@@ -18,13 +18,14 @@ const (
 )
 
 // ProviderProfile defines a provider type template with credentials schema,
-// endpoints, binaries, and discovery configuration.
+// files, endpoints, binaries, and discovery configuration.
 type ProviderProfile struct {
 	ID               string
 	DisplayName      string
 	Description      string
 	Category         ProfileCategory
 	Credentials      []ProfileCredential
+	Files            []ProfileFile
 	Endpoints        []NetworkEndpoint
 	Binaries         []NetworkBinary
 	InferenceCapable bool
@@ -33,6 +34,13 @@ type ProviderProfile struct {
 	Annotations      map[string]string
 	Source           string
 	Scope            string
+}
+
+// ProfileFile declares non-secret content served at a virtual sandbox path.
+type ProfileFile struct {
+	Path    string
+	Content string
+	EnvVar  string
 }
 
 // ProfileCredential defines a single credential required by a provider profile.

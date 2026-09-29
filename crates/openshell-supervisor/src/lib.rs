@@ -2550,7 +2550,7 @@ fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool 
 fn prepare_provider_environment(
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
-    ProviderCredentialState::from_bound_environment(
+    let prepared = ProviderCredentialState::from_bound_environment(
         provider.provider_env_revision,
         provider.environment.clone(),
         provider.credential_expires_at_ms.clone(),
@@ -2558,7 +2558,9 @@ fn prepare_provider_environment(
         provider.static_credential_bindings.clone(),
         provider.non_secret_environment_keys.clone(),
     )
-    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))
+    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
+    prepared.set_managed_files(provider.files.clone());
+    Ok(prepared)
 }
 
 // Retain only the most recent rejection, so A -> B -> A emits all transitions.
@@ -3093,6 +3095,7 @@ fn initial_provider_credentials(
         result.non_secret_environment_keys,
     ) {
         Ok(credentials) => {
+            credentials.set_managed_files(result.files);
             readiness.credentials_installed(identity, &credentials, expires_at_ms);
             credentials
         }
@@ -5532,6 +5535,7 @@ network_policies:
 
     fn startup_provider(revision: u64) -> openshell_core::grpc_client::ProviderEnvironmentResult {
         openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: std::collections::HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),
             policy_hash: String::new(),
@@ -5788,6 +5792,7 @@ network_policies:
         use std::collections::HashMap;
 
         let mut result = openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: HashMap::new(),
             environment: HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),

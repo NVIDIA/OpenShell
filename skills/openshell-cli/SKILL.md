@@ -176,6 +176,14 @@ openshell profile import --url https://example.com/profiles/my-profile.yaml
 binary grants before importing it. The URL path must end in `.yaml`, `.yml`, or
 `.json`; downloads are limited to 1 MiB and 15 seconds.
 
+Profiles may also declare non-secret `files` rendered from provider `--config`
+values. Inspect the profile and the installed version's CLI help before
+creating the provider. These virtual files support read-only opens by absolute
+path; applications must reopen the path after an update and cannot rely on
+inotify or directory listing. See the published [provider profiles
+guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles.md)
+for the file schema and example.
+
 Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
 
 Existing scripts can continue using `provider list-profiles` and `provider profile export/import/update/lint/delete`. These commands share the top-level handlers and preserve their arguments, output options, and workspace/global flags. Prefer `profile` when writing new commands.

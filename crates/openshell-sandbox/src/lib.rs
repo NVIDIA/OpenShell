@@ -22,6 +22,8 @@ mod network_broker;
 pub mod perf;
 #[cfg(unix)]
 pub mod process;
+#[cfg(target_os = "linux")]
+mod provider_files;
 mod pty;
 pub mod sandbox;
 #[cfg(target_os = "linux")]

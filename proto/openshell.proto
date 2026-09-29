@@ -2480,6 +2480,17 @@ message ProviderProfile {
   // Server-set visibility: "platform", "workspace", or empty for
   // non-scoped sources. Ignored on import/update payloads.
   string scope = 13;
+  // Non-secret files rendered from provider configuration for the workload.
+  repeated ProviderProfileFile files = 14;
+}
+
+message ProviderProfileFile {
+  // One virtual file name below /run/openshell/providers/<provider>/.
+  string path = 1;
+  // UTF-8 template. Only {{config.KEY}} references are supported.
+  string content = 2;
+  // Optional environment variable containing the virtual absolute path.
+  string env_var = 3;
 }
 
 // Provider profile response.
@@ -2581,6 +2592,8 @@ message GetSandboxProviderEnvironmentRequest {
   // provider credentials. Gateways withhold static credential material when
   // this capability is absent.
   bool supports_static_credential_bindings = 2;
+  // Whether this supervisor supports provider-managed workload files.
+  bool supports_provider_files = 3;
 }
 
 // One network endpoint at which a static provider credential may be resolved.
@@ -2633,6 +2646,8 @@ message GetSandboxProviderEnvironmentResponse {
   string policy_hash = 8;
   // Nonzero when material was withheld; installing an empty map is not readiness.
   ProviderReadinessReason readiness_reason = 9;
+  // Complete desired set of non-secret managed files, keyed by absolute path.
+  map<string, string> files = 10;
 }
 
 message ExchangeProviderSubjectTokenRequest {

@@ -308,6 +308,7 @@ func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
 		"description":       true,
 		"category":          true,
 		"credentials":       true,
+		"files":             true,
 		"endpoints":         true,
 		"binaries":          true,
 		"inference_capable": true,

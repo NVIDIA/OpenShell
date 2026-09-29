@@ -13,7 +13,7 @@ use openshell_core::proto::{
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
@@ -697,6 +697,8 @@ pub struct ProviderTypeProfile {
     pub category: ProviderProfileCategory,
     #[serde(default)]
     pub credentials: Vec<CredentialProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ProviderFileProfile>,
     #[serde(default)]
     pub endpoints: Vec<EndpointProfile>,
     #[serde(default)]
@@ -709,6 +711,80 @@ pub struct ProviderTypeProfile {
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scope: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderFileProfile {
+    pub path: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub env_var: String,
+}
+
+impl ProviderFileProfile {
+    fn validate_template(&self) -> Result<(), String> {
+        let mut remaining = self.content.as_str();
+        while let Some(start) = remaining.find("{{") {
+            if remaining[..start].contains("}}") {
+                return Err("unexpected provider file placeholder close".to_string());
+            }
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            remaining = &after[end + 2..];
+        }
+        if remaining.contains("}}") {
+            return Err("unexpected provider file placeholder close".to_string());
+        }
+        Ok(())
+    }
+
+    /// Render only explicitly referenced non-secret provider config values.
+    pub fn render(&self, config: &HashMap<String, String>) -> Result<String, String> {
+        self.validate_template()?;
+        let mut remaining = self.content.as_str();
+        let mut rendered = String::new();
+        while let Some(start) = remaining.find("{{") {
+            rendered.push_str(&remaining[..start]);
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            let value = config
+                .get(key)
+                .ok_or_else(|| format!("missing provider config key '{key}'"))?;
+            rendered.push_str(value);
+            remaining = &after[end + 2..];
+            if rendered.len() > 65_536 {
+                return Err("rendered provider file exceeds 64 KiB".to_string());
+            }
+        }
+        rendered.push_str(remaining);
+        if rendered.len() > 65_536 {
+            return Err("rendered provider file exceeds 64 KiB".to_string());
+        }
+        Ok(rendered)
+    }
+}
+
+fn valid_file_config_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -743,6 +819,15 @@ impl ProviderTypeProfile {
                         .map(credential_refresh_from_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_from_proto),
+                })
+                .collect(),
+            files: profile
+                .files
+                .iter()
+                .map(|file| ProviderFileProfile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -909,6 +994,15 @@ impl ProviderTypeProfile {
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
+                })
+                .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|file| ProviderProfileFile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -2037,8 +2131,80 @@ pub fn validate_profile_set(
             ));
         }
 
+        if profile.files.len() > 16 {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "files",
+                "at most 16 provider files are allowed",
+            ));
+        }
+        let mut file_paths = HashSet::new();
+        let mut file_env_vars = HashSet::new();
+        for file in &profile.files {
+            if file.path.is_empty()
+                || file.path == "."
+                || file.path == ".."
+                || !file
+                    .path
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+                || !file_paths.insert(file.path.as_str())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.path",
+                    "file path must be a unique, safe file name",
+                ));
+            }
+            if file.content.len() > 65_536 {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    "file template exceeds 64 KiB",
+                ));
+            }
+            if let Err(error) = file.validate_template() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    error,
+                ));
+            }
+            if !file.env_var.is_empty()
+                && (!file
+                    .env_var
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    || !file
+                        .env_var
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    || !file_env_vars.insert(file.env_var.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.env_var",
+                    "file environment key must be unique and use letters, digits, or underscores",
+                ));
+            }
+        }
+
         let mut credential_names = HashSet::new();
         for credential in &profile.credentials {
+            for env_var in &credential.env_vars {
+                if file_env_vars.contains(env_var.as_str()) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "files.env_var",
+                        format!("file environment key '{env_var}' conflicts with a credential"),
+                    ));
+                }
+            }
             let credential_name = credential.name.trim();
             if credential_name.is_empty() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -5738,6 +5904,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "space.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: " alex-api ".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5756,6 +5923,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "underscore.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "alex_api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5774,6 +5942,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "case.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "Alex-API".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -7794,5 +7963,30 @@ binaries:
                 .contains("mcp options are only valid for protocol mcp")),
             "expected mcp-options-on-non-mcp rejection: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn managed_file_example_validates_and_renders_only_config_fields() {
+        let yaml = include_str!("../../../examples/provider-managed-files/acme-config.yaml");
+        let profile = parse_profile_yaml(yaml).expect("example profile parses");
+        let diagnostics =
+            validate_profile_set(&[("acme-config.yaml".to_string(), profile.clone())]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let rendered = profile.files[0]
+            .render(&HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "https://api.acme.example".to_string(),
+                ),
+                ("project".to_string(), "production".to_string()),
+            ]))
+            .expect("render provider config");
+        assert!(rendered.contains("project = \"production\""));
+        assert!(!rendered.contains("{{"));
+
+        let mut invalid = profile;
+        invalid.files[0].content = "token = \"{{credential.API_KEY}}\"".to_string();
+        let diagnostics = validate_profile_set(&[("invalid.yaml".to_string(), invalid)]);
+        assert!(diagnostics.iter().any(|d| d.field == "files.content"));
     }
 }

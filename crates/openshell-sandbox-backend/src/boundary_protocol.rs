@@ -684,6 +684,8 @@ pub enum Request {
         resource_claims: std::collections::BTreeMap<String, String>,
     },
     Confirm,
+    /// Verify file-open mediation before sending a file-bearing snapshot.
+    ProbeProviderFiles,
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
@@ -692,12 +694,16 @@ pub enum Request {
         ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     UpdateProviderEnvironment {
         /// Ordered publication within this authenticated boundary session.
         generation: u64,
         revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     AttachProcess {
         process_id: String,
@@ -772,6 +778,7 @@ impl fmt::Debug for Request {
                 .field("resource_claims", resource_claims)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
+            Self::ProbeProviderFiles => formatter.write_str("ProbeProviderFiles"),
             Self::StartAgent {
                 sandbox_id,
                 spec,
@@ -780,6 +787,7 @@ impl fmt::Debug for Request {
                 ca_bundle,
                 provider_env_revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
@@ -788,6 +796,7 @@ impl fmt::Debug for Request {
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
                 .field("provider_env_revision", provider_env_revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -797,10 +806,12 @@ impl fmt::Debug for Request {
                 generation,
                 revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("UpdateProviderEnvironment")
                 .field("generation", generation)
                 .field("revision", revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -872,6 +883,7 @@ pub enum Response {
         /// before workload launch.
         confirmation: Box<BoundaryConfirmation>,
     },
+    ProviderFilesSupported,
     Started {
         process_id: String,
         provider_env_revision: u64,
@@ -1563,6 +1575,7 @@ mod tests {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
             request: Request::StartAgent {
+                provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-1".to_string(),
                 spec: AgentSpecWire {
                     program: "/bin/true".to_string(),
@@ -1612,6 +1625,7 @@ mod tests {
         second.insert("A".to_string(), "1".to_string());
         second.insert("B".to_string(), "2".to_string());
         let build = |provider_env| Request::UpdateProviderEnvironment {
+            provider_files: std::collections::HashMap::new(),
             generation: 1,
             revision: 2,
             provider_env,
@@ -1622,7 +1636,7 @@ mod tests {
         let expected = format!(
             "{:x}",
             Sha256::digest(
-                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"revision":2}"#
+                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}"#
             )
         );
         for provider_env in [first, second] {
@@ -1659,11 +1673,34 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+
+        let mut request = build(std::collections::HashMap::new());
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut request else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 1".to_string(),
+        );
+        let mut envelope = RequestEnvelope::new(request).expect("file-bearing request envelope");
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut envelope.request
+        else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 2".to_string(),
+        );
+        assert!(matches!(
+            envelope.validate_payload_digest(),
+            Err(FrameError::PayloadDigestMismatch)
+        ));
     }
 
     #[test]
     fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
         let request = RequestEnvelope::new(Request::StartAgent {
+            provider_files: std::collections::HashMap::new(),
             sandbox_id: "sandbox-1".to_string(),
             spec: AgentSpecWire {
                 program: "/bin/true".to_string(),

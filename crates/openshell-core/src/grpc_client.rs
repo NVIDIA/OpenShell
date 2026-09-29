@@ -1093,6 +1093,7 @@ pub async fn fetch_provider_environment(
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
             supports_static_credential_bindings: true,
+            supports_provider_files: true,
         })
         .await
         .map_err(grpc_status_error)?;
@@ -1116,6 +1117,7 @@ fn provider_environment_result(
         .collect::<Result<HashMap<_, _>>>()?;
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
+        files: inner.files,
         provider_env_revision: inner.provider_env_revision,
         provider_attachment_epoch: inner.provider_attachment_epoch,
         policy_hash: inner.policy_hash,
@@ -1380,6 +1382,7 @@ mod settings_poll_tests {
 /// Credential material and the authority snapshot that produced its bindings.
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
+    pub files: HashMap<String, String>,
     pub provider_env_revision: u64,
     /// Attachment identity captured with the delivered credential records.
     pub provider_attachment_epoch: String,

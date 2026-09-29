@@ -432,7 +432,8 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 /// reconfigure an INET endpoint. Connected `send()`/null-destination
 /// `sendto()` retains the audited cBPF fast path.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
-    install_listener(&[
+    #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
+    let mut syscalls = vec![
         libc::SYS_socket,
         libc::SYS_connect,
         libc::SYS_bind,
@@ -447,7 +448,12 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_rt_sigqueueinfo,
-    ])
+        libc::SYS_openat,
+        libc::SYS_openat2,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    syscalls.push(libc::SYS_open);
+    install_listener(&syscalls)
 }
 
 /// Run a no-capability conformance probe.

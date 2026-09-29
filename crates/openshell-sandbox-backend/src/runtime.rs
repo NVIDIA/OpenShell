@@ -396,12 +396,26 @@ impl ReadyBoundary for RemoteReady {
         } else {
             (None, None)
         };
-        let (provider_env_revision, provider_env) = self
+        let provider_snapshot = self
             .provider_credentials
-            .child_env_snapshot_with_gcp_resolved()
+            .child_environment_snapshot()
             .map_err(|error| {
                 BackendError::Process(format!("snapshot provider environment: {error}"))
             })?;
+        if !provider_snapshot.files.is_empty() {
+            let response = self
+                .client
+                .call_idempotent(Request::ProbeProviderFiles)
+                .await
+                .map_err(|error| {
+                    BackendError::Process(format!("provider file capability probe failed: {error}"))
+                })?;
+            if !matches!(response, Response::ProviderFilesSupported) {
+                return Err(BackendError::Process(
+                    "sandbox boundary does not support provider files".to_string(),
+                ));
+            }
+        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -410,8 +424,9 @@ impl ReadyBoundary for RemoteReady {
                 policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
-                provider_env_revision,
-                provider_env,
+                provider_env_revision: provider_snapshot.revision,
+                provider_env: provider_snapshot.environment,
+                provider_files: provider_snapshot.files,
             })
             .await?;
         let Response::Started {
@@ -621,6 +636,22 @@ impl RemoteExec {
                 .map_err(|error| {
                     BackendError::Process(format!("snapshot provider environment: {error}"))
                 })?;
+            if !snapshot.files.is_empty() {
+                let response = self
+                    .client
+                    .call_idempotent(Request::ProbeProviderFiles)
+                    .await
+                    .map_err(|error| {
+                        BackendError::Process(format!(
+                            "provider file capability probe failed: {error}"
+                        ))
+                    })?;
+                if !matches!(response, Response::ProviderFilesSupported) {
+                    return Err(BackendError::Process(
+                        "sandbox boundary does not support provider files".to_string(),
+                    ));
+                }
+            }
             *generation = generation.checked_add(1).ok_or_else(|| {
                 BackendError::Process("provider environment publication exhausted".to_string())
             })?;
@@ -631,6 +662,7 @@ impl RemoteExec {
                     generation: requested_generation,
                     revision: snapshot.revision,
                     provider_env: snapshot.environment,
+                    provider_files: snapshot.files,
                 })
                 .await?;
             let Response::ProviderEnvironmentUpdated {
@@ -2286,6 +2318,7 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
+                            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
@@ -3452,6 +3485,7 @@ mod tests {
         assert!(matches!(
             client
                 .exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
@@ -3511,6 +3545,7 @@ mod tests {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 client.exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
