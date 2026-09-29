@@ -1948,10 +1948,11 @@ mod tests {
         Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
-    use std::fs::File;
+    use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
+    use std::fs::{self, File};
     use std::io::{BufReader, Error, ErrorKind};
     use std::net::SocketAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1980,7 +1981,7 @@ mod tests {
         }))
     }
 
-    fn test_tls_connector(ca_path: &Path) -> TlsConnector {
+    fn test_tls_connector(ca_path: &Path, client_auth: Option<(&Path, &Path)>) -> TlsConnector {
         let mut roots = rustls::RootCertStore::empty();
         let file = File::open(ca_path).expect("failed to open test CA certificate");
         for certificate in rustls_pemfile::certs(&mut BufReader::new(file)) {
@@ -1989,11 +1990,58 @@ mod tests {
                 .expect("failed to add test CA certificate");
         }
 
-        TlsConnector::from(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        ))
+        let config = if let Some((cert_path, key_path)) = client_auth {
+            let cert_file = File::open(cert_path).expect("failed to open test client certificate");
+            let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse test client certificate");
+            let key_file = File::open(key_path).expect("failed to open test client key");
+            let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+                .expect("failed to parse test client key")
+                .expect("test client key is missing");
+
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .expect("failed to configure test client certificate"),
+            )
+        } else {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        };
+
+        TlsConnector::from(config)
+    }
+
+    fn write_test_client_certificate(
+        directory: &Path,
+        name: &str,
+        ca_cert: &rcgen::Certificate,
+        ca_key: &KeyPair,
+    ) -> (PathBuf, PathBuf) {
+        let client_key = KeyPair::generate().expect("failed to generate test client key");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_cert = client_params
+            .signed_by(&client_key, ca_cert, ca_key)
+            .expect("failed to sign test client certificate");
+
+        let cert_path = directory.join(format!("{name}-cert.pem"));
+        let key_path = directory.join(format!("{name}-key.pem"));
+        fs::write(&cert_path, client_cert.pem()).expect("failed to write test client certificate");
+        fs::write(&key_path, client_key.serialize_pem()).expect("failed to write test client key");
+        (cert_path, key_path)
     }
 
     #[test]
@@ -2357,7 +2405,7 @@ mod tests {
             shutdown_rx,
         ));
 
-        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"));
+        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
         let stream = TcpStream::connect(address)
             .await
             .expect("failed to connect to metrics listener");
@@ -2404,6 +2452,160 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&plaintext_response).starts_with("HTTP/"),
             "TLS metrics listener must not serve plaintext HTTP"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_mtls_trusts_only_the_metrics_client_ca() {
+        let directory = tempdir().expect("failed to create test directory");
+        let (_server_ca_cert, _server_ca_key) = generate_test_certs_with_ca(directory.path());
+
+        let metrics_ca_directory = directory.path().join("metrics-client-ca");
+        fs::create_dir(&metrics_ca_directory).expect("failed to create metrics CA directory");
+        let (metrics_ca_cert, metrics_ca_key) = generate_test_certs_with_ca(&metrics_ca_directory);
+
+        let gateway_ca_directory = directory.path().join("gateway-client-ca");
+        fs::create_dir(&gateway_ca_directory).expect("failed to create gateway CA directory");
+        let (gateway_ca_cert, gateway_ca_key) = generate_test_certs_with_ca(&gateway_ca_directory);
+
+        let (metrics_client_cert, metrics_client_key) = write_test_client_certificate(
+            directory.path(),
+            "metrics-client",
+            &metrics_ca_cert,
+            &metrics_ca_key,
+        );
+        let (gateway_client_cert, gateway_client_key) = write_test_client_certificate(
+            directory.path(),
+            "gateway-client",
+            &gateway_ca_cert,
+            &gateway_ca_key,
+        );
+        let metrics_tls_acceptor = TlsAcceptor::from_files(
+            &directory.path().join("server-cert.pem"),
+            &directory.path().join("server-key.pem"),
+            Some(&metrics_ca_directory.join("ca.pem")),
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("failed to configure metrics mTLS acceptor");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            metrics_tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let metrics_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&metrics_client_cert, &metrics_client_key)),
+        );
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect with metrics client certificate");
+        let mut metrics_client = metrics_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics client TLS handshake failed");
+        metrics_client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics with metrics client certificate");
+        let mut authorized_response = Vec::new();
+        metrics_client
+            .read_to_end(&mut authorized_response)
+            .await
+            .expect("failed to read authorized metrics response");
+        assert!(
+            String::from_utf8_lossy(&authorized_response).starts_with("HTTP/1.1 200"),
+            "metrics client certificate should be authorized"
+        );
+
+        let gateway_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&gateway_client_cert, &gateway_client_key)),
+        );
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect with gateway client certificate");
+        let rejected_response = match gateway_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut gateway_client) => {
+                let _ = gateway_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    gateway_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&rejected_response).starts_with("HTTP/"),
+            "gateway client certificate must not authorize metrics scraping"
+        );
+
+        let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("failed to connect without a client certificate");
+        let anonymous_response = match anonymous_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut anonymous_client) => {
+                let _ = anonymous_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    anonymous_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&anonymous_response).starts_with("HTTP/"),
+            "metrics mTLS must reject clients without a certificate"
         );
 
         stop_listener(shutdown_tx, listener_task).await;
