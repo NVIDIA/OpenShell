@@ -13,7 +13,7 @@ Before writing an RFC, you must open a [GitHub issue](https://github.com/NVIDIA/
 - Build consensus before investing in a detailed proposal
 - Identify the right reviewers and stakeholders
 
-If the ticket shows sufficient interest and maintainers decide the idea needs broad design review, they will ask for an RFC from that issue. Maintainers assign the RFC number and add the `needs-rfc` label in the issue before the RFC is created, preventing number clashes across branches and making pending RFC work searchable.
+If the ticket shows sufficient interest and maintainers decide the idea needs broad design review, they will ask for an RFC from that issue. Maintainers assign the RFC number and add `needs:rfc` before the RFC is created, preventing number clashes across branches and making pending RFC work searchable.
 
 ## RFCs vs other artifacts
 
@@ -93,7 +93,7 @@ Start with a GitHub issue. New features must use the feature request template an
 
 ### 2. Get maintainer confirmation
 
-Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder, and add the `needs-rfc` label to the originating issue so pending RFC work is searchable. Authors should use the assigned number instead of choosing one locally.
+Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder, and add `needs:rfc` to the originating issue so pending RFC work is searchable. Authors should use the assigned number instead of choosing one locally.
 
 ### 3. Create your RFC
 

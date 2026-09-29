@@ -118,6 +118,8 @@ gh pr create --title "PR title" --body "PR description"
 
 Features, user-visible behavior changes, public API changes, architecture changes, and multi-PR efforts must link an accepted issue. Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
 
+Keep `type:*`, `state:*`, and `needs:*` on the linked issue; do not mirror those labels onto the PR. GitHub already shows PR review and merge state. A PR with no linked issue may carry useful labels, but its labels do not establish that the work was accepted.
+
 ```bash
 gh pr create \
   --title "Fix validation error for empty requests" \

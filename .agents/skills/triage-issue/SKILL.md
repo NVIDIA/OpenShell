@@ -9,7 +9,7 @@ metadata:
 
 Assess a community issue so the duty engineer can quickly accept it, decline it with an explanation, ask for exact missing information, or invite collaborators into the decision. This skill is human-invoked during this rollout. `state:new` calls for screening only; it does not authorize planning or implementation. Maintainer-authored issues normally enter `state:accepted` through the issue-opened workflow and do not need this screening.
 
-The [issue workflow](../../../docs/contributing/issue-workflow.mdx) defines the three label axes. The [proposal](https://github.com/NVIDIA/OpenShell/issues/3807) explains the rollout. This skill never decides acceptance or roadmap placement, and never adds or removes `state:accepted`, `roadmap`, `needs:spike`, `needs:plan`, `needs:pr`, or `needs:rfc` without human direction. A human can directly request a specific phase without changing queue labels.
+The [issue workflow](https://docs.nvidia.com/openshell/latest/contributing/issue-workflow.md) defines the three label axes. The [proposal](https://github.com/NVIDIA/OpenShell/issues/3807) explains the rollout. This skill never decides acceptance or roadmap placement, and never adds or removes `state:accepted`, `roadmap`, `needs:spike`, `needs:plan`, `needs:pr`, or `needs:rfc` without human direction. A human can directly request a specific phase without changing queue labels.
 
 ## Prerequisites
 

@@ -91,7 +91,7 @@ The canonical workflow chains are defined in `AGENTS.md` under "## Workflow Chai
 
 ### Labels
 
-The canonical label set is used by skills and templates. The key labels are: `state:triage-needed`, `state:needs-info`, `state:validated`, `state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels. Lifecycle and `agent:*` request labels gate unattended queue pickup. They do not prevent a direct user request: the agent warns about each missing or incomplete expected workflow label and continues with the requested phase without changing those labels.
+The canonical three-axis label set lives in `.agents/workflow-labels.json` and is explained in `docs/contributing/issue-workflow.mdx`. The key values are `type:*`, `state:new`, `state:validated`, `state:accepted`, `state:in-progress`, `state:in-review`, `needs:info`, `needs:plan`, `needs:pr`, `needs:spike`, `needs:rfc`, plus the orthogonal `status:stale`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, and relevant area/topic/integration/test labels. State, the human-set need, acceptance, and any required approved plan gate unattended queue pickup. A direct request authorizes its stated phase after a warning about missing or incomplete queue labels; it does not change them.
 
 ## Step 2: Check Each File for Drift
 
@@ -116,7 +116,7 @@ For each file in the table above, check for the following inconsistencies:
 ### Issue Lifecycle Documentation
 
 1. **`CONTRIBUTING.md` issue lifecycle section** — State, roadmap, acceptance-signal, and agent-workflow meanings must match `AGENTS.md`.
-2. **Invocation modes** — Lifecycle and `agent:*` request labels must gate unattended queue pickup without blocking a direct user request to a specific agent.
+2. **Invocation modes** — Acceptance, the active issue state, the human-set need, and any required approved plan must gate unattended queue pickup without blocking a direct user request to a specific agent.
 3. **Direct-mode warnings** — Guidance must require the agent to warn about each missing or incomplete expected workflow label, continue with the requested phase, and leave labels unchanged.
 
 ### `README.md`

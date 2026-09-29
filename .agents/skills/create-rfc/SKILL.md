@@ -16,8 +16,12 @@ Keep the template as the source of truth for section guidance.
    RFC number, and how the lifecycle works.
 2. Read `rfc/0000-template/README.md` before drafting. Follow its section
    guidance, including scope, expected detail, and suggested section length.
-3. Choose the next available `NNNN` from the existing `rfc/NNNN-*` directories
-   unless the user provided a specific number.
+3. Confirm that an originating GitHub issue exists and a maintainer assigned its
+   RFC number. The maintainer also records `needs:rfc` on
+   the issue. Never choose a number locally or apply these human-only labels.
+   If the number is missing, prepare the draft in ignored `architecture/plans/`
+   for review, then ask the maintainer to assign a number before creating the
+   RFC folder.
 4. Create `rfc/NNNN-short-title/README.md` by copying the template and replacing
    placeholders. Use a short hyphenated folder title.
 5. Fill in front matter with the RFC author, `state: draft`, and any related

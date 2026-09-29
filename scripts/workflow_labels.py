@@ -26,8 +26,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
         if name in seen:
             raise ValueError(f"duplicate label: {name}")
         seen.add(name)
-        if not name.startswith(AXES):
-            raise ValueError(f"not a workflow-axis label: {name}")
+        if not name.startswith(AXES) and name != "status:stale":
+            raise ValueError(f"not a managed workflow label: {name}")
         if not re.fullmatch(r"[0-9a-fA-F]{6}", label["color"]):
             raise ValueError(f"invalid color for {name}")
         if not label["description"] or len(label["description"]) > 100:

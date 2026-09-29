@@ -246,7 +246,7 @@ Before discovering work, define the invocation target selector and keep every la
 - Explicit issue or PR numbers: process only those items, even if a PR is closed or merged.
 - "My PRs" or similar operator-owned requests: resolve the current GitHub user with `gh api user --jq '.login'` and process only PRs authored by that login.
 - "All active PRs", "all gator-labeled PRs", or repo-wide requests: process across authors only when the operator explicitly asks for repo-wide scope. For write actions across authors, verify maintainer authority first.
-- No-number requests that mention untriaged issues: process only the issue set implied by the request, such as open issues with `state:triage-needed`.
+- No-number requests that mention untriaged issues: process only the issue set implied by the request, such as open issues with `state:new`. That intake state permits screening only; it does not queue planning or implementation. Keep `gator:*` labels as the separate PR supervision state machine.
 
 For PR watch requests, normal discovery should include open non-draft PRs matching the target selector. Closed/merged reconciliation may also include closed or merged PRs matching the same selector when they still have an active `gator:*` label. This is a cleanup extension of the current invocation scope, not permission to scan or mutate all gator-labeled PRs in the repository.
 

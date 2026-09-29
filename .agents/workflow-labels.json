@@ -14,6 +14,7 @@
     {"name": "needs:plan", "color": "fbca04", "description": "Needs an implementation plan or review of that plan"},
     {"name": "needs:pr", "color": "fbca04", "description": "Needs a pull request or review of that pull request"},
     {"name": "needs:spike", "color": "fbca04", "description": "Needs a maintainer-approved bounded investigation"},
-    {"name": "needs:rfc", "color": "fbca04", "description": "Needs a maintainer-directed RFC pull request"}
+    {"name": "needs:rfc", "color": "fbca04", "description": "Needs a maintainer-directed RFC pull request"},
+    {"name": "status:stale", "color": "ededed", "description": "Inactive item awaiting renewed attention; separate from workflow state"}
   ]
 }

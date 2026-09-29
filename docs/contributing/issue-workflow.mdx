@@ -19,6 +19,8 @@ Use `state:new`, `state:validated`, `state:accepted`, `state:in-progress`, and `
 
 GitHub's closed status and reason describe completed or declined work. Do not add terminal `state:done` or `state:canceled` labels. When closing a new issue, clear `needs:*` labels that no longer describe a next action. The migration leaves already closed items untouched.
 
+`status:stale` is an inactivity marker outside the four workflow axes. It can appear on an issue or pull request without creating a conflicting `state:*` label. The stale workflow does not close items automatically.
+
 GitHub's built-in issue type is separate metadata. Use `type:*` for the more specific workflow classification. Conventional Commit types describe commits and do not determine issue type. Usage questions may use `type:support`; suspected vulnerabilities belong in the private process in `SECURITY.md`, not a public `type:security` issue.
 
 ## Intake and Disposition
