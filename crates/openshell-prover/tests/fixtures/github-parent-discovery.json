@@ -1,0 +1,109 @@
+{
+  "filesystem_policy": {
+    "include_workdir": true,
+    "read_only": [
+      "/usr",
+      "/lib",
+      "/lib64",
+      "/proc",
+      "/etc",
+      "/app",
+      "/opt",
+      "/var/log",
+      "/dev/urandom"
+    ],
+    "read_write": [
+      "/sandbox",
+      "/tmp",
+      "/dev/null",
+      "/home/sandbox"
+    ]
+  },
+  "landlock": {
+    "compatibility": "best_effort"
+  },
+  "network_policies": {
+    "github_pi_subagents_clone_discovery": {
+      "binaries": [
+        {
+          "path": "/usr/bin/git"
+        },
+        {
+          "path": "/usr/local/bin/git"
+        }
+      ],
+      "endpoints": [
+        {
+          "enforcement": "enforce",
+          "host": "github.com",
+          "port": 443,
+          "protocol": "rest",
+          "rules": [
+            {
+              "allow": {
+                "method": "GET",
+                "path": "/nicobailon/pi-subagents/info/refs"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "github_pi_subagents_clone_discovery"
+    },
+    "openshell_tool_service": {
+      "binaries": [
+        {
+          "path": "/usr/bin/pi"
+        },
+        {
+          "path": "/usr/local/bin/pi"
+        },
+        {
+          "path": "/usr/bin/node"
+        },
+        {
+          "path": "/usr/local/bin/node"
+        },
+        {
+          "path": "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+        },
+        {
+          "path": "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+        }
+      ],
+      "endpoints": [
+        {
+          "allowed_ips": [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16"
+          ],
+          "enforcement": "enforce",
+          "host": "host.openshell.internal",
+          "port": 8765,
+          "protocol": "rest",
+          "rules": [
+            {
+              "allow": {
+                "method": "POST",
+                "path": "/v1/jobs"
+              }
+            },
+            {
+              "allow": {
+                "method": "GET",
+                "path": "/v1/jobs/**"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "openshell-tool-service"
+    }
+  },
+  "process": {
+    "run_as_group": "sandbox",
+    "run_as_user": "sandbox"
+  },
+  "version": 1
+}

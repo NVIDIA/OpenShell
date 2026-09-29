@@ -155,6 +155,10 @@ check that `coverage.domains` includes every part of the policy that you rely
 on. Run `openshell-prover check --help` for all options, including `--timeout`,
 which changes the default 10-second time limit.
 
+Network counterexamples can include `query_params`, a map of decoded query keys
+to arrays of distinct repeated values. The map is omitted when empty.
+Percent-encode keys and values when constructing a URL from a counterexample.
+
 ## What the Boundary Check Covers
 
 A passing result means that the candidate allows nothing beyond the boundary in
@@ -168,6 +172,9 @@ files in the sandbox image. For those comparisons, the prover returns
 `unsupported` instead of guessing. Very large policies, for example with more
 than 1,024 network rules or 4,096 endpoints across both files, return
 `inconclusive` with the `reason_code` `resource_limit`.
+The combined-input limit also includes 256 query matchers. Comparing identical
+policies with 129 query matchers each exceeds that limit. Query keys and values
+count toward the limits of 4 KiB per modeled pattern and 1 MiB of pattern text.
 
 ### Filesystem Access
 
@@ -222,10 +229,29 @@ The prover returns `unsupported` in these cases:
 
 ### REST Requests
 
-The prover compares method and path allow and deny rules on endpoints with
+The prover compares method, path, and supported query allow and deny rules on endpoints with
 `protocol: rest`. These endpoints must use `enforcement: enforce`. An endpoint
 in audit mode returns `unsupported`, because it does not block requests. A host
 and port that has both a REST endpoint and an endpoint without request rules
-also returns `unsupported`, as do REST rules that match query parameters or use
+also returns `unsupported`, as do REST rules that use
 `?` or bracket expressions in paths. Other request protocols, such as WebSocket,
 GraphQL, MCP, and JSON-RPC, return `unsupported`.
+
+#### Query Constraints
+
+Query keys and exact values must be ASCII without NUL. Exact strings and the whole
+`*` wildcard are supported; partial globs and `any` matchers return `unsupported`.
+The runtime uses `.` as a glob delimiter: `*` matches `a` and an empty value, but
+not `a.b`. A boundary `q: "*"` therefore does not contain a candidate `q: "a.b"`.
+
+Every configured key must be present. All repeated values must match an allow
+constraint; any matching value satisfies each configured deny constraint. Thus
+`q=a&q=a.b` fails an allow `q: "*"` but matches a deny `q: "*"`.
+Unconfigured keys are unrestricted. Comparisons use decoded values and do not
+infer that one application operation includes another.
+
+The prover models exact-empty matchers such as `query: {q: ""}`, and local YAML
+loading supports them. The runtime's protobuf-loading path rejects these matchers
+for both allow and deny rules. A containment proof does not establish deployment
+compatibility; do not use exact-empty matchers in policies deployed through that
+path.

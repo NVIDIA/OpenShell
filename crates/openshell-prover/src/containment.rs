@@ -22,13 +22,16 @@ use std::time::{Duration, Instant};
 use openshell_policy_schema::{
     AccessPreset, FilesystemPolicy, L7Allow as Allow, L7DenyRule as DenyRule, LandlockPolicy,
     NetworkBinary as Binary, NetworkEndpoint as Endpoint, NetworkMiddleware,
-    NetworkPolicyRule as NetworkRule, PolicyDocument, ProcessPolicy,
+    NetworkPolicyRule as NetworkRule, PolicyDocument, ProcessPolicy, QueryMatcher,
 };
 use z3::ast::{Ast, Bool, Int, Regexp, String as Z3String};
 use z3::{Context, Params, SatResult, Solver};
 
 mod execution;
 mod ip;
+#[cfg(test)]
+mod probe_tests;
+mod query;
 
 const LAYER_L4: &str = "l4";
 const LAYER_REST: &str = "rest";
@@ -39,6 +42,8 @@ const MAX_BINARIES: usize = 4_096;
 const MAX_PORT_ENTRIES: usize = 65_536;
 const MAX_L7_RULES: usize = 16_384;
 const MAX_IP_RANGES: usize = 4_096;
+const MAX_QUERY_MATCHERS: usize = 256;
+const MAX_CONCRETE_PROBES: usize = 64;
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_TOTAL_PATTERN_BYTES: usize = 1024 * 1024;
 
@@ -285,6 +290,8 @@ pub enum Counterexample {
         protocol: Protocol,
         method: Option<String>,
         path: Option<String>,
+        /// Decoded query values; repeated parameters retain distinct values.
+        query_params: BTreeMap<String, Vec<String>>,
     },
 }
 
@@ -364,6 +371,7 @@ struct SymbolicAction {
     path: Z3String,
     ip: ip::SymbolicIp,
     trusted_gateway: Bool,
+    query: query::SymbolicQuery,
 }
 
 enum NetworkSolve {
@@ -517,15 +525,29 @@ fn solve_network_mode(
     if network_is_structurally_contained(boundary, candidate, binary_identity_required) {
         return NetworkSolve::Within;
     }
-    if let Some(witness) = concrete_network_witness(boundary, candidate, binary_identity_required) {
+    if let Some(witness) = concrete_network_witness(
+        boundary,
+        candidate,
+        binary_identity_required,
+        started,
+        timeout,
+        cancelled,
+    ) {
         return NetworkSolve::Exceeds(witness);
     }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return NetworkSolve::Incomplete(cancelled_result());
+    }
+    if started.elapsed() >= timeout {
+        return NetworkSolve::Incomplete(solver_timeout_result());
+    }
     let solver = Solver::new();
-    let action = symbolic_action(if binary_identity_required {
+    let mut action = symbolic_action(if binary_identity_required {
         "strict_boundary_policy_action"
     } else {
         "relaxed_boundary_policy_action"
     });
+    action.query = query::SymbolicQuery::new("boundary", boundary, candidate);
     assert_action_domain(&solver, &action, binary_identity_required);
     solver.assert(
         Bool::and(&[
@@ -592,7 +614,15 @@ fn concrete_network_witness(
     boundary: &ContainmentPolicy,
     candidate: &ContainmentPolicy,
     binary_identity_required: bool,
+    started: Instant,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
 ) -> Option<Counterexample> {
+    let stopped = || {
+        cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) || started.elapsed() >= timeout
+    };
+    let mut rules_considered = 0;
+    let mut replays = 0;
     for (rule, endpoint) in candidate
         .network_policies
         .values()
@@ -610,41 +640,59 @@ fn concrete_network_witness(
                 |binary| binary.path.replace("**", "a").replace('*', "a"),
             )
         });
-        let method = endpoint
+        // Preset/L4 endpoints still get one unconstrained-query request.
+        for allow in endpoint
             .rules
-            .first()
-            .map_or("GET", |rule| rule.allow.method.as_str())
-            .to_ascii_uppercase();
-        let path = endpoint
-            .rules
-            .first()
-            .map_or(endpoint.path.as_str(), |rule| rule.allow.path.as_str());
-        let path = if path.is_empty() {
-            "/".to_owned()
-        } else {
-            path.replace("**", "a").replace('*', "a")
-        };
-        if !is_canonical_dns_host(&host)
-            || !is_canonical_rest_path(&path)
-            || !is_http_method(&method)
+            .iter()
+            .map(|rule| Some(&rule.allow))
+            .chain(endpoint.rules.is_empty().then_some(None))
         {
-            continue;
-        }
-        for destination_ip in ip::sample_addresses(endpoint) {
-            let witness = Counterexample::Network {
-                binary: binary.clone(),
-                ancestor_binary: binary.clone(),
-                binary_identity_required,
-                host: host.clone(),
-                destination_ip,
-                trusted_gateway: false,
-                port: endpoint.effective_ports()[0],
-                protocol: endpoint.protocol_kind(),
-                method: (endpoint.protocol_kind() == Protocol::Rest).then(|| method.clone()),
-                path: (endpoint.protocol_kind() == Protocol::Rest).then(|| path.clone()),
+            if rules_considered == MAX_CONCRETE_PROBES || stopped() {
+                return None;
+            }
+            rules_considered += 1;
+            let method = allow
+                .map_or("GET", |allow| allow.method.as_str())
+                .to_ascii_uppercase();
+            let path = allow.map_or(endpoint.path.as_str(), |allow| allow.path.as_str());
+            let query_params =
+                allow.map_or_else(BTreeMap::new, |allow| query::sample(&allow.query));
+            let path = if path.is_empty() {
+                "/".to_owned()
+            } else {
+                path.replace("**", "a").replace('*', "a")
             };
-            if counterexample_satisfies_predicate(boundary, candidate, &witness) {
-                return Some(witness);
+            if !is_canonical_dns_host(&host)
+                || !is_canonical_rest_path(&path)
+                || !is_http_method(&method)
+            {
+                continue;
+            }
+            for destination_ip in ip::sample_addresses(endpoint) {
+                if replays == MAX_CONCRETE_PROBES || stopped() {
+                    return None;
+                }
+                replays += 1;
+                let witness = Counterexample::Network {
+                    binary: binary.clone(),
+                    ancestor_binary: binary.clone(),
+                    binary_identity_required,
+                    host: host.clone(),
+                    destination_ip,
+                    trusted_gateway: false,
+                    port: endpoint.effective_ports()[0],
+                    protocol: endpoint.protocol_kind(),
+                    method: (endpoint.protocol_kind() == Protocol::Rest).then(|| method.clone()),
+                    path: (endpoint.protocol_kind() == Protocol::Rest).then(|| path.clone()),
+                    query_params: query_params.clone(),
+                };
+                let exceeds = counterexample_satisfies_predicate(boundary, candidate, &witness);
+                if stopped() {
+                    return None;
+                }
+                if exceeds {
+                    return Some(witness);
+                }
             }
         }
     }
@@ -760,6 +808,7 @@ fn rest_endpoint_structurally_contains(boundary: &Endpoint, candidate: &Endpoint
         boundary.rules.iter().any(|boundary_rule| {
             method_pattern_contains(&boundary_rule.allow.method, &candidate_rule.allow.method)
                 && path_pattern_contains(&boundary_rule.allow.path, &candidate_rule.allow.path)
+                && query::contains(&boundary_rule.allow.query, &candidate_rule.allow.query)
         })
     })
 }
@@ -800,6 +849,7 @@ fn symbolic_action(name: &str) -> SymbolicAction {
         path: Z3String::new_const(format!("{name}_path")),
         ip: ip::SymbolicIp::new(name),
         trusted_gateway: Bool::new_const(format!("{name}_trusted_gateway")),
+        query: query::SymbolicQuery::default(),
     }
 }
 
@@ -929,12 +979,12 @@ fn endpoint_denies(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
         endpoint_matches_connection(endpoint, action),
         action.layer.eq(LAYER_REST),
         endpoint_path_matches(endpoint, action),
-        bool_or(
-            endpoint
-                .deny_rules
-                .iter()
-                .map(|deny| method_and_path_match(&deny.method, &deny.path, action)),
-        ),
+        bool_or(endpoint.deny_rules.iter().map(|deny| {
+            Bool::and(&[
+                method_and_path_match(&deny.method, &deny.path, action),
+                action.query.matches(&deny.query, true),
+            ])
+        })),
     ])
 }
 
@@ -942,12 +992,12 @@ fn rest_endpoint_allows(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
     match AccessPreset::parse(&endpoint.access) {
         Some(AccessPreset::Full) => any_method_matches(action, "**"),
         Some(preset) => methods_match(action, preset.methods("rest"), "**"),
-        None => bool_or(
-            endpoint
-                .rules
-                .iter()
-                .map(|rule| method_and_path_match(&rule.allow.method, &rule.allow.path, action)),
-        ),
+        None => bool_or(endpoint.rules.iter().map(|rule| {
+            Bool::and(&[
+                method_and_path_match(&rule.allow.method, &rule.allow.path, action),
+                action.query.matches(&rule.allow.query, false),
+            ])
+        })),
     }
 }
 
@@ -1054,6 +1104,11 @@ fn counterexample_from_model(
         protocol,
         method,
         path,
+        query_params: if protocol == Protocol::Rest {
+            action.query.decode(model)?
+        } else {
+            BTreeMap::new()
+        },
     })
 }
 
@@ -1090,6 +1145,7 @@ fn counterexample_satisfies_predicate(
         protocol,
         method,
         path,
+        query_params,
     } = counterexample
     else {
         return false;
@@ -1104,6 +1160,7 @@ fn counterexample_satisfies_predicate(
         path: Z3String::from_str(path.as_deref().unwrap_or("/")).unwrap(),
         ip: ip::SymbolicIp::concrete(*destination_ip),
         trusted_gateway: Bool::from_bool(*trusted_gateway),
+        query: query::SymbolicQuery::concrete(boundary, candidate, query_params),
     };
     Bool::and(&[
         policy_allows(candidate, &concrete, *binary_identity_required),
@@ -1942,6 +1999,7 @@ fn resource_limit_reason(
     let mut port_entry_count = 0_usize;
     let mut l7_count = 0_usize;
     let mut ip_range_count = 0_usize;
+    let mut query_matcher_count = 0_usize;
     let mut total_pattern_bytes = 0_usize;
     for policy in policies {
         for path in policy
@@ -2016,6 +2074,37 @@ fn resource_limit_reason(
                         }
                     }
                 }
+                for rules in endpoint
+                    .rules
+                    .iter()
+                    .map(|rule| &rule.allow.query)
+                    .chain(endpoint.deny_rules.iter().map(|rule| &rule.query))
+                {
+                    query_matcher_count = query_matcher_count.saturating_add(rules.len());
+                    if query_matcher_count > MAX_QUERY_MATCHERS {
+                        return Some(resource_limit_detail(
+                            "query_matchers",
+                            query_matcher_count,
+                            MAX_QUERY_MATCHERS,
+                        ));
+                    }
+                    for (key, matcher) in rules {
+                        if let Some(reason) = account_pattern_bytes(key, &mut total_pattern_bytes) {
+                            return Some(reason);
+                        }
+                        let patterns = match matcher {
+                            QueryMatcher::Glob(value) => std::slice::from_ref(value),
+                            QueryMatcher::Any(values) => values.any.as_slice(),
+                        };
+                        for pattern in patterns {
+                            if let Some(reason) =
+                                account_pattern_bytes(pattern, &mut total_pattern_bytes)
+                            {
+                                return Some(reason);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2042,7 +2131,7 @@ fn resource_limit_detail(metric: &str, observed: usize, limit: usize) -> String 
 fn unsupported_allow(rule: &Allow) -> bool {
     rule.method.is_empty()
         || !rule.command.is_empty()
-        || !rule.query.is_empty()
+        || !query::supported(&rule.query)
         || !rule.operation_type.is_empty()
         || !rule.operation_name.is_empty()
         || !rule.fields.is_empty()
@@ -2056,7 +2145,7 @@ fn unsupported_allow(rule: &Allow) -> bool {
 fn unsupported_deny(rule: &DenyRule) -> bool {
     rule.method.is_empty()
         || !rule.command.is_empty()
-        || !rule.query.is_empty()
+        || !query::supported(&rule.query)
         || !rule.operation_type.is_empty()
         || !rule.operation_name.is_empty()
         || !rule.fields.is_empty()
