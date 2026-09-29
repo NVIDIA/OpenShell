@@ -17,6 +17,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot "windows-mxc-e2e-environment.ps1")
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
     throw "windows-mxc-ocsf-audit-e2e.ps1 requires Windows."
@@ -87,13 +88,10 @@ function Get-AvailablePort {
 }
 
 $passed = $false
-$oldAppData = $env:APPDATA
-$oldLocalAppData = $env:LOCALAPPDATA
+$environmentSnapshot = $null
 
 try {
-    $env:APPDATA = Join-Path $StageDir "appdata"
-    $env:LOCALAPPDATA = Join-Path $StageDir "localappdata"
-    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+    $environmentSnapshot = Push-OpenShellMxcE2eEnvironment -StageDir $StageDir
 
     $runner = Join-Path $StageDir "run-ocsf-audit.ps1"
     $share = Join-Path $StageDir "share"
@@ -152,8 +150,9 @@ try {
         }
     throw
 } finally {
-    $env:APPDATA = $oldAppData
-    $env:LOCALAPPDATA = $oldLocalAppData
+    if ($null -ne $environmentSnapshot) {
+        Pop-OpenShellMxcE2eEnvironment -Snapshot $environmentSnapshot
+    }
     if ($passed -and -not $KeepArtifacts -and (Test-Path -LiteralPath $StageDir)) {
         Remove-Item -LiteralPath $StageDir -Recurse -Force
     } else {

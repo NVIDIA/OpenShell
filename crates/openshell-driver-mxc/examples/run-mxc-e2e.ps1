@@ -107,6 +107,14 @@ function Quote-NativeArgument([string]$value) {
     return $quoted.ToString()
 }
 
+function New-CmdWriteCommand([string]$value, [string]$path) {
+    if ($path.Contains('"')) {
+        throw "cmd.exe write target contains an invalid quote: $path"
+    }
+    $normalizedPath = $path.Replace('\', '/')
+    return "echo $value 1> `"$normalizedPath`""
+}
+
 function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $filePath
@@ -548,23 +556,23 @@ try {
             $mockDenyAttempted = $true
             if ($sc.Kind -eq "positive") {
                 Remove-Item $sc.PosTarget -Force -ErrorAction SilentlyContinue
-                $command = @($cmdExe, "/c", "echo ok 1> $($sc.PosTarget.Replace('\', '/'))")
+                $command = @($cmdExe, "/c", (New-CmdWriteCommand "ok" $sc.PosTarget))
             } elseif ($sc.Kind -eq "deny") {
                 Remove-Item $sc.DenyTarget -Force -ErrorAction SilentlyContinue
-                $denied = $sc.DenyTarget.Replace('\', '/')
+                $deniedCommand = New-CmdWriteCommand "denied" $sc.DenyTarget
                 if ($sc.ControlTarget) {
                     Remove-Item $sc.ControlTarget -Force -ErrorAction SilentlyContinue
-                    $control = $sc.ControlTarget.Replace('\', '/')
+                    $controlCommand = New-CmdWriteCommand "ok" $sc.ControlTarget
                     if ($Mock) {
                         # The in-process shim authorizes or denies a whole command.
                         # Use a separate denied-only launch below so mock CI exercises
                         # both branches instead of allowing both redirects together.
-                        $command = @($cmdExe, "/c", "echo ok 1> $control")
+                        $command = @($cmdExe, "/c", $controlCommand)
                     } else {
-                        $command = @($cmdExe, "/c", "echo ok 1> $control & echo denied 1> $denied")
+                        $command = @($cmdExe, "/c", "$controlCommand & $deniedCommand")
                     }
                 } else {
-                    $command = @($cmdExe, "/c", "echo denied 1> $denied")
+                    $command = @($cmdExe, "/c", $deniedCommand)
                 }
             } else {
                 $command = @($cmdExe, "/c", "exit 0")
@@ -619,7 +627,7 @@ try {
                 $launchCountBefore = ([regex]::Matches($gwText, 'MXC agent launched')).Count
                 $denyDriverConfig = @{
                     mxc = @{
-                        command = @($cmdExe, "/c", "echo denied 1> $denied")
+                        command = @($cmdExe, "/c", $deniedCommand)
                         cwd = $demoDirFwd
                     }
                 } | ConvertTo-Json -Compress -Depth 4

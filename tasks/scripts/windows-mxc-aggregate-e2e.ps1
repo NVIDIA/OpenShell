@@ -17,6 +17,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot "windows-mxc-e2e-environment.ps1")
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
     throw "windows-mxc-aggregate-e2e.ps1 requires Windows."
@@ -62,7 +63,7 @@ if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
     }
 }
 $ArtifactRoot = [System.IO.Path]::GetFullPath($ArtifactRoot)
-$StageDir = [System.IO.Path]::GetFullPath((Join-Path $ArtifactRoot "openshell-mxc-aggregate-e2e-$Target"))
+$StageDir = [System.IO.Path]::GetFullPath((Join-Path $ArtifactRoot "openshell mxc aggregate e2e-$Target"))
 $expectedPrefix = $ArtifactRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 if (-not $StageDir.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "refusing to use staging path outside artifact root: $StageDir"
@@ -88,13 +89,10 @@ function Get-AvailablePort {
 }
 
 $passed = $false
-$oldAppData = $env:APPDATA
-$oldLocalAppData = $env:LOCALAPPDATA
+$environmentSnapshot = $null
 
 try {
-    $env:APPDATA = Join-Path $StageDir "appdata"
-    $env:LOCALAPPDATA = Join-Path $StageDir "localappdata"
-    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+    $environmentSnapshot = Push-OpenShellMxcE2eEnvironment -StageDir $StageDir
 
     $runner = Join-Path $StageDir "run-mxc-e2e.ps1"
     $demoDir = Join-Path $StageDir "demo"
@@ -141,8 +139,9 @@ try {
         }
     throw
 } finally {
-    $env:APPDATA = $oldAppData
-    $env:LOCALAPPDATA = $oldLocalAppData
+    if ($null -ne $environmentSnapshot) {
+        Pop-OpenShellMxcE2eEnvironment -Snapshot $environmentSnapshot
+    }
     if ($passed -and -not $KeepArtifacts -and (Test-Path -LiteralPath $StageDir)) {
         Remove-Item -LiteralPath $StageDir -Recurse -Force
     } else {

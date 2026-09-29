@@ -53,6 +53,8 @@ In scope:
 - Running focused unsupported-driver contract tests.
 - Running the shipped Ollama and cloud-inference MXC examples against the
   in-process `wxc` mock and a local API stub.
+- Running the shipped provider-credential, OCSF audit, and aggregate MXC
+  examples against the in-process `wxc` mock.
 - Reporting test counts, skipped/gated areas, warnings, artifacts, and logs.
 - Keeping Linux and macOS build paths unchanged.
 - Keeping unsupported Windows compute drivers explicit and testable.
@@ -161,6 +163,9 @@ mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
 mise run --skip-tools windows:e2e:mxc:inference-mock:x64
+mise run --skip-tools windows:e2e:mxc:provider-mock
+mise run --skip-tools windows:e2e:mxc:ocsf-mock
+mise run --skip-tools windows:e2e:mxc:aggregate-mock
 ```
 
 Use the `arm64` form of the inference task on a native ARM64 host. It exercises
@@ -168,6 +173,13 @@ the real gateway, CLI, and shipped PowerShell runners with an in-process `wxc`
 mock and local HTTP responses. It proves example wiring, request execution, and
 sandbox-scoped credential propagation; it does not prove MXC, AppContainer,
 filesystem, or network enforcement.
+
+The provider mock proves provider/profile/policy attachment and placeholder
+propagation without exposing the synthetic credential. The OCSF mock proves
+the durable zero-provider-events diagnostic path. The aggregate mock exercises
+the read-write, read-only, default-deny, and unsupported-network-policy
+scenarios, including a staging path containing spaces. These remain wiring
+checks; native MXC qualification is required for enforcement evidence.
 
 The two `windows:test:mxc-real:*` tasks are host-specific and mutually
 exclusive on a single host (each rejects the other architecture -- see the
@@ -231,10 +243,11 @@ entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
 dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy
 for the Windows-supported workspace and e2e crates plus Rust tests, build
-release binaries, and run both shipped MXC inference examples through the mock
-task. Pushes to `main` and manual dispatches run the same lint and test commands
-in a cache-seed job, followed by a dependent release-binary build and
-mock-example job. The seed and PR jobs use the same cache namespaces. Merge
+release binaries, and run the inference, provider-credential, OCSF audit, and
+aggregate shipped examples through their mock tasks. Pushes to `main` and
+manual dispatches run the same lint and test commands in a cache-seed job,
+followed by a dependent release-binary build and mock-example job. The seed and
+PR jobs use the same cache namespaces. Merge
 queues do not run this workflow. Main/manual seed and build jobs use job-level
 `continue-on-error: true`; opt-in PR jobs report failures normally. Applying
 the label alone does not start a run: re-run all jobs in the current mirror
@@ -286,6 +299,9 @@ crypto dependency builds.
 | `windows:test:mxc-gb300:arm64` | Runs the required native ARM64 ProcessContainer subset and fails when a test skips. |
 | `windows:e2e:mxc:inference-mock:x64` | Runs the shipped Ollama and cloud-inference demos on native x64 through the real gateway and CLI, in-process `wxc` mock, and local API stub. This is wiring evidence, not MXC enforcement evidence. |
 | `windows:e2e:mxc:inference-mock:arm64` | Runs the same mock-wiring checks on native ARM64 with ARM64 release binaries. |
+| `windows:e2e:mxc:provider-mock` | Runs the shipped provider-credential demo with a synthetic credential and verifies placeholder propagation without leaking the credential. |
+| `windows:e2e:mxc:ocsf-mock` | Runs the shipped OCSF audit demo and verifies the durable zero-provider-events finding. |
+| `windows:e2e:mxc:aggregate-mock` | Runs the four aggregate MXC scenarios through the mock, including a staging path containing spaces. |
 | `windows:qualify:mxc:gb300:contract` | Validates the required/optional/unsupported/architecture-constrained GB300 matrix. |
 | `windows:qualify:mxc:gb300` | Runs the fail-closed GB300 ARM64 gate and validates hash-bound evidence. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
@@ -338,8 +354,8 @@ When reporting `windows:ci`, distinguish these categories:
 - Passed tests from the full ARM64 workspace test log when run on a native
   ARM64 host.
 - The focused unsupported-contract re-run.
-- The architecture-matched MXC inference-example mock task and its explicit
-  wiring-only limitation.
+- The architecture-matched MXC inference, provider-credential, OCSF audit, and
+  aggregate mock tasks and their explicit wiring-only limitation.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.
