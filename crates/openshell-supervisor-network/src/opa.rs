@@ -4548,7 +4548,7 @@ process:
                 match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
                     Ok(_) => accepted.push(format!("{field} (versioned={versioned})")),
                     Err(error) => {
-                        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"])
+                        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"]);
                     }
                 }
             }
@@ -4586,7 +4586,7 @@ process:
                 match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
                     Ok(_) => accepted.push(invalid.clone()),
                     Err(error) => {
-                        assert_safe_load_error(&error, &["root", "private-path", "4294967295"])
+                        assert_safe_load_error(&error, &["root", "private-path", "4294967295"]);
                     }
                 }
             }
