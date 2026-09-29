@@ -21,14 +21,22 @@ Prerequisites
     copy in a regular directory. Do not use a copy from an installed MSIX or
     WindowsApps package directory; its package ACLs can make CreateSandbox
     fail with "wxc-exec spawn failed: Access is denied. (os error 5)".
-  - Before the first process_container run, obtain wxc-host-prep.exe from the
-    MXC binaries distribution. In an elevated PowerShell session, run this
-    one-time host setup command:
+  - Before the first process_container run, check the selected isolation tier
+    and host-preparation warnings in PowerShell:
+      & "C:\path\to\wxc-exec.exe" --probe
+    Only if the probe selects AppContainer + DACL (appcontainer-dacl) and
+    recommends prepare-system-drive, obtain wxc-host-prep.exe from the MXC
+    binaries distribution and run this once in elevated PowerShell:
       & "C:\path\to\wxc-host-prep.exe" prepare-system-drive
-    This makes a persistent, host-wide ACL change for the AppContainer
-    well-known SIDs. If wxc-exec starts but the agent exits with
-    "wxc-exec stderr: Access is denied." or exit code 1, confirm this command
-    completed successfully.
+    BaseContainer and AppContainer + BFS do not require this preparation.
+    The persistent, host-wide ACL change grants the AppContainer well-known
+    SIDs metadata access to the system-drive root only; it does not grant
+    directory listing or write access, or change descendant ACLs.
+    If wxc-exec starts but the agent exits with "wxc-exec stderr: Access is
+    denied." or exit code 1, check the probe warnings before changing host
+    ACLs; these errors alone do not identify missing host preparation.
+    For verification, other host prerequisites, and rollback, see:
+      https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
   - Local demo: an Ollama-compatible service on 127.0.0.1:11434 by default.
     Override -OllamaHost, -OllamaPort, and -Model when needed.
   - Cloud demo: NV_API_KEY and outbound HTTPS to integrate.api.nvidia.com.

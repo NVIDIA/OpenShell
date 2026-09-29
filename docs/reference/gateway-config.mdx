@@ -941,19 +941,30 @@ gateway from starting the executable outside its package context. If sandbox
 creation fails with `wxc-exec spawn failed: Access is denied. (os error 5)`,
 verify that `wxc_exec_path` points to the standalone copy.
 
-Before the first live `process_container` run, obtain `wxc-host-prep.exe` from
-the MXC binaries distribution and run this command once in an elevated
-PowerShell session:
+Before the first live `process_container` run, check the selected isolation
+tier and host-preparation warnings in PowerShell:
+
+```shell
+& "C:\path\to\wxc-exec.exe" --probe
+```
+
+If the probe selects AppContainer + DACL (`appcontainer-dacl`) and recommends
+`prepare-system-drive`, obtain `wxc-host-prep.exe` from the MXC binaries
+distribution and run this command once in an elevated PowerShell session.
+BaseContainer and AppContainer + BFS do not require this preparation.
 
 ```shell
 & "C:\path\to\wxc-host-prep.exe" prepare-system-drive
 ```
 
-This command makes a persistent, host-wide ACL change that gives the
-AppContainer well-known SIDs the minimum access needed to inspect the system
-drive root. If `wxc-exec.exe` starts but the agent exits with
-`wxc-exec stderr: Access is denied.` or exit code 1, confirm that the elevated
-host-preparation command completed successfully.
+This persistent, host-wide change adds non-inheriting ACL entries that give
+the AppContainer well-known SIDs metadata access to the system-drive root. It
+does not grant directory listing or write access, or change descendant ACLs.
+If `wxc-exec.exe` starts but the agent exits with
+`wxc-exec stderr: Access is denied.` or exit code 1, check the probe warnings
+before changing host ACLs; these errors alone do not identify missing host
+preparation. See Microsoft's [MXC host-preparation guide](https://github.com/microsoft/mxc/blob/main/docs/host-prep.md)
+for verification, other host prerequisites, and rollback instructions.
 
 ```toml
 [openshell]
