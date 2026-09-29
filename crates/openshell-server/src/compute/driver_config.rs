@@ -120,6 +120,19 @@ pub fn admission_config_from_context(
     name: &str,
 ) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
     let mut table = toml::map::Map::new();
+    if name == "mxc" {
+        // MXC needs caller command JSON and cannot resolve labels for its host
+        // filesystem grants. Keep the gateway's expected policy in sync with
+        // MxcComputeConfig::default() when these fields are omitted.
+        table.insert("allow_driver_config".into(), toml::Value::Boolean(true));
+        table.insert(
+            "resource_admission".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "enabled".into(),
+                toml::Value::Boolean(false),
+            )])),
+        );
+    }
     if let Some(config) = context
         .file
         .and_then(|file| file.openshell.drivers.get(name))
@@ -129,6 +142,15 @@ pub fn admission_config_from_context(
                 table.insert(field.into(), value.clone());
             }
         }
+    }
+    if name == "mxc"
+        && let Some(resource_admission) = table
+            .get_mut("resource_admission")
+            .and_then(toml::Value::as_table_mut)
+    {
+        resource_admission
+            .entry("enabled")
+            .or_insert(toml::Value::Boolean(false));
     }
     let policy: openshell_core::resource_admission::DriverAdmissionConfig =
         toml::Value::Table(table).try_into().map_err(|error| {
@@ -260,8 +282,8 @@ mod tests {
     }
 
     #[test]
-    fn common_admission_defaults_and_replacement_apply_to_every_driver() {
-        for name in ["kubernetes", "docker", "podman", "vm", "mxc", "external"] {
+    fn common_admission_defaults_and_replacement_apply_to_other_drivers() {
+        for name in ["kubernetes", "docker", "podman", "vm", "external"] {
             let defaults = admission_config_from_context(test_context(None), name).unwrap();
             assert!(!defaults.allow_driver_config);
             assert!(defaults.resource_admission.enabled);
@@ -276,6 +298,33 @@ mod tests {
                 BTreeMap::from([("example.com/approved".into(), "yes".into())])
             );
         }
+    }
+
+    #[test]
+    fn mxc_admission_defaults_and_explicit_settings() {
+        let defaults = admission_config_from_context(test_context(None), "mxc").unwrap();
+        assert!(defaults.allow_driver_config);
+        assert!(!defaults.resource_admission.enabled);
+
+        let file: config_file::ConfigFile = toml::from_str("[openshell.drivers.mxc]\n").unwrap();
+        assert_eq!(
+            admission_config_from_context(test_context(Some(&file)), "mxc").unwrap(),
+            defaults
+        );
+
+        let file: config_file::ConfigFile = toml::from_str(
+            "[openshell.drivers.mxc]\nallow_driver_config = false\n[openshell.drivers.mxc.resource_admission]\nenabled = true\n",
+        )
+        .unwrap();
+        let explicit = admission_config_from_context(test_context(Some(&file)), "mxc").unwrap();
+        assert!(!explicit.allow_driver_config);
+        assert!(explicit.resource_admission.enabled);
+
+        let file: config_file::ConfigFile =
+            toml::from_str("[openshell.drivers.mxc.resource_admission]\n").unwrap();
+        let partial = admission_config_from_context(test_context(Some(&file)), "mxc").unwrap();
+        assert!(partial.allow_driver_config);
+        assert!(!partial.resource_admission.enabled);
     }
 
     #[test]
