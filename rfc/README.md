@@ -24,9 +24,8 @@ OpenShell has several places where design information lives. Use this guide to p
 | **GitHub issue** | Track and scope a bug, feature request, or rough idea | Always start here; new features use the feature request template |
 | **Spike issue** (`create-spike`) | Investigate implementation feasibility for a scoped change | You need to explore the codebase and produce a buildable issue for a specific component or feature |
 | **RFC** | Propose a cross-cutting decision that needs broad consensus | Maintainers requested an RFC from an existing issue and assigned an RFC number |
-| **Architecture doc** (`architecture/`) | Document how things work today | Living reference material — updated as the system evolves |
 
-The key distinction: **spikes investigate whether and how something can be done; RFCs propose that we should do it and seek agreement on the approach.** A spike may precede an RFC (to gather data) or follow one (to flesh out implementation details). When an RFC reaches `implemented`, its relevant content should be folded into the appropriate `architecture/` docs so the living reference stays current.
+The key distinction: **spikes investigate whether and how something can be done; RFCs propose that we should do it and seek agreement on the approach.** A spike may precede an RFC (to gather data) or follow one (to flesh out implementation details).
 
 ## When to use an RFC
 

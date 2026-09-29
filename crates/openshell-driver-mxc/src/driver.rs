@@ -414,9 +414,11 @@ fn append_tls_readwrite_grant(
 }
 
 impl MxcComputeBackend {
-    pub fn new(config: MxcComputeConfig) -> Self {
+    /// Create an MXC backend whose audit records identify the configured gateway.
+    pub fn new(gateway_name: impl Into<String>, config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
         let (watch_tx, _) = broadcast::channel(256);
+        let gateway_name = gateway_name.into();
 
         // Start the Plane-A ETW → OCSF consumer if enabled. The consumer thread
         // attributes each event to a `sandbox_id` via `attribution` (seeded by
@@ -426,7 +428,7 @@ impl MxcComputeBackend {
             crate::etw_consumer::AttributionIndex::new(),
         ));
         let etw_session = if config.etw_audit {
-            match crate::etw_consumer::start_session(attribution.clone()) {
+            match crate::etw_consumer::start_session(attribution.clone(), gateway_name) {
                 Ok(session) => Some(session),
                 Err(e) => {
                     warn!(error = %e, "MXC ETW audit consumer failed to start; continuing without it");
