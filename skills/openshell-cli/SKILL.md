@@ -377,6 +377,8 @@ attachments running. Configure VS Code Remote-SSH with:
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
+A writable attachment that finds another attachment holding stdin reports `attached read-only; retry input after the owner disconnects`. Automatic recovery can hit this when it reattaches before the supervisor closes the dead connection. The supervisor closes a connection 60 seconds after it last received bytes from it, which can be later than 60 seconds after the network failed if the relay buffered data. After the old owner disconnects or times out, send the input you meant to type next. If stdin is free, the attachment prints `input enabled` and forwards that input to the process, so do not probe with Enter or a prompt answer such as `y`. If nothing prints, the old connection still holds stdin. Input sent while the attachment was read-only never reaches the process, so send it again later. `Ctrl-C`, `Ctrl-D`, and `Ctrl-P` then `Ctrl-Q` still exit a read-only attachment instead of enabling input; enable input first if you need `Ctrl-C` to interrupt the process. Recovery never takes stdin from a healthy owner, and an explicitly read-only attachment stays read-only.
+
 If `connect` reports `canonical main process already finished`, inspect the
 result with `sandbox get`. A pending foreground attachment can still retrieve
 retained output in `Completed` or `Error`; phase alone does not determine
