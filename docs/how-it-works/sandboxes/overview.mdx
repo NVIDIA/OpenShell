@@ -278,6 +278,10 @@ process. It retries transient transport failures for up to 60 seconds. Initial
 authentication failures, sandbox lifecycle changes, and clean SSH exits are
 not retried.
 
+The supervisor sends SSH keepalive probes after 15 seconds without inbound traffic and closes a connection after 60 seconds without receiving peer bytes, including when relay writes are stalled. Healthy idle clients answer these probes and stay attached. The timeout starts when the supervisor last reads peer bytes; relay buffering and scheduling can delay detection after physical network loss. The canonical process keeps running when its dead attachment closes.
+
+If recovery reaches the sandbox before the old connection releases stdin, the replacement reports `attached read-only`. After the old connection times out, type again: the replacement acquires stdin if it is available, reports `input enabled`, and forwards that new input. Keystrokes sent while another attachment owned stdin are discarded. An explicitly read-only attachment stays read-only, and recovery never displaces a healthy input owner.
+
 `Ctrl-C` retains its normal terminal behavior and interrupts the foreground
 process. For read-only attachments, `Ctrl-C` or `Ctrl-D` exits only the current
 viewer.

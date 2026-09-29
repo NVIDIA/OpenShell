@@ -135,6 +135,8 @@ can contain a valid sequence gap.
 
 ## Sandbox-Local Surfaces
 
+Supervisor SSH connections send a keepalive after 15 seconds without inbound traffic and enforce a 60-second receive deadline, including while transport writes are blocked. Only received peer bytes renew that deadline; outgoing process output does not. The interval starts at the supervisor's last read, so bytes already buffered by a relay can delay detection relative to physical network loss. Deadline observation also depends on executor scheduling. An expired connection releases its canonical stdin lease through handler cleanup.
+
 | Surface | Current bound | Scope and behavior |
 |---|---:|---|
 | `policy.local` request body | 64 KiB and 15 s read | Reject an oversized or stalled local request. |

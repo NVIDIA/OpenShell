@@ -712,6 +712,10 @@ set both.
 
 ## Connect and Logs
 
+The supervisor probes SSH peers after 15 seconds without inbound traffic and closes a connection after 60 seconds without received peer bytes. The receive deadline also runs during blocked transport writes, so a stalled relay cannot indefinitely retain canonical stdin. Healthy idle clients answer the probes. Closing an attachment releases its input lease while the canonical process keeps running.
+
+A writable attachment that reconnects before the previous lease is released reports that it is read-only. Later ordinary input retries the existing exclusive acquisition; success reports `input enabled` and forwards that new input. Earlier rejected keystrokes are discarded. Explicit read-only viewers, EOF, and detach requests never acquire the released lease, and a healthy owner is never displaced.
+
 The supervisor runs an SSH server on a Unix socket inside the sandbox. The
 gateway reaches it through the outbound supervisor relay, not by dialing the
 sandbox workload directly. The relay supports:

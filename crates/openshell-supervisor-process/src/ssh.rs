@@ -26,6 +26,14 @@ const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
 const MAIN_DETACH_EOF: u8 = 0x04;
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+
+mod peer_stream;
+
+#[cfg(test)]
+#[path = "ssh/reconnect_tests.rs"]
+mod reconnect_tests;
 
 fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
     let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
@@ -70,6 +78,9 @@ fn ssh_server_init(
     let mut config = russh::server::Config {
         server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
+        // Peer replies keep idle attachments alive without relying on shell I/O.
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: 3,
         ..Default::default()
     };
     config.keys.push(host_key);
@@ -159,9 +170,15 @@ pub async fn run_ssh_server(
                 let main_session = main_session.clone();
 
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        handle_connection(stream, config, port_forward, boundary_exec, main_session)
-                            .await
+                    if let Err(err) = handle_connection(
+                        stream,
+                        config,
+                        port_forward,
+                        boundary_exec,
+                        main_session,
+                        SSH_PEER_TIMEOUT,
+                    )
+                    .await
                     {
                         ocsf_emit!(
                             SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -300,6 +317,7 @@ async fn handle_connection(
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
+    peer_timeout: Duration,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -316,9 +334,12 @@ async fn handle_connection(
     );
 
     let handler = SshHandler::new(port_forward, boundary_exec, main_session);
+    let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
-        .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
+        .map_err(|err| miette::miette!("ssh stream error: {err}"))?
+        .await
+        .map_err(|err| miette::miette!("ssh session error: {err}"))?;
     Ok(())
 }
 
@@ -339,6 +360,9 @@ struct ChannelState {
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
+    /// A writable attachment denied stdin may retry on later input. Explicit
+    /// viewers and channels that sent EOF must never acquire a new lease.
+    main_input_pending: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
 }
@@ -704,6 +728,7 @@ impl russh::server::Handler for SshHandler {
                     Err(error) => (None, Some(error)),
                 }
             };
+            state.main_input_pending = warning.is_some();
             state.input_sender = input;
             state.main_detach_prefix_pending = false;
             let mut output = main_session.subscribe();
@@ -715,7 +740,7 @@ impl russh::server::Handler for SshHandler {
                     .extended_data(
                         channel,
                         1,
-                        format!("openshell: {error}; attached read-only; press Ctrl-C or Ctrl-D to exit{line_ending}").into_bytes(),
+                        format!("openshell: {error}; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}").into_bytes(),
                     )
                     .await;
             }
@@ -831,11 +856,35 @@ impl russh::server::Handler for SshHandler {
                 .await;
             return Ok(());
         }
-        let (forward, detach) = if state.main_attached {
+        let denied_prefix = state.main_input_pending && state.main_detach_prefix_pending;
+        let (mut forward, detach) = if state.main_attached {
             filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
         } else {
             (data.to_vec(), false)
         };
+        // Remember a denied viewer's prefix only to recognize split detach
+        // sequences. It must not become process input when a later frame wins
+        // the lease: that earlier keystroke was sent without write ownership.
+        if denied_prefix && forward.first() == Some(&MAIN_DETACH_PREFIX) {
+            forward.remove(0);
+        }
+        // A reconnect can precede detection of the old connection's failure.
+        // Retry only on new input, using the same exclusive acquisition as a
+        // fresh attachment. Detach keys retain their read-only behavior.
+        if state.main_attached
+            && state.main_input_pending
+            && !state.main_read_only
+            && !detach
+            && !forward.is_empty()
+            && let Some(main_session) = self.main_session.as_ref()
+            && !main_session.finished()
+            && let Ok((owner, input)) = main_session.acquire_input()
+        {
+            state.main_input_owner = Some(owner);
+            state.input_sender = Some(InputSender::Main(input));
+            state.main_input_pending = false;
+            session.extended_data(channel, 1, b"openshell: input enabled\r\n".to_vec())?;
+        }
         let error = (!forward.is_empty())
             .then(|| state.input_sender.as_ref()?.send(forward).err())
             .flatten();
@@ -866,6 +915,7 @@ impl russh::server::Handler for SshHandler {
                 main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
@@ -1086,6 +1136,7 @@ impl SshHandler {
                 main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
@@ -1221,7 +1272,7 @@ mod tests {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    struct AcceptAnyServerKey;
+    pub(super) struct AcceptAnyServerKey;
 
     impl russh::client::Handler for AcceptAnyServerKey {
         type Error = russh::Error;
@@ -1234,7 +1285,7 @@ mod tests {
         }
     }
 
-    struct TestLoopbackConnector;
+    pub(super) struct TestLoopbackConnector;
 
     #[async_trait::async_trait]
     impl openshell_isolation_interface::contract::BoundaryLoopbackConnector for TestLoopbackConnector {
@@ -1256,7 +1307,7 @@ mod tests {
         }
     }
 
-    struct RejectingExec;
+    pub(super) struct RejectingExec;
 
     #[async_trait::async_trait]
     impl openshell_isolation_interface::contract::BoundaryExec for RejectingExec {
@@ -1546,7 +1597,7 @@ mod tests {
                 assert_eq!(
                     String::from_utf8_lossy(&data),
                     format!(
-                        "openshell: canonical main process already has an input owner; attached read-only; press Ctrl-C or Ctrl-D to exit{line_ending}"
+                        "openshell: canonical main process already has an input owner; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}"
                     )
                 );
             }
