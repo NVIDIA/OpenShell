@@ -2623,6 +2623,14 @@ mod lifecycle_tests {
         driver_sandbox_with_command(id, "", vec![shell, "/c".into(), "exit 0".into()])
     }
 
+    fn inbox_powershell() -> String {
+        let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+        Path::new(&system_root)
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[tokio::test]
     async fn termination_confirmation_rejects_closed_unconfirmed_channel() {
         let (tx, mut rx) = watch::channel(false);
@@ -3466,7 +3474,7 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
@@ -3527,7 +3535,7 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
@@ -3886,7 +3894,7 @@ mod lifecycle_tests {
             out_tmp.path().to_string_lossy().replace('\\', "/")
         );
         let cmd = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("Set-Content -LiteralPath {out_path} -Value hi"),
@@ -3945,7 +3953,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
@@ -3988,7 +3996,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
@@ -4039,7 +4047,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
