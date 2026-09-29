@@ -875,7 +875,7 @@ pub(crate) async fn run_server(
                 None,
                 Vec::new(),
             )?;
-            metrics_tls_acceptor.spawn_reload_worker(shutdown_rx.clone());
+            metrics_tls_acceptor.spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
 
             info!(address = %metrics_bind_address, "Metrics TLS server listening");
             tokio::spawn(serve_tls_metrics_listener(
