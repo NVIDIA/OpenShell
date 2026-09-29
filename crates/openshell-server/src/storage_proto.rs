@@ -118,13 +118,16 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Restart policy is stored in SandboxSpec, and the count and well-known
-    // timestamps are stored in SandboxStatus. Legacy payloads decode with
-    // Unspecified (treated as Never), zero count, and absent timestamps.
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Restart policy is stored
+    // in SandboxSpec, and the count and well-known timestamps are stored in
+    // SandboxStatus. Existing numbers and fields are unchanged, so prior
+    // payloads retain their meaning. The frozen storage V1 schema and the set
+    // of public/durable type names are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b1f9b34f035234e1032685eb4fc829950acad63a971b3abd37a2ccbbec783531";
+        "92c8410cd40561d6c2506d805807b7ca217317be37d73c1335c0c4d4c1082ce7";
     const DURABLE_SCHEMA_SHA256: &str =
-        "517561b578c88d28ffd74d128faf668e65aef03c784dd794aeb5208e1dbf6de3";
+        "8f2fcbd45dfba056c7719e03430614acf5a5333b9ca228628d8b642a6d450fbd";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "d60c0a91163bcdd6c29e24c64e0f00555f914240465f94295d800e9063171bef";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
