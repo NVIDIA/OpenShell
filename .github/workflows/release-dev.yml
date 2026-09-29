@@ -159,7 +159,6 @@ jobs:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]
@@ -170,7 +169,6 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
