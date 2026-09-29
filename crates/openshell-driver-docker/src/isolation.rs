@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use openshell_core::cdi::CdiContext;
 use openshell_isolation_interface::contract::{
     BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
@@ -70,6 +71,7 @@ pub struct DockerBoundarySpec {
     pub container_id: String,
     pub image_identity: String,
     pub gpu_requested: bool,
+    pub cdi_context: Option<CdiContext>,
     pub listener_socket: PathBuf,
     pub control_socket: PathBuf,
     pub sandbox_tls: SandboxTlsServerConfig,
@@ -118,7 +120,7 @@ impl DockerBoundarySpec {
                 },
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
-                cdi_context: None,
+                cdi_context: self.cdi_context,
                 workload_identity: self.workload_identity.clone(),
                 outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
@@ -188,6 +190,13 @@ mod tests {
             container_id: "sha256:container".to_string(),
             image_identity: "sha256:image".to_string(),
             gpu_requested: true,
+            cdi_context: Some(CdiContext::new(
+                vec!["nvidia.com/gpu=0".to_string()],
+                vec![openshell_core::cdi::CdiSpecDirectory::new(
+                    openshell_core::cdi::cdi_spec_mount_path(0),
+                    "/var/run/cdi",
+                )],
+            )),
             listener_socket: PathBuf::from("/run/openshell/boundary/control.sock"),
             control_socket: PathBuf::from("/host/control.sock"),
             sandbox_tls: SandboxTlsServerConfig {
@@ -223,6 +232,15 @@ mod tests {
         assert_eq!(
             provisioned.runtime_descriptor.resource_claims[GPU_RESOURCE_CLAIM],
             "true"
+        );
+        assert_eq!(
+            provisioned
+                .boundary_config
+                .cdi_context
+                .as_ref()
+                .unwrap()
+                .selected_devices,
+            ["nvidia.com/gpu=0"]
         );
         assert_eq!(
             provisioned.boundary_config.outer_fence,

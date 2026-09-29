@@ -12,6 +12,12 @@ pub const CDI_CONTEXT_VERSION: u32 = 1;
 /// Base workload-runtime path under which compute drivers mount CDI specification directories.
 pub const CDI_SPEC_DIR_BASE: &str = "/run/openshell/boundary/cdi-specs";
 
+/// Return the workload-runtime path used for a CDI specification directory.
+#[must_use]
+pub fn cdi_spec_mount_path(index: usize) -> String {
+    format!("{CDI_SPEC_DIR_BASE}/{index}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CdiContext {
     pub version: u32,

@@ -23,6 +23,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::cdi::{CdiContext, CdiSpecDirectory, cdi_spec_mount_path};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -311,12 +312,49 @@ struct DockerDriverRuntimeConfig {
     app_armor_profile: Option<AppArmorProfile>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DockerGpuRuntimeCapabilities {
     cdi_supported: bool,
+    cdi_spec_dirs: Vec<String>,
     wsl_all_gpu_fallback_enabled: bool,
 }
 
+impl DockerGpuRuntimeCapabilities {
+    fn cdi_context(&self, gpu_device_ids: Option<&[String]>) -> Result<Option<CdiContext>, Status> {
+        let Some(gpu_device_ids) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty())
+        else {
+            return Ok(None);
+        };
+        self.require_cdi_spec_dirs()?;
+        Ok(Some(CdiContext::new(
+            gpu_device_ids.to_vec(),
+            self.cdi_spec_dirs
+                .iter()
+                .enumerate()
+                .map(|(index, source)| CdiSpecDirectory::new(cdi_spec_mount_path(index), source))
+                .collect(),
+        )))
+    }
+
+    fn cdi_spec_bind_strings(&self) -> Result<Vec<String>, Status> {
+        self.require_cdi_spec_dirs()?;
+        Ok(self
+            .cdi_spec_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, source)| format!("{source}:{}:ro,z", cdi_spec_mount_path(index)))
+            .collect())
+    }
+
+    fn require_cdi_spec_dirs(&self) -> Result<(), Status> {
+        if self.cdi_spec_dirs.is_empty() {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI spec directories reported by the daemon",
+            ));
+        }
+        Ok(())
+    }
+}
 #[derive(Clone)]
 pub struct DockerComputeDriver {
     docker: Arc<Docker>,
@@ -863,14 +901,13 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let cdi_supported = info
-            .cdi_spec_dirs
-            .as_ref()
-            .is_some_and(|dirs| !dirs.is_empty());
+        let cdi_spec_dirs = info.cdi_spec_dirs.clone().unwrap_or_default();
+        let cdi_supported = !cdi_spec_dirs.is_empty();
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
         let gpu = DockerGpuRuntimeCapabilities {
             cdi_supported,
+            cdi_spec_dirs,
             wsl_all_gpu_fallback_enabled,
         };
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
@@ -941,7 +978,7 @@ impl DockerComputeDriver {
                 supervisor_grpc_endpoint,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
-                gpu,
+                gpu: gpu.clone(),
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
                 allow_driver_config: docker_config.allow_driver_config,
@@ -1761,7 +1798,7 @@ impl DockerComputeDriver {
             &created.id,
             &image,
             &workload_identity,
-            gpu_devices.is_some(),
+            gpu_devices.as_deref(),
         )
         .await
         {
@@ -4521,7 +4558,7 @@ async fn prepare_docker_boundary_files(
     container_id: &str,
     image: &DockerImageMetadata,
     workload_identity: &ResolvedWorkloadIdentity,
-    gpu_requested: bool,
+    gpu_device_ids: Option<&[String]>,
 ) -> Result<(), Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
@@ -4551,7 +4588,8 @@ async fn prepare_docker_boundary_files(
         verification_keys,
         container_id: container_id.to_string(),
         image_identity: image.id.clone(),
-        gpu_requested,
+        gpu_requested: gpu_device_ids.is_some_and(|device_ids| !device_ids.is_empty()),
+        cdi_context: config.gpu.cdi_context(gpu_device_ids)?,
         listener_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         control_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         sandbox_tls: SandboxTlsServerConfig {
@@ -5694,7 +5732,10 @@ fn build_container_create_body_for_image(
         }),
         ..Default::default()
     });
-    let user_bind_strings = docker_driver_bind_strings(driver_config)?;
+    let mut user_bind_strings = docker_driver_bind_strings(driver_config)?;
+    if gpu_device_ids.is_some_and(|device_ids| !device_ids.is_empty()) {
+        user_bind_strings.extend(config.gpu.cdi_spec_bind_strings()?);
+    }
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
