@@ -3,7 +3,11 @@
 
 package types
 
-import "time"
+import (
+	"time"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
+)
 
 // createConfig holds configuration for Create calls.
 type createConfig struct {
@@ -42,12 +46,7 @@ func WithServiceExposures(exposures ...ServiceExposure) CreateOption {
 // they passed as nil for an unlabeled sandbox, do not panic.
 func ApplyCreateOptions(opts []CreateOption) createConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg createConfig
-	for _, opt := range opts {
-		if opt == nil {
-			continue
-		}
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
