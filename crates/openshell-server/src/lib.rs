@@ -371,6 +371,15 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
+fn log_metrics_tls_handshake_rejection(error: &std::io::Error, client: SocketAddr) {
+    warn!(
+        event = "metrics_tls_handshake_rejected",
+        error = %error,
+        client = %client,
+        "Rejected metrics TLS handshake; verify that the client uses HTTPS and, when client authentication is enabled, a certificate trusted by the metrics client CA"
+    );
+}
+
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
     openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
@@ -1061,12 +1070,7 @@ async fn serve_tls_metrics_listener(
                     debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
                 }
                 Ok(Err(error)) => {
-                    warn!(
-                        event = "metrics_tls_handshake_rejected",
-                        error = %error,
-                        client = %addr,
-                        "Rejected metrics TLS handshake; verify that the client uses HTTPS and, when client authentication is enabled, a certificate trusted by the metrics client CA"
-                    );
+                    log_metrics_tls_handshake_rejection(&error, addr);
                 }
                 Err(_) => {
                     warn!(client = %addr, "Metrics TLS handshake timed out");
@@ -1945,8 +1949,9 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
-        extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener, serve_tls_metrics_listener, validate_peer_endpoint_scheme,
+        extension_token_ttl, is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
+        validate_peer_endpoint_scheme,
     };
     use axum::{Router, routing::get};
     use openshell_core::{
@@ -2391,6 +2396,59 @@ mod tests {
     async fn stop_listener(shutdown: watch::Sender<bool>, handle: tokio::task::JoinHandle<()>) {
         let _ = shutdown.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[derive(Clone)]
+    struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metrics_tls_handshake_rejection_logs_actionable_context() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+
+        log_metrics_tls_handshake_rejection(
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            "192.0.2.10:443".parse().expect("valid test client address"),
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("WARN"), "log output: {output}");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("untrusted client certificate"),
+            "log output: {output}"
+        );
+        assert!(output.contains("192.0.2.10:443"), "log output: {output}");
+        assert!(
+            output.contains("Rejected metrics TLS handshake"),
+            "log output: {output}"
+        );
     }
 
     #[tokio::test]
