@@ -112,6 +112,60 @@ function Esc([string]$p) { return $p.Replace('\', '\\') }
 # Convert Windows path to forward-slash form (TOML values).
 function Fwd([string]$p) { return $p.Replace('\', '/') }
 
+# Build one CreateProcess-compatible command-line argument. Windows PowerShell
+# 5.1 removes embedded quotes and can split JSON values at embedded spaces when
+# invoking native commands through the call operator.
+function Quote-NativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') { return $value }
+
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append('"')
+    $backslashes = 0
+    foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($ch -eq '"') {
+            [void]$quoted.Append(('\' * (2 * $backslashes + 1)))
+            [void]$quoted.Append('"')
+        } else {
+            if ($backslashes -gt 0) { [void]$quoted.Append(('\' * $backslashes)) }
+            [void]$quoted.Append($ch)
+        }
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) { [void]$quoted.Append(('\' * (2 * $backslashes))) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $filePath
+    $startInfo.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "failed to start $filePath" }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $output = @($stdout.Result, $stderr.Result) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_ -split "`r?`n" } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    return @{
+        ExitCode = $process.ExitCode
+        Output = @($output)
+    }
+}
+
 # -WsPort is NOT actually wired through end to end: the in-sandbox server's
 # port is a compile-time const (WS_PORT = 22000 in mxc-ws-agent.rs) -- the
 # TOML generation below doesn't patch it. Rather than silently accept an
@@ -485,14 +539,15 @@ try {
         # Use the same pattern as run-mxc-e2e.ps1: pass --no-tty with a no-op
         # command so the CLI fires the SSH attempt, fails quickly (connection
         # refused), and returns.  Do NOT gate on exit code here.
-        $createOut = & $cli sandbox create `
-            --name $sandboxName `
-            --policy $policyUsed `
-            --driver-config-json $driverConfigJson `
-            --no-tty `
-            -- cmd.exe /c exit 0 `
-            2>&1
-        $createExitCode = $LASTEXITCODE
+        $createResult = Invoke-NativeCaptured $cli @(
+            "sandbox", "create",
+            "--name", $sandboxName,
+            "--policy", $policyUsed,
+            "--driver-config-json", $driverConfigJson,
+            "--no-tty", "--", "cmd.exe", "/c", "exit", "0"
+        )
+        $createOut = $createResult.Output
+        $createExitCode = $createResult.ExitCode
     } catch {
         $createOut = $_.Exception.Message; $createExitCode = 1
     }

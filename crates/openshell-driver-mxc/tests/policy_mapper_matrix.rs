@@ -27,8 +27,8 @@ use openshell_core::proto::{
     NetworkPolicyRule, ProcessPolicy, SandboxPolicy, UiClipboardAccess, UiPolicy,
 };
 use openshell_driver_mxc::{
-    EmbeddedPolicyMapper, MapCtx, MapError, MxcMappingOptions, PolicyMapper, map_to_mxc,
-    split_policy,
+    DEFAULT_COARSE_MXC_VERSION, DEFAULT_MXC_VERSION, EmbeddedPolicyMapper, MapCtx, MapError,
+    MxcMappingOptions, PolicyMapper, map_to_mxc, split_policy,
 };
 use openshell_policy::{serialize_sandbox_policy, validate_sandbox_policy};
 use serde_json::Value;
@@ -131,6 +131,26 @@ fn assert_single_loss(
 }
 
 // ─── QUADRANT A: mappable fields, assert exact MXC output ───────────────────
+
+/// The standalone coarse mapper and live governed-egress path intentionally
+/// target different schema shapes. Keep the compatibility constant scoped to
+/// the coarse artifact and prevent either side from silently drifting.
+#[test]
+fn a_schema_versions_match_their_distinct_network_shapes() {
+    let policy = SandboxPolicy::default();
+    let coarse = map_to_mxc(&policy, &default_opts()).config;
+    assert_eq!(DEFAULT_MXC_VERSION, DEFAULT_COARSE_MXC_VERSION);
+    assert_eq!(coarse["version"], DEFAULT_COARSE_MXC_VERSION);
+    assert!(coarse["network"].get("allowedHosts").is_some());
+    assert!(coarse["network"].get("egress").is_none());
+
+    let governed = split_policy(&policy, &pc_split_opts())
+        .expect("governed split must exist when a proxy redirect is configured")
+        .mxc_config;
+    assert_eq!(governed["version"], "0.8.0-alpha");
+    assert!(governed["network"].get("allowedHosts").is_none());
+    assert!(governed["network"].get("egress").is_some());
+}
 
 /// filesystem.read_write → readwritePaths verbatim, order preserved.
 #[test]

@@ -17,7 +17,7 @@ use openshell_core::proto::{
 use serde_json::{Value, json};
 
 use super::config::{
-    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, add_backend_network_loss,
+    DEFAULT_COARSE_MXC_VERSION, DEFAULT_COMMAND, DEFAULT_CONTAINMENT, add_backend_network_loss,
     add_backend_specific_config, default_enforcement_mode, filesystem_default_deny_message,
 };
 use super::loss::{LossItem, add_loss};
@@ -27,8 +27,9 @@ use crate::mxc::MXC_SCHEMA_VERSION;
 /// coarse map (e.g. `proxy_redirect`) are reserved for the governed-egress split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
-    /// MXC schema version written into coarse-map output. The governed-egress
-    /// split uses the driver's MXC 0.8 schema.
+    /// Caller-selectable schema version written only into standalone coarse-map
+    /// output. The governed-egress split and live driver requests instead use
+    /// [`MXC_SCHEMA_VERSION`].
     pub mxc_version: String,
     /// MXC containment backend.
     pub containment: String,
@@ -52,7 +53,7 @@ pub struct MxcMappingOptions {
 impl Default for MxcMappingOptions {
     fn default() -> Self {
         Self {
-            mxc_version: DEFAULT_MXC_VERSION.to_owned(),
+            mxc_version: DEFAULT_COARSE_MXC_VERSION.to_owned(),
             containment: DEFAULT_CONTAINMENT.to_owned(),
             command: DEFAULT_COMMAND.to_owned(),
             container_id: "openshell-policy".to_owned(),

@@ -1013,7 +1013,7 @@ mod tests {
         let workdir = tempfile::tempdir().expect("temporary workdir");
         let output = workdir.path().join("mock-env.txt");
         let process = MxcProcess {
-            command_line: format!("echo %{KEY}% 1> \"{}\"", output.display()),
+            command_line: format!("echo %{KEY}%,%SystemRoot% 1> \"{}\"", output.display()),
             cwd: workdir.path().to_string_lossy().into_owned(),
             env: vec![format!("{KEY}=process-value")],
             timeout: 0,
@@ -1029,7 +1029,7 @@ mod tests {
         assert!(status.success());
         assert_eq!(
             std::fs::read_to_string(output).expect("mock output").trim(),
-            "process-value"
+            "process-value,%SystemRoot%"
         );
     }
 

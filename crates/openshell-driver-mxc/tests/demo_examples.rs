@@ -138,6 +138,24 @@ fn shipped_aggregate_e2e_assets_support_mock_wiring_validation() {
 }
 
 #[test]
+fn shipped_audit_and_websocket_configs_use_current_schema() {
+    for name in ["mxc-ocsf-audit.toml", "mxc-ws-gateway.toml"] {
+        let source = read_example(name);
+        let parsed: Value = toml::from_str(&source)
+            .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
+        let openshell = parsed
+            .get("openshell")
+            .and_then(Value::as_table)
+            .unwrap_or_else(|| panic!("{name} is missing [openshell]"));
+        assert_eq!(
+            openshell.get("version").and_then(Value::as_integer),
+            Some(2),
+            "{name} must use schema version 2"
+        );
+    }
+}
+
+#[test]
 fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
@@ -201,6 +219,8 @@ fn shipped_inference_policies_are_narrow_and_valid_after_rendering() {
             .replace("__OPENSHELL_DEMO_SHARE__", share)
             .replace("__OLLAMA_HOST__", "127.0.0.1")
             .replace("__OLLAMA_PORT__", "11434")
+            .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
+            .replace("__INFERENCE_PORT__", "443")
             .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
         let policy = parse_sandbox_policy(&rendered)
             .unwrap_or_else(|error| panic!("failed to parse rendered {name}: {error}"));
@@ -255,6 +275,19 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
     assert!(!cloud.contains("pass -ApiKey"));
     assert!(cloud.contains("nvidia/nemotron-3.5-lightning-30b-a3b"));
     assert!(!cloud.contains("nvidia/nvidia-nemotron-nano-9b-v2"));
+
+    let local = read_example("run-ollama-test.ps1");
+    assert!(local.contains("[switch] $Mock"));
+    assert!(local.contains("in-process wxc shim"));
+    assert!(local.contains("does not provide MXC or AppContainer isolation"));
+
+    let cloud = read_example("run-inference-test.ps1");
+    assert!(cloud.contains("[switch] $Mock"));
+    assert!(cloud.contains("[string] $ApiUrl"));
+    assert!(cloud.contains("$apiUri.IsLoopback"));
+    assert!(cloud.contains("--noproxy"));
+    assert!(cloud.contains("in-process wxc shim"));
+    assert!(cloud.contains("does not provide MXC or AppContainer isolation"));
 }
 
 #[cfg(target_os = "windows")]

@@ -14,8 +14,8 @@ network_policies:
   nvidia_inference:
     name: nvidia-inference
     endpoints:
-      - host: integrate.api.nvidia.com
-        port: 443
+      - host: "__INFERENCE_HOST__"
+        port: __INFERENCE_PORT__
         protocol: rest
         # Chat completions use POST.
         access: read-write

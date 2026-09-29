@@ -123,3 +123,13 @@ run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts
 description = "Run all four shipped aggregate MXC scenarios with the in-process wxc mock on native Windows"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-aggregate-e2e.ps1 -Mock"
+
+["windows:e2e:mxc:inference-mock:x64"]
+description = "Run the shipped MXC inference demos against the in-process wxc mock and a local API stub on Windows x64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-inference-examples-e2e.ps1 -Target x86_64-pc-windows-msvc"
+
+["windows:e2e:mxc:inference-mock:arm64"]
+description = "Run the shipped MXC inference demos against the in-process wxc mock and a local API stub on Windows ARM64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-mxc-inference-examples-e2e.ps1 -Target aarch64-pc-windows-msvc"

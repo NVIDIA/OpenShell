@@ -259,6 +259,11 @@ Windows validation separates source correctness from host capability:
 - The aggregate example runs its read-write, read-only, default-deny, and
   unsupported-network-policy scenarios in mock mode. This validates the
   shipped runner and expected policy paths without claiming native enforcement.
+- Hosted Windows CI runs the shipped Ollama and cloud-inference demos against
+  that mock and a local compatible API. This proves both complete demo scripts,
+  sandbox-scoped credential propagation, and response paths without a model or
+  external credential, but it does not prove MXC isolation, proxy substitution,
+  or network enforcement.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Hello World local-inference demo for OpenShell on MXC. PowerShell 5.1 compatible.
+# -Mock runs the workload on the host through the in-process wxc shim. It is for
+# CI wiring coverage only and does not provide MXC or AppContainer isolation.
 
 [CmdletBinding()]
 param(
@@ -15,6 +17,7 @@ param(
     [string] $Prompt = "Say hello in exactly five words.",
     [ValidateRange(0, 65535)] [int] $Port = 0,
     [string] $SandboxName,
+    [switch] $Mock,
     [switch] $KeepArtifacts
 )
 
@@ -135,11 +138,18 @@ $success = $false
 $failure = $null
 $oldGatewayConfig = $env:OPENSHELL_GATEWAY_CONFIG
 $oldComputeDriver = $env:OPENSHELL_COMPUTE_DRIVER
+$oldMockWxc = $env:OPENSHELL_MXC_MOCK_WXC
 
 try {
     $gateway = Resolve-Executable $GatewayPath "openshell-gateway.exe" ""
     $cli = Resolve-Executable $CliPath "openshell.exe" ""
-    $wxc = Resolve-Executable $WxcExecPath "wxc-exec.exe" "OPENSHELL_WXC_EXEC_PATH"
+    if ($Mock) {
+        # The gateway still validates that wxc_exec_path is absolute. The
+        # in-process mock never launches this placeholder.
+        $wxc = Join-Path $here "mock-wxc-exec.exe"
+    } else {
+        $wxc = Resolve-Executable $WxcExecPath "wxc-exec.exe" "OPENSHELL_WXC_EXEC_PATH"
+    }
     foreach ($fixture in @("mxc-ollama.toml", "ollama.yaml")) {
         if (-not (Test-Path -LiteralPath (Join-Path $here $fixture) -PathType Leaf)) {
             throw "required demo fixture '$fixture' is missing beside the runner"
@@ -163,7 +173,7 @@ try {
 
     Info "gateway: $gateway"
     Info "CLI: $cli"
-    Info "wxc-exec: $wxc"
+    Info "wxc-exec: $(if ($Mock) { 'in-process mock (no MXC isolation)' } else { $wxc })"
     Info "share: $ShareDir"
     Info "Ollama: http://${OllamaHost}:$OllamaPort"
 
@@ -226,6 +236,11 @@ try {
     $gwErrLog = Join-Path $resultDir "gateway.err.log"
     $env:OPENSHELL_GATEWAY_CONFIG = $tomlUsed
     $env:OPENSHELL_COMPUTE_DRIVER = "mxc"
+    if ($Mock) {
+        $env:OPENSHELL_MXC_MOCK_WXC = "1"
+    } else {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    }
     $gatewayProcess = Start-Process -FilePath $gateway -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--port", "$Port", "--log-level", "info") -WorkingDirectory $here -PassThru -WindowStyle Hidden -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline -and -not (Test-Port $Port)) {
@@ -269,13 +284,18 @@ try {
     }
     $env:OPENSHELL_GATEWAY_CONFIG = $oldGatewayConfig
     $env:OPENSHELL_COMPUTE_DRIVER = $oldComputeDriver
+    if ([string]::IsNullOrWhiteSpace($oldMockWxc)) {
+        Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
+    } else {
+        $env:OPENSHELL_MXC_MOCK_WXC = $oldMockWxc
+    }
     if (-not $KeepArtifacts -and $createdShare -and $ShareDir -and (Test-Path -LiteralPath $ShareDir)) {
         Remove-Item -LiteralPath $ShareDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
 $verdict = if ($success) { "PASS" } else { "FAIL" }
-$summary = "verdict=$verdict`r`nbase=local-ollama`r`nsandbox=$SandboxName`r`ngateway=$endpoint`r`nbackend=process_container`r`nresult=$failure`r`n"
+$summary = "verdict=$verdict`r`nbase=local-ollama`r`nmode=$(if ($Mock) { 'mock-wiring' } else { 'real-mxc' })`r`nsandbox=$SandboxName`r`ngateway=$endpoint`r`nbackend=process_container`r`nresult=$failure`r`n"
 Write-Utf8 (Join-Path $resultDir "summary.txt") $summary
 Write-Host "`n$summary"
 Write-Host "Results: $resultDir"

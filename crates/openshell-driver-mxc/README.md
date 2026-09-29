@@ -59,7 +59,7 @@ pc_relay_spawner_path = ""
 pc_relay_target_port  = 0
 # processContainer only: env-inheritance tier for the launched process
 # (safest first): default is a minimal Windows CreateProcessW bootstrap set
-# (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA); pc_minimal_env starts from an
+# (SYSTEMROOT/WINDIR/PATH/PATHEXT/COMSPEC/LOCALAPPDATA); pc_minimal_env starts from an
 # EMPTY env for runtimes that need a fully curated per-sandbox environment.
 pc_minimal_env = false
 # processContainer only: compatibility fallback for unrestricted outbound TCP.
@@ -203,11 +203,11 @@ environment variable, so workloads using it must pass
 `--cacert %CURL_CA_BUNDLE%` explicitly. Clients that honor the injected trust
 variables consume the same per-sandbox bundle directly.
 
-The driver seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and
-`LOCALAPPDATA` from the gateway host before applying sandbox and TLS overrides,
-so required Windows bootstrap values remain available without exposing the
-gateway's full environment unless the gateway explicitly opts into another
-environment mode.
+The driver seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `PATHEXT`, `COMSPEC`, and
+`LOCALAPPDATA` from the gateway host before applying sandbox and TLS overrides.
+These values provide Windows process startup and command-resolution behavior
+without exposing the gateway's full environment unless the gateway explicitly
+opts into another environment mode.
 
 When governed egress is disabled, any network rule fails closed during sandbox creation.
 

@@ -12,8 +12,18 @@ use super::loss::{LossItem, add_loss};
 /// not supply a real workload command.
 pub const DEFAULT_COMMAND: &str = "sh -lc \"echo OpenShell policy mapped to MXC; replace process.commandLine before running a real workload\"";
 
-/// Default MXC schema version emitted in `version`.
-pub const DEFAULT_MXC_VERSION: &str = "0.7.0-alpha";
+/// Default schema for the standalone coarse mapper's host-list config.
+///
+/// This is deliberately independent from [`crate::mxc::MXC_SCHEMA_VERSION`]:
+/// the coarse artifact uses the MXC 0.7 `allowedHosts` shape, while live driver
+/// requests and the governed-egress split use MXC 0.8 directional networking.
+pub const DEFAULT_COARSE_MXC_VERSION: &str = "0.7.0-alpha";
+
+/// Compatibility name for [`DEFAULT_COARSE_MXC_VERSION`].
+///
+/// This value belongs only to [`super::map_to_mxc`] output. It is not the
+/// schema version used for live `wxc-exec` requests.
+pub const DEFAULT_MXC_VERSION: &str = DEFAULT_COARSE_MXC_VERSION;
 
 /// Default MXC containment backend for the coarse mapping.
 pub const DEFAULT_CONTAINMENT: &str = "bubblewrap";

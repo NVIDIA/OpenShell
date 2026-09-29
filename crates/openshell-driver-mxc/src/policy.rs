@@ -8,11 +8,12 @@
 //! the standalone `openshell-policy-mapper` crate). This file defines the trait
 //! seam plus:
 //!
-//! - [`EmbeddedPolicyMapper`] — the **primary** impl. Calls
-//!   [`crate::policy_map::map_to_mxc`] directly on the typed `SandboxPolicy`
-//!   proto (no YAML bridge), extracts the MXC filesystem shares, normalizes
-//!   their paths to Windows form, and rejects the create on any `error`-severity
-//!   loss.
+//! - [`EmbeddedPolicyMapper`] — the **primary** impl. Calls the coarse mapper or
+//!   governed-egress split directly on the typed `SandboxPolicy` proto (no YAML
+//!   bridge), extracts the MXC filesystem/UI fragment, normalizes paths, and
+//!   rejects the create on any `error`-severity loss. The generated mapping JSON
+//!   is an intermediate representation: live requests are rebuilt by
+//!   [`crate::mxc`] using its active schema version.
 //!
 //! **Rule: never silently drop policy.** Unmappable rules surface as
 //! `MapError::Unsupported` and are rejected by `CreateSandbox` before lifecycle side effects.
@@ -181,7 +182,8 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             // Map directly off the typed proto. The default MXC driver path runs
             // an isolation session, so use that containment: its network branch
             // yields an `error` loss for any host allowlist, which rejects
-            // network policy below.
+            // network policy below. This coarse JSON is never sent to wxc-exec;
+            // only the extracted filesystem/UI policy enters the live request.
             let opts = crate::policy_map::MxcMappingOptions {
                 containment: ctx.containment.clone(),
                 container_id: ctx.sandbox_id.clone(),

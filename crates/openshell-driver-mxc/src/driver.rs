@@ -211,8 +211,8 @@ pub struct MxcComputeConfig {
     /// passed to the process.
     /// Use for agents like Node.js that fail with `STATUS_DLL_INIT_FAILED`
     /// when unrecognised host env vars are present; the caller is then
-    /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`COMSPEC`/
-    /// `LOCALAPPDATA` through `sandbox create --env/--env-from` if needed
+    /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`PATHEXT`/
+    /// `COMSPEC`/`LOCALAPPDATA` through `sandbox create --env/--env-from` if needed
     /// (`CreateProcessW` itself won't succeed without `LOCALAPPDATA` at
     /// least -- see `MINIMAL_WINDOWS_BOOTSTRAP_ENV`).
     ///
@@ -665,8 +665,14 @@ fn allocate_sandbox_proxy_addr(
 /// are secrets, so resolving them from the gateway host is safe; this is
 /// the per-sandbox environment layers on top of. See `pc_minimal_env` on
 /// `MxcComputeConfig` for the explicit empty-baseline option.
-const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
-    ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
+const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 6] = [
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "LOCALAPPDATA",
+];
 
 const TLS_ENV_KEYS: [&str; 6] = [
     "NODE_EXTRA_CA_CERTS",
@@ -2612,9 +2618,19 @@ mod lifecycle_tests {
     }
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
-        let shell =
-            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
-        driver_sandbox_with_command(id, "", vec![shell, "/c".into(), "exit 0".into()])
+        driver_sandbox_with_command(id, "", vec![inbox_cmd(), "/c".into(), "exit 0".into()])
+    }
+
+    fn inbox_cmd() -> String {
+        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
+    }
+
+    fn inbox_powershell() -> String {
+        let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+        Path::new(&system_root)
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+            .to_string_lossy()
+            .into_owned()
     }
 
     #[tokio::test]
@@ -2847,6 +2863,8 @@ mod lifecycle_tests {
             .replace("__OPENSHELL_DEMO_SHARE__", share)
             .replace("__OLLAMA_HOST__", "127.0.0.1")
             .replace("__OLLAMA_PORT__", "11434")
+            .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
+            .replace("__INFERENCE_PORT__", "443")
             .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
         parse_sandbox_policy(&rendered).expect("parse rendered shipped demo policy")
     }
@@ -3458,10 +3476,10 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{hello}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
@@ -3469,35 +3487,22 @@ mod lifecycle_tests {
         let sb = with_policy(driver_sandbox_with_command("sb-pos", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
-        // Self-reported Ready=True (no supervisor) once the agent exec launches.
-        let ready = wait_for(&backend, "sb-pos", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
-        })
-        .await;
-        assert!(ready.is_some(), "sandbox should self-report Ready=True");
-
-        // Positive proof: the in-policy write materializes the host artifact.
-        let host_path = tmp.path().join("hello.txt");
-        let mut found = false;
-        for _ in 0..100 {
-            if host_path.exists() {
-                found = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(found, "hello.txt should appear in the granted share folder");
-
         // A successful one-shot agent (exit 0) must STAY Ready, not demote to
         // Error. Assert the terminal condition is Ready=True/AgentCompleted so the
         // positive demo shows a green Ready phase, not a red Error.
         let completed = wait_for(&backend, "sb-pos", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentCompleted")
+            ready_condition(s).is_some_and(|condition| {
+                condition.status == "True" && condition.reason == "AgentCompleted"
+            })
         })
         .await;
         assert!(
             completed.is_some(),
             "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
+        );
+        assert!(
+            tmp.path().join("hello.txt").is_file(),
+            "hello.txt should appear in the granted share folder"
         );
         assert!(
             !backend
@@ -3519,10 +3524,10 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{hello}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
@@ -3530,13 +3535,15 @@ mod lifecycle_tests {
         let sb = with_policy(driver_sandbox_with_command("sb-pc", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
-        let ready = wait_for(&backend, "sb-pc", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        let completed = wait_for(&backend, "sb-pc", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| {
+                condition.status == "True" && condition.reason == "AgentCompleted"
+            })
         })
         .await;
         assert!(
-            ready.is_some(),
-            "processContainer sandbox should self-report Ready=True"
+            completed.is_some(),
+            "processContainer sandbox should report Ready=True/AgentCompleted"
         );
         let recorded = crate::mxc::mock_recorded_config("sb-pc").expect("mock recorded config");
         assert!(
@@ -3547,17 +3554,8 @@ mod lifecycle_tests {
         assert_eq!(recorded["ui"]["clipboard"], "none");
         assert_eq!(recorded["ui"]["injection"], false);
 
-        let host_path = tmp.path().join("hello.txt");
-        let mut found = false;
-        for _ in 0..100 {
-            if host_path.exists() {
-                found = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         assert!(
-            found,
+            tmp.path().join("hello.txt").is_file(),
             "in-policy write should materialize under processContainer"
         );
     }
@@ -3878,10 +3876,10 @@ mod lifecycle_tests {
             out_tmp.path().to_string_lossy().replace('\\', "/")
         );
         let cmd = vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {out_path} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{out_path}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
@@ -3937,7 +3935,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
@@ -3980,7 +3978,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
@@ -4031,7 +4029,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let command = vec![
-            "powershell".into(),
+            inbox_powershell(),
             "-NoProfile".into(),
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
