@@ -282,7 +282,9 @@ Inactive issues and pull requests are automatically labeled `state:stale` after 
 
 ## Prerequisites
 
-Install [mise](https://mise.jdx.dev/). This is used to set up the development environment.
+Install [Nix](https://nixos.org/download/) and [mise](https://mise.jdx.dev/).
+Nix provides the Rust toolchain and native build dependencies. Mise provides the
+common task interface and the tools used by the non-Rust SDKs and workflows.
 
 ```bash
 # Install mise (macOS/Linux)
@@ -290,6 +292,12 @@ curl https://mise.run | sh
 ```
 
 After installing `mise`, activate it with `mise activate` or [add it to your shell](https://mise.jdx.dev/getting-started.html).
+
+Verify that Nix flakes are available before continuing:
+
+```bash
+nix flake show
+```
 
 Shell setup examples:
 
@@ -304,12 +312,10 @@ echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
-Project requirements:
+Project requirements not supplied by the Nix development environment:
 
-- Rust 1.94+
 - Python 3.11+
 - Docker (running)
-- CMake 3.16+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
@@ -454,6 +460,20 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
+
+Rust validation tasks run through the Nix flake so local development and CI use
+the same pinned toolchain and command definitions. Run them through mise, or
+invoke the corresponding Nix apps directly:
+
+| Mise task                           | Nix app                       |
+| ----------------------------------- | ----------------------------- |
+| `mise run rust:check`               | `nix run .#rust-check`         |
+| `mise run rust:lockfiles:check`     | `nix run .#cargo-lockfiles`    |
+| `mise run rust:lint`                | `nix run .#rust-lint`          |
+| `mise run rust:format`              | `nix run .#rust-format`        |
+| `mise run rust:format:check`        | `nix run .#rust-format-check`  |
+| `mise run rust:deny:policy`         | `nix run .#rust-deny-policy`   |
+| `mise run test:rust`                | `nix run .#rust-test`          |
 
 ## Project Structure
 
