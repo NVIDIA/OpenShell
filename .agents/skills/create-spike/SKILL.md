@@ -91,7 +91,7 @@ The prompt to the reviewer **must** instruct it to:
 
 8. **Look at relevant tests to understand test coverage expectations.** What test patterns exist? What level of coverage is expected for this area?
 
-9. **Check architecture docs** in the `architecture/` directory for relevant documentation about the affected subsystems.
+9. **Check design records** in `rfc/` and the affected crate `README.md` files for relevant decisions and constraints.
 
 10. **Assess gateway config documentation impact.** If the change would add, remove, rename, or change defaults for gateway TOML keys or driver-specific config options, call out that `docs/how-it-works/gateways/configuration.mdx` must be updated. If the change is surfaced through Helm or compute-driver setup docs, call out the relevant deployment or compute-driver docs too.
 
@@ -156,7 +156,7 @@ gh issue create \
 
 ### Architecture Overview
 
-<How the affected subsystems work today. Include data flow, component interactions, and relevant design decisions. Reference architecture docs if applicable.>
+<How the affected subsystems work today. Include data flow, component interactions, and relevant design decisions. Reference RFCs or crate READMEs if applicable.>
 
 ### Code References
 
@@ -278,7 +278,7 @@ User says: "Allow sandbox egress to private IP space via networking policy"
    - Reads OPA policy evaluation pipeline in `opa.rs` and `crates/openshell-sandbox/data/sandbox-policy.rego`
    - Reads proto definitions in `sandbox.proto` for `NetworkEndpoint`
    - Maps the 4-layer defense model: netns, seccomp, OPA, SSRF check
-   - Reads `architecture/security-policy.md` and `architecture/sandbox.md`
+   - Reads RFC 0002 and the `openshell-policy` crate README
    - Identifies exact insertion points: policy field addition, SSRF check bypass path, OPA rule extension
    - Assesses: Medium complexity, High confidence, ~6 files
 3. Fetch labels — select `area:sandbox`, `area:proxy`, `area:policy`, `state:validated`

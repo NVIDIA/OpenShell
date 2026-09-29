@@ -16,7 +16,7 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
 - **Do** interrogate your agent until you understand every edge case and interaction in your changes.
 - **Don't** submit code you can't explain without your agent open.
-- **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
+- **Don't** use agents as a substitute for understanding the system. Read the RFCs, crate READMEs, and published docs.
 
 ## First-Time Contributors
 
@@ -470,7 +470,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
-| `architecture/` | Architecture docs and plans                   |
+| `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
 | `.agents/`      | Contributor skills and persona definitions    |

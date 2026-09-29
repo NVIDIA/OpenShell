@@ -91,7 +91,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: I've reviewed existing issues and the architecture docs
+        - label: I've reviewed existing issues and the published docs
           required: true
         - label: This is a design proposal, not a "please build this" request
           required: true

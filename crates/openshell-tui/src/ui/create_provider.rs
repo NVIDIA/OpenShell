@@ -6,7 +6,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
-use crate::app::{App, CreateProviderPhase, ProviderKeyField, UpdateProviderField};
+use crate::app::{
+    App, CreateProviderPhase, ProviderKeyField, ProviderProfileYaml, UpdateProviderField,
+};
 
 use indexmap::IndexMap;
 use std::ops::Range;
@@ -602,7 +604,7 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let title = if detail.show_raw_provider {
         " Provider Object YAML "
-    } else if detail.show_raw_profile {
+    } else if detail.show_raw_profile && detail.raw_profile_yaml.yaml().is_some() {
         " Provider Profile YAML "
     } else {
         " Provider Detail "
@@ -629,13 +631,12 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    if detail.show_raw_profile {
+    if detail.show_raw_profile
+        && let Some(raw) = detail.raw_profile_yaml.yaml()
+    {
         draw_raw_yaml(
             frame,
-            detail
-                .raw_profile_yaml
-                .as_deref()
-                .unwrap_or("No provider profile is available for this provider."),
+            raw,
             detail.raw_profile_scroll,
             "Summary",
             "y",
@@ -676,6 +677,18 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
             t.status_warn,
         )));
     }
+    if matches!(detail.raw_profile_yaml, ProviderProfileYaml::Invalid) {
+        // Fixed diagnostics bound the display and never expose values echoed by
+        // the serializer, even when malformed profile fields contain secrets.
+        lines.push(Line::from(Span::styled(
+            "Profile YAML unavailable: serialization failed.",
+            t.status_warn,
+        )));
+        lines.push(Line::from(Span::styled(
+            "Correct the profile at its source, then reopen this view.",
+            t.status_warn,
+        )));
+    }
     if let Some(description) = &detail.profile_description {
         lines.push(Line::from(vec![
             Span::styled("Description: ", t.muted),
@@ -704,7 +717,7 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("[o]", t.key_hint),
         Span::styled(" Object YAML  ", t.muted),
     ];
-    if detail.raw_profile_yaml.is_some() {
+    if detail.raw_profile_yaml.yaml().is_some() {
         hint_spans.extend([
             Span::styled("[y]", t.key_hint),
             Span::styled(" Profile YAML  ", t.muted),
