@@ -249,7 +249,7 @@ The most commonly changed values are:
 | `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Trusted control-side supervisor image. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
-| `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
+| `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. On PostgreSQL, also requires `server.peer.allowInsecureTransport=true`; refer to [High Availability](/kubernetes/high-availability#secure-peer-transport). |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |

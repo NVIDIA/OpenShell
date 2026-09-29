@@ -127,6 +127,13 @@ helm upgrade --install openshell \
 
 Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
 
+<Note>
+A gateway on PostgreSQL, such as a high-availability deployment, cannot use
+`server.disableTls=true` without an explicit opt-out. Keep TLS on the gateway pods and use
+[End-to-end TLS](#end-to-end-tls-backendtlspolicy) instead. Refer to
+[High Availability](/kubernetes/high-availability#secure-peer-transport).
+</Note>
+
 ### Register over HTTPS
 
 ```shell
