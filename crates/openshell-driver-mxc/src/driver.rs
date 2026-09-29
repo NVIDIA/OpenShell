@@ -211,8 +211,8 @@ pub struct MxcComputeConfig {
     /// passed to the process.
     /// Use for agents like Node.js that fail with `STATUS_DLL_INIT_FAILED`
     /// when unrecognised host env vars are present; the caller is then
-    /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`COMSPEC`/
-    /// `LOCALAPPDATA` through `sandbox create --env/--env-from` if needed
+    /// responsible for supplying `SYSTEMROOT`/`WINDIR`/`PATH`/`PATHEXT`/
+    /// `COMSPEC`/`LOCALAPPDATA` through `sandbox create --env/--env-from` if needed
     /// (`CreateProcessW` itself won't succeed without `LOCALAPPDATA` at
     /// least -- see `MINIMAL_WINDOWS_BOOTSTRAP_ENV`).
     ///
@@ -665,8 +665,14 @@ fn allocate_sandbox_proxy_addr(
 /// are secrets, so resolving them from the gateway host is safe; this is
 /// the per-sandbox environment layers on top of. See `pc_minimal_env` on
 /// `MxcComputeConfig` for the explicit empty-baseline option.
-const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
-    ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
+const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 6] = [
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "LOCALAPPDATA",
+];
 
 const TLS_ENV_KEYS: [&str; 6] = [
     "NODE_EXTRA_CA_CERTS",
