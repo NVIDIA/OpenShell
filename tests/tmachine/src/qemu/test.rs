@@ -96,6 +96,18 @@ async fn test_ephemeral(
             Err(result.err().unwrap_or_else(|| anyhow::anyhow!("tmachine run interrupted")))
         }
     };
+    if result.is_err() {
+        let diagnostics = std::path::Path::new("ansible/playbooks/diagnostics/k3s.yaml");
+        if let Err(error) = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            crate::ansible::collect_diagnostics(diagnostics, &environment.variables),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("diagnostics timed out")))
+        {
+            eprintln!("failed to collect k3s diagnostics: {error:#}");
+        }
+    }
     let cleanup = vm.stop().await;
     cleanup.context("stop disposable tmachine guest")?;
     result

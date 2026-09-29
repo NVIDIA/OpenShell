@@ -286,6 +286,10 @@ Unlike Docker and Podman environments, this environment runs setup and
 installation on a disposable overlay disk, so cluster state and credentials
 cannot enter the reusable setup or install caches. The guest is removed after
 successful, failed, and interrupted runs.
+Failed runs collect bounded, redacted systemd, k3s, Kubernetes, gateway, and
+sandbox state before removal. Kubernetes diagnostic requests have individual
+timeouts, and completed sections stream directly to the artifact so an overall
+collection timeout retains earlier evidence.
 
 Run the Kubernetes composition locally after staging the candidate inputs:
 

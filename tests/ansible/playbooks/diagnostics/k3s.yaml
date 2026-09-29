@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Collect sanitized disposable Kubernetes guest diagnostics
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    sensitive_line: '(?i)^.*(?:token|password|secret|credential|authorization|bearer|private.key|BEGIN).*'
+  tasks:
+    - name: Read guest identity
+      ansible.builtin.command: uname -a
+      register: guest_identity
+      changed_when: false
+      failed_when: false
+
+    - name: Report guest identity
+      ansible.builtin.debug:
+        msg:
+          guest: "{{ guest_identity.stdout_lines }}"
+
+    - name: Read systemd unit state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - "{{ item }}"
+          - --property=ActiveState,SubState,Result,ExecMainStatus
+      loop:
+        - k3s.service
+        - openshell-gateway.service
+      register: unit_state
+      changed_when: false
+      failed_when: false
+
+    - name: Report systemd unit state
+      ansible.builtin.debug:
+        msg:
+          systemd: "{{ unit_state.results | map(attribute='stdout_lines') | list }}"
+
+    - name: Read recent k3s and gateway journal
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --no-pager
+          - --output=short-iso
+          - --lines=150
+          - --unit
+          - "{{ item }}"
+      loop:
+        - k3s.service
+        - openshell-gateway.service
+      register: service_journal
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Report sanitized service journals
+      ansible.builtin.debug:
+        msg:
+          journal: "{{ service_journal.results | map(attribute='stdout_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+
+    - name: Read effective k3s and Kubernetes versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - k3s --version
+        - k3s kubectl --request-timeout=10s version -o json
+      register: cluster_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Report effective cluster versions
+      ansible.builtin.debug:
+        msg:
+          versions: "{{ cluster_versions.results | map(attribute='stdout_lines') | flatten | list }}"
+          errors: "{{ cluster_versions.results | map(attribute='stderr_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+
+    - name: Read Kubernetes node and pod state
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - --request-timeout=10s
+          - get
+          - "{{ item }}"
+          - --all-namespaces
+          - -o
+          - wide
+      loop:
+        - nodes
+        - pods
+      register: cluster_state
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Report sanitized node and pod state
+      ansible.builtin.debug:
+        msg:
+          nodes_and_pods: "{{ cluster_state.results | map(attribute='stdout_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+          errors: "{{ cluster_state.results | map(attribute='stderr_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+
+    - name: Read recent Kubernetes events
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - --request-timeout=10s
+          - get
+          - events
+          - --all-namespaces
+          - --sort-by=.lastTimestamp
+      register: cluster_events
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Report sanitized Kubernetes events
+      ansible.builtin.debug:
+        msg:
+          events: "{{ cluster_events.stdout_lines | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+          errors: "{{ cluster_events.stderr_lines | map('regex_replace', sensitive_line, '[redacted]') | list }}"
