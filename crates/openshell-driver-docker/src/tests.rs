@@ -190,7 +190,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cert: PathBuf::from("/tmp/tls.crt"),
             key: PathBuf::from("/tmp/tls.key"),
         }),
-        daemon_version: "28.0.0".to_string(),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
