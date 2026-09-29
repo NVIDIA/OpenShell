@@ -28,9 +28,14 @@ the sandbox record and driver-supported persistent storage.
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
 
 ```toml
+[openshell]
+version = 2
+
 [openshell.gateway]
 compute_driver = "docker"
 ```
+
+Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
 When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
 
