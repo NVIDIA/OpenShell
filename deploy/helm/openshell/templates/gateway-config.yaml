@@ -23,6 +23,17 @@ One value is intentionally NOT rendered here:
 {{- if and $metricsTls.enabled $metricsTls.requireClientCert (not $metricsTls.clientCaSecretName) }}
 {{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" }}
 {{- end }}
+{{- $gatewayClientCaSecretName := "" }}
+{{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
+{{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+{{- $gatewayClientCaSecretName = .Values.server.tls.certSecretName }}
+{{- else }}
+{{- $gatewayClientCaSecretName = .Values.server.tls.clientCaSecretName }}
+{{- end }}
+{{- end }}
+{{- if and $metricsTls.enabled $metricsTls.clientCaSecretName (eq $metricsTls.clientCaSecretName $gatewayClientCaSecretName) }}
+{{- fail "metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret" }}
+{{- end }}
 {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
 {{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
 {{- end -}}

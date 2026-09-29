@@ -210,7 +210,7 @@ metrics:
     enabled: false
     # -- Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName.
     certSecretName: ""
-    # -- Secret with ca.crt for verifying metrics scraper client certificates. Required when requireClientCert is true.
+    # -- Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. Required when requireClientCert is true.
     clientCaSecretName: ""
     # -- Require a client certificate signed by clientCaSecretName to scrape metrics.
     requireClientCert: false

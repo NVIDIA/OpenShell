@@ -412,7 +412,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
 | metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
-| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. Required when requireClientCert is true. |
+| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. Required when requireClientCert is true. |
 | metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
 | metrics.tls.requireClientCert | bool | `false` | Require a client certificate signed by clientCaSecretName to scrape metrics. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |

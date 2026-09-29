@@ -105,6 +105,28 @@ tests:
       - failedTemplate:
           errorMessage: 'metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName'
 
+  - it: rejects a metrics client CA that reuses the gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: openshell-server-tls
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
+  - it: rejects a metrics client CA that reuses a custom gateway client CA Secret
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: false
+      server.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.enabled: true
+      metrics.tls.clientCaSecretName: gateway-client-ca
+      metrics.tls.requireClientCert: true
+    asserts:
+      - failedTemplate:
+          errorMessage: 'metrics.tls.clientCaSecretName must not reuse the gateway client CA Secret'
+
   - it: rejects metrics TLS when the metrics port is disabled
     template: templates/statefulset.yaml
     set:
