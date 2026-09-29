@@ -100,6 +100,11 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
+- section: "Contributing"
+  slug: contributing
+  contents:
+  - page: "Issue Workflow"
+    path: contributing/issue-workflow.mdx
 - section: "Tutorials"
   slug: tutorials
   path: tutorials/index.mdx

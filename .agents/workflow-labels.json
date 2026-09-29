@@ -1,0 +1,19 @@
+{
+  "labels": [
+    {"name": "type:bug", "color": "d73a4a", "description": "Issue describes a defect in intended behavior"},
+    {"name": "type:chore", "color": "6f42c1", "description": "Issue tracks maintenance or project infrastructure work"},
+    {"name": "type:feature", "color": "6f42c1", "description": "Issue proposes a new user-facing capability"},
+    {"name": "type:spike", "color": "6f42c1", "description": "Issue tracks a bounded investigation with a specific question"},
+    {"name": "type:support", "color": "6f42c1", "description": "Issue asks for usage help or support"},
+    {"name": "state:new", "color": "d4f4dd", "description": "New issue awaiting triage assessment"},
+    {"name": "state:validated", "color": "b4d9f5", "description": "Assessment complete; maintainer disposition is pending"},
+    {"name": "state:accepted", "color": "0e8a16", "description": "Maintainer decided to pursue this issue"},
+    {"name": "state:in-progress", "color": "1d76db", "description": "Authorized work is in progress"},
+    {"name": "state:in-review", "color": "c5def5", "description": "Plan or pull request awaits human review"},
+    {"name": "needs:info", "color": "f9d0c4", "description": "Needs specific information before the next decision"},
+    {"name": "needs:plan", "color": "fbca04", "description": "Needs an implementation plan or review of that plan"},
+    {"name": "needs:pr", "color": "fbca04", "description": "Needs a pull request or review of that pull request"},
+    {"name": "needs:spike", "color": "fbca04", "description": "Needs a maintainer-approved bounded investigation"},
+    {"name": "needs:rfc", "color": "fbca04", "description": "Needs a maintainer-directed RFC pull request"}
+  ]
+}

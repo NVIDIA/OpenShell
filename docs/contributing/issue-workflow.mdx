@@ -1,0 +1,54 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Issue Workflow"
+description: "How OpenShell records an issue's kind, state, and next work."
+---
+
+OpenShell uses three label groups to show what an issue is, where it stands, and what work it needs next. The [workflow label manifest](https://github.com/NVIDIA/OpenShell/blob/main/.agents/workflow-labels.json) defines their names, descriptions, and colors.
+
+## Read the Three Axes
+
+| Axis | Meaning | Rule |
+| --- | --- | --- |
+| `type:*` | Kind of issue: bug, chore, feature, spike, or support. | At most one. It may be absent during intake; classify it from evidence before advancing the work. |
+| `state:*` | Current assessment or work state. | Exactly one on an open issue once the intake workflow has run. |
+| `needs:*` | The next missing work product or information. | At most one. It may be absent while a human makes a disposition or assignment decision. |
+
+Use `state:new`, `state:validated`, `state:accepted`, `state:in-progress`, and `state:in-review` to describe the issue's current position. `needs:info`, `needs:plan`, `needs:pr`, `needs:spike`, and `needs:rfc` describe the next work. The issue discussion and assignment identify who should act.
+
+GitHub's closed status and reason describe completed or declined work. Do not add terminal `state:done` or `state:canceled` labels. When closing a new issue, clear `needs:*` labels that no longer describe a next action. The migration leaves already closed items untouched.
+
+GitHub's built-in issue type is separate metadata. Use `type:*` for the more specific workflow classification. Conventional Commit types describe commits and do not determine issue type. Usage questions may use `type:support`; suspected vulnerabilities belong in the private process in `SECURITY.md`, not a public `type:security` issue.
+
+## Intake and Disposition
+
+Non-maintainer issues start at `state:new`, which calls for initial screening only. For this rollout, a human invokes triage. The triage skill sends findings to `#openshell-triage` for the duty engineer and collaborators to discuss. The engineer directs any public response or label change. Aim to reach an explained acceptance or decline promptly; use `state:validated` only while a genuine maintainer decision is pending.
+
+Maintainer-authored issues bypass triage for this rollout and enter `state:accepted` for scheduling and assignment. The separate automatic-triage follow-on will reconsider that exception. A maintainer still identifies the issue's type and next work when those are not evident from the submission.
+
+Only a human decides whether to accept or decline work, authorizes a spike or RFC, and places an issue on the roadmap. An agent never infers acceptance from technical validity. A maintainer may record acceptance with `state:accepted` or roadmap placement. Maintainers direct an RFC and assign its number before applying `needs:rfc`. `needs:spike` represents an approved, bounded investigation, not a promise to implement its findings.
+
+## Authorize Agent Work
+
+For unattended planning or implementation, a human sets `needs:plan` or `needs:pr` after authorizing that phase. The agent checks acceptance or roadmap placement, a work state that permits pickup, the relevant `needs:*` label, and any required approved plan. `state:new` permits intake screening only; `state:in-review` means a human is reviewing a plan or PR. A request for a plan authorizes planning only; an implementation request follows plan approval. Agents do not set `needs:plan` or `needs:pr` to queue themselves.
+
+A direct user request authorizes the phase it explicitly names even when the issue's labels are missing or incomplete. The agent names the discrepancy and continues without changing queue labels. General build agents do not handle `topic:security` issues; specialized security skills preserve the private review and human decision gates.
+
+## Review Common Combinations
+
+| Situation | Labels on the issue | Next action |
+| --- | --- | --- |
+| New community report | `state:new`; `type:*` optional pending assessment | Human invokes triage screening. |
+| Needs an answer from the reporter | `state:new` or `state:validated`, `needs:info` | Ask a specific question and reassess the answer. |
+| Validated, waiting for disposition | `type:bug` or `type:feature`, `state:validated` | Maintainer accepts or declines promptly. |
+| Accepted, queued for a plan | `state:accepted`, `needs:plan` | Authorized agent prepares the plan. |
+| Approved plan, queued for implementation | `state:accepted` or `state:in-progress`, `needs:pr` | Authorized agent prepares the PR. |
+| Plan or PR ready for review | `state:in-review`, `needs:plan` or `needs:pr` | Human reviews and either approves or requests another pass. |
+| Reopened after an earlier close | One current `state:*` and an appropriate `needs:*` if work is authorized | Reassess the new information and clear obsolete labels before work resumes. |
+
+The following combinations need correction: two labels from one single-valued axis; `state:new` with `needs:pr`; `state:validated` with `needs:pr`; or `state:in-progress` with no known authorized next work. A missing `type:*` during intake is a classification task, not a reason to guess from the current label backlog. The migration rehearsal reports ambiguous historical combinations for human review.
+
+## Pull Requests
+
+Keep issue workflow labels on the linked issue. A pull request does not need to repeat them. If a pull request has no linked issue, labels from these axes are optional and must not be assumed to represent an accepted issue. Review and merge state remain visible in GitHub's pull request interface.
