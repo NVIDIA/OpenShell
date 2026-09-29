@@ -17,11 +17,17 @@
 //!   policy is flattened into an MXC host allowlist (`network.allowedHosts`),
 //!   and anything MXC cannot express (ports, protocol, L7 rules, binary scope)
 //!   is recorded in the loss report. Use this when MXC enforces network on its
-//!   own, with no `OpenShell` proxy in the loop.
+//!   own, with no `OpenShell` proxy in the loop. Its default schema is MXC 0.7,
+//!   matching that host-list shape; the caller can override the coarse target.
 //! - [`split_policy`] — the *lossless* split for the Windows MXC compute
 //!   driver: MXC handles filesystem + containment + loopback-only egress,
 //!   while the full `OpenShell` network policy is preserved in a trimmed policy
-//!   enforced by the host CONNECT proxy.
+//!   enforced by the host CONNECT proxy. This path uses the live driver's MXC
+//!   0.8 directional-network schema.
+//!
+//! The coarse mapper's schema version describes its generated artifact, not the
+//! live driver's operating schema. The embedded driver may use a coarse mapping
+//! as an intermediate policy translation but does not send that JSON to MXC.
 //!
 //! The report/loss-report helpers are only exercised by the example and the
 //! integration tests, so the Windows lib build would otherwise warn on them;
@@ -36,7 +42,9 @@ mod loss;
 mod map;
 mod report;
 
-pub use config::{DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION};
+pub use config::{
+    DEFAULT_COARSE_MXC_VERSION, DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION,
+};
 pub use loss::{LossItem, OPEN_SHELL_SUPERSET_GAPS};
 pub use map::{MxcMappingOptions, MxcMappingResult, SplitPolicyResult, map_to_mxc, split_policy};
 pub use report::{build_loss_report, render_readme};

@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 
 use super::loss::{LossItem, OPEN_SHELL_SUPERSET_GAPS, summarize_missing_mxc};
 
-/// Build the structured `loss-report.json` value.
+/// Build the structured `loss-report.json` value for a generated mapper artifact.
+///
+/// `target.schemaVersion` describes that artifact's caller-selected schema. It
+/// must not be interpreted as the live MXC driver's request schema.
 pub fn build_loss_report(
     source_policy: &str,
     generated_config: &str,
