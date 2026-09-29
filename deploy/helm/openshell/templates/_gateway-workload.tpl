@@ -164,6 +164,16 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
+        {{- if .Values.metrics.tls.enabled }}
+        - name: metrics-tls-cert
+          mountPath: /etc/openshell-metrics/server
+          readOnly: true
+        {{- if .Values.metrics.tls.clientCaSecretName }}
+        - name: metrics-tls-client-ca
+          mountPath: /etc/openshell-metrics/client-ca
+          readOnly: true
+        {{- end }}
+        {{- end }}
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
@@ -263,6 +273,19 @@ spec:
         {{- else }}
         secretName: {{ .Values.server.tls.clientCaSecretName }}
         {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.metrics.tls.enabled }}
+    - name: metrics-tls-cert
+      secret:
+        secretName: {{ .Values.metrics.tls.certSecretName | default .Values.server.tls.certSecretName }}
+    {{- if .Values.metrics.tls.clientCaSecretName }}
+    - name: metrics-tls-client-ca
+      secret:
+        secretName: {{ .Values.metrics.tls.clientCaSecretName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
     {{- end }}
     {{- end }}
     {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
