@@ -179,6 +179,13 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
+    /// TLS configuration for the dedicated metrics listener.
+    ///
+    /// When `None`, the metrics listener retains its plaintext HTTP behavior.
+    /// This configuration is intentionally separate from [`Self::tls`] so
+    /// metrics clients can use their own client CA trust boundary.
+    pub metrics_tls: Option<MetricsTlsConfig>,
+
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
@@ -321,6 +328,27 @@ pub struct TlsConfig {
     /// primary (internal) cert.
     #[serde(default)]
     pub external_server_names: Vec<String>,
+}
+
+/// TLS configuration for the dedicated metrics listener.
+///
+/// Unlike [`TlsConfig`], metrics TLS does not support external certificates
+/// or SNI routing. The metrics listener has one narrow HTTPS/mTLS contract
+/// with an optional, metrics-specific client CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTlsConfig {
+    /// Path to the TLS certificate file served by the metrics listener.
+    pub cert_path: PathBuf,
+
+    /// Path to the TLS private key file served by the metrics listener.
+    pub key_path: PathBuf,
+
+    /// Path to the CA certificate file used to verify metrics clients.
+    pub client_ca_path: Option<PathBuf>,
+
+    /// Whether metrics clients must present a certificate trusted by
+    /// [`Self::client_ca_path`].
+    pub require_client_auth: bool,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
@@ -849,6 +877,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            metrics_tls: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             tls,
@@ -894,6 +923,13 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Create a new configuration with TLS for the dedicated metrics listener.
+    #[must_use]
+    pub fn with_metrics_tls(mut self, tls: MetricsTlsConfig) -> Self {
+        self.metrics_tls = Some(tls);
         self
     }
 
@@ -1118,11 +1154,12 @@ mod tests {
     use super::{
         AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        GatewayProviderProfileSourceConfig, ImagePullPolicy, MetricsTlsConfig,
+        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
-    use std::net::SocketAddr;
     use std::time::Duration;
+    use std::{net::SocketAddr, path::PathBuf};
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1606,6 +1643,23 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn metrics_tls_is_disabled_by_default_and_can_be_configured() {
+        assert!(Config::new(None).metrics_tls.is_none());
+
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/etc/openshell-metrics/tls.crt"),
+            key_path: PathBuf::from("/etc/openshell-metrics/tls.key"),
+            client_ca_path: Some(PathBuf::from("/etc/openshell-metrics/ca.crt")),
+            require_client_auth: true,
+        };
+
+        assert_eq!(
+            Config::new(None).with_metrics_tls(tls.clone()).metrics_tls,
+            Some(tls)
+        );
     }
 
     #[test]
