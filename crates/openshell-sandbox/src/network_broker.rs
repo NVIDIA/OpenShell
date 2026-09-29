@@ -2214,10 +2214,6 @@ mod tests {
 
     #[test]
     fn accepted_loopback_stream_is_registered_for_notified_operations() {
-        let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
-        let address = reservation.local_addr().expect("reserved address");
-        drop(reservation);
-
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
@@ -2225,9 +2221,9 @@ mod tests {
         let workload = std::thread::spawn(move || {
             launcher
                 .execute(move || -> io::Result<SocketAddr> {
-                    let listener = TcpListener::bind(address)?;
+                    let listener = TcpListener::bind("127.0.0.1:0")?;
                     ready_tx
-                        .send(())
+                        .send(listener.local_addr()?)
                         .map_err(|_| io::Error::other("test client disappeared"))?;
                     let (stream, _) = listener.accept()?;
                     let peer = stream.peer_addr()?;
@@ -2256,7 +2252,13 @@ mod tests {
                 .expect("launcher result")
         });
 
-        ready_rx.recv().expect("listener ready");
+        let Ok(address) = ready_rx.recv() else {
+            let error = workload
+                .join()
+                .expect("join workload")
+                .expect_err("listener not ready");
+            panic!("workload listener failed: {error}");
+        };
         let mut client = TcpStream::connect(address).expect("connect loopback client");
         let mut payload = [0_u8; 8];
         client
