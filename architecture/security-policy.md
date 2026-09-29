@@ -171,6 +171,8 @@ repair instead of launching with connection-time denials or a fallback policy.
 Accepted runtime state includes the matching provider-environment revision, so
 policy and credential updates cannot activate independently.
 
+Startup policy writes and rejection reports describe the configuration snapshot that the supervisor read. If the gateway returns `ABORTED`, the supervisor discards that attempt and fetches a fresh snapshot after backing off. It does not resend the stale write or report, and a write conflict does not mark the configuration invalid. This recovery depends on the gateway detecting the conflict; it does not add a policy-revision precondition to writes.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds

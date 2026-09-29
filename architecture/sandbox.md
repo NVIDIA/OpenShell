@@ -839,7 +839,11 @@ so it cannot replace the configuration captured for that launch. Restart resets
 admission and requires a fresh accepted configuration. Permanent gateway errors
 and exhausted transient retries terminate startup; each RPC attempt has a
 10-second deadline, including acceptance reports; only acknowledged configuration
-rejections wait for repair within the gateway's provisioning deadline. Image discovery uses the authenticated
+rejections wait for repair within the gateway's provisioning deadline. When the
+gateway refuses the image policy upload or the baseline-path write-back with
+`FAILED_PRECONDITION` or `INVALID_ARGUMENT`, startup reports the refusal as a
+configuration rejection, logs the gateway's message, and keeps waiting for
+repair. Image discovery uses the authenticated
 sandbox boundary control request deadline.
 
 Policy and provider refreshes are prepared before publication. Publication
@@ -872,7 +876,9 @@ startup: the enriched revision the supervisor synced back to the gateway is the
 revision it acknowledges, so a successfully constructed initial policy never
 remains `Pending`. If the first poll returns a different revision, the supervisor
 processes it through the normal reload path instead of treating it as already
-loaded.
+loaded. A global policy is never written back, because the gateway refuses
+sandbox policy writes while one is active; the supervisor adds the baseline
+paths to its own copy only.
 
 A newer sandbox-scoped revision can carry the same non-empty effective policy
 hash as the currently loaded revision, for example when provenance changes
