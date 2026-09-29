@@ -367,12 +367,6 @@ fn podman_config(
     if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         config.socket_path = Some(path.into());
     }
-    if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-        config.host_gateway_ip = ip;
-    }
-    if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
-        config.userns = Some(mode);
-    }
     Ok(config)
 }
 
