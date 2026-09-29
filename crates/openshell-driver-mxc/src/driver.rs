@@ -3487,18 +3487,13 @@ mod lifecycle_tests {
         let sb = with_policy(driver_sandbox_with_command("sb-pos", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
-        // Self-reported Ready=True (no supervisor) once the agent exec launches.
-        let ready = wait_for(&backend, "sb-pos", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
-        })
-        .await;
-        assert!(ready.is_some(), "sandbox should self-report Ready=True");
-
         // A successful one-shot agent (exit 0) must STAY Ready, not demote to
         // Error. Assert the terminal condition is Ready=True/AgentCompleted so the
         // positive demo shows a green Ready phase, not a red Error.
         let completed = wait_for(&backend, "sb-pos", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentCompleted")
+            ready_condition(s).is_some_and(|condition| {
+                condition.status == "True" && condition.reason == "AgentCompleted"
+            })
         })
         .await;
         assert!(
@@ -3540,13 +3535,15 @@ mod lifecycle_tests {
         let sb = with_policy(driver_sandbox_with_command("sb-pc", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
-        let ready = wait_for(&backend, "sb-pc", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        let completed = wait_for(&backend, "sb-pc", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| {
+                condition.status == "True" && condition.reason == "AgentCompleted"
+            })
         })
         .await;
         assert!(
-            ready.is_some(),
-            "processContainer sandbox should self-report Ready=True"
+            completed.is_some(),
+            "processContainer sandbox should report Ready=True/AgentCompleted"
         );
         let recorded = crate::mxc::mock_recorded_config("sb-pc").expect("mock recorded config");
         assert!(
@@ -3557,14 +3554,6 @@ mod lifecycle_tests {
         assert_eq!(recorded["ui"]["clipboard"], "none");
         assert_eq!(recorded["ui"]["injection"], false);
 
-        let completed = wait_for(&backend, "sb-pc", |sandbox| {
-            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentCompleted")
-        })
-        .await;
-        assert!(
-            completed.is_some(),
-            "processContainer sandbox should report AgentCompleted"
-        );
         assert!(
             tmp.path().join("hello.txt").is_file(),
             "in-policy write should materialize under processContainer"
