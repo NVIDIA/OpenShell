@@ -26,7 +26,12 @@ pub async fn test(
     let image = QemuImage::create(&install_disk, test_disk).await;
     let vm = QemuVm::start(&image).await;
 
-    run_playbooks(&testsuite.playbooks, &testsuite.inputs).await?;
+    run_playbooks(
+        &testsuite.playbooks,
+        &testsuite.inputs,
+        &environment.variables,
+    )
+    .await?;
 
     if testsuite.interactive {
         println!("Opening an SSH shell in the tmachine VM.");

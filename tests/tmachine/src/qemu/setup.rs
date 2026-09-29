@@ -10,7 +10,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files};
+use super::layer::{cached_layer, hash_file, hash_files, hash_variables};
 
 const SETUP_CACHE_VERSION: &[u8] = b"tmachine-disk-blake3-v1";
 
@@ -26,6 +26,7 @@ pub async fn setup(machine: &Machine, environment: &Environment) -> Result<PathB
         environment.setup.use_galaxy,
         &environment.setup.playbooks,
         &BTreeMap::new(),
+        &environment.variables,
     )
     .await
 }
@@ -39,5 +40,6 @@ fn setup_hash(machine: &Machine, environment: &Environment) -> Result<String> {
     hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &environment.setup.playbooks)
         .context("failed to hash setup playbooks")?;
+    hash_variables(&mut hasher, &environment.variables);
     Ok(hasher.finalize().to_hex().to_string())
 }

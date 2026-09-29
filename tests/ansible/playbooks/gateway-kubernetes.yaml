@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell on the disposable Kubernetes cluster
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Require cluster inputs from the environment
+      ansible.builtin.assert:
+        that:
+          - kubeconfig is defined
+          - kubernetes_namespace is defined
+          - ansible_facts.default_ipv4.address is defined
+        fail_msg: Kubernetes installation requires a ready tmachine k3s environment
+
+    - name: Set Kubernetes gateway runtime values
+      ansible.builtin.set_fact:
+        openshell_gateway_driver: kubernetes
+        openshell_gateway_user: tmachine
+        openshell_gateway_home: /home/tmachine
+        openshell_gateway_uid: "{{ ansible_facts.user_uid }}"
+        openshell_gateway_bind_address: 0.0.0.0:17670
+        openshell_gateway_guest_ip: "{{ ansible_facts.default_ipv4.address }}"
+
+    - name: Configure Kubernetes gateway
+      ansible.builtin.include_role:
+        name: openshell_gateway
+
+    - name: Register Kubernetes gateway for test client
+      ansible.builtin.include_role:
+        name: openshell_client

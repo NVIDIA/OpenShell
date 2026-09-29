@@ -9,7 +9,7 @@ use blake3::Hasher;
 use crate::config::{Environment, Installer, Machine};
 
 use super::ansible_hash::hash_sources;
-use super::layer::{cached_layer, hash_file, hash_files, hash_inputs};
+use super::layer::{cached_layer, hash_file, hash_files, hash_inputs, hash_variables};
 use super::setup::setup;
 
 const INSTALL_CACHE_VERSION: &[u8] = b"tmachine-install-blake3-v1";
@@ -24,18 +24,23 @@ pub async fn install(
         return Ok(setup_disk);
     }
 
-    let hash = install_hash(&setup_disk, installer)?;
+    let hash = install_hash(&setup_disk, environment, installer)?;
     cached_layer(
         &setup_disk,
         &hash,
         installer.use_galaxy,
         &installer.playbooks,
         &installer.inputs,
+        &environment.variables,
     )
     .await
 }
 
-fn install_hash(setup_disk: &Path, installer: &Installer) -> Result<String> {
+fn install_hash(
+    setup_disk: &Path,
+    environment: &Environment,
+    installer: &Installer,
+) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(INSTALL_CACHE_VERSION);
     hash_file(&mut hasher, setup_disk).context("failed to hash setup disk")?;
@@ -43,5 +48,6 @@ fn install_hash(setup_disk: &Path, installer: &Installer) -> Result<String> {
     hash_sources(&mut hasher).context("failed to hash Ansible sources")?;
     hash_files(&mut hasher, &installer.playbooks).context("failed to hash install playbooks")?;
     hash_inputs(&mut hasher, &installer.inputs)?;
+    hash_variables(&mut hasher, &environment.variables);
     Ok(hasher.finalize().to_hex().to_string())
 }

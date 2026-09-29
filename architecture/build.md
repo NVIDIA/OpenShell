@@ -275,6 +275,20 @@ independent from binary or package installation and lets multiple installers
 reuse the same prepared setup disk. The `none` installer skips OpenShell
 installation and boots the prepared environment directly.
 
+The `ubuntu-k3s` environment provisions a pinned k3s release on Ubuntu 24.04
+and requires the API and node to report Ready before installation begins. It
+passes a guest-local kubeconfig path and namespace as environment values to
+the independent `kubernetes-binaries` installer and the shared `conformance`
+testsuite. That installer imports the candidate sandbox and supervisor images
+into k3s and starts the candidate gateway with the Kubernetes driver. The
+kubeconfig stays inside the guest with mode `0600` and is never an artifact.
+
+Run the Kubernetes composition locally after staging the candidate inputs:
+
+```shell
+nix run .#tmachine -- test ubuntu-k3s kubernetes-binaries conformance
+```
+
 ### Interactive tmachine shell
 
 The test command is `tmachine test <environment> <installer> <testsuite>`. The

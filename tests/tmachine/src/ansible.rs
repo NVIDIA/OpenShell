@@ -25,8 +25,15 @@ pub async fn install_roles() {
     assert!(status.success());
 }
 
-pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
+pub async fn run(
+    playbook: &Path,
+    inputs: &BTreeMap<String, PathBuf>,
+    variables: &BTreeMap<String, String>,
+) -> Result<()> {
     let mut command = Command::new("ansible-playbook");
+    for (name, value) in variables {
+        command.arg("--extra-vars").arg(format!("{name}={value}"));
+    }
     for (name, path) in inputs {
         let value = match std::fs::canonicalize(path) {
             Ok(path) => path,
