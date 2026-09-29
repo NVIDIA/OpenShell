@@ -102,6 +102,20 @@ To keep the gateway running after you log out, enable linger:
 sudo loginctl enable-linger $USER
 ```
 
+### WSL 2 with Docker Desktop
+
+Under Docker Desktop, the Docker host network is the Docker Desktop VM, not your WSL distribution, so sandboxes cannot reach a gateway on `127.0.0.1`. Sandbox creation then fails with `ControlSupervisorStartFailed`. Keep the gateway on its default loopback address and point the Docker driver at `host.docker.internal`, which Docker Desktop routes to the Windows host and WSL forwards to the distribution:
+
+```toml
+[openshell]
+version = 2
+
+[openshell.drivers.docker]
+grpc_endpoint = "https://host.docker.internal:17670"
+```
+
+Add this to `~/.config/openshell/gateway.toml` and restart the gateway. Do not bind the gateway to the distribution's network address instead: Docker Desktop containers cannot route to it.
+
 ## Snap
 
 The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.
