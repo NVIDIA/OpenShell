@@ -119,6 +119,11 @@ pub struct VmComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes passed to the VM
+    /// driver for its host-side supervisors.
+    #[serde(flatten)]
+    pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
+
     /// Path on the gateway host to a PEM CA bundle trusted for the corporate
     /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
     pub proxy_ca_bundle: Option<PathBuf>,
@@ -210,6 +215,7 @@ impl VmComputeConfig {
 
     fn validate_proxy_config(&self) -> Result<()> {
         self.upstream_proxy.validate().map_err(Error::config)?;
+        self.ipv6_egress.validate().map_err(Error::config)?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err(Error::config("proxy_ca_bundle must not be empty when set"));
@@ -259,6 +265,7 @@ impl Default for VmComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
@@ -679,6 +686,8 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     if let Some(path) = config.proxy_ca_bundle.as_ref() {
         command.arg("--upstream-proxy-ca-bundle").arg(path);
     }
+    // The VM driver accepts the supervisor's flag names and forwards them.
+    command.args(config.ipv6_egress.supervisor_args());
     if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
         command
             .arg("--provider-spiffe-workload-api-tcp-endpoint")
@@ -854,6 +863,33 @@ mod tests {
                 "http://collector.internal:4317",
                 "--gateway-name",
                 "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_ipv6_egress_settings() {
+        let config: VmComputeConfig = toml::from_str(
+            r#"
+policy_dns_ipv6_egress = "disabled"
+nat64_prefixes = ["2001:db8:64::/96"]
+"#,
+        )
+        .expect("VM driver config parses");
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_proxy_and_spiffe_args(&mut command, &config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--policy-dns-ipv6-egress",
+                "disabled",
+                "--nat64-prefix",
+                "2001:db8:64::/96"
             ]
         );
     }

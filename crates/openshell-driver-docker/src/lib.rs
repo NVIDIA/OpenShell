@@ -56,7 +56,8 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{
-    AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, UpstreamProxyConfig,
+    AppArmorProfile, Error, ImagePullPolicy, Result as CoreResult, SupervisorIpv6EgressConfig,
+    UpstreamProxyConfig,
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -218,6 +219,11 @@ pub struct DockerComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes supplied to the
+    /// supervisor.
+    #[serde(flatten)]
+    pub ipv6_egress: SupervisorIpv6EgressConfig,
+
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
 
@@ -242,6 +248,7 @@ impl DockerComputeConfig {
         validate_image_pull_policy(self.image_pull_policy)?;
         self.upstream_proxy.validate().map_err(Error::config)?;
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
+        self.ipv6_egress.validate().map_err(Error::config)?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
@@ -276,6 +283,7 @@ impl Default for DockerComputeConfig {
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: SupervisorIpv6EgressConfig::default(),
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
         }
@@ -307,6 +315,7 @@ struct DockerDriverRuntimeConfig {
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
     upstream_proxy: UpstreamProxyConfig,
+    ipv6_egress: SupervisorIpv6EgressConfig,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
 }
@@ -947,6 +956,7 @@ impl DockerComputeDriver {
                 allow_driver_config: docker_config.allow_driver_config,
                 resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
+                ipv6_egress: docker_config.ipv6_egress.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
                     .clone(),
@@ -5121,6 +5131,7 @@ async fn spawn_docker_control_process(
         format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
     ];
     command.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+    command.extend(config.ipv6_egress.supervisor_args());
     let mut supervisor_mounts = vec![
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
