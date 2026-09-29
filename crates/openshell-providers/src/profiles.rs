@@ -3,7 +3,10 @@
 
 //! Declarative provider type profiles.
 
-use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, ParseMcpVersionsError,
+    canonicalize_mcp_versions, parse_mcp_versions,
+};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
@@ -499,23 +502,12 @@ fn default_mcp_profile_versions() -> Vec<String> {
 fn validate_mcp_profile_versions(
     values: &[String],
 ) -> Result<BTreeSet<McpProtocolVersion>, String> {
-    if values.is_empty() {
-        return Err(
-            "mcp.versions must contain at least one supported protocol version".to_string(),
-        );
-    }
-
-    let mut versions = BTreeSet::new();
-    for value in values {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| format!("{error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !versions.insert(version) {
-            return Err(format!("duplicate MCP protocol version '{value}'"));
+    parse_mcp_versions(values).map_err(|error| match error {
+        ParseMcpVersionsError::Unsupported(error) => {
+            format!("{error}; {MCP_VERSION_REMEDIATION}")
         }
-    }
-
-    Ok(versions)
+        error => error.to_string(),
+    })
 }
 
 fn deserialize_mcp_profile_versions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -1678,24 +1670,8 @@ fn materialize_and_canonicalize_mcp_profile_versions(versions: &mut Vec<String>)
     if versions.is_empty() {
         *versions = default_mcp_profile_versions();
     } else {
-        canonicalize_mcp_profile_versions(versions);
+        canonicalize_mcp_versions(versions);
     }
-}
-
-fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
-    // Preserve unsupported and duplicate values so subsequent validation can
-    // reject them; sorting must never repair malformed protobuf input.
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
 }
 
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
@@ -4100,7 +4076,7 @@ endpoints:
     path: /mcp
     protocol: mcp
     mcp:
-      versions: ["2025-11-25", "2025-03-26", "2025-06-18"]
+      versions: ["2026-07-28", "2025-11-25", "2025-03-26", "2025-06-18"]
       strict_tool_names: false
 binaries:
   - /usr/bin/example-agent
@@ -4108,7 +4084,7 @@ binaries:
         )
         .expect("profile should parse");
 
-        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
+        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
         assert_eq!(
             profile.endpoints[0]
                 .mcp
@@ -4559,7 +4535,7 @@ endpoints:
             "versions: [\"2025-03-26\", \"2025-03-26\"]",
             "versions: [latest]",
             "versions: [draft]",
-            "versions: ['2026-07-28']",
+            "versions: ['2026-07-29']",
             "versions: [\"2025-03-26 \"]",
         ] {
             let yaml = format!(

@@ -205,7 +205,7 @@ network_policies:
 | `mcp.versions` | list of strings | `["2025-11-25"]` | Allowed MCP revisions. Refer to [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | `65536` | Maximum MCP request body size for inspection. |
 | `mcp.strict_tool_names` | bool | `true` | Requires tool names to match `^[A-Za-z0-9_.-]{1,128}$`. |
-| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, the endpoint allows every MCP method except those that deny rules match. If rules name specific tools, `tools/call` is limited to those tools. Rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
+| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, the endpoint allows every core MCP method available in the request's revision, except those that deny rules match. An extension method still needs an allow rule that names it exactly. If rules name specific tools, `tools/call` is limited to those tools. Rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
 | `json_rpc.max_body_bytes` | integer | `65536` | Maximum JSON-RPC request body size for inspection. |
 
 #### Endpoint Constraints
@@ -349,9 +349,12 @@ matcher fields in one rule.
 - Tool arguments are not matched, so an allowed tool accepts any arguments.
 - One denied call denies an entire batched request.
 - Server responses and server-to-client messages are not inspected.
+- Only an allow rule that names an extension method exactly can allow it.
+  Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
+  method is one that no supported MCP revision defines.
 
-A client sends `initialize` and `notifications/initialized` before calling
-tools, so allow both:
+Under the 2025 revisions, a client sends `initialize` and
+`notifications/initialized` before calling tools, so allow both:
 
 ```yaml showLineNumbers={false}
 rules:
@@ -368,23 +371,81 @@ deny_rules:
     tool: send_email
 ```
 
+OpenShell uses the `tower-mcp-types` library to inspect each request under its
+MCP revision. It checks the JSON-RPC structure, whether a client can send the
+method in that revision, and the parameter types of known methods. It rejects a
+body that repeats a key within any JSON object, and a method that MCP defines
+but the request's revision does not, such as `server/discover` under
+`2025-11-25`. A request that fails these checks returns `400` with the error
+`invalid_mcp_request`, even on an endpoint that uses `enforcement: audit`. These
+type checks are not complete JSON Schema validation.
+
 #### MCP Version Selection
 
 `mcp.versions` lists the MCP revisions an endpoint accepts: `2025-03-26`,
-`2025-06-18`, or `2025-11-25`. When omitted, only `2025-11-25` is allowed.
+`2025-06-18`, `2025-11-25`, or `2026-07-28`. When omitted, the list is exactly
+`["2025-11-25"]`, so the endpoint does not accept `2026-07-28` until you list
+it.
 
 ```yaml showLineNumbers={false}
 mcp:
   versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell does not check the revision of a single `initialize` request, because
-the client negotiates the revision in that request. For other requests,
-OpenShell reads the revision from the `MCP-Protocol-Version` header, or uses
-`2025-03-26` when the header is absent. A duplicate, empty, or
-unsupported header value returns `400`, and a supported revision that the
-endpoint does not allow returns `403`. For a client that requires an unsupported
-revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
+OpenShell selects each request's revision from its `MCP-Protocol-Version`
+header. When the header is absent, OpenShell selects `2025-03-26`, so an
+endpoint whose clients omit the header must allow `2025-03-26`. A duplicate,
+empty, or unsupported header value returns `400`, and a supported revision that
+the endpoint does not allow returns `403`.
+
+OpenShell inspects each request under its selected revision only. For example,
+only `2025-03-26` accepts JSON-RPC batches, with at most 64 messages each, and
+later revisions reject a request body that is a JSON array.
+
+Under the 2025 revisions, a client starts with a single `initialize` request
+that proposes a revision in its body, so OpenShell does not check that request's
+revision against `mcp.versions`. An endpoint that allows only `2026-07-28`
+rejects `initialize`.
+
+For a client that requires an unsupported revision, omit `protocol` and `mcp` to
+allow its traffic without MCP inspection.
+
+#### Sessionless MCP Requests
+
+The `2026-07-28` revision has no `initialize` handshake or session. Each request
+carries the client's protocol version and capabilities. A client can call
+`server/discover` to learn what the server supports, and can call
+`subscriptions/listen` to receive notifications on that request's response
+stream. Each HTTP `POST` carries one JSON-RPC request or extension notification.
+
+OpenShell checks each `2026-07-28` request for the following:
+
+- `params._meta` contains `io.modelcontextprotocol/protocolVersion` set to
+  `2026-07-28`, and `io.modelcontextprotocol/clientCapabilities`. Extension
+  requests need this metadata too.
+- The `MCP-Protocol-Version` header is `2026-07-28`. Without it, OpenShell
+  selects `2025-03-26` and rejects the request.
+- The `Mcp-Method` header equals the JSON-RPC `method`.
+- For `tools/call` and `prompts/get`, the `Mcp-Name` header equals
+  `params.name`. For `resources/read`, it equals `params.uri`. OpenShell decodes
+  a `=?base64?...?=` value before comparing it.
+
+A request with missing or invalid metadata, or with a missing, duplicate, or
+mismatched `Mcp-Method` or `Mcp-Name` header, returns `400`. OpenShell also
+rejects `initialize`, `notifications/initialized`, `notifications/cancelled`,
+JSON-RPC responses from the client, and batches. A request that uses an HTTP
+method other than `POST` returns `405`.
+
+OpenShell repeats these checks after middleware changes a request. A middleware
+that replaces the body of a `2026-07-28` request must also update `Mcp-Method`
+and `Mcp-Name` to match the new body.
+
+An extension notification needs `MCP-Protocol-Version: 2026-07-28` and an allow
+rule that names its `method` exactly, such as `method: vendor/notice`. It does
+not need `params._meta`, `Mcp-Method`, or `Mcp-Name`.
+
+OpenShell forwards `Mcp-Param-*` headers without comparing them with tool
+arguments.
 
 ### JSON-RPC Rules
 
@@ -393,6 +454,7 @@ revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
 | `method` | string | Yes | Exact method name, or `*` for all methods. Other globs are rejected. |
 
 Parameters are not matched. One denied call denies an entire batched request.
+OpenShell rejects a body that repeats a key within any JSON object.
 
 ```yaml showLineNumbers={false}
 rules:

@@ -761,20 +761,11 @@ pub async fn sandbox_forward(
 
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
 
-    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
-    command
-        .arg("-N")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-o")
-        .arg(format!(
-            "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID={}",
-            session.sandbox_id
-        ))
-        .arg("-L")
-        .arg(spec.ssh_forward_arg());
-
-    command.arg("sandbox");
+    let mut command = TokioCommand::from(ssh_forward_command(
+        &session.proxy_command,
+        &session.sandbox_id,
+        spec,
+    ));
 
     if background {
         command
@@ -793,34 +784,43 @@ pub async fn sandbox_forward(
 
     if background {
         let mut child = command.spawn().into_diagnostic()?;
-        let pid = child.id().ok_or_else(|| {
-            miette::miette!("ssh process did not expose a PID for background tracking")
-        })?;
+        let Some(pid) = child.id() else {
+            terminate_owned_forward_child(&mut child).await;
+            return Err(miette::miette!(
+                "ssh process did not expose a PID for background tracking"
+            ));
+        };
 
         if let Err(err) = wait_for_forward_start(&mut child, spec)
             .await
             .wrap_err("ssh process started but local forward listener was not reachable")
         {
-            terminate_owned_forward_child(&mut child);
+            terminate_owned_forward_child(&mut child).await;
             return Err(err);
         }
 
-        track_background_forward_or_cleanup(
+        let tracked = track_background_forward_or_cleanup(
             workspace,
             name,
             port,
             pid,
             &session.sandbox_id,
             &spec.bind_addr,
-            || terminate_owned_forward_child(&mut child),
-        )?;
+            || {
+                let _ = child.start_kill();
+            },
+        );
+        if tracked.is_err() {
+            let _ = child.wait().await;
+        }
+        tracked?;
         return Ok(());
     }
 
     let status = {
         let mut child = command.spawn().into_diagnostic()?;
         if let Err(err) = wait_for_forward_start(&mut child, spec).await {
-            let _ = child.kill().await;
+            terminate_owned_forward_child(&mut child).await;
             return Err(err);
         }
         eprintln!("{}", foreground_forward_started_message(name, spec));
@@ -832,6 +832,30 @@ pub async fn sandbox_forward(
     }
 
     Ok(())
+}
+
+/// A forward must stay owned by the process we spawn so it can be reaped or
+/// tracked by PID. User SSH config may otherwise move it into a persistent mux.
+fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
+    let mut command = ssh_base_command(proxy_command);
+    command
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPath=none")
+        .arg("-o")
+        .arg("ControlPersist=no")
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
+        .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg(format!("SetEnv=OPENSHELL_FORWARD_SANDBOX_ID={sandbox_id}"))
+        .arg("-L")
+        .arg(spec.ssh_forward_arg())
+        .arg("sandbox");
+    command
 }
 
 /// Wait for the local listener, racing the probe against the `ssh` child
@@ -859,7 +883,16 @@ async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result
                 ))
             }
         }
+    }?;
+
+    if let Some(status) = child.try_wait().into_diagnostic()? {
+        return Err(miette::miette!(
+            "ssh exited with status {status} after local forward listener opened on {}:{}",
+            forward_probe_host(spec),
+            spec.port,
+        ));
     }
+    Ok(())
 }
 
 /// Poll the local endpoint until a connect succeeds or `wait_for` elapses. The
@@ -935,9 +968,10 @@ fn forward_probe_host(spec: &ForwardSpec) -> &str {
     }
 }
 
-/// Best-effort cleanup for the SSH child this process spawned.
-fn terminate_owned_forward_child(child: &mut Child) {
-    let _ = child.start_kill();
+/// Best-effort cleanup for the SSH child this process spawned. `kill` waits for
+/// the child to exit, so failed startup cannot leave an unreaped process.
+async fn terminate_owned_forward_child(child: &mut Child) {
+    let _ = child.kill().await;
 }
 
 /// Track a verified background forward, cleaning it up if PID-file persistence fails.
@@ -2432,6 +2466,55 @@ mod tests {
         assert_eq!(forward_probe_host(&ipv4), "127.0.0.1");
         assert_eq!(forward_probe_host(&ipv6), "::1");
         assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ssh_config");
+        fs::write(
+            &config,
+            format!(
+                "Host sandbox\n  ControlMaster auto\n  ControlPath {}/mux-%C\n  ControlPersist yes\n  ForkAfterAuthentication yes\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let forward = ssh_forward_command(
+            "openshell ssh-proxy --sandbox demo",
+            "sandbox-id",
+            &ForwardSpec::new(18080),
+        );
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&config)
+            .arg("-G")
+            .args(forward.get_args())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).unwrap();
+        assert!(effective.lines().any(|line| line == "controlmaster false"));
+        assert!(effective.lines().any(|line| line == "controlpersist no"));
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "forkafterauthentication no")
+        );
+        assert!(
+            !effective
+                .lines()
+                .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
+        );
     }
 
     #[tokio::test]

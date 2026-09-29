@@ -485,6 +485,8 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 - `startupProbe` and `livenessProbe` use `/healthz`.
 - `readinessProbe` uses `/readyz`, which reflects the latest result of an in-process background database check.
 
+Each sandbox supervisor Pod uses a `tcpSocket` readiness probe on port 5501. The supervisor accepts connections on that port only while its gateway session is ready. If you add a default-deny ingress policy to sandbox namespaces, allow TCP port 5501 from the node so kubelet can reach supervisor Pods.
+
 ## Next Steps
 
 - To run multiple gateway replicas, refer to [High Availability](/kubernetes/high-availability).

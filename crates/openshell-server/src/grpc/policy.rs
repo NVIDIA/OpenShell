@@ -67,14 +67,12 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    GetResourceVersion, VERSION,
+    GetResourceVersion,
     endpoint_path::EndpointPathPattern,
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
     compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
@@ -92,7 +90,7 @@ use openshell_prover::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -269,7 +267,7 @@ fn emit_gateway_policy_audit_log(
     version: i64,
     policy_hash: &str,
 ) {
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         state_label,
@@ -277,12 +275,7 @@ fn emit_gateway_policy_audit_log(
         version,
         policy_hash,
         &[],
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
 /// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
@@ -307,7 +300,7 @@ fn emit_gateway_policy_auto_approve_audit_log(
         ("prover_delta", "empty".to_string()),
         ("resolved_from", resolved_from.to_string()),
     ];
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         "approved",
@@ -315,15 +308,10 @@ fn emit_gateway_policy_auto_approve_audit_log(
         version,
         policy_hash,
         &extra,
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
-fn build_gateway_policy_audit_message(
+fn build_gateway_policy_audit_event(
     sandbox_id: &str,
     sandbox_name: &str,
     state_label: &str,
@@ -331,16 +319,8 @@ fn build_gateway_policy_audit_message(
     version: i64,
     policy_hash: &str,
     extra_fields: &[(&str, String)],
-) -> String {
-    let ctx = EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    };
+) -> OcsfEvent {
+    let ctx = crate::gateway_ocsf::context(sandbox_id, sandbox_name);
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Other, state_label)
         .severity(SeverityId::Informational)
@@ -355,8 +335,7 @@ fn build_gateway_policy_audit_message(
     for (key, value) in extra_fields {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    builder.build()
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -18980,8 +18959,8 @@ mod tests {
     }
 
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
+    fn build_gateway_policy_audit_event_formats_ocsf_config_line() {
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "merged",
@@ -18989,7 +18968,8 @@ mod tests {
             7,
             "sha256:testhash",
             &[],
-        );
+        )
+        .format_shorthand();
 
         assert_eq!(
             message,
@@ -19004,13 +18984,13 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+    fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
             ("auto", "true".to_string()),
             ("source", "agent_authored".to_string()),
             ("prover_delta", "empty".to_string()),
         ];
-        let message = build_gateway_policy_audit_message(
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "approved",
@@ -19018,7 +18998,8 @@ mod tests {
             12,
             "sha256:autohash",
             &extra,
-        );
+        )
+        .format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
@@ -19039,6 +19020,58 @@ mod tests {
             message.contains("prover_delta:empty"),
             "missing prover_delta field: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
+        use tracing_subscriber::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let config = toml::from_str(&format!(
+            "path = {:?}\nrotation = 'never'\n",
+            path.display().to_string()
+        ))
+        .unwrap();
+        let log = crate::ocsf_log::OcsfLog::start(config).unwrap();
+        let subscriber = tracing_subscriber::registry().with(log.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            emit_gateway_policy_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "approved",
+                "approved chunk abc",
+                7,
+                "sha256:manual",
+            );
+            emit_gateway_policy_auto_approve_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "auto-approved: no new prover findings",
+                8,
+                "sha256:auto",
+                "mechanistic",
+                "gateway",
+            );
+        });
+        log.shutdown().await;
+
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
+            assert_eq!(event["container"]["uid"], "sb-123");
+            assert!(event["container"].get("image").is_none());
+        }
+        assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
+        assert!(events[0]["unmapped"].get("auto").is_none());
+        assert_eq!(events[1]["unmapped"]["policy_hash"], "sha256:auto");
+        assert_eq!(events[1]["unmapped"]["auto"], "true");
+        assert_eq!(events[1]["unmapped"]["resolved_from"], "gateway");
     }
 
     #[test]

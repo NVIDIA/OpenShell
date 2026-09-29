@@ -7332,7 +7332,7 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains("allow_driver_config"));
             assert!(
-                matches!(driver.create_sandbox_inner(&sandbox).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
+                matches!(Box::pin(driver.create_sandbox_inner(&sandbox)).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
             );
         }
     }

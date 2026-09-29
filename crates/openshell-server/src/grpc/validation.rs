@@ -10,7 +10,7 @@
 
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxSpec, SandboxTemplate,
+    SandboxRestartPolicy, SandboxSpec, SandboxTemplate,
 };
 use openshell_core::rpc_error::invalid_argument;
 use prost::Message;
@@ -206,6 +206,7 @@ pub(super) fn validate_sandbox_spec(name: &str, spec: &SandboxSpec) -> Result<()
     if !spec.command.is_empty() {
         validate_main_process_command(&spec.command)?;
     }
+    validate_restart_policy(spec)?;
 
     // --- spec.policy serialized size ---
     validate_sandbox_policy_size(spec)?;
@@ -222,7 +223,18 @@ pub(super) fn validate_sandbox_governance_spec(
     if !spec.command.is_empty() {
         validate_main_process_command(&spec.command)?;
     }
+    validate_restart_policy(spec)?;
     validate_sandbox_policy_size(spec)?;
+    Ok(())
+}
+
+fn validate_restart_policy(spec: &SandboxSpec) -> Result<(), Status> {
+    SandboxRestartPolicy::try_from(spec.restart_policy).map_err(|_| {
+        invalid_argument(
+            "spec.restart_policy",
+            format!("unknown restart_policy value: {}", spec.restart_policy),
+        )
+    })?;
     Ok(())
 }
 
@@ -1225,6 +1237,17 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_unknown_restart_policy() {
+        let spec = SandboxSpec {
+            restart_policy: 99,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("restart_policy"));
     }
 
     #[test]

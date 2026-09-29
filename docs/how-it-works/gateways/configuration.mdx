@@ -276,6 +276,41 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
+## OCSF JSONL Output
+
+`[openshell.gateway.ocsf_log]` enables a gateway-local file containing native OCSF events emitted by the gateway, including events without a sandbox association. Omit the table to disable it. Restart the gateway after changing this configuration.
+
+Gateway records use `[openshell.gateway] name` as `device.uid` and `device.name`, shared across replicas; `device.hostname` identifies the replica. Assign a distinct name to each installation collected together. The default name does not guarantee uniqueness, and renaming an installation changes its audit identity.
+
+```toml
+[openshell.gateway.ocsf_log]
+path = "/var/log/openshell/gateway-ocsf.jsonl"
+schema_version = "1.3"
+rotation = "daily"
+max_files = 7
+queue_capacity = 10000
+queue_max_bytes = 16777216
+```
+
+| Field | Default | Behavior |
+|---|---|---|
+| `path` | Required | Nonempty file path; relative paths use the gateway's working directory. |
+| `schema_version` | Native OCSF 1.8.0 | Optional downgrade target. Accepted values are `1.1` and `1.3`. The configured version applies to every record in the file. |
+| `rotation` | `daily` | Rotate on the first write of a new UTC day. `never` allows unbounded file growth. |
+| `max_files` | `7` | Positive number of rotated segments to retain, in addition to the active file. Rejects explicit use with `rotation = "never"`. |
+| `queue_capacity` | `10000` | Positive queued-record limit. Overflow discards incoming records. |
+| `queue_max_bytes` | `16777216` | Positive limit on queued encoded bytes. Records exceeding this limit are discarded. |
+
+Unknown fields are rejected. This is one file destination, not an exporter registry. The existing `ocsf_json_enabled` sandbox setting remains independent.
+
+Give each gateway replica its own writable file and an external shipper read access to the containing directory. New files use owner-only permissions on Unix; arrange shipper access deliberately. Rotation renames the active file to a date- and UUID-suffixed sibling. The shipper must follow rotated files and checkpoint its progress. Do not use multiple writers or external copy-truncate rotation on this path.
+
+The gateway queues OCSF independently of `RUST_LOG`, excludes ordinary diagnostics, and preserves native event IDs. It writes up to 100 records per batch with a 500 ms batching interval. One additional bounded batch can be in flight. File errors do not stop sandbox execution: failed writes are not replayed, and subsequent records are discarded during reopen backoff. A restarted writer removes an incomplete trailing line before appending.
+
+Metrics include `openshell_ocsf_log_queued_total`, `openshell_ocsf_log_written_total`, `openshell_ocsf_log_queue_records`, `openshell_ocsf_log_queue_bytes`, `openshell_ocsf_log_dropped_total` (with a bounded `reason` label), and `openshell_ocsf_log_writer_errors_total`. Recovery reports discarded bytes through `openshell_ocsf_log_recovery_discarded_bytes_total`, not an invented lost-record count. Warnings report writer failures independently of this file.
+
+Allow enough retention and disk space for shipper outages. Graceful shutdown allows five seconds for draining; outstanding OS writes remain uncertain if they outlast that budget. Flush does not mean fsync. The file is a best-effort collection boundary, not durable acceptance, a replay protocol, or proof of a complete audit history. See [OCSF JSON export](/observability/ocsf-json-export) for the separate sandbox-local output.
+
 ## OTLP Export
 
 `[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.
@@ -896,6 +931,13 @@ no_proxy = ".svc.cluster.local,10.0.0.0/8"
 # Optional root-owned host file containing user:pass. An http:// proxy also
 # requires proxy_auth_allow_insecure = true as an explicit acknowledgement.
 proxy_auth_file = "/etc/openshell/secrets/proxy-auth"
+proxy_auth_allow_insecure = false
+# Last resort for proxy ACLs that require hostname CONNECT targets. The proxy
+# then performs DNS resolution and becomes part of the effective egress boundary.
+proxy_connect_by_hostname = false
+# Operator-owned gateway-host PEM bundle trusted for an HTTPS proxy and for
+# destination certificates re-signed by a TLS-intercepting proxy.
+proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
 # Project a host Unix Workload API socket into the supervisor for provider
 # token exchange. The socket parent must be a dedicated absolute directory.
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -903,6 +945,30 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 
 Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
+
+Docker accepts `http://` and `https://` proxy URLs in explicit
+`scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
+OpenShell policy still applies. Proxy URLs cannot embed credentials. Supply a
+`user:pass` file with `proxy_auth_file`, and set
+`proxy_auth_allow_insecure = true` only to acknowledge that Basic credentials
+travel in cleartext to an `http://` proxy.
+
+`proxy_ca_bundle` requires `https_proxy`, but the configured proxy URL may use
+either scheme because a plain HTTP proxy can still intercept destination TLS.
+The file must be a readable, bounded PEM bundle containing a usable certificate
+authority. Docker validates it at gateway startup and again before each
+supervisor launch. Missing, unreadable, empty, oversized, malformed, and
+certificate-free bundles fail closed rather than falling back to default trust
+or direct egress.
+
+The gateway-host path is operator-owned and cannot be selected through sandbox
+environment, image contents, or `template.driver_config.docker`. The driver
+copies the validated contents into its supervisor-only named volume and passes
+the fixed path `/.openshell/supervisor/upstream-proxy-ca-bundle.pem` to the
+companion supervisor. The bundle extends trust for the TLS connection to an
+`https://` proxy, supervisor connections to re-signed upstream certificates,
+and the combined trust bundle exposed to workload processes. The gateway-host
+path is never mounted into or exposed to the workload container.
 
 ### Podman
 

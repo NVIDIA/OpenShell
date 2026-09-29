@@ -263,6 +263,11 @@ pub struct ContainerSpec {
     stop_timeout: u32,
     /// Extra /etc/hosts entries for the networked supervisor container.
     /// The isolated workload resolves host aliases through policy DNS.
+    /// Native restart stays disabled; the gateway owns sandbox restart policy.
+    restart_policy: String,
+    /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
+    /// via Podman's `host-gateway` magic so sandbox containers can reach
+    /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
     /// Search domains written to `/etc/resolv.conf` by Podman.
     dns_search: Vec<String>,
@@ -1283,6 +1288,10 @@ fn build_base_spec(
         // Inject stable host aliases into the networked supervisor container.
         // The workload clears these entries and resolves the driver-neutral
         // alias through the policy-DNS relay instead.
+        restart_policy: "no".to_string(),
+        // Inject stable host aliases into /etc/hosts so sandbox containers can
+        // reach services on the host. `host.openshell.internal` is the driver-
+        // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
         // Preserve Podman's resolver defaults for both policy-DNS and ordinary
         // sandboxes. Namespace-local capture supports UDP and TCP, so it must
@@ -3344,6 +3353,12 @@ mod tests {
         let mut config = test_config();
         config.host_gateway_ip = "192.168.127.254".to_string();
         let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["restart_policy"].as_str(),
+            Some("no"),
+            "the gateway owns sandbox restart policy"
+        );
 
         let hostadd: Vec<&str> = spec["hostadd"]
             .as_array()
