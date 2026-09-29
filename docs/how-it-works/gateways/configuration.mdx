@@ -84,6 +84,9 @@ version = 2
 [openshell.gateway.tls]
 # ... gateway listener TLS ...
 
+[openshell.gateway.metrics_tls]
+# ... dedicated metrics listener TLS ...
+
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
 
@@ -229,6 +232,14 @@ client_ca_path        = "/etc/openshell/certs/client-ca.pem"
 # external_key_path     = "/etc/openshell/certs/external-key.pem"
 # external_server_names = ["gateway.example.com"]
 
+# Dedicated metrics-listener TLS. Omit this table to retain the plaintext
+# metrics listener. Use a CA that is distinct from the gateway client CA.
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
+
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
 public_key_path  = "/etc/openshell/jwt/public.pem"
@@ -301,6 +312,49 @@ Set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client cert
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
+
+## Metrics Listener TLS
+
+The dedicated metrics listener is configured with `metrics_bind_address`. It
+remains plaintext unless `[openshell.gateway.metrics_tls]` is configured, which
+preserves compatibility with existing Prometheus deployments. TLS for this
+listener is independent from `[openshell.gateway.tls]`: it has its own server
+certificate, optional client CA, and reload worker.
+
+```toml
+[openshell.gateway]
+metrics_bind_address = "0.0.0.0:9090"
+
+[openshell.gateway.metrics_tls]
+cert_path           = "/etc/openshell/metrics/server/tls.crt"
+key_path            = "/etc/openshell/metrics/server/tls.key"
+client_ca_path      = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
+```
+
+`cert_path` and `key_path` are required whenever the table is present. Omit
+`client_ca_path` for HTTPS with anonymous scraping. Set `client_ca_path` and
+`require_client_auth = true` for mTLS; a client without a certificate, or with
+a certificate from another CA, cannot scrape `/metrics`. When
+`require_client_auth = false`, anonymous clients remain allowed, but any client
+certificate they present must validate against `client_ca_path`.
+
+The metrics client CA must be distinct from the gateway listener client CA. In
+Kubernetes, sandbox workloads receive gateway client credentials for their
+control-plane connection. Reusing that CA for metrics would let those workload
+identities access the metrics endpoint. The metrics server certificate may be
+the same certificate used by the gateway listener when its SANs cover the
+metrics Service DNS name.
+
+The listener watches its certificate, key, and optional client CA files. A
+valid change is applied without restarting the gateway; an invalid replacement
+keeps the last known-good configuration active. Reload logs and OCSF events
+include `listener=metrics` to distinguish this boundary from gateway TLS.
+
+For a Helm installation, set `metrics.tls.enabled=true` and provide the
+operator-managed Secret names through `metrics.tls.certSecretName` and, for
+mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
+metrics-specific PKI or monitoring resources.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 

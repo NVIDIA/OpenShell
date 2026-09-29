@@ -841,6 +841,7 @@ version = 2
 [openshell.gateway]
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
+metrics_bind_address = "0.0.0.0:9090"
 log_level = "info"
 compute_driver = "kubernetes"
 credential_drivers = ["kubernetes-secrets"]
@@ -852,6 +853,12 @@ policy_validation_failure_mode = "retain_last_valid"
 cert_path = "/etc/openshell/certs/gateway.pem"
 key_path = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path = "/etc/openshell/certs/client-ca.pem"
+
+[openshell.gateway.metrics_tls]
+cert_path = "/etc/openshell/metrics/server/tls.crt"
+key_path = "/etc/openshell/metrics/server/tls.key"
+client_ca_path = "/etc/openshell/metrics/client-ca/ca.crt"
+require_client_auth = true
 
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com/realms/openshell"
@@ -881,6 +888,16 @@ namespace = "agents"
             Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
         );
         assert!(gw.tls.is_some());
+        let metrics_tls = gw.metrics_tls.as_ref().expect("metrics TLS config parses");
+        assert_eq!(
+            metrics_tls.cert_path,
+            Path::new("/etc/openshell/metrics/server/tls.crt")
+        );
+        assert_eq!(
+            metrics_tls.client_ca_path.as_deref(),
+            Some(Path::new("/etc/openshell/metrics/client-ca/ca.crt"))
+        );
+        assert!(metrics_tls.require_client_auth);
         let oidc = gw.oidc.as_ref().expect("OIDC config parses");
         assert!(!oidc.dangerously_allow_insecure_http);
         assert_eq!(
