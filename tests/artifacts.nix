@@ -12,6 +12,7 @@ let
   gnuToolchain = toolchains.${if isAarch64 then "aarch64-gnu" else "x86_64-gnu"};
   muslToolchain = toolchains.${if isAarch64 then "aarch64-musl" else "x86_64-musl"};
   dockerArch = if isAarch64 then "arm64" else "amd64";
+  snapcraftImage = "ghcr.io/canonical/snapcraft:8_core24@sha256:0443273552768a3230c2ede3aa47e567da0242bfbb0a7bb1283093208c404a0c";
   toolchainEnv = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (
     builtins.attrValues toolchains
   );
@@ -197,6 +198,120 @@ let
     features = "e2e-podman";
     filter = podmanE2eArchiveFilter;
   };
+
+  snapPackage = pkgs.writeShellApplication {
+    name = "package-artifacts-snap";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.docker-client
+      pkgs.git
+      pkgs.python3
+    ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      build_dir=$(mktemp -d "''${TMPDIR:-/tmp}/openshell-snap-build.XXXXXX")
+      volume_name="openshell-snap-build-$(id -u)-$$-$RANDOM"
+      fix_ownership() {
+        docker run --rm \
+          --platform linux/${dockerArch} \
+          --volume "$build_dir:/host" \
+          --entrypoint /usr/bin/chown \
+          ${snapcraftImage} \
+          -R "$(id -u):$(id -g)" /host >/dev/null 2>&1 || true
+      }
+      cleanup() {
+        status=$?
+        trap - EXIT
+        docker volume rm "$volume_name" >/dev/null 2>&1 || true
+        fix_ownership
+        rm -rf -- "$build_dir"
+        exit "$status"
+      }
+      trap cleanup EXIT
+
+      prebuilt_dir="$build_dir/input/snap/prebuilt"
+      mkdir -p "$prebuilt_dir/meta/gui"
+
+      install -m 0644 snapcraft.yaml "$build_dir/input/snapcraft.yaml"
+      install -d -m 0755 "$build_dir/input/snap/hooks"
+      install -m 0755 snap/hooks/install "$build_dir/input/snap/hooks/install"
+      install -m 0755 snap/hooks/post-refresh "$build_dir/input/snap/hooks/post-refresh"
+      install -m 0755 snap/hooks/connect-plug-docker "$build_dir/input/snap/hooks/connect-plug-docker"
+      install -m 0755 \
+        "artifacts/binaries/${muslToolchain.target}/openshell" \
+        "$prebuilt_dir/openshell"
+      install -m 0755 \
+        "artifacts/binaries/${gnuToolchain.target}/openshell-gateway" \
+        "$prebuilt_dir/openshell-gateway"
+      install -m 0755 \
+        "artifacts/binaries/${muslToolchain.target}/openshell-sandbox" \
+        "$prebuilt_dir/openshell-sandbox"
+      install -m 0755 \
+        tasks/scripts/snap-gateway-wrapper.sh \
+        "$prebuilt_dir/openshell-gateway-wrapper"
+      install -m 0644 LICENSE "$prebuilt_dir/LICENSE"
+      install -m 0644 README.md "$prebuilt_dir/README.md"
+      install -m 0644 \
+        snap/local/term.desktop \
+        "$prebuilt_dir/meta/gui/term.desktop"
+      install -m 0644 \
+        snap/local/icon.png \
+        "$prebuilt_dir/meta/gui/icon.png"
+      python3 tasks/scripts/release.py get-version --snap \
+        >"$prebuilt_dir/version"
+
+      docker volume create "$volume_name" >/dev/null
+      docker run --rm \
+        --platform linux/${dockerArch} \
+        --volume "$build_dir/input:/input:ro" \
+        --volume "$volume_name:/project" \
+        --entrypoint /bin/sh \
+        ${snapcraftImage} \
+        -c 'cp -a /input/. /project/'
+
+      docker run --rm \
+        --platform linux/${dockerArch} \
+        --volume "$volume_name:/project" \
+        ${snapcraftImage}
+
+      mkdir -p "$build_dir/output"
+      docker run --rm \
+        --platform linux/${dockerArch} \
+        --volume "$volume_name:/project:ro" \
+        --volume "$build_dir/output:/output" \
+        --entrypoint /bin/sh \
+        ${snapcraftImage} \
+        -c 'set -eu
+          found=0
+          for artifact in /project/*.snap /project/*.comp; do
+            [ -e "$artifact" ] || continue
+            cp "$artifact" /output/
+            found=1
+          done
+          [ "$found" -eq 1 ]'
+      fix_ownership
+
+      shopt -s nullglob
+      snap_files=("$build_dir/output"/*.snap)
+      component_files=("$build_dir/output"/*.comp)
+      if (( ''${#snap_files[@]} == 0 )); then
+        echo "ERROR: Snapcraft did not produce a .snap file" >&2
+        exit 1
+      fi
+
+      mkdir -p artifacts/snap
+      for artifact in "''${snap_files[@]}" "''${component_files[@]}"; do
+        install -m 0644 "$artifact" artifacts/snap/
+        echo "Created Snap artifact: artifacts/snap/$(basename "$artifact")"
+      done
+      ln -f \
+        "artifacts/snap/$(basename "''${snap_files[0]}")" \
+        artifacts/snap/openshell.snap
+      echo "Created stable Snap artifact: artifacts/snap/openshell.snap"
+    '';
+  };
 in
 rec {
   inherit
@@ -286,6 +401,18 @@ rec {
     '';
   };
 
+  snap = pkgs.writeShellApplication {
+    name = "build-artifacts-snap";
+    runtimeInputs = [
+      binaries
+      snapPackage
+    ];
+    text = ''
+      build-artifacts-binaries
+      package-artifacts-snap
+    '';
+  };
+
   images = pkgs.writeShellApplication {
     name = "build-artifacts-images";
     runtimeInputs = [
@@ -371,10 +498,12 @@ rec {
       testArchives
       images
       helm
+      snapPackage
     ];
     text = ''
       build-artifacts-binaries
       build-artifacts-test-archives
+      package-artifacts-snap
       build-artifacts-images
       build-artifacts-helm
     '';

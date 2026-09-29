@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Configure snapd
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Gather distribution facts
+      ansible.builtin.setup:
+        gather_subset:
+          - distribution
+
+    - name: Validate snapd support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          snapd is supported only on Ubuntu tmachine guests, not
+          {{ ansible_facts.distribution }}.
+
+    - name: Install snapd
+      ansible.builtin.apt:
+        name: snapd
+        state: present
+        update_cache: true
+        install_recommends: false
+
+    - name: Start snapd socket activation
+      ansible.builtin.systemd_service:
+        name: snapd.socket
+        enabled: true
+        state: started
+
+    - name: Wait for snapd seed
+      ansible.builtin.command:
+        cmd: snap wait system seed.loaded
+      changed_when: false
+
+    - name: Query snapd version
+      ansible.builtin.command:
+        cmd: snap version
+      register: snapd_version
+      changed_when: false
+
+    - name: Resolve snapd version
+      ansible.builtin.set_fact:
+        openshell_snapd_version: >-
+          {{ snapd_version.stdout
+             | regex_search('(?m)^snapd\s+(\S+)$', '\1')
+             | first }}
+
+    - name: Install current candidate snapd Snap for local package support
+      ansible.builtin.command:
+        argv:
+          - snap
+          - install
+          - snapd
+          - --channel=latest/candidate
+      when: openshell_snapd_version is version('2.77', '<')
+
+    - name: Restart upgraded snapd
+      ansible.builtin.systemd_service:
+        name: snapd.service
+        daemon_reload: true
+        state: restarted
+      when: openshell_snapd_version is version('2.77', '<')
+
+    - name: Wait for upgraded snapd seed
+      ansible.builtin.command:
+        cmd: snap wait system seed.loaded
+      changed_when: false
+      when: openshell_snapd_version is version('2.77', '<')
+
+    - name: Query effective snapd version
+      ansible.builtin.command:
+        cmd: snap version
+      register: effective_snapd_version
+      changed_when: false
+
+    - name: Resolve effective snapd version
+      ansible.builtin.set_fact:
+        openshell_snapd_version: >-
+          {{ effective_snapd_version.stdout
+             | regex_search('(?m)^snapd\s+(\S+)$', '\1')
+             | first }}
+
+    # Snapd 2.76 introduced the system :docker slot. Version 2.77 additionally
+    # permits a locally-built Snap to connect to it without a store assertion.
+    - name: Require local Snap system Docker support
+      ansible.builtin.assert:
+        that:
+          - openshell_snapd_version is version('2.77', '>=')
+        fail_msg: >-
+          Local OpenShell Snap testing requires snapd 2.77 or newer, found
+          {{ openshell_snapd_version }}.

@@ -361,6 +361,32 @@ unit's `gateway.env` hook. Ordinary package installations continue to use the
 gateway's built-in runtime-image defaults unless the operator configures an
 override.
 
+`nix run .#build-artifacts-snap` runs the shared binary artifact builder and
+packages its native-architecture Linux outputs with the digest-pinned Canonical
+Snapcraft `core24` container. The container builds in a temporary Docker volume
+because Snapcraft records extended attributes that macOS bind mounts do not
+support. The task copies the resulting package to `artifacts/snap/` and removes
+the temporary volume. The aggregate `build-artifacts` app includes this Snap
+package.
+
+The tmachine `snap` installer installs that local package and can run the same
+conformance suites as the binary and Debian installers. It connects the Snap's
+system `:docker` interface to package-installed Docker because Docker Snap
+cannot start containers with the `no-new-privileges` security option that the
+Docker driver requires. Like the Debian qualification profile, the Snap
+installer selects the staged candidate runtime images explicitly instead of
+retagging them as release defaults. Strict confinement requires that
+qualification config to remain inside the Snap's canonical state directory.
+The tmachine-only service override selects the Docker driver explicitly because
+the manual connection hook restarts the gateway before auto-detection observes
+the newly connected interface. The package generates its own gateway PKI and
+sandbox JWT bundle. The installer copies the generated mTLS client bundle into
+the tmachine user's Snap state and registers the HTTPS gateway before a shared
+testsuite runs. Local package installation requires snapd 2.77 or newer so the
+unasserted Snap can connect to the system `:docker` slot. The installer uses the
+current candidate snapd Snap when the guest distribution package is older
+because stable does not yet provide that local-connection behavior.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored

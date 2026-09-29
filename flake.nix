@@ -156,6 +156,10 @@
             type = "app";
             program = "${artifacts.images}/bin/build-artifacts-images";
           };
+          build-artifacts-snap = {
+            type = "app";
+            program = "${artifacts.snap}/bin/build-artifacts-snap";
+          };
           test-guest = testGuest.app;
           test-guest-cache = testGuest.cacheApp;
         };

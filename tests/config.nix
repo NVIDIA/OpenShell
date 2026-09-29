@@ -102,6 +102,19 @@ let
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
+      {
+        name = "snap";
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/snapd.yaml"
+          "ansible/playbooks/openshell-snap.yaml"
+        ];
+        inputs = {
+          openshell_snap_package = "../artifacts/snap/openshell.snap";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
     ];
 
     testsuites = [

@@ -152,13 +152,14 @@ parts:
       install -D -m 0644 "$CRAFT_PART_SRC/README.md" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/README.md"
 
-  ssh:
-    # Vendor the openssh-client `ssh` binary into the snap so the CLI/TUI
-    # can spawn `ssh` for sandbox connect/exec/forward without relying on
-    # the host's ssh-keys interface. The binary lands at
-    # $SNAP/usr/bin/ssh and is found via the snap runtime PATH.
+  cli-runtime:
+    # Vendor commands spawned by the CLI. `ssh` supports sandbox
+    # connect/exec/forward, while `git` provides .gitignore-aware uploads.
+    # Both are found through the snap runtime PATH.
     plugin: nil
     stage-packages:
+      - git
       - openssh-client
     prime:
+      - usr/bin/git
       - usr/bin/ssh

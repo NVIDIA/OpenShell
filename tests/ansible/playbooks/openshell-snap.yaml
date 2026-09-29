@@ -1,0 +1,268 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell Snap
+  hosts: all
+  gather_facts: false
+  vars:
+    openshell_snap_dir: /var/lib/openshell-snap
+    openshell_image_staging_dir: "{{ openshell_snap_dir }}/images"
+    openshell_snap_service: snap.openshell.gateway.service
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create OpenShell Snap staging directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ openshell_snap_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Create OpenShell image staging directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ openshell_image_staging_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy OpenShell Snap
+      become: true
+      ansible.builtin.copy:
+        src: "{{ openshell_snap_package }}"
+        dest: "{{ openshell_snap_dir }}/openshell.snap"
+        mode: "0600"
+
+    - name: Copy OpenShell runtime images
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ openshell_image_staging_dir }}/{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - src: "{{ openshell_sandbox_image }}"
+          dest: sandbox.tar
+        - src: "{{ openshell_supervisor_image }}"
+          dest: supervisor.tar
+
+    - name: Load OpenShell runtime images
+      become: true
+      ansible.builtin.command:
+        argv:
+          - docker
+          - load
+          - --input
+          - "{{ openshell_image_staging_dir }}/{{ item }}.tar"
+      loop:
+        - sandbox
+        - supervisor
+
+    - name: Install candidate OpenShell Snap
+      become: true
+      ansible.builtin.command:
+        argv:
+          - snap
+          - install
+          - "{{ openshell_snap_dir }}/openshell.snap"
+          - --dangerous
+
+    # A local install cannot auto-connect the Docker interface. Pause the
+    # auto-started daemon before it exhausts systemd's start limit while driver
+    # auto-detection is still unavailable.
+    - name: Stop OpenShell Snap gateway before configuration
+      become: true
+      ansible.builtin.command:
+        argv:
+          - snap
+          - stop
+          - openshell.gateway
+
+    # Keep the qualification override inside SNAP_COMMON so strict confinement
+    # permits the packaged gateway to read it.
+    - name: Configure candidate OpenShell runtime images for qualification
+      become: true
+      ansible.builtin.copy:
+        dest: /var/snap/openshell/common/gateway.toml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [openshell]
+          version = 2
+
+          [openshell.gateway]
+
+          [openshell.drivers.docker]
+          sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
+          supervisor_image = "docker.io/openshell/supervisor:tmachine"
+
+    - name: Expose OpenShell CLI at the tmachine scenario contract path
+      become: true
+      ansible.builtin.file:
+        src: /snap/bin/openshell
+        dest: /usr/local/bin/openshell
+        state: link
+
+    - name: Create OpenShell Snap gateway service override directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/systemd/system/snap.openshell.gateway.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Order OpenShell Snap gateway after Docker
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/snap.openshell.gateway.service.d/tmachine.conf
+        mode: "0644"
+        content: |
+          [Unit]
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          Environment=OPENSHELL_COMPUTE_DRIVER=docker
+          SyslogIdentifier=openshell-gateway
+
+    - name: Reload systemd units
+      become: true
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Reset OpenShell Snap gateway start limit
+      become: true
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - reset-failed
+          - "{{ openshell_snap_service }}"
+      register: openshell_snap_reset_failed
+      changed_when: false
+      failed_when: >-
+        openshell_snap_reset_failed.rc != 0 and
+        'not loaded' not in openshell_snap_reset_failed.stderr
+
+    - name: Connect OpenShell Snap observation interfaces
+      become: true
+      ansible.builtin.command:
+        argv:
+          - snap
+          - connect
+          - "{{ item.plug }}"
+          - "{{ item.slot }}"
+      loop:
+        - plug: openshell:log-observe
+          slot: core:log-observe
+        - plug: openshell:system-observe
+          slot: core:system-observe
+
+    - name: Connect OpenShell Snap Docker interface
+      become: true
+      ansible.builtin.command:
+        argv:
+          - snap
+          - connect
+          - openshell:docker
+          - :docker
+      register: openshell_snap_docker_connection
+      failed_when: false
+
+    - name: Read OpenShell Snap gateway logs after Docker connection failure
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - "{{ openshell_snap_service }}"
+          - --no-pager
+          - --lines
+          - "100"
+      register: openshell_snap_connection_logs
+      changed_when: false
+      failed_when: false
+      when: openshell_snap_docker_connection.rc != 0
+
+    - name: Show OpenShell Snap Docker connection diagnostics
+      ansible.builtin.debug:
+        var: openshell_snap_connection_logs.stdout_lines
+      when: openshell_snap_docker_connection.rc != 0
+
+    - name: Require OpenShell Snap Docker connection
+      ansible.builtin.assert:
+        that:
+          - openshell_snap_docker_connection.rc == 0
+        fail_msg: OpenShell Snap Docker interface connection failed
+
+    - name: Restart OpenShell Snap gateway
+      become: true
+      ansible.builtin.command:
+        argv:
+          - snap
+          - restart
+          - openshell.gateway
+
+    - name: Wait for OpenShell Snap gateway
+      block:
+        - name: Wait for gateway port
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 17670
+            timeout: 60
+
+      rescue:
+        - name: Read OpenShell Snap gateway logs
+          become: true
+          ansible.builtin.command:
+            argv:
+              - journalctl
+              - --unit
+              - "{{ openshell_snap_service }}"
+              - --no-pager
+              - --lines
+              - "100"
+          changed_when: false
+          failed_when: false
+          register: openshell_snap_gateway_logs
+
+        - name: Show OpenShell Snap gateway logs
+          ansible.builtin.debug:
+            var: openshell_snap_gateway_logs.stdout_lines
+
+        - name: Report OpenShell Snap gateway startup failure
+          ansible.builtin.fail:
+            msg: OpenShell Snap gateway did not start
+
+    - name: Create OpenShell Snap client TLS directory
+      become: true
+      ansible.builtin.file:
+        path: /home/tmachine/snap/openshell/common/.local/state/openshell/tls/client
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Install OpenShell Snap client TLS bundle
+      become: true
+      ansible.builtin.copy:
+        src: "/var/snap/openshell/common/tls/{{ item.src }}"
+        dest: >-
+          /home/tmachine/snap/openshell/common/.local/state/openshell/tls/{{ item.dest }}
+        remote_src: true
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+      loop:
+        - src: ca.crt
+          dest: ca.crt
+        - src: client/tls.crt
+          dest: client/tls.crt
+        - src: client/tls.key
+          dest: client/tls.key
+
+    - name: Register packaged OpenShell Snap gateway
+      ansible.builtin.include_role:
+        name: openshell_client
+      vars:
+        openshell_client_gateway_endpoint: https://127.0.0.1:17670
+        openshell_client_gateway_name: openshell

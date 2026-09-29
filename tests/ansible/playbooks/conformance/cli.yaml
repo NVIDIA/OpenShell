@@ -25,6 +25,40 @@
         group: tmachine
         mode: "0700"
 
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
+    - name: Read OpenShell CLI link target
+      ansible.builtin.command:
+        argv:
+          - readlink
+          - "{{ openshell_cli.stdout }}"
+      register: openshell_cli_link
+      changed_when: false
+      failed_when: false
+
+    - name: Select OpenShell conformance temporary directory
+      ansible.builtin.set_fact:
+        openshell_conformance_tmpdir: >-
+          {{ '/home/tmachine/snap/openshell/common/tmp'
+             if openshell_cli.stdout == '/snap/bin/openshell'
+             or openshell_cli_link.stdout == '/snap/bin/openshell'
+             else '/tmp/openshell-conformance' }}
+
+    # Strict Snap confinement gives applications a private /tmp and hides
+    # dotfiles under $HOME. Its package-owned user directory supports both.
+    - name: Create OpenShell conformance temporary directory
+      ansible.builtin.file:
+        path: "{{ openshell_conformance_tmpdir }}"
+        state: directory
+        mode: "0700"
+
     - name: Extract OpenShell conformance test bundle
       become: true
       ansible.builtin.unarchive:
@@ -46,15 +80,6 @@
           - conformance_archive.stat.isreg | default(false)
         fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
 
-    - name: Resolve installed OpenShell CLI
-      ansible.builtin.command:
-        argv:
-          - /bin/sh
-          - -c
-          - command -v openshell
-      register: openshell_cli
-      changed_when: false
-
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
@@ -74,6 +99,7 @@
           - --no-fail-fast
       environment:
         OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+        TMPDIR: "{{ openshell_conformance_tmpdir }}"
       register: conformance_result
       changed_when: false
       failed_when: false
@@ -90,8 +116,8 @@
       ansible.builtin.command:
         argv:
           - journalctl
-          - --unit
-          - openshell-gateway.service
+          - --identifier
+          - openshell-gateway
           - --no-pager
           - --lines
           - "500"
