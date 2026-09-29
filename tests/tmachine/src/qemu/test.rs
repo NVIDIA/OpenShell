@@ -26,45 +26,54 @@ pub async fn test(
     let image = QemuImage::create(&install_disk, test_disk).await;
     let vm = QemuVm::start(&image).await;
 
-    run_playbooks(
+    let result = run_playbooks(
         &testsuite.playbooks,
         &testsuite.inputs,
         &environment.variables,
     )
-    .await?;
-
-    if testsuite.interactive {
-        println!("Opening an SSH shell in the tmachine VM.");
-        let ssh_status = Command::new("sshpass")
-            .env("SSHPASS", "tmachine")
-            .args([
-                "-e",
-                "ssh",
-                "-tt",
-                "-p",
-                "2222",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                "tmachine@127.0.0.1",
-            ])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .context("open SSH shell in tmachine VM")?;
-
-        vm.shutdown().await;
-        vm.wait().await;
-        anyhow::ensure!(ssh_status.success(), "SSH shell exited with {ssh_status}");
-        return Ok(());
+    .await;
+    if let Err(error) = result {
+        vm.stop().await?;
+        return Err(error);
     }
 
-    vm.shutdown().await;
-    vm.wait().await;
+    if testsuite.interactive {
+        let shell_result = open_shell().await;
+        vm.stop().await?;
+        return shell_result;
+    }
+
+    vm.stop().await?;
+    Ok(())
+}
+
+async fn open_shell() -> Result<()> {
+    println!("Opening an SSH shell in the tmachine VM.");
+    let mut command = Command::new("sshpass");
+    command
+        .env("SSHPASS", "tmachine")
+        .args([
+            "-e",
+            "ssh",
+            "-tt",
+            "-p",
+            "2222",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "tmachine@127.0.0.1",
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command.kill_on_drop(true);
+    let ssh_status = command
+        .status()
+        .await
+        .context("open SSH shell in tmachine VM")?;
+    anyhow::ensure!(ssh_status.success(), "SSH shell exited with {ssh_status}");
     Ok(())
 }
