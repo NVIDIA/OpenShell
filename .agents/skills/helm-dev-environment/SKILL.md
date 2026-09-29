@@ -299,6 +299,14 @@ KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
 
 Use the IP that pods in that cluster use to reach listeners on the test host.
 
+Use `mise run e2e:kubernetes:ha-tls` for the TLS HA lane. It layers
+`ci/values-high-availability-tls.yaml` so gateway pods serve TLS and mTLS and
+route peers over HTTPS with the chart CA, skips Envoy, registers an mTLS CLI
+gateway over the Service port-forward (`OPENSHELL_E2E_KUBE_POD_TLS=1`), and
+runs only `kubernetes_ha_operations`: one sandbox kept across scale-up,
+scale-down, graceful and forced owner loss, and a rolling restart, with each
+HA-tested operation class driven through non-owner replicas.
+
 ### BackendTLSPolicy (end-to-end TLS)
 
 To enable end-to-end TLS between the Gateway proxy and the gateway pod, add
