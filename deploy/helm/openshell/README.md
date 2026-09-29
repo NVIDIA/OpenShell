@@ -275,6 +275,41 @@ DNS name while connecting directly to the owning pod. Custom TLS Secrets must
 include that Service DNS name in the server certificate and provide the CA and
 client credentials configured by `server.tls`.
 
+## Secure metrics scraping
+
+The dedicated metrics endpoint is plaintext by default for compatibility with
+existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
+HTTPS. The initial implementation uses operator-provided Kubernetes Secrets;
+it does not generate metrics PKI or create a `ServiceMonitor`.
+
+```yaml
+metrics:
+  tls:
+    enabled: true
+    # Empty uses server.tls.certSecretName instead.
+    certSecretName: openshell-metrics-server-tls
+    clientCaSecretName: openshell-metrics-scraper-ca
+    requireClientCert: true
+```
+
+The server Secret must provide `tls.crt` and `tls.key`; the scraper CA Secret
+must provide `ca.crt`. When `requireClientCert` is true, the chart rejects a
+render without `clientCaSecretName`. The metrics client CA must be separate
+from `server.tls.clientCaSecretName`: sandbox workloads receive gateway client
+credentials, and trusting that CA on the metrics listener would grant those
+workloads scraping access.
+
+The metrics server certificate may reuse the gateway server TLS Secret when its
+SANs cover the Service DNS name used by the scraper. The gateway reloads valid
+certificate changes in place and preserves the last known-good configuration on
+an invalid replacement. Logs and OCSF events identify these reloads with
+`listener=metrics`.
+
+Configure your monitoring resource separately. A Prometheus Operator
+`ServiceMonitor` or `PodMonitor` that uses mTLS must reference its client
+certificate, key, and CA from Secrets in the monitoring resource's namespace.
+Do not disable server verification with `insecureSkipVerify`.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -342,6 +377,10 @@ discovery endpoint or its TLS CA.
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
+| metrics.tls.certSecretName | string | `""` | Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName. |
+| metrics.tls.clientCaSecretName | string | `""` | Secret with ca.crt for verifying metrics scraper client certificates. Required when requireClientCert is true. |
+| metrics.tls.enabled | bool | `false` | Enable TLS for the dedicated metrics listener. |
+| metrics.tls.requireClientCert | bool | `false` | Require a client certificate signed by clientCaSecretName to scrape metrics. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict SSH ingress on sandbox pods to the gateway. In managed mode, the driver applies the equivalent policy to each workspace namespace. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
