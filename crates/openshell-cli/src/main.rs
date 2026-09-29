@@ -251,6 +251,22 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str, workspace: &str) ->
     Ok(last)
 }
 
+/// Accept `sandbox exec <name> -- <command>`. Clap keeps `--` in `command`
+/// when a token precedes it, so the name would otherwise run as the program.
+fn split_exec_name(
+    name: Option<String>,
+    mut command: Vec<String>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if name.is_some() || command.get(1).map(String::as_str) != Some("--") {
+        return Ok((name, command));
+    }
+    let rest = command.split_off(2);
+    if rest.is_empty() {
+        return Err(miette::miette!("No command given after `--`."));
+    }
+    Ok((command.into_iter().next(), rest))
+}
+
 // Custom root help stays hand-authored so commands can be grouped into product
 // areas without relying on clap's default subcommand listing. User-facing
 // commands remain visible so shell completion can suggest them at the root.
@@ -1674,12 +1690,14 @@ enum SandboxCommands {
     /// For interactive shell sessions, use `sandbox connect` instead.
     ///
     /// Examples:
+    ///   openshell sandbox exec my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
     ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Exec {
         /// Sandbox name (defaults to last-used sandbox).
+        /// May also be given as `exec <name> -- <command>`.
         #[arg(long, short = 'n', add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
@@ -3578,6 +3596,7 @@ async fn run_async() -> Result<()> {
                             command,
                             no_login_shell,
                         } => {
+                            let (name, command) = split_exec_name(name, command)?;
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
                             let tty_override = if no_tty {
@@ -4406,6 +4425,46 @@ mod tests {
 
         assert_eq!(name, "work-sandbox");
         assert_eq!(provider, "work-github");
+    }
+
+    #[test]
+    fn exec_accepts_positional_sandbox_name() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["openshell", "sandbox", "exec"];
+            argv.extend(args);
+            let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Exec { name, command, .. }),
+            }) = Cli::try_parse_from(argv)
+                .expect("exec should parse")
+                .command
+            else {
+                panic!("expected sandbox exec command");
+            };
+            split_exec_name(name, command)
+        };
+        let owned = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        let (name, command) = parse(&["a", "--", "echo", "hi"]).unwrap();
+        assert_eq!(name.as_deref(), Some("a"));
+        assert_eq!(command, owned(&["echo", "hi"]));
+
+        let (name, command) = parse(&["-n", "a", "--", "echo", "hi"]).unwrap();
+        assert_eq!(name.as_deref(), Some("a"));
+        assert_eq!(command, owned(&["echo", "hi"]));
+
+        let (name, command) = parse(&["--", "echo", "hi"]).unwrap();
+        assert_eq!(name, None);
+        assert_eq!(command, owned(&["echo", "hi"]));
+
+        let (name, command) = parse(&["git", "log", "--", "path"]).unwrap();
+        assert_eq!(name, None);
+        assert_eq!(command, owned(&["git", "log", "--", "path"]));
+
+        let (name, command) = parse(&["-n", "a", "echo", "--", "x"]).unwrap();
+        assert_eq!(name.as_deref(), Some("a"));
+        assert_eq!(command, owned(&["echo", "--", "x"]));
+
+        assert!(parse(&["a", "--"]).is_err());
     }
 
     #[test]
