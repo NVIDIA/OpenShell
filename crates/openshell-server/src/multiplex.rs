@@ -63,6 +63,16 @@ impl MakeRequestId for UuidRequestId {
     }
 }
 
+/// Paths called on a timer rather than by someone waiting on the result.
+const POLLED_PATHS: &[&str] = &[
+    "/health",
+    "/healthz",
+    "/readyz",
+    "/openshell.v1.OpenShell/GetSandboxConfig",
+    "/openshell.v1.OpenShell/ReportProviderReadiness",
+    "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+];
+
 /// Build a tracing span for an inbound request, recording the `request_id`
 /// header (set by [`UuidRequestId`] or supplied by the client).
 fn make_request_span<B>(req: &Request<B>) -> Span {
@@ -79,7 +89,7 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
     // the callsite name.
     let otel_name = otel_span_name(req.method(), path);
 
-    let span = if matches!(path, "/health" | "/healthz" | "/readyz") {
+    let span = if POLLED_PATHS.contains(&path) {
         tracing::debug_span!(
             "request",
             method = %req.method(),
@@ -2220,6 +2230,34 @@ mod tests {
         assert!(
             output.contains("trace-test-id-12345"),
             "trace output should contain the request_id recorded in the span, got: {output}"
+        );
+    }
+
+    #[test]
+    fn polled_paths_get_debug_request_spans() {
+        let _traced = crate::otel_tracing::test_exporter::install_traced();
+        let level = |path: &str| {
+            let req = Request::builder()
+                .uri(path)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            *make_request_span(&req)
+                .metadata()
+                .expect("span enabled")
+                .level()
+        };
+
+        for path in [
+            "/healthz",
+            "/openshell.v1.OpenShell/GetSandboxConfig",
+            "/openshell.v1.OpenShell/ReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+        ] {
+            assert_eq!(level(path), tracing::Level::DEBUG, "{path}");
+        }
+        assert_eq!(
+            level("/openshell.v1.OpenShell/CreateSandbox"),
+            tracing::Level::INFO
         );
     }
 
