@@ -1061,7 +1061,12 @@ async fn serve_tls_metrics_listener(
                     debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
                 }
                 Ok(Err(error)) => {
-                    error!(error = %error, client = %addr, "Metrics TLS handshake failed");
+                    warn!(
+                        event = "metrics_tls_handshake_rejected",
+                        error = %error,
+                        client = %addr,
+                        "Rejected metrics TLS handshake; verify that the client uses HTTPS and, when client authentication is enabled, a certificate trusted by the metrics client CA"
+                    );
                 }
                 Err(_) => {
                     warn!(client = %addr, "Metrics TLS handshake timed out");
