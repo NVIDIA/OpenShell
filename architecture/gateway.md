@@ -66,6 +66,8 @@ it does not establish that a mutation is safe to repeat. SDKs retain the origina
 transport status, metadata, and unknown details alongside decoded fields.
 SDK deletion waits recognize missing-resource status through typed error wrappers
 without suppressing other failures.
+Python SDK lifecycle waits use monotonic deadlines and bound each poll RPC and
+sleep by the remaining wait budget, while retaining shorter per-call timeouts.
 
 Ordinary user-callable unary mutations explicitly opt into durable request
 admission when the client supplies a UUID. Typed adapters

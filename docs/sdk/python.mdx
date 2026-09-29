@@ -107,6 +107,11 @@ workspace for repeated exec, stop, start, and delete operations. List methods
 return lazy `Pager` instances; use `list_all()` only when you want to fetch the
 complete collection.
 
+`wait_ready()`, `wait_stopped()`, and `wait_deleted()` apply `timeout_seconds`
+to the whole wait, including lookup RPCs and polling delays. Each lookup also
+respects a shorter client `timeout`. Changes to the system clock do not extend
+or shorten the wait.
+
 ## Next Steps
 
 - Review [Manage Sandboxes](/how-it-works/sandboxes/overview) for labels, templates, services, and Python SDK examples.

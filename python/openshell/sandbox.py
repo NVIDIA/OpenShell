@@ -913,12 +913,15 @@ class SandboxClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
+        return self._get(name, workspace=workspace, timeout=self._timeout)
+
+    def _get(self, name: str, *, workspace: str, timeout: float) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
                 name=name,
             ),
-            timeout=self._timeout,
+            timeout=timeout,
         )
         return _sandbox_ref(response.sandbox)
 
@@ -1075,20 +1078,28 @@ class SandboxClient:
         timeout_seconds: float = 60.0,
         expected_sandbox_id: str | None = None,
     ) -> None:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout_seconds
+        while (remaining := deadline - time.monotonic()) > 0:
             try:
-                current = self.get(name, workspace=workspace)
+                current = self._get(
+                    name, workspace=workspace, timeout=min(self._timeout, remaining)
+                )
                 if (
                     expected_sandbox_id is not None
                     and current.id != expected_sandbox_id
                 ):
                     return
             except grpc.RpcError as exc:
-                if getattr(exc, "code", lambda: None)() == grpc.StatusCode.NOT_FOUND:
+                code = getattr(exc, "code", lambda: None)()
+                if code == grpc.StatusCode.NOT_FOUND:
                     return
+                if (
+                    code == grpc.StatusCode.DEADLINE_EXCEEDED
+                    and time.monotonic() >= deadline
+                ):
+                    break
                 raise
-            time.sleep(1)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
         raise SandboxError(f"sandbox {name} was not deleted within timeout")
 
     def wait_ready(
@@ -1122,9 +1133,20 @@ class SandboxClient:
         target_name: str,
         timeout_seconds: float,
     ) -> SandboxRef:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            sandbox = self.get(name, workspace=workspace)
+        deadline = time.monotonic() + timeout_seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                sandbox = self._get(
+                    name, workspace=workspace, timeout=min(self._timeout, remaining)
+                )
+            except grpc.RpcError as exc:
+                if (
+                    getattr(exc, "code", lambda: None)()
+                    == grpc.StatusCode.DEADLINE_EXCEEDED
+                    and time.monotonic() >= deadline
+                ):
+                    break
+                raise
             if sandbox.status.phase == target_phase:
                 return sandbox
             if (
@@ -1139,7 +1161,7 @@ class SandboxClient:
                 raise SandboxError(f"sandbox {name} stopped before becoming ready")
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {name} entered error phase")
-            time.sleep(1)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
         raise SandboxError(f"sandbox {name} was not {target_name} within timeout")
 
     def exec_stream(
