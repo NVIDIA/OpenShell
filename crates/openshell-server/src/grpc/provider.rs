@@ -6301,6 +6301,7 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "oci-genai",
                 "openai",
                 "openrouter",
                 "pypi"
