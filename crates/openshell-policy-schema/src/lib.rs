@@ -7,7 +7,7 @@
 //! pure schema validation, and lexical policy-path normalization. Runtime and
 //! protobuf adaptation intentionally live in `openshell-policy`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -17,16 +17,24 @@ use std::str::FromStr;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Fixed batch-member bound for the MCP 2025-03-26 wire profile.
+/// Fixed resource bound for legacy MCP request batches inspected by Tower.
 pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
 
 /// Stable MCP protocol revisions accepted in authored policy.
+///
+/// This closed vocabulary pins product support and ordering independently of
+/// the protocol inspector. Wire semantics remain owned by the inspector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum McpProtocolVersion {
+    /// MCP protocol revision `2025-03-26`.
     V2025_03_26,
+    /// MCP protocol revision `2025-06-18`.
     V2025_06_18,
+    /// MCP protocol revision `2025-11-25`.
     V2025_11_25,
+    /// Sessionless MCP protocol revision `2026-07-28`.
+    V2026_07_28,
 }
 
 /// Pinned revision used when authored policy omits MCP versions.
@@ -35,30 +43,22 @@ pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion:
 pub const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision, use an exact supported revision, or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
 
 impl McpProtocolVersion {
-    pub const ALL: &'static [Self] = &[Self::V2025_03_26, Self::V2025_06_18, Self::V2025_11_25];
+    /// Every supported policy revision in canonical semantic order.
+    pub const ALL: &'static [Self] = &[
+        Self::V2025_03_26,
+        Self::V2025_06_18,
+        Self::V2025_11_25,
+        Self::V2026_07_28,
+    ];
 
+    /// Return the exact MCP protocol identifier accepted in policy.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V2025_03_26 => "2025-03-26",
             Self::V2025_06_18 => "2025-06-18",
             Self::V2025_11_25 => "2025-11-25",
-        }
-    }
-
-    #[must_use]
-    pub const fn wire_profile(self) -> McpWireProfile {
-        match self {
-            Self::V2025_03_26 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: true,
-                max_batch_messages: Some(MAX_MCP_LEGACY_BATCH_MESSAGES),
-            },
-            Self::V2025_06_18 | Self::V2025_11_25 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: false,
-                max_batch_messages: None,
-            },
+            Self::V2026_07_28 => "2026-07-28",
         }
     }
 }
@@ -77,6 +77,7 @@ impl FromStr for McpProtocolVersion {
             "2025-03-26" => Ok(Self::V2025_03_26),
             "2025-06-18" => Ok(Self::V2025_06_18),
             "2025-11-25" => Ok(Self::V2025_11_25),
+            "2026-07-28" => Ok(Self::V2026_07_28),
             _ => Err(ParseMcpProtocolVersionError {
                 value: value.to_owned(),
             }),
@@ -84,12 +85,14 @@ impl FromStr for McpProtocolVersion {
     }
 }
 
+/// Error returned for a revision outside the exact policy vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseMcpProtocolVersionError {
     value: String,
 }
 
 impl ParseMcpProtocolVersionError {
+    /// Return the original rejected identifier without normalization.
     #[must_use]
     pub fn value(&self) -> &str {
         &self.value
@@ -108,29 +111,64 @@ impl fmt::Display for ParseMcpProtocolVersionError {
 
 impl std::error::Error for ParseMcpProtocolVersionError {}
 
-/// Immutable batch-shape metadata for an exact MCP revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct McpWireProfile {
-    version: McpProtocolVersion,
-    allows_json_rpc_batches: bool,
-    max_batch_messages: Option<usize>,
+/// Sort MCP policy revisions without hiding invalid input.
+///
+/// Supported revisions use [`McpProtocolVersion::ALL`] semantic order, followed
+/// by unsupported identifiers in lexical order. Duplicate values and the exact
+/// spelling of every identifier remain available to subsequent validation.
+/// Empty lists remain empty; the caller owns omission and default handling.
+pub fn canonicalize_mcp_versions(versions: &mut [String]) {
+    versions.sort_by(|left, right| {
+        match (
+            left.parse::<McpProtocolVersion>(),
+            right.parse::<McpProtocolVersion>(),
+        ) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => left.cmp(right),
+        }
+    });
 }
 
-impl McpWireProfile {
-    #[must_use]
-    pub const fn version(self) -> McpProtocolVersion {
-        self.version
+/// Parse an explicit MCP policy allowlist into canonical semantic order.
+///
+/// This does not choose a default or modify the input. Callers must handle
+/// omitted fields before passing an explicit list to this function.
+///
+/// # Errors
+///
+/// Returns [`ParseMcpVersionsError::Empty`] for an empty list, or the first
+/// unsupported or duplicate revision in input order.
+pub fn parse_mcp_versions(
+    values: &[String],
+) -> std::result::Result<BTreeSet<McpProtocolVersion>, ParseMcpVersionsError> {
+    if values.is_empty() {
+        return Err(ParseMcpVersionsError::Empty);
     }
 
-    #[must_use]
-    pub const fn allows_json_rpc_batches(self) -> bool {
-        self.allows_json_rpc_batches
+    let mut versions = BTreeSet::new();
+    for value in values {
+        let version = value.parse::<McpProtocolVersion>()?;
+        if !versions.insert(version) {
+            return Err(ParseMcpVersionsError::Duplicate(version));
+        }
     }
+    Ok(versions)
+}
 
-    #[must_use]
-    pub const fn max_batch_messages(self) -> Option<usize> {
-        self.max_batch_messages
-    }
+/// Error returned when an explicit MCP policy allowlist is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParseMcpVersionsError {
+    /// The explicitly supplied allowlist contains no revisions.
+    #[error("mcp.versions must contain at least one supported protocol version")]
+    Empty,
+    /// An identifier does not exactly match a supported revision.
+    #[error(transparent)]
+    Unsupported(#[from] ParseMcpProtocolVersionError),
+    /// A supported revision occurs more than once in the list.
+    #[error("duplicate MCP protocol version '{0}'")]
+    Duplicate(McpProtocolVersion),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -960,21 +998,19 @@ pub fn validate_mcp_config(config: &McpConfig, context: &str) -> Result<()> {
     let Some(versions) = config.versions.as_deref() else {
         return Ok(());
     };
-    if versions.is_empty() {
-        miette::bail!(
-            "{context} has an empty mcp.versions list; omit it to use the pinned default revision"
-        );
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for value in versions {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !seen.insert(version) {
-            miette::bail!("{context} has duplicate protocol version '{value}'");
-        }
-    }
-    Ok(())
+    parse_mcp_versions(versions)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ParseMcpVersionsError::Empty => miette::miette!(
+                "{context} has an empty mcp.versions list; omit it to use the pinned default revision"
+            ),
+            ParseMcpVersionsError::Unsupported(error) => {
+                miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}")
+            }
+            ParseMcpVersionsError::Duplicate(version) => {
+                miette::miette!("{context} has duplicate protocol version '{version}'")
+            }
+        })
 }
 
 fn reject_json_unknown_fields(
@@ -1383,6 +1419,37 @@ network_policies:
         };
         assert!(parse_policy_reader(&b"version: 1\nextra"[..], limits,).is_err());
         assert!(parse_policy_bytes(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn mcp_config_preserves_explicit_sessionless_versions_and_omission() {
+        let config = parse_mcp_config(serde_json::json!({
+            "versions": ["2026-07-28", "2025-03-26"],
+        }))
+        .expect("explicit supported revisions");
+        assert_eq!(
+            config.versions.as_deref(),
+            Some(["2026-07-28".to_string(), "2025-03-26".to_string()].as_slice())
+        );
+        assert!(
+            parse_mcp_config(serde_json::json!({}))
+                .unwrap()
+                .versions
+                .is_none()
+        );
+        assert_eq!(DEFAULT_MCP_PROTOCOL_VERSION.as_str(), "2025-11-25");
+    }
+
+    #[test]
+    fn mcp_config_rejects_empty_duplicate_and_unknown_versions() {
+        for versions in [
+            serde_json::json!([]),
+            serde_json::json!(["2026-07-28", "2026-07-28"]),
+            serde_json::json!(["2026-07-29"]),
+            serde_json::json!([" 2026-07-28"]),
+        ] {
+            assert!(parse_mcp_config(serde_json::json!({ "versions": versions })).is_err());
+        }
     }
 
     #[test]

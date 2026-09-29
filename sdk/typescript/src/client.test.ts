@@ -22,7 +22,7 @@ import {
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import { OpenShell, SandboxPhase, SandboxRestartPolicy, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
@@ -334,6 +334,20 @@ describe('create', () => {
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+  });
+
+  it('sends the restart policy', async () => {
+    let created: { spec?: { restartPolicy?: SandboxRestartPolicy } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', restartPolicy: 'on-failure' });
+
+    expect(created.spec?.restartPolicy).toBe(SandboxRestartPolicy.ON_FAILURE);
   });
 
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
@@ -841,6 +855,29 @@ describe('sandbox templates', () => {
     await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('maps restart controller status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.STARTING,
+            restartCount: 3,
+            nextRestartTime: { seconds: 1_700_000_000n, nanos: 0 },
+            mainProcessStartedTime: { seconds: 1_699_999_000n, nanos: 0 },
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'starting',
+      restartCount: 3,
+      nextRestartAtMs: 1_700_000_000_000,
+      mainProcessStartedAtMs: 1_699_999_000_000,
+    });
   });
 });
 

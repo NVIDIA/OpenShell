@@ -108,7 +108,7 @@ The agent will be prompted interactively if credentials are missing.
 
 ### Step 4: Exit and clean up
 
-Exit the sandbox shell (`exit` or Ctrl-D), then:
+Exit the sandbox shell with `exit`, or detach with Ctrl-D, then:
 
 ```bash
 openshell sandbox delete <name>
@@ -277,6 +277,7 @@ Key flags:
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
+- `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -364,22 +365,28 @@ that process running; reconnecting targets the same process instance and replays
 recent output. If an established SSH transport is interrupted, such as when a
 laptop sleeps and wakes, the CLI retries transient failures for up to 60 seconds
 and reattaches to that same process. Use `sandbox exec --tty -- /bin/bash -l`
-for a new shell. Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating
-main. OpenSSH's `~.` escape looks like transport loss and therefore starts
-automatic recovery; after it reattaches, use `Ctrl-P`, then `Ctrl-Q` to exit, or
-press `Ctrl-C` between retry attempts to cancel recovery. When you own stdin,
-`Ctrl-C` interrupts the foreground process. In a read-only attachment, `Ctrl-C`
-exits the viewer and leaves main and other attachments running. Configure VS
-Code Remote-SSH with:
+for a new shell. Press `Ctrl-D` or `Ctrl-P`, then `Ctrl-Q` to disconnect without
+terminating main. OpenSSH's `~.` escape looks like transport loss and therefore
+starts automatic recovery; after it reattaches, use `Ctrl-D` or `Ctrl-P`, then
+`Ctrl-Q` to exit, or press `Ctrl-C` between retry attempts to cancel recovery.
+When you own stdin, `Ctrl-C` interrupts the foreground process. In a read-only
+attachment, `Ctrl-C` or `Ctrl-D` exits the viewer and leaves main and other
+attachments running. Configure VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
+A writable attachment that finds another attachment holding stdin reports `attached read-only; retry input after the owner disconnects`. Automatic recovery can hit this when it reattaches before the supervisor closes the dead connection. The supervisor closes a connection 60 seconds after it last received bytes from it, which can be later than 60 seconds after the network failed if the relay buffered data. After the old owner disconnects or times out, send the input you meant to type next. If stdin is free, the attachment prints `input enabled` and forwards that input to the process, so do not probe with Enter or a prompt answer such as `y`. If nothing prints, the old connection still holds stdin. Input sent while the attachment was read-only never reaches the process, so send it again later. `Ctrl-C`, `Ctrl-D`, and `Ctrl-P` then `Ctrl-Q` still exit a read-only attachment instead of enabling input; enable input first if you need `Ctrl-C` to interrupt the process. Recovery never takes stdin from a healthy owner, and an explicitly read-only attachment stays read-only.
+
 If `connect` reports `canonical main process already finished`, inspect the
-result with `sandbox get`. A pending
-foreground attachment can still retrieve retained output in `Completed` or
-`Error`; phase alone does not determine whether attachment is available.
+result with `sandbox get`. A pending foreground attachment can still retrieve
+retained output in `Completed` or `Error`; phase alone does not determine
+whether attachment is available. A nonzero main-process exit under
+`on-failure`, or any exit under `always`,
+moves the sandbox to `Starting` during backoff and resource replacement. Connect
+and exec commands resume after the new supervisor session makes it `Ready`.
+An explicit `sandbox stop` cancels a pending restart.
 
 ### Upload and download files
 
@@ -689,6 +696,9 @@ openshell forward start 8080 my-app -d
 ```
 
 The service is now reachable at `localhost:8080`.
+CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
+user's SSH config. Only background forwards are tracked by `forward list` and
+managed by `forward stop`; foreground forwards end when the command exits.
 
 Manage or iterate on the sandbox:
 

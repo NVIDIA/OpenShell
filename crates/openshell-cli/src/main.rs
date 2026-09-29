@@ -1535,6 +1535,14 @@ enum SandboxCommands {
         #[arg(long, conflicts_with = "editor")]
         detach: bool,
 
+        /// Restart behavior after the canonical main process exits.
+        #[arg(
+            long,
+            value_parser = ["never", "on-failure", "always"],
+            default_value = "never"
+        )]
+        restart_policy: String,
+
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -1717,7 +1725,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
-    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
+    /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
@@ -3314,6 +3322,7 @@ async fn run_async() -> Result<()> {
                     tty,
                     no_tty,
                     detach,
+                    restart_policy,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3416,6 +3425,7 @@ async fn run_async() -> Result<()> {
                             output: output.as_str(),
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
+                            restart_policy: &restart_policy,
                         },
                         &cli.workspace,
                         &tls,
@@ -6006,6 +6016,51 @@ mod tests {
                 panic!("expected SandboxCommands::Create");
             }
         }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_defaults_to_never() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "never"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_accepts_on_failure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--restart-policy",
+            "on-failure",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "on-failure"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--restart-policy",
+                "unless-stopped",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

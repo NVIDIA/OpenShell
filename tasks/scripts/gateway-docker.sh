@@ -214,6 +214,9 @@ fi
 if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
   printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
 fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
+  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
+fi
 if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
   printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
 fi

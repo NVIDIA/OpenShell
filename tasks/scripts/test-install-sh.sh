@@ -112,7 +112,7 @@ assert_linux_package_method() {
   local expected=$7
   local actual
 
-  actual="$(
+  (
     export OPENSHELL_INSTALL_METHOD="$install_method"
     export OPENSHELL_VERSION="$requested_version"
     has_cmd() {
@@ -125,7 +125,8 @@ assert_linux_package_method() {
     }
     snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
     linux_package_method
-  )"
+  ) >"$out"
+  actual="$(cat "$out")"
   if [ "$actual" != "$expected" ]; then
     echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
     exit 1
@@ -270,7 +271,7 @@ assert_snap_install_flow() {
   local expected=$5
   local calls
 
-  calls="$(
+  (
     has_cmd() {
       case "$1" in
         snap) return 0 ;;
@@ -295,7 +296,8 @@ assert_snap_install_flow() {
     export TARGET_USER=test-user
     export OPENSHELL_VERSION="$requested_version"
     install_linux_snap
-  )"
+  ) >"$out"
+  calls="$(cat "$out")"
   if [ "$calls" != "$expected" ]; then
     echo "FAIL: ${name}: unexpected command sequence" >&2
     echo "Expected:" >&2

@@ -10,6 +10,11 @@ position: 4
 
 Each gateway runs agent workloads on one compute runtime, selected by its compute driver. Pick the runtime that matches the isolation boundary and infrastructure you need. The CLI workflow stays the same across runtimes: you create, connect to, stop, start, and delete sandboxes through the gateway.
 
+The gateway owns main-process restart policy. Docker, Podman, Kubernetes, and
+MicroVM native restart mechanisms remain disabled. When policy selects a
+replacement, the gateway stops and starts the compute resource while retaining
+the sandbox record and driver-supported persistent storage.
+
 | Runtime | Driver | Use when |
 |---|---|---|
 | [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |
@@ -90,6 +95,26 @@ socket_path = "/var/run/docker.sock"
 Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
 Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+
+### Docker Corporate Proxy Egress
+
+For proxy-required networks, the Docker driver accepts `https_proxy`,
+`no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
+`proxy_connect_by_hostname`, and `proxy_ca_bundle`. The companion supervisor
+chains policy-approved TLS tunnels through the proxy with HTTP CONNECT.
+
+`proxy_ca_bundle` is an operator-owned gateway-host PEM path. Docker validates
+and copies the bundle into its supervisor-only named volume, so this also works
+with remote Docker daemons and does not expose the host path to the workload.
+The supervisor uses the bundle for an HTTPS proxy connection and for upstream
+certificates re-signed by a TLS-intercepting proxy. Workload processes receive
+the same corporate roots through their generated combined trust bundle.
+
+Sandbox environment, image contents, and `template.driver_config.docker`
+cannot alter these settings. Invalid proxy relationships or CA files prevent
+the gateway or sandbox from starting and never degrade to direct egress. See
+the [Gateway Configuration File](/how-it-works/gateways/configuration) for URL,
+authentication, `NO_PROXY`, hostname CONNECT, and CA validation details.
 
 ### Docker Mounts
 

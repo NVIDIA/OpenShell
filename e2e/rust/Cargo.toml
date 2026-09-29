@@ -69,6 +69,11 @@ path = "tests/docker_preflight.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "docker_corporate_proxy"
+path = "tests/docker_corporate_proxy.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "driver_config_volume"
 path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]
@@ -111,11 +116,6 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "podman_resource_limits"
 path = "tests/podman_resource_limits.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
-name = "podman_userns"
-path = "tests/podman_userns.rs"
 required-features = ["e2e-podman"]
 
 [[test]]

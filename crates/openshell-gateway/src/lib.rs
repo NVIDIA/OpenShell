@@ -158,7 +158,7 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        let backend = openshell_driver_mxc::MxcComputeBackend::new(config);
+        let backend = openshell_driver_mxc::MxcComputeBackend::new(context.gateway_name(), config);
         let driver = openshell_driver_mxc::ComputeDriverService::new(backend);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),

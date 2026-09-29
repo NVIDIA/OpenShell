@@ -5115,6 +5115,7 @@ where
         crate::l7::rest::RelayRequestOptions {
             resolver: options.secret_resolver,
             body_classifier: options.body_classifier,
+            mcp_request_validation: None,
             credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
@@ -5647,7 +5648,15 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        if crate::l7::rest::request_is_h2c_upgrade(&forward_request_bytes) {
+        // Refuse upgrades this endpoint cannot inspect before the L7 policy
+        // decision; see `unsupported_upgrade_detail` for the per-protocol rule.
+        if let Some(upgrade_detail) = crate::l7::rest::unsupported_upgrade_detail(
+            &forward_request_bytes,
+            l7_config.config.protocol,
+        ) {
+            if let Some(observer) = endpoint_observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Denied)
@@ -5666,9 +5675,9 @@ async fn handle_forward_proxy(
                 )
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
-                    "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{telemetry_path}"
+                    "FORWARD_L7 denied unsupported upgrade for {method} {host_lc}:{port}{telemetry_path}"
                 ))
-                .status_detail(crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL)
+                .status_detail(upgrade_detail)
                 .build();
             ocsf_emit!(event);
             emit_activity_simple(activity_tx, true, "l7_parse_rejection");
@@ -5678,7 +5687,7 @@ async fn handle_forward_proxy(
                 port,
                 &binary_str,
                 &decision,
-                crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
+                upgrade_detail,
                 "forward-l7-parse-rejection",
             );
             respond(
@@ -5687,7 +5696,7 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "unsupported_l7_protocol",
-                    crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
+                    upgrade_detail,
                 ),
             )
             .await?;
@@ -5809,22 +5818,21 @@ async fn handle_forward_proxy(
                     crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
                 )
             };
-            // Forward HTTP shares the MCP transport gate with CONNECT before
-            // method authorization. Borrow the buffered request so checking
-            // the version does not copy the inspected body.
-            if !crate::l7::relay::enforce_mcp_protocol_version(
+            // Policy evaluation must use the selected revision's inspection,
+            // including method classification, just as the CONNECT relays do.
+            let Some(info) = crate::l7::relay::enforce_mcp_protocol_version(
                 &l7_config.config,
                 &jsonrpc_request,
-                &info,
+                info,
                 client,
                 &l7_ctx,
                 &telemetry_path,
                 endpoint_observer.as_ref(),
             )
             .await?
-            {
+            else {
                 return Ok(());
-            }
+            };
             forward_request_bytes = jsonrpc_request.raw_header;
             Some(info)
         } else {
@@ -6559,6 +6567,28 @@ async fn handle_forward_proxy(
             websocket_permessage_deflate,
             websocket_subprotocol,
         } => {
+            // JSON-RPC and MCP rules apply to individual HTTP requests. No
+            // current path forwards upgrade headers for these protocols: the
+            // request-side refusal rejects them, and request middleware cannot
+            // add upgrade or connection headers. If a later change lets such a
+            // request reach an upstream that answers `101`, close instead of
+            // relaying frames that no rule would inspect.
+            if forward_upgrade_config
+                .as_ref()
+                .is_some_and(|config| config.protocol.is_jsonrpc_family())
+            {
+                warn!(
+                    host = %host_lc,
+                    port,
+                    "closing forwarded JSON-RPC connection after unexpected protocol upgrade"
+                );
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::ProtocolError)
+                        .await;
+                }
+                return Ok(());
+            }
             let mut upgrade_options = if let (Some(config), Some(engine)) = (
                 forward_upgrade_config.as_ref(),
                 forward_tunnel_engine.as_ref(),
@@ -8426,14 +8456,41 @@ network_policies: {}
             return;
         };
 
-        for (body, version_header) in [
+        // Every case uses the complete forwarding and middleware path. Sessionless
+        // requests carry their own metadata, and subscription responses retain SSE bytes.
+        // Share the proxy's identity cache across requests from this client binary
+        // so each profile does not hash the entire test executable again.
+        let identity_cache = Arc::new(BinaryIdentityCache::new());
+        for (body, mcp_headers, response_content_type, response_body) in [
             (
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
                 "",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}"#,
             ),
             (
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
                 "MCP-Protocol-Version: 2025-11-25\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":3,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":3,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: echo\r\n",
+                "application/json",
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"hello"}]}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":5,"method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+                "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n",
+                "text/event-stream",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
             ),
         ] {
             let upstream_listener = TcpListener::bind((upstream_ip, 0))
@@ -8457,12 +8514,20 @@ network_policies:
         port: {upstream_port}
         path: /mcp
         protocol: mcp
+        mcp_versions: ["2025-11-25", "2026-07-28"]
         enforcement: enforce
         rules:
           - allow:
               method: initialize
           - allow:
               method: tools/list
+          - allow:
+              method: server/discover
+          - allow:
+              method: tools/call
+              tool: echo
+          - allow:
+              method: subscriptions/listen
     binaries:
       - {{ path: "{executable}" }}
 "#,
@@ -8500,12 +8565,11 @@ network_policies:
                         break;
                     }
                 }
-                socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    )
-                    .await
-                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
                 String::from_utf8(request).expect("UTF-8 MCP request")
             });
             let proxy_listener = TcpListener::bind("127.0.0.1:0")
@@ -8514,7 +8578,7 @@ network_policies:
             let proxy_address = proxy_listener.local_addr().unwrap();
             let target = format!("http://{upstream_ip}:{upstream_port}/mcp");
             let request = format!(
-                "POST {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nContent-Type: application/json\r\n{version_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{mcp_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
             );
             let client = tokio::spawn(async move {
@@ -8542,7 +8606,7 @@ network_policies:
                     None,
                     socket_addrs,
                     engine,
-                    Arc::new(BinaryIdentityCache::new()),
+                    Arc::clone(&identity_cache),
                     Arc::new(AtomicU32::new(std::process::id())),
                     None,
                     AgentProposals::default(),
@@ -8563,18 +8627,154 @@ network_policies:
 
             let response = client.await.expect("join MCP client");
             assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            let response_header_end = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|end| end + 4)
+                .expect("response has HTTP headers");
+            assert_eq!(
+                &response[response_header_end..],
+                response_body.as_bytes(),
+                "MCP response bytes must reach the client unchanged"
+            );
+            let response_headers = std::str::from_utf8(&response[..response_header_end])
+                .expect("UTF-8 response headers");
+            assert!(
+                response_headers.contains(&format!("Content-Type: {response_content_type}\r\n"))
+            );
             let forwarded = upstream.await.expect("join MCP upstream");
             assert!(forwarded.starts_with("POST /mcp HTTP/1.1\r\n"));
-            if version_header.is_empty() {
+            if mcp_headers.is_empty() {
                 assert!(
                     !forwarded
                         .to_ascii_lowercase()
                         .contains("mcp-protocol-version:")
                 );
             } else {
-                assert!(forwarded.contains(version_header));
+                for header in mcp_headers.lines() {
+                    assert!(forwarded.contains(header), "missing forwarded {header}");
+                }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn forward_mcp_websocket_upgrade_is_denied_before_connecting_upstream() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind MCP upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_policies:
+  mcp-upstream:
+    name: mcp-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load MCP policy"),
+        );
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/mcp");
+        // A receive-stream GET that the MCP policy allows, plus WebSocket
+        // upgrade headers.
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let mut response = Vec::new();
+            socket
+                .read_to_end(&mut response)
+                .await
+                .expect("read proxy response");
+            response
+        });
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let stream: BoundaryDuplexStream = Box::new(proxy_connection);
+        let mut proxy_connection = tokio::io::BufReader::new(stream);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Box::pin(handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                None,
+                socket_addrs,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
+        )
+        .await
+        .expect("refused upgrade must complete without an upstream response")
+        .expect("handle refused MCP WebSocket upgrade");
+        drop(proxy_connection);
+
+        let response = String::from_utf8(client.await.unwrap()).expect("UTF-8 response");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "the upgrade must be refused: {response}"
+        );
+        assert!(
+            response.contains(crate::l7::rest::UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+            "the refusal must name the unsupported upgrade: {response}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream_listener.accept()
+            )
+            .await
+            .is_err(),
+            "a refused upgrade must not establish an upstream connection"
+        );
     }
 
     #[tokio::test]
@@ -9702,6 +9902,8 @@ network_policies:
                 is_batch: false,
                 receive_stream: false,
                 has_response: true,
+                mcp_revision: None,
+                mcp_http_metadata: None,
                 error: None,
             }),
         };

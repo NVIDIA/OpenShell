@@ -8,11 +8,10 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
 
-When a PR is not mirrored automatically, only the GitHub users listed in
-`.github/copy-pr-bot.yaml` under `vetters_override` can admit its current
-revision with `/ok to test <SHA>`. The list is a snapshot of the codeowners
-and selected repository maintainers; update it when those people change.
-This setting does not change the bot's automatic trust policy for ready PRs.
+When a PR is not mirrored automatically, anyone with Write, Maintain, or Admin
+access to this repository can admit its current revision with
+`/ok to test <SHA>`. This includes external maintainers with repository access.
+Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
@@ -347,11 +346,11 @@ Prerequisites:
 Flow:
 
 1. Open the PR. The vouch check confirms first-time external contributors are vouched (otherwise their PRs are auto-closed).
-2. If copy-pr-bot does not mirror it automatically, a listed vetter reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
+2. If copy-pr-bot does not mirror it automatically, a maintainer with Write access or greater reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
 3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to automatically admitted PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
 4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
 
-Important: if a PR requires manual admission, every new commit needs another `/ok to test <new-SHA>` from a listed vetter before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
+Important: if a PR requires manual admission, every new commit needs another `/ok to test <new-SHA>` from a maintainer with Write access or greater before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
 
 ## Merge queue
 
