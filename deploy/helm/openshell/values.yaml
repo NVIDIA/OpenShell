@@ -552,6 +552,20 @@ pkiInitJob:
   # see "TLS error: Secret is not supplied by SDS" when connecting to the gateway,
   # check if the TLS secret exists and run `helm upgrade` to create the ConfigMap.
   failOnTimeout: true
+  # -- Pod-level securityContext for the certgen hook Jobs. Defaults satisfy the
+  # Kubernetes Restricted Pod Security Standard.
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container-level securityContext for the certgen hook Jobs. Defaults
+  # satisfy the Kubernetes Restricted Pod Security Standard.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.

@@ -74,6 +74,50 @@ tests:
           content: "--jwt-secret-name=custom-jwt-keys"
         documentIndex: 3
 
+  - it: satisfies the Restricted Pod Security Standard by default
+    template: templates/certgen.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: ["ALL"]
+        documentIndex: 3
+
+  - it: allows overriding the certgen hook security context
+    template: templates/certgen.yaml
+    set:
+      pkiInitJob.podSecurityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/certgen.json
+      pkiInitJob.securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: Localhost
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsUser
+          value: 2000
+        documentIndex: 3
+
   - it: renders JWT-only hook when cert-manager is enabled even if pkiInitJob remains enabled
     template: templates/certgen.yaml
     set:
