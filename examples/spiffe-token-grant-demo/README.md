@@ -90,13 +90,19 @@ Expected output includes endpoint-specific token claims:
 alpha called with path /:
   aud: alpha, account
   scope: alpha profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 
 beta called with path /:
   aud: beta, account
   scope: beta profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 ```
+
+The final path segment joins the sandbox pod's namespace, pod name, and
+`openshell.ai/sandbox-id` annotation with `.` into a single opaque identifier.
+The `token-issuer` accepts any subject under the
+`spiffe://openshell.local/openshell/sandbox/` prefix in the gateway trust
+domain; the segment must be treated as opaque and not parsed.
 
 The protected services also write proof-of-life logs when they accept a call:
 
@@ -108,8 +114,8 @@ KUBECONFIG=kubeconfig kubectl -n default logs deployment/beta --tail=20
 Example log lines:
 
 ```text
-alpha accepted request path=/ aud="alpha, account" scope="alpha profile email" client_id=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-beta accepted request path=/ aud="beta, account" scope="beta profile email" client_id=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+alpha accepted request path=/ aud="alpha, account" scope="alpha profile email" client_id=spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
+beta accepted request path=/ aud="beta, account" scope="beta profile email" client_id=spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 ```
 
 ## Automated Demo
