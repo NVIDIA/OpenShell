@@ -91,6 +91,27 @@ jobs:
       contents: read
       packages: read
     steps:
+      # The disposition gate comes from the workflow's own revision, so a
+      # scanned candidate cannot approve its own findings. Cone-mode sparse
+      # checkout also includes root files such as security-dispositions.toml.
+      - name: Check out the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: workflow-revision
+          sparse-checkout: tasks/scripts
+          persist-credentials: false
+
+      - name: Stage the disposition gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/dispositions"
+          cp workflow-revision/tasks/scripts/security_dispositions.py "$RUNNER_TEMP/dispositions/"
+          if [ -f workflow-revision/security-dispositions.toml ]; then
+            cp workflow-revision/security-dispositions.toml "$RUNNER_TEMP/dispositions/"
+          fi
+          rm -rf workflow-revision
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
@@ -159,15 +180,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # The findings table stays in the summary for context; the disposition
+      # gate below decides pass or fail.
       - name: Report findings
+        id: report
         if: >-
           ${{
             !cancelled()
             && steps.config.conclusion == 'success'
             && steps.images.conclusion == 'success'
           }}
-        env:
-          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
         run: |
           set +e
           tasks/scripts/trivy-scan.sh gate
@@ -175,15 +197,25 @@ jobs:
           set -e
           case "$status" in
             0) echo "No findings at ${TRIVY_SEVERITY}." ;;
-            10)
-              if [ "$FAIL_ON_FINDINGS" = "true" ]; then
-                echo "::error::Trivy findings at ${TRIVY_SEVERITY}."
-                exit 1
-              fi
-              echo "::warning::Trivy findings at ${TRIVY_SEVERITY}; this check is informational."
-              ;;
+            10) echo "Trivy findings at ${TRIVY_SEVERITY}; checking dispositions." ;;
             *) echo "::error::Trivy could not evaluate the reports (exit $status)."; exit "$status" ;;
           esac
+          tasks/scripts/trivy-scan.sh reports >"$RUNNER_TEMP/trivy-gate-reports.txt"
+
+      - name: Enforce dispositions
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        env:
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t reports <"$RUNNER_TEMP/trivy-gate-reports.txt"
+          python3 "$RUNNER_TEMP/dispositions/security_dispositions.py" gate \
+            --scanner trivy \
+            --severity "$TRIVY_SEVERITY" \
+            --fail-on-findings "$FAIL_ON_FINDINGS" \
+            --dispositions "$RUNNER_TEMP/dispositions/security-dispositions.toml" \
+            "${reports[@]}"
 
   upload-sarif:
     name: Publish Trivy SARIF (${{ matrix.batch }})

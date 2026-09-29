@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Reviewed decisions for HIGH/CRITICAL CodeQL, Trivy, and Zizmor findings.
+# The release gate (tasks/scripts/security_dispositions.py) passes a finding
+# only when a current entry covers its rule and path. See CI.md, "Security
+# finding dispositions", for the workflow and SLAs.
+#
+# Fields:
+#   id                 <rule>/<lowest alert number>, prefixed codeql/ or trivy/
+#   scanner            codeql | trivy | zizmor
+#   rule               code-scanning rule ID
+#   disposition        deferred | rejected
+#   scanner_severity   critical | high
+#   assessed_severity  critical | high | medium | low | none (none: rejected only)
+#   reason             why this decision
+#   approver           GitHub login of the deciding maintainer
+#   first_seen         date the earliest alert was created
+#   first_seen_at      Actions run that first reported it
+#   expires            deferred only; at most first_seen + SLA unless sla_exception
+#   sla_exception      deferred only; why expires exceeds the SLA
+#   [disposition.alerts]  alert number = path (package name for image CVEs)
+
+[[disposition]]
+id = "codeql/rust/disabled-certificate-check/170"
+scanner = "codeql"
+rule = "rust/disabled-certificate-check"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "medium"
+reason = "OIDC clients skip IdP TLS verification whenever --gateway-insecure is set; scope the flag to the gateway connection."
+approver = "purp"
+first_seen = 2026-08-27
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/33080368521"
+expires = 2026-10-06
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+170 = "crates/openshell-cli/src/oidc_auth.rs"
+171 = "crates/openshell-sdk/src/oidc.rs"
+
+[[disposition]]
+id = "zizmor/unpinned-images/4"
+scanner = "zizmor"
+rule = "zizmor/unpinned-images"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "high"
+reason = "CI jobs use the floating ghcr.io/nvidia/openshell/ci:latest image; pin it by digest."
+approver = "purp"
+first_seen = 2026-08-26
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/32970386225"
+expires = 2026-10-06
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+4 = ".github/workflows/branch-checks.yml"
+5 = ".github/workflows/branch-checks.yml"
+6 = ".github/workflows/branch-checks.yml"
+7 = ".github/workflows/branch-checks.yml"
+8 = ".github/workflows/branch-checks.yml"
+9 = ".github/workflows/branch-checks.yml"
+12 = ".github/workflows/cargo-deny.yml"
+15 = ".github/workflows/deb-package.yml"
+39 = ".github/workflows/e2e-gpu-test.yaml"
+45 = ".github/workflows/helm-lint.yml"
+55 = ".github/workflows/release-dev.yml"
+56 = ".github/workflows/release-dev.yml"
+73 = ".github/workflows/release-tag.yml"
+74 = ".github/workflows/release-tag.yml"
+75 = ".github/workflows/release-tag.yml"
+84 = ".github/workflows/release-vm-kernel.yml"
+85 = ".github/workflows/release-vm-kernel.yml"
+
+[[disposition]]
+id = "codeql/rust/cleartext-logging/163"
+scanner = "codeql"
+rule = "rust/cleartext-logging"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "certgen --dry-run prints generated private keys to stdout; operator-invoked and local, but should not print key material."
+approver = "purp"
+first_seen = 2026-08-27
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/33080368521"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+163 = "crates/openshell-server/src/certgen.rs"
+164 = "crates/openshell-server/src/certgen.rs"
+165 = "crates/openshell-server/src/certgen.rs"
+
+[[disposition]]
+id = "zizmor/template-injection/38"
+scanner = "zizmor"
+rule = "zizmor/template-injection"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "${{ }} expressions expand inside run: scripts; inputs are maintainer-controlled, but should move to env."
+approver = "purp"
+first_seen = 2026-08-26
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/32970386225"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+38 = ".github/workflows/e2e-gpu-test.yaml"
+46 = ".github/workflows/release-canary.yml"
+47 = ".github/workflows/release-canary.yml"
+48 = ".github/workflows/release-canary.yml"
+49 = ".github/workflows/release-canary.yml"
+
+[[disposition]]
+id = "zizmor/github-env/125"
+scanner = "zizmor"
+rule = "zizmor/github-env"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "E2E setup composite actions write to GITHUB_ENV; values are workflow-controlled, but should use step outputs."
+approver = "purp"
+first_seen = 2026-08-27
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/33079538368"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+125 = ".github/actions/setup-e2e-gateway/action.yml"
+134 = ".github/actions/setup-e2e-vm-driver/action.yml"
+180 = ".github/actions/setup-e2e-cli/action.yml"
+
+[[disposition]]
+id = "zizmor/excessive-permissions/13"
+scanner = "zizmor"
+rule = "zizmor/excessive-permissions"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "Write permissions granted at workflow level; move them to the jobs that need them."
+approver = "purp"
+first_seen = 2026-08-26
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/32970386225"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+13 = ".github/workflows/ci-image.yml"
+83 = ".github/workflows/release-vm-kernel.yml"
+
+[[disposition]]
+id = "trivy/DS-0002/219"
+scanner = "trivy"
+rule = "DS-0002"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "The supervisor image has no USER instruction; it drops privileges at runtime, but the image should declare a non-root user."
+approver = "purp"
+first_seen = 2026-09-10
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/34459723119"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+219 = "deploy/docker/Dockerfile.supervisor"
+
+[[disposition]]
+id = "trivy/KSV-0014/210"
+scanner = "trivy"
+rule = "KSV-0014"
+disposition = "deferred"
+scanner_severity = "high"
+assessed_severity = "low"
+reason = "The gateway container lacks readOnlyRootFilesystem; set it and mount writable paths explicitly."
+approver = "purp"
+first_seen = 2026-09-10
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/34459723119"
+expires = 2026-11-17
+sla_exception = "Pre-GA backlog detected during alpha while static findings were not enforced (#3552). Timeline granted in #3671."
+
+[disposition.alerts]
+210 = "deploy/helm/openshell/templates/statefulset.yaml"
+
+[[disposition]]
+id = "codeql/rust/cleartext-logging/198"
+scanner = "codeql"
+rule = "rust/cleartext-logging"
+disposition = "rejected"
+scanner_severity = "high"
+assessed_severity = "none"
+reason = "False positive: provider profile export prints the TLS key file path, not key material."
+approver = "purp"
+first_seen = 2026-09-04
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/33841122993"
+
+[disposition.alerts]
+198 = "crates/openshell-cli/src/commands/provider.rs"
+199 = "crates/openshell-cli/src/commands/provider.rs"
+
+[[disposition]]
+id = "codeql/rust/cleartext-logging/166"
+scanner = "codeql"
+rule = "rust/cleartext-logging"
+disposition = "rejected"
+scanner_severity = "high"
+assessed_severity = "none"
+reason = "Not exploitable: login prints the signed-in user's own username to their terminal."
+approver = "purp"
+first_seen = 2026-08-27
+first_seen_at = "https://github.com/NVIDIA/OpenShell/actions/runs/33080368521"
+
+[disposition.alerts]
+166 = "crates/openshell-cli/src/commands/gateway.rs"

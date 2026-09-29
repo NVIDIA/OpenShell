@@ -174,6 +174,15 @@ expect_status 10 "consolidated findings remain blocking" \
   "${SCANNER}" gate
 test -s "${TMP_DIR}/summary"
 
+# The disposition gate evaluates exactly the report set the table gate reads.
+env TRIVY_REPORT_DIR="${HEAD}" "${SCANNER}" reports >"${TMP_DIR}/gate-reports"
+[[ "$(head -n 1 "${TMP_DIR}/gate-reports")" == "${HEAD}/consolidated/config.json" ]]
+expected_reports=$((1 + $(find "${HEAD}" -maxdepth 1 \( -name 'image-*.json' -o -name 'config-packaged-*.json' \) | wc -l)))
+[[ "$(wc -l <"${TMP_DIR}/gate-reports")" -eq "${expected_reports}" ]]
+[[ "$(grep -c -e '/config-static.json$' -e '/config-defaults.json$' -e '/config-fixture-' "${TMP_DIR}/gate-reports" || true)" -eq 0 ]]
+expect_status 2 "reports needs a scan first" \
+  env TRIVY_REPORT_DIR="${TMP_DIR}/no-reports" "${SCANNER}" reports
+
 # Empty configuration is a valid clearing analysis, not a skipped upload.
 make_case empty-sarif
 write_report "${HEAD}/config-static.json" 0
