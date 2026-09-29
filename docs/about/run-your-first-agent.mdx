@@ -97,12 +97,16 @@ openshell rule reject my-agent \
 Approving a rule changes the policy that the other pending proposals were
 evaluated against. The next `rule approve` for one of them re-evaluates it and
 reports `proposal inputs changed; evaluation refreshed`. List the pending rules
-again, review the refreshed proposal, and re-run the approval. To approve every
-pending proposal at once, run:
+again, review the refreshed proposal, and re-run the approval. To approve the
+pending proposals in one batch, run:
 
 ```shell
 openshell rule approve-all my-agent
 ```
+
+`rule approve-all` skips security-flagged proposals unless you pass
+`--include-security-flagged`, and skips proposals whose evaluation changed since
+it listed them. It reports how many it skipped.
 
 Approved rules hot-reload into the running sandbox without a restart, so the
 agent can retry the request. To let the agent propose its own narrower rules,
