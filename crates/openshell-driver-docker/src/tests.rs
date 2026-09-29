@@ -335,7 +335,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
         }),
-        daemon_version: "28.0.0".to_string(),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
             wsl_all_gpu_fallback_enabled: false,
