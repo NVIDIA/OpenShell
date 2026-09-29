@@ -49,6 +49,7 @@ pub async fn run(
             .arg(format!("{name}={}", value.display()));
     }
 
+    command.kill_on_drop(true);
     let status = command.arg(playbook).status().await.unwrap();
 
     assert!(status.success());

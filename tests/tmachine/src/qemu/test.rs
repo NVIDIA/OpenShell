@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,9 @@ pub async fn test(
     installer: &Installer,
     testsuite: &Testsuite,
 ) -> Result<()> {
+    if environment.ephemeral {
+        return test_ephemeral(machine, environment, installer, testsuite).await;
+    }
     let install_disk = install(machine, environment, installer).await?;
     let test_dir = tempdir().unwrap();
     let test_disk = test_dir.path().join("test.qcow2");
@@ -44,6 +48,66 @@ pub async fn test(
     }
 
     vm.stop().await?;
+    Ok(())
+}
+
+async fn test_ephemeral(
+    machine: &Machine,
+    environment: &Environment,
+    installer: &Installer,
+    testsuite: &Testsuite,
+) -> Result<()> {
+    let run_dir = tempdir().context("create disposable tmachine run directory")?;
+    let image = QemuImage::create(&machine.base_image, run_dir.path().join("run.qcow2")).await;
+    let vm = QemuVm::start(&image).await;
+    let run = async {
+        if environment.setup.use_galaxy || installer.use_galaxy {
+            crate::ansible::install_roles().await;
+        }
+        run_playbooks(
+            &environment.setup.playbooks,
+            &BTreeMap::new(),
+            &environment.variables,
+        )
+        .await
+        .context("prepare ephemeral environment")?;
+        run_playbooks(
+            &installer.playbooks,
+            &installer.inputs,
+            &environment.variables,
+        )
+        .await
+        .context("install in ephemeral environment")?;
+        run_playbooks(
+            &testsuite.playbooks,
+            &testsuite.inputs,
+            &environment.variables,
+        )
+        .await
+        .context("run ephemeral testsuite")?;
+        if testsuite.interactive {
+            open_shell().await?;
+        }
+        Ok(())
+    };
+    let result = tokio::select! {
+        result = run => result,
+        result = wait_for_interrupt() => {
+            Err(result.err().unwrap_or_else(|| anyhow::anyhow!("tmachine run interrupted")))
+        }
+    };
+    let cleanup = vm.stop().await;
+    cleanup.context("stop disposable tmachine guest")?;
+    result
+}
+
+async fn wait_for_interrupt() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("register SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("wait for SIGINT")?,
+        _ = terminate.recv() => {},
+    }
     Ok(())
 }
 

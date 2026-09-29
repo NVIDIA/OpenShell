@@ -28,6 +28,8 @@ pub struct Environment {
     pub setup: Setup,
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -76,6 +78,7 @@ machines:
 environments:
   - name: ubuntu-k3s
     machine: ubuntu
+    ephemeral: true
     variables:
       kubeconfig: /home/tmachine/.kube/config
       kubernetes_namespace: openshell
@@ -96,6 +99,7 @@ testsuites:
         .unwrap();
 
         let environment = &config.environments[0];
+        assert!(environment.ephemeral);
         assert_eq!(
             environment.variables["kubeconfig"],
             "/home/tmachine/.kube/config"

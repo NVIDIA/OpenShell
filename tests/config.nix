@@ -46,6 +46,7 @@ let
       {
         name = "ubuntu-k3s";
         machine = "ubuntu";
+        ephemeral = true;
         variables = {
           kubeconfig = "/home/tmachine/.kube/config";
           kubernetes_namespace = "openshell";

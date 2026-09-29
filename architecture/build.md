@@ -282,6 +282,10 @@ the independent `kubernetes-binaries` installer and the shared `conformance`
 testsuite. That installer imports the candidate sandbox and supervisor images
 into k3s and starts the candidate gateway with the Kubernetes driver. The
 kubeconfig stays inside the guest with mode `0600` and is never an artifact.
+Unlike Docker and Podman environments, this environment runs setup and
+installation on a disposable overlay disk, so cluster state and credentials
+cannot enter the reusable setup or install caches. The guest is removed after
+successful, failed, and interrupted runs.
 
 Run the Kubernetes composition locally after staging the candidate inputs:
 
@@ -310,7 +314,7 @@ nix run .#tmachine -- test ubuntu-docker-rootful deb shell
 
 Exit the SSH session to shut down and discard the disposable guest.
 
-The `tests/tmachine` setup and install caches include a digest of the
+For cached environments, the `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task
 includes, templates, inventory, and requirements. The digest uses sorted
 relative paths, file contents, and executable permissions; source symlinks
