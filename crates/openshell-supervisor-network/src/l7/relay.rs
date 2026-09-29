@@ -224,7 +224,10 @@ where
                     // even when the caller disconnects before receiving it.
                     observer.observe(EndpointResult::PolicyDenied);
                 }
-                let reason = error.to_string();
+                let reason = format!(
+                    "{error}; {}",
+                    crate::l7::mcp::selected_revision_context(request, version)
+                );
                 let summary = l7_protocol_log_summary(None, Some(&info));
                 ocsf_emit!(build_l7_request_event(
                     ctx,
@@ -305,7 +308,7 @@ where
         // Record the denial before client delivery can fail.
         observer.observe(EndpointResult::PolicyDenied);
     }
-    let reason = error.to_string();
+    let reason = error.rejection_detail(request);
     let summary = l7_protocol_log_summary(None, Some(info));
     ocsf_emit!(build_l7_request_event(
         ctx,
@@ -10819,23 +10822,31 @@ network_policies:
 
     #[tokio::test]
     async fn mcp_relay_rejects_invalid_disallowed_and_missing_versions_without_forwarding() {
-        for (headers, status, code) in [
+        for (headers, status, code, remedy) in [
             (
                 "MCP-Protocol-Version: 2026-07-29\r\n",
                 "400 Bad Request",
                 "unsupported_mcp_protocol_version",
+                "use a supported client/server revision permitted by mcp.versions",
             ),
             (
                 "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
                 "400 Bad Request",
                 "invalid_mcp_protocol_version_header",
+                "send exactly one revision",
             ),
             (
                 "MCP-Protocol-Version: 2025-06-18\r\n",
                 "403 Forbidden",
                 "mcp_protocol_version_not_allowed",
+                "selected MCP revision 2025-06-18 from MCP-Protocol-Version",
             ),
-            ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
+            (
+                "",
+                "403 Forbidden",
+                "mcp_protocol_version_not_allowed",
+                "missing MCP-Protocol-Version header fallback; send the client/server revision explicitly",
+            ),
         ] {
             let (response, forwarded) = run_rejected_mcp_request(
                 false,
@@ -10848,6 +10859,7 @@ network_policies:
                 "{response}"
             );
             assert!(response.contains(code), "{response}");
+            assert!(response.contains(remedy), "{response}");
             assert!(forwarded.is_empty(), "rejected request reached upstream");
         }
     }
@@ -11333,10 +11345,38 @@ network_policies:
             response.contains("does not permit top-level JSON-RPC batches"),
             "{response}"
         );
+        assert!(response.contains("send each JSON-RPC message in a separate request"));
+        assert!(response.contains("selected MCP revision 2025-11-25 from MCP-Protocol-Version"));
         assert!(
             forwarded.is_empty(),
             "profile-invalid request reached upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_explains_unavailable_method_without_reflecting_params() {
+        // tasks/update is known to the parser but absent from the selected
+        // core revision. The diagnostic must not suggest adding an allow rule.
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tasks/update","params":{"taskId":"private-task-marker","inputResponses":{"secret":"private-argument-marker"}}}"#;
+        for route_selected in [false, true] {
+            let (response, forwarded) = run_rejected_mcp_request(
+                route_selected,
+                "MCP-Protocol-Version: 2025-11-25\r\n",
+                body,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("invalid_mcp_request"), "{response}");
+            assert!(response.contains("`tasks/update` is unavailable in revision 2025-11-25"));
+            assert!(response.contains("allow_all_known_mcp_methods cannot enable"));
+            assert!(response.contains("from MCP-Protocol-Version"));
+            assert!(!response.contains("private-task-marker"));
+            assert!(!response.contains("private-argument-marker"));
+            assert!(forwarded.is_empty(), "unavailable method reached upstream");
+        }
     }
 
     #[tokio::test]

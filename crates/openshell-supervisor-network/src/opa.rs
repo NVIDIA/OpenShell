@@ -4925,6 +4925,31 @@ process:
         val == regorus::Value::from(true)
     }
 
+    fn assert_l7_denial(
+        engine: &OpaEngine,
+        input: &serde_json::Value,
+        deny_rule_matches: bool,
+        expected_reason: &str,
+    ) {
+        let mut eng = engine.engine.lock().unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.allow_request".into())
+                .expect("evaluate allow_request"),
+            regorus::Value::from(false),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.deny_request".into())
+                .expect("evaluate deny_request"),
+            regorus::Value::from(deny_rule_matches),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .expect("evaluate one unambiguous denial reason"),
+            regorus::Value::from(expected_reason),
+        );
+    }
+
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
         let mut engine = regorus::Engine::new();
         engine
@@ -6271,10 +6296,34 @@ network_policies:
             "tools/call",
             serde_json::json!({"name": "blocked_action"}),
         );
-        assert!(!eval_l7(&engine, &blocked));
+        assert_l7_denial(
+            &engine,
+            &blocked,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
+        );
+
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "private_tool_name", "arguments.secret": "private-value"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
 
         let list_tools = l7_jsonrpc_input("mcp.params.test", 8000, "/mcp", "tools/list");
-        assert!(!eval_l7(&engine, &list_tools));
+        assert_l7_denial(
+            &engine,
+            &list_tools,
+            false,
+            "MCP core method is not permitted by policy; ask the policy owner to review rules for this method in the selected MCP revision",
+        );
     }
 
     #[test]
@@ -6311,12 +6360,19 @@ network_policies:
         let list_tools = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "tools/list");
         assert!(eval_l7(&engine, &list_tools));
 
-        let mut extension = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "vendor/extension");
+        let mut extension = l7_jsonrpc_input(
+            "mcp.default.test",
+            8000,
+            "/mcp",
+            "vendor/private_method_name",
+        );
         extension["request"]["jsonrpc"]["mcp_method_classification"] =
             serde_json::json!("extension");
-        assert!(
-            !eval_l7(&engine, &extension),
-            "allow_all_known_mcp_methods must cover only selected-profile methods"
+        assert_l7_denial(
+            &engine,
+            &extension,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
         );
     }
 
@@ -6382,18 +6438,106 @@ network_policies:
             l7_jsonrpc_input("mcp.extension-wildcard.test", 8000, "/mcp", "tools/vendor");
         wildcard["request"]["jsonrpc"]["mcp_method_classification"] =
             serde_json::json!("extension");
-        assert!(
-            !eval_l7(&engine, &wildcard),
-            "wildcards must not authorize unknown extension methods"
+        assert_l7_denial(
+            &engine,
+            &wildcard,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
         );
 
         let mut denied =
             l7_jsonrpc_input("mcp.extension-denied.test", 8000, "/mcp", "tools/vendor");
         denied["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
-        assert!(
-            !eval_l7(&engine, &denied),
-            "deny-rule wildcards must still block explicitly allowed extensions"
+        assert_l7_denial(
+            &engine,
+            &denied,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
         );
+    }
+
+    #[test]
+    fn l7_mcp_denial_reason_matches_request_path_and_protocol() {
+        let data = r#"
+network_policies:
+  mixed:
+    name: mixed
+    endpoints:
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        rules: [{allow: {method: reports.list}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rest
+        protocol: rest
+        enforcement: enforce
+        rules: [{allow: {method: GET, path: /rest}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules: [{allow: {tool: read_status}}]
+    binaries:
+      - {path: /usr/bin/curl}
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Select the explanation by the current request path, not the first
+        // configured endpoint for this host and port.
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.reasons.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "other_tool"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
+        for path in ["/rest", "/rpc", "/other"] {
+            assert_l7_denial(
+                &engine,
+                &l7_jsonrpc_input("mcp.reasons.test", 8000, path, "tools/call"),
+                false,
+                &format!("POST {path} not permitted by policy"),
+            );
+        }
+
+        // Batch envelopes have no selected call until the relay evaluates
+        // each member. Protocol failures also remain outside policy hints.
+        for field in ["method", "error", "mcp_method_classification"] {
+            let mut input = unmatched_tool.clone();
+            input["request"]["jsonrpc"][field] = match field {
+                "method" => serde_json::Value::Null,
+                "error" => serde_json::json!("invalid MCP request"),
+                _ => serde_json::json!("unavailable"),
+            };
+            assert_l7_denial(&engine, &input, false, "POST /mcp not permitted by policy");
+        }
+
+        assert_l7_denial(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/rpc"),
+            true,
+            "JSON-RPC response frames are not permitted from client to server",
+        );
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/mcp")
+        ));
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.reasons.test", 8000, "/mcp", "tools/list")
+        ));
     }
 
     #[test]

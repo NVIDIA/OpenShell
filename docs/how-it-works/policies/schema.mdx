@@ -203,7 +203,7 @@ network_policies:
 | `mcp.versions` | list of strings | `["2025-11-25"]` | Allowed MCP revisions. Refer to [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | `65536` | Maximum MCP request body size for inspection. |
 | `mcp.strict_tool_names` | bool | `true` | Requires tool names to match `^[A-Za-z0-9_.-]{1,128}$`. |
-| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, the endpoint allows every core MCP method available in the request's revision, except those that deny rules match. An extension method still needs an allow rule that names it exactly. If rules name specific tools, `tools/call` is limited to those tools. Rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
+| `mcp.allow_all_known_mcp_methods` | bool | `false` | Allow core MCP methods for the selected request revision. Tool restrictions still apply, and deny rules take precedence. Refer to [Allow Core MCP Methods](#allow-core-mcp-methods) for the behavior and [Core MCP Methods](#core-mcp-methods) for the method list. |
 | `json_rpc.max_body_bytes` | integer | `65536` | Maximum JSON-RPC request body size for inspection. |
 
 #### Endpoint Constraints
@@ -351,8 +351,7 @@ matcher fields in one rule.
   Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
   method is one that no supported MCP revision defines.
 
-Under the 2025 revisions, a client sends `initialize` and
-`notifications/initialized` before calling tools, so allow both:
+Under the 2025 revisions, a client sends `initialize` and `notifications/initialized` before calling tools. When `mcp.allow_all_known_mcp_methods` is omitted or `false`, allow both explicitly:
 
 ```yaml showLineNumbers={false}
 rules:
@@ -377,6 +376,49 @@ but the request's revision does not, such as `server/discover` under
 `2025-11-25`. A request that fails these checks returns `400` with the error
 `invalid_mcp_request`, even on an endpoint that uses `enforcement: audit`. These
 type checks are not complete JSON Schema validation.
+
+#### Allow Core MCP Methods
+
+Set `mcp.allow_all_known_mcp_methods: true` to allow the [core methods](#core-mcp-methods) available in each request's [selected MCP revision](#mcp-version-selection). A policy that accepts several revisions still checks each request against its own revision. The option does not combine their method sets.
+
+Tool-specific allow rules continue to restrict `tools/call` to matching names, and deny rules take precedence over every allow. Without tool-specific allow rules, this option allows calls to every tool name, subject to deny rules and tool-name validation. Extension methods require an allow rule that names the method exactly. An explicit allow rule cannot enable a core method that is unavailable in the selected revision.
+
+For example, this endpoint allows core methods for `2025-11-25`, while limiting tool calls to `search_web` and `read_document`:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    enforcement: enforce
+    mcp:
+      versions: ["2025-11-25"]
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            any: [search_web, read_document]
+```
+
+Here, `tools/call` is the JSON-RPC method, and `search_web` is the tool name in `params.name`. Allowing a method does not establish that the server supports it or that a tool is read-only.
+
+#### Core MCP Methods
+
+The following list covers client-to-server requests and notifications, which OpenShell inspects. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that recognize those methods in the client-to-server direction.
+
+| Methods or notifications | MCP revisions |
+|---|---|
+| `tools/list`, `tools/call` | All supported revisions. |
+| `resources/list`, `resources/templates/list`, `resources/read` | All supported revisions. |
+| `prompts/list`, `prompts/get`, `completion/complete` | All supported revisions. |
+| `notifications/cancelled` | All supported revisions. |
+| `initialize`, `ping`, `logging/setLevel` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `resources/subscribe`, `resources/unsubscribe` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `notifications/initialized`, `notifications/progress`, `notifications/roots/list_changed` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`, `notifications/tasks/status` | `2025-11-25` only; experimental. |
+| `server/discover`, `subscriptions/listen` | `2026-07-28` only. |
+
+MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
 
 #### MCP Version Selection
 
@@ -407,6 +449,16 @@ rejects `initialize`.
 
 For a client that requires an unsupported revision, omit `protocol` and `mcp` to
 allow its traffic without MCP inspection.
+
+#### Understand MCP Rejections
+
+Use the response's error code and detail to distinguish a protocol problem from a policy denial:
+
+- `unsupported_mcp_protocol_version` (`400`) means this OpenShell build does not support the header's revision. Configure the client to use a revision that OpenShell and the server support and that `mcp.versions` permits.
+- `mcp_protocol_version_not_allowed` (`403`) means the selected revision is supported but excluded by the endpoint policy. Use a compatible revision the policy permits, or ask the policy owner to review `mcp.versions`.
+- A detail that names the missing-header fallback means OpenShell selected `2025-03-26`, even if the policy defaults to `2025-11-25`. Send the client/server revision explicitly in `MCP-Protocol-Version`; the policy must permit it.
+- `invalid_mcp_request` (`400`) can mean the method is unavailable in the selected revision. For example, `tasks/get` is unavailable in `2025-06-18`. Use a method available in that revision, or configure the client and server to use a compatible revision that includes it and is permitted by policy. Adding an allow rule or enabling `allow_all_known_mcp_methods` cannot override this protocol check.
+- A rule denial (`403` under `enforcement: enforce`) requires a policy review. An extension method needs an exact method allow rule; a denied tool call may need a matching tool selector. An explicit deny rule takes precedence, so adding an allow rule cannot override it. Ask the policy owner to review the relevant allow or deny rule.
 
 #### Sessionless MCP Requests
 
