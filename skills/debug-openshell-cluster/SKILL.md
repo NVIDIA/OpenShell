@@ -778,6 +778,20 @@ kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,o
 kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
 
+If the Sandbox exists but its workload Pod never appears, capture the Sandbox
+status before deleting or retrying it, then inspect the Agent Sandbox
+controller. Controller Pod restarts, leader-election state, reconciliation
+errors, and namespace events distinguish a slow handoff from a rejected or
+stuck reconciliation:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o yaml
+kubectl -n agent-sandbox-system get deployment,pod,lease -o wide
+kubectl -n agent-sandbox-system get events --sort-by=.lastTimestamp
+kubectl -n agent-sandbox-system logs deployment/agent-sandbox-controller \
+  --all-containers --prefix --tail=300
+```
+
 Creation and recovery fail closed. A missing Secret leaves both pods inert; a
 missing or unobserved workload fence must prevent the driver from releasing the
 Sandbox; and readiness requires both Agent Sandbox readiness and an Available

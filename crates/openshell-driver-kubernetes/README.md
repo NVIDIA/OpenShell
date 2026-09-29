@@ -117,6 +117,11 @@ Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
+After releasing a Sandbox CR, the driver allows the Agent Sandbox controller
+up to 90 seconds to reconcile its gated workload Pod. This controller deadline
+is separate from the 30-second limit on each Kubernetes API request. The driver
+uses a name-scoped watch after an initial Pod lookup and still rejects a Pod
+unless its controller owner reference matches the created Sandbox UID.
 
 ## Workspace Persistence
 

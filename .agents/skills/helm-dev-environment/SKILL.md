@@ -269,7 +269,9 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
-target. `/readyz` remains covered by server unit/integration tests.
+target. `/readyz` remains covered by server unit/integration tests. On failure,
+the wrapper also captures Agent Sandbox controller Pod state and logs,
+controller-namespace events, and deployment and leader-election Lease state.
 
 Use `mise run e2e:kubernetes:ha-rebalancing` for full-suite HA coverage. The
 task creates an external PostgreSQL fixture, installs Envoy Gateway, applies

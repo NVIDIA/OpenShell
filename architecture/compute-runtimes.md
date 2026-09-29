@@ -470,9 +470,11 @@ before a suspended Sandbox CR, then provisions split immutable bootstrap
 Secrets, the private runtime Service, and a gated supervisor Pod. A
 non-root init container stages `openshell-sandbox` and one-use bootstrap files
 into memory volumes. The workload Pod never mounts supervisor or gateway
-credentials. The driver removes its scheduling gate only after the companions
-exist; measured confirmation and supervisor-session registration gate public
-readiness.
+credentials. The Agent Sandbox controller creates the gated workload Pod
+asynchronously; the driver observes that handoff with a bounded watch and
+accepts only a Pod whose controller owner reference matches the Sandbox UID.
+The driver removes its scheduling gate only after the companions exist;
+measured confirmation and supervisor-session registration gate public readiness.
 
 ## Images
 

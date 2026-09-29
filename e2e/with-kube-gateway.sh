@@ -76,6 +76,7 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 # Sandbox API introduced in v0.5.0 and falls back to v1alpha1 for v0.4.6
 # clusters. Override this env var to exercise the v1alpha1 controller release.
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v1.0.3}"
+AGENT_SANDBOX_NAMESPACE="agent-sandbox-system"
 
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
@@ -441,6 +442,36 @@ cleanup_vault_fixture() {
   VAULT_FIXTURE_DEPLOYED=0
 }
 
+dump_agent_sandbox_controller_diagnostics() {
+  if ! kctl get namespace "${AGENT_SANDBOX_NAMESPACE}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "=== Agent Sandbox controller pod state ==="
+  kctl -n "${AGENT_SANDBOX_NAMESPACE}" get pods -o wide 2>&1 || true
+  kctl -n "${AGENT_SANDBOX_NAMESPACE}" get pods -o yaml 2>&1 || true
+  echo "=== Agent Sandbox controller deployment ==="
+  kctl -n "${AGENT_SANDBOX_NAMESPACE}" get deployment/agent-sandbox-controller \
+    -o yaml 2>&1 || true
+  echo "=== Agent Sandbox controller leases ==="
+  kctl -n "${AGENT_SANDBOX_NAMESPACE}" get leases.coordination.k8s.io \
+    -o yaml 2>&1 || true
+  echo "=== Agent Sandbox controller events ==="
+  kctl -n "${AGENT_SANDBOX_NAMESPACE}" get events \
+    --sort-by=.lastTimestamp 2>&1 | tail -n 100 || true
+  echo "=== Agent Sandbox controller logs (last 300 lines each) ==="
+  while IFS= read -r controller_pod; do
+    [ -n "${controller_pod}" ] || continue
+    echo "--- ${controller_pod} ---"
+    kctl -n "${AGENT_SANDBOX_NAMESPACE}" logs "${controller_pod}" \
+      --all-containers --prefix --tail=300 2>&1 || true
+    echo "--- ${controller_pod} (previous containers) ---"
+    kctl -n "${AGENT_SANDBOX_NAMESPACE}" logs "${controller_pod}" --previous \
+      --all-containers --prefix --tail=300 2>&1 || true
+  done < <(kctl -n "${AGENT_SANDBOX_NAMESPACE}" get pods -o name 2>/dev/null || true)
+  echo "=== end Agent Sandbox controller debug output ==="
+}
+
 cleanup() {
   local exit_code=$?
 
@@ -484,6 +515,9 @@ cleanup() {
         -l "app.kubernetes.io/instance=${RELEASE_NAME}" --tail=200 \
         --all-containers --prefix 2>&1 || true
       echo "=== end gateway debug output ==="
+    fi
+    if command -v kubectl >/dev/null 2>&1; then
+      dump_agent_sandbox_controller_diagnostics
     fi
     if [ -f "${PORTFORWARD_LOG}" ]; then
       echo "=== port-forward log ==="

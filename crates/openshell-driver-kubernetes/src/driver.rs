@@ -34,6 +34,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+    WatchEvent as KubeWatchEvent, WatchParams,
 };
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -266,6 +267,9 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+/// Allow the Agent Sandbox controller enough time to reconcile the gated
+/// workload Pod independently of the timeout for one Kubernetes API request.
+const WORKLOAD_POD_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(90);
 fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     match error.code() {
         tonic::Code::InvalidArgument => {
@@ -680,6 +684,49 @@ const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 /// Sentinel file written by the init container after copying the image's
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
+
+fn validate_workload_pod_owner(
+    pod: Pod,
+    pod_name: &str,
+    sandbox_uid: &str,
+) -> Result<Pod, KubernetesDriverError> {
+    let owned = pod
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| {
+            owner.controller == Some(true) && owner.kind == SANDBOX_KIND && owner.uid == sandbox_uid
+        });
+    if !owned {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "workload Pod {pod_name} is not controlled by the created Sandbox UID"
+        )));
+    }
+    Ok(pod)
+}
+
+fn sandbox_reconciliation_snapshot(sandbox: &DynamicObject) -> serde_json::Value {
+    let spec = sandbox.data.get("spec");
+    serde_json::json!({
+        "metadata": {
+            "name": sandbox.metadata.name,
+            "namespace": sandbox.metadata.namespace,
+            "uid": sandbox.metadata.uid,
+            "resourceVersion": sandbox.metadata.resource_version,
+            "generation": sandbox.metadata.generation,
+            "creationTimestamp": sandbox.metadata.creation_timestamp,
+            "deletionTimestamp": sandbox.metadata.deletion_timestamp,
+            "finalizers": sandbox.metadata.finalizers,
+        },
+        "spec": {
+            "operatingMode": spec.and_then(|value| value.get("operatingMode")),
+            "replicas": spec.and_then(|value| value.get("replicas")),
+        },
+        "status": sandbox.data.get("status"),
+    })
+}
 
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
@@ -2028,41 +2075,119 @@ impl KubernetesComputeDriver {
     async fn wait_for_bootstrap_workload_pod(
         &self,
         pods: &Api<Pod>,
+        namespace: &str,
+        sandbox_api: &Api<DynamicObject>,
         pod_name: &str,
         sandbox_uid: &str,
     ) -> Result<Pod, KubernetesDriverError> {
-        let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
-        loop {
-            match pods.get_opt(pod_name).await {
-                Ok(Some(pod)) => {
-                    let owned = pod
-                        .metadata
-                        .owner_references
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|owner| {
-                            owner.controller == Some(true)
-                                && owner.kind == SANDBOX_KIND
-                                && owner.uid == sandbox_uid
-                        });
-                    if !owned {
-                        return Err(KubernetesDriverError::Precondition(format!(
-                            "workload Pod {pod_name} is not controlled by the created Sandbox UID"
-                        )));
+        let watch_pods = Api::<Pod>::namespaced(self.watch_client.clone(), namespace);
+        Box::pin(self.wait_for_bootstrap_workload_pod_with_timeout(
+            pods,
+            &watch_pods,
+            sandbox_api,
+            pod_name,
+            sandbox_uid,
+            WORKLOAD_POD_RECONCILIATION_TIMEOUT,
+        ))
+        .await
+    }
+
+    async fn wait_for_bootstrap_workload_pod_with_timeout(
+        &self,
+        pods: &Api<Pod>,
+        watch_pods: &Api<Pod>,
+        sandbox_api: &Api<DynamicObject>,
+        pod_name: &str,
+        sandbox_uid: &str,
+        reconciliation_timeout: Duration,
+    ) -> Result<Pod, KubernetesDriverError> {
+        let wait = async {
+            loop {
+                let current = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name))
+                    .await
+                    .map_err(|_| {
+                        KubernetesDriverError::Message(format!(
+                            "timed out after {}s getting workload Pod {pod_name}",
+                            KUBE_API_TIMEOUT.as_secs()
+                        ))
+                    })?
+                    .map_err(KubernetesDriverError::from_kube)?;
+                if let Some(pod) = current {
+                    return validate_workload_pod_owner(pod, pod_name, sandbox_uid);
+                }
+
+                // Start a name-scoped watch at current state after the initial
+                // GET. An empty resourceVersion reports a Pod created in the
+                // small interval between those two requests without allowing
+                // the arbitrarily stale initial state permitted by version 0.
+                let watch_timeout = u32::try_from(KUBE_API_TIMEOUT.as_secs()).unwrap_or(294);
+                let params = WatchParams::default()
+                    .fields(&format!("metadata.name={pod_name}"))
+                    .timeout(watch_timeout);
+                let events = watch_pods
+                    .watch(&params, "")
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+                tokio::pin!(events);
+
+                while let Some(event) = events
+                    .try_next()
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?
+                {
+                    match event {
+                        KubeWatchEvent::Added(pod) | KubeWatchEvent::Modified(pod) => {
+                            return validate_workload_pod_owner(pod, pod_name, sandbox_uid);
+                        }
+                        KubeWatchEvent::Deleted(_) | KubeWatchEvent::Bookmark(_) => {}
+                        KubeWatchEvent::Error(error) => {
+                            return Err(KubernetesDriverError::Message(format!(
+                                "Kubernetes watch for workload Pod {pod_name} failed: {error:?}"
+                            )));
+                        }
                     }
-                    return Ok(pod);
                 }
-                Ok(None) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Ok(None) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "timed out waiting for gated workload Pod {pod_name}"
-                    )));
-                }
-                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+                // Kubernetes watches are finite. Re-check current state before
+                // opening the next watch until the reconciliation deadline.
             }
+        };
+
+        if let Ok(result) = tokio::time::timeout(reconciliation_timeout, wait).await {
+            result
+        } else {
+            self.emit_sandbox_reconciliation_snapshot(sandbox_api, pod_name)
+                .await;
+            Err(KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for gated workload Pod {pod_name}",
+                reconciliation_timeout.as_secs_f64()
+            )))
+        }
+    }
+
+    async fn emit_sandbox_reconciliation_snapshot(
+        &self,
+        sandbox_api: &Api<DynamicObject>,
+        sandbox_name: &str,
+    ) {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, sandbox_api.get(sandbox_name)).await {
+            Ok(Ok(sandbox)) => {
+                let snapshot = sandbox_reconciliation_snapshot(&sandbox);
+                warn!(
+                    sandbox_cr = %sandbox_name,
+                    snapshot = %snapshot,
+                    "Agent Sandbox controller did not create the workload Pod before the reconciliation deadline"
+                );
+            }
+            Ok(Err(error)) => warn!(
+                sandbox_cr = %sandbox_name,
+                %error,
+                "failed to read Sandbox CR snapshot after workload Pod reconciliation timed out"
+            ),
+            Err(_) => warn!(
+                sandbox_cr = %sandbox_name,
+                timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                "timed out reading Sandbox CR snapshot after workload Pod reconciliation timed out"
+            ),
         }
     }
 
@@ -2412,7 +2537,7 @@ impl KubernetesComputeDriver {
         .await?;
 
         let workload_pod = self
-            .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
+            .wait_for_bootstrap_workload_pod(&pods, namespace, &sandbox_api.api, cr_name, cr_uid)
             .await?;
         let admission_object = sandbox_api
             .api
@@ -2691,7 +2816,7 @@ impl KubernetesComputeDriver {
 
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
         let workload_pod = self
-            .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
+            .wait_for_bootstrap_workload_pod(&pods, namespace, &sandbox_api.api, cr_name, cr_uid)
             .await?;
         let admission_object = sandbox_api
             .api
@@ -7616,6 +7741,234 @@ mod tests {
                 "code": 404
             }),
         )
+    }
+
+    fn sandbox_test_api(client: Client) -> Api<DynamicObject> {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        Api::namespaced_with(client, "openshell", &resource)
+    }
+
+    #[tokio::test]
+    async fn workload_pod_waiter_uses_current_state_watch_after_initial_get() {
+        let workload_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sandbox-cr",
+                "uid": "pod-uid",
+                "ownerReferences": [{
+                    "apiVersion": "agents.x-k8s.io/v1beta1",
+                    "kind": SANDBOX_KIND,
+                    "name": "sandbox-cr",
+                    "uid": "sandbox-uid",
+                    "controller": true
+                }]
+            },
+            "spec": {"containers": []}
+        });
+        let get_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service_get_requests = get_requests.clone();
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let get_requests = service_get_requests.clone();
+                async move {
+                    get_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(
+                        request.uri().path(),
+                        "/api/v1/namespaces/openshell/pods/sandbox-cr"
+                    );
+                    Ok::<_, std::convert::Infallible>(kube_test_not_found("pods", "sandbox-cr"))
+                }
+            }),
+            "openshell",
+        );
+        let watch_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service_watch_requests = watch_requests.clone();
+        let watch_client = Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let workload_pod = workload_pod.clone();
+                let watch_requests = service_watch_requests.clone();
+                async move {
+                    watch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(request.uri().path(), "/api/v1/namespaces/openshell/pods");
+                    let query = request.uri().query().unwrap_or_default();
+                    assert!(query.split('&').any(|parameter| parameter == "watch=true"));
+                    assert!(
+                        query
+                            .split('&')
+                            .any(|parameter| parameter == "resourceVersion="),
+                        "watch must start at current state rather than permit stale initial data: {query}"
+                    );
+                    Ok::<_, std::convert::Infallible>(kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({"type": "ADDED", "object": workload_pod}),
+                    ))
+                }
+            }),
+            "openshell",
+        );
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+        let pods = Api::<Pod>::namespaced(driver.client.clone(), "openshell");
+        let sandbox_api = sandbox_test_api(driver.client.clone());
+
+        let pod = driver
+            .wait_for_bootstrap_workload_pod(
+                &pods,
+                "openshell",
+                &sandbox_api,
+                "sandbox-cr",
+                "sandbox-uid",
+            )
+            .await
+            .expect("watch should deliver the controller-owned workload Pod");
+
+        assert_eq!(pod.metadata.uid.as_deref(), Some("pod-uid"));
+        assert_eq!(get_requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(watch_requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn workload_pod_waiter_rejects_mismatched_sandbox_uid() {
+        let (driver, steps, _) = scripted_driver(
+            KubernetesComputeConfig::default(),
+            vec![(
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/sandbox-cr",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "sandbox-cr",
+                            "uid": "pod-uid",
+                            "ownerReferences": [{
+                                "apiVersion": "agents.x-k8s.io/v1beta1",
+                                "kind": SANDBOX_KIND,
+                                "name": "sandbox-cr",
+                                "uid": "different-sandbox-uid",
+                                "controller": true
+                            }]
+                        },
+                        "spec": {"containers": []}
+                    }),
+                ),
+            )],
+        );
+        let pods = Api::<Pod>::namespaced(driver.client.clone(), "openshell");
+        let sandbox_api = sandbox_test_api(driver.client.clone());
+
+        let error = driver
+            .wait_for_bootstrap_workload_pod(
+                &pods,
+                "openshell",
+                &sandbox_api,
+                "sandbox-cr",
+                "sandbox-uid",
+            )
+            .await
+            .expect_err("a Pod controlled by another Sandbox must be rejected");
+
+        assert!(matches!(error, KubernetesDriverError::Precondition(_)));
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn workload_pod_waiter_uses_reconciliation_timeout_and_reads_snapshot() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service_requests = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let requests = service_requests.clone();
+            async move {
+                let uri = request.uri().to_string();
+                requests.lock().unwrap().push(uri.clone());
+                let response = if uri.contains("watch=true") {
+                    futures::future::pending::<http::Response<kube::client::Body>>().await
+                } else if request.uri().path().ends_with("/pods/sandbox-cr") {
+                    kube_test_not_found("pods", "sandbox-cr")
+                } else {
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "agents.x-k8s.io/v1beta1",
+                            "kind": SANDBOX_KIND,
+                            "metadata": {
+                                "name": "sandbox-cr",
+                                "namespace": "openshell",
+                                "uid": "sandbox-uid",
+                                "resourceVersion": "42"
+                            },
+                            "spec": {"operatingMode": "Running"},
+                            "status": {"conditions": [{"type": "Ready", "status": "False"}]}
+                        }),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client.clone(),
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+        let pods = Api::<Pod>::namespaced(client.clone(), "openshell");
+        let sandbox_api = sandbox_test_api(client);
+
+        let error = driver
+            .wait_for_bootstrap_workload_pod_with_timeout(
+                &pods,
+                &pods,
+                &sandbox_api,
+                "sandbox-cr",
+                "sandbox-uid",
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("a stalled controller must hit the reconciliation deadline");
+
+        assert!(error.to_string().contains("timed out after 2s"), "{error}");
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|uri| uri.contains("watch=true")));
+        assert!(
+            requests
+                .iter()
+                .any(|uri| uri.ends_with("/sandboxes/sandbox-cr")),
+            "timeout should read a final Sandbox CR/status snapshot: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_reconciliation_snapshot_keeps_status_without_pod_template() {
+        let sandbox: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": SANDBOX_KIND,
+            "metadata": {"name": "sandbox-cr", "uid": "sandbox-uid"},
+            "spec": {
+                "operatingMode": "Running",
+                "podTemplate": {"spec": {"containers": [{"env": [{"value": "sensitive"}]}]}}
+            },
+            "status": {"conditions": [{"type": "Ready", "status": "False"}]}
+        }))
+        .unwrap();
+
+        let snapshot = sandbox_reconciliation_snapshot(&sandbox);
+
+        assert_eq!(snapshot["spec"]["operatingMode"], "Running");
+        assert_eq!(snapshot["status"]["conditions"][0]["type"], "Ready");
+        assert!(!snapshot.to_string().contains("sensitive"));
     }
 
     #[test]
