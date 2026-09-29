@@ -165,6 +165,9 @@ impl SandboxTemplateSource {
 pub struct TelemetryComputeDriver(&'static str);
 
 impl TelemetryComputeDriver {
+    /// Telemetry category for the first-party Apple Container compute driver.
+    pub const APPLE_CONTAINER: Self = Self("apple-container");
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         self.0
@@ -680,6 +683,10 @@ mod tests {
         assert_eq!(
             TelemetryComputeDriver::anonymous_category("first_party").as_str(),
             "first_party"
+        );
+        assert_eq!(
+            TelemetryComputeDriver::APPLE_CONTAINER.as_str(),
+            "apple-container"
         );
     }
 

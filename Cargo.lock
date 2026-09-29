@@ -4108,6 +4108,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-apple-container"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "openshell-core",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-driver-db-credstore"
 version = "0.0.0"
 dependencies = [
@@ -4380,6 +4397,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-driver-apple-container",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-mxc",

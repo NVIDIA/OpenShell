@@ -36,6 +36,9 @@ tonic = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+openshell-driver-apple-container = { path = "../openshell-driver-apple-container", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
 
@@ -47,11 +50,13 @@ in-tree-compute-drivers = [
     "compute-driver-podman",
     "compute-driver-vm",
     "compute-driver-mxc",
+    "compute-driver-apple-container",
 ]
 compute-driver-mxc = ["dep:openshell-driver-mxc"]
 compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
 compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]
+compute-driver-apple-container = ["dep:openshell-driver-apple-container"]
 compute-driver-vm = [
     "dep:openshell-policy",
     "dep:openshell-otel",

@@ -30,7 +30,15 @@ pub struct PkiBundle {
 ///
 /// Covers the host aliases used by every supported runtime: Kubernetes service DNS,
 /// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
-/// and `host.containers.internal` for Podman containers reaching their host.
+/// `host.containers.internal` for Podman containers reaching their host, and
+/// `host.container.internal` for Apple Container guests reaching their host.
+///
+/// The Apple Container alias is macOS-only: including it on other operating
+/// systems would force a one-time CA rotation on every existing install
+/// (including Linux/Podman users who will never run Apple Container) because
+/// `missing_required_server_sans` in `openshell-server/src/certgen.rs` would
+/// detect a new required name and regenerate the local CA, breaking every
+/// existing CLI/sandbox that trusts the old CA.
 pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "openshell",
     "openshell.openshell.svc",
@@ -40,6 +48,8 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "*.openshell.localhost",
     "host.docker.internal",
     "host.containers.internal",
+    #[cfg(target_os = "macos")]
+    "host.container.internal",
     "127.0.0.1",
     "::1",
 ];
@@ -250,5 +260,7 @@ mod tests {
         assert!(DEFAULT_SERVER_SANS.contains(&"host.containers.internal"));
         assert!(DEFAULT_SERVER_SANS.contains(&"127.0.0.1"));
         assert!(DEFAULT_SERVER_SANS.contains(&"::1"));
+        #[cfg(target_os = "macos")]
+        assert!(DEFAULT_SERVER_SANS.contains(&"host.container.internal"));
     }
 }

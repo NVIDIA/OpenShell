@@ -20,7 +20,7 @@ compile_error!(
 mod vm;
 
 #[cfg(any(
-    all(target_os = "windows", feature = "compute-driver-mxc"),
+    target_os = "macos",
     all(
         not(target_os = "windows"),
         any(
@@ -29,10 +29,12 @@ mod vm;
             feature = "compute-driver-podman",
             feature = "compute-driver-vm"
         )
-    )
+    ),
+    all(target_os = "windows", feature = "compute-driver-mxc")
 ))]
 use openshell_core::telemetry::TelemetryComputeDriver;
 #[cfg(any(
+    target_os = "macos",
     target_os = "windows",
     feature = "compute-driver-docker",
     feature = "compute-driver-kubernetes",
@@ -57,6 +59,8 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
         )
     ))]
     install_in_tree_compute_drivers(&mut registry);
+    #[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+    install_apple_container_compute_driver(&mut registry);
     #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
     install_mxc_compute_driver(&mut registry);
     #[cfg(target_os = "windows")]
@@ -132,6 +136,84 @@ impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
 #[cfg(target_os = "windows")]
 fn unsupported_windows_compute_driver(name: &str) -> openshell_core::Error {
     openshell_core::Error::config(format!("compute driver '{name}' is unsupported on Windows"))
+}
+
+#[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+fn install_apple_container_compute_driver(registry: &mut ComputeDriverRegistry) {
+    // Apple Container is macOS-specific and never auto-detected; operators
+    // select it explicitly via `--compute-driver apple-container`.
+    let registration =
+        ComputeDriverRegistration::new("apple-container", 400, None, AppleContainerFactory)
+            .expect("first-party driver name is valid")
+            .with_telemetry_category(TelemetryComputeDriver::APPLE_CONTAINER)
+            .with_local_singleplayer();
+    registry
+        .install(registration)
+        .expect("first-party driver names are unique");
+}
+
+#[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+#[derive(Clone, Copy)]
+struct AppleContainerFactory;
+
+#[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+#[async_trait::async_trait]
+impl openshell_server::ComputeDriverFactory for AppleContainerFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let _: openshell_driver_apple_container::AppleContainerComputeConfig =
+            apple_container_config(context)?;
+        Ok(())
+    }
+
+    async fn build(
+        &self,
+        context: openshell_server::ComputeDriverBuildContext<'_>,
+    ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
+        let mut config = apple_container_config(context.config_context())?;
+        require_guest_tls_for_local_driver(&context, "apple-container")?;
+        apply_guest_tls(
+            &mut config.guest_tls_ca,
+            &mut config.guest_tls_cert,
+            &mut config.guest_tls_key,
+            context.guest_tls_paths(),
+        );
+        // TODO(upstream PR): plumb SupervisorSessionRegistry through
+        // ComputeDriverBuildContext so the Apple driver can gate "Ready" on the
+        // supervisor having connected back; today we accept main's invariant
+        // that container-start implies success and pass an always-ready stub.
+        let driver = openshell_driver_apple_container::AppleContainerComputeDriver::new(
+            config,
+            std::sync::Arc::new(openshell_driver_apple_container::AlwaysReadySupervisor),
+        )
+        .await
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let driver = openshell_driver_apple_container::ComputeDriverService::new_in_process(
+            std::sync::Arc::new(driver),
+        );
+        Ok(openshell_server::ComputeDriverInstance::InProcess(
+            std::sync::Arc::new(driver),
+        ))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+fn apple_container_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_apple_container::AppleContainerComputeConfig> {
+    let mut config: openshell_driver_apple_container::AppleContainerComputeConfig =
+        context.driver_config()?;
+    config.gateway_port = context.gateway_port();
+    if let Ok(dir) = std::env::var("OPENSHELL_APPLE_CONTAINER_SUPERVISOR_BIN_DIR") {
+        config.supervisor_bin_dir = dir.into();
+    }
+    Ok(config)
 }
 
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
@@ -460,12 +542,15 @@ fn vm_config(
     Ok(config)
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
+#[cfg(any(
+    target_os = "macos",
+    all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-podman",
+            feature = "compute-driver-vm"
+        )
     )
 ))]
 fn require_guest_tls_for_local_driver(
@@ -479,12 +564,15 @@ fn require_guest_tls_for_local_driver(
     )
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
+#[cfg(any(
+    target_os = "macos",
+    all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-podman",
+            feature = "compute-driver-vm"
+        )
     )
 ))]
 fn validate_local_driver_guest_tls(
@@ -500,12 +588,15 @@ fn validate_local_driver_guest_tls(
     Ok(())
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
+#[cfg(any(
+    target_os = "macos",
+    all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-podman",
+            feature = "compute-driver-vm"
+        )
     )
 ))]
 fn apply_guest_tls(
@@ -539,8 +630,19 @@ mod local_driver_tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    #[cfg(feature = "in-tree-compute-drivers")]
+    #[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
     fn linux_builtin_compute_driver_registry_has_expected_names() {
+        assert_eq!(
+            super::install_default_compute_drivers()
+                .installed_driver_names()
+                .collect::<Vec<_>>(),
+            ["apple-container", "docker", "kubernetes", "podman", "vm"]
+        );
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "in-tree-compute-drivers"))]
+    #[test]
+    fn builtin_compute_driver_registry_has_expected_names() {
         assert_eq!(
             super::install_default_compute_drivers()
                 .installed_driver_names()
@@ -612,6 +714,8 @@ mod tests {
     #[test]
     fn default_registry_contains_exactly_the_enabled_compute_drivers() {
         let expected: Vec<&str> = vec![
+            #[cfg(all(target_os = "macos", feature = "compute-driver-apple-container"))]
+            "apple-container",
             #[cfg(feature = "compute-driver-docker")]
             "docker",
             #[cfg(feature = "compute-driver-kubernetes")]

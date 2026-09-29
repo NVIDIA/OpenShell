@@ -132,6 +132,8 @@ struct RunArgs {
     ///
     /// Accepts one registered driver name. When unset, the gateway runs
     /// detection probes supplied by the drivers compiled into the binary.
+    /// Apple Container is macOS-specific and never auto-detected; select it
+    /// explicitly via `--compute-driver apple-container`.
     #[arg(
         long = "compute-driver",
         env = "OPENSHELL_COMPUTE_DRIVER",
