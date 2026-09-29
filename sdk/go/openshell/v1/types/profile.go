@@ -20,11 +20,11 @@ const (
 // ProviderProfile defines a provider type template with credentials schema,
 // files, endpoints, binaries, and discovery configuration.
 type ProviderProfile struct {
-	ID               string
-	DisplayName      string
-	Description      string
-	Category         ProfileCategory
-	Credentials      []ProfileCredential
+	ID          string
+	DisplayName string
+	Description string
+	Category    ProfileCategory
+	Credentials []ProfileCredential
 	// Files is EXPERIMENTAL. This API and its behavior may change or be removed.
 	Files            []ProfileFile
 	Endpoints        []NetworkEndpoint
