@@ -325,6 +325,31 @@ operator ConfigMap reference. */}}
 {{- end -}}
 {{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_bundle" "/etc/openshell-tls/additional-ca-source/ca.crt") -}}
 {{- end -}}
+{{/* Metrics TLS is opt-in and deliberately uses a separate configuration
+boundary from the gateway listener so its client CA can stay independent. */}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $metricsTls := get $metrics "tls" | default dict -}}
+{{- if get $metricsTls "enabled" -}}
+{{- if not .Values.service.metricsPort -}}
+{{- fail "metrics.tls.enabled requires service.metricsPort to be non-zero" -}}
+{{- end -}}
+{{- if and (get $metricsTls "requireClientCert") (not (get $metricsTls "clientCaSecretName")) -}}
+{{- fail "metrics.tls.requireClientCert requires metrics.tls.clientCaSecretName" -}}
+{{- end -}}
+{{- $metricsTlsConfig := get $config "openshell.gateway.metrics_tls" | default dict -}}
+{{- $_ := set $metricsTlsConfig "cert_path" "/etc/openshell-metrics/server/tls.crt" -}}
+{{- $_ := set $metricsTlsConfig "key_path" "/etc/openshell-metrics/server/tls.key" -}}
+{{- if get $metricsTls "clientCaSecretName" -}}
+{{- $_ := set $metricsTlsConfig "client_ca_path" "/etc/openshell-metrics/client-ca/ca.crt" -}}
+{{- else -}}
+{{- $_ := unset $metricsTlsConfig "client_ca_path" -}}
+{{- end -}}
+{{- $_ := set $metricsTlsConfig "require_client_auth" (get $metricsTls "requireClientCert") -}}
+{{- $_ := set $config "openshell.gateway.metrics_tls" $metricsTlsConfig -}}
+{{- else -}}
+{{- $_ := unset $config "openshell.gateway.metrics_tls" -}}
+>>>>>>> 9c53b03f6 (feat(helm): configure metrics TLS with operator Secrets)
+{{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}
 {{- range $tableName := keys $config | sortAlpha -}}
