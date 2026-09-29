@@ -32,6 +32,9 @@
 #   openshell-supervisor-relay kills the server directly and exits
 #   driver also kills wxc-exec as a backstop regardless
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe.  Patched at runtime by run-ws-agent-test.ps1.
 # Leave commented for mock-mode smoke tests (pass -Mock to the script).

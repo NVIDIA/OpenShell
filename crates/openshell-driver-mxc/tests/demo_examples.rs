@@ -39,6 +39,24 @@ fn read_example(name: &str) -> String {
 }
 
 #[test]
+fn shipped_audit_and_websocket_configs_use_current_schema() {
+    for name in ["mxc-ocsf-audit.toml", "mxc-ws-gateway.toml"] {
+        let source = read_example(name);
+        let parsed: Value = toml::from_str(&source)
+            .unwrap_or_else(|error| panic!("failed to parse {name}: {error}"));
+        let openshell = parsed
+            .get("openshell")
+            .and_then(Value::as_table)
+            .unwrap_or_else(|| panic!("{name} is missing [openshell]"));
+        assert_eq!(
+            openshell.get("version").and_then(Value::as_integer),
+            Some(2),
+            "{name} must use schema version 2"
+        );
+    }
+}
+
+#[test]
 fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
