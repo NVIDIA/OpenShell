@@ -40,11 +40,11 @@ process exit, or `--restart-policy always` to replace it after every exit:
 openshell sandbox create --name worker --detach --restart-policy on-failure -- ./worker
 ```
 
-The default policy is `never`. The gateway waits 10 seconds before the first
-replacement, doubles the delay after consecutive failures up to 5 minutes, and
-resets the count after the main process runs for 10 minutes. A replacement
-starts a new supervisor and main process. It retains the sandbox identity and
-configuration; filesystem persistence follows the compute driver's stop and
+The default policy is `never`. The gateway starts the first replacement as soon
+as terminal output has been delivered. Repeated quick exits wait 1 second, then
+double the delay up to 3 minutes. Running for 10 seconds resets the delay. A
+replacement starts a new supervisor and main process. It retains the sandbox
+identity and configuration; filesystem persistence follows the compute driver's stop and
 start behavior. It does not restore process memory or terminal history.
 
 Detached commands have no attachment grace period. When the command exits,

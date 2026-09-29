@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;
@@ -322,10 +322,12 @@ const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 /// Restart intents live in sandbox rows. A lightweight holder-only scan makes
 /// cross-replica writes and lost wakeups recover without changing the general
 /// backend reconciliation cadence.
-const RESTART_SCAN_INTERVAL: Duration = Duration::from_secs(1);
-const RESTART_INITIAL_DELAY_MS: i64 = 10_000;
-const RESTART_MAX_DELAY_MS: i64 = 300_000;
-const RESTART_STABILITY_WINDOW_MS: i64 = 600_000;
+const RESTART_SCAN_INTERVAL: Duration = Duration::from_millis(500);
+const RESTART_BACKOFF_BASE_DELAY_MS: i64 = 1_000;
+const RESTART_MAX_DELAY_MS: i64 = 180_000;
+const RESTART_STABILITY_WINDOW_MS: i64 = 10_000;
+const RESTART_DRIVER_RETRY_DELAY_MS: i64 = 10_000;
+const RESTART_TERMINAL_DELIVERY_GRACE_MS: i64 = 10_000;
 const RESTART_READINESS_TIMEOUT_MS: i64 = 120_000;
 
 /// How long a sandbox can remain provisioning in the store without a
@@ -654,6 +656,7 @@ pub struct ComputeRuntime {
     rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
     restart_authority:
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
+    restart_notify: Arc<Notify>,
 }
 
 pub struct SandboxSyncGuard {
@@ -750,6 +753,7 @@ impl ComputeRuntime {
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
+            restart_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -3609,6 +3613,7 @@ impl ComputeRuntime {
             }
             tokio::select! {
                 () = tokio::time::sleep(RESTART_SCAN_INTERVAL) => {}
+                () = self.restart_notify.notified() => {}
                 _ = cancel.changed() => return,
             }
         }
@@ -3634,9 +3639,10 @@ impl ComputeRuntime {
                 };
                 let phase =
                     SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                let due = sandbox.status.as_ref().is_some_and(|status| {
-                    next_restart_at_ms(status) == 0 || next_restart_at_ms(status) <= now_ms
-                });
+                let due = sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| restart_is_due(status, now_ms));
                 if phase == SandboxPhase::Starting
                     && is_automatic_restart_transition(&sandbox)
                     && due
@@ -3671,9 +3677,10 @@ impl ComputeRuntime {
         };
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
         let now_ms = openshell_core::time::now_ms();
-        let due = current.status.as_ref().is_some_and(|status| {
-            next_restart_at_ms(status) == 0 || next_restart_at_ms(status) <= now_ms
-        });
+        let due = current
+            .status
+            .as_ref()
+            .is_some_and(|status| restart_is_due(status, now_ms));
         if phase != SandboxPhase::Starting || !is_automatic_restart_transition(&current) || !due {
             return Ok(());
         }
@@ -3998,7 +4005,10 @@ impl ComputeRuntime {
                     } else {
                         set_next_restart_at_ms(
                             status,
-                            now_ms.saturating_add(restart_delay_ms(status.restart_count.max(1))),
+                            now_ms.saturating_add(
+                                restart_delay_ms(status.restart_count.max(1))
+                                    .max(RESTART_DRIVER_RETRY_DELAY_MS),
+                            ),
                         );
                     }
                     upsert_ready_condition(
@@ -4689,6 +4699,27 @@ impl ComputeRuntime {
         {
             return Err("main-process instance does not match the terminal result".to_string());
         }
+        if is_terminal_delivery_pending(status) {
+            let restart_count = status.restart_count;
+            let delay_ms = restart_delay_ms(restart_count);
+            let updated = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    sandbox_resource_version(&sandbox),
+                    |sandbox| {
+                        upsert_ready_condition(
+                            &mut sandbox.status,
+                            restart_ready_condition(restart_count, delay_ms),
+                        );
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            self.sandbox_index.update_from_sandbox(&updated);
+            self.sandbox_watch_bus.notify(sandbox_id);
+            self.restart_notify.notify_one();
+        }
         Ok(())
     }
 
@@ -5340,10 +5371,60 @@ fn is_automatic_restart_transition(sandbox: &Sandbox) -> bool {
 }
 
 fn restart_delay_ms(restart_count: u32) -> i64 {
-    let shift = restart_count.saturating_sub(1).min(31);
-    RESTART_INITIAL_DELAY_MS
+    if restart_count <= 1 {
+        return 0;
+    }
+    let shift = restart_count.saturating_sub(2).min(31);
+    RESTART_BACKOFF_BASE_DELAY_MS
         .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
         .min(RESTART_MAX_DELAY_MS)
+}
+
+fn is_terminal_delivery_pending(status: &SandboxStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.r#type == "Ready" && condition.reason == "MainProcessExitDraining"
+    })
+}
+
+fn restart_is_due(status: &SandboxStatus, now_ms: i64) -> bool {
+    let deadline_ms = next_restart_at_ms(status);
+    if deadline_ms > now_ms {
+        return false;
+    }
+    if !is_terminal_delivery_pending(status) {
+        return true;
+    }
+    let exit_time_ms = deadline_ms.saturating_sub(restart_delay_ms(status.restart_count));
+    now_ms >= exit_time_ms.saturating_add(RESTART_TERMINAL_DELIVERY_GRACE_MS)
+}
+
+fn restart_ready_condition(restart_count: u32, delay_ms: i64) -> SandboxCondition {
+    let (reason, message) = if delay_ms == 0 {
+        (
+            "MainProcessRestartScheduled",
+            format!("Canonical main process exited; restart {restart_count} scheduled immediately"),
+        )
+    } else {
+        let delay_seconds = delay_ms / 1_000;
+        let delay_unit = if delay_seconds == 1 {
+            "second"
+        } else {
+            "seconds"
+        };
+        (
+            "MainProcessRestartBackoff",
+            format!(
+                "Canonical main process exited; restart {restart_count} scheduled in {delay_seconds} {delay_unit}"
+            ),
+        )
+    };
+    SandboxCondition {
+        r#type: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: reason.to_string(),
+        message,
+        transition_time: None,
+    }
 }
 
 fn next_restart_at_ms(status: &SandboxStatus) -> i64 {
@@ -5400,18 +5481,14 @@ fn apply_main_process_restart(
     status.exit_code = Some(exit_code);
     set_main_process_started_at_ms(status, 0);
     set_next_restart_at_ms(status, now_ms.saturating_add(delay_ms));
-    let restart_count = status.restart_count;
     upsert_ready_condition(
         &mut sandbox.status,
         SandboxCondition {
             r#type: "Ready".to_string(),
             status: "False".to_string(),
-            reason: "MainProcessRestartBackoff".to_string(),
-            message: format!(
-                "Canonical main process exited; restart {} scheduled in {} seconds",
-                restart_count,
-                delay_ms / 1000
-            ),
+            reason: "MainProcessExitDraining".to_string(),
+            message: "Canonical main process exited; waiting for terminal delivery before restart"
+                .to_string(),
             transition_time: None,
         },
     );
@@ -6821,6 +6898,7 @@ pub fn new_test_runtime_with_driver(
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
+        restart_notify: Arc::new(Notify::new()),
     }
 }
 
@@ -7869,6 +7947,7 @@ mod tests {
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
+            restart_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -8550,14 +8629,41 @@ mod tests {
     }
 
     #[test]
-    fn restart_backoff_matches_kubernetes_defaults_and_cap() {
-        assert_eq!(restart_delay_ms(1), 10_000);
-        assert_eq!(restart_delay_ms(2), 20_000);
-        assert_eq!(restart_delay_ms(3), 40_000);
-        assert_eq!(restart_delay_ms(4), 80_000);
-        assert_eq!(restart_delay_ms(5), 160_000);
-        assert_eq!(restart_delay_ms(6), 300_000);
-        assert_eq!(restart_delay_ms(20), 300_000);
+    fn restart_backoff_starts_after_first_exit_and_caps_at_three_minutes() {
+        assert_eq!(restart_delay_ms(0), 0);
+        assert_eq!(restart_delay_ms(1), 0);
+        assert_eq!(restart_delay_ms(2), 1_000);
+        assert_eq!(restart_delay_ms(3), 2_000);
+        assert_eq!(restart_delay_ms(4), 4_000);
+        assert_eq!(restart_delay_ms(8), 64_000);
+        assert_eq!(restart_delay_ms(9), 128_000);
+        assert_eq!(restart_delay_ms(10), 180_000);
+        assert_eq!(restart_delay_ms(20), 180_000);
+    }
+
+    #[test]
+    fn unfinished_terminal_delivery_gets_bounded_restart_fallback() {
+        let now_ms = openshell_core::time::now_ms();
+        let status = SandboxStatus {
+            restart_count: 2,
+            next_restart_time: restart_timestamp(now_ms + restart_delay_ms(2)),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".into(),
+                reason: "MainProcessExitDraining".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!restart_is_due(&status, now_ms + restart_delay_ms(2)));
+        assert!(!restart_is_due(
+            &status,
+            now_ms + RESTART_TERMINAL_DELIVERY_GRACE_MS - 1
+        ));
+        assert!(restart_is_due(
+            &status,
+            now_ms + RESTART_TERMINAL_DELIVERY_GRACE_MS
+        ));
     }
 
     #[tokio::test]
@@ -8576,6 +8682,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
+        let before_exit_ms = openshell_core::time::now_ms();
         runtime
             .main_process_exited("sb-1", "instance-1", 0)
             .await
@@ -8595,7 +8702,42 @@ mod tests {
         let status = restarting.status.unwrap();
         assert_eq!(status.restart_count, 1);
         assert_eq!(status.exit_code, Some(0));
-        assert!(next_restart_at_ms(&status) > openshell_core::time::now_ms());
+        assert!(next_restart_at_ms(&status) >= before_exit_ms);
+        assert!(next_restart_at_ms(&status) <= openshell_core::time::now_ms());
+        assert!(!restart_is_due(&status, openshell_core::time::now_ms()));
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason == "MainProcessExitDraining"
+        }));
+
+        runtime
+            .finalize_main_process_exit("sb-1", "instance-1")
+            .await
+            .unwrap();
+        let finalized = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let status = finalized.status.unwrap();
+        assert!(restart_is_due(&status, openshell_core::time::now_ms()));
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .find(|condition| condition.r#type == "Ready")
+                .map(|condition| condition.message.as_str()),
+            Some("Canonical main process exited; restart 1 scheduled immediately")
+        );
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason == "MainProcessRestartScheduled"
+        }));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.restart_notify.notified(),
+        )
+        .await
+        .expect("finalized restart should wake the local restart worker");
 
         runtime
             .supervisor_session_connected("sb-1", "instance-2")
@@ -8763,10 +8905,24 @@ mod tests {
 
         let status = sandbox.status.unwrap();
         assert_eq!(status.restart_count, 1);
-        assert_eq!(
-            next_restart_at_ms(&status),
-            now_ms + RESTART_INITIAL_DELAY_MS
-        );
+        assert_eq!(next_restart_at_ms(&status), now_ms);
+    }
+
+    #[test]
+    fn short_main_run_keeps_restart_backoff_count() {
+        let now_ms = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            restart_count: 5,
+            main_process_started_time: restart_timestamp(now_ms - RESTART_STABILITY_WINDOW_MS + 1),
+            ..Default::default()
+        });
+
+        apply_main_process_restart(&mut sandbox, "instance-6", 9, now_ms);
+
+        let status = sandbox.status.unwrap();
+        assert_eq!(status.restart_count, 6);
+        assert_eq!(next_restart_at_ms(&status), now_ms + 16_000);
     }
 
     #[tokio::test]
@@ -8961,12 +9117,13 @@ mod tests {
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Starting as i32,
             exit_code: Some(9),
-            restart_count: 2,
+            restart_count: 1,
             next_restart_time: restart_timestamp(openshell_core::time::now_ms() - 1),
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
+        let before_failure_ms = openshell_core::time::now_ms();
         let error = runtime.restart_sandbox_runtime("sb-1").await.unwrap_err();
 
         assert!(error.contains("transport unavailable"));
@@ -8978,7 +9135,10 @@ mod tests {
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
         let status = stored.status.unwrap();
-        assert!(next_restart_at_ms(&status) > openshell_core::time::now_ms());
+        assert!(
+            next_restart_at_ms(&status)
+                >= before_failure_ms.saturating_add(RESTART_DRIVER_RETRY_DELAY_MS)
+        );
         assert!(status.conditions.iter().any(|condition| {
             condition.r#type == "Ready" && condition.reason == "SandboxRestartFailed"
         }));
