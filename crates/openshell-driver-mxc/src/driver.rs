@@ -2618,9 +2618,11 @@ mod lifecycle_tests {
     }
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
-        let shell =
-            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
-        driver_sandbox_with_command(id, "", vec![shell, "/c".into(), "exit 0".into()])
+        driver_sandbox_with_command(id, "", vec![inbox_cmd(), "/c".into(), "exit 0".into()])
+    }
+
+    fn inbox_cmd() -> String {
+        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
     }
 
     fn inbox_powershell() -> String {
@@ -3474,10 +3476,10 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            inbox_powershell(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{hello}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
@@ -3492,18 +3494,6 @@ mod lifecycle_tests {
         .await;
         assert!(ready.is_some(), "sandbox should self-report Ready=True");
 
-        // Positive proof: the in-policy write materializes the host artifact.
-        let host_path = tmp.path().join("hello.txt");
-        let mut found = false;
-        for _ in 0..100 {
-            if host_path.exists() {
-                found = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(found, "hello.txt should appear in the granted share folder");
-
         // A successful one-shot agent (exit 0) must STAY Ready, not demote to
         // Error. Assert the terminal condition is Ready=True/AgentCompleted so the
         // positive demo shows a green Ready phase, not a red Error.
@@ -3514,6 +3504,10 @@ mod lifecycle_tests {
         assert!(
             completed.is_some(),
             "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
+        );
+        assert!(
+            tmp.path().join("hello.txt").is_file(),
+            "hello.txt should appear in the granted share folder"
         );
         assert!(
             !backend
@@ -3535,10 +3529,10 @@ mod lifecycle_tests {
         let share = tmp.path().to_string_lossy().replace('\\', "/");
         let hello = format!("{share}/hello.txt");
         let cmd = vec![
-            inbox_powershell(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{hello}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
@@ -3563,17 +3557,16 @@ mod lifecycle_tests {
         assert_eq!(recorded["ui"]["clipboard"], "none");
         assert_eq!(recorded["ui"]["injection"], false);
 
-        let host_path = tmp.path().join("hello.txt");
-        let mut found = false;
-        for _ in 0..100 {
-            if host_path.exists() {
-                found = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let completed = wait_for(&backend, "sb-pc", |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentCompleted")
+        })
+        .await;
         assert!(
-            found,
+            completed.is_some(),
+            "processContainer sandbox should report AgentCompleted"
+        );
+        assert!(
+            tmp.path().join("hello.txt").is_file(),
             "in-policy write should materialize under processContainer"
         );
     }
@@ -3894,10 +3887,10 @@ mod lifecycle_tests {
             out_tmp.path().to_string_lossy().replace('\\', "/")
         );
         let cmd = vec![
-            inbox_powershell(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {out_path} -Value hi"),
+            inbox_cmd(),
+            "/d".into(),
+            "/c".into(),
+            format!(r#"echo hi>"{out_path}""#),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
