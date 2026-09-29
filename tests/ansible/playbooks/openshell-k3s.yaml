@@ -56,6 +56,37 @@
         dest: /var/lib/openshell/artifacts/helm-chart.tgz
         mode: "0600"
 
+    - name: Write OpenShell Helm values
+      ansible.builtin.copy:
+        dest: /var/lib/openshell/artifacts/values.yaml
+        mode: "0600"
+        content: |
+          global:
+            image:
+              registry: ""
+          gateway:
+            image:
+              repository: openshell/gateway
+              tag: tmachine
+              pullPolicy: Never
+          sandboxRuntime:
+            image:
+              repository: openshell/sandbox
+              tag: tmachine
+              pullPolicy: never
+          supervisor:
+            image:
+              repository: openshell/supervisor
+              tag: tmachine
+              pullPolicy: never
+          networkPolicy:
+            enabled: true
+          server:
+            auth:
+              allowUnauthenticatedUsers: true
+            disableTls: true
+            telemetryEnabled: false
+
     - name: Install Agent Sandbox
       ansible.builtin.command:
         argv:
@@ -99,34 +130,8 @@
           - --namespace
           - openshell
           - --create-namespace
-          - --set
-          - global.image.registry=
-          - --set
-          - gateway.image.repository=openshell/gateway
-          - --set
-          - gateway.image.tag=tmachine
-          - --set
-          - gateway.image.pullPolicy=Never
-          - --set
-          - sandboxRuntime.image.repository=openshell/sandbox
-          - --set
-          - sandboxRuntime.image.tag=tmachine
-          - --set
-          - sandboxRuntime.image.pullPolicy=never
-          - --set
-          - supervisor.image.repository=openshell/supervisor
-          - --set
-          - supervisor.image.tag=tmachine
-          - --set
-          - supervisor.image.pullPolicy=never
-          - --set
-          - networkPolicy.enabled=true
-          - --set
-          - server.auth.allowUnauthenticatedUsers=true
-          - --set
-          - server.disableTls=true
-          - --set
-          - server.telemetryEnabled=false
+          - --values
+          - /var/lib/openshell/artifacts/values.yaml
           - --wait
           - --timeout=5m
       environment:
