@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install K3s and Helm
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    helm_version: 4.2.0
+    k3s_version: 1.36.3+k3s1
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install download prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Download K3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/install-k3s.sh
+        mode: "0755"
+
+    - name: Install K3s
+      ansible.builtin.command:
+        argv:
+          - /tmp/install-k3s.sh
+          - server
+          - --disable=servicelb
+          - --disable=traefik
+        creates: /usr/local/bin/k3s
+      environment:
+        INSTALL_K3S_VERSION: "v{{ k3s_version }}"
+
+    - name: Wait for K3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - wait
+          - --for=condition=Ready
+          - node
+          - --all
+          - --timeout=120s
+      changed_when: false
+
+    - name: Download Helm installer
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+        dest: /tmp/install-helm.sh
+        mode: "0755"
+
+    - name: Install Helm
+      ansible.builtin.command:
+        argv:
+          - /tmp/install-helm.sh
+        creates: /usr/local/bin/helm
+      environment:
+        DESIRED_VERSION: "v{{ helm_version }}"

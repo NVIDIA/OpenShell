@@ -44,6 +44,17 @@ let
         };
       }
       {
+        name = "ubuntu-k3s";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = false;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/k3s.yaml"
+          ];
+        };
+      }
+      {
         name = "fedora-podman-rootful";
         machine = "fedora";
         setup = {
@@ -70,6 +81,19 @@ let
     ];
 
     installers = [
+      {
+        name = "k3s";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        inputs = {
+          agent_sandbox_version = "0.5.0";
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        };
+      }
       {
         name = "none";
         use_galaxy = false;
