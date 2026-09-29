@@ -97,6 +97,8 @@ pub struct GatewayFileSection {
     pub health_bind_address: Option<SocketAddr>,
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub metrics_tls: Option<MetricsTlsFileConfig>,
 
     // ── Logging ──────────────────────────────────────────────────────────
     #[serde(default)]
@@ -272,6 +274,21 @@ impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
                 .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
         })
     }
+}
+/// TLS fields for the dedicated metrics listener.
+///
+/// This is separate from [`GatewayTlsFileConfig`] so metrics clients can
+/// trust a dedicated client CA and cannot inherit the gateway listener's
+/// wider certificate and SNI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsTlsFileConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+    #[serde(default)]
+    pub require_client_auth: bool,
 }
 /// `[openshell.gateway.otlp]` section.
 ///
