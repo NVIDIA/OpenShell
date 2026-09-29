@@ -1,6 +1,6 @@
 ---
 name: build-from-issue
-description: Given a GitHub issue number, plan and implement the work described in the issue. Supports direct user requests and unattended queue processing through the `agent:*` workflow labels. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
+description: Given a GitHub issue number, plan and implement the work described in the issue. Supports direct user requests and unattended queue processing through the three-axis workflow labels. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
 metadata:
   internal: true
 ---
@@ -20,16 +20,16 @@ This skill operates as a stateful workflow — it can be run repeatedly against 
 
 This skill supports two invocation modes:
 
-- **Direct mode:** A user explicitly asks the agent to plan or implement a specific issue. The request itself authorizes the requested phase; the corresponding `agent:*` request label is not required.
-- **Queue mode:** An always-on or unattended agent scans for work without a live user directing it to a specific issue. In this mode, `agent:plan-requested` authorizes planning and `agent:implementation-requested` authorizes implementation.
+- **Direct mode:** A user explicitly asks the agent to plan or implement a specific issue. The request itself authorizes the requested phase; queue labels are not required.
+- **Queue mode:** An unattended agent scans for work without a live user directing it. Planning requires acceptance or roadmap placement, an active pickup state, and human-applied `needs:plan`. Implementation requires an active pickup state, `needs:pr`, and an approved plan. Run `uv run --no-project python scripts/workflow_gate.py --issue <id> --phase plan|implement` before either queued phase; stop if it denies the phase.
 
 A direct request authorizes only what it says. A request to review or plan does not authorize implementation. A request to build, implement, or work on an issue authorizes both the planning needed to perform the work and implementation unless the user asks to stop after planning.
 
-The two request labels remain human-only queue controls. Under **no circumstances** should this skill or any agent apply them, ask to apply them, or suggest automating their application.
+Acceptance, roadmap placement, and queue authorization remain human-only decisions. Under **no circumstances** should this skill apply `state:accepted`, `roadmap`, `needs:plan`, or `needs:pr` to authorize itself.
 
-In direct mode, issue lifecycle and `agent:*` workflow labels are advisory rather than gates. Inspect the labels and warn the user about each expected label that is missing or any lifecycle label that indicates the normal workflow is incomplete, then continue with the requested phase. Do not ask the user to fix the labels first. A direct request does not change the issue's disposition or make the labels accurate; it only authorizes the requested work.
+In direct mode, run the gate with `--direct` to report queue discrepancies, then warn the user about the missing or contradictory labels and continue with the requested phase. Do not ask the user to fix the labels first. A direct request does not change the issue's disposition or make the labels accurate; it only authorizes the requested work. The gate still blocks `topic:security` from this general build skill.
 
-If direct work begins on an issue that was not already in the label-driven workflow, do not introduce `agent:in-progress` or `agent:pr-opened` solely for that invocation. If a matching request label is present, preserve the existing label transitions so unattended agents can track the workflow.
+If direct work begins on an issue that was not already in the label-driven workflow, do not introduce workflow labels solely for that invocation. For queued work, transition `state:*` as described below without adding acceptance or authorization labels.
 
 ## Agent Comment Markers
 
@@ -63,16 +63,16 @@ Fetch issue + comments
   ├─ topic:security present?
   │   → Route to review-security-issue or fix-security-issue; STOP
   │
-  ├─ Direct mode + expected lifecycle or agent-workflow labels missing/incomplete?
+  ├─ Direct mode + expected workflow labels missing/incomplete?
   │   → Warn which labels are missing or incomplete; continue with the requested phase
   │
   ├─ Queue mode + triage incomplete, awaiting information, or awaiting human disposition?
   │   → Report the blocking state and STOP
   │
-  ├─ No plan comment and no direct planning request and agent:plan-requested absent?
+  ├─ No plan comment and no direct planning request and queue planning gate denied?
   │   → No request for agent planning; STOP
   │
-  ├─ No plan comment + direct planning request or agent:plan-requested present?
+  ├─ No plan comment + direct planning request or queue planning gate passed?
   │   → Generate plan via principal-engineer-reviewer
   │   → Post plan comment
   │   → Advance labels only for a label-driven invocation
@@ -83,20 +83,18 @@ Fetch issue + comments
   │   → Update the plan comment if feedback requires plan changes
   │   → STOP
   │
-  ├─ Plan exists + direct implementation request or 'agent:implementation-requested' label?
+  ├─ 'state:in-review' and 'needs:pr' labels present?
+  │   → Check for an existing PR; link to it and STOP if found
+  │
+  ├─ 'state:in-progress' + 'needs:pr' present?
+  │   → Confirm queue authorization or direct request, then resume the existing branch
+  │
+  ├─ Plan exists + direct implementation request or queue implementation gate passed?
   │   → Run scope check (warn if high complexity)
   │   → Check for conflicting branches/PRs
   │   → BUILD (Steps 6–14)
   │
-  ├─ 'agent:in-progress' label present?
-  │   → Detect existing branch and resume if possible
-  │   → Otherwise report current state
-  │
-  ├─ 'agent:pr-opened' label present?
-  │   → Report that PR already exists, link to it
-  │   → STOP
-  │
-  └─ Plan exists + no new comments + neither a direct implementation request nor 'agent:implementation-requested'?
+  └─ Plan exists + no new comments + neither a direct implementation request nor queue authorization?
       → Report: "Plan is posted and awaiting review. No new comments to address."
       → STOP
 ```
@@ -113,15 +111,15 @@ If the issue is closed, report that and stop.
 
 If `topic:security` is present, stop. General build agents must not plan or implement security issues. Route planning/review to `review-security-issue` and authorized remediation to `fix-security-issue`.
 
-In queue mode, stop before planning on `state:triage-needed` or `state:needs-info`, and stop on `state:validated` without roadmap placement. Require `state:accepted` or roadmap placement before queue work proceeds. If no plan exists, require `agent:plan-requested`; require `agent:implementation-requested` before queue-mode implementation.
+In queue mode, run the gate for the intended phase. `state:new` calls for screening only. `needs:info` or `state:in-review` blocks unattended build work. A plan request never authorizes implementation. After reviewing the plan, the human records approval by changing `needs:plan` to `needs:pr` and returning the issue to `state:accepted` or `state:in-progress`.
 
 In direct mode, inspect the same expected workflow state but do not stop because a lifecycle or agent-workflow label is absent or incomplete. Before continuing, warn the user with the specific discrepancy, for example:
 
-> "Issue #42 is missing `state:accepted` or roadmap placement and `agent:implementation-requested`. Those labels are expected in the queued workflow, but your direct request authorizes implementation, so I am continuing without changing them."
+> "Issue #42 is missing `state:accepted` or roadmap placement and `needs:pr`. Those are expected for queued implementation, but your direct request authorizes this phase, so I am continuing without changing them."
 
-If `state:triage-needed`, `state:needs-info`, or `state:validated` is present, name that state in the warning and explain what it normally means. Continue unless the issue lacks information that is actually necessary to perform the requested work; in that case, report the concrete missing information rather than treating the label itself as the blocker.
+If `state:new`, `needs:info`, or `state:validated` is present, name it in the warning and explain what it normally means. Continue unless the issue lacks information actually needed to perform the requested work; report that concrete blocker rather than treating the label itself as the blocker.
 
-Never add or remove `state:accepted`, either human request label, or the `roadmap` label.
+Never add `state:accepted`, `needs:plan`, or `needs:pr` to queue yourself, and never change roadmap placement. A human applies the phase-specific `needs:*` label to queue work. An agent may replace `state:accepted` with an active state after authorization and moves the issue to `state:in-review` at handoff.
 
 ## Step 2: Fetch and Classify Comments
 
@@ -146,7 +144,7 @@ Using the state machine above, determine what to do based on:
 1. Whether a plan comment exists
 2. Whether there are human comments newer than the last agent comment (plan or conversation)
 3. Whether this is direct mode and which phase the user requested
-4. Which lifecycle and agent-workflow labels are present (`state:*`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, and `agent:pr-opened`) and which discrepancies require a direct-mode warning
+4. Which `state:*` and `needs:*` labels are present; whether a human recorded acceptance or roadmap placement; and which discrepancies require a direct-mode warning
 
 Follow the appropriate branch below.
 
@@ -154,7 +152,7 @@ Follow the appropriate branch below.
 
 ## Branch A: Generate the Plan
 
-If no plan comment exists, generate one when the user directly requested planning or implementation, or when `agent:plan-requested` is present. Otherwise report that no one has requested agent planning and stop.
+If no plan comment exists, generate one when the user directly requested planning or implementation, or when the queued planning gate passes. Otherwise report that no one has authorized agent planning and stop.
 
 ### A1: Analyze the Issue with Principal Engineer Reviewer
 
@@ -228,13 +226,13 @@ EOF
 
 ### A3: Mark the Plan Ready in Queue Mode
 
-If `agent:plan-requested` was present, replace it with `agent:plan-ready`. Do not add `agent:plan-ready` for a direct invocation that was not already using the label workflow.
+If the queued planning gate passed, move the issue to `state:in-review` and keep `needs:plan`. Do not change workflow labels for an unlabeled direct invocation.
 
 ```bash
-gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"
+gh issue edit <id> --remove-label "state:accepted" --remove-label "state:validated" --remove-label "state:in-progress" --add-label "state:in-review"
 ```
 
-If the direct request authorized implementation, continue to Branch C. Otherwise report that the plan has been posted and stop. In queue mode, a human reviews the plan and applies `agent:implementation-requested` before an unattended agent can build.
+If the direct request authorized implementation, continue to Branch C. Otherwise report that the plan has been posted and stop. In queue mode, a human reviews the plan, replaces `needs:plan` with `needs:pr`, and returns the issue to an active pickup state before an unattended agent can build. Only the human may perform that authorization transition.
 
 ---
 
@@ -302,7 +300,7 @@ Report to the user what feedback was addressed and whether the plan was updated.
 
 ## Branch C: Build
 
-Proceed with implementation when the plan exists and either the user directly requested implementation or `agent:implementation-requested` is present. An existing `agent:in-progress` or `agent:pr-opened` label still triggers the resume or existing-PR checks below.
+Proceed with implementation when the plan exists and either the user directly requested implementation or the queue implementation gate passes. Existing `state:in-progress` or `state:in-review` with `needs:pr` still triggers the resume or existing-PR checks below.
 
 ### Step 4: Scope Check
 
@@ -312,7 +310,7 @@ Read the plan comment and check the **Complexity** and **Confidence** fields.
 
   > "This issue is rated High complexity / Low confidence. The plan includes open questions that may need human decisions during implementation. Proceeding, but flagging this for your awareness."
 
-  Continue — do not hard-stop. The user directly requested implementation or chose to apply `agent:implementation-requested`.
+  Continue — do not hard-stop. The user directly requested implementation or a human queued it with `needs:pr` in an active pickup state.
 
 ### Step 5: Conflict Detection
 
@@ -359,10 +357,10 @@ git checkout -b <prefix><issue-id>-<short-description>/$USERNAME
 
 ### Step 7: Mark Queue Work In Progress
 
-If `agent:implementation-requested` is present, replace it and `agent:plan-ready` with `agent:in-progress`. In direct mode without a request label, do not add an agent-workflow label.
+If the queued implementation gate passed, move to `state:in-progress`, keeping `needs:pr`. In direct mode without queue authorization, do not add workflow labels.
 
 ```bash
-gh issue edit <id> --remove-label "agent:implementation-requested" --remove-label "agent:plan-ready" --add-label "agent:in-progress"
+gh issue edit <id> --remove-label "state:accepted" --remove-label "state:in-review" --add-label "state:in-progress"
 ```
 
 ### Step 8: Implement the Changes
@@ -629,10 +627,10 @@ Include **every test** that ran (not just the new ones) so the reviewer can see 
 
 #### Update labels
 
-If `agent:in-progress` is present, replace it with `agent:pr-opened`. Do not add `agent:pr-opened` for an unlabeled direct invocation:
+If queued implementation was authorized, move from `state:in-progress` to `state:in-review` and hand off the open PR to a human. Keep `needs:pr` until the PR is accepted. Do not add workflow labels for an unlabeled direct invocation:
 
 ```bash
-gh issue edit <id> --remove-label "agent:in-progress" --add-label "agent:pr-opened"
+gh issue edit <id> --remove-label "state:in-progress" --add-label "state:in-review"
 ```
 
 #### Report workflow run URL
@@ -650,7 +648,7 @@ Report the workflow run URL and suggest the user can use the `watch-github-actio
 
 ## Branch D: Resume In-Progress Build
 
-If the `agent:in-progress` label is present, the skill was previously started but may not have completed.
+If `state:in-progress` and `needs:pr` are present, the skill may have been started but not completed.
 
 1. Check for an existing branch matching the issue ID:
    ```bash
@@ -658,7 +656,7 @@ If the `agent:in-progress` label is present, the skill was previously started bu
    ```
 2. If found, check it out and inspect the state (are there uncommitted changes? committed but not pushed? pushed but no PR?).
 3. Resume from the appropriate step (9, 10, 12, or 13).
-4. If the state is unrecoverable, report to the user and suggest starting fresh. Queue mode requires a human to reapply `agent:implementation-requested`; a new direct implementation request can resume without it.
+4. If the state is unrecoverable, report to the user and suggest starting fresh. Queue mode requires a human to confirm or renew `needs:pr` and the active pickup state; a new direct implementation request can resume without queue labels.
 
 ---
 
@@ -687,12 +685,12 @@ If the `agent:in-progress` label is present, the skill was previously started bu
 User says: "Plan issue #42"
 
 1. Fetch issue #42 — title: "Add pagination to dataset list endpoint"
-2. Notice that `state:accepted` and `agent:plan-requested` are absent; warn that the issue does not match the queued workflow, then continue because the user directly requested planning
+2. Notice that acceptance and `needs:plan` are absent; warn that the issue does not match the queued workflow, then continue because the user directly requested planning
 3. Fetch comments — no `🏗️ build-plan` marker found
 4. Pass issue to `principal-engineer-reviewer` for analysis
 5. Reviewer produces a plan: feat type, Medium complexity, 3 implementation steps, unit + integration tests needed
 6. Post the plan comment with the `🏗️ build-plan` marker
-7. Because this direct invocation was unlabeled, leave the `agent:*` workflow labels unchanged
+7. Because this direct invocation was not queued, leave the workflow labels unchanged
 8. Report to user: "Plan posted on issue #42. Awaiting review."
 
 ### Second run — human left feedback
@@ -719,34 +717,34 @@ User says: "Check issue #42"
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — `state:accepted` is present but `agent:implementation-requested` is absent; warn about the missing queue label and continue because the user directly requested implementation
+1. Fetch issue #42 — `state:accepted` is present but `needs:pr` is absent; warn about the missing queue label and continue because the user directly requested implementation
 2. Plan exists (Revision 2), complexity: Medium, confidence: High
 3. No conflicting branches or PRs
 4. Create branch `feat/42-add-pagination/jmyers`
-5. Leave `agent:*` labels unchanged because this direct invocation was not picked up from the queue
+5. Leave workflow labels unchanged because this direct invocation was not picked up from the queue
 6. Implement pagination for both endpoints per the plan
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise run pre-commit` passes on first attempt
 9. E2E tests skipped (no changes under `e2e/`)
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
-12. No agent-workflow label transition is needed
+12. No issue workflow label transition is needed
 13. Report PR URL and workflow run status to user
 
 ### Run directly on an issue outside the workflow state machine
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — it has `state:triage-needed`; neither `state:accepted` nor `agent:implementation-requested` is present
-2. Warn that triage and acceptance are incomplete and name the missing implementation request label
+1. Fetch issue #42 — it has `state:new` for screening; neither acceptance nor `needs:pr` is present
+2. Warn that screening and acceptance are incomplete and name the missing implementation need
 3. Continue through planning and implementation because the user directly requested the work
-4. Do not add, remove, or reinterpret lifecycle or agent-workflow labels
+4. Do not add, remove, or reinterpret issue workflow labels
 
 ### Run on issue with existing PR
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — `agent:pr-opened` label present
+1. Fetch issue #42 — `state:in-review` and `needs:pr` are present
 2. Find existing PR #789 linked to the issue
 3. Report: "PR [#789](...) already exists for issue #42. Nothing to build."
 

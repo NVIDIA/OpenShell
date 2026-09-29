@@ -121,12 +121,13 @@ gh label list --limit 100
 
 Based on the investigation results, select appropriate labels:
 
-- **Do not add issue type labels** — GitHub built-in issue types come from issue templates or manual follow-up, not labels
+- **Add one `type:*` label** when the investigation establishes bug, feature, chore, or spike work. GitHub's built-in issue type is separate metadata; Conventional Commit types do not determine this label.
 - **Include area labels** if they exist in the repo (e.g., `area:sandbox`, `area:proxy`, `area:policy`, `area:cli`)
 - **Do not invent labels** — only use labels that already exist in the repo
 - **Add `state:validated` only when the evidence is sufficient for human disposition** — the spike established a coherent problem or proposal and completed the factual assessment needed for a human yes/no decision
-- **Add `state:needs-info` instead when material evidence is missing** — identify the exact evidence, reproduction details, or decision input still needed in the issue body
-- **Never add `state:accepted`, an `agent:*` label, or the `roadmap` label** — acceptance, roadmap placement, and requests for agent work require a human decision
+- **Use `state:new` with `needs:info` when material evidence is missing** — identify the exact evidence, reproduction details, or decision input still needed in the issue body
+- **Leave the issue for human disposition** or an information request. Do not queue an agent for further work on the new issue.
+- **Never add `state:accepted`, `needs:plan`, `needs:pr`, or the `roadmap` label** — acceptance, roadmap placement, and agent queue authorization require a human decision
 
 ## Step 4: Create the GitHub Issue
 
@@ -135,7 +136,8 @@ Create the issue with a structured body containing both the stakeholder-readable
 ```bash
 gh issue create \
   --title "<type>: <concise description of the problem/feature>" \
-  --label "<area:component>" --label "<state:validated|state:needs-info>" \
+  --label "<area:component>" --label "<type:bug|type:feature|type:chore|type:spike>" \
+  --label "<state:validated|state:new>" \
   --body "$(cat <<'EOF'
 ## Problem Statement
 
@@ -201,7 +203,7 @@ gh issue create \
 
 ## Disposition Readiness
 
-- **State:** `<state:validated|state:needs-info>`
+- **State:** `<state:validated|state:new>`
 - **Assessment:** <why the available evidence is or is not sufficient for a human accept/decline decision>
 - **Missing evidence:** <specific evidence still needed, or "None">
 
@@ -213,10 +215,12 @@ gh issue create \
 - <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 
 ---
-*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. To queue unattended agent planning, a human applies `agent:plan-requested`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them.*
+*Created by spike investigation. `state:validated` means the issue awaits human disposition; `state:new` with `needs:info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. After acceptance, a human may queue planning with `needs:plan`; a direct request authorizes only its stated phase without changing queue labels.*
 EOF
 )"
 ```
+
+Add `--label needs:info` when the chosen state is `state:new` because evidence is missing.
 
 **Do NOT post a follow-up comment on the issue.** All findings must be contained in the issue body itself.
 
@@ -237,11 +241,11 @@ After creating the issue, report:
 
 For `state:validated`:
 
-> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them. If no, close it as not planned and record the rationale.
+> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `needs:plan` in an active pickup state to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them. If no, close it as not planned and record the rationale.
 
-For `state:needs-info`:
+For `state:new` with `needs:info`:
 
-> Collect the missing evidence identified in the issue. Leave it off the roadmap. Once the evidence is sufficient, replace `state:needs-info` with `state:validated` for human disposition.
+> Collect the missing evidence identified in the issue. Leave it off the roadmap. Once the evidence is sufficient, replace `state:new` with `state:validated` and clear `needs:info` for human disposition.
 
 ## Design Principles
 
@@ -255,7 +259,7 @@ For `state:needs-info`:
 
 5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the issue body footer.
 
-6. **Treat validation as an evidence threshold, not an automatic spike outcome.** Apply `state:validated` only when the investigation supports a human accept/decline decision. Otherwise apply `state:needs-info`, state what is missing, and leave the issue off the roadmap.
+6. **Treat validation as an evidence threshold, not an automatic spike outcome.** Apply `state:validated` only when the investigation supports a human accept/decline decision. Otherwise apply `state:new` with `needs:info`, state what is missing, and leave the issue off the roadmap.
 
 ## Useful Commands Reference
 

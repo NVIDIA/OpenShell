@@ -13,7 +13,7 @@ Review an issue that outlines a security, vulnerability, or privacy concern.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
-- The issue must have `topic:security`. In unattended queue mode it must also have `agent:plan-requested`; for a direct user request, warn if that workflow label is missing and continue without changing it.
+- The issue must have `topic:security`. In unattended queue mode it must also have human-applied `needs:plan` in an eligible state; for a direct user request, warn if the queue condition is missing and continue without changing it. Never publish exploit details in a public issue; follow `SECURITY.md` for vulnerability reports.
 
 ## Agent Comment Marker
 
@@ -43,10 +43,10 @@ gh issue view <id> --json title,body,state,labels,author
 
 First, check the issue's labels from the metadata fetched in Step 1.
 
-- **If the issue has `agent:implementation-requested`**, the issue has already been reviewed and a human authorized remediation. There is no review to perform. Suggest using `fix-security-issue` and stop.
+- **If the issue has `needs:pr` in an active pickup state with an approved security review**, a human authorized remediation. Suggest using `fix-security-issue` and stop.
 - **If `topic:security` is missing**, report that this specialized skill only reviews security issues and stop.
-- **If this is queue mode and `agent:plan-requested` is missing**, report that the issue is not ready for unattended pickup and stop.
-- **If the user directly requested review of this issue**, warn that `agent:plan-requested` is missing, then proceed without it. Never add or offer to add the human-only request label.
+- **If this is queue mode**, run `uv run --no-project python scripts/workflow_gate.py --issue <id> --phase plan --security`; report its reasons and stop if it denies the phase. `state:new` calls for intake screening only, never a security review.
+- **If the user directly requested review of this issue**, run the gate with `--direct`, warn about its queue discrepancies, then proceed. Never add or offer to add human-only authorization labels.
 
 Next, fetch existing comments on the issue:
 
@@ -141,13 +141,13 @@ EOF
 
 ## Step 5: Mark the Security Plan Ready
 
-After posting a legitimate-concern review with a remediation plan, replace `agent:plan-requested` with `agent:plan-ready` only when the request label was present:
+After posting a legitimate-concern review with a remediation plan, hand queued work to a human. Keep `needs:plan` until the human approves the remediation plan:
 
 ```bash
-gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"
+gh issue edit <id> --remove-label "state:accepted" --remove-label "state:validated" --add-label "state:in-review"
 ```
 
-This signals that an unattended agent produced a remediation plan that awaits human review. For an unlabeled direct invocation, leave the `agent:*` labels unchanged. A later direct request can authorize remediation without `agent:implementation-requested`; warn that the expected label is missing and continue, while unattended remediation still requires that label. For a not-actionable determination, remove `agent:plan-requested` if present, do not add another `agent:*` label, and report that a human should close the issue or record the risk decision.
+This signals that a remediation plan awaits human review. For an unqueued direct invocation, leave workflow labels unchanged. A later direct request can authorize remediation without queue labels; warn about the discrepancy and continue, while unattended remediation requires a human to apply `needs:pr` and return the issue to an active pickup state after approval. For a not-actionable determination in queue mode, clear `needs:plan`, set `state:validated`, and report that a human should close the issue or record the risk decision.
 
 ## Step 6: Address Follow-up Comments
 
@@ -169,7 +169,7 @@ For each unanswered human comment:
 | `gh issue view <id> --json title,body,state,labels,author` | Fetch full issue metadata as JSON |
 | `gh issue view <id> --json comments --jq '.comments[].body'` | Fetch all comments on an issue |
 | `gh issue comment <id> --body "..."` | Post a comment on an issue |
-| `gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"` | Mark a remediation plan ready for human review |
+| `gh issue edit <id> --add-label "state:in-review"` | Hand a remediation plan to a human for review |
 
 ## Example Usage
 
@@ -182,7 +182,7 @@ User says: "Review security issue #42"
 3. No prior review found -- pass issue to `principal-engineer-reviewer` with security lens
 4. Reviewer determines it's a legitimate XSS vulnerability in the API response handler
 5. Post a comment with severity assessment and remediation plan
-6. If `agent:plan-requested` was present, replace it with `agent:plan-ready`; otherwise leave the direct invocation unlabeled
+6. If queued with `needs:plan`, set `state:in-review` for human review; otherwise leave the direct invocation's labels unchanged
 7. Report the finding and posted comment to the user
 
 ### Re-review with new comments
