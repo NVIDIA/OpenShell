@@ -3772,6 +3772,7 @@ mod tests {
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         let eval = L7EvalContext {
@@ -10224,6 +10225,178 @@ network_policies:
             upstream_response,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn chunked_http_pipeline_authorizes_each_request() {
+        for protocol in ["mcp", "json-rpc", "graphql", "rest"] {
+            for route_selected in [false, true] {
+                for second_allowed in [false, true] {
+                    let rules = match protocol {
+                        "mcp" => "method: tools/call, tool: echo",
+                        "json-rpc" => "method: echo",
+                        "graphql" => "operation_type: query, fields: [echo]",
+                        "rest" => "method: POST, path: /mcp/allowed",
+                        _ => unreachable!(),
+                    };
+                    let endpoint_path = if protocol == "rest" {
+                        "/mcp/**"
+                    } else {
+                        "/mcp"
+                    };
+                    let data = format!(
+                        r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: {endpoint_path}
+        protocol: {protocol}
+        enforcement: enforce
+        rules:
+          - allow: {{ {rules} }}
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"
+                    );
+                    let (config, tunnel_engine, ctx) = mcp_relay_context_from_data(&data);
+                    let body = |id, name| {
+                        match protocol {
+                            "mcp" => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                                "params": {"name": name, "arguments": {}}
+                            }),
+                            "json-rpc" => {
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": name})
+                            }
+                            "graphql" => {
+                                serde_json::json!({"query": format!("query {{ {name} }}")})
+                            }
+                            "rest" => serde_json::json!({"id": id, "value": name}),
+                            _ => unreachable!(),
+                        }
+                        .to_string()
+                    };
+                    let first = body(1, "echo");
+                    let second = body(2, if second_allowed { "echo" } else { "blocked" });
+                    let mut wire = String::new();
+                    for (index, body) in [&first, &second].into_iter().enumerate() {
+                        let target = if protocol == "rest" {
+                            if index == 0 || second_allowed {
+                                "/mcp/allowed"
+                            } else {
+                                "/mcp/blocked"
+                            }
+                        } else {
+                            "/mcp"
+                        };
+                        write!(
+                            wire,
+                            "POST {target} HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+                    let (mut relay_upstream, upstream) = tokio::io::duplex(8192);
+                    // Queue both requests before the relay reads. A normal
+                    // sequential exchange cannot expose chunked read-ahead loss.
+                    app.write_all(wire.as_bytes()).await.unwrap();
+                    app.shutdown().await.unwrap();
+                    let relay = async move {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    };
+                    let server = async move {
+                        let mut upstream = tokio::io::BufReader::new(upstream);
+                        let provider = crate::l7::rest::RestProvider::with_options(
+                            crate::l7::path::CanonicalizeOptions::default(),
+                        );
+                        let mut forwarded = Vec::new();
+                        while let Some(mut request) =
+                            provider.parse_request(&mut upstream).await.unwrap()
+                        {
+                            // REST streams chunked framing; the body inspectors
+                            // normalize the same message to Content-Length.
+                            if protocol == "rest" {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::Chunked
+                                ));
+                            } else {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::ContentLength(_)
+                                ));
+                            }
+                            let body = crate::l7::http::read_body_for_inspection(
+                                &mut upstream,
+                                &mut request,
+                                1024,
+                            )
+                            .await
+                            .unwrap();
+                            forwarded.push(String::from_utf8(body).unwrap());
+                            upstream
+                                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                        forwarded
+                    };
+                    let client = async move {
+                        let mut response = String::new();
+                        app.read_to_string(&mut response).await.unwrap();
+                        response
+                    };
+                    let (result, forwarded, response) = Box::pin(tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async { tokio::join!(relay, server, client) },
+                    ))
+                    .await
+                    .expect("pipelined requests must finish without losing a request");
+                    result.unwrap();
+                    let expected = if second_allowed {
+                        vec![first, second]
+                    } else {
+                        vec![first]
+                    };
+                    assert_eq!(
+                        forwarded, expected,
+                        "{protocol}, route_selected={route_selected}"
+                    );
+                    assert_eq!(
+                        response.matches("HTTP/1.1 204 No Content").count(),
+                        if second_allowed { 2 } else { 1 },
+                        "{response}"
+                    );
+                    assert_eq!(
+                        response.contains("403 Forbidden"),
+                        !second_allowed,
+                        "{response}"
+                    );
+                }
+            }
+        }
     }
 
     async fn run_mcp_relay_case(

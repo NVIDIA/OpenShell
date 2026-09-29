@@ -1327,6 +1327,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         command,
         tty,
         service_exposures,
+        restart_policy,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -1344,6 +1345,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             resource_requirements,
             command,
             tty,
+            restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1634,11 +1636,16 @@ mod tests {
         let request = create_sandbox_request(SandboxSpec {
             command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
             tty: false,
+            restart_policy: crate::types::SandboxRestartPolicy::OnFailure,
             ..SandboxSpec::default()
         });
 
         let spec = request.spec.expect("sandbox spec should be present");
         assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
         assert!(!spec.tty);
+        assert_eq!(
+            spec.restart_policy(),
+            proto::SandboxRestartPolicy::OnFailure
+        );
     }
 }

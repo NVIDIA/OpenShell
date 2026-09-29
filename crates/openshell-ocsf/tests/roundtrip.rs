@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthTypeId,
     BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder, ConnectionInfo,
-    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, EventOrigin, FindingInfo,
     HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
     NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder, RiskLevelId,
     SecurityLevelId, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
@@ -27,6 +27,7 @@ fn ctx() -> EventContext {
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 8888,
+        origin: EventOrigin::Supervisor,
     }
 }
 

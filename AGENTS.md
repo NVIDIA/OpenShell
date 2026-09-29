@@ -80,8 +80,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
-| `architecture/` | Architecture docs | Design decisions and component documentation |
+| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
 
 ## Public API Conventions
 
@@ -110,7 +109,7 @@ design, and schema evolution.
 
 ## Plans
 
-- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
+- Store plan documents in `plans/`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
 - When asked to write a plan, write it there without asking for the location.
 
 ## Sandbox Logging (OCSF)
@@ -264,24 +263,13 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Documentation
 
-- When making changes, update the relevant documentation in the `architecture/` directory.
+- Put crate-specific implementation details in the relevant crate `README.md`, design proposals in `rfc/`, and temporary plans in the ignored `plans/` directory.
 - When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
-
-### Architecture Docs
-
-- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
-- Update one of the existing top-level architecture docs before adding a new file.
-- Put useful crate-specific details in the relevant crate `README.md`.
-- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
-- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
-- Remove stale detail instead of preserving it by default.
-- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
-- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
 
 ## Security
 

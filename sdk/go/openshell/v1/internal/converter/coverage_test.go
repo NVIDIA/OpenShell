@@ -31,6 +31,7 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"restart_policy":        true,
 	}
 
 	// The gateway owns this identity. Provider status exposes it through the
@@ -115,15 +116,18 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"agent_pod":               true,
-		"agent_fd":                true,
-		"sandbox_fd":              true,
-		"phase":                   true,
-		"conditions":              true,
-		"endpoint_statuses":       true,
-		"current_policy_version":  true,
-		"exit_code":               true,
-		"configuration_admission": true,
+		"agent_pod":                 true,
+		"agent_fd":                  true,
+		"sandbox_fd":                true,
+		"phase":                     true,
+		"conditions":                true,
+		"endpoint_statuses":         true,
+		"current_policy_version":    true,
+		"exit_code":                 true,
+		"configuration_admission":   true,
+		"restart_count":             true,
+		"next_restart_time":         true,
+		"main_process_started_time": true,
 	}
 	// The instance ID coordinates internal gateway/supervisor lifecycle
 	// fencing. The first-activation marker governs static policy repair.

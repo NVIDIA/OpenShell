@@ -40,7 +40,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -238,6 +238,13 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
+fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(()),
+        _ => Err(Status::failed_precondition("sandbox is not ready")),
+    }
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -420,6 +427,13 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -454,12 +468,16 @@ async fn handle_create_sandbox_inner(
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
         resolved.tty = governance_spec.tty;
+        resolved.restart_policy = governance_spec.restart_policy;
         (resolved, Some(provenance))
     };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
     spec.provider_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
 
     // Leave an omitted command empty rather than persisting a concrete shell:
     // the sandbox boundary resolves the default login shell against the agent image
@@ -2416,9 +2434,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2931,9 +2947,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -6658,6 +6672,10 @@ mod tests {
 
         let created = response.sandbox.expect("created sandbox");
         assert_eq!(
+            created.spec.as_ref().unwrap().restart_policy(),
+            SandboxRestartPolicy::Never
+        );
+        assert_eq!(
             created
                 .metadata
                 .as_ref()
@@ -7549,7 +7567,7 @@ mod tests {
     fn template_create_sandbox_spec_field_policy_is_exhaustive() {
         assert_proto_fields_classified(
             "openshell.v1.SandboxSpec",
-            &["policy", "providers", "command", "tty"],
+            &["policy", "providers", "command", "tty", "restart_policy"],
             &[
                 "log_level",
                 "environment",

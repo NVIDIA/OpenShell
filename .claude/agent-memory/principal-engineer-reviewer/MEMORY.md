@@ -11,7 +11,7 @@
 - Sandbox gRPC client: `crates/openshell-sandbox/src/grpc_client.rs`
 - CLI commands: `crates/openshell-cli/src/main.rs` (clap defs), `crates/openshell-cli/src/run.rs` (impl)
 - Python SDK: `python/openshell/`
-- Plans go in: `architecture/plans/`
+- Plans go in: `plans/`
 
 ## Key Patterns
 - TracingLogBus: per-sandbox broadcast::channel(1024) + VecDeque tail buffer (200 lines)
@@ -23,6 +23,6 @@
 - Build: `mise run sandbox` for sandbox infra
 
 ## Review Preferences (observed)
-- Plans stored as markdown in architecture/plans/
+- Plans stored as markdown in plans/
 - Conventional commits required
 - No AI attribution in commits

@@ -8,10 +8,11 @@ use std::path::Path;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
-    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, KeyToPath,
+    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
     LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
-    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -58,6 +59,9 @@ pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
 pub const CLIENT_TLS_CERTIFICATE_PATH: &str = "/.openshell/supervisor/client-tls.crt";
 pub const CLIENT_TLS_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/client-tls.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
+/// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
+/// process in every sandbox on every period.
+pub const CONTROL_HEALTH_PORT: u16 = 5501;
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
@@ -334,6 +338,8 @@ pub fn supervisor_pod(
         "/sandbox".to_string(),
         "--health-socket-path".to_string(),
         CONTROL_HEALTH_SOCKET_PATH.to_string(),
+        "--health-port".to_string(),
+        CONTROL_HEALTH_PORT.to_string(),
     ];
     if let Some(url) = https_proxy {
         command.extend(["--upstream-proxy".to_string(), url.to_string()]);
@@ -411,13 +417,9 @@ pub fn supervisor_pod(
         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
         env: Some(environment),
         readiness_probe: Some(Probe {
-            exec: Some(ExecAction {
-                command: Some(vec![
-                    "/openshell-supervisor".to_string(),
-                    "health".to_string(),
-                    "--socket".to_string(),
-                    CONTROL_HEALTH_SOCKET_PATH.to_string(),
-                ]),
+            tcp_socket: Some(TCPSocketAction {
+                port: IntOrString::Int(i32::from(CONTROL_HEALTH_PORT)),
+                ..Default::default()
             }),
             period_seconds: Some(1),
             failure_threshold: Some(3),
@@ -984,24 +986,26 @@ mod tests {
                 .and_then(|capabilities| capabilities.drop.as_ref()),
             Some(&vec!["ALL".to_string()])
         );
+        let probe = container.readiness_probe.as_ref().expect("readiness probe");
+        assert!(
+            probe.exec.is_none(),
+            "exec probes spawn a process per period"
+        );
         assert_eq!(
-            container
-                .readiness_probe
-                .as_ref()
-                .and_then(|probe| probe.exec.as_ref())
-                .and_then(|exec| exec.command.as_ref()),
-            Some(&vec![
-                "/openshell-supervisor".to_string(),
-                "health".to_string(),
-                "--socket".to_string(),
-                CONTROL_HEALTH_SOCKET_PATH.to_string(),
-            ])
+            probe.tcp_socket.as_ref().map(|tcp| &tcp.port),
+            Some(&IntOrString::Int(i32::from(CONTROL_HEALTH_PORT)))
         );
         let command = container.command.as_ref().unwrap();
         assert!(
             command
                 .windows(2)
                 .any(|args| args == ["--health-socket-path", CONTROL_HEALTH_SOCKET_PATH])
+        );
+        let health_port = CONTROL_HEALTH_PORT.to_string();
+        assert!(
+            command
+                .windows(2)
+                .any(|args| args == ["--health-port", health_port.as_str()])
         );
         let env = container.env.as_ref().unwrap();
         let env_value = |name: &str| {

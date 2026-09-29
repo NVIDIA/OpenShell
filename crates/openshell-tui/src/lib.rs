@@ -23,8 +23,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -2767,6 +2767,41 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(|s| s.object_name().to_string())
         .collect();
     app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_restart_policies = sandboxes
+        .iter()
+        .map(|s| {
+            match s
+                .spec
+                .as_ref()
+                .and_then(|spec| SandboxRestartPolicy::try_from(spec.restart_policy).ok())
+            {
+                Some(SandboxRestartPolicy::OnFailure) => "on-failure",
+                Some(SandboxRestartPolicy::Always) => "always",
+                _ => "never",
+            }
+            .to_string()
+        })
+        .collect();
+    app.sandbox_restart_counts = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().map_or(0, |status| status.restart_count))
+        .collect();
+    app.sandbox_exit_codes = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().and_then(|status| status.exit_code))
+        .collect();
+    app.sandbox_next_restart_at = sandboxes
+        .iter()
+        .map(|s| {
+            format_timestamp(
+                s.status
+                    .as_ref()
+                    .and_then(|status| status.next_restart_time.as_ref())
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
     app.sandbox_images = sandboxes
         .iter()
         .map(|s| {

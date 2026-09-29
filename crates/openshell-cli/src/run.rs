@@ -56,11 +56,11 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceExposure, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    exec_sandbox_event, tcp_forward_init,
+    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
+    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -452,6 +452,7 @@ pub struct SandboxCreateConfig<'a> {
     pub output: &'a str,
     pub detach: bool,
     pub suppress_credential_warnings: bool,
+    pub restart_policy: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -480,6 +481,7 @@ impl Default for SandboxCreateConfig<'_> {
             output: "table",
             detach: false,
             suppress_credential_warnings: false,
+            restart_policy: "never",
         }
     }
 }
@@ -516,6 +518,7 @@ pub async fn sandbox_create(
         output,
         detach,
         suppress_credential_warnings,
+        restart_policy,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -670,6 +673,12 @@ pub async fn sandbox_create(
             template: inline_template,
             command: main_command,
             tty: main_terminal,
+            restart_policy: match restart_policy {
+                "never" => SandboxRestartPolicy::Never as i32,
+                "on-failure" => SandboxRestartPolicy::OnFailure as i32,
+                "always" => SandboxRestartPolicy::Always as i32,
+                value => return Err(miette::miette!("invalid restart policy '{value}'")),
+            },
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -1697,6 +1706,41 @@ where
         "Resource version:".dimmed(),
         sandbox.metadata.as_ref().map_or(0, |m| m.resource_version)
     );
+    println!(
+        "  {} {}",
+        "Restart policy:".dimmed(),
+        sandbox
+            .spec
+            .as_ref()
+            .map_or("never", |spec| { restart_policy_name(spec.restart_policy) })
+    );
+    if let Some(status) = sandbox.status.as_ref() {
+        println!(
+            "  {} {}",
+            "Main process instance:".dimmed(),
+            if status.main_process_instance_id.is_empty() {
+                "-"
+            } else {
+                &status.main_process_instance_id
+            }
+        );
+        println!(
+            "  {} {}",
+            "Last exit code:".dimmed(),
+            status
+                .exit_code
+                .map_or_else(|| "-".to_string(), |code| code.to_string())
+        );
+        println!("  {} {}", "Restart count:".dimmed(), status.restart_count);
+        println!(
+            "  {} {}",
+            "Next restart:".dimmed(),
+            status.next_restart_time.as_ref().map_or_else(
+                || "-".to_string(),
+                |time| format_epoch_ms(proto_timestamp_ms(Some(time))),
+            )
+        );
+    }
 
     // Display labels if present
     if let Some(metadata) = &sandbox.metadata
@@ -2846,6 +2890,14 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     ]
 }
 
+fn restart_policy_name(policy: i32) -> &'static str {
+    match SandboxRestartPolicy::try_from(policy) {
+        Ok(SandboxRestartPolicy::OnFailure) => "on-failure",
+        Ok(SandboxRestartPolicy::Always) => "always",
+        Ok(SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never) | Err(_) => "never",
+    }
+}
+
 fn sandbox_detail_to_json(
     sandbox: &Sandbox,
     config: &GetSandboxConfigResponse,
@@ -2854,6 +2906,33 @@ fn sandbox_detail_to_json(
     let obj = value
         .as_object_mut()
         .expect("sandbox_to_json returns object");
+
+    let restart_policy = sandbox
+        .spec
+        .as_ref()
+        .map_or("never", |spec| restart_policy_name(spec.restart_policy));
+    obj.insert("restart_policy".into(), serde_json::json!(restart_policy));
+    if let Some(status) = sandbox.status.as_ref() {
+        obj.insert(
+            "main_process_instance_id".into(),
+            serde_json::json!(status.main_process_instance_id),
+        );
+        obj.insert("exit_code".into(), serde_json::json!(status.exit_code));
+        obj.insert(
+            "restart_count".into(),
+            serde_json::json!(status.restart_count),
+        );
+        obj.insert(
+            "next_restart_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(status.next_restart_time.as_ref())),
+        );
+        obj.insert(
+            "main_process_started_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(
+                status.main_process_started_time.as_ref()
+            )),
+        );
+    }
 
     let policy_source = if config.policy_source == PolicySource::Global as i32 {
         "global"
@@ -5861,7 +5940,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             &rev.policy_hash
         };
         let error_short = if rev.load_error.len() > 40 {
-            format!("{}...", &rev.load_error[..40])
+            truncate_status_field(&rev.load_error, 40)
         } else {
             rev.load_error.clone()
         };
@@ -6440,10 +6519,10 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
-        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
-        WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
+        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceEndpoint,
+        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6524,6 +6603,29 @@ mod tests {
         assert_eq!(unknown[0]["scope"], "global");
         assert_eq!(unknown[0]["status"], "unspecified");
         assert!(unknown[0].get("sandbox").is_none());
+    }
+
+    #[test]
+    fn policy_revision_table_handles_unicode_load_errors() {
+        // Stored diagnostics can contain Unicode paths. Byte 40 splits the
+        // character in the 40-scalar case; longer errors must also remain safe.
+        let revisions = [
+            String::new(),
+            "a".repeat(40),
+            "a".repeat(41),
+            format!("{}é", "a".repeat(39)),
+            format!("{}éz", "a".repeat(39)),
+        ]
+        .into_iter()
+        .map(|load_error| SandboxPolicyRevision {
+            version: 1,
+            status: PolicyStatus::Failed as i32,
+            load_error,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+        super::print_policy_revision_table(&revisions);
     }
 
     #[test]
@@ -7717,6 +7819,22 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(2);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            main_process_instance_id: "main-2".to_string(),
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            main_process_started_time: openshell_core::time::timestamp_from_millis(
+                1_699_999_000_000,
+            )
+            .ok(),
+            ..Default::default()
+        });
 
         let config = GetSandboxConfigResponse {
             policy_source: PolicySource::Global as i32,
@@ -7728,7 +7846,13 @@ mod tests {
 
         assert_eq!(json["id"], "sb-123");
         assert_eq!(json["name"], "test-sb");
-        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["phase"], "Starting");
+        assert_eq!(json["restart_policy"], "on-failure");
+        assert_eq!(json["main_process_instance_id"], "main-2");
+        assert_eq!(json["exit_code"], 9);
+        assert_eq!(json["restart_count"], 2);
+        assert_eq!(json["next_restart_at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(json["main_process_started_at_ms"], 1_699_999_000_000_i64);
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());

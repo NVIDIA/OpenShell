@@ -4771,6 +4771,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "temp-env",
  "tempfile",
  "tokio",

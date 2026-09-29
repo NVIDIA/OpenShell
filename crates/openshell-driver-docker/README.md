@@ -50,6 +50,32 @@ through the Docker archive API. No workload launch depends on a host bind
 mount or a tool supplied by the workload image, so the same path works with
 local, remote, and VM-backed Docker daemons.
 
+## Corporate Proxy Egress
+
+`[openshell.drivers.docker]` accepts the operator-owned corporate proxy fields
+`https_proxy`, `no_proxy`, `proxy_auth_file`,
+`proxy_auth_allow_insecure`, `proxy_connect_by_hostname`, and
+`proxy_ca_bundle`. Sandbox environment, image contents, and per-sandbox driver
+configuration cannot select or override them.
+
+The driver validates the proxy URL and cross-field relationships at gateway
+startup. It bounded-reads proxy credentials and the PEM CA bundle before use.
+Missing, unreadable, empty, oversized, malformed, or certificate-free CA files
+fail closed. A CA bundle requires `https_proxy`, although the proxy URL may be
+`http://` when the proxy intercepts destination TLS.
+
+For each supervisor launch, Docker copies the credential and CA contents into
+the existing supervisor-only named volume. It passes only the fixed container
+paths `/.openshell/supervisor/upstream-proxy-auth` and
+`/.openshell/supervisor/upstream-proxy-ca-bundle.pem` to the supervisor. It
+does not bind-mount the gateway-host files, which preserves remote-daemon
+support and keeps host paths out of workload container metadata.
+
+The supervisor trusts the configured CA for its TLS connection to an HTTPS
+proxy and for destination certificates re-signed by a TLS-intercepting proxy.
+It also includes the corporate root in the generated combined trust bundle
+used by workload processes.
+
 ## Identity and Workspace
 
 Before creating the workload, the driver pins the image ID and reads its

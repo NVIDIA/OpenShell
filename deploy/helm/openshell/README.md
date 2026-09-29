@@ -355,7 +355,7 @@ discovery endpoint or its TLS CA.
 | pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
-| podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
+| podLifecycle.terminationGracePeriodSeconds | int | `30` | Maximum time, in seconds, Kubernetes waits for the gateway to exit before killing it. The gateway exits as soon as shutdown completes; the limit covers supervisor session cleanup and draining queued OCSF records. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
@@ -420,12 +420,21 @@ discovery endpoint or its TLS CA.
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.enableWebsocketTunnel | bool | `false` | Enable the WebSocket tunnel used by CLI/SDK clients behind an authenticated edge proxy. Leave disabled for direct gateway installs. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
+| server.extraVolumeMounts | list | `[]` | Additional volume mounts for the gateway container. |
+| server.extraVolumes | list | `[]` | Additional volumes for the gateway pod. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
 | server.grpcRateLimit.requests | int | `0` | Maximum gRPC requests allowed per window. Must be positive (alongside windowSeconds) to enable rate limiting; 0 (default) disables it. |
 | server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
 | server.name | string | `""` | Operator-facing gateway name. Defaults to the chart fullname so all replicas in one installation share an identity. Set explicitly when one telemetry collector receives spans from multiple namespaces or clusters. |
+| server.ocsfLog.enabled | bool | `false` | Write gateway OCSF events as JSONL. |
+| server.ocsfLog.maxFiles | int | `7` | Rotated files retained when rotation is daily. |
+| server.ocsfLog.path | string | `"/tmp/gateway-ocsf.jsonl"` | OCSF JSONL path. The default is writable in the gateway container but does not persist across restarts. To keep records, mount a volume with server.extraVolumes and server.extraVolumeMounts and set a path on it. When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME) on the mount so each replica writes its own file. |
+| server.ocsfLog.queueCapacity | int | `10000` | Maximum records waiting for the file writer. |
+| server.ocsfLog.queueMaxBytes | int | `16777216` | Maximum encoded bytes waiting for the file writer. |
+| server.ocsfLog.rotation | string | `"daily"` | Rotate the active file daily in UTC, or never. |
+| server.ocsfLog.schemaVersion | string | `""` | Optional OCSF downgrade target. Empty emits native OCSF 1.8.0. Supported values: "1.1", "1.3". |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
