@@ -1,57 +1,20 @@
-name: Issue Triage Gate
+name: Issue Intake Labels
 
 on:
   issues:
     types: [opened]
 
 permissions:
+  contents: read
   issues: write
 
 jobs:
-  label-non-maintainer-issues:
+  label-new-issue:
     runs-on: ubuntu-latest
     if: github.repository_owner == 'NVIDIA'
     steps:
-      - name: Check contributor permissions
-        id: contributor
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        with:
-          result-encoding: string
-          script: |
-            const author = context.payload.issue.user.login;
-            const maintainerPermissions = ['admin', 'maintain', 'write'];
-
-            try {
-              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                username: author,
-              });
-
-              if (maintainerPermissions.includes(data.permission)) {
-                console.log(`${author} has maintainer permissions: ${data.permission}.`);
-                return 'false';
-              }
-
-              console.log(`${author} is not a maintainer; permission is ${data.permission}.`);
-              return 'true';
-            } catch (e) {
-              if (e.status === 404) {
-                console.log(`${author} is not a repository collaborator; labeling for triage.`);
-                return 'true';
-              }
-
-              throw e;
-            }
-
-      - name: Add triage label
-        if: steps.contributor.outputs.result == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        with:
-          script: |
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              labels: ['state:triage-needed'],
-            });
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Apply intake labels
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/issue_intake.py

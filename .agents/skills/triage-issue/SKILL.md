@@ -1,254 +1,65 @@
 ---
 name: triage-issue
-description: Assess, validate, and route community-filed issues for human disposition and roadmap placement. Takes a specific issue number or processes a confirmed batch of issues labeled state:triage-needed. Investigates reported behavior, separates objective findings from product decisions, and prepares validated issues for a human yes/no decision. Trigger keywords - triage issue, triage, assess issue, review incoming issue, triage issues.
+description: Assess community-filed OpenShell issues and send a private, evidence-based handoff to the duty engineer. Takes an issue number or a confirmed batch of open issues labeled state:new. A human directs all public responses and disposition.
 metadata:
   internal: true
 ---
 
 # Triage Issue
 
-Establish the facts a human needs to decide whether OpenShell should address an issue and, if so, where it belongs on the roadmap. Triage does not authorize work, sequence it, or produce an implementation plan.
+Assess a community issue so the duty engineer can quickly accept it, decline it with an explanation, ask for exact missing information, or invite collaborators into the decision. This skill is human-invoked during this rollout. `state:new` calls for screening only; it does not authorize planning or implementation. Maintainer-authored issues normally enter `state:accepted` through the issue-opened workflow and do not need this screening.
+
+The [issue workflow](../../../docs/contributing/issue-workflow.mdx) defines the three label axes. The [proposal](https://github.com/NVIDIA/OpenShell/issues/3807) explains the rollout. This skill never decides acceptance or roadmap placement, and never adds or removes `state:accepted`, `roadmap`, `needs:spike`, `needs:plan`, `needs:pr`, or `needs:rfc` without human direction. A human can directly request a specific phase without changing queue labels.
 
 ## Prerequisites
 
-- The `gh` CLI must be authenticated (`gh auth status`)
-- You must be in a git repository with a GitHub remote
-- The workflow labels `state:validated`, `state:accepted`, and `state:needs-info` must exist. Report missing labels to the operator; do not create them implicitly.
+- `gh` is authenticated to the OpenShell repository.
+- The OpenShell Triage bot is installed in `#openshell-triage` with `chat:write` and `channels:history`, and its token is available through the `OPENSHELL_TRIAGE_SLACK_BOT_TOKEN` secret environment variable. The bot posts under its own identity. If the bot or token is not available, prepare the assessment locally and stop before any public comment or issue mutation.
+- `OPENSHELL_TRIAGE_SLACK_CHANNEL_ID` defaults to `C0C20SDLDNW`; `OPENSHELL_TRIAGE_SLACK_DUTY_GROUP_ID` defaults to `S0C099KM56F`. Configure both when the Slack workspace changes. The latter identifies the one-person `@openshell-duty-eng` group; maintaining group membership is outside this skill.
 
-## Critical: Disposition and Roadmap Placement Are Human-Only
+## Select Issues
 
-Triage establishes technical validity; it does not decide whether valid work belongs on the roadmap. Agents must never:
+For a supplied issue number, fetch the issue and comments with `gh issue view <id> --json title,body,state,labels,author,comments`. Stop if closed, accepted, or already on the roadmap, unless the human expressly asks for a new assessment of later evidence. Do not treat a missing or old label as a reason to skip a directly requested assessment.
 
-- Decide that OpenShell should or should not invest in otherwise valid work.
-- Apply or remove `state:accepted`.
-- Add an issue to the roadmap project, apply or remove the `roadmap` label, or recommend a specific roadmap item.
-- Apply `agent:plan-requested` or `agent:implementation-requested`.
-- Treat technical validity as product acceptance.
+For batch invocation, list open `state:new` issues with `gh issue list --label state:new --state open --json number,title`. Show the count and up to ten titles, then ask the human to confirm the exact batch before investigating or posting. Each confirmed issue gets its own handoff. Do not run an automatic issue-opened trigger from this skill; that belongs to [#3816](https://github.com/NVIDIA/OpenShell/issues/3816).
 
-OpenShell has no `priority:*` labels. Sequencing comes from association with an item on the OpenShell Roadmap, and that association is a maintainer decision.
+Before repeating an assessment, inspect existing Slack handoff and newer GitHub comments. The handoff tool reuses the issue's Slack thread and skips an identical summary. Reassess only when new evidence or a human request justifies it.
 
-`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or a user can directly ask an agent to work on a specific issue.
+## Investigate
 
-The optional `agent:*` workflow controls unattended queue pickup: `agent:plan-requested` queues planning, and `agent:implementation-requested` queues implementation after plan review. A direct user instruction separately authorizes the phase it requests. The agent warns about missing or incomplete expected lifecycle and workflow labels, then continues without changing them.
+1. Check for a substantive User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. Impact should identify consequences, current workaround, and why it is insufficient. A bug also needs reproducible steps and environment; a feature request needs a user-visible proposed design and alternatives. Reporter diagnostics are optional.
+2. Search open and closed issues for duplicates and prior declines. For a reported bug, check the reported version against releases and known fixes. Identify a concrete fixing change before calling a report fixed; request a retest if the causal link is uncertain.
+3. Validate the reported behavior against code and documentation. Use the `principal-engineer-reviewer` sub-agent for a technical validity check when deeper diagnosis is needed. Record what you actually checked, evidence quality, affected users, scope, regression status, and workaround. Do not turn label frequency or an incomplete historical label into design evidence.
+4. Classify the outcome as validated bug, validated feature, needs information, needs investigation, cannot reproduce, fixed in release, duplicate, expected behavior, support request, wrong repository, or possible security report. A technically valid feature may still be declined by a human. A suspected vulnerability follows `SECURITY.md`; do not expand exploit details in a public issue or Slack.
 
-## Agent Comment Marker
+## Hand Off Privately
 
-All comments posted by this skill **must** begin with the following marker line:
+Write a concise assessment to a local UTF-8 file. Include the issue link, classification, factual summary, evidence and uncertainty, impact and workaround, precise information needed if any, and the human decisions needed. Recommend an immediate accept/decline discussion when the evidence allows one. If a decision is delayed, identify the exact person or evidence needed so `state:validated` does not become a parking place. Keep issue text and secrets out of the summary unless directly needed; redact credentials and personal data.
 
-```
-> **📋 triage-agent**
-```
+For ordinary reports, deliver the file with:
 
-This marker distinguishes triage comments from human comments and from other skills (`🏗️ build-from-issue-agent`, `🔒 security-review-agent`, etc.).
-
-## Invocation Modes
-
-This skill supports two modes:
-
-### Single Issue
-
-```
-triage issue 250
-triage issue #250
+```shell
+uv run --no-project python scripts/triage_handoff.py \
+  --issue-url https://github.com/NVIDIA/OpenShell/issues/<id> \
+  --summary-file /path/to/triage-summary.txt
 ```
 
-Assess one specific issue. Proceed to Step 1 with the given issue number.
+For a possible security report, send only a safe routing notice with `--security` instead of a summary file. This mode discards any supplied assessment text. The tool posts as the bot to the configured channel, mentions `<!subteam^S0C099KM56F>` (or the configured replacement group), and reuses the existing issue thread. It checks channel history before posting and fails closed if it cannot check for a prior handoff. If delivery fails, report the error to the operator and stop before public action. A bot installation or token is not required merely to review a draft PR for this integration.
 
-### Batch
-
-```
-triage issues
-```
-
-Batch mode requires a confirmation gate before processing. This prevents accidental mass-commenting on a public repository.
-
-**Step 1: Preview.** Query all matching issues and display a summary:
-
-```bash
-gh issue list --label "state:triage-needed" --state open --json number,title --jq '.[] | "#\(.number) \(.title)"'
-```
-
-Present the results to the user:
-
-```
-Found N issues with state:triage-needed:
-
-  #250  Bug: sandbox fails to start with VM driver
-  #312  Feature: add --output yaml to sandbox list
-  ... (show up to 10, then "and N more")
-
-This will post a triage comment on each issue.
-```
-
-**Step 2: Confirm.** Ask the user for explicit confirmation before proceeding. Use `AskUserQuestion` with options "Proceed with all N issues", "Let me pick specific issues", and let them provide custom input. Do **not** proceed without confirmation.
-
-**Step 3: Process.** Only after confirmation, run the full triage workflow (Steps 1-7 below) for each issue. Report a summary at the end listing each issue and its classification.
-
-## Step 1: Fetch the Issue
-
-Strip any leading `#` from the issue number and fetch the issue.
-
-```bash
-gh issue view <id> --json title,body,state,labels,author,comments
-```
-
-If the issue is closed, report that and stop.
-
-## Step 2: Check for Prior Triage
-
-Search the issue comments for the triage agent marker (`> **📋 triage-agent**`).
-
-- **If the marker is found** and no subsequent human comments exist with new information or questions, report that the issue has already been triaged and stop.
-- **If the marker is found** but there are newer human comments with additional information, proceed to Step 3 to re-evaluate with the new context.
-- **If a human already declined the issue, applied `state:accepted`, or placed it on the roadmap**, do not undo or reinterpret that decision.
-- **If the marker is not found**, proceed to Step 3.
-
-## Step 3: Check Report Completeness
-
-Check for a substantive User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. The impact should explain the consequences of the current behavior and any insufficient workaround. For bug reports, also identify the reproduction steps and relevant environment. For feature requests, review the Proposed Design and Alternatives Considered. Reporter-supplied diagnostics and agent output are optional and must not be used as an intake gate.
-
-If the report contains enough context to understand and assess the need, continue. If a required section lacks material information, classify it as `needs-information`, request only the exact missing information, remove `state:triage-needed`, and add `state:needs-info`.
-
-- If a public issue may disclose a security vulnerability, do not repeat or expand sensitive details. Classify it as `security-report` and direct the operator to `SECURITY.md`.
-- Route usage questions and support requests to the documented support venue.
-- Handle clear duplicates, wrong-repository reports, and objectively expected behavior without requiring a full technical investigation.
-
-Proceed to Step 4 for reports requiring technical validation.
-
-## Step 4: Check Reported Version and Known Fixes
-
-Before deeper diagnosis, determine whether the report may already be fixed in a newer release.
-
-1. Extract the reported OpenShell version from the issue body, environment section, logs, and comments. If no version is provided, record that as missing context and continue.
-2. Check current release information and known fixes when available:
-   - `gh release list --limit 10`
-   - `gh release view <tag>`
-   - linked issues, merged PRs, release notes, local git tags/history, and both open and closed possible duplicates
-3. If network access or release metadata is unavailable, state the limitation in the triage comment instead of guessing.
-
-If the issue targets an older OpenShell release and a newer release or merged PR appears to address the same behavior:
-
-- If the reporter has already reproduced the issue on the fixed/current release, continue to Step 5.
-- If the reporter has not tested the fixed/current release, identify a concrete fixing change before using `fixed-in-release`. If the causal link is uncertain, request a retest instead of declaring the issue fixed.
-
-## Step 5: Diagnose and Validate
-
-Assess the report by investigating the codebase. Use the `principal-engineer-reviewer` sub-agent via the Task tool:
-
-```
-Prompt the sub-agent with:
-- The full issue title and body
-- Instructions to evaluate with a skeptical lens:
-  1. What persona and desired capability does the user story establish?
-  2. Does the problem statement match current product behavior?
-  3. Does the impact explain the consequences, current workaround, and why that workaround is insufficient?
-  4. Are the acceptance criteria specific, observable, and consistent with the user story?
-  5. Can the described workflow be reproduced or otherwise validated from the information given?
-  6. Does the current product support the requested outcome, and what component owns the behavior?
-  7. Is the report best classified as a bug, feature request, support request, or another category?
-  8. If this is a feature request, is the proposed design technically coherent and feasible? Do not decide whether the project should accept it.
-  9. Are there any open or closed issues that duplicate this?
-  10. What uncertainty remains, and what exact evidence would resolve it?
-```
-
-Based on the sub-agent's analysis, also attempt to validate the report directly:
-
-- For bug reports: check the relevant code paths, look for the described failure mode
-- For feature requests: assess feasibility against the existing architecture
-- For gateway deployment or infrastructure issues: reference the known failure patterns in `skills/debug-openshell-cluster/SKILL.md`
-- For inference and provider-topology issues: reference `skills/debug-inference/SKILL.md`
-- For CLI/usage issues: reference the workflows in `skills/openshell-cli/SKILL.md` and confirm installed syntax with `openshell --help`
-
-Record impact signals for the human decision: affected users and scope, regression status, workaround availability, severity evidence, and evidence quality. Do not convert those facts into a roadmap or sequencing recommendation.
-
-## Step 6: Classify
-
-Based on the investigation, classify the issue into one of these categories:
-
-| Classification | Meaning | Agent action |
-|---|---|---|
-| **validated-bug** | Evidence confirms a real defect | Add relevant area/topic labels; replace triage/needs-info state with `state:validated`; leave open |
-| **validated-feature** | The proposal is technically coherent and feasible | Add relevant area/topic labels; replace triage/needs-info state with `state:validated`; leave open |
-| **needs-investigation** | The report is credible but needs a deeper spike | Add `spike` if available; replace triage/needs-info state with `state:validated`; leave open for a human decision on whether to invest in the spike |
-| **needs-information** | Critical reproduction or environment evidence is missing | Replace `state:triage-needed` with `state:needs-info`; request the exact missing evidence |
-| **cannot-reproduce** | A faithful attempt did not reproduce, but the report may still be valid | Replace `state:triage-needed` with `state:needs-info`; document the attempt and request discriminating evidence |
-| **fixed-in-release** | A concrete released change fixes the reported behavior | Explain the fix and version; close only when the causal link is clear, otherwise request a retest |
-| **duplicate** | Another open or closed issue is the canonical report | Link the canonical issue and close |
-| **expected-behavior** | Code and documentation establish that the behavior is intentional | Explain the behavior and close |
-| **support-request** | The report asks for usage help rather than tracking work | Provide the support route and close |
-| **wrong-repository** | Another repository owns the affected component | Link the correct tracker and close |
-| **security-report** | The report may contain a vulnerability | Avoid further public analysis and direct the operator to `SECURITY.md` for safe handling |
-
-Do not use `validated-feature` to imply roadmap acceptance. Do not use `expected-behavior` to decline a technically valid feature request.
-
-## Step 7: Post Triage Comment
-
-Post a structured comment with the triage marker:
+The duty engineer reads the summary in Slack, asks other maintainers for opinions there, and directs the public response and issue label changes. Do not post a public triage assessment or mutate the issue on the strength of the agent's own recommendation. After a human gives explicit direction, carry out only the requested public action and use this marker at the start of any agent-authored comment:
 
 ```markdown
 > **📋 triage-agent**
->
-> ## Triage Assessment
->
-> **Classification:** <validated-bug | validated-feature | needs-investigation>
->
-> ### Summary
-> <What was established and confidence in the evidence.>
->
-> ### Investigation
-> <Reproduction results, code/release evidence, affected components, and duplicates.>
->
-> ### Impact Signals
-> - **Affected users/scope:** <facts or unknown>
-> - **Regression:** <yes/no/unknown>
-> - **Workaround:** <available/unavailable/unknown>
-> - **Evidence quality:** <high/medium/low with reason>
->
-> ### Human Decision Required
-> Decide whether OpenShell should address this issue. If yes, apply
-> `state:accepted`, associate it with a roadmap item, or do both, and decide
-> whether the work remains human-owned. Either action records acceptance;
-> roadmap placement additionally records sequencing.
-> To queue investigation or planning for an unattended agent, also apply
-> `agent:plan-requested`. You can instead directly ask an agent to use
-> `create-spike` or `build-from-issue` on this issue; the agent will warn about
-> missing expected workflow labels and continue without changing them. If no,
-> close it as not planned and record the rationale.
-
 ```
 
-For other outcomes, replace the impact and decision sections with the exact information request, objective resolution, or safe routing guidance.
+## Human-Directed Outcomes
 
-Keep exactly one intake/triage state among `state:triage-needed`, `state:needs-info`, and `state:validated`. Remove `state:triage-needed` after every completed assessment. Never apply `state:accepted`, any `agent:*` label, or the `roadmap` label during triage. Never close a validated issue.
-## Relationship to Other Skills
+| Human direction | Issue labels and status |
+| --- | --- |
+| Ask for specific missing information | Keep `state:new` or `state:validated` as directed; set `needs:info`; ask only the exact question. |
+| Factual assessment complete but decision pending | Set `state:validated`; clear stale `needs:*`; record who will decide and why a delay is needed. |
+| Accept | Human applies `state:accepted` or places the issue on the roadmap, then chooses the next work and actor. Agents do not record this decision themselves. |
+| Decline, duplicate, fixed, support route, or wrong repository | Explain the reason or route empathetically, then close with the appropriate GitHub reason if directed. Clear `needs:*` on closure. |
+| Approved bounded investigation or RFC | A human authorizes `needs:spike` or `needs:rfc` and directs the next step. |
 
-```
-Community issue filed
-        |
-  [GitHub Action: instant gate check]
-        |
-  triage-issue
-        |
-  state:validated
-        |
-  human decline OR state:accepted / roadmap placement
-        |
-  create-spike          (if deeper investigation is approved)
-        |
-  human queues planning with agent:plan-requested
-  OR directly requests planning
-        |
-  build-from-issue      (creates implementation plan)
-        |
-  human queues implementation with agent:implementation-requested
-  OR directly requests implementation
-        |
-  implementation
-```
-
-- **triage-issue** establishes technical validity and impact evidence.
-- **Humans** decide whether to accept valid work and where it lands on the roadmap.
-- **create-spike** deepens investigation only after that investment is approved.
-- **build-from-issue** may be invoked directly for a specific issue. Unattended agents use `agent:plan-requested` to pick up planning and `agent:implementation-requested` to pick up implementation.
-
-Triage is the assessment layer. It does not sequence work, accept it onto the roadmap, plan, or build.
+Use `type:bug`, `type:feature`, `type:support`, or `type:spike` only when evidence supports the type. The human may ask the agent to apply those non-acceptance labels after reviewing the handoff. Never add `agent:*` workflow labels to new work. Do not apply `topic:security` to a new public vulnerability report; route privately.
