@@ -179,10 +179,44 @@ Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
 Gator payload: `5`' \
     0
 
-run_case "allows unmarked comment" \
+run_case "allows /ok to test with the full current head SHA" \
     "$same_sha_body" \
     '/ok to test 0e4d7af7722fbedce2307d571b0c937a1eb3250f' \
     0
+
+run_case "blocks /ok to test with an abbreviated SHA" \
+    '' \
+    '/ok to test 0e4d7af' \
+    22
+
+run_case "blocks /ok to test with a stale full SHA" \
+    '' \
+    '/ok to test 1111111111111111111111111111111111111111' \
+    22
+
+run_case "blocks /ok to test without a SHA" \
+    '' \
+    '/ok to test' \
+    22
+
+run_case "blocks /ok to test with extra text" \
+    '' \
+    '/ok to test 0e4d7af7722fbedce2307d571b0c937a1eb3250f
+
+Mirroring for E2E.' \
+    22
+
+OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1 run_case "blocks an abbreviated /ok to test SHA even with the same-SHA override" \
+    '' \
+    '/OK to test 0e4d7af' \
+    22
+
+run_case "fails closed for /ok to test when the PR head lookup fails" \
+    '' \
+    '/ok to test 0e4d7af7722fbedce2307d571b0c937a1eb3250f' \
+    21 \
+    false \
+    pull
 
 run_case "allows terminal cleanup" \
     "$same_sha_body" \

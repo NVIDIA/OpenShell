@@ -217,7 +217,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
-  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test for the current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label, posting /ok to test with the full 40-character current head SHA, and rerunning the relevant current-head workflow when the E2E Label Help bot says that is required."
 ```
 
 ## Model Or Image Experiments

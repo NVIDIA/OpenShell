@@ -929,12 +929,18 @@ After applying a `test:*` label, read the bot comment that is posted by the E2E 
 If a mirror is missing or stale and you have maintainer authority, post:
 
 ```text
-/ok to test <sha>
+/ok to test <full-head-sha>
 ```
 
-The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+`<full-head-sha>` is the full 40-character SHA of the current PR head. copy-pr-bot rejects abbreviated SHAs. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
 
-If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
+```bash
+gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
+```
+
+The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment. The `gh` wrapper rejects `/ok to test` comments that do not exactly match the current full head SHA.
+
+If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <full-head-sha>` with the full current head SHA written out.
 
 Do not treat a test label or `/ok to test` comment as proof that testing
 started. Confirm that every required workflow has a check or run for the
