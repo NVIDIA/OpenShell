@@ -3,20 +3,21 @@
 
 #![cfg(feature = "e2e-podman")]
 
-//! Podman-specific E2E coverage for OCI identity inspection and immutable-image
-//! launch.
+//! Podman-specific E2E coverage for immutable-image launch and the isolated
+//! workload/supervisor container pair.
 //!
 //! The test builds an image through the selected Podman engine, creates a
-//! sandbox from its mutable tag, and verifies both the child identity and the
-//! image ID recorded on the real sandbox container. This exercises the Podman
-//! API inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries. Workspace behavior shared with Docker is covered
-//! by the `oci-image` feature suite in `tests/suites/features`.
+//! sandbox from its mutable tag, and inspects the real Podman containers: the
+//! image ID recorded on the workload, each container's user, the supervisor's
+//! capabilities, networking, and mounts. This exercises the Podman API
+//! inspect → protected metadata → create path rather than only its unit
+//! serialization boundaries. The sandbox identity and workspace seen by the
+//! main process and `sandbox exec` are shared with Docker and covered by the
+//! `oci-image` feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
 use openshell_e2e::harness::container::{ContainerEngine, is_e2e_driver};
-use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
 const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
@@ -199,41 +200,12 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
     let policy_path = policy.path().to_str().expect("policy path is UTF-8");
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--from",
-            &image.tag,
-            "--policy",
-            policy_path,
-            "--no-tty",
-        ],
-        &[
-            "sh",
-            "-c",
-            "set -eu; printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; echo podman-oci-identity-ready; sleep infinity",
-        ],
+        &["--from", &image.tag, "--policy", policy_path, "--no-tty"],
+        &["sh", "-c", "echo podman-oci-identity-ready; sleep infinity"],
         READY_MARKER,
     )
     .await
     .expect("create sandbox from Podman-built OCI identity image");
-
-    let direct_output = strip_ansi(&sandbox.create_output);
-    assert!(
-        direct_output.contains("direct-identity=2345:2346"),
-        "expected direct child identity {OCI_UID}:{OCI_GID}:\n{direct_output}"
-    );
-
-    let ssh_output = sandbox
-        .exec(&[
-            "sh",
-            "-c",
-            "test \"$(id -u):$(id -g)\" = 2345:2346; echo podman-ssh-identity-ok",
-        ])
-        .await
-        .expect("SSH child should use Podman OCI identity");
-    assert!(
-        ssh_output.contains("podman-ssh-identity-ok"),
-        "expected SSH identity marker:\n{ssh_output}"
-    );
 
     let container_id =
         sandbox_container_id(&image.engine, &sandbox.name).expect("find Podman sandbox container");
