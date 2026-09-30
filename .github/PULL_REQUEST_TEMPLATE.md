@@ -2,12 +2,7 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!--
-Required for features, user-visible behavior changes, public API changes,
-architecture changes, and multi-PR efforts: Fixes #NNN or Closes #NNN.
-For an exempt small docs fix, mechanical change, or obvious localized bug fix:
-No issue required: <brief reason>
--->
+<!-- Every PR must close an existing issue covering its scope. Use Closes #NNN. -->
 
 ## Changes
 <!-- Bullet list of key changes -->
@@ -19,6 +14,7 @@ No issue required: <brief reason>
 - [ ] E2E tests added/updated (if applicable)
 
 ## Checklist
+
 - [ ] Follows [Conventional Commits](https://www.conventionalcommits.org/)
 - [ ] Commits are signed off (DCO)
 - [ ] Architecture docs updated (if applicable)

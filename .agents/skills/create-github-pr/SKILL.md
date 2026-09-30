@@ -13,7 +13,7 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- For issue-backed work, the branch should follow `<issue-number>-<description>/<username>`. Exempt issue-less changes may use `<description>/<username>`.
+- Every PR must close an existing issue. The branch should follow `<issue-number>-<description>/<username>`.
 
 ## Before Creating a PR
 
@@ -49,19 +49,11 @@ Before creating a PR, verify:
    git branch --show-current
    ```
 
-2. **Branch follows naming convention** - Use `<issue-number>-<description>/<initials>` for issue-backed work or `<description>/<initials>` for an exempt issue-less change.
+2. **Branch follows naming convention** - Use `<issue-number>-<description>/<initials>`.
 
    ```bash
    # Example: 1234-add-pagination/jd
    git branch --show-current
-   ```
-
-3. **Consider squashing commits** - For cleaner history, squash related commits before pushing:
-
-   ```bash
-   # Squash last N commits into one
-   git reset --soft HEAD~N
-   git commit -m "feat(component): description"
    ```
 
 ### Push Your Branch
@@ -116,19 +108,25 @@ gh pr create --title "PR title" --body "PR description"
 
 ### Link to an Issue
 
-Features, user-visible behavior changes, public API changes, architecture changes, and multi-PR efforts must link an accepted issue. Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
+Every PR must close its own issue. Verify that the issue exists, remains open, and covers the PR scope. Use `Closes #<issue-number>` in the body so merge closes it:
 
 ```bash
 gh pr create \
-  --title "Fix validation error for empty requests" \
-  --body "Closes #123
+  --title "fix(cli): validate empty requests" \
+  --body "## Summary
 
-## Summary
-- Added validation for empty request bodies
-- Returns 400 instead of 500"
+Validate empty request bodies.
+
+## Related Issue
+
+Closes #123
+
+## Changes
+
+- Return 400 instead of 500"
 ```
 
-Small documentation fixes, mechanical maintenance, and obvious localized bug fixes may omit a separate issue when the PR contains enough context to review the decision and implementation together. In that case, write `No issue required: <brief reason>` in the Related Issue section. Do not use this exception for security fixes; follow `SECURITY.md`.
+If the work needs multiple PRs, create a separate closable issue for each PR. A higher-level tracking issue may link the component issues, but no PR should close that tracking issue until all its work is complete. Follow `SECURITY.md` for vulnerability disclosure. First-time external contributors must be vouched before their PRs are accepted; the vouch check may close unvouched PRs. Check the current vouch process before opening a PR for an external contributor.
 
 ### Create as Draft
 
@@ -136,12 +134,6 @@ For work-in-progress that's not ready for review:
 
 ```bash
 gh pr create --draft --title "WIP: New feature"
-```
-
-### With Labels
-
-```bash
-gh pr create --title "Title" --label "area:cli" --label "topic:security"
 ```
 
 ### Target a Different Branch
@@ -161,7 +153,7 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Fixes #NNN / Closes #NNN, or "No issue required: <reason>" for an exempt change -->
+<!-- Closes #NNN; this issue covers the scope of this PR -->
 
 ## Changes
 <!-- Bullet list of key changes -->
