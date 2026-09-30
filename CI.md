@@ -410,7 +410,7 @@ Flow:
 Prerequisites:
 
 - DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
-- First-time external contributors must be vouched. See the [Vouch System](AGENTS.md#vouch-system).
+- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
