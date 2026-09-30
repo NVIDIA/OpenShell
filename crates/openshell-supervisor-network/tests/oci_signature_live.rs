@@ -118,3 +118,39 @@ async fn oci_signed_post_generative_ai_native_chat() {
         "response should carry a chatResponse: {response}"
     );
 }
+
+/// A 64x64 solid red PNG, base64-encoded, for the vision request.
+const RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PQQkAAAgAsetfWiP4FgYrsKZeS0BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDgsqnc8OJg6Ln3AAAAAElFTkSuQmCC";
+
+#[tokio::test]
+#[ignore = "requires OCI_TEST_* credentials and network access to OCI"]
+async fn oci_signed_post_generative_ai_native_vision() {
+    let key = signing_key();
+    let host = format!(
+        "inference.generativeai.{}.oci.oraclecloud.com",
+        env("OCI_TEST_REGION")
+    );
+    // Multimodal GENERIC chat: the image travels in the body, so this also
+    // exercises body hashing on a larger payload than the text tests.
+    let body = format!(
+        r#"{{"compartmentId":"{}","servingMode":{{"servingType":"ON_DEMAND","modelId":"meta.llama-4-maverick-17b-128e-instruct-fp8"}},"chatRequest":{{"apiFormat":"GENERIC","messages":[{{"role":"USER","content":[{{"type":"TEXT","text":"What color is this image? Answer with one word."}},{{"type":"IMAGE","imageUrl":{{"url":"data:image/png;base64,{}"}}}}]}}],"maxTokens":10}}}}"#,
+        env("OCI_TEST_COMPARTMENT_ID"),
+        RED_PNG_BASE64
+    );
+    let mut raw = format!(
+        "POST /20231130/actions/chat HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: application/json\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body.as_bytes());
+    let signed = sign_request(&raw, &host, &key).expect("sign vision POST");
+    let (status, response) = send_tls(&host, &signed).await;
+    assert_eq!(
+        status, 200,
+        "native Generative AI vision chat must accept the proxy signature: {response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("red"),
+        "model should identify the red image: {response}"
+    );
+}
