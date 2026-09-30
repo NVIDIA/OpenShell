@@ -22,6 +22,10 @@
 #                    resource, or OKE workload identity.
 # Endpoint access:   the regional Generative AI inference hosts in the
 #                    commercial realm, limited to the native /20231130 API.
+#                    Attach one OCI signing profile per sandbox: two attached
+#                    profiles may not both provide OCI_KEY_ID. To reach several
+#                    OCI services from one sandbox, attach the endpointless
+#                    oci.yaml profile and bind it from a sandbox policy.
 #                    Requests carry the compartment OCID in the body, so the
 #                    sandbox must know it; scope the key's IAM policy to that
 #                    compartment.
