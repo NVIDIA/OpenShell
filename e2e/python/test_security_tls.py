@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import grpc
 import pytest
 
-from openshell._proto import openshell_pb2, openshell_pb2_grpc
+from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -157,7 +157,12 @@ class TestServerMtlsEnforcement:
             stub = openshell_pb2_grpc.OpenShellStub(channel)
             response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
-            stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), timeout=10)
+            stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                ),
+                timeout=10,
+            )
         finally:
             channel.close()
 
@@ -178,14 +183,25 @@ class TestServerMtlsEnforcement:
             response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), timeout=10)
+                stub.ListSandboxes(
+                    openshell_pb2.ListSandboxesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        )
+                    ),
+                    timeout=10,
+                )
             assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
             # An unverified bearer token must not promote the TLS connection
             # to a user identity either.
             with pytest.raises(grpc.RpcError) as exc_info:
                 stub.ListSandboxes(
-                    openshell_pb2.ListSandboxesRequest(),
+                    openshell_pb2.ListSandboxesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        )
+                    ),
                     metadata=(("authorization", "Bearer invalid-token"),),
                     timeout=10,
                 )
