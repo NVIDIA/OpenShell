@@ -118,6 +118,12 @@ struct Args {
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
 
+    /// Path to a PEM CA bundle trusted for direct (non-proxied), inspected
+    /// upstream HTTPS egress. Independent of `--upstream-proxy-ca-bundle`:
+    /// applies regardless of whether a corporate proxy is configured.
+    #[arg(long)]
+    additional_ca_bundle: Option<String>,
+
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
@@ -431,6 +437,7 @@ fn main() -> Result<()> {
                     ocsf_enabled,
                     ocsf_schema_version,
                     upstream_proxy_args,
+                    args.additional_ca_bundle,
                     backend_descriptor,
                     auth_bundle,
                     admitted_isolation_backend,
@@ -452,6 +459,7 @@ fn main() -> Result<()> {
                     policy_data,
                     args.tls_dir,
                     upstream_proxy_args,
+                    args.additional_ca_bundle,
                 )
                 .await
             }

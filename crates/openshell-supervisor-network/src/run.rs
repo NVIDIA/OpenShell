@@ -142,6 +142,34 @@ fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) ->
     Ok(epoch)
 }
 
+/// Read an operator-supplied additional destination CA bundle (#3781) and
+/// fold it into `system_ca_bundle`, so it reaches both the sandbox trust
+/// bundle (`write_ca_files`) and the supervisor's own upstream TLS
+/// verification (`build_upstream_client_config`) alongside the system CA
+/// bundle. A no-op when `additional_ca_bundle` is `None`.
+///
+/// # Errors
+///
+/// Fails closed on an unreadable or certificate-free bundle, matching the
+/// corporate-proxy CA bundle's validation.
+fn append_additional_ca_bundle(
+    system_ca_bundle: &mut String,
+    additional_ca_bundle: Option<&str>,
+) -> Result<(), String> {
+    let Some(path) = additional_ca_bundle else {
+        return Ok(());
+    };
+    let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+        path,
+        "--additional-ca-bundle",
+    )?;
+    if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
+        system_ca_bundle.push('\n');
+    }
+    system_ca_bundle.push_str(&pem);
+    Ok(())
+}
+
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
 ///
@@ -197,6 +225,7 @@ pub async fn run_networking(
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<&str>,
     proxy_tls_dir: Option<&std::path::Path>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
@@ -370,6 +399,16 @@ pub async fn run_networking(
                     }
                     system_ca_bundle.push_str(&pem);
                 }
+                // An operator-supplied additional destination CA (#3781):
+                // unlike the corporate proxy CA above, this applies
+                // regardless of whether a proxy is configured, so a private
+                // CA can be trusted for direct, inspected egress without
+                // rebuilding the supervisor image. Folded into the same
+                // bundle for the same reason (sandbox trust + upstream
+                // verification must agree), and validated the same way
+                // (fail closed on an unreadable or certificate-free bundle).
+                append_additional_ca_bundle(&mut system_ca_bundle, additional_ca_bundle)
+                    .map_err(|err| miette::miette!("{err}"))?;
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
                     Ok(paths) => {
                         // /etc/openshell-tls is subsumed by the /etc baseline
@@ -565,5 +604,71 @@ mod transparent_runtime_tests {
         std::fs::write(&path, "corrupt\n").unwrap();
         let error = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap_err();
         assert!(error.to_string().contains("allocation epoch is invalid"));
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_is_noop_when_unset() {
+        let mut bundle = "existing-system-bundle".to_string();
+        append_additional_ca_bundle(&mut bundle, None).unwrap();
+        assert_eq!(bundle, "existing-system-bundle");
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_appends_to_nonempty_system_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        let ca_pem = generate_test_ca_pem();
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let mut bundle = "system-bundle-without-trailing-newline".to_string();
+        append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap();
+
+        // The two bundles must both be present, newline-separated — this is
+        // the exact property build_upstream_client_config and write_ca_files
+        // rely on: a #3781 fix that silently dropped or overwrote the system
+        // bundle instead of appending would pass a naive "contains the CA"
+        // check but break every other destination's upstream verification.
+        assert!(bundle.starts_with("system-bundle-without-trailing-newline\n"));
+        assert!(bundle.trim_end().ends_with(ca_pem.trim_end()));
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_works_with_empty_system_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        let ca_pem = generate_test_ca_pem();
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let mut bundle = String::new();
+        append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap();
+        assert_eq!(bundle.trim_end(), ca_pem.trim_end());
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_fails_closed_on_missing_file() {
+        let mut bundle = String::new();
+        let error =
+            append_additional_ca_bundle(&mut bundle, Some("/nonexistent/additional-ca.pem"))
+                .unwrap_err();
+        assert!(error.contains("--additional-ca-bundle"), "{error}");
+        // Fail closed: the bundle must not be silently left unmodified/partial.
+        assert!(bundle.is_empty());
+    }
+
+    #[test]
+    fn append_additional_ca_bundle_fails_closed_on_certificate_free_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("not-a-cert.pem");
+        std::fs::write(&ca_path, "not a certificate\n").unwrap();
+
+        let mut bundle = String::new();
+        let error =
+            append_additional_ca_bundle(&mut bundle, Some(ca_path.to_str().unwrap())).unwrap_err();
+        assert!(error.contains("--additional-ca-bundle"), "{error}");
+    }
+
+    /// Generate a real, valid self-signed CA certificate PEM for tests.
+    fn generate_test_ca_pem() -> String {
+        SandboxCa::generate().unwrap().cert_pem().to_string()
     }
 }

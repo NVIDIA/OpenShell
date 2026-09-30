@@ -694,6 +694,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 ocsf_enabled: Arc::new(AtomicBool::new(false)),
                 ocsf_schema_version: Arc::new(Mutex::new(String::new())),
                 upstream_proxy_args: UpstreamProxyArgs::default(),
+                additional_ca_bundle: None,
                 backend_descriptor: TestSetup::descriptor(),
                 auth_bundle: setup.auth.clone(),
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),

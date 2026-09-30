@@ -174,6 +174,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
     sandbox_proxy_ca_bundle: Option<String>,
 
+    /// Path (on the gateway host) to a PEM CA bundle trusted for direct
+    /// (non-proxied), policy-inspected HTTPS egress to destinations signed by
+    /// a private CA. Unlike `--sandbox-proxy-ca-bundle`, this applies
+    /// regardless of whether a corporate proxy is configured. Bind-mounted
+    /// read-only into the supervisor container.
+    #[arg(long, env = "OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE")]
+    sandbox_additional_ca_bundle: Option<String>,
+
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
     #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
@@ -241,6 +249,7 @@ async fn main() -> Result<()> {
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
         proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+        additional_ca_bundle: args.sandbox_additional_ca_bundle,
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,
