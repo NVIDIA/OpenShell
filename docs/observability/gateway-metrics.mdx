@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Gateway Metrics"
 sidebar-title: "Gateway Metrics"
-description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, and peer routing signals for multi-replica deployments."
+description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, peer routing, and mutation lock signals for multi-replica deployments."
 keywords: "Generative AI, Cybersecurity, Observability, Metrics, Prometheus, Gateway, Kubernetes, High Availability"
 ---
 
@@ -175,6 +175,13 @@ that owns a sandbox's supervisor session:
 | `openshell_server_routed_request_attempts_total` | Counter | `operation`, `route`, `relay_kind`, `outcome`, `grpc_code` | Local relay setup and outbound peer attempts, counted once when they finish or are cancelled. Each retry counts separately. |
 | `openshell_server_peer_request_duration_seconds` | Histogram | `operation`, `outcome` | Latency of outbound peer requests only (`route="peer"`). For relays, until the owner's supervisor claimed the relay. |
 
+Mutation locks:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_mutation_lock_wait_seconds` | Histogram | `scope` | Time to acquire a mutation lock, recorded for successful acquisitions. |
+| `openshell_server_mutation_lock_timeouts_total` | Counter | `scope` | Acquisitions that waited longer than 10 seconds, including background work such as supervisor disconnect handling and provider credential refresh. API requests fail with `UNAVAILABLE` and reason `MUTATION_LOCK_TIMEOUT`, and [API Errors](/sdk/api-errors) describes how to retry them. A lock connection that PostgreSQL does not open, although at least a second of the wait remained, is not counted. |
+
 The labels take these values:
 
 - `operation` is `relay`, `report_provider_readiness`, `report_endpoint_status`,
@@ -210,6 +217,7 @@ The labels take these values:
   unchanged. The label is not named `code` because
   `openshell_server_grpc_requests_total` uses that name for the numeric status
   code.
+- `scope` is `global`, `workspace`, or `sandbox`.
 
 Gauges and counters exist from startup. They start at `0`, except
 `openshell_server_relay_pending_capacity`, which starts at its limit. `openshell_server_routed_request_attempts_total` starts with seven
