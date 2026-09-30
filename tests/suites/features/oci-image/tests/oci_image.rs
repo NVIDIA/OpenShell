@@ -21,6 +21,22 @@ const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const ENGINE_ENV: &str = "OPENSHELL_TEST_CONTAINER_ENGINE";
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+/// Sandbox condition reason for an image `WORKDIR` the sandbox identity
+/// cannot use.
+const WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFailed";
+/// A complete sandbox policy without a `process` section, so the sandbox
+/// identity falls back to the image `USER`.
+const IMAGE_IDENTITY_POLICY: &str = "version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /lib64, /proc, /dev/urandom, /etc]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+
+network_policies: {}
+";
 
 /// A named image user that owns its custom `WORKDIR`. Existing image content
 /// keeps its ownership.
@@ -42,14 +58,15 @@ USER app
             "{} test \"$(stat -c %u:%g .)\" = 1234:1235;",
             workspace_checks("1234:1235", "/workspace/project", true)
         );
-        let sandbox = create_sandbox(runner, "named", "nu", &image, &checks).await?;
+        let sandbox = create_sandbox(runner, "named", "nu", &image, None, &checks).await?;
         file_transfer_uses_workspace(runner, &sandbox).await
     })
     .await;
 }
 
 /// A numeric image user without passwd entries can reach a custom `WORKDIR`
-/// whose parent directories are private to that user.
+/// whose parent directories are private to that user. The sandbox policy omits
+/// `process`, so the image `USER` is the only source of the sandbox identity.
 #[tokio::test]
 async fn custom_workdir_with_numeric_user_and_private_parents() {
     run("oci-image/custom-workdir-numeric-user", async |runner| {
@@ -66,8 +83,16 @@ USER 2345:2346
 "
             ),
         )?;
+        let policy_file = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create policy file: {error}"))?;
+        std::fs::write(policy_file.path(), IMAGE_IDENTITY_POLICY)
+            .map_err(|error| format!("write policy file: {error}"))?;
+        let policy = policy_file
+            .path()
+            .to_str()
+            .ok_or("policy path is not UTF-8")?;
         let checks = workspace_checks("2345:2346", "/home/app/project", true);
-        create_sandbox(runner, "numeric", "pu", &image, &checks)
+        create_sandbox(runner, "numeric", "pu", &image, Some(policy), &checks)
             .await
             .map(drop)
     })
@@ -84,7 +109,7 @@ async fn default_workdir_uses_managed_workspace() {
             &format!("FROM {BASE_IMAGE}\nUSER 2345:2346\n"),
         )?;
         let checks = workspace_checks("2345:2346", "/sandbox", false);
-        create_sandbox(runner, "default", "dw", &image, &checks)
+        create_sandbox(runner, "default", "dw", &image, None, &checks)
             .await
             .map(drop)
     })
@@ -92,7 +117,8 @@ async fn default_workdir_uses_managed_workspace() {
 }
 
 /// OpenShell rejects a custom `WORKDIR` that the image user cannot write
-/// instead of granting the user new access to it.
+/// instead of granting the user new access to it, and reports that reason
+/// rather than a generic startup failure.
 #[tokio::test]
 async fn unwritable_custom_workdir_is_rejected() {
     run("oci-image/unwritable-workdir", async |runner| {
@@ -129,6 +155,13 @@ USER app
             .map_err(|error| error.to_string())?;
         if create.success() || create.stdout().contains("should-not-run") {
             return Err(create.failure_diagnostic("sandbox creation fails before the command runs"));
+        }
+        if !create.stdout().contains(WORKSPACE_VALIDATION_FAILED)
+            && !create.stderr().contains(WORKSPACE_VALIDATION_FAILED)
+        {
+            return Err(create.failure_diagnostic(&format!(
+                "sandbox creation fails with {WORKSPACE_VALIDATION_FAILED}"
+            )));
         }
         Ok(())
     })
@@ -173,6 +206,7 @@ async fn create_sandbox(
     suffix: &str,
     short: &str,
     image: &TestImage,
+    policy: Option<&str>,
     checks: &str,
 ) -> Result<String, String> {
     // Sandbox names are limited to 19 characters on some drivers.
@@ -182,14 +216,16 @@ async fn create_sandbox(
         "(set -eu; {checks} touch main-write) >/tmp/oci-main.log 2>&1; \
          echo $? >/tmp/oci-main.status; exec sleep infinity"
     );
+    let mut args = vec!["sandbox", "create", "--name", &name, "--from", &image.tag];
+    if let Some(policy) = policy {
+        args.extend(["--policy", policy]);
+    }
+    args.extend(["--detach", "--", "sh", "-c", &main]);
     runner
         .step(format!("{suffix}/create"))
         .description("sandbox starts from the test image")
         .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox", "create", "--name", &name, "--from", &image.tag, "--detach", "--", "sh",
-            "-c", &main,
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?
         .require_success()?;
