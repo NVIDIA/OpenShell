@@ -1265,18 +1265,23 @@ async fn reject_live_request_body<C: AsyncRead + AsyncWrite + Unpin>(
 /// Credential signing and body rewriting need the complete request body
 /// before upstream contact, so middleware output is withheld on those routes,
 /// up to the smallest body those steps accept. Adding middleware therefore
-/// does not lower the body size a route already handles.
+/// does not lower the body size a route already handles. OCI signing hashes
+/// POST, PUT, and PATCH bodies and buffers them under the same ceiling as
+/// `SigV4` body signing.
 fn request_body_delivery(config: &L7EndpointConfig) -> RequestBodyDelivery {
-    let sigv4 = config
-        .credential_signing
-        .is_sigv4()
-        .then_some(crate::l7::rest::MAX_SIGV4_BODY_BYTES);
+    let signing = if config.credential_signing.is_sigv4() {
+        Some(crate::l7::rest::MAX_SIGV4_BODY_BYTES)
+    } else if config.credential_signing.is_oci() {
+        Some(crate::l7::rest::MAX_OCI_BODY_BYTES)
+    } else {
+        None
+    };
     let rewrite = (config.protocol == L7Protocol::Rest && config.request_body_credential_rewrite)
         .then_some(crate::l7::rest::MAX_REWRITE_BODY_BYTES);
-    match (sigv4, rewrite) {
+    match (signing, rewrite) {
         (None, None) => RequestBodyDelivery::Incremental,
-        (sigv4, rewrite) => RequestBodyDelivery::Withhold {
-            max_bytes: sigv4.into_iter().chain(rewrite).min().unwrap_or_default(),
+        (signing, rewrite) => RequestBodyDelivery::Withhold {
+            max_bytes: signing.into_iter().chain(rewrite).min().unwrap_or_default(),
         },
     }
 }
@@ -14597,12 +14602,19 @@ network_policies:
             request_body_delivery(&crate::l7::parse_l7_config(&val).unwrap())
         };
         let sigv4 = r#", "credential_signing": "sigv4", "signing_service": "bedrock""#;
+        let oci = r#", "credential_signing": "oci""#;
         let rewrite = r#", "request_body_credential_rewrite": true"#;
         assert_eq!(delivery(""), RequestBodyDelivery::Incremental);
         assert_eq!(
             delivery(sigv4),
             RequestBodyDelivery::Withhold {
                 max_bytes: crate::l7::rest::MAX_SIGV4_BODY_BYTES
+            }
+        );
+        assert_eq!(
+            delivery(oci),
+            RequestBodyDelivery::Withhold {
+                max_bytes: crate::l7::rest::MAX_OCI_BODY_BYTES
             }
         );
         assert_eq!(

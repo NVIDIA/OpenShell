@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-genai-native.yaml
+#   openshell provider profile import -f providers/oci-genai-native.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl. Add the interpreter that runs your OCI SDK client
+#                    (for example the langchain-oci ChatOCIGenAI class) before
+#                    relying on binary-scoped attribution.
+# Reference layout:  any image whose client sends unsigned requests to the
+#                    native Generative AI API; the proxy signs them. This is
+#                    the signed counterpart of oci-genai.yaml, which uses a
+#                    bearer Generative AI API key on the OpenAI-compatible
+#                    endpoint and needs no signing.
+# Credential scope:  OCI_KEY_ID and OCI_PRIVATE_KEY, signed by the proxy. Any
+#                    OCI principal works: API key, session token, instance,
+#                    resource, or OKE workload identity.
+# Endpoint access:   the regional Generative AI inference hosts in the
+#                    commercial realm, limited to the native /20231130 API.
+#                    Requests carry the compartment OCID in the body, so the
+#                    sandbox must know it; scope the key's IAM policy to that
+#                    compartment.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/chat \
+#                        -H 'Content-Type: application/json' \
+#                        -d '{"compartmentId":"<compartment-ocid>","servingMode":{"servingType":"ON_DEMAND","modelId":"meta.llama-3.3-70b-instruct"},"chatRequest":{"apiFormat":"GENERIC","messages":[{"role":"USER","content":[{"type":"TEXT","text":"Reply with OK"}]}],"maxTokens":20}}'
+
+id: oci-genai-native
+display_name: OCI Generative AI (native API)
+description: OCI Generative AI native inference API via proxy-side OCI request signing
+category: inference
+inference_capable: true
+credentials:
+  - name: key_id
+    description: OCI signing key id (tenancy/user/fingerprint for an API key, or ST$<token> for a principal)
+    env_vars: [OCI_KEY_ID]
+    required: true
+  - name: private_key
+    description: Base64 of the unencrypted RSA private key PEM that pairs with the key id (single line, `base64 -w0 < key.pem`)
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true
+endpoints:
+  # `*` matches exactly one DNS label, which is the region identifier.
+  - host: "inference.generativeai.*.oci.oraclecloud.com"
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    credential_signing: oci
+    rules:
+      - allow: { method: POST, path: "/20231130/**" }
+      - allow: { method: GET, path: "/20231130/**" }
+binaries: [/usr/bin/curl, /usr/local/bin/curl]
