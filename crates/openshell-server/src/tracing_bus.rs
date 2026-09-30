@@ -299,24 +299,6 @@ impl TracingLogBus {
             .collect::<Vec<CursoredEvent>>()
     }
 
-    /// Like `tail`, but also reports the coverage floor `max` leaves behind.
-    ///
-    /// See `tail_with_floor_impl`: a cursor at or below the returned floor
-    /// isn't safe to advertise as a resume point, because `max` -- not
-    /// eviction -- is why anything at or below it is missing from this
-    /// batch.
-    pub(crate) fn tail_with_floor(
-        &self,
-        sandbox_id: &str,
-        max: usize,
-    ) -> (Vec<CursoredEvent>, u64) {
-        let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || (Vec::new(), 0),
-            |per| tail_with_floor_impl(&per.tail, max),
-        )
-    }
-
     /// Identity and extent of this sandbox's current cursor space.
     ///
     /// `None` means nothing has been published for the sandbox, so there is no
@@ -428,6 +410,77 @@ impl TracingLogBus {
         });
         ResumeSnapshot::Read(log, platform)
     }
+
+    /// Read both bounded initial tails and the space's high-water mark, all
+    /// under one lock hold.
+    ///
+    /// `None` skips a source. Holding the cursor-space lock -- the one every
+    /// publish holds across its tail insert and broadcast send -- means no
+    /// publish can land between the two reads, and `highest_seq` is exactly
+    /// the boundary between what these tails could see and what can only
+    /// arrive live. Every event at or below it was already buffered when the
+    /// tails were read, so the caller can suppress live copies at or below it
+    /// without dropping anything the tails could not have covered.
+    ///
+    /// Reads never mint a space: with none, both tails are empty and
+    /// `highest_seq` is `0`.
+    pub(crate) fn snapshot_tail(
+        &self,
+        sandbox_id: &str,
+        log_max: Option<usize>,
+        platform_max: Option<usize>,
+    ) -> TailSnapshot {
+        let spaces = self.seq.lock();
+        let highest_seq = spaces
+            .get(sandbox_id)
+            .map_or(0, |space| space.next.saturating_sub(1));
+
+        let (logs, log_floor) = log_max.map_or_else(
+            || (Vec::new(), 0),
+            |max| {
+                let inner = self.inner.lock().expect("tracing bus lock poisoned");
+                inner.per_id.get(sandbox_id).map_or_else(
+                    || (Vec::new(), 0),
+                    |per| tail_with_floor_impl(&per.tail, max),
+                )
+            },
+        );
+        let (events, platform_floor) = platform_max.map_or_else(
+            || (Vec::new(), 0),
+            |max| {
+                let inner = self
+                    .platform_event_bus
+                    .inner
+                    .lock()
+                    .expect("platform event bus lock poisoned");
+                inner.per_id.get(sandbox_id).map_or_else(
+                    || (Vec::new(), 0),
+                    |per| tail_with_floor_impl(&per.tail, max),
+                )
+            },
+        );
+        drop(spaces);
+
+        TailSnapshot {
+            logs,
+            log_floor,
+            events,
+            platform_floor,
+            highest_seq,
+        }
+    }
+}
+
+/// Outcome of [`TracingLogBus::snapshot_tail`]. Each floor is the one
+/// `tail_with_floor_impl` reports for that source; an unread source has no
+/// events and a floor of `0`.
+pub(crate) struct TailSnapshot {
+    pub(crate) logs: Vec<CursoredEvent>,
+    pub(crate) log_floor: u64,
+    pub(crate) events: Vec<CursoredEvent>,
+    pub(crate) platform_floor: u64,
+    /// Highest seq the space had issued at the lock hold; `0` with no space.
+    pub(crate) highest_seq: u64,
 }
 
 /// Outcome of [`TracingLogBus::snapshot_after`].
@@ -873,25 +926,95 @@ mod tests {
     }
 
     #[test]
-    fn tracing_log_bus_tail_with_floor_reports_truncation() {
+    fn snapshot_tail_reports_truncation() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-floor";
         for _ in 0..5 {
             bus.publish_external(make_log_event(sandbox_id, "line"));
         }
-        let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
-        assert_eq!(cursors(&events), vec![4, 5]);
-        assert_eq!(floor, 3);
+        let snap = bus.snapshot_tail(sandbox_id, Some(2), None);
+        assert_eq!(cursors(&snap.logs), vec![4, 5]);
+        assert_eq!(snap.log_floor, 3);
 
         // Wide enough to cover everything: no floor.
-        let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
-        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
-        assert_eq!(floor, 0);
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), None);
+        assert_eq!(cursors(&snap.logs), vec![1, 2, 3, 4, 5]);
+        assert_eq!(snap.log_floor, 0);
+    }
 
-        // Unknown sandbox: nothing buffered, no floor.
-        let (events, floor) = bus.tail_with_floor("nope", 10);
-        assert!(events.is_empty());
-        assert_eq!(floor, 0);
+    /// `highest_seq` is the space's high-water mark at the lock hold, not the
+    /// newest event either window returned: events a depth excluded still
+    /// count, since they were buffered when the tails were read and can only
+    /// reach a live receiver as a duplicate of pre-snapshot history.
+    #[test]
+    fn snapshot_tail_reports_the_high_water_mark_past_excluded_events() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-hwm";
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 2
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 3
+
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), Some(0));
+        assert_eq!(cursors(&snap.logs), vec![1, 2]);
+        assert_eq!(snap.log_floor, 0);
+        assert!(snap.events.is_empty());
+        assert_eq!(snap.platform_floor, 3);
+        assert_eq!(snap.highest_seq, 3);
+    }
+
+    /// An unread source is skipped outright; a sandbox with nothing published
+    /// yields empty tails and a zero mark without minting a cursor space.
+    #[test]
+    fn snapshot_tail_skips_unread_sources_and_never_mints_a_space() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-tail-skip";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0));
+
+        let snap = bus.snapshot_tail(sandbox_id, Some(10), None);
+        assert_eq!(cursors(&snap.logs), vec![1]);
+        assert!(snap.events.is_empty());
+        assert_eq!(snap.platform_floor, 0);
+        assert_eq!(snap.highest_seq, 2);
+
+        let snap = bus.snapshot_tail("nope", Some(10), Some(10));
+        assert!(snap.logs.is_empty() && snap.events.is_empty());
+        assert_eq!(snap.highest_seq, 0);
+        assert_eq!(bus.cursor_space("nope"), None);
+    }
+
+    /// Same guarantee as `snapshot_after_blocks_while_cursor_space_is_locked`
+    /// for the initial read: `snapshot_tail` takes the lock every publish holds
+    /// across its tail insert and broadcast send, so no publish can land
+    /// between the log read and the platform read.
+    #[test]
+    fn snapshot_tail_blocks_while_cursor_space_is_locked() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-tail-lock";
+        bus.publish_external(make_log_event(sandbox_id, "line"));
+
+        let guard = bus.seq.lock();
+
+        let bus2 = bus.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            bus2.snapshot_tail(sandbox_id, Some(10), Some(10));
+            done_tx.send(()).unwrap();
+        });
+
+        // Give the worker time to reach (and block on) the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "snapshot_tail returned without waiting for the cursor-space lock"
+        );
+
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot_tail should complete once the lock is released");
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1292,7 +1415,9 @@ impl PlatformEventBus {
     }
 
     /// Return buffered platform events and the coverage floor `max` leaves
-    /// behind. See `TracingLogBus::tail_with_floor`.
+    /// behind. See `tail_with_floor_impl`. Production reads go through
+    /// `TracingLogBus::snapshot_tail`, which holds the cursor-space lock.
+    #[cfg(test)]
     pub(crate) fn tail_with_floor(
         &self,
         sandbox_id: &str,

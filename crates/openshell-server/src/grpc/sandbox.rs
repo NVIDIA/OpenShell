@@ -1871,24 +1871,22 @@ pub(super) async fn handle_watch_sandbox(
             // replay buffer and a live receiver; the live loop suppresses events
             // at or below its source's mark so each is delivered exactly once.
             //
-            // The two marks must stay separate. Both buses number from one
-            // shared cursor space, but they are read at different instants and
-            // bounded independently (`log_tail_lines` vs `event_tail`, which has
-            // no default and so replays nothing unless the client asks). A
-            // single shared mark therefore lets the deeper source censor the
-            // shallower one: with the default `event_tail` of 0 the mark rises
-            // to the newest buffered log while no platform event was replayed at
-            // all, and every platform event published in the initialization
-            // window is dropped as a duplicate of something never sent. Keyed by
-            // source, an event is suppressed only if its own source's replay
-            // actually covered it.
+            // Both reads happen under one cursor-space lock hold, so every
+            // event at or below the snapshot's high-water mark was buffered
+            // when they ran. A resume replays everything after the cursor from
+            // each followed source, so each source's mark is the last seq its
+            // own replay returned. The initial tail is depth-bounded, so both
+            // marks move to the snapshot's high-water mark instead: anything at
+            // or below it was either in the batch or deliberately left out as
+            // pre-snapshot history, and its live copy must not arrive after a
+            // higher cursor from the batch.
             //
-            // No unit test pins this. The only reachable window is between the
-            // subscribe above and the log tail read below -- an event published
-            // earlier is replayed rather than live, and one published later
-            // outranks the mark -- and the producer crosses that window with no
-            // await a test can wedge open. Reproducing it needs a seam in the
-            // producer, which is not worth adding to production code.
+            // No gateway-level test reaches the window between the subscribe
+            // above and the snapshot below: the producer crosses it with no
+            // await a test can wedge open. The bus-level
+            // `snapshot_tail_blocks_while_cursor_space_is_locked` and
+            // `snapshot_after_blocks_while_cursor_space_is_locked` pin the
+            // atomicity this relies on.
             let resume_seq = resume_after.map_or(0, |resume| resume.seq);
             let mut log_cutoff: u64 = resume_seq;
             let mut platform_cutoff: u64 = resume_seq;
@@ -2037,28 +2035,24 @@ pub(super) async fn handle_watch_sandbox(
                 // That's the trade-off of a single shared scalar cursor: an
                 // event handed out below the sibling's floor would let a
                 // resume skip the sibling's withheld events past it.
-                let mut logs = Vec::new();
-                let log_floor = if follow_logs {
-                    let (l, floor) = state
-                        .tracing_log_bus
-                        .tail_with_floor(&sandbox_id, log_tail as usize);
-                    logs = l;
-                    floor
-                } else {
-                    0_u64
-                };
-
-                let mut events = Vec::new();
-                let platform_floor = if follow_events {
-                    let (e, floor) = state
-                        .tracing_log_bus
-                        .platform_event_bus
-                        .tail_with_floor(&sandbox_id, event_tail as usize);
-                    events = e;
-                    floor
-                } else {
-                    0_u64
-                };
+                //
+                // Both windows and the space's high-water mark come from one
+                // lock hold (see `TracingLogBus::snapshot_tail`), so no
+                // publish can land between the two reads. Read separately, a
+                // log published after the log read and a platform event
+                // published after it could let the platform window hand out
+                // the higher cursor while the log arrives live afterwards.
+                let crate::tracing_bus::TailSnapshot {
+                    mut logs,
+                    log_floor,
+                    mut events,
+                    platform_floor,
+                    highest_seq,
+                } = state.tracing_log_bus.snapshot_tail(
+                    &sandbox_id,
+                    follow_logs.then_some(log_tail as usize),
+                    follow_events.then_some(event_tail as usize),
+                );
 
                 // 0 means "nothing excluded" for a source, so a fully-covered
                 // source never raises the maximum.
@@ -2071,35 +2065,31 @@ pub(super) async fn handle_watch_sandbox(
                 events.retain(|cursored| cursored.seq > critical_floor);
                 let platform_withheld = before - events.len();
 
-                // Cutoffs reflect only what this batch actually delivered.
-                // Withheld backlog was already published before this
-                // connect, so it can never arrive again via the live
-                // broadcast -- there's nothing to suppress a duplicate of,
-                // and raising a cutoff past what was sent would risk
-                // swallowing a genuinely new live event with a seq in the
-                // withheld range instead.
+                // Both cutoffs move to the snapshot's high-water mark. The
+                // receivers were subscribed before the snapshot, so an event
+                // published in between is both buffered and queued live. At
+                // or below the mark, it was either delivered above or left
+                // out of this batch as pre-snapshot history; delivering its
+                // live copy would emit a lower cursor after a higher one
+                // from the batch. Above the mark, it can only arrive live.
+                log_cutoff = log_cutoff.max(highest_seq);
+                platform_cutoff = platform_cutoff.max(highest_seq);
+
                 let mut tail: Vec<CursoredEvent> = Vec::new();
-                if let Some(last) = logs.last() {
-                    log_cutoff = log_cutoff.max(last.seq);
-                }
                 tail.extend(logs);
-                if let Some(last) = events.last() {
-                    platform_cutoff = platform_cutoff.max(last.seq);
-                }
                 tail.extend(events);
 
                 tail.sort_by_key(|cursored| cursored.seq);
 
                 // Disclose the gap before anything else in this batch. The
-                // cutoffs above are never raised past what was actually
-                // delivered, so a later live event past the floor still
-                // reaches the client -- withholding it too would starve the
-                // stream indefinitely, since the backlog behind the floor
-                // was published before subscribe and will never arrive live
-                // to fill it in. The client has to learn the gap exists from
-                // this warning; a resume from any cursor this batch hands out
-                // cannot recover it, and `tail_after` reports no gap
-                // when asked, since nothing was evicted, only never sent.
+                // withheld events sit at or below the snapshot's mark, so the
+                // cutoffs above keep their live copies (if any) from being
+                // delivered out of order, while later live events past the
+                // mark still reach the client. The client has to learn the
+                // gap exists from this warning; a resume from any cursor this
+                // batch hands out cannot recover it, and `tail_after` reports
+                // no gap when asked, since nothing was evicted, only never
+                // sent.
                 if log_withheld > 0 || platform_withheld > 0 {
                     let warning = crate::sandbox_watch::coverage_gap_warning_event(
                         log_withheld,

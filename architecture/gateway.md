@@ -515,26 +515,28 @@ whatever each bus kept; it does not align their depths.
 
 The broadcast receivers are subscribed before replay, so an event buffered during
 initialization could appear in both replay and the live receiver; the producer
-tracks the highest replayed seq and suppresses live events at or below it, so
-each event is delivered once. That mark is per source, because the two tails are
-read at different instants and bounded independently — one shared mark would let
-the deeper source censor the shallower one, discarding the shallower source's own
-live arrivals as duplicates of a replay that never ran. Subscribing never mints a
-cursor space, so a resume against a torn-down sandbox cannot create the space its
-stale cursor is then checked against. Clients track the highest observed `cursor`
-and pass it as `resume_after_cursor` on reconnect.
+keeps a per-source mark and suppresses live events at or below it, so each event
+is delivered once. Subscribing never mints a cursor space, so a resume against a
+torn-down sandbox cannot create the space its stale cursor is then checked
+against. Clients track the highest observed `cursor` and pass it as
+`resume_after_cursor` on reconnect.
 
-On resume, epoch validation and both bus reads happen inside one call under one
-lock — `TracingLogBus::snapshot_after` — rather than as a validate-then-read
-pair. A publish landing between two independently-locked reads would be visible
-to whichever ran second and not the other, desyncing their high-water marks
-against a live stream that treats them as read at the same instant; a teardown
-plus a republish landing between a *separate* validation and read would apply
-the old space's seq to the replacement's buffers and find no gap, since
-`tail_after` only compares numbers, not epochs. Folding validation into the same
-lock hold as the reads closes both windows at once: nothing can retire or
-recreate the space while it's held, so a second post-read epoch check isn't
-needed.
+Both replay paths read the two buses inside one call under the cursor-space lock
+that every publish holds across its buffer insert and broadcast send:
+`TracingLogBus::snapshot_after` on resume and `TracingLogBus::snapshot_tail`
+without a cursor. A publish landing between two independently locked reads would
+let the second read hand out a higher cursor while a lower event from the other
+source arrives live afterwards, and a client that disconnected in between would
+resume past it. On resume, the same lock hold also validates the epoch, so a
+teardown plus a republish cannot retire the validated space and install a
+replacement numbered from 1 before the reads apply the old seq to it.
+
+The marks differ by path. A resume replays everything after the cursor, so each
+source's mark is the last seq its own replay returned. The initial tail is
+bounded by depth, so both marks move to the snapshot's high-water mark: every
+event at or below it was already buffered, and was either sent in the batch or
+left out as pre-snapshot history. Its live copy is suppressed rather than
+delivered after a higher cursor from the batch.
 
 #### Coverage floor
 
