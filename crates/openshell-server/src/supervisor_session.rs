@@ -1689,6 +1689,37 @@ fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
     owner.is_fresh(OWNER_TTL)
 }
 
+/// The replica currently holding this sandbox's supervisor session, if known.
+pub async fn owner_replica_id(state: &Arc<ServerState>, sandbox_id: &str) -> Option<String> {
+    if state.store.is_single_replica() {
+        return None;
+    }
+    let local = state.supervisor_sessions.has_session(sandbox_id);
+    let owner = if local {
+        None
+    } else {
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        resolve_owner(state, &owner_index, sandbox_id)
+            .await
+            .ok()
+            .flatten()
+    };
+    owner_hint(&state.replica_id, local, owner.as_ref())
+}
+
+fn owner_hint(
+    self_replica_id: &str,
+    local: bool,
+    owner: Option<&crate::supervisor_owner::OwnerRecord>,
+) -> Option<String> {
+    if local {
+        return Some(self_replica_id.to_string());
+    }
+    owner
+        .filter(|owner| owner_is_fresh(owner))
+        .map(|owner| owner.owner_replica_id.clone())
+}
+
 /// Endpoint recorded when this replica advertises none.
 fn local_owner_endpoint(replica_id: &str) -> String {
     format!("{LOCAL_OWNER_ENDPOINT_SCHEME}{replica_id}")
@@ -4682,6 +4713,20 @@ mod tests {
             .expect("should redirect to another replica");
         assert_eq!(redirect.owner_replica_id, "gw-1");
         assert_eq!(redirect.peer_endpoint, "https://gw-1:8443");
+    }
+
+    #[test]
+    fn owner_hint_names_the_replica_holding_the_session() {
+        assert_eq!(owner_hint("gw-0", true, None).as_deref(), Some("gw-0"));
+        assert_eq!(
+            owner_hint("gw-0", false, Some(&owner_record("gw-1"))).as_deref(),
+            Some("gw-1")
+        );
+        assert_eq!(owner_hint("gw-0", false, None), None);
+
+        let mut stale = owner_record("gw-1");
+        stale.updated_at_ms = 0;
+        assert_eq!(owner_hint("gw-0", false, Some(&stale)), None);
     }
 
     #[test]

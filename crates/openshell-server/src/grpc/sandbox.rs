@@ -886,11 +886,18 @@ fn template_resource_struct(resources: &SandboxResources) -> Option<Struct> {
     }
 }
 
+fn owner_requested<T>(request: &Request<T>) -> bool {
+    request
+        .metadata()
+        .contains_key(openshell_core::replica_routing::OWNER_REQUEST_HEADER)
+}
+
 pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let wants_owner = owner_requested(&request);
     let req = request.into_inner();
     let sandbox = resolve_and_authorize_sandbox_name(
         state,
@@ -900,10 +907,21 @@ pub(super) async fn handle_get_sandbox(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(SandboxResponse {
+    let owner = if wants_owner {
+        crate::supervisor_session::owner_replica_id(state, sandbox.object_id()).await
+    } else {
+        None
+    };
+    let mut response = Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-    }))
+    });
+    if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
+        response
+            .metadata_mut()
+            .insert(openshell_core::replica_routing::OWNER_REPLICA_HEADER, value);
+    }
+    Ok(response)
 }
 
 pub(super) async fn handle_list_sandboxes(
@@ -6991,6 +7009,49 @@ mod tests {
                 .and_then(|metadata| metadata.annotations.get(&annotation_key)),
             Some(&annotation_value)
         );
+    }
+
+    #[tokio::test]
+    async fn single_replica_get_sandbox_sends_no_owner_hint() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("hinted", Vec::new());
+        sandbox.metadata.as_mut().unwrap().workspace = "default".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "session-a".to_string(),
+            mpsc::channel(1).0,
+            oneshot::channel().0,
+        );
+
+        let mut request = authed_request(GetSandboxRequest {
+            name: "hinted".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        });
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::OWNER_REQUEST_HEADER,
+            "1".parse().unwrap(),
+        );
+        let response = handle_get_sandbox(&state, request).await.unwrap();
+        assert!(
+            response
+                .metadata()
+                .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_is_resolved_only_when_requested() {
+        let mut request = Request::new(());
+        assert!(!owner_requested(&request));
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::OWNER_REQUEST_HEADER,
+            "1".parse().unwrap(),
+        );
+        assert!(owner_requested(&request));
     }
 
     #[tokio::test]
