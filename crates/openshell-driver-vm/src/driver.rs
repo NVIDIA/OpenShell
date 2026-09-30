@@ -2259,6 +2259,17 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
+        // Startup recovery bypasses create/start admission. Validate saved
+        // credentials before host preparation, extension hooks, or state changes.
+        if let Err(error) = decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        ) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
+            return false;
+        }
         if let Err(error) = self.validate_sandbox(&sandbox) {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
             return false;
@@ -7851,6 +7862,7 @@ mod tests {
                 id: format!("sb-restored-trace-{suffix}"),
                 name: format!("restored-trace-{suffix}"),
                 spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication(suffix).0,
                     template: Some(SandboxTemplate {
                         image: "invalid image reference".to_string(),
                         ..Default::default()
@@ -10239,6 +10251,122 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
         assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_invalid_launch_authentication_before_side_effects() {
+        #[derive(Debug, Default)]
+        struct RestoreObserver {
+            calls: AtomicUsize,
+        }
+
+        #[tonic::async_trait]
+        impl LifecycleExtension for RestoreObserver {
+            fn name(&self) -> &str {
+                "restore-observer"
+            }
+
+            async fn before_restore(&self, _sandbox: &RestoreContext) -> LifecycleResult<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        for scan_at_startup in [true, false] {
+            for authentication in [
+                Vec::new(),
+                br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let observer = Arc::new(RestoreObserver::default());
+                let mut driver =
+                    test_driver_with_extensions(LifecycleExtensionRegistry::with(vec![
+                        observer.clone(),
+                    ]));
+                driver.config.state_dir = directory.path().to_path_buf();
+                driver.config.default_image = "invalid image reference".to_string();
+                let sandbox = Sandbox {
+                    id: "sb-auth-restore".to_string(),
+                    name: "auth-restore".to_string(),
+                    spec: Some(SandboxSpec {
+                        launch_authentication: authentication,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let state_dir = sandbox_state_dir(directory.path(), &sandbox.id).unwrap();
+                create_private_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                fs::write(state_dir.join("overlay.ext4"), b"retained overlay").unwrap();
+                fs::write(state_dir.join(HOST_AUTH_BUNDLE_FILE), b"retained auth").unwrap();
+                if !scan_at_startup {
+                    fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n").unwrap();
+                }
+                let mut original_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                original_files.sort();
+                let mut events = driver.events.subscribe();
+
+                let accepted = if scan_at_startup {
+                    driver.restore_persisted_sandboxes().await;
+                    false
+                } else {
+                    driver
+                        .restore_persisted_sandbox(
+                            sandbox.clone(),
+                            state_dir.clone(),
+                            true,
+                            &tracing::Span::current(),
+                        )
+                        .await
+                };
+                // If validation regresses, join the failed provisioning task so
+                // its later cleanup cannot race with the state assertions.
+                let task = driver
+                    .registry
+                    .lock()
+                    .await
+                    .get_mut(&sandbox.id)
+                    .and_then(|record| record.provisioning_task.take());
+                if let Some(task) = task {
+                    task.await.unwrap();
+                }
+
+                assert!(
+                    !accepted,
+                    "invalid launch credentials must deny restoration"
+                );
+                assert_eq!(
+                    observer.calls.load(Ordering::Relaxed),
+                    0,
+                    "launch authentication must precede lifecycle extension hooks"
+                );
+                assert!(driver.registry.lock().await.is_empty());
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+                assert!(
+                    !extension_state_dir(&state_dir, "restore-observer")
+                        .unwrap()
+                        .exists()
+                );
+                let mut retained_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                retained_files.sort();
+                assert_eq!(retained_files, original_files);
+            }
+        }
     }
 
     #[test]
