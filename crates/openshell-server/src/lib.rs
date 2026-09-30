@@ -288,12 +288,6 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
-    /// Serializes settings mutations (global and sandbox) to prevent
-    /// read-modify-write races. Held for the duration of any setting
-    /// set/delete operation, including the precedence check on sandbox
-    /// mutations that reads global state.
-    pub settings_mutex: tokio::sync::Mutex<()>,
-
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -447,7 +441,6 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
-            settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             replica_id,

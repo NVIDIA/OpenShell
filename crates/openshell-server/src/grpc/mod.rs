@@ -191,6 +191,10 @@ struct StoredSettings {
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
     resource_version: u64,
+    /// Database id of the loaded row. Not persisted; a save aborts when the
+    /// row was deleted and recreated under the same name since the load.
+    #[serde(skip)]
+    record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

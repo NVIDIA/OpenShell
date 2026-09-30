@@ -387,6 +387,10 @@ impl PostgresStore {
             // starts. PostgreSQL then abandons the wait at the caller's
             // deadline even if this future is cancelled and the socket closed.
             let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
                 LockMode::Exclusive => {
                     "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
                      SELECT pg_advisory_lock($2) FROM timeout"

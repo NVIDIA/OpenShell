@@ -10,6 +10,7 @@ use super::{
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
 };
 use crate::ServerState;
+use crate::compute::MutationScope;
 use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
@@ -111,9 +112,19 @@ async fn handle_report_endpoint_status_inner(
     // Session validation, configuration derivation, and persistence share the
     // sandbox mutation boundary. A newly registered supervisor can therefore
     // invalidate its predecessor before any stale report reaches the CAS.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&req.sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
@@ -362,9 +373,19 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     sandbox_id: &str,
     supervisor_session_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_current_session(sandbox_id, supervisor_session_id)
@@ -409,9 +430,19 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if state
         .supervisor_sessions
         .current_session_id(sandbox_id)
@@ -485,12 +516,16 @@ pub async fn retry_endpoint_status_after_supervisor_disconnect(
 /// runs before gateway listeners are bound. A fresh shared owner preserves its
 /// evidence; records without one are reset so stale success is never served.
 pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(
-            error,
-            "acquire endpoint status startup reconciliation lock",
-        )
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status startup reconciliation lock",
+            )
+        })?;
     let mut offset = 0;
     loop {
         let sandboxes = state

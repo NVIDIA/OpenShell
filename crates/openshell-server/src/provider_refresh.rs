@@ -1497,12 +1497,15 @@ async fn apply_minted_credential(
             updated.credential_expiration_times.remove(key);
         }
     }
-    // Acquire the shared sandbox mutation boundary only around validation and
+    // Acquire the workspace mutation key only around validation and
     // persistence, after any remote minting or credential staging. This
     // prevents route status from committing against the old provider revision
     // after the rotation writes, without holding the guard across network I/O.
-    let _sandbox_sync_guard = if let Some(compute) = compute {
-        match compute.sandbox_sync_guard().await {
+    let _mutation_guard = if let Some(compute) = compute {
+        match compute
+            .mutation_guard(crate::compute::MutationScope::Workspace(workspace))
+            .await
+        {
             Ok(guard) => Some(guard),
             Err(error) => {
                 if let Some(credentials) = credentials
@@ -1510,9 +1513,10 @@ async fn apply_minted_credential(
                 {
                     cleanup_staged_refresh_handles(credentials, provider, handles).await;
                 }
-                return Err(Status::internal(format!(
-                    "acquire provider mutation lock: {error}"
-                )));
+                return Err(crate::grpc::persistence_error_to_status(
+                    error,
+                    "acquire provider mutation lock",
+                ));
             }
         }
     } else {

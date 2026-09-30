@@ -4,10 +4,39 @@
 //! Keys, modes, and deadlines of the mutation locks that serialize
 //! cross-object mutations across gateway replicas.
 //!
-//! On `PostgreSQL` a lock set is acquired as session-level advisory locks in
-//! ascending key order on one lock-pool connection, so every waiter on a key
-//! holds only smaller keys and no wait-for cycle can form.
+//! The locks form a hierarchy of intention locks. Each key is held shared
+//! (S) or exclusive (X):
+//!
+//! | Mutation | Keys |
+//! |---|---|
+//! | global policy and settings, platform-scope profiles | X(global) |
+//! | providers and workspace-scoped profiles | S(global) X(workspace) |
+//! | one sandbox, admin or supervisor | S(global) S(workspace) X(sandbox) |
+//! | lifecycle, driver watch, reconcile (process-local only) | S(global) X(sandbox) |
+//! | provisioning-deadline reconcile (process-local only) | S(global) S(workspace) X(sandbox) |
+//!
+//! Ordering rules, which make the scheme deadlock-free:
+//!
+//! 1. A per-sandbox lifecycle gate, where a path uses one, comes first.
+//! 2. Process-local keys follow in ascending `i64` order.
+//! 3. On `PostgreSQL`, the same keys follow as session-level advisory locks in
+//!    ascending order, all on one lock-pool connection.
+//! 4. A task never acquires a mutation guard or a local lifecycle lock while
+//!    it holds one: no nesting and no upgrade.
+//! 5. The SSH identity key, held on a data-pool connection, is a leaf: its
+//!    holders take no mutation guard, local key, or lifecycle gate, so sandbox
+//!    creation may wait for it while holding its guard.
+//!
+//! Within each layer every waiter on a key holds only smaller keys, and the
+//! local phase ends before the `PostgreSQL` phase starts, so no wait-for cycle
+//! can form.
+//!
+//! The global key is the legacy cross-object key. Gateways from earlier
+//! releases hold it exclusively for every mutation, which conflicts with every
+//! scope of this release, so mixed-version fleets stay mutually exclusive
+//! during a rolling upgrade.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -57,40 +86,91 @@ pub const LOCK_CONNECTION_MIN_BUDGET: Duration = Duration::from_secs(1);
 /// per second, where c is how long one guard is held.
 pub(super) const MUTATION_LOCK_POOL_MAX_CONNECTIONS: u32 = 4;
 
-/// Mode in which a mutation lock key is held.
+/// Domain separator hashed into every derived key.
+const KEY_DOMAIN: &[u8] = b"openshell/mutation-lock/v1";
+
+/// Advisory-lock key of the one-time time-payload migration
+/// (`PostgresStore::migrate_legacy_time_payloads`). Derived keys never use it.
+const TIME_PAYLOAD_MIGRATION_LOCK_KEY: i64 = 3052;
+
+/// Mode in which a mutation lock key is held. `Shared` sorts first, so the
+/// maximum of two modes is the stronger one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LockMode {
+    Shared,
     Exclusive,
 }
 
 /// A mutation lock key.
 #[derive(Clone, Copy, Debug)]
-pub enum MutationLockKey {
+pub enum MutationLockKey<'a> {
     /// The fleet-wide key, [`GLOBAL_MUTATION_LOCK_KEY`].
     Global,
+    /// One workspace, by name.
+    Workspace(&'a str),
+    /// One sandbox, by stable id.
+    Sandbox(&'a str),
 }
 
-impl MutationLockKey {
-    /// The `PostgreSQL` advisory-lock key.
+impl MutationLockKey<'_> {
+    /// The `PostgreSQL` advisory-lock key, also used by the process-local lock
+    /// table.
+    ///
+    /// Derived keys are the first 8 bytes, as a big-endian `i64`, of
+    /// `SHA-256(KEY_DOMAIN || 0 || kind || 0 || value)`. They are computed in
+    /// Rust so every replica and every `PostgreSQL` version agrees on them. A
+    /// hash collision only over-serializes.
     pub fn advisory_key(self) -> i64 {
         match self {
             Self::Global => GLOBAL_MUTATION_LOCK_KEY,
+            Self::Workspace(workspace) => derived_key(b"workspace", workspace),
+            Self::Sandbox(sandbox_id) => derived_key(b"sandbox", sandbox_id),
         }
+    }
+}
+
+fn derived_key(kind: &[u8], value: &str) -> i64 {
+    let digest = Sha256::new()
+        .chain_update(KEY_DOMAIN)
+        .chain_update([0])
+        .chain_update(kind)
+        .chain_update([0])
+        .chain_update(value.as_bytes())
+        .finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    avoid_reserved(i64::from_be_bytes(prefix))
+}
+
+/// Keep derived keys off the global, SSH identity, and migration keys.
+const fn avoid_reserved(key: i64) -> i64 {
+    if key == GLOBAL_MUTATION_LOCK_KEY
+        || key == SSH_IDENTITY_LOCK_KEY
+        || key == TIME_PAYLOAD_MIGRATION_LOCK_KEY
+    {
+        key ^ 1
+    } else {
+        key
     }
 }
 
 /// The keys one mutation holds, each in its strongest requested mode.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MutationLockSet {
-    #[expect(
-        clippy::zero_sized_map_values,
-        reason = "LockMode is zero-sized while Exclusive is its only mode"
-    )]
     entries: BTreeMap<i64, LockMode>,
 }
 
 impl MutationLockSet {
-    pub fn insert(&mut self, key: MutationLockKey, mode: LockMode) {
+    /// Process-local lock set of a lifecycle, driver-watch, or reconcile path:
+    /// S(global) X(sandbox).
+    pub fn sandbox_lifecycle(sandbox_id: &str) -> Self {
+        let mut set = Self::default();
+        set.insert(MutationLockKey::Global, LockMode::Shared);
+        set.insert(MutationLockKey::Sandbox(sandbox_id), LockMode::Exclusive);
+        set
+    }
+
+    pub fn insert(&mut self, key: MutationLockKey<'_>, mode: LockMode) {
         self.insert_raw(key.advisory_key(), mode);
     }
 
@@ -137,5 +217,75 @@ mod tests {
             set.iter().collect::<Vec<_>>(),
             vec![(-3, LockMode::Exclusive), (5, LockMode::Exclusive)]
         );
+    }
+
+    #[test]
+    fn derived_keys_match_golden_values() {
+        // Computed independently from the documented byte layout. Changing
+        // any of them breaks mutual exclusion with running replicas.
+        assert_eq!(
+            MutationLockKey::Workspace("default").advisory_key(),
+            4_171_374_605_116_754_083
+        );
+        assert_eq!(
+            MutationLockKey::Workspace("team-a").advisory_key(),
+            4_635_337_207_968_654_063
+        );
+        assert_eq!(
+            MutationLockKey::Sandbox("00000000-0000-0000-0000-000000000001").advisory_key(),
+            -542_384_872_970_356_635
+        );
+        assert_eq!(
+            MutationLockKey::Sandbox("sb-1").advisory_key(),
+            -7_385_842_969_463_770_825
+        );
+    }
+
+    #[test]
+    fn derived_keys_separate_kinds() {
+        assert_ne!(
+            MutationLockKey::Workspace("x").advisory_key(),
+            MutationLockKey::Sandbox("x").advisory_key()
+        );
+    }
+
+    #[test]
+    fn reserved_keys_are_remapped() {
+        assert_ne!(
+            avoid_reserved(GLOBAL_MUTATION_LOCK_KEY),
+            GLOBAL_MUTATION_LOCK_KEY
+        );
+        assert_ne!(avoid_reserved(SSH_IDENTITY_LOCK_KEY), SSH_IDENTITY_LOCK_KEY);
+        assert_eq!(avoid_reserved(TIME_PAYLOAD_MIGRATION_LOCK_KEY), 3053);
+        assert_eq!(avoid_reserved(42), 42);
+    }
+
+    #[test]
+    fn lock_set_keeps_strongest_mode() {
+        let mut set = MutationLockSet::default();
+        set.insert_raw(5, LockMode::Shared);
+        set.insert_raw(-3, LockMode::Exclusive);
+        set.insert_raw(5, LockMode::Exclusive);
+        set.insert_raw(-3, LockMode::Shared);
+
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![(-3, LockMode::Exclusive), (5, LockMode::Exclusive)]
+        );
+    }
+
+    #[test]
+    fn sandbox_lifecycle_set_is_shared_global_exclusive_sandbox() {
+        let set = MutationLockSet::sandbox_lifecycle("sb-1");
+
+        let mut expected = vec![
+            (GLOBAL_MUTATION_LOCK_KEY, LockMode::Shared),
+            (
+                MutationLockKey::Sandbox("sb-1").advisory_key(),
+                LockMode::Exclusive,
+            ),
+        ];
+        expected.sort_unstable();
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
     }
 }

@@ -307,7 +307,7 @@ impl SshIdentityStore {
 
     /// Keep credential staging and publication alive if the calling RPC is
     /// cancelled. The independent identity lock fences parent deletion on
-    /// every replica without nesting the creation cross-object lock.
+    /// every replica without nesting the creation mutation guard.
     pub(crate) async fn prepare(
         &self,
         sandbox: &mut Sandbox,

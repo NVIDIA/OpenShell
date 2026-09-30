@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+use crate::compute::MutationScope;
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
 use crate::pagination::Pagination;
@@ -2653,9 +2654,13 @@ pub(super) async fn handle_create_provider(
         ));
     }
     let provider_type = provider.r#type.clone();
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire provider mutation lock")
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2889,10 +2894,11 @@ pub(super) async fn handle_import_provider_profiles(
     .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2984,10 +2990,11 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3148,10 +3155,11 @@ pub(super) async fn handle_delete_provider_profile(
     .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3974,10 +3982,15 @@ pub(super) async fn handle_update_provider(
         .name;
     // Provider material contributes to the route-report configuration epoch.
     // Serialize its mutation with route-status validation so a report derived
-    // from the prior revision cannot commit after this update.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire provider mutation lock")
-    })?;
+    // from the prior revision cannot commit after this update. The workspace
+    // key excludes every sandbox mutation in this workspace.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire provider mutation lock")
+        })?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -4732,11 +4745,14 @@ pub(super) async fn handle_configure_provider_refresh(
     // persist further down are otherwise separate steps: two concurrent
     // configures of providers attached to the same sandbox could each pass
     // validation before either persisted and both reserve the same key (CWE-362).
-    // This is the same guard sandbox create/attach and profile changes take.
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire provider mutation lock")
-        })?;
+    // Every provider attached to one sandbox lives in this workspace, so holding
+    // the workspace key exclusively also excludes sandbox create and attach,
+    // which hold it shared.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire provider mutation lock"))?;
 
     let provider = state
         .store
@@ -5185,12 +5201,14 @@ pub(super) async fn handle_delete_provider(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    // Sandbox create and attach hold this guard while they write provider
-    // references, so no sandbox can start referencing the provider between
-    // the attached-sandbox check and the delete.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire provider mutation lock")
-    })?;
+    // A sandbox create or attach in this workspace holds the workspace key
+    // shared, so no sandbox can start referencing the provider between the
+    // attached-sandbox check and the delete.
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace(&workspace))
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "acquire provider mutation lock"))?;
     let name = req.name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
@@ -5960,9 +5978,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_provider_profile_waits_for_sandbox_sync_guard() {
+    async fn import_provider_profile_waits_for_sandbox_mutation_in_workspace() {
         let state = test_server_state().await;
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "profile-import-guard"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_import_provider_profiles(
@@ -5984,7 +6006,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "profile import should wait for sandbox sync guard"
+            "profile import should wait for a sandbox mutation in its workspace"
         );
         drop(guard);
 
@@ -9146,7 +9168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_provider_profile_waits_for_sandbox_sync_guard() {
+    async fn delete_provider_profile_waits_for_sandbox_mutation_in_workspace() {
         let state = test_server_state().await;
         state
             .store
@@ -9154,7 +9176,11 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "profile-delete-guard"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_delete_provider_profile(
@@ -9174,7 +9200,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "profile delete should wait for sandbox sync guard"
+            "profile delete should wait for a sandbox mutation in its workspace"
         );
         drop(guard);
 
@@ -9209,7 +9235,11 @@ mod tests {
         .await
         .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             let mut provider = provider_with_values("guarded-provider", "guarded-create");
@@ -9268,6 +9298,21 @@ mod tests {
         .expect("created provider")
     }
 
+    fn provider_config_update(current: &Provider) -> Request<UpdateProviderRequest> {
+        let mut provider = current.clone();
+        provider.credential_handles.clear();
+        provider
+            .config
+            .insert("NEW_CONFIG".to_string(), "new-value".to_string());
+        authed_request(UpdateProviderRequest {
+            request_id: String::new(),
+            provider: Some(provider),
+            credential_expiration_times: HashMap::new(),
+            clear_credential_expiration_keys: Vec::new(),
+            workspace_scope: Some(default_workspace_selector()),
+        })
+    }
+
     fn delete_provider_request(name: &str) -> Request<DeleteProviderRequest> {
         authed_request(DeleteProviderRequest {
             request_id: String::new(),
@@ -9294,14 +9339,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_provider_waits_for_sandbox_mutation_in_workspace() {
+        let state = test_server_state().await;
+        create_openai_provider(&state, "guarded-delete-provider").await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let mut delete = tokio::spawn(async move {
+            handle_delete_provider(
+                &task_state,
+                delete_provider_request("guarded-delete-provider"),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "provider delete should wait for a sandbox mutation in its workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+            .await
+            .expect("delete should finish after guard release")
+            .expect("join delete task")
+            .expect("delete should succeed")
+            .into_inner();
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_rejects_empty_name_without_waiting_for_workspace() {
+        let state = test_server_state().await;
+        let _guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_delete_provider(&state, delete_provider_request("")),
+        )
+        .await
+        .expect("an empty name should not wait for the workspace lock")
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn delete_provider_rejects_provider_attached_while_waiting() {
         let state = test_server_state().await;
         create_openai_provider(&state, "raced-provider").await;
         let sandbox = sandbox_in_default_workspace("raced-sandbox", Vec::new());
         state.store.put_message(&sandbox).await.unwrap();
-        // An attach holds the sandbox sync guard while it writes the provider
-        // into the sandbox spec.
-        let attach_guard = state.compute.sandbox_sync_guard().await.unwrap();
+        // An attach to this sandbox holds its sandbox scope while it writes
+        // the provider into the spec.
+        let attach_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", sandbox.object_id()))
+            .await
+            .unwrap();
 
         let task_state = state.clone();
         let mut delete = tokio::spawn(async move {
@@ -9341,6 +9447,60 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn update_provider_waits_for_sandbox_mutation_in_same_workspace() {
+        let state = test_server_state().await;
+        let current = create_openai_provider(&state, "guarded-update-provider").await;
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "x"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let request = provider_config_update(&current);
+        let mut update =
+            tokio::spawn(async move { handle_update_provider(&task_state, request).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut update)
+                .await
+                .is_err(),
+            "provider update should wait for a sandbox mutation in its workspace"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), update)
+            .await
+            .expect("update should finish after guard release")
+            .expect("join update task")
+            .expect("update should succeed")
+            .into_inner();
+        assert!(response.provider.unwrap().config.contains_key("NEW_CONFIG"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_does_not_wait_for_sandbox_mutation_in_other_workspace() {
+        let state = test_server_state().await;
+        let current = create_openai_provider(&state, "unguarded-update-provider").await;
+        // The "team-a" workspace row is not needed to hold its keys.
+        let other_workspace_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("team-a", "x"))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_update_provider(&state, provider_config_update(&current)),
+        )
+        .await
+        .expect("provider update should not wait for another workspace")
+        .expect("update should succeed")
+        .into_inner();
+        assert!(response.provider.unwrap().config.contains_key("NEW_CONFIG"));
+        drop(other_workspace_guard);
     }
 
     #[tokio::test]
