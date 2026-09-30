@@ -29,9 +29,11 @@ pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacit
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
+pub const MUTATION_LOCK_TIMEOUTS_TOTAL: &str = "openshell_server_mutation_lock_timeouts_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const MUTATION_LOCK_WAIT_SECONDS: &str = "openshell_server_mutation_lock_wait_seconds";
 
 const LABEL_REASON: &str = "reason";
 const LABEL_OPERATION: &str = "operation";
@@ -39,17 +41,21 @@ const LABEL_OUTCOME: &str = "outcome";
 const LABEL_GRPC_CODE: &str = "grpc_code";
 const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
+const LABEL_SCOPE: &str = "scope";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
-/// claim timeout and the 15 s routed-relay wait.
+/// claim and lock timeouts and the 15 s routed-relay wait.
 const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0,
 ];
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 2] =
-    [RELAY_CLAIM_DURATION_SECONDS, PEER_REQUEST_DURATION_SECONDS];
+const BUCKETED_HISTOGRAMS: [&str; 3] = [
+    RELAY_CLAIM_DURATION_SECONDS,
+    PEER_REQUEST_DURATION_SECONDS,
+    MUTATION_LOCK_WAIT_SECONDS,
+];
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +135,26 @@ impl PeerRpc {
             Self::ReportProviderReadiness => "report_provider_readiness",
             Self::ReportEndpointStatus => "report_endpoint_status",
             Self::GetSandboxProviderStatus => "get_sandbox_provider_status",
+        }
+    }
+}
+
+/// Mutation lock scope kind. The platform scope ("" workspace) maps to `Global`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockScope {
+    Global,
+    Workspace,
+    Sandbox,
+}
+
+impl LockScope {
+    pub const ALL: [Self; 3] = [Self::Global, Self::Workspace, Self::Sandbox];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+            Self::Sandbox => "sandbox",
         }
     }
 }
@@ -240,6 +266,11 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         Unit::Count,
         "Pending relay channels dropped because the supervisor did not connect back in time."
     );
+    describe_counter!(
+        MUTATION_LOCK_TIMEOUTS_TOTAL,
+        Unit::Count,
+        "Mutation lock acquisitions that timed out."
+    );
     describe_histogram!(
         RELAY_CLAIM_DURATION_SECONDS,
         Unit::Seconds,
@@ -249,6 +280,11 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
+    );
+    describe_histogram!(
+        MUTATION_LOCK_WAIT_SECONDS,
+        Unit::Seconds,
+        "Time spent acquiring the mutation lock for a scope."
     );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
@@ -272,6 +308,9 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         counter!(RELAY_REJECTED_TOTAL, LABEL_REASON => reason.label()).increment(0);
     }
     counter!(RELAY_EXPIRED_TOTAL).increment(0);
+    for scope in LockScope::ALL {
+        counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
+    }
     for rpc in PeerRpc::ALL {
         if rpc == PeerRpc::Relay {
             continue;
@@ -337,6 +376,20 @@ pub fn record_relay_expired(count: usize) {
 
 pub fn record_relay_claimed(waited: Duration) {
     histogram!(RELAY_CLAIM_DURATION_SECONDS).record(waited);
+}
+
+/// Time to acquire every key of one mutation guard (local registry plus Postgres), recorded
+/// on success only.
+pub fn record_lock_wait(scope: LockScope, waited: Duration) {
+    histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => scope.label()).record(waited);
+}
+
+/// A guard acquisition that timed out: a local wait, a full lock pool, too little time left to
+/// open a lock connection, or Postgres `lock_timeout` (SQLSTATE 55P03). A lock connection that
+/// Postgres does not open with at least `LOCK_CONNECTION_MIN_BUDGET` left is not counted. RPC
+/// callers return the timeout as `Status::unavailable`.
+pub fn record_lock_timeout(scope: LockScope) {
+    counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(1);
 }
 
 /// Counts one local relay setup or outbound peer attempt exactly once, and times peer requests.
@@ -503,6 +556,18 @@ mod tests {
                 0,
             ),
             ("openshell_server_relay_expired_total", 0),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"global\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"workspace\"}",
+                0,
+            ),
+            (
+                "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}",
+                0,
+            ),
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
@@ -579,6 +644,7 @@ mod tests {
             LABEL_OUTCOME => "success"
         )
         .record(sample);
+        histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
         histogram!(
             "openshell_server_grpc_request_duration_seconds",
             "method" => "ListSandboxes",

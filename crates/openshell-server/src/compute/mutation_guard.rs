@@ -10,6 +10,7 @@
 //! connection. A task never acquires a guard while it holds one.
 
 use super::{ComputeRuntime, SandboxLifecycleGuard};
+use crate::gateway_metrics::{self, LockScope};
 use crate::grpc::workspace::DEFAULT_WORKSPACE_NAME;
 use crate::persistence::mutation_lock::MUTATION_LOCK_TIMEOUT;
 use crate::persistence::{
@@ -88,6 +89,16 @@ impl<'a> MutationScope<'a> {
             }
         }
         set
+    }
+
+    /// The metric label of this scope.
+    pub(crate) const fn lock_scope(&self) -> LockScope {
+        match self {
+            Self::Global => LockScope::Global,
+            Self::Workspace(workspace) if workspace.is_empty() => LockScope::Global,
+            Self::Workspace(_) => LockScope::Workspace,
+            Self::Sandbox { .. } => LockScope::Sandbox,
+        }
     }
 }
 
@@ -242,12 +253,23 @@ impl ComputeRuntime {
         let result = self
             .acquire_mutation_guard(&scope.lock_set(), deadline)
             .await;
-        if let Err(PersistenceError::LockTimeout(detail)) = &result {
-            warn!(
+        match &result {
+            Ok(_) => gateway_metrics::record_lock_wait(scope.lock_scope(), started.elapsed()),
+            Err(PersistenceError::LockTimeout(detail)) => {
+                gateway_metrics::record_lock_timeout(scope.lock_scope());
+                warn!(
+                    scope = scope.lock_scope().label(),
+                    waited_ms = duration_millis(started.elapsed()),
+                    detail = %detail,
+                    "mutation lock acquisition timed out"
+                );
+            }
+            Err(error) => warn!(
+                scope = scope.lock_scope().label(),
                 waited_ms = duration_millis(started.elapsed()),
-                detail = %detail,
-                "mutation lock acquisition timed out"
-            );
+                error = %error,
+                "mutation lock acquisition failed"
+            ),
         }
         result
     }
@@ -357,6 +379,7 @@ impl ComputeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway_metrics::MetricsCapture;
     use crate::persistence::Store;
     use crate::persistence::mutation_lock::GLOBAL_MUTATION_LOCK_KEY;
     use openshell_core::proto::SandboxPhase;
@@ -467,6 +490,20 @@ mod tests {
                 .lock_set()
                 .iter()
                 .eq([(GLOBAL_MUTATION_LOCK_KEY, Exclusive)])
+        );
+    }
+
+    #[test]
+    fn scope_labels_map_platform_workspace_to_global() {
+        assert_eq!(MutationScope::Global.lock_scope(), LockScope::Global);
+        assert_eq!(MutationScope::Workspace("").lock_scope(), LockScope::Global);
+        assert_eq!(
+            MutationScope::Workspace("team-a").lock_scope(),
+            LockScope::Workspace
+        );
+        assert_eq!(
+            MutationScope::sandbox("", "sb-1").lock_scope(),
+            LockScope::Sandbox
         );
     }
 
@@ -674,6 +711,65 @@ mod tests {
         );
         drop(held);
         assert_eq!(runtime.mutation_locks.live_entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn lock_metrics_record_wait_and_timeout() {
+        const WAITS: &str = "openshell_server_mutation_lock_wait_seconds_count{scope=\"sandbox\"}";
+        const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+        let metrics = MetricsCapture::install();
+        let runtime = test_runtime().await;
+        runtime.set_mutation_lock_timeout_for_tests(Duration::from_millis(50));
+
+        let held = runtime
+            .mutation_guard(MutationScope::sandbox("w", "a"))
+            .await
+            .unwrap();
+        assert_eq!(metrics.value(WAITS), Some(1));
+        assert_eq!(metrics.value(TIMEOUTS), None);
+
+        assert!(
+            runtime
+                .mutation_guard(MutationScope::sandbox("w", "a"))
+                .await
+                .is_err()
+        );
+        assert_eq!(metrics.value(TIMEOUTS), Some(1));
+        assert_eq!(metrics.value(WAITS), Some(1));
+
+        drop(runtime.lock_sandbox_local("b").await);
+        assert_eq!(metrics.value(WAITS), Some(1));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn lock_connection_failure_is_not_counted_as_a_timeout() {
+        const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+        let metrics = MetricsCapture::install();
+        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let store = crate::persistence::PostgresStore::connect_lazy_for_tests(&url, 1);
+        let runtime =
+            super::super::new_test_runtime_for_driver(Arc::new(Store::Postgres(store)), "test")
+                .await;
+        // Leave enough time to open a lock connection, so the refusal is a
+        // database error.
+        runtime.set_mutation_lock_timeout_for_tests(
+            crate::persistence::mutation_lock::LOCK_CONNECTION_MIN_BUDGET
+                + Duration::from_millis(300),
+        );
+
+        match runtime
+            .mutation_guard(MutationScope::sandbox("w", "a"))
+            .await
+        {
+            Err(PersistenceError::Database(detail)) => assert!(
+                detail.starts_with("could not open a mutation lock connection"),
+                "{detail}"
+            ),
+            Err(error) => panic!("expected a database error, got {error:?}"),
+            Ok(_) => panic!("nothing listens, yet the guard was acquired"),
+        }
+        assert_eq!(metrics.value(TIMEOUTS), None);
     }
 
     /// Workspaces and sandboxes the random scope mix draws from.
