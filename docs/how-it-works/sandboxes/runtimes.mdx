@@ -94,7 +94,7 @@ socket_path = "/var/run/docker.sock"
 
 Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
-Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. When the gateway runs inside WSL 2 with Docker Desktop, the driver connects sandboxes to the gateway through `host.docker.internal` automatically. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
 ### Docker Corporate Proxy Egress
 

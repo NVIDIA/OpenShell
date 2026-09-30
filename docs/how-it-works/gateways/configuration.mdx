@@ -911,7 +911,8 @@ image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
 # Optional override. When omitted, the host-networked supervisor uses the
-# gateway's primary loopback endpoint.
+# gateway's primary loopback endpoint, or host.docker.internal when the
+# gateway runs inside WSL 2 with Docker Desktop.
 grpc_endpoint      = "https://127.0.0.1:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
