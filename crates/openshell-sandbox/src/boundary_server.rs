@@ -27,7 +27,6 @@ mod linux {
 
     use crate::boundary_io::BoundaryRuntimeState;
     use crate::delegated::{AgentSignaler, spawn_workload};
-    use crate::identity::{DriverIdentity, resolve_process_identity};
     use crate::main_session::{MainOutput, MainSession};
     use crate::network_broker::NetworkBroker;
     use crate::process::ProcessStatus;
@@ -2498,13 +2497,8 @@ mod linux {
                         .build()
                 );
             }
-            let driver_identity = DriverIdentity::Resolved {
-                uid: self.config.workload_identity.uid,
-                gid: self.config.workload_identity.gid,
-            };
-            if let Err(error) = resolve_process_identity(&mut policy, &driver_identity) {
-                return guest_error(BoundaryErrorKind::Process, error.to_string());
-            }
+            policy.process.run_as_user = Some(self.config.workload_identity.uid.to_string());
+            policy.process.run_as_group = Some(self.config.workload_identity.gid.to_string());
             let launch = ManagedProcessLaunch {
                 process_id: format!("{}:main:0", self.config.generation),
                 spec,
