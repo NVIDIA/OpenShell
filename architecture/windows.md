@@ -268,6 +268,8 @@ Windows validation separates source correctness from host capability:
   OpenClaw example as separate steps. The probe uses an explicitly absent
   `wxc-exec`; the other two use the in-process mock. They check the
   unavailable-backend report, sandbox lifecycle, and workload proof files.
+  The OpenClaw mock requires a successful create, a workload proof, and a
+  `Ready` sandbox before reporting a pass.
   The wrappers isolate CLI config, state, and data directories, and direct
   sandbox calls to their temporary loopback gateways. The mock disables relay
   wrapping because it has no control channel. These runs do not validate

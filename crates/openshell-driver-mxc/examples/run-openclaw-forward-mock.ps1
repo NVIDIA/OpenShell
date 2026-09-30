@@ -70,7 +70,7 @@ function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
     if (-not $AllowFailure -and $process.ExitCode -ne 0) {
         throw "openshell $($CommandArgs -join ' ') failed (exit $($process.ExitCode)): $output"
     }
-    return @{ ExitCode = $process.ExitCode; Output = $output }
+    return @{ ExitCode = $process.ExitCode; Output = $output; Stdout = $stdout.Result }
 }
 
 function Test-Port([int]$Candidate) {
@@ -126,10 +126,10 @@ try {
         command = @($cmd, "/d", "/s", "/c", "echo PASS 1> `"$proof`"")
         cwd = $shareFwd
     } } | ConvertTo-Json -Compress -Depth 5
+    $created = $true
     $create = Invoke-Cli @("sandbox", "create", "--name", $SandboxName,
         "--policy", $policyUsed, "--driver-config-json", $driverConfig,
-        "--no-tty", "--output", "json") -AllowFailure
-    $created = $true
+        "--no-tty", "--output", "json")
     $deadline = (Get-Date).AddSeconds(30)
     $proofText = ""
     while ((Get-Date) -lt $deadline) {
@@ -143,9 +143,12 @@ try {
         throw "mock workload did not finish proof (create exit $($create.ExitCode)): $($create.Output)"
     }
     $get = Invoke-Cli @("sandbox", "get", $SandboxName, "--output", "json")
-    $expectedNamePattern = '"name"\s*:\s*"' + [regex]::Escape($SandboxName) + '"'
-    if ($get.Output -notmatch $expectedNamePattern) {
-        throw "created sandbox was not returned by the CLI"
+    $sandbox = ConvertFrom-Json -InputObject $get.Stdout -ErrorAction Stop
+    if ($sandbox.name -cne $SandboxName) {
+        throw "sandbox get returned '$($sandbox.name)' instead of '$SandboxName'"
+    }
+    if ($sandbox.phase -cne "Ready") {
+        throw "sandbox '$SandboxName' is not Ready (phase: $($sandbox.phase))"
     }
     $delete = Invoke-Cli @("sandbox", "delete", $SandboxName)
     $created = $false

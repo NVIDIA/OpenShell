@@ -261,7 +261,9 @@ reports an explicitly absent `wxc-exec`; the other runners use the in-process
 mock to verify gateway, CLI, driver, and workload-proof wiring. A pass is not
 evidence of WebSocket forwarding, OpenClaw behavior, proxy substitution, or
 MXC enforcement. The mock runners stage isolated XDG config, state, and data
-directories and pin sandbox calls to their disposable gateway endpoints.
+directories and pin sandbox calls to their disposable gateway endpoints. The
+OpenClaw mock requires a successful CLI create and a `Ready` sandbox after the
+workload proof.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
