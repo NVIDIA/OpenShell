@@ -1092,20 +1092,6 @@ impl Store {
             .collect()
     }
 
-    /// List and decode protobuf messages across all workspaces, hydrating
-    /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<T>> {
-        self.list_by_type(T::object_type(), limit, offset)
-            .await?
-            .into_iter()
-            .map(decode_record)
-            .collect()
-    }
-
     /// List and decode objects that have a related membership record, with
     /// pagination. See [`Store::list_with_membership`] for details.
     pub async fn list_messages_with_membership<

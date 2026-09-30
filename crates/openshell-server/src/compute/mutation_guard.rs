@@ -341,6 +341,12 @@ impl ComputeRuntime {
             .await
     }
 
+    /// How long one mutation guard acquisition waits before it fails with
+    /// [`PersistenceError::LockTimeout`].
+    pub(crate) fn mutation_lock_timeout(&self) -> Duration {
+        self.mutation_locks.timeout()
+    }
+
     /// Shorten the mutation lock deadline of this runtime and its clones.
     #[cfg(test)]
     pub(crate) fn set_mutation_lock_timeout_for_tests(&self, timeout: Duration) {

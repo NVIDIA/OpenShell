@@ -11,11 +11,14 @@ use super::{
 };
 use crate::ServerState;
 use crate::compute::MutationScope;
-use crate::persistence::{ObjectId, ObjectWorkspace};
+use crate::persistence::{
+    ObjectCursor, ObjectId, ObjectListQuery, ObjectWorkspace, PersistenceError,
+};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::EndpointReportCursor;
+use futures::TryStreamExt;
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
@@ -31,6 +34,17 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 const ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE: u32 = 100;
+/// Sandboxes reconciled at once, matching the four-connection mutation lock
+/// pool.
+const ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY: usize = 4;
+/// Guarded attempts per sandbox before repeated write conflicts fail startup.
+/// Lock timeouts usually stop earlier, at the retry window below.
+const ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS: usize = 5;
+/// Retry window for lock timeouts, in mutation lock timeouts from the start of
+/// the scan. No lock-timeout retry starts after it, so a scan stuck behind a
+/// long holder fails at most one lock wait later: about 40 seconds with the
+/// 10-second wait, inside the Helm chart's 60-second startup probe.
+const ENDPOINT_STARTUP_RECONCILIATION_RETRY_LOCK_WAITS: u32 = 3;
 const ENDPOINT_DISCONNECT_RETRY_INITIAL_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(100);
 const ENDPOINT_DISCONNECT_RETRY_MAX_BACKOFF: std::time::Duration =
@@ -515,72 +529,180 @@ pub async fn retry_endpoint_status_after_supervisor_disconnect(
 /// Supervisor sessions are intentionally process-local. This reconciliation
 /// runs before gateway listeners are bound. A fresh shared owner preserves its
 /// evidence; records without one are reset so stale success is never served.
+///
+/// Each sandbox is reset under its own mutation guard, so other replicas keep
+/// mutating unrelated sandboxes during the scan. Keyset paging keeps the scan
+/// stable when sandboxes are deleted mid-scan.
 pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> Result<(), Status> {
-    let _mutation_guard = state
-        .compute
-        .mutation_guard(MutationScope::Global)
-        .await
-        .map_err(|error| {
-            super::super::persistence_error_to_status(
-                error,
-                "acquire endpoint status startup reconciliation lock",
-            )
-        })?;
-    let mut offset = 0;
+    let retry_deadline = tokio::time::Instant::now()
+        + state.compute.mutation_lock_timeout() * ENDPOINT_STARTUP_RECONCILIATION_RETRY_LOCK_WAITS;
+    let mut cursor: Option<ObjectCursor> = None;
     loop {
-        let sandboxes = state
+        let page = state
             .store
-            .list_all_messages::<Sandbox>(ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE, offset)
+            .list_message_page::<Sandbox>(
+                ObjectListQuery::AllWorkspaces,
+                cursor.as_ref(),
+                ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE,
+            )
             .await
             .map_err(|error| {
                 Status::internal(format!(
                     "list sandboxes for tool server endpoint-status startup reconciliation failed: {error}"
                 ))
             })?;
-        if sandboxes.is_empty() {
+        // Each future holds at most its own sandbox guard and never waits on
+        // another, so running them in one task cannot deadlock.
+        futures::stream::iter(
+            page.messages
+                .iter()
+                .filter(|sandbox| has_endpoint_status(sandbox))
+                .map(Ok::<_, Status>),
+        )
+        .try_for_each_concurrent(ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY, |candidate| {
+            invalidate_sandbox_endpoint_status_on_startup(state, candidate, retry_deadline)
+        })
+        .await?;
+        let Some(next_cursor) = page.next_cursor else {
             return Ok(());
-        }
-
-        for sandbox in &sandboxes {
-            let has_endpoint_status = sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| !status.endpoint_statuses.is_empty());
-            if !has_endpoint_status {
-                continue;
-            }
-            let sandbox_id = sandbox.object_id();
-            if has_fresh_shared_owner(state, sandbox_id).await? {
-                continue;
-            }
-            let expected_resource_version = sandbox.get_resource_version();
-            let updated = state
-                .store
-                .update_message_cas::<Sandbox, _>(
-                    sandbox_id,
-                    expected_resource_version,
-                    invalidate_endpoint_status_without_session,
-                )
-                .await
-                .map_err(|error| {
-                    super::super::persistence_error_to_status(
-                        error,
-                        "invalidate tool server endpoint status during gateway startup",
-                    )
-                })?;
-            state.sandbox_index.update_from_sandbox(&updated);
-        }
-
-        let page_len = sandboxes.len() as u32;
-        if page_len < ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE {
-            return Ok(());
-        }
-        offset = offset.checked_add(page_len).ok_or_else(|| {
-            Status::internal(
-                "sandbox pagination overflow during tool server endpoint-status reconciliation",
-            )
-        })?;
+        };
+        cursor = Some(next_cursor);
     }
+}
+
+async fn invalidate_sandbox_endpoint_status_on_startup(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+    retry_deadline: tokio::time::Instant,
+) -> Result<(), Status> {
+    // A live owner keeps its evidence, so it costs no guard.
+    if has_fresh_shared_owner(state, candidate.object_id()).await? {
+        return Ok(());
+    }
+    retry_startup_reconciliation(retry_deadline, || {
+        invalidate_sandbox_endpoint_status_once(state, candidate)
+    })
+    .await
+    .inspect_err(|status| {
+        warn!(
+            sandbox_id = candidate.object_id(),
+            error = status.message(),
+            "tool server endpoint-status startup reconciliation gave up on a sandbox"
+        );
+    })
+}
+
+/// Outcome of one guarded startup-reconciliation attempt.
+enum StartupAttempt {
+    Done,
+    /// The guard wait timed out behind another holder, or the write hit a
+    /// concurrent change, a row deleted after the re-read, or another database
+    /// error; re-read and try again.
+    Retry(PersistenceError),
+}
+
+/// Run `attempt` until it is done, at most
+/// `ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS` times, and retry no lock timeout
+/// after `retry_deadline`. Write conflicts retry in milliseconds, so they keep
+/// the attempt limit alone. An error from `attempt` is returned without a retry.
+async fn retry_startup_reconciliation<F, Fut>(
+    retry_deadline: tokio::time::Instant,
+    mut attempt: F,
+) -> Result<(), Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<StartupAttempt, Status>>,
+{
+    let mut attempts = 1;
+    loop {
+        match attempt().await? {
+            StartupAttempt::Done => return Ok(()),
+            StartupAttempt::Retry(error)
+                if attempts >= ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS
+                    || (matches!(error, PersistenceError::LockTimeout(_))
+                        && tokio::time::Instant::now() >= retry_deadline) =>
+            {
+                return Err(super::super::persistence_error_to_status(
+                    error,
+                    "invalidate tool server endpoint status during gateway startup",
+                ));
+            }
+            StartupAttempt::Retry(_) => attempts += 1,
+        }
+    }
+}
+
+async fn invalidate_sandbox_endpoint_status_once(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+) -> Result<StartupAttempt, Status> {
+    let sandbox_id = candidate.object_id();
+    let _mutation_guard = match state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            candidate.object_workspace(),
+            sandbox_id,
+        ))
+        .await
+    {
+        Ok(guard) => guard,
+        // A holder of this sandbox, its workspace or the global key that
+        // releases within the retry window must not stop a replica from
+        // starting.
+        Err(error @ PersistenceError::LockTimeout(_)) => return Ok(StartupAttempt::Retry(error)),
+        Err(error) => {
+            return Err(super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status startup reconciliation lock",
+            ));
+        }
+    };
+    // A supervisor may have connected to another replica while this waited.
+    if has_fresh_shared_owner(state, sandbox_id).await? {
+        return Ok(StartupAttempt::Done);
+    }
+    let Some(current) = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    else {
+        return Ok(StartupAttempt::Done);
+    };
+    if !has_endpoint_status(&current) {
+        return Ok(StartupAttempt::Done);
+    }
+    match state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            sandbox_id,
+            current.get_resource_version(),
+            invalidate_endpoint_status_without_session,
+        )
+        .await
+    {
+        Ok(updated) => {
+            state.sandbox_index.update_from_sandbox(&updated);
+            Ok(StartupAttempt::Done)
+        }
+        // Lifecycle writers on other replicas take no distributed guard, and a
+        // delete between the re-read and the write surfaces as a database
+        // error. Retry with a fresh read after this guard drops.
+        Err(error @ (PersistenceError::Conflict { .. } | PersistenceError::Database(_))) => {
+            Ok(StartupAttempt::Retry(error))
+        }
+        Err(error) => Err(super::super::persistence_error_to_status(
+            error,
+            "invalidate tool server endpoint status during gateway startup",
+        )),
+    }
+}
+
+fn has_endpoint_status(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| !status.endpoint_statuses.is_empty())
 }
 
 async fn has_fresh_shared_owner(
