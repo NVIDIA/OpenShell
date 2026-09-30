@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 use openshell_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
 use serial_test::serial;
@@ -757,125 +757,41 @@ async fn canonical_main_nonzero_exit_preserves_status() {
 
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
-async fn detached_canonical_main_exit_zero_reaches_completed() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-success-release";
-    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 0");
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
+async fn canonical_tty_main_and_exec_receive_declared_environment() {
+    let script =
+        r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &[
+            "--tty",
+            "--no-auto-providers",
+            "--env",
+            "REPRO_SENTINEL=present",
+        ],
+        &["sh", "-c", script],
+        "declared_env=",
+    )
+    .await
+    .expect("create canonical TTY process with declared environment");
+    let initial = normalize_output(&sandbox.create_output);
+    let later = sandbox
+        .exec(&[
+            "sh",
+            "-c",
+            r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
+        ])
         .await
-        .expect("create detached successful canonical main");
-    sandbox
-        .exec(&["touch", RELEASE_PATH])
-        .await
-        .expect("release detached successful canonical main");
-
-    wait_for_sandbox_phase(&sandbox.name, "Completed", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("detached successful main did not complete:\n{err}"));
-    let details = sandbox_details(&sandbox.name).await;
-    assert!(
-        details.contains("Phase: Completed"),
-        "detached successful main should retain Completed status:\n{details}"
-    );
-
+        .expect("exec environment probe");
     sandbox.cleanup().await;
-}
 
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn detached_canonical_main_nonzero_exit_reaches_error() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-failure-release";
-    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 11");
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
-        .await
-        .expect("create detached failing canonical main");
-    sandbox
-        .exec(&["touch", RELEASE_PATH])
-        .await
-        .expect("release detached failing canonical main");
-
-    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("detached failing main did not reach Error:\n{err}"));
-    let details = sandbox_details(&sandbox.name).await;
     assert!(
-        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
-        "detached failing main should retain its terminal result:\n{details}"
+        initial.lines().any(|line| line == "declared_env=present"),
+        "initial TTY process must receive declared environment: {initial}"
     );
-
-    sandbox.cleanup().await;
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn canonical_main_and_exec_receive_declared_environment() {
-    for mode in ["--tty", "--no-tty"] {
-        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
-        let mut sandbox = SandboxGuard::create_keep_with_args(
-            &[
-                mode,
-                "--no-auto-providers",
-                "--env",
-                "REPRO_SENTINEL=present",
-            ],
-            &["sh", "-c", script],
-            "declared_env=",
-        )
-        .await
-        .expect("create canonical process with declared environment");
-        let initial = normalize_output(&sandbox.create_output);
-        let later = sandbox
-            .exec(&[
-                "sh",
-                "-c",
-                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
-            ])
-            .await;
-        sandbox.cleanup().await;
-
-        assert!(
-            initial.lines().any(|line| line == "declared_env=present"),
-            "initial process must receive declared environment ({mode}): {initial}"
-        );
-        let later = normalize_output(&later.expect("exec environment probe"));
-        assert!(
-            later.lines().any(|line| line == "declared_env=present"),
-            "exec must receive the same declared environment ({mode}): {later}"
-        );
-    }
-}
-
-#[tokio::test]
-#[serial(sandbox_lifecycle)]
-async fn detached_main_exit_during_provisioning_is_classified_as_workload_result() {
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
-        .await
-        .expect("fast detached main exit should not be reported as a provisioning failure");
-
-    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
-        .await
-        .unwrap_or_else(|err| panic!("fast detached main did not reach Error:\n{err}"));
-
-    let mut get_cmd = openshell_cmd();
-    get_cmd
-        .args(["sandbox", "get", &sandbox.name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
-    let details = normalize_output(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&get_output.stdout),
-        String::from_utf8_lossy(&get_output.stderr),
-    ));
+    let later = normalize_output(&later);
     assert!(
-        get_output.status.success(),
-        "sandbox get failed:\n{details}"
+        later.lines().any(|line| line == "declared_env=present"),
+        "exec must receive the same declared environment as the TTY main: {later}"
     );
-    assert!(
-        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
-        "fast detached main should retain its workload result:\n{details}"
-    );
-
-    sandbox.cleanup().await;
 }
 
 #[tokio::test]

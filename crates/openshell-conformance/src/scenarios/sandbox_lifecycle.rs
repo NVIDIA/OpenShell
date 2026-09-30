@@ -18,6 +18,7 @@ const TRANSITION_INTERVAL: Duration = Duration::from_secs(2);
 struct SandboxState {
     name: String,
     phase: String,
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +26,49 @@ struct SandboxListPage {
     sandboxes: Vec<SandboxState>,
     next_page_token: String,
 }
+
+#[derive(Clone, Copy)]
+enum CanonicalMainOutcome {
+    Success,
+    Failure,
+}
+
+impl CanonicalMainOutcome {
+    const fn case(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Success => "cs",
+            Self::Failure => "cf",
+        }
+    }
+
+    const fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::Failure => 11,
+        }
+    }
+
+    const fn phase(self) -> &'static str {
+        match self {
+            Self::Success => "Completed",
+            Self::Failure => "Error",
+        }
+    }
+}
+
+/// Certify canonical-main terminal state, persistence, and deletion.
+pub const SANDBOX_CANONICAL_MAIN_SCENARIO: Scenario = Scenario {
+    name: "sandbox-lifecycle/canonical-main",
+    description: "Verify canonical-main terminal state, persistence, and deletion.",
+    run: run_canonical_main_lifecycle,
+};
 
 /// Certify stop and stopped-deletion behavior without requiring exec.
 pub const SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
@@ -40,12 +84,108 @@ pub const SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO: Scenario = Scenario {
     run: run_lifecycle_restart_persistence,
 };
 
+fn run_canonical_main_lifecycle(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move {
+        canonical_main_reaches_terminal_state(runner, CanonicalMainOutcome::Success).await?;
+        canonical_main_reaches_terminal_state(runner, CanonicalMainOutcome::Failure).await?;
+        fast_canonical_main_exit_is_workload_result(runner).await
+    })
+}
 fn run_lifecycle_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(stopped_can_be_deleted(runner))
 }
 
 fn run_lifecycle_restart_persistence(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(stop_start_preserves_workspace(runner))
+}
+
+async fn canonical_main_reaches_terminal_state(
+    runner: &mut OpenShellRunner,
+    outcome: CanonicalMainOutcome,
+) -> Result<(), String> {
+    let case = outcome.case();
+    let exit_code = outcome.exit_code();
+    let expected_phase = outcome.phase();
+    let sandbox_name = format!("ct-{}-{}", runner.id(), outcome.suffix());
+    let release_path = format!("/sandbox/.openshell-canonical-{case}-release");
+    let main = format!("while [ ! -e '{release_path}' ]; do sleep 0.05; done; exit {exit_code}");
+    let step = format!("canonical-{case}");
+
+    create_running_sandbox(runner, &sandbox_name, &main, &step).await?;
+    exec_expect_exact(
+        runner,
+        &sandbox_name,
+        &format!("{step}/release"),
+        &["touch", &release_path],
+        "",
+    )
+    .await?;
+    wait_for_terminal_state(
+        runner,
+        &sandbox_name,
+        expected_phase,
+        exit_code,
+        &format!("{step}/terminal"),
+    )
+    .await?;
+    require_terminal_state(
+        runner,
+        &sandbox_name,
+        expected_phase,
+        exit_code,
+        &format!("{step}/persistent"),
+    )
+    .await?;
+    delete_and_confirm_absent(runner, &sandbox_name, &format!("{step}/delete")).await
+}
+
+async fn fast_canonical_main_exit_is_workload_result(
+    runner: &mut OpenShellRunner,
+) -> Result<(), String> {
+    let outcome = CanonicalMainOutcome::Failure;
+    let sandbox_name = format!("ct-{}-fp", runner.id());
+    let step = "canonical-fast-failure";
+
+    runner.track_sandbox(&sandbox_name);
+    let create = runner
+        .step(format!("{step}/create"))
+        .description(format!(
+            "sandbox '{sandbox_name}' treats an immediate canonical-main exit as a workload result"
+        ))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "create",
+            "--name",
+            &sandbox_name,
+            "--detach",
+            "--no-tty",
+            "--",
+            "sh",
+            "-lc",
+            &format!("exit {}", outcome.exit_code()),
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    create.require_success()?;
+
+    wait_for_terminal_state(
+        runner,
+        &sandbox_name,
+        outcome.phase(),
+        outcome.exit_code(),
+        &format!("{step}/terminal"),
+    )
+    .await?;
+    require_terminal_state(
+        runner,
+        &sandbox_name,
+        outcome.phase(),
+        outcome.exit_code(),
+        &format!("{step}/persistent"),
+    )
+    .await?;
+    delete_and_confirm_absent(runner, &sandbox_name, &format!("{step}/delete")).await
 }
 
 async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {
@@ -63,7 +203,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "write-sentinel",
+        "stop-start/write-sentinel",
         &[
             "sh",
             "-lc",
@@ -106,7 +246,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "read-sentinel",
+        "stop-start/read-sentinel",
         &["cat", sentinel_path],
         &format!("{sentinel}\n"),
     )
@@ -114,7 +254,7 @@ async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<
     exec_expect_exact(
         runner,
         &sandbox_name,
-        "read-main-run-count",
+        "stop-start/read-main-run-count",
         &["cat", run_count_path],
         "2\n",
     )
@@ -133,10 +273,7 @@ async fn stopped_can_be_deleted(runner: &mut OpenShellRunner) -> Result<(), Stri
 
     run_lifecycle_command(runner, "stop", &sandbox_name, "stopped-delete/stop").await?;
     wait_for_phase(runner, &sandbox_name, "Stopped", "stopped-delete/stopped").await?;
-    run_lifecycle_command(runner, "delete", &sandbox_name, "stopped-delete/delete").await?;
-    wait_for_absence(runner, &sandbox_name, "stopped-delete/deleted").await?;
-    runner.forget_sandbox(&sandbox_name);
-    Ok(())
+    delete_and_confirm_absent(runner, &sandbox_name, "stopped-delete/delete").await
 }
 
 async fn create_running_sandbox(
@@ -194,7 +331,7 @@ async fn exec_expect_exact(
     let mut args = vec!["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"];
     args.extend_from_slice(command);
     let result = runner
-        .step(format!("stop-start/{step}"))
+        .step(step)
         .description(format!("sandbox '{sandbox_name}' exec {step} succeeds"))
         .with_timeout(COMMAND_TIMEOUT)
         .run(&args)
@@ -206,6 +343,108 @@ async fn exec_expect_exact(
     } else {
         Err(result.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")))
     }
+}
+
+async fn require_terminal_state(
+    runner: &OpenShellRunner,
+    sandbox_name: &str,
+    expected_phase: &str,
+    expected_exit_code: i32,
+    step: &str,
+) -> Result<(), String> {
+    let result = runner
+        .step(step)
+        .description(format!(
+            "persistent sandbox '{sandbox_name}' remains in phase {expected_phase} with exit code {expected_exit_code}"
+        ))
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&["sandbox", "get", sandbox_name, "--output", "json"])
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()?;
+    let state = result
+        .json::<SandboxState>()
+        .map_err(|error| error.to_string())?;
+    if state.name != sandbox_name
+        || state.phase != expected_phase
+        || state.exit_code != Some(expected_exit_code)
+    {
+        return Err(result.failure_diagnostic(&format!(
+            "sandbox '{sandbox_name}' remains in phase {expected_phase} with exit code {expected_exit_code}"
+        )));
+    }
+    Ok(())
+}
+
+async fn wait_for_terminal_state(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    expected_phase: &str,
+    expected_exit_code: i32,
+    step: &str,
+) -> Result<(), String> {
+    let sandbox_name = sandbox_name.to_string();
+    let expected_phase = expected_phase.to_string();
+    let step = step.to_string();
+    let poll_step = step.clone();
+    runner
+        .poll_until(
+            &poll_step,
+            TRANSITION_TIMEOUT,
+            TRANSITION_INTERVAL,
+            async move |runner| {
+                let result = runner
+                    .step(format!("{step}/get"))
+                    .description(format!(
+                        "sandbox '{sandbox_name}' reaches phase {expected_phase} with exit code {expected_exit_code}"
+                    ))
+                    .with_timeout(COMMAND_TIMEOUT)
+                    .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+                    .await;
+                match result {
+                    Ok(result) if !result.success() => {
+                        Poll::Pending(result.failure_diagnostic(&format!(
+                            "sandbox '{sandbox_name}' can be retrieved"
+                        )))
+                    }
+                    Ok(result) => match result.json::<SandboxState>() {
+                        Ok(state) if state.name != sandbox_name => Poll::Failed(format!(
+                            "sandbox get returned {:?}; expected '{sandbox_name}'",
+                            state.name
+                        )),
+                        Ok(state)
+                            if state.phase == expected_phase
+                                && state.exit_code == Some(expected_exit_code) =>
+                        {
+                            Poll::Ready(())
+                        }
+                        Ok(state) if state.phase == expected_phase => Poll::Pending(format!(
+                            "sandbox '{sandbox_name}' exit code is {:?}; expected {expected_exit_code}",
+                            state.exit_code
+                        )),
+                        Ok(state) => Poll::Pending(format!(
+                            "sandbox '{sandbox_name}' phase is {:?}; expected {expected_phase:?}",
+                            state.phase
+                        )),
+                        Err(error) => Poll::Failed(error.to_string()),
+                    },
+                    Err(error) => Poll::Pending(error.to_string()),
+                }
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn delete_and_confirm_absent(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<(), String> {
+    run_lifecycle_command(runner, "delete", sandbox_name, step).await?;
+    wait_for_absence(runner, sandbox_name, &format!("{step}/absent")).await?;
+    runner.forget_sandbox(sandbox_name);
+    Ok(())
 }
 
 async fn wait_for_phase(

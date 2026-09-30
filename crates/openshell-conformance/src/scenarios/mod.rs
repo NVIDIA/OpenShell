@@ -5,6 +5,7 @@
 
 mod file_transfer;
 mod policy_behavior;
+mod sandbox_environment;
 mod sandbox_lifecycle;
 mod smoke;
 
@@ -15,7 +16,9 @@ pub use file_transfer::{
 pub use policy_behavior::{
     MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, SANDBOX_LOCAL_SCENARIO,
 };
+pub use sandbox_environment::SANDBOX_ENVIRONMENT_SCENARIO;
 pub use sandbox_lifecycle::{
-    SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO, SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO,
+    SANDBOX_CANONICAL_MAIN_SCENARIO, SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO,
+    SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO,
 };
 pub use smoke::{SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO};

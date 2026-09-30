@@ -123,10 +123,13 @@ let
     "provider_refresh_handles"
     "provider_token_exchange"
     "proxy_egress_pipeline"
-    # Conformance covers stop/start workspace preservation and deletion while
-    # stopped. The remaining canonical-main, TTY, attachment replay, and
-    # no-keep cases still need migration. Nextest archive filters cannot select
-    # individual tests, so keep the complete binary in the follow-up bucket.
+    # Conformance covers stop/start workspace preservation, deletion while
+    # stopped, and detached canonical-main terminal state, fast-exit
+    # classification, environment propagation, persistence, and deletion. TTY
+    # streaming/environment and CLI exit-code propagation, attachment
+    # replay/recovery, signals, and no-keep cases remain. Nextest archive
+    # filters cannot select individual tests, so keep the complete binary in
+    # the follow-up bucket.
     "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"

@@ -4,9 +4,15 @@
 //! Driver-agnostic sandbox lifecycle conformance tests.
 
 use openshell_conformance::{
-    OpenShellRunner, SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO,
+    OpenShellRunner, SANDBOX_CANONICAL_MAIN_SCENARIO, SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO,
     SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO, Scenario,
 };
+
+/// Exercise canonical-main terminal state and persistence through the candidate CLI.
+#[tokio::test]
+async fn canonical_main() {
+    run_scenario(&SANDBOX_CANONICAL_MAIN_SCENARIO).await;
+}
 
 /// Exercise stop and stopped-deletion behavior through the candidate CLI.
 #[tokio::test]
