@@ -173,9 +173,9 @@ User says: "Review PR #456"
 
 ### Review by branch name
 
-User says: "Review branch `feature/add-pagination`"
+User says: "Review branch `feat/1234-add-pagination/octocat`"
 
-1. Look up PR with `gh pr list --head "feature/add-pagination"`
+1. Look up PR with `gh pr list --head "feat/1234-add-pagination/octocat"`
 2. If found, fetch PR metadata and diff
 3. If not found, diff against main locally
 4. Produce summary
