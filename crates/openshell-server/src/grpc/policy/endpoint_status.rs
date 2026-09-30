@@ -439,11 +439,16 @@ pub async fn reset_endpoint_status_for_supervisor_session(
 /// Reset endpoint observations after the active supervisor stream disconnects.
 ///
 /// A concurrently registered replacement owns its own pre-acknowledgement
-/// reset, so this path leaves that session's cursor alone.
+/// reset, so this path leaves that session's cursor alone. A replacement that
+/// already exists is detected before the mutation guard, so the reset does not
+/// wait behind other mutations of the sandbox.
 pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
+        return Ok(());
+    }
     let Some(_mutation_guard) = state
         .compute
         .sandbox_mutation_guard_by_id(sandbox_id)
@@ -457,14 +462,10 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
     else {
         return Err(Status::not_found("sandbox not found"));
     };
-    if state
-        .supervisor_sessions
-        .current_session_id(sandbox_id)
-        .is_some()
-    {
-        return Ok(());
-    }
-    if has_fresh_shared_owner(state, sandbox_id).await? {
+    // Re-check under the guard: a replacement's pre-acknowledgement reset runs
+    // under the same sandbox key, and resetting after it would wipe the
+    // replacement's fresh evidence.
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
         return Ok(());
     }
     let sandbox = state
@@ -714,6 +715,22 @@ async fn has_fresh_shared_owner(
         .await
         .map(|owner| owner.is_some_and(|owner| owner.is_fresh(OWNER_TTL)))
         .map_err(|error| Status::unavailable(format!("resolve supervisor owner failed: {error}")))
+}
+
+/// True when a replacement supervisor session (local, or a fresh owner on a
+/// peer) now owns endpoint observation, so a disconnect must not reset.
+async fn disconnect_reset_is_superseded(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<bool, Status> {
+    if state
+        .supervisor_sessions
+        .current_session_id(sandbox_id)
+        .is_some()
+    {
+        return Ok(true);
+    }
+    has_fresh_shared_owner(state, sandbox_id).await
 }
 
 fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {

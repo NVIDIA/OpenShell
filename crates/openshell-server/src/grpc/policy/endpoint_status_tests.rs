@@ -4,13 +4,17 @@
 use super::super::tests::{mcp_policy_with_versions, test_sandbox, with_sandbox};
 use super::super::{handle_get_sandbox_config, handle_report_policy_status, handle_update_config};
 use super::*;
+use crate::grpc::OpenShellService;
 use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::endpoint_status::endpoint_id;
+use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::proto::{
     EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
     NetworkPolicyRule, PolicyStatus, ReportPolicyStatusRequest, SandboxCondition, SandboxPhase,
-    UpdateConfigRequest,
+    SupervisorHello, SupervisorMessage, UpdateConfigRequest, supervisor_message,
 };
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 
 fn timestamp(value: &str) -> prost_types::Timestamp {
@@ -1324,6 +1328,241 @@ async fn startup_reconciliation_stops_after_the_attempt_limit() {
     .expect_err("an attempt error is returned");
     assert_eq!(error.code(), Code::Unavailable);
     assert_eq!(calls, 1, "an attempt error is not retried");
+}
+
+/// Store accepted endpoint evidence, then end the supervisor session that
+/// reported it, as the session task does before its disconnect reset.
+async fn disconnected_sandbox_with_endpoint_result(sandbox_id: &str) -> Arc<ServerState> {
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    assert!(
+        state
+            .supervisor_sessions
+            .remove_if_current(sandbox_id, "session-a")
+            .is_some()
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("sandbox status")
+            .endpoint_statuses[0]
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    state
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_local_session_replaced() {
+    let sandbox_id = "endpoint-disconnect-local-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a local replacement must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_peer_owns_session() {
+    let sandbox_id = "endpoint-disconnect-peer-owner";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .publish(
+            sandbox_id,
+            "peer-s",
+            "inst",
+            1,
+            "peer-replica",
+            "https://peer:8080",
+        )
+        .await
+        .expect("publish a live owner on a peer");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a live peer owner must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_waits_for_guard_without_replacement() {
+    let sandbox_id = "endpoint-disconnect-no-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::NoObservedExchange as i32
+    );
+    assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+}
+
+#[tokio::test]
+async fn disconnect_reset_rechecks_for_replacement_under_guard() {
+    let sandbox_id = "endpoint-disconnect-late-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+
+    // The replacement registers after the unguarded check, so only the
+    // re-check under the guard can keep its evidence.
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+}
+
+/// Serve the gateway API on loopback so a test can open a real supervisor
+/// stream.
+async fn gateway_client(state: Arc<ServerState>) -> OpenShellClient<tonic::transport::Channel> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(OpenShellServer::new(OpenShellService::new(state)))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    OpenShellClient::connect(format!("http://{address}"))
+        .await
+        .expect("connect to the test gateway")
+}
+
+#[tokio::test]
+async fn replacement_reset_timeout_invalidates_superseded_evidence() {
+    let sandbox_id = "endpoint-replacement-reset-timeout";
+    // Session A stays registered, so the replacement supersedes it before A's
+    // session loop could schedule a disconnect reset.
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let hold = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .expect("hold the sandbox mutation guard")
+        .expect("sandbox exists");
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+    let hello = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: "instance-b".to_string(),
+            connection_epoch: 1,
+            supports_provider_readiness: false,
+            redirected: false,
+            supports_session_redirect: false,
+        })),
+    };
+    let error = gateway_client(Arc::clone(&state))
+        .await
+        .connect_supervisor(tokio_stream::iter([hello]))
+        .await
+        .expect_err("the replacement's endpoint reset times out on the held guard");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(
+        state
+            .supervisor_sessions
+            .current_session_id(sandbox_id)
+            .is_none()
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("sandbox status")
+            .endpoint_statuses[0]
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32,
+        "nothing resets while the guard is held"
+    );
+
+    drop(hold);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = stored_sandbox(&state, sandbox_id)
+                .await
+                .status
+                .expect("sandbox status");
+            if status.endpoint_statuses[0].last_result == EndpointResult::NoObservedExchange as i32
+            {
+                assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+                assert_eq!(status.phase, SandboxPhase::Provisioning as i32);
+                assert!(status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready" && condition.status == "False"
+                }));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the superseded session's evidence is reset once the guard is free");
 }
 
 #[tokio::test]
