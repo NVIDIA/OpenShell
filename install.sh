@@ -26,6 +26,7 @@ HOMEBREW_PROVER_ASSET="openshell-prover-aarch64-apple-darwin.tar.gz"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
+TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-}"
 
 info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -64,6 +65,9 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_INSTALL_METHOD
                         Linux package to install: snap, deb, or rpm. Unset
                         selects deb or rpm from the host package manager.
+    OPENSHELL_TELEMETRY_ENABLED
+                        Set to 'false' to disable telemetry in the installed
+                        gateway service. Snap installs do not support this option.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
@@ -919,8 +923,25 @@ patch_prerelease_homebrew_formula_urls() {
   mv "$_patched_file" "$_formula_file"
 }
 
+telemetry_disabled() {
+  [ "${TELEMETRY_ENABLED:-}" = "false" ]
+}
+
+configure_user_service_telemetry() {
+  telemetry_disabled || return 0
+  _override_dir="${TARGET_HOME}/.config/systemd/user/openshell-gateway.service.d"
+  as_target_user mkdir -p "$_override_dir"
+  # shellcheck disable=SC2016
+  as_target_user sh -c '
+    printf "[Service]\nEnvironment=\"OPENSHELL_TELEMETRY_ENABLED=false\"\n" > "${1}/telemetry.conf"
+  ' sh "$_override_dir"
+  info "configured OPENSHELL_TELEMETRY_ENABLED=false in openshell-gateway user service"
+}
+
 start_user_gateway() {
   info "restarting openshell-gateway user service as ${TARGET_USER}..."
+
+  configure_user_service_telemetry
 
   if ! as_target_user systemctl --user daemon-reload; then
     info "could not reach the user systemd manager for ${TARGET_USER}"
@@ -1347,6 +1368,10 @@ install_linux_snap() {
   require_cmd snap
   set_linux_target_runtime_dir
 
+  if telemetry_disabled; then
+    warn "OPENSHELL_TELEMETRY_ENABLED=false is not supported for snap installs; configure telemetry after installation"
+  fi
+
   if snap list docker >/dev/null 2>&1; then
     error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
 Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
@@ -1376,6 +1401,24 @@ Install Docker Engine from a system package or Docker's package repository, then
   register_snap_gateway
   OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
   wait_for_local_gateway_status
+}
+
+configure_macos_gateway_telemetry() {
+  telemetry_disabled || return 0
+  _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
+  [ -n "$_brew_prefix" ] || return 0
+  _plist="${_brew_prefix}/opt/${HOMEBREW_FORMULA_NAME}/homebrew.mxcl.${HOMEBREW_FORMULA_NAME}.plist"
+  if [ ! -f "$_plist" ]; then
+    warn "could not locate gateway plist at ${_plist}; OPENSHELL_TELEMETRY_ENABLED will not be set in the service"
+    return 0
+  fi
+  info "disabling telemetry in gateway service plist..."
+  as_target_user /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' "$_plist" 2>/dev/null || true
+  if ! as_target_user /usr/libexec/PlistBuddy \
+    -c 'Add :EnvironmentVariables:OPENSHELL_TELEMETRY_ENABLED string false' "$_plist" 2>/dev/null; then
+    as_target_user /usr/libexec/PlistBuddy \
+      -c 'Set :EnvironmentVariables:OPENSHELL_TELEMETRY_ENABLED false' "$_plist"
+  fi
 }
 
 install_macos_homebrew() {
@@ -1414,6 +1457,8 @@ install_macos_homebrew() {
     as_target_user brew install --formula "$_formula_ref"
   fi
 
+  configure_macos_gateway_telemetry
+
   info "restarting OpenShell Homebrew service..."
   if ! as_target_user brew services restart "$_formula_ref"; then
     warn "could not restart the OpenShell Homebrew service"
@@ -1445,6 +1490,11 @@ main() {
         ;;
     esac
   fi
+
+  case "${TELEMETRY_ENABLED:-}" in
+    true|false|'') ;;
+    *) error "OPENSHELL_TELEMETRY_ENABLED must be 'true' or 'false'" ;;
+  esac
 
   require_cmd curl
   PLATFORM="$(detect_platform)"
