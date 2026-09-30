@@ -500,10 +500,8 @@ console.log(sandbox.serviceUrls[''])
 
 ```go
 sandbox, err := client.Sandboxes().Create(
-    ctx, "default", "app-server", spec, nil,
-    v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
-        {TargetPort: 4500},
-    }},
+    ctx, "default", "app-server", spec,
+    v1.WithServiceExposures(v1.ServiceExposure{TargetPort: 4500}),
 )
 fmt.Println(sandbox.ServiceURLs[""])
 ```
