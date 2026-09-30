@@ -4823,6 +4823,7 @@ dependencies = [
  "apollo-parser",
  "async-trait",
  "aws-credential-types",
+ "aws-lc-rs",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "base64 0.22.1",

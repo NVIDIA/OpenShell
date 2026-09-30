@@ -90,11 +90,25 @@ pub enum CredentialSigning {
     SigV4Body,
     /// Never include body in signature (use UNSIGNED-PAYLOAD, stream through).
     SigV4NoBody,
+    /// Oracle Cloud Infrastructure request signing: RSA-SHA256 HTTP
+    /// `Signature` over `date (request-target) host`, plus the body headers
+    /// for POST, PUT, and PATCH. The body is buffered for those methods and
+    /// streamed through for the others.
+    Oci,
 }
 
 impl CredentialSigning {
     pub fn is_sigv4(&self) -> bool {
         matches!(self, Self::SigV4 | Self::SigV4Body | Self::SigV4NoBody)
+    }
+
+    pub fn is_oci(&self) -> bool {
+        matches!(self, Self::Oci)
+    }
+
+    /// True when the proxy re-signs requests for this endpoint with any scheme.
+    pub fn signs_requests(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -349,6 +363,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         Some("sigv4") => CredentialSigning::SigV4,
         Some("sigv4:body") => CredentialSigning::SigV4Body,
         Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
+        Some("oci") => CredentialSigning::Oci,
         Some(other) if !other.is_empty() => {
             let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::High)
@@ -2254,6 +2269,20 @@ mod tests {
     #[test]
     fn is_sigv4_false_for_none() {
         assert!(!CredentialSigning::None.is_sigv4());
+    }
+
+    #[test]
+    fn parses_oci_credential_signing_without_signing_service() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "oci", "host": "objectstorage.us-chicago-1.oraclecloud.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).expect("oci signing parses without signing_service");
+        assert_eq!(config.credential_signing, CredentialSigning::Oci);
+        assert!(config.credential_signing.is_oci());
+        assert!(!config.credential_signing.is_sigv4());
+        assert!(config.credential_signing.signs_requests());
+        assert!(!CredentialSigning::None.signs_requests());
     }
 
     #[test]
