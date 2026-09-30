@@ -35,8 +35,8 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request,
-    RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
+    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, ExitStatusWire, MAX_CONTROL_FRAME_BYTES,
+    Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
     STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
     read_stream_frame, validate_resource_claims, write_stream_frame,
@@ -52,6 +52,16 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds the liveness check that decides whether a stream failure lost the
+/// whole connection.
+const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Relay and pending-accept streams share the boundary's concurrent stream
+/// limit with exec and control exchanges; leave the remainder for those.
+const MAX_NETWORK_STREAMS: usize = 96;
+const _: () = assert!(
+    MAX_NETWORK_STREAMS < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
+);
+const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -371,25 +381,41 @@ impl ReadyBoundary for RemoteReady {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let (ca_cert, ca_bundle) = if let Some((ca_cert, ca_bundle)) = ca_paths {
-            let ca_cert = tokio::fs::read(&ca_cert).await.map_err(|error| {
+            let ca_cert = tokio::fs::read_to_string(&ca_cert).await.map_err(|error| {
                 BackendError::Process(format!("read host proxy CA {}: {error}", ca_cert.display()))
             })?;
-            let ca_bundle = tokio::fs::read(&ca_bundle).await.map_err(|error| {
-                BackendError::Process(format!(
-                    "read host proxy CA bundle {}: {error}",
-                    ca_bundle.display()
-                ))
-            })?;
+            let ca_bundle = tokio::fs::read_to_string(&ca_bundle)
+                .await
+                .map_err(|error| {
+                    BackendError::Process(format!(
+                        "read host proxy CA bundle {}: {error}",
+                        ca_bundle.display()
+                    ))
+                })?;
             (Some(ca_cert), Some(ca_bundle))
         } else {
             (None, None)
         };
-        let (provider_env_revision, provider_env) = self
+        let provider_snapshot = self
             .provider_credentials
-            .child_env_snapshot_with_gcp_resolved()
+            .child_environment_snapshot()
             .map_err(|error| {
                 BackendError::Process(format!("snapshot provider environment: {error}"))
             })?;
+        if !provider_snapshot.files.is_empty() {
+            let response = self
+                .client
+                .call_idempotent(Request::ProbeProviderFiles)
+                .await
+                .map_err(|error| {
+                    BackendError::Process(format!("provider file capability probe failed: {error}"))
+                })?;
+            if !matches!(response, Response::ProviderFilesSupported) {
+                return Err(BackendError::Process(
+                    "sandbox boundary does not support provider files".to_string(),
+                ));
+            }
+        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -398,8 +424,9 @@ impl ReadyBoundary for RemoteReady {
                 policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
-                provider_env_revision,
-                provider_env,
+                provider_env_revision: provider_snapshot.revision,
+                provider_env: provider_snapshot.environment,
+                provider_files: provider_snapshot.files,
             })
             .await?;
         let Response::Started {
@@ -537,6 +564,7 @@ async fn open_process_attachment(
         network_reader,
         stdout_pump,
         stderr_pump,
+        None,
     ));
     let terminal: Option<Arc<dyn BoundaryTerminal>> = if has_terminal {
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(RemoteTerminal { client, process_id });
@@ -562,22 +590,29 @@ async fn pump_process_responses(
     mut network: tokio::io::ReadHalf<BoundaryDuplexStream>,
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
+    completion: Option<tokio::sync::oneshot::Sender<BoundaryExitStatus>>,
 ) {
-    loop {
+    let status = loop {
         match read_stream_frame(&mut network).await {
             Ok(Some((STREAM_STDOUT, payload))) => {
                 if stdout.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
             Ok(Some((STREAM_STDERR, payload))) => {
                 if stderr.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
-            Ok(Some((STREAM_EXIT, _)) | None) | Err(_) => return,
-            Ok(Some((_channel, _))) => return,
+            Ok(Some((STREAM_EXIT, payload))) => {
+                break serde_json::from_slice::<ExitStatusWire>(&payload)
+                    .map_or(BoundaryExitStatus::Exited(74), Into::into);
+            }
+            Ok(None | Some(_)) | Err(_) => break BoundaryExitStatus::Exited(74),
         }
+    };
+    if let Some(completion) = completion {
+        let _ = completion.send(status);
     }
 }
 
@@ -601,6 +636,22 @@ impl RemoteExec {
                 .map_err(|error| {
                     BackendError::Process(format!("snapshot provider environment: {error}"))
                 })?;
+            if !snapshot.files.is_empty() {
+                let response = self
+                    .client
+                    .call_idempotent(Request::ProbeProviderFiles)
+                    .await
+                    .map_err(|error| {
+                        BackendError::Process(format!(
+                            "provider file capability probe failed: {error}"
+                        ))
+                    })?;
+                if !matches!(response, Response::ProviderFilesSupported) {
+                    return Err(BackendError::Process(
+                        "sandbox boundary does not support provider files".to_string(),
+                    ));
+                }
+            }
             *generation = generation.checked_add(1).ok_or_else(|| {
                 BackendError::Process("provider environment publication exhausted".to_string())
             })?;
@@ -611,6 +662,7 @@ impl RemoteExec {
                     generation: requested_generation,
                     revision: snapshot.revision,
                     provider_env: snapshot.environment,
+                    provider_files: snapshot.files,
                 })
                 .await?;
             let Response::ProviderEnvironmentUpdated {
@@ -758,11 +810,13 @@ async fn open_exec_session(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
+    let (output_status_tx, output_status_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(pump_exec_input(stdin_pump, network_writer));
     tokio::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
+        Some(output_status_tx),
     ));
 
     let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
@@ -783,6 +837,7 @@ async fn open_exec_session(
         stdout,
         stderr,
         terminal,
+        output_status: Some(output_status_rx),
     })
 }
 
@@ -826,6 +881,8 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         // An idle accept has no deadline. Recover transport loss before exposing
         // a source error, which permanently stops the proxy. The boundary drops
         // the interrupted pending open; a retry never replays its decision.
+        // Pending accepts and live relays each hold a stream until the relay ends.
+        let permit = self.client.acquire_network_stream().await;
         let (stream, response) = self.client.call_wait_stream(Request::AcceptNetwork).await?;
         let Response::NetworkConnected {
             identity,
@@ -839,7 +896,10 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         };
         let (decision, completion) = tokio::sync::oneshot::channel();
         let (proxy_stream, transport_stream) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(complete_network_open(stream, transport_stream, completion));
+        tokio::spawn(async move {
+            complete_network_open(stream, transport_stream, completion).await;
+            drop(permit);
+        });
         Ok(PendingTcpOpen {
             stream: Box::new(proxy_stream),
             binary_identity: identity.into_result(),
@@ -1040,6 +1100,8 @@ struct BoundaryClient {
     reconnect: tokio::sync::Mutex<()>,
     next_connection_generation: AtomicU64,
     credential_monitor_started: AtomicBool,
+    network_streams: Arc<tokio::sync::Semaphore>,
+    network_streams_exhausted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1048,6 +1110,108 @@ struct CachedGrpcChannel {
     bearer_fingerprint: [u8; 32],
     generation: u64,
     channel: tonic::transport::Channel,
+    transport: Arc<TransportAbort>,
+}
+
+/// Closes a channel's physical transport so the boundary observes the
+/// disconnect even while abandoned streams still hold channel clones.
+#[derive(Default)]
+struct TransportAbort {
+    connected: AtomicBool,
+    aborted: AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl TransportAbort {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        let waker = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Register before checking so an abort between the two still wakes us.
+    fn poll_aborted(&self, context: &std::task::Context<'_>) -> bool {
+        {
+            let mut waker = self
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !waker
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(context.waker()))
+            {
+                *waker = Some(context.waker().clone());
+            }
+        }
+        self.is_aborted()
+    }
+}
+
+struct AbortableTransport {
+    inner: BoundaryDuplexStream,
+    abort: Arc<TransportAbort>,
+}
+
+impl AbortableTransport {
+    fn aborted_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "boundary transport replaced",
+        )
+    }
+}
+
+impl tokio::io::AsyncRead for AbortableTransport {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.abort.poll_aborted(context) {
+            return std::task::Poll::Ready(Err(Self::aborted_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for AbortableTransport {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.abort.poll_aborted(context) {
+            return std::task::Poll::Ready(Err(Self::aborted_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.abort.poll_aborted(context) {
+            return std::task::Poll::Ready(Err(Self::aborted_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
 }
 
 // Cache only a digest; authenticate with the exact captured header so a
@@ -1099,7 +1263,31 @@ impl BoundaryClient {
             reconnect: tokio::sync::Mutex::new(()),
             next_connection_generation: AtomicU64::new(1),
             credential_monitor_started: AtomicBool::new(false),
+            network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
+            network_streams_exhausted: AtomicBool::new(false),
         }
+    }
+
+    async fn acquire_network_stream(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let acquire = self.network_streams.clone().acquire_owned();
+        tokio::pin!(acquire);
+        // Bursty clients briefly exceed the budget; only report sustained waits.
+        let permit = if let Ok(permit) =
+            tokio::time::timeout(NETWORK_STREAM_WAIT_WARNING, &mut acquire).await
+        {
+            self.network_streams_exhausted
+                .store(false, Ordering::Relaxed);
+            permit
+        } else {
+            if !self.network_streams_exhausted.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    limit = MAX_NETWORK_STREAMS,
+                    "Sandbox network relay streams exhausted; new sandbox TCP connections are waiting for a relay to close"
+                );
+            }
+            acquire.await
+        };
+        permit.expect("network stream semaphore is never closed")
     }
 
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
@@ -1385,10 +1573,8 @@ impl BoundaryClient {
                     "cannot rotate Sandbox Protocol connection before attach".to_string(),
                 )
             })?;
-        let channel = self.build_grpc_channel().await?;
-        self.exchange_on_channel(channel.clone(), &attach, &credential)
-            .await?;
-        self.exchange_on_channel(channel.clone(), &confirm, &credential)
+        let (channel, transport) = self
+            .attach_new_channel(&attach, Some(&confirm), &credential)
             .await?;
         *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch: credential.epoch,
@@ -1397,6 +1583,7 @@ impl BoundaryClient {
                 .next_connection_generation
                 .fetch_add(1, Ordering::Relaxed),
             channel,
+            transport,
         });
         *self.mediation.lock().await = None;
         Ok(())
@@ -1418,18 +1605,27 @@ impl BoundaryClient {
         observed_generation: Option<u64>,
     ) -> Result<(), BackendError> {
         let _reconnect = self.reconnect.lock().await;
-        if self
-            .grpc_channel
-            .lock()
-            .await
-            .as_ref()
-            .map(|cached| cached.generation)
-            != observed_generation
-        {
+        let cached = self.grpc_channel.lock().await.clone();
+        if cached.as_ref().map(|cached| cached.generation) != observed_generation {
             return Ok(());
         }
+        let confirm = self
+            .confirm_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(cached) = &cached {
+            // One failed stream does not prove the connection is gone. Keep a
+            // live connection: the boundary rejects a same-epoch replacement
+            // while it still considers the current connection active.
+            if let Some(confirm) = &confirm
+                && self.connection_is_live(cached, confirm).await
+            {
+                return Ok(());
+            }
+            cached.transport.abort();
+        }
 
-        *self.grpc_channel.lock().await = None;
         *self.mediation.lock().await = None;
         let attach = self
             .attach_request
@@ -1437,21 +1633,30 @@ impl BoundaryClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let Some(attach) = attach else {
+            *self.grpc_channel.lock().await = None;
             return Ok(());
         };
-        let confirm = self
-            .confirm_request
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // Keep the aborted channel cached until the confirmed replacement is
+        // swapped in. Concurrent callers then fail fast and wait on this
+        // recovery instead of caching a connection that never attached.
         let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
-        let channel = self.build_grpc_channel().await?;
-        self.exchange_on_channel(channel.clone(), &attach, &credential)
-            .await?;
-        if let Some(confirm) = confirm {
-            self.exchange_on_channel(channel.clone(), &confirm, &credential)
-                .await?;
-        }
+        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
+        let (channel, transport) = loop {
+            match self
+                .attach_new_channel(&attach, confirm.as_ref(), &credential)
+                .await
+            {
+                Ok(attached) => break attached,
+                // The boundary may not have retired the aborted connection yet.
+                Err(BackendError::Unavailable(message))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::debug!(%message, "boundary reattach not accepted yet; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch: credential.epoch,
             bearer_fingerprint: credential.fingerprint,
@@ -1459,8 +1664,53 @@ impl BoundaryClient {
                 .next_connection_generation
                 .fetch_add(1, Ordering::Relaxed),
             channel,
+            transport,
         });
         Ok(())
+    }
+
+    async fn connection_is_live(
+        &self,
+        cached: &CachedGrpcChannel,
+        confirm: &RequestEnvelope,
+    ) -> bool {
+        let Ok(credential) = BoundaryCredential::capture(&self.sandbox_bearer) else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(
+                CONNECTION_PROBE_TIMEOUT,
+                self.exchange_on_channel(cached.channel.clone(), confirm, &credential),
+            )
+            .await,
+            Ok(Ok(Response::Confirmed { .. }))
+        )
+    }
+
+    /// Open a new physical connection and replay the authenticated lifecycle,
+    /// closing the connection again if the boundary does not accept it.
+    async fn attach_new_channel(
+        &self,
+        attach: &RequestEnvelope,
+        confirm: Option<&RequestEnvelope>,
+        credential: &BoundaryCredential,
+    ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
+        let (channel, transport) = self.build_grpc_channel().await?;
+        let result = async {
+            self.exchange_on_channel(channel.clone(), attach, credential)
+                .await?;
+            if let Some(confirm) = confirm {
+                self.exchange_on_channel(channel.clone(), confirm, credential)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            transport.abort();
+            return Err(error);
+        }
+        Ok((channel, transport))
     }
 
     fn start_credential_monitor(self: &Arc<Self>) {
@@ -1603,7 +1853,7 @@ impl BoundaryClient {
             return Ok(cached.channel.clone());
         }
         let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
-        let channel = self.build_grpc_channel().await?;
+        let (channel, transport) = self.build_grpc_channel().await?;
         *state = Some(CachedGrpcChannel {
             credential_epoch: credential.epoch,
             bearer_fingerprint: credential.fingerprint,
@@ -1611,25 +1861,38 @@ impl BoundaryClient {
                 .next_connection_generation
                 .fetch_add(1, Ordering::Relaxed),
             channel: channel.clone(),
+            transport,
         });
         Ok(channel)
     }
 
-    async fn build_grpc_channel(&self) -> Result<tonic::transport::Channel, BackendError> {
+    async fn build_grpc_channel(
+        &self,
+    ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
+        let transport = Arc::new(TransportAbort::default());
+        let connector_transport = transport.clone();
         let endpoint =
             tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
-                .initial_stream_window_size(16 * 1024 * 1024)
-                .initial_connection_window_size(16 * 1024 * 1024)
+                .initial_stream_window_size(crate::boundary_protocol::BOUNDARY_STREAM_WINDOW_BYTES)
+                .initial_connection_window_size(
+                    crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
+                )
                 .http2_keep_alive_interval(Duration::from_secs(10))
                 .keep_alive_while_idle(true);
         let channel = endpoint
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let runtime_descriptor = runtime_descriptor.clone();
+                let abort = connector_transport.clone();
                 async move {
+                    // A channel is one authenticated connection. Never let it
+                    // silently reconnect without replaying attach and confirm.
+                    if abort.is_aborted() || abort.connected.swap(true, Ordering::AcqRel) {
+                        return Err(AbortableTransport::aborted_error());
+                    }
                     connect_boundary_with_retry(&runtime_descriptor)
                         .await
-                        .map(TokioIo::new)
+                        .map(|inner| TokioIo::new(AbortableTransport { inner, abort }))
                         .map_err(|error| std::io::Error::other(error.to_string()))
                 }
             }))
@@ -1637,7 +1900,7 @@ impl BoundaryClient {
             .map_err(|error| {
                 BackendError::Unavailable(format!("start boundary gRPC channel: {error}"))
             })?;
-        Ok(channel)
+        Ok((channel, transport))
     }
 
     #[cfg(test)]
@@ -1924,6 +2187,7 @@ fn is_transport_unavailable(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     mod credential_renewal;
+    mod flow_control;
     mod network_recovery;
 
     use std::path::PathBuf;
@@ -2054,6 +2318,7 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
+                            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
@@ -2183,6 +2448,7 @@ mod tests {
                 .fingerprint,
             generation: 1,
             channel,
+            transport: Arc::default(),
         });
         // A caller may try again later, but each call makes exactly one
         // bounded attach attempt and preserves the server's typed denial.
@@ -2253,7 +2519,24 @@ mod tests {
             Response::Confirmed { .. }
         ));
 
+        // A stream-level failure on a live connection keeps that connection.
         let failed_generation = client.connection_generation().await;
+        client
+            .recover_after_unavailable(failed_generation)
+            .await
+            .unwrap();
+        assert_eq!(client.connection_generation().await, failed_generation);
+        assert_eq!(accepted.load(Ordering::Acquire), 1);
+        assert_eq!(requests.load(Ordering::Acquire), 3);
+
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .expect("cached channel")
+            .transport
+            .abort();
         client
             .recover_after_unavailable(failed_generation)
             .await
@@ -2263,7 +2546,7 @@ mod tests {
             .expect("replacement connection accepted")
             .unwrap();
         assert_eq!(accepted.load(Ordering::Acquire), 2);
-        assert_eq!(requests.load(Ordering::Acquire), 4);
+        assert_eq!(requests.load(Ordering::Acquire), 5);
 
         // Another accept can report the same transport loss after recovery.
         // It must reuse the replacement without a third connection or replay.
@@ -2277,7 +2560,7 @@ mod tests {
         .unwrap();
         assert_eq!(client.connection_generation().await, recovered_generation);
         assert_eq!(accepted.load(Ordering::Acquire), 2);
-        assert_eq!(requests.load(Ordering::Acquire), 4);
+        assert_eq!(requests.load(Ordering::Acquire), 5);
     }
 
     #[test]
@@ -2293,7 +2576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mediation_transport_failure_recovers_without_deadlocking_the_cache() {
+    async fn mediation_stream_failure_retries_without_deadlocking_the_cache() {
         let certificate = test_certificate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2351,12 +2634,12 @@ mod tests {
             .await
             .expect("mediation recovery must not deadlock")
             .expect("mediation recovery must open a replacement session");
-        tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("replacement physical connection must be accepted")
-            .unwrap();
+        // The liveness probe keeps the healthy physical connection.
+        assert!(!server.is_finished(), "no replacement connection expected");
+        server.abort();
         assert_eq!(mediation_failures.load(Ordering::Acquire), 0);
-        assert_eq!(requests.load(Ordering::Acquire), 5);
+        // Attach, confirm, liveness confirm, then the successful mediation.
+        assert_eq!(requests.load(Ordering::Acquire), 4);
     }
 
     #[tokio::test]
@@ -2411,8 +2694,10 @@ mod tests {
                 request: vec![1, 2, 3],
                 transport: openshell_isolation_interface::contract::DnsTransport::Udp,
                 identity: crate::boundary_protocol::BinaryIdentityWire::Resolved {
-                    binary_path: PathBuf::from("/usr/bin/dig"),
-                    binary_digest: Some("a".repeat(64).parse().unwrap()),
+                    executable: crate::boundary_protocol::ExecutableIdentityWire {
+                        path: PathBuf::from("/usr/bin/dig"),
+                        digest: Some("a".repeat(64).parse().unwrap()),
+                    },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
                 },
@@ -2440,7 +2725,7 @@ mod tests {
         let query = session.accept_dns().await.unwrap();
         assert_eq!(query.message, [1, 2, 3]);
         assert_eq!(
-            query.binary_identity.unwrap().binary_path,
+            query.binary_identity.unwrap().executable.path,
             PathBuf::from("/usr/bin/dig")
         );
         query.response.send(Ok(vec![4, 5, 6])).unwrap();
@@ -2898,7 +3183,7 @@ mod tests {
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         ));
-        let session = open_exec_session(
+        let mut session = open_exec_session(
             client,
             ExecSpec {
                 program: "/bin/true".to_string(),
@@ -2914,9 +3199,15 @@ mod tests {
         .unwrap();
         // The test peer closes its I/O stream without an exit frame. Neither
         // that loss nor a dropped reader can invalidate the process handle.
+        let output_status = session.output_status.take().unwrap();
         drop(session.stdin);
         drop(session.stdout);
         drop(session.stderr);
+        assert_eq!(
+            output_status.await.unwrap(),
+            BoundaryExitStatus::Exited(74),
+            "missing stream exit must fail even when the process exits cleanly"
+        );
         let attachment = session.process.attach().await.unwrap();
         drop(attachment);
         for _ in 0..2 {
@@ -2926,6 +3217,34 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_output_completion_preserves_failure_status() {
+        let (network, mut peer) = tokio::io::duplex(1024);
+        let network: BoundaryDuplexStream = Box::new(network);
+        let (reader, _writer) = tokio::io::split(network);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, _error_output) = tokio::io::duplex(1024);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_process_responses(
+            reader,
+            stdout,
+            stderr,
+            Some(completion_tx),
+        ));
+        write_stream_frame(&mut peer, STREAM_STDOUT, b"hello")
+            .await
+            .unwrap();
+        let status = serde_json::to_vec(&ExitStatusWire::Exited(74)).unwrap();
+        write_stream_frame(&mut peer, STREAM_EXIT, &status)
+            .await
+            .unwrap();
+        let mut bytes = [0; 5];
+        output.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"hello");
+        assert_eq!(completion_rx.await.unwrap(), BoundaryExitStatus::Exited(74));
+        pump.await.unwrap();
     }
 
     struct TestTlsIo(BoundaryDuplexStream);
@@ -3166,11 +3485,12 @@ mod tests {
         assert!(matches!(
             client
                 .exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
-                    ca_cert: Some(vec![b'c'; 16 * 1024]),
-                    ca_bundle: Some(vec![b'b'; 256 * 1024]),
+                    ca_cert: Some("c".repeat(16 * 1024)),
+                    ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
                     provider_env: HashMap::new(),
                 })
@@ -3225,11 +3545,12 @@ mod tests {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 client.exchange(Request::StartAgent {
+                    provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
-                    ca_cert: Some(vec![b'c'; 16 * 1024]),
-                    ca_bundle: Some(vec![b'b'; 256 * 1024]),
+                    ca_cert: Some("c".repeat(16 * 1024)),
+                    ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
                     provider_env: HashMap::new(),
                 })

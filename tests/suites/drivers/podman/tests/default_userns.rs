@@ -86,16 +86,38 @@ async fn configured_userns_matches_podman_reference() {
 }
 
 fn normalize_uid_map(value: &str) -> Option<String> {
-    let mappings = value
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.len() == 3
-                && fields
-                    .iter()
-                    .all(|field| field.bytes().all(|byte| byte.is_ascii_digit())))
-            .then(|| fields.join(" "))
-        })
-        .collect::<Vec<_>>();
-    (!mappings.is_empty()).then(|| mappings.join("\n"))
+    let mut mappings: Vec<(u64, u64, u64)> = Vec::new();
+    for line in value.lines() {
+        let fields = line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(fields) = fields else { continue };
+        let [inside, outside, length] = fields.as_slice() else {
+            continue;
+        };
+        if let Some(previous) = mappings.last_mut()
+            && previous.0.checked_add(previous.2) == Some(*inside)
+            && previous.1.checked_add(previous.2) == Some(*outside)
+        {
+            previous.2 += *length;
+        } else {
+            mappings.push((*inside, *outside, *length));
+        }
+    }
+    (!mappings.is_empty()).then(|| {
+        mappings
+            .iter()
+            .map(|(inside, outside, length)| format!("{inside} {outside} {length}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+#[test]
+fn adjacent_uid_ranges_match_a_combined_mapping() {
+    assert_eq!(
+        normalize_uid_map("0 0 1\n1 1 65535\n"),
+        normalize_uid_map("0 0 65536\n")
+    );
 }

@@ -84,6 +84,9 @@ const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
 pub(crate) const HTTP2_PRIOR_KNOWLEDGE_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
     "HTTP/2 cleartext upgrade (h2c) is not supported for L7-inspected endpoints";
+pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
+    "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
+pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -745,6 +748,7 @@ where
         RelayRequestOptions {
             resolver,
             body_classifier: None,
+            mcp_request_validation: None,
             credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
@@ -771,6 +775,8 @@ pub(crate) enum WebSocketExtensionMode {
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) body_classifier: Option<&'a openshell_core::secrets::body::BodyCredentialClassifier>,
+    /// Revalidate buffered MCP requests after header transformations.
+    pub(crate) mcp_request_validation: Option<McpRequestValidation<'a>>,
     pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
@@ -781,6 +787,14 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+/// Policy and logging context for checking the MCP request sent upstream.
+#[derive(Clone, Copy)]
+pub(crate) struct McpRequestValidation<'a> {
+    pub(crate) config: &'a crate::l7::L7EndpointConfig,
+    pub(crate) ctx: &'a crate::l7::relay::L7EvalContext,
+    pub(crate) redacted_target: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -914,6 +928,33 @@ where
 
     let rewrite_result =
         rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+
+    if let Some(validation) = options.mcp_request_validation {
+        // Header credential resolution and hop-by-hop cleanup must finish
+        // before checking MCP mirrors. MCP bodies are already fully buffered
+        // and are not eligible for credential body rewriting.
+        let mut raw_header = rewrite_result.rewritten.clone();
+        raw_header.extend_from_slice(&req.raw_header[header_end..]);
+        let outgoing = L7Request {
+            action: req.action.clone(),
+            target: req.target.clone(),
+            query_params: req.query_params.clone(),
+            raw_header,
+            body_length: req.body_length,
+        };
+        if !crate::l7::relay::enforce_final_mcp_protocol_version(
+            validation.config,
+            &outgoing,
+            client,
+            validation.ctx,
+            validation.redacted_target,
+            observer,
+        )
+        .await?
+        {
+            return Ok(RelayOutcome::Consumed);
+        }
+    }
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -2393,6 +2434,71 @@ pub(crate) fn request_is_h2c_upgrade(raw_header: &[u8]) -> bool {
     upgrade_h2c && connection_upgrade
 }
 
+/// Returns why an L7 endpoint using `protocol` must refuse this request's
+/// upgrade, or `None` when the request may continue.
+///
+/// Every inspected protocol refuses h2c. Protocols named by
+/// `upgrade_refusal_for_protocol` refuse every request that carries an
+/// `Upgrade` header. Callers apply this before the L7 policy decision and
+/// regardless of enforcement mode, because an upgrade would end inspection
+/// rather than break a rule that audit mode could log.
+pub(crate) fn unsupported_upgrade_detail(
+    raw_header: &[u8],
+    protocol: crate::l7::L7Protocol,
+) -> Option<&'static str> {
+    if request_is_h2c_upgrade(raw_header) {
+        return Some(UNSUPPORTED_H2C_UPGRADE_DETAIL);
+    }
+    let refusal = upgrade_refusal_for_protocol(protocol)?;
+    request_has_upgrade_header(raw_header).then_some(refusal)
+}
+
+/// Returns the refusal detail for a protocol whose policy applies only to
+/// individual HTTP requests, or `None` for a protocol that may relay an
+/// allowed upgrade.
+///
+/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// After an upgrade the relay would copy frames that no rule of these
+/// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
+/// served by separate `protocol: websocket` endpoints with GraphQL operation
+/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// endpoints keep their existing upgrade behavior. The match is exhaustive so
+/// a new protocol must choose.
+pub(crate) fn upgrade_refusal_for_protocol(
+    protocol: crate::l7::L7Protocol,
+) -> Option<&'static str> {
+    use crate::l7::L7Protocol;
+    match protocol {
+        L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+        L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
+    }
+}
+
+/// Returns true when a request carries an `Upgrade` header, whatever its
+/// value.
+///
+/// Both relay checks that can lead to a protocol switch require that header:
+/// `request_is_websocket_upgrade`, which decides whether upgrade headers are
+/// forwarded, and `client_requested_upgrade`, which decides whether an
+/// upstream `101` may reach the client. A refusal based on this test therefore
+/// covers every request either one treats as an upgrade. Headers that are not
+/// UTF-8 return false; the shared relay rejects them before forwarding.
+fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw_header.len(), |p| p + 4);
+    let Ok(header_str) = std::str::from_utf8(&raw_header[..header_end]) else {
+        return false;
+    };
+
+    header_str.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("upgrade"))
+    })
+}
+
 fn rewrite_websocket_extensions_for_mode(
     raw_header: &[u8],
     mode: WebSocketExtensionMode,
@@ -2785,12 +2891,26 @@ pub(crate) async fn send_json_response<C: AsyncWrite + Unpin>(
     client: &mut C,
     status: &str,
 ) -> Result<()> {
+    send_json_response_with_allow(policy_name, body, client, status, None).await
+}
+
+/// Send a JSON response, including the required `Allow` field for an HTTP 405.
+/// The allowed methods are supplied by the protocol adapter, never the peer.
+pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    allowed_methods: Option<&'static str>,
+) -> Result<()> {
     let body_bytes = body.to_string();
+    let allow = allowed_methods.map_or_else(String::new, |methods| format!("Allow: {methods}\r\n"));
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\
+         {allow}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -3663,7 +3783,7 @@ mod tests {
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum ResponseRelayScript {
         HeadersOnly,
         WholeBody,
@@ -6027,6 +6147,95 @@ mod tests {
         (observer, receiver)
     }
 
+    #[tokio::test]
+    async fn endpoint_observation_records_mcp_denial_after_header_cleanup() {
+        for disconnect_client in [false, true] {
+            let (observer, mut receiver) = test_endpoint_observer().await;
+            let config = crate::l7::parse_l7_config(
+                &regorus::Value::from_json_str(
+                    r#"{"protocol":"mcp","mcp_versions":["2025-11-25"]}"#,
+                )
+                .expect("parse MCP config JSON"),
+            )
+            .expect("parse MCP config");
+            let ctx = crate::l7::relay::L7EvalContext {
+                host: "mcp.example.test".into(),
+                port: 8000,
+                policy_name: "mcp-policy".into(),
+                ..Default::default()
+            };
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+            // The incoming version is allowed, but Connection nominates it for
+            // removal. The final gate must observe the outgoing request's denial.
+            let raw_request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nConnection: close, MCP-Protocol-Version\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            let request =
+                request_from_buffered_http("POST", "/mcp", "/mcp", raw_request.into_bytes())
+                    .expect("parse buffered MCP request");
+            let (mut client, peer) = tokio::io::duplex(4096);
+            let mut peer = Some(peer);
+            if disconnect_client {
+                drop(peer.take());
+            }
+            let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                relay_http_request_with_response_middleware_guarded_observed(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    RelayRequestOptions {
+                        mcp_request_validation: Some(McpRequestValidation {
+                            config: &config,
+                            ctx: &ctx,
+                            redacted_target: "/mcp",
+                        }),
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&observer),
+                ),
+            )
+            .await
+            .expect("reject before upstream I/O");
+            if disconnect_client {
+                assert!(
+                    result.is_err(),
+                    "denial delivery must fail after disconnect"
+                );
+            } else {
+                assert!(matches!(
+                    result.expect("deliver denial"),
+                    RelayOutcome::Consumed
+                ));
+            }
+            assert!(matches!(
+                receiver.try_recv().expect("final MCP denial observation"),
+                EndpointStatusCommand::Observe {
+                    result: EndpointResult::PolicyDenied,
+                    ..
+                }
+            ));
+            assert!(receiver.try_recv().is_err(), "one result per exchange");
+            drop(client);
+            drop(upstream);
+            let mut sent = Vec::new();
+            upstream_peer.read_to_end(&mut sent).await.unwrap();
+            assert!(sent.is_empty(), "rejected request reached upstream");
+            if let Some(mut peer) = peer {
+                let mut response = String::new();
+                peer.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("mcp_protocol_version_not_allowed"),
+                    "{response}"
+                );
+            }
+        }
+    }
+
     async fn assert_observed_response_result(response: &'static [u8], expected: EndpointResult) {
         let (observer, mut receiver) = test_endpoint_observer().await;
         let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
@@ -7154,7 +7363,7 @@ mod tests {
             ResponseRelayScript::HeadersOnly,
         )
         .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
 
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\n\r\n",
@@ -7932,6 +8141,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_persistence_is_independent_of_framing_and_middleware() {
+        for script in [
+            None,
+            Some(ResponseRelayScript::HeadersOnly),
+            Some(ResponseRelayScript::Stream),
+            Some(ResponseRelayScript::WholeBody),
+        ] {
+            for (method, response, closes) in [
+                (
+                    "GET",
+                    "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    true,
+                ),
+                ("HEAD", "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n", true),
+                ("GET", "HTTP/1.0 204 No Content\r\n\r\n", true),
+                (
+                    "GET",
+                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    false,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    false,
+                ),
+                (
+                    "HEAD",
+                    "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n",
+                    false,
+                ),
+            ] {
+                // Body-inspecting scripts reject bodiless responses at preflight.
+                if (method == "HEAD"
+                    || response.contains("204 No Content")
+                    || response.contains("304 Not Modified"))
+                    && matches!(
+                        script,
+                        Some(ResponseRelayScript::Stream | ResponseRelayScript::WholeBody)
+                    )
+                {
+                    continue;
+                }
+                let fixture = script.map(response_middleware_fixture);
+                let middleware = fixture
+                    .as_ref()
+                    .map(|(runner, chain)| response_middleware_context(runner, chain, method));
+                let mut upstream = response.as_bytes();
+                let (mut reader, mut writer) = tokio::io::duplex(4096);
+                let outcome = relay_response(
+                    method,
+                    &mut upstream,
+                    &mut writer,
+                    RelayResponseOptions::default(),
+                    middleware,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    matches!(outcome, RelayOutcome::Consumed),
+                    closes,
+                    "{response}"
+                );
+                let mut delivered = Vec::new();
+                if closes {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        reader.read_to_end(&mut delivered),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{script:?} {method} {response:?}: {error}"))
+                    .unwrap();
+                } else {
+                    // A second write demonstrates that persistent output is still open.
+                    writer.write_all(b"next response").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                    reader.read_to_end(&mut delivered).await.unwrap();
+                    assert!(delivered.ends_with(b"next response"));
+                }
+                if let Some(script) = script {
+                    let expected = match script {
+                        ResponseRelayScript::HeadersOnly => "hello",
+                        ResponseRelayScript::Stream => "HELLO",
+                        ResponseRelayScript::WholeBody => "whole:hello",
+                        _ => unreachable!(),
+                    };
+                    if response.ends_with("hello") {
+                        assert!(String::from_utf8_lossy(&delivered).contains(expected));
+                    }
+                } else {
+                    assert!(delivered.starts_with(response.as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn relay_response_connection_close_with_content_length() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
 
@@ -7956,18 +8276,19 @@ mod tests {
         .expect("relay must not deadlock");
 
         let outcome = result.expect("relay_response should succeed");
-        // With explicit framing, Connection: close is still reported as reusable
-        // so the relay loop continues.  The *next* upstream write will fail and
-        // exit the loop via the normal error path.
-        assert!(
-            matches!(outcome, RelayOutcome::Reusable),
-            "explicit framing keeps loop alive despite Connection: close"
-        );
+        assert!(matches!(outcome, RelayOutcome::Consumed));
 
-        client_write.shutdown().await.unwrap();
+        // Keep the relay-side stream alive: EOF must come from shutdown,
+        // not from dropping the stream or the test closing it manually.
         let mut received = Vec::new();
-        client_read.read_to_end(&mut received).await.unwrap();
-        assert!(String::from_utf8_lossy(&received).contains("hello"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_read.read_to_end(&mut received),
+        )
+        .await
+        .expect("closing response must deliver EOF")
+        .unwrap();
+        assert_eq!(received, response);
     }
 
     #[tokio::test]
@@ -8783,6 +9104,175 @@ mod tests {
     fn client_requested_upgrade_rejects_upgrade_without_connection() {
         let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
         assert!(!client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_h2c_for_every_protocol() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n";
+        for protocol in [
+            crate::l7::L7Protocol::Rest,
+            crate::l7::L7Protocol::Websocket,
+            crate::l7::L7Protocol::Graphql,
+            crate::l7::L7Protocol::JsonRpc,
+            crate::l7::L7Protocol::Mcp,
+        ] {
+            assert_eq!(
+                unsupported_upgrade_detail(raw, protocol),
+                Some(UNSUPPORTED_H2C_UPGRADE_DETAIL),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_any_upgrade_on_jsonrpc_family() {
+        let websocket = format!(
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nAccept: text/event-stream\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        // Any request that carries an `Upgrade` header is refused, including
+        // one without `Connection: upgrade` that the relay would not upgrade.
+        let requests: [&[u8]; 3] = [
+            websocket.as_bytes(),
+            b"POST /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, upgrade\r\nContent-Length: 0\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: custom\r\n\r\n",
+        ];
+        for raw in requests {
+            for protocol in [crate::l7::L7Protocol::JsonRpc, crate::l7::L7Protocol::Mcp] {
+                assert_eq!(
+                    unsupported_upgrade_detail(raw, protocol),
+                    Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+                    "{protocol:?}: {}",
+                    String::from_utf8_lossy(raw)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_allows_ordinary_requests_and_relaying_protocols() {
+        let websocket = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        for protocol in [
+            crate::l7::L7Protocol::Rest,
+            crate::l7::L7Protocol::Websocket,
+        ] {
+            assert_eq!(
+                unsupported_upgrade_detail(websocket.as_bytes(), protocol),
+                None,
+                "{protocol:?}"
+            );
+        }
+
+        // Streamable HTTP requests, a look-alike header name, and a stray
+        // `Connection: upgrade` without an `Upgrade` header stay allowed;
+        // none of them can switch protocols.
+        let ordinary: [&[u8]; 4] = [
+            b"POST /mcp HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n{}",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nAccept: text/event-stream\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade-Insecure-Requests: 1\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n\r\n",
+        ];
+        for raw in ordinary {
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
+                assert_eq!(
+                    unsupported_upgrade_detail(raw, protocol),
+                    None,
+                    "{protocol:?}: {}",
+                    String::from_utf8_lossy(raw)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_upgrades_on_graphql() {
+        let requests = [
+            format!(
+                "GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n"
+            ),
+            "POST /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: custom\r\nConnection: upgrade\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        ];
+        for raw in &requests {
+            assert_eq!(
+                unsupported_upgrade_detail(raw.as_bytes(), crate::l7::L7Protocol::Graphql),
+                Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_refusal_for_protocol_names_every_per_request_protocol() {
+        use crate::l7::L7Protocol;
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::JsonRpc),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Mcp),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Graphql),
+            Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+            assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_covers_every_relay_upgrade_check() {
+        // The refusal must be at least as broad as both relay checks that can
+        // lead to a protocol switch, across header spellings that pass
+        // ingress validation.
+        let valid_websocket = |head: &str| {
+            format!("{head}Sec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        };
+        let requests = [
+            valid_websocket(
+                "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUPGRADE: WebSocket\r\nCONNECTION: UPGRADE\r\n",
+            ),
+            valid_websocket(
+                "GET /mcp HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nConnection: upgrade\r\nUpgrade: websocket\r\n",
+            ),
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade:\r\nConnection: upgrade\r\n\r\n"
+                .to_string(),
+            "GET /mcp HTTP/1.0\r\nUpgrade: websocket\r\nConnection:upgrade\r\n\r\n".to_string(),
+            "POST /mcp HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nUpgrade: custom\r\nConnection: close, Upgrade\r\n\r\n"
+                .to_string(),
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: upgrade\r\n\r\n"
+                .to_string(),
+        ];
+        for raw in &requests {
+            assert!(
+                validate_http_request_header_block(raw.as_bytes()).is_ok(),
+                "fixture must pass ingress validation: {raw}"
+            );
+            assert!(
+                client_requested_upgrade(raw) || request_is_websocket_upgrade(raw.as_bytes()),
+                "fixture must be an upgrade to the relay: {raw}"
+            );
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
+                assert!(
+                    unsupported_upgrade_detail(raw.as_bytes(), protocol).is_some(),
+                    "{protocol:?} must refuse: {raw}"
+                );
+            }
+        }
     }
 
     #[test]

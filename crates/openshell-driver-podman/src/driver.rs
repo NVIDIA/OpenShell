@@ -32,6 +32,7 @@ use tracing::{Instrument as _, debug, info, warn};
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+const POLICY_DNS_RESOLV_CONF: &[u8] = b"nameserver 127.0.0.53\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PodmanEndpointEnvironment {
@@ -181,6 +182,28 @@ async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) 
             secret = %secret_name,
             error = %err,
             "Failed to remove Podman sandbox token secret"
+        );
+    }
+}
+
+async fn create_sandbox_resolver_secret(
+    client: &PodmanClient,
+    sandbox_id: &str,
+) -> Result<String, ComputeDriverError> {
+    let secret_name = container::resolver_secret_name(sandbox_id);
+    client
+        .create_secret(&secret_name, POLICY_DNS_RESOLV_CONF)
+        .await
+        .map_err(ComputeDriverError::from)?;
+    Ok(secret_name)
+}
+
+async fn cleanup_sandbox_resolver_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
+        warn!(
+            secret = %secret_name,
+            error = %err,
+            "Failed to remove Podman sandbox resolver secret"
         );
     }
 }
@@ -977,6 +1000,10 @@ impl PodmanComputeDriver {
         // failure. The supervisor independently validates the certificate
         // content at startup.
         validate_sandbox_proxy_ca_bundle(&self.config).await?;
+        let host_gateway_ip = self
+            .config
+            .resolved_host_gateway_ip()
+            .map_err(ComputeDriverError::from)?;
 
         let identity = self
             .resolve_workload_identity(sandbox, &immutable_image_id, &image_user)
@@ -1004,22 +1031,32 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Create workspace volume and per-sandbox token secret.
-        let (token_secret_name, proxy_auth_secret_name) = async {
+        // Create the workspace volume and per-sandbox runtime files.
+        let (resolver_secret_name, token_secret_name, proxy_auth_secret_name) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 self.client
                     .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
                     .await
                     .map_err(ComputeDriverError::from)?;
-                let token_secret_name =
-                    match create_sandbox_token_secret(&self.client, sandbox).await {
+                let resolver_secret_name =
+                    match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
                         Ok(name) => name,
                         Err(e) => {
                             let _ = self.client.remove_volume(&vol_name).await;
                             return Err(e);
                         }
                     };
+                let token_secret_name = match create_sandbox_token_secret(&self.client, sandbox)
+                    .await
+                {
+                    Ok(name) => name,
+                    Err(e) => {
+                        let _ = self.client.remove_volume(&vol_name).await;
+                        cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
+                        return Err(e);
+                    }
+                };
                 let proxy_auth_secret_name =
                     match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox)
                         .await
@@ -1030,10 +1067,16 @@ impl PodmanComputeDriver {
                             if let Some(secret) = token_secret_name.as_deref() {
                                 cleanup_sandbox_token_secret(&self.client, secret).await;
                             }
+                            cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name)
+                                .await;
                             return Err(e);
                         }
                     };
-                Ok((token_secret_name, proxy_auth_secret_name))
+                Ok((
+                    resolver_secret_name,
+                    token_secret_name,
+                    proxy_auth_secret_name,
+                ))
             }
             .await;
             phase_status.finish(result)
@@ -1046,14 +1089,15 @@ impl PodmanComputeDriver {
         ))
         .await?;
 
-        // Clean up the volume and both per-sandbox secrets on any failure past
-        // this point.
+        // Clean up the volume and per-sandbox secrets on any failure past this
+        // point.
         let channel_owned = std::sync::atomic::AtomicBool::new(false);
         let cleanup_created = || async {
             if channel_owned.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = self.client.remove_volume(&channel_volume).await;
             }
             let _ = self.client.remove_volume(&vol_name).await;
+            cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
             if let Some(secret) = token_secret_name.as_deref() {
                 cleanup_sandbox_token_secret(&self.client, secret).await;
             }
@@ -1111,6 +1155,7 @@ impl PodmanComputeDriver {
                     sandbox,
                     config: &runtime_config,
                     token_secret: token_secret_name.as_deref(),
+                    resolver_secret: &resolver_secret_name,
                     gpu_devices: gpu_devices.as_deref(),
                     requested_image: &image,
                     image_id: &immutable_image_id,
@@ -1154,16 +1199,21 @@ impl PodmanComputeDriver {
                         .and_then(|spec| {
                             decode_launch_authentication(&spec.launch_authentication)
                         })?;
+                    let generation = uuid::Uuid::new_v4().to_string();
                     let archives = crate::isolation::bootstrap_archives(
-                        &sandbox.id,
-                        &workload_id,
-                        &uuid::Uuid::new_v4().to_string(),
-                        &identity,
-                        crate::isolation::userns_preserves_host_groups(
-                            self.config.userns.as_deref(),
-                        ),
-                        child_env,
-                        &launch_authentication,
+                        crate::isolation::BootstrapArchivesInput {
+                            sandbox_id: &sandbox.id,
+                            container_id: &workload_id,
+                            generation: &generation,
+                            host_gateway_ip,
+                            identity: &identity,
+                            allow_extra_supplementary_groups:
+                                crate::isolation::userns_preserves_host_groups(
+                                    self.config.userns.as_deref(),
+                                ),
+                            child_env,
+                            launch_authentication: &launch_authentication,
+                        },
                     )?;
                     self.client
                         .copy_to_container(
@@ -1499,15 +1549,23 @@ impl PodmanComputeDriver {
             let bundle =
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
             let restart_metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
-            let archives = crate::isolation::bootstrap_archives(
-                sandbox_id,
-                &container_id,
-                generation.as_str(),
-                &restart_metadata.workload_identity,
-                crate::isolation::userns_preserves_host_groups(self.config.userns.as_deref()),
-                restart_metadata.child_env,
-                &launch_authentication,
-            )?;
+            let archives =
+                crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
+                    sandbox_id,
+                    container_id: &container_id,
+                    generation: generation.as_str(),
+                    host_gateway_ip: self
+                        .config
+                        .resolved_host_gateway_ip()
+                        .map_err(ComputeDriverError::from)?,
+                    identity: &restart_metadata.workload_identity,
+                    allow_extra_supplementary_groups:
+                        crate::isolation::userns_preserves_host_groups(
+                            self.config.userns.as_deref(),
+                        ),
+                    child_env: restart_metadata.child_env,
+                    launch_authentication: &launch_authentication,
+                })?;
             self.client
                 .copy_to_container(
                     &container_id,
@@ -1575,6 +1633,11 @@ impl PodmanComputeDriver {
             }
             cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id))
                 .await;
+            cleanup_sandbox_resolver_secret(
+                &self.client,
+                &container::resolver_secret_name(sandbox_id),
+            )
+            .await;
             cleanup_sandbox_proxy_auth_secret(
                 &self.client,
                 &container::proxy_auth_secret_name(sandbox_id),
@@ -1617,6 +1680,8 @@ impl PodmanComputeDriver {
             );
         }
         cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
+        cleanup_sandbox_resolver_secret(&self.client, &container::resolver_secret_name(sandbox_id))
+            .await;
         cleanup_sandbox_proxy_auth_secret(
             &self.client,
             &container::proxy_auth_secret_name(sandbox_id),
@@ -3335,12 +3400,22 @@ mod tests {
         assert!(!environment.keys().any(|key| key.starts_with("OPENSHELL_")));
     }
 
-    fn secret_delete_request(sandbox_id: &str) -> String {
+    fn proxy_auth_secret_delete_request(sandbox_id: &str) -> String {
         format!(
             "DELETE {}",
             api_path(&format!(
                 "/libpod/secrets/{}",
                 container::proxy_auth_secret_name(sandbox_id)
+            ))
+        )
+    }
+
+    fn resolver_secret_delete_request(sandbox_id: &str) -> String {
+        format!(
+            "DELETE {}",
+            api_path(&format!(
+                "/libpod/secrets/{}",
+                container::resolver_secret_name(sandbox_id)
             ))
         )
     }
@@ -3482,6 +3557,7 @@ mod tests {
             StubResponse::new(StatusCode::NOT_FOUND, ""), // no existing private workspace
             StubResponse::new(StatusCode::CREATED, "{}"), // workspace volume
             owned_volume_response(&container::volume_name(sandbox_id), sandbox_id),
+            StubResponse::new(StatusCode::CREATED, "{}"), // resolver secret
         ];
         if proxy_secret {
             responses.push(StubResponse::new(StatusCode::CREATED, "{}"));
@@ -3580,6 +3656,7 @@ mod tests {
                     StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "create failed"),
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
                 ])
                 .collect(),
@@ -3602,8 +3679,12 @@ mod tests {
             .expect("request log lock should not be poisoned")
             .clone();
         assert!(
-            requests.contains(&secret_delete_request(sandbox_id)),
+            requests.contains(&proxy_auth_secret_delete_request(sandbox_id)),
             "proxy-auth secret must be removed on container-create failure: {requests:?}"
+        );
+        assert!(
+            requests.contains(&resolver_secret_delete_request(sandbox_id)),
+            "resolver secret must be removed on container-create failure: {requests:?}"
         );
         let _ = fs::remove_file(&auth_file);
         let _ = fs::remove_file(socket_path);
@@ -3626,6 +3707,7 @@ mod tests {
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workload
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
                 ])
                 .collect(),
@@ -3648,8 +3730,12 @@ mod tests {
             .expect("request log lock should not be poisoned")
             .clone();
         assert!(
-            requests.contains(&secret_delete_request(sandbox_id)),
+            requests.contains(&proxy_auth_secret_delete_request(sandbox_id)),
             "proxy-auth secret must be removed on start failure: {requests:?}"
+        );
+        assert!(
+            requests.contains(&resolver_secret_delete_request(sandbox_id)),
+            "resolver secret must be removed on start failure: {requests:?}"
         );
         let _ = fs::remove_file(&auth_file);
         let _ = fs::remove_file(socket_path);
@@ -3668,6 +3754,7 @@ mod tests {
                 StubResponse::new(StatusCode::OK, "[]"),       // list_containers (not found)
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove resolver secret
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
             ],
         );
@@ -3684,8 +3771,12 @@ mod tests {
             .expect("request log lock should not be poisoned")
             .clone();
         assert!(
-            requests.contains(&secret_delete_request(sandbox_id)),
+            requests.contains(&proxy_auth_secret_delete_request(sandbox_id)),
             "proxy-auth secret must be removed on delete: {requests:?}"
+        );
+        assert!(
+            requests.contains(&resolver_secret_delete_request(sandbox_id)),
+            "resolver secret must be removed on delete: {requests:?}"
         );
         let _ = fs::remove_file(socket_path);
     }

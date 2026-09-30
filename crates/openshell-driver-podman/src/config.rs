@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 
@@ -54,12 +54,12 @@ pub struct PodmanComputeConfig {
     pub ssh_socket_path: String,
     /// Name of the Podman bridge network used for driver-managed resources.
     pub network_name: String,
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination for sandbox host-gateway aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver. macOS defaults to
-    /// gvproxy's host-loopback IP because stale Podman machines may fail to
-    /// resolve `host-gateway` while still serving `host.containers.internal`
-    /// through gvproxy.
+    /// Empty uses supervisor loopback on Linux and gvproxy's host-loopback IP
+    /// with Podman Machine. The resolved address is pinned into the protected
+    /// runtime descriptor; sandbox policy DNS never trusts workload resolver
+    /// state for `host.openshell.internal`.
     pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
@@ -439,16 +439,46 @@ impl PodmanComputeConfig {
     }
 
     pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
+        self.resolved_host_gateway_ip().map(|_| ())
+    }
+
+    /// Resolve the trusted supervisor-side destination for host-gateway aliases.
+    pub fn resolved_host_gateway_ip(&self) -> Result<IpAddr, crate::client::PodmanApiError> {
         let trimmed = self.host_gateway_ip.trim();
-        if trimmed.is_empty() {
-            return Ok(());
+        let address = if trimmed.is_empty() {
+            #[cfg(target_os = "macos")]
+            {
+                MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP
+                    .parse::<IpAddr>()
+                    .expect("Podman Machine host gateway constant must be an IP address")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            }
+        } else {
+            trimmed.parse::<IpAddr>().map_err(|err| {
+                crate::client::PodmanApiError::InvalidInput(format!(
+                    "invalid host_gateway_ip value '{trimmed}': {err}"
+                ))
+            })?
+        };
+
+        let normalized = match address {
+            IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(address, IpAddr::V4),
+            IpAddr::V4(_) => address,
+        };
+        if address.is_unspecified()
+            || address.is_multicast()
+            || normalized == IpAddr::V4(Ipv4Addr::BROADCAST)
+            || normalized == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        {
+            return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                "invalid host_gateway_ip value '{address}': address is not a safe concrete host destination"
+            )));
         }
 
-        trimmed.parse::<IpAddr>().map(|_| ()).map_err(|err| {
-            crate::client::PodmanApiError::InvalidInput(format!(
-                "invalid host_gateway_ip value '{trimmed}': {err}"
-            ))
-        })
+        Ok(address)
     }
 
     /// Resolve the default host gateway override for the current platform.
@@ -648,6 +678,12 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert_eq!(cfg.host_gateway_ip, MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP);
         assert!(cfg.validate_host_gateway_ip().is_ok());
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP
+                .parse::<IpAddr>()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -656,6 +692,10 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert!(cfg.host_gateway_ip.is_empty());
         assert!(cfg.validate_host_gateway_ip().is_ok());
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
     }
 
     #[test]
@@ -666,6 +706,33 @@ mod tests {
         };
         let err = cfg.validate_host_gateway_ip().unwrap_err();
         assert!(err.to_string().contains("host_gateway_ip"));
+    }
+
+    #[test]
+    fn host_gateway_ip_resolution_preserves_explicit_address() {
+        let cfg = PodmanComputeConfig {
+            host_gateway_ip: "192.168.127.254".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            "192.168.127.254".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn host_gateway_ip_validation_rejects_unsafe_destinations() {
+        for address in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "169.254.169.254"] {
+            let cfg = PodmanComputeConfig {
+                host_gateway_ip: address.to_string(),
+                ..PodmanComputeConfig::default()
+            };
+            let error = cfg.validate_host_gateway_ip().unwrap_err();
+            assert!(
+                error.to_string().contains("safe concrete host destination"),
+                "unexpected validation error for {address}: {error}"
+            );
+        }
     }
 
     #[test]

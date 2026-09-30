@@ -43,3 +43,11 @@ rules:
       - pods
     verbs:
       - get
+  # Generation-scoped sandbox bootstrap Secrets.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - delete

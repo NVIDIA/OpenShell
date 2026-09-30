@@ -43,7 +43,7 @@ spec:
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
       image: {{ include "openshell.image" . | quote }}
-      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
       args:
         - --config
         - /etc/openshell/gateway.toml
@@ -184,6 +184,9 @@ spec:
           mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
           readOnly: true
         {{- end }}
+        {{- with .Values.server.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       ports:
         - name: grpc
           containerPort: {{ .Values.service.port }}
@@ -290,6 +293,9 @@ spec:
       csi:
         driver: csi.spiffe.io
         readOnly: true
+    {{- end }}
+    {{- with .Values.server.extraVolumes }}
+    {{- toYaml . | nindent 4 }}
     {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:

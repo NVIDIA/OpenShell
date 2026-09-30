@@ -22,7 +22,9 @@ import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './g
 import {
   type ExecSandboxInputSchema,
   OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
+  SandboxRestartPolicy,
   type SandboxSpecSchema,
   type SandboxWorkloadTemplateSchema,
   ServiceStatus,
@@ -84,6 +86,9 @@ export type SandboxPhaseName =
   | 'starting'
   | 'completed';
 
+/** Restart behavior after the canonical main process exits. */
+export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
+
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
 
@@ -141,6 +146,8 @@ export interface SandboxSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Restart behavior after the canonical main process exits. */
+  restartPolicy?: SandboxRestartPolicyName;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -162,6 +169,23 @@ export interface ServiceExposure {
   service?: string;
   /** Loopback TCP port inside the sandbox. */
   targetPort: number;
+  /** Handling for an incoming application Authorization header. */
+  authorizationMode?: ServiceAuthorizationMode;
+}
+
+export enum ServiceAuthorizationMode {
+  Strip = 'strip',
+  BearerPassthrough = 'bearer_passthrough',
+}
+
+function serviceAuthorizationModeToProto(mode: ServiceAuthorizationMode | undefined): ProtoServiceAuthorizationMode {
+  switch (mode) {
+    case ServiceAuthorizationMode.BearerPassthrough:
+      return ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH;
+    case ServiceAuthorizationMode.Strip:
+    case undefined:
+      return ProtoServiceAuthorizationMode.STRIP;
+  }
 }
 
 export interface SandboxFromTemplateSpec {
@@ -197,6 +221,9 @@ export interface SandboxRef {
   createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
+  restartCount: number;
+  nextRestartAtMs?: number;
+  mainProcessStartedAtMs?: number;
 }
 
 export interface SandboxWorkloadTemplateProvenance {
@@ -223,6 +250,14 @@ export interface SandboxWorkspaceOptions {
   /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
+
+/** Pagination and workspace scope for providers attached to one sandbox. */
+export type SandboxProviderListOptions = SandboxWorkspaceOptions & {
+  /** Maximum providers requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
+};
 
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
@@ -464,6 +499,17 @@ export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
 function phaseName(p: SandboxPhase): SandboxPhaseName {
   return PHASE_NAMES[p] ?? 'unspecified';
 }
+
+function restartPolicyValue(policy: SandboxRestartPolicyName | undefined): SandboxRestartPolicy {
+  switch (policy) {
+    case 'on-failure':
+      return SandboxRestartPolicy.ON_FAILURE;
+    case 'always':
+      return SandboxRestartPolicy.ALWAYS;
+    default:
+      return SandboxRestartPolicy.NEVER;
+  }
+}
 function statusName(s: ServiceStatus): HealthStatus {
   return STATUS_NAMES[s] ?? 'unspecified';
 }
@@ -480,6 +526,8 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
+  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
+  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -496,6 +544,9 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
         }
       : undefined,
     serviceUrls,
+    restartCount: sandbox.status?.restartCount ?? 0,
+    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
+    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
   };
 }
 
@@ -781,21 +832,49 @@ export interface Page<T> {
   readonly nextPageToken: string;
 }
 
+const maxConsumedPageTokens = 10_000;
+const maxConsumedPageTokenBytes = 1 << 20;
+
 /** Lazy, single-pass iterator that fetches one RPC page per advance. */
 export class Pager<T> implements AsyncIterable<Page<T>> {
   private nextToken: string | undefined;
+  private readonly consumedTokens = new Set<string>();
+  private consumedTokenBytes = 0;
 
   constructor(
     private readonly fetch: (pageToken: string) => Promise<Page<T>>,
     pageToken = '',
+    private readonly maxConsumedTokens = maxConsumedPageTokens,
+    private readonly maxConsumedTokenBytes = maxConsumedPageTokenBytes,
   ) {
     this.nextToken = pageToken;
+  }
+
+  private validateCurrentTokenBudget(pageToken: string): number {
+    if (pageToken === '') return 0;
+    const tokenBytes = new TextEncoder().encode(pageToken).byteLength;
+    if (
+      this.consumedTokens.size >= this.maxConsumedTokens ||
+      tokenBytes > this.maxConsumedTokenBytes - this.consumedTokenBytes
+    ) {
+      throw new Error('pager continuation token history limit exceeded');
+    }
+    return tokenBytes;
   }
 
   /** Fetch the next page, or return undefined after the final page. */
   async nextPage(): Promise<Page<T> | undefined> {
     if (this.nextToken === undefined) return undefined;
-    const page = await this.fetch(this.nextToken);
+    const pageToken = this.nextToken;
+    const tokenBytes = this.validateCurrentTokenBudget(pageToken);
+    const page = await this.fetch(pageToken);
+    if (pageToken !== '') {
+      this.consumedTokens.add(pageToken);
+      this.consumedTokenBytes += tokenBytes;
+    }
+    if (page.nextPageToken !== '' && this.consumedTokens.has(page.nextPageToken)) {
+      throw new Error('pager received a repeated continuation token');
+    }
     this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
     return page;
   }
@@ -949,6 +1028,7 @@ export class SandboxClient {
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,
+        restartPolicy: restartPolicyValue(spec.restartPolicy),
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
@@ -961,6 +1041,7 @@ export class SandboxClient {
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
@@ -987,6 +1068,7 @@ export class SandboxClient {
           spec.serviceExposures?.map((exposure) => ({
             service: exposure.service ?? '',
             targetPort: exposure.targetPort,
+            authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
@@ -1606,15 +1688,27 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
-    try {
-      const resp = await this.grpc.listSandboxProviders({
-        ...sandboxTarget(name, options),
-      });
-      return resp.providers.map((p) => providerRef(p));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  listProviders(name: string, options?: SandboxProviderListOptions | null): Pager<ProviderRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxProviders({
+          ...sandboxTarget(name, options),
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+        });
+        return {
+          items: resp.providers.map((provider) => providerRef(provider)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every provider attached to this sandbox. */
+  async listAllProviders(name: string, options?: SandboxProviderListOptions | null): Promise<ProviderRef[]> {
+    return this.listProviders(name, options).all();
   }
 
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {

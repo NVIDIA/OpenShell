@@ -16,7 +16,7 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
 - **Do** interrogate your agent until you understand every edge case and interaction in your changes.
 - **Don't** submit code you can't explain without your agent open.
-- **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
+- **Don't** use agents as a substitute for understanding the system. Read the RFCs, crate READMEs, and published docs.
 
 ## First-Time Contributors
 
@@ -470,7 +470,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
-| `architecture/` | Architecture docs and plans                   |
+| `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
 | `.agents/`      | Contributor skills and persona definitions    |
@@ -487,7 +487,7 @@ field design, and schema-evolution rules.
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides. Keep every page URL equal to its file path under `docs/`; `mise run docs` checks this with `docs:nav`.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs-from-commits` skill.
 It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.

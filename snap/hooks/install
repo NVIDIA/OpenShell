@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create the mTLS default and replace insecure configs on refresh.
+
+set -eu
+
+config_file="${SNAP_COMMON}/gateway.toml"
+insecure='^[[:space:]]*(allow_unauthenticated_users|disable_tls)[[:space:]]*=[[:space:]]*true([[:space:]#]|$)'
+
+# Keep secure operator configs, symlinks, and directories. Replace a config
+# that explicitly allows plaintext or anonymous access, even if it has other
+# edits.
+if [ -L "$config_file" ]; then
+	exit 0
+elif [ -f "$config_file" ]; then
+	grep -Eq "$insecure" "$config_file" || exit 0
+	echo "openshell: replacing insecure gateway config with the mTLS default" >&2
+elif [ -e "$config_file" ]; then
+	exit 0
+fi
+
+mkdir -p "$SNAP_COMMON"
+umask 077
+temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
+trap 'rm -f "$temporary_file"' 0 HUP INT TERM
+cat >"$temporary_file" <<'CONFIG'
+[openshell]
+version = 2
+
+[openshell.gateway]
+CONFIG
+mv -f "$temporary_file" "$config_file"
+trap - 0 HUP INT TERM

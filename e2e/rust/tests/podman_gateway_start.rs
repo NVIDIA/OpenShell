@@ -55,7 +55,7 @@ fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
             "--filter",
             MANAGED_BY_LABEL_FILTER,
             "--filter",
-            "label=openshell.io/isolation-role=sandbox",
+            "label=openshell.ai/isolation-role=sandbox",
             "--filter",
         ])
         .arg(sandbox_name_filter)

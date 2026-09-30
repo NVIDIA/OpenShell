@@ -90,31 +90,99 @@ where
     }
 }
 
+/// Where the supervisor publishes readiness. The listener exists only while
+/// the supervisor session is ready, so a successful connect means ready.
+#[derive(Clone, Debug)]
+enum ReadinessEndpoint {
+    Unix(std::path::PathBuf),
+    /// Wildcard TCP port reachable from the node, for kubelet `tcpSocket` probes.
+    Tcp(u16),
+}
+
+enum ReadinessListener {
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+impl ReadinessEndpoint {
+    fn bind(&self) -> Result<ReadinessListener> {
+        match self {
+            Self::Unix(path) => {
+                prepare_control_readiness_path(path)?;
+                tokio::net::UnixListener::bind(path)
+                    .map(ReadinessListener::Unix)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("bind supervisor readiness socket on {}", path.display())
+                    })
+            }
+            Self::Tcp(port) => bind_readiness_tcp(*port)
+                .and_then(tokio::net::TcpListener::from_std)
+                .map(ReadinessListener::Tcp)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("bind supervisor readiness listener on port {port}")),
+        }
+    }
+
+    fn remove(&self) {
+        if let Self::Unix(path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Falls back to IPv4 when the network namespace has IPv6 disabled.
+fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let bind = |domain: Domain, address: std::net::SocketAddr| {
+        let socket = Socket::new(domain, Type::STREAM, None)?;
+        if domain == Domain::IPV6 {
+            socket.set_only_v6(false)?;
+        }
+        socket.set_reuse_address(true)?;
+        socket.bind(&address.into())?;
+        socket.listen(128)?;
+        socket.set_nonblocking(true)?;
+        Ok::<_, std::io::Error>(std::net::TcpListener::from(socket))
+    };
+    bind(Domain::IPV6, (std::net::Ipv6Addr::UNSPECIFIED, port).into())
+        .or_else(|_| bind(Domain::IPV4, (std::net::Ipv4Addr::UNSPECIFIED, port).into()))
+}
+
+impl ReadinessListener {
+    async fn accept(&self) -> std::io::Result<()> {
+        match self {
+            Self::Unix(listener) => listener.accept().await.map(drop),
+            Self::Tcp(listener) => listener.accept().await.map(drop),
+        }
+    }
+}
+
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
-    path: std::path::PathBuf,
+    endpoint: ReadinessEndpoint,
 }
 
 impl ControlReadiness {
     fn start(
-        path: std::path::PathBuf,
+        endpoint: ReadinessEndpoint,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if session_readiness
+        if let ReadinessEndpoint::Unix(path) = &endpoint {
+            prepare_control_readiness_path(path)?;
+        }
+        let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
         {
-            return Err(miette::miette!(
-                "supervisor session is not ready when starting health listener"
-            ));
-        }
-        prepare_control_readiness_path(&path)?;
-        let listener = tokio::net::UnixListener::bind(&path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("bind supervisor readiness socket on {}", path.display()))?;
-        let task_path = path.clone();
+            None
+        } else {
+            Some(endpoint.bind()?)
+        };
+        let task_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            let mut listener = Some(listener);
+            let mut listener = listener;
             loop {
                 let session_unready = session_readiness
                     .as_ref()
@@ -122,7 +190,7 @@ impl ControlReadiness {
                 if listener.is_none() || session_unready {
                     if session_unready {
                         listener.take();
-                        let _ = std::fs::remove_file(&task_path);
+                        task_endpoint.remove();
                         let Some(readiness) = session_readiness.as_mut() else {
                             break;
                         };
@@ -130,16 +198,7 @@ impl ControlReadiness {
                             break;
                         }
                     }
-                    match prepare_control_readiness_path(&task_path).and_then(|()| {
-                        tokio::net::UnixListener::bind(&task_path)
-                            .into_diagnostic()
-                            .wrap_err_with(|| {
-                                format!(
-                                    "rebind supervisor readiness socket on {}",
-                                    task_path.display()
-                                )
-                            })
-                    }) {
+                    match task_endpoint.bind() {
                         Ok(rebound) => listener = Some(rebound),
                         Err(error) => {
                             tracing::warn!(%error, "control-mode readiness rebind failed; retrying");
@@ -156,7 +215,7 @@ impl ControlReadiness {
                 if let Some(readiness) = session_readiness.as_mut() {
                     tokio::select! {
                         accepted = active_listener.accept() => match accepted {
-                            Ok((stream, _)) => drop(stream),
+                            Ok(()) => {}
                             Err(error) => {
                                 tracing::warn!(%error, "control-mode readiness accept failed; retrying");
                                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -170,7 +229,7 @@ impl ControlReadiness {
                     }
                 } else {
                     match active_listener.accept().await {
-                        Ok((stream, _)) => drop(stream),
+                        Ok(()) => {}
                         Err(error) => {
                             tracing::warn!(%error, "control-mode readiness accept failed; retrying");
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -178,9 +237,9 @@ impl ControlReadiness {
                     }
                 }
             }
-            let _ = std::fs::remove_file(&task_path);
+            task_endpoint.remove();
         });
-        Ok(Self { task, path })
+        Ok(Self { task, endpoint })
     }
 }
 
@@ -225,7 +284,7 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        self.endpoint.remove();
     }
 }
 
@@ -460,6 +519,7 @@ pub async fn run_network_proxy(
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: listen.ip(),
         proxy_port: listen.port(),
+        origin: openshell_ocsf::EventOrigin::Supervisor,
     }) {
         debug!("OCSF context already initialized, keeping existing");
     }
@@ -568,6 +628,7 @@ pub async fn run_sandbox(
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
     health_socket_path: Option<std::path::PathBuf>,
+    health_port: Option<u16>,
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -602,6 +663,7 @@ pub async fn run_sandbox(
             product_version: openshell_core::VERSION.to_string(),
             proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         }) {
             debug!("OCSF context already initialized, keeping existing");
         }
@@ -650,7 +712,7 @@ pub async fn run_sandbox(
         loaded_policy_origin,
         initial_agent_proposals_enabled,
         initial_extension_authentication_enabled,
-        captured_provider_credentials,
+        captured_provider_environment,
     ) = load_policy_with_gateway(
         sandbox_id.clone(),
         sandbox.clone(),
@@ -675,8 +737,8 @@ pub async fn run_sandbox(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(credentials) = captured_provider_credentials {
-        credentials
+    let provider_credentials = if let Some(environment) = captured_provider_environment {
+        environment.install(&provider_readiness)
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -1122,14 +1184,12 @@ pub async fn run_sandbox(
                         running.exec(),
                     )
                 });
-        let mut control_readiness = if let Some(path) = health_socket_path {
-            Some(ControlReadiness::start(
-                path,
-                boundary_access.session_readiness(),
-            )?)
-        } else {
-            None
-        };
+        let mut control_readiness = health_socket_path
+            .map(ReadinessEndpoint::Unix)
+            .into_iter()
+            .chain(health_port.map(ReadinessEndpoint::Tcp))
+            .map(|endpoint| ControlReadiness::start(endpoint, boundary_access.session_readiness()))
+            .collect::<Result<Vec<_>>>()?;
         let instance_id = boundary_access.instance_id().to_string();
         let wait_agent = agent.clone();
         let shutdown_requested = wait_for_control_shutdown_signal();
@@ -1183,7 +1243,7 @@ pub async fn run_sandbox(
             }
         };
         if !retain_access {
-            control_readiness.take();
+            control_readiness.clear();
         }
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
@@ -1228,7 +1288,7 @@ pub async fn run_sandbox(
         }
         if completion_cancelled {
             retain_access = false;
-            control_readiness.take();
+            control_readiness.clear();
         }
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
@@ -1984,6 +2044,35 @@ enum LocalPolicyIdentity {
     EndpointOnly,
 }
 
+struct CapturedProviderEnvironment {
+    credentials: ProviderCredentialState,
+    expires_at_ms: Option<i64>,
+    identity: EnvironmentIdentity,
+}
+
+impl CapturedProviderEnvironment {
+    fn install(self, readiness: &ProviderReadinessTracker) -> ProviderCredentialState {
+        readiness.credentials_installed(self.identity, &self.credentials, self.expires_at_ms);
+        self.credentials
+    }
+
+    fn new(
+        credentials: ProviderCredentialState,
+        provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
+    ) -> Self {
+        Self {
+            credentials,
+            expires_at_ms: provider
+                .credential_expires_at_ms
+                .values()
+                .copied()
+                .filter(|expiry| *expiry > 0)
+                .min(),
+            identity: EnvironmentIdentity::from_environment(provider),
+        }
+    }
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -2000,7 +2089,7 @@ async fn load_policy(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     load_policy_with_gateway(
         sandbox_id,
@@ -2040,7 +2129,7 @@ async fn load_policy_with_gateway(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
     // File mode: load OPA engine from rego rules + YAML data (dev override)
@@ -2403,7 +2492,10 @@ async fn load_policy_with_gateway(
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
-                Some(captured_provider_credentials),
+                Some(CapturedProviderEnvironment::new(
+                    captured_provider_credentials,
+                    &provider,
+                )),
             ));
         }
     }
@@ -2490,7 +2582,7 @@ fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool 
 fn prepare_provider_environment(
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
-    ProviderCredentialState::from_bound_environment(
+    let prepared = ProviderCredentialState::from_bound_environment(
         provider.provider_env_revision,
         provider.environment.clone(),
         provider.credential_expires_at_ms.clone(),
@@ -2498,7 +2590,9 @@ fn prepare_provider_environment(
         provider.static_credential_bindings.clone(),
         provider.non_secret_environment_keys.clone(),
     )
-    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))
+    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
+    prepared.set_managed_files(provider.files.clone());
+    Ok(prepared)
 }
 
 // Retain only the most recent rejection, so A -> B -> A emits all transitions.
@@ -3033,6 +3127,7 @@ fn initial_provider_credentials(
         result.non_secret_environment_keys,
     ) {
         Ok(credentials) => {
+            credentials.set_managed_files(result.files);
             readiness.credentials_installed(identity, &credentials, expires_at_ms);
             credentials
         }
@@ -4741,8 +4836,8 @@ mod tests {
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let readiness =
-            ControlReadiness::start(path.clone(), None).expect("start readiness listener");
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Unix(path.clone()), None)
+            .expect("start readiness listener");
         check_control_readiness(&path).expect("running supervisor accepts readiness probes");
 
         drop(readiness);
@@ -4754,10 +4849,20 @@ mod tests {
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
-        let _readiness = ControlReadiness::start(path.clone(), Some(session_rx))
-            .expect("start readiness listener");
-        check_control_readiness(&path).expect("accepted session is ready");
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+        let _readiness =
+            ControlReadiness::start(ReadinessEndpoint::Unix(path.clone()), Some(session_rx))
+                .expect("start readiness listener");
+        assert!(check_control_readiness(&path).is_err());
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while check_control_readiness(&path).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first accepted session creates readiness socket");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
@@ -4776,6 +4881,65 @@ mod tests {
         })
         .await
         .expect("replacement session restores readiness socket");
+    }
+
+    #[test]
+    fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|reserved| reserved.local_addr())
+            .expect("reserve loopback port")
+            .port();
+        let listener = bind_readiness_tcp(port).expect("bind readiness listener");
+        if listener.local_addr().expect("local address").is_ipv6() {
+            assert!(
+                !socket2::SockRef::from(&listener)
+                    .only_v6()
+                    .expect("read IPV6_V6ONLY"),
+                "net.ipv6.bindv6only=1 must not make the wildcard listener IPv6-only"
+            );
+        }
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("IPv4 kubelet probe reaches the readiness listener");
+    }
+
+    #[tokio::test]
+    async fn tcp_control_readiness_tracks_supervisor_session() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|reserved| reserved.local_addr())
+            .expect("reserve loopback port")
+            .port();
+        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(session_rx))
+            .expect("start TCP readiness listener");
+        let connects = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        assert!(connects(), "accepted session is ready");
+
+        session_tx.send_replace(false);
+        timeout(Duration::from_secs(1), async {
+            while connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lost session closes readiness listener");
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while !connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement session reopens readiness listener");
+
+        drop(readiness);
+        timeout(Duration::from_secs(1), async {
+            while connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped guard closes readiness listener");
     }
 
     #[test]
@@ -5403,6 +5567,7 @@ network_policies:
 
     fn startup_provider(revision: u64) -> openshell_core::grpc_client::ProviderEnvironmentResult {
         openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: std::collections::HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),
             policy_hash: String::new(),
@@ -5429,6 +5594,22 @@ network_policies:
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
+    }
+
+    #[test]
+    fn startup_environment_seeds_provider_readiness() {
+        let mut provider = startup_provider(10);
+        provider.provider_attachment_epoch = "epoch".to_string();
+        provider.policy_hash = "policy".to_string();
+        let identity = EnvironmentIdentity::from_environment(&provider);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        let readiness = ProviderReadinessTracker::new();
+
+        let credentials =
+            CapturedProviderEnvironment::new(credentials, &provider).install(&readiness);
+
+        assert_eq!(credentials.revision(), 10);
+        assert!(!readiness.needs_environment(&identity));
     }
 
     #[test]
@@ -5659,6 +5840,7 @@ network_policies:
         use std::collections::HashMap;
 
         let mut result = openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: HashMap::new(),
             environment: HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),
@@ -6064,6 +6246,65 @@ network_policies:
         assert_eq!(observed.provider_env_revision, 6);
         assert_eq!(observed.config_revision, 200);
         assert_eq!(observed.policy_hash, "hash-v2");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn provider_readiness_startup_environment_avoids_unchanged_refresh() {
+        let policy = proto_policy_fixture();
+        let mut settings = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        settings.provider_env_revision = 6;
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let mut provider = static_provider_environment(6, Some("initial"));
+        provider.policy_hash.clone_from(&settings.policy_hash);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        ctx.provider_credentials = CapturedProviderEnvironment::new(credentials, &provider)
+            .install(&ctx.provider_readiness);
+        let generation = engine.current_generation();
+        let guard = engine.generation_guard(generation).unwrap();
+        let (policy_gateway, polls, mut reports) = scripted_policy_gateway();
+        let observed_polls = policy_gateway.polled_sandboxes.clone();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway {
+                policy: policy_gateway,
+                requests,
+            },
+        ));
+
+        polls.send(settings.clone()).unwrap();
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(settings).unwrap();
+        timeout(Duration::from_secs(1), async {
+            while observed_polls.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), received.recv())
+                .await
+                .is_err(),
+            "unchanged settings must not refetch the startup environment"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(!guard.is_stale());
         task.abort();
         let _ = task.await;
     }

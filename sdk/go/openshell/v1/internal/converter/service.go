@@ -26,6 +26,7 @@ func ServiceEndpointFromProto(resp *pb.ServiceEndpointResponse) *types.ServiceEn
 		result.Name = ep.GetName()
 		result.TargetPort = ep.GetTargetPort()
 		result.Domain = ep.GetDomain()
+		result.AuthorizationMode = serviceAuthorizationModeFromProto(ep.GetAuthorizationMode())
 
 		if m := ep.GetMetadata(); m != nil {
 			result.ID = m.GetId()
@@ -48,12 +49,27 @@ func ServiceEndpointToProto(se *types.ServiceEndpoint) *pb.ServiceEndpointRespon
 				Id:        se.ID,
 				Workspace: se.Workspace,
 			},
-			SandboxId:  se.SandboxID,
-			Sandbox:    se.Sandbox,
-			Name:       se.Name,
-			TargetPort: se.TargetPort,
-			Domain:     se.Domain,
+			SandboxId:         se.SandboxID,
+			Sandbox:           se.Sandbox,
+			Name:              se.Name,
+			TargetPort:        se.TargetPort,
+			Domain:            se.Domain,
+			AuthorizationMode: serviceAuthorizationModeToProto(se.AuthorizationMode),
 		},
 		Url: se.URL,
 	}
+}
+
+func serviceAuthorizationModeToProto(mode types.ServiceAuthorizationMode) pb.ServiceAuthorizationMode {
+	if mode == types.ServiceAuthorizationModeBearerPassthrough {
+		return pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+	}
+	return pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP
+}
+
+func serviceAuthorizationModeFromProto(mode pb.ServiceAuthorizationMode) types.ServiceAuthorizationMode {
+	if mode == pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH {
+		return types.ServiceAuthorizationModeBearerPassthrough
+	}
+	return types.ServiceAuthorizationModeStrip
 }

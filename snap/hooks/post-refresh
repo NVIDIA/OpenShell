@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Replace insecure gateway configs on refresh, then restart the gateway so the
+# new config takes effect even when the previous revision used
+# refresh-mode: endure and kept its plaintext gateway running.
+
+set -eu
+
+"${SNAP}/meta/hooks/install"
+snapctl restart "${SNAP_INSTANCE_NAME}.gateway"

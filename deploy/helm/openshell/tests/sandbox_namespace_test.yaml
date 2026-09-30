@@ -73,7 +73,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
       - notContains:
           path: rules
           content:

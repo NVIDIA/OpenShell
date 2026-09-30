@@ -21,9 +21,9 @@ Create pull requests on GitHub using the `gh` CLI.
 
 If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
 `[openshell.drivers.<name>]` fields, driver config defaults, or Helm rendering
-of `gateway.toml`, verify that `docs/reference/gateway-config.mdx` is updated
+of `gateway.toml`, verify that `docs/how-it-works/gateways/configuration.mdx` is updated
 in the same branch. If the change affects user-facing compute-driver setup,
-also update `docs/reference/sandbox-compute-drivers.mdx` or the relevant
+also update `docs/how-it-works/sandboxes/runtimes.mdx` or the relevant
 deployment docs.
 
 ### Check Agent Infrastructure

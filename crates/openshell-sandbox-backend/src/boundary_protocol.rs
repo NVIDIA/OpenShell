@@ -24,8 +24,8 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, OuterFenceGuarantees,
-    ResolveError, ShellSpec,
+    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
+    OuterFenceGuarantees, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -42,6 +42,20 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+// Every relay, exec, and control exchange shares one HTTP/2 connection. The
+// connection window must exceed what all streams can hold unread, otherwise
+// stalled relays starve DNS and control traffic of connection-level credit.
+// h2 keeps at least two thirds of `connection - in-flight` advertised, so the
+// reserve stays usable even with every stream stalled at its window.
+pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const BOUNDARY_STREAM_WINDOW_BYTES: u32 = 256 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAMS
+    * BOUNDARY_STREAM_WINDOW_BYTES
+    + BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES;
+// HTTP/2 caps any flow-control window at 2^31 - 1.
+const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
 
 /// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
 /// co-located runtime.
@@ -639,10 +653,11 @@ impl RequestEnvelope {
 }
 
 fn request_payload_digest(request: &Request) -> Result<String, FrameError> {
-    // Round-tripping through Value canonicalizes every JSON object by key. In
-    // particular, this makes HashMap-backed provider environments stable
-    // across process restarts and independently serialized retries.
-    let normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
+    // Sort every object explicitly: dependency features may make Value retain
+    // insertion order. Provider environments must hash identically after
+    // deserialization and across independently serialized retries.
+    let mut normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
+    normalized.sort_all_objects();
     let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
@@ -669,20 +684,26 @@ pub enum Request {
         resource_claims: std::collections::BTreeMap<String, String>,
     },
     Confirm,
+    /// Verify file-open mediation before sending a file-bearing snapshot.
+    ProbeProviderFiles,
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: Box<SandboxPolicyWire>,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     UpdateProviderEnvironment {
         /// Ordered publication within this authenticated boundary session.
         generation: u64,
         revision: u64,
         provider_env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        provider_files: std::collections::HashMap<String, String>,
     },
     AttachProcess {
         process_id: String,
@@ -757,6 +778,7 @@ impl fmt::Debug for Request {
                 .field("resource_claims", resource_claims)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
+            Self::ProbeProviderFiles => formatter.write_str("ProbeProviderFiles"),
             Self::StartAgent {
                 sandbox_id,
                 spec,
@@ -765,6 +787,7 @@ impl fmt::Debug for Request {
                 ca_bundle,
                 provider_env_revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
@@ -773,6 +796,7 @@ impl fmt::Debug for Request {
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
                 .field("provider_env_revision", provider_env_revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -782,10 +806,12 @@ impl fmt::Debug for Request {
                 generation,
                 revision,
                 provider_env,
+                provider_files,
             } => formatter
                 .debug_struct("UpdateProviderEnvironment")
                 .field("generation", generation)
                 .field("revision", revision)
+                .field("provider_file_count", &provider_files.len())
                 .field(
                     "provider_env_keys",
                     &provider_env.keys().collect::<Vec<_>>(),
@@ -857,6 +883,7 @@ pub enum Response {
         /// before workload launch.
         confirmation: Box<BoundaryConfirmation>,
     },
+    ProviderFilesSupported,
     Started {
         process_id: String,
         provider_env_revision: u64,
@@ -955,12 +982,36 @@ pub enum BoundaryErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableIdentityWire {
+    pub path: PathBuf,
+    pub digest: Option<Sha256Digest>,
+}
+
+impl From<ExecutableIdentity> for ExecutableIdentityWire {
+    fn from(identity: ExecutableIdentity) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+impl From<ExecutableIdentityWire> for ExecutableIdentity {
+    fn from(identity: ExecutableIdentityWire) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BinaryIdentityWire {
     Resolved {
-        binary_path: PathBuf,
-        binary_digest: Option<Sha256Digest>,
-        ancestors: Vec<PathBuf>,
+        executable: ExecutableIdentityWire,
+        ancestors: Vec<ExecutableIdentityWire>,
         cmdline_paths: Vec<PathBuf>,
     },
     Failed {
@@ -972,9 +1023,8 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
     fn from(identity: Result<BinaryIdentity, ResolveError>) -> Self {
         match identity {
             Ok(identity) => Self::Resolved {
-                binary_path: identity.binary_path,
-                binary_digest: identity.binary_digest,
-                ancestors: identity.ancestors,
+                executable: identity.executable.into(),
+                ancestors: identity.ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths: identity.cmdline_paths,
             },
             Err(error) => Self::Failed {
@@ -988,14 +1038,12 @@ impl BinaryIdentityWire {
     pub fn into_result(self) -> Result<BinaryIdentity, ResolveError> {
         match self {
             Self::Resolved {
-                binary_path,
-                binary_digest,
+                executable,
                 ancestors,
                 cmdline_paths,
             } => Ok(BinaryIdentity {
-                binary_path,
-                binary_digest,
-                ancestors,
+                executable: executable.into(),
+                ancestors: ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths,
             }),
             Self::Failed { message } => Err(ResolveError::Failed(message)),
@@ -1460,15 +1508,21 @@ mod tests {
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
         for encoded in [
             r#"{"result":"resolved","ancestors":[],"cmdline_paths":[]}"#,
-            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"invalid","ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","executable":{"path":"/bin/tool","digest":"invalid"},"ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ancestors":[],"cmdline_paths":[]}"#,
             r#"{"result":"failed","message":"unavailable","binary_path":"/bin/tool"}"#,
         ] {
             assert!(serde_json::from_str::<BinaryIdentityWire>(encoded).is_err());
         }
         let identity = BinaryIdentityWire::from(Ok(BinaryIdentity {
-            binary_path: PathBuf::from("/bin/tool"),
-            binary_digest: Some("a".repeat(64).parse().unwrap()),
-            ancestors: Vec::new(),
+            executable: ExecutableIdentity {
+                path: PathBuf::from("/bin/tool"),
+                digest: Some("a".repeat(64).parse().unwrap()),
+            },
+            ancestors: vec![ExecutableIdentity {
+                path: PathBuf::from("/bin/launcher"),
+                digest: Some("b".repeat(64).parse().unwrap()),
+            }],
             cmdline_paths: Vec::new(),
         }));
         let encoded = serde_json::to_vec(&identity).unwrap();
@@ -1521,6 +1575,7 @@ mod tests {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
             request: Request::StartAgent {
+                provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-1".to_string(),
                 spec: AgentSpecWire {
                     program: "/bin/true".to_string(),
@@ -1536,8 +1591,8 @@ mod tests {
                     landlock: LandlockPolicy::default(),
                     process: ProcessPolicy::default(),
                 })),
-                ca_cert: Some(b"test certificate".to_vec()),
-                ca_bundle: Some(b"test bundle".to_vec()),
+                ca_cert: Some("test certificate".to_string()),
+                ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
@@ -1570,14 +1625,44 @@ mod tests {
         second.insert("A".to_string(), "1".to_string());
         second.insert("B".to_string(), "2".to_string());
         let build = |provider_env| Request::UpdateProviderEnvironment {
+            provider_files: std::collections::HashMap::new(),
             generation: 1,
             revision: 2,
             provider_env,
         };
-        assert_eq!(
-            request_payload_digest(&build(first)).expect("first digest"),
-            request_payload_digest(&build(second)).expect("second digest")
+        // Pin the canonical bytes, including the nested environment object.
+        // Two randomized HashMaps can otherwise happen to iterate identically
+        // and conceal a serializer that preserves insertion order.
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(
+                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}"#
+            )
         );
+        for provider_env in [first, second] {
+            let request = build(provider_env);
+            assert_eq!(request_payload_digest(&request).expect("digest"), expected);
+
+            // Deserialization reconstructs the map with an independent hash
+            // seed; validation must retain the sender's canonical digest.
+            let envelope = RequestEnvelope::new(request).expect("request envelope");
+            let frame = encode_frame(&envelope).expect("encode envelope");
+            let mut decoded: RequestEnvelope = decode_frame(&frame).expect("decode envelope");
+            assert_eq!(decoded.payload_digest, expected);
+            decoded
+                .validate_payload_digest()
+                .expect("round-trip digest");
+
+            let Request::UpdateProviderEnvironment { provider_env, .. } = &mut decoded.request
+            else {
+                panic!("decoded the wrong request variant");
+            };
+            provider_env.insert("A".to_string(), "changed".to_string());
+            assert!(matches!(
+                decoded.validate_payload_digest(),
+                Err(FrameError::PayloadDigestMismatch)
+            ));
+        }
 
         let mut envelope = RequestEnvelope::new(build(std::collections::HashMap::new()))
             .expect("request envelope");
@@ -1588,6 +1673,58 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+
+        let mut request = build(std::collections::HashMap::new());
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut request else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 1".to_string(),
+        );
+        let mut envelope = RequestEnvelope::new(request).expect("file-bearing request envelope");
+        let Request::UpdateProviderEnvironment { provider_files, .. } = &mut envelope.request
+        else {
+            unreachable!();
+        };
+        provider_files.insert(
+            "/run/openshell/providers/acme/client.toml".to_string(),
+            "version = 2".to_string(),
+        );
+        assert!(matches!(
+            envelope.validate_payload_digest(),
+            Err(FrameError::PayloadDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
+        let request = RequestEnvelope::new(Request::StartAgent {
+            provider_files: std::collections::HashMap::new(),
+            sandbox_id: "sandbox-1".to_string(),
+            spec: AgentSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 5,
+                interactive: false,
+            },
+            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy::default(),
+                network: NetworkPolicy::default(),
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            })),
+            ca_cert: Some("A".repeat(16 * 1024)),
+            ca_bundle: Some("B".repeat(400 * 1024)),
+            provider_env_revision: 0,
+            provider_env: std::collections::HashMap::new(),
+        })
+        .expect("request envelope");
+        let frame = encode_frame(&request).expect("large CA bundle must fit in frame limit");
+        let decoded: RequestEnvelope = decode_frame(&frame).expect("round-trip");
+        assert_eq!(decoded, request);
     }
 
     #[test]

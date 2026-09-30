@@ -522,6 +522,22 @@ pub async fn report_main_process_exit(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) async fn test_bridge_ssh_relay(
+    target: tokio::net::UnixStream,
+    inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
+    out_tx: mpsc::Sender<RelayFrame>,
+) {
+    let _ = bridge_relay(
+        Box::new(target),
+        tokio_stream::wrappers::ReceiverStream::new(inbound),
+        out_tx,
+        "half-open-test".into(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+}
+
 /// Confirm terminal delivery and permit ephemeral cleanup.
 pub async fn finalize_main_process_exit(
     endpoint: &str,
@@ -687,8 +703,24 @@ async fn handle_relay_open(
         }
         Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
     };
-    let mut inbound = response.into_inner();
+    bridge_relay(
+        target,
+        response.into_inner(),
+        out_tx,
+        channel_id,
+        terminating,
+    )
+    .await
+}
 
+/// Forward the relay's data frames without interpreting the target protocol.
+async fn bridge_relay(
+    target: Box<dyn TargetStream>,
+    mut inbound: impl tokio_stream::Stream<Item = Result<RelayFrame, tonic::Status>> + Unpin,
+    out_tx: mpsc::Sender<RelayFrame>,
+    channel_id: String,
+    terminating: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the local SSH daemon on its Unix socket.
     let (mut target_r, mut target_w) = tokio::io::split(target);
 
@@ -939,6 +971,7 @@ mod ocsf_event_tests {
             product_version: "0.0.1".into(),
             proxy_ip: "127.0.0.1".parse().unwrap(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         }
     }
 

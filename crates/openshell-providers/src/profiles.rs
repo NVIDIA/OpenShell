@@ -3,14 +3,17 @@
 
 //! Declarative provider type profiles.
 
-use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, ParseMcpVersionsError,
+    canonicalize_mcp_versions, parse_mcp_versions,
+};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
@@ -499,23 +502,12 @@ fn default_mcp_profile_versions() -> Vec<String> {
 fn validate_mcp_profile_versions(
     values: &[String],
 ) -> Result<BTreeSet<McpProtocolVersion>, String> {
-    if values.is_empty() {
-        return Err(
-            "mcp.versions must contain at least one supported protocol version".to_string(),
-        );
-    }
-
-    let mut versions = BTreeSet::new();
-    for value in values {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| format!("{error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !versions.insert(version) {
-            return Err(format!("duplicate MCP protocol version '{value}'"));
+    parse_mcp_versions(values).map_err(|error| match error {
+        ParseMcpVersionsError::Unsupported(error) => {
+            format!("{error}; {MCP_VERSION_REMEDIATION}")
         }
-    }
-
-    Ok(versions)
+        error => error.to_string(),
+    })
 }
 
 fn deserialize_mcp_profile_versions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -705,6 +697,10 @@ pub struct ProviderTypeProfile {
     pub category: ProviderProfileCategory,
     #[serde(default)]
     pub credentials: Vec<CredentialProfile>,
+    /// EXPERIMENTAL: Non-secret files served to sandbox workloads on demand.
+    /// This API and its behavior may change or be removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ProviderFileProfile>,
     #[serde(default)]
     pub endpoints: Vec<EndpointProfile>,
     #[serde(default)]
@@ -717,6 +713,81 @@ pub struct ProviderTypeProfile {
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scope: String,
+}
+
+/// EXPERIMENTAL: A non-secret provider file template. This API may change or be removed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderFileProfile {
+    pub path: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub env_var: String,
+}
+
+impl ProviderFileProfile {
+    fn validate_template(&self) -> Result<(), String> {
+        let mut remaining = self.content.as_str();
+        while let Some(start) = remaining.find("{{") {
+            if remaining[..start].contains("}}") {
+                return Err("unexpected provider file placeholder close".to_string());
+            }
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            remaining = &after[end + 2..];
+        }
+        if remaining.contains("}}") {
+            return Err("unexpected provider file placeholder close".to_string());
+        }
+        Ok(())
+    }
+
+    /// Render only explicitly referenced non-secret provider config values.
+    pub fn render(&self, config: &HashMap<String, String>) -> Result<String, String> {
+        self.validate_template()?;
+        let mut remaining = self.content.as_str();
+        let mut rendered = String::new();
+        while let Some(start) = remaining.find("{{") {
+            rendered.push_str(&remaining[..start]);
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            let value = config
+                .get(key)
+                .ok_or_else(|| format!("missing provider config key '{key}'"))?;
+            rendered.push_str(value);
+            remaining = &after[end + 2..];
+            if rendered.len() > 65_536 {
+                return Err("rendered provider file exceeds 64 KiB".to_string());
+            }
+        }
+        rendered.push_str(remaining);
+        if rendered.len() > 65_536 {
+            return Err("rendered provider file exceeds 64 KiB".to_string());
+        }
+        Ok(rendered)
+    }
+}
+
+fn valid_file_config_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -751,6 +822,15 @@ impl ProviderTypeProfile {
                         .map(credential_refresh_from_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_from_proto),
+                })
+                .collect(),
+            files: profile
+                .files
+                .iter()
+                .map(|file| ProviderFileProfile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -917,6 +997,15 @@ impl ProviderTypeProfile {
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
+                })
+                .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|file| ProviderProfileFile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -1678,24 +1767,8 @@ fn materialize_and_canonicalize_mcp_profile_versions(versions: &mut Vec<String>)
     if versions.is_empty() {
         *versions = default_mcp_profile_versions();
     } else {
-        canonicalize_mcp_profile_versions(versions);
+        canonicalize_mcp_versions(versions);
     }
-}
-
-fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
-    // Preserve unsupported and duplicate values so subsequent validation can
-    // reject them; sorting must never repair malformed protobuf input.
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
 }
 
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
@@ -2061,8 +2134,80 @@ pub fn validate_profile_set(
             ));
         }
 
+        if profile.files.len() > 16 {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "files",
+                "at most 16 provider files are allowed",
+            ));
+        }
+        let mut file_paths = HashSet::new();
+        let mut file_env_vars = HashSet::new();
+        for file in &profile.files {
+            if file.path.is_empty()
+                || file.path == "."
+                || file.path == ".."
+                || !file
+                    .path
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+                || !file_paths.insert(file.path.as_str())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.path",
+                    "file path must be a unique, safe file name",
+                ));
+            }
+            if file.content.len() > 65_536 {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    "file template exceeds 64 KiB",
+                ));
+            }
+            if let Err(error) = file.validate_template() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    error,
+                ));
+            }
+            if !file.env_var.is_empty()
+                && (!file
+                    .env_var
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    || !file
+                        .env_var
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    || !file_env_vars.insert(file.env_var.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.env_var",
+                    "file environment key must be unique and use letters, digits, or underscores",
+                ));
+            }
+        }
+
         let mut credential_names = HashSet::new();
         for credential in &profile.credentials {
+            for env_var in &credential.env_vars {
+                if file_env_vars.contains(env_var.as_str()) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "files.env_var",
+                        format!("file environment key '{env_var}' conflicts with a credential"),
+                    ));
+                }
+            }
             let credential_name = credential.name.trim();
             if credential_name.is_empty() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -4100,7 +4245,7 @@ endpoints:
     path: /mcp
     protocol: mcp
     mcp:
-      versions: ["2025-11-25", "2025-03-26", "2025-06-18"]
+      versions: ["2026-07-28", "2025-11-25", "2025-03-26", "2025-06-18"]
       strict_tool_names: false
 binaries:
   - /usr/bin/example-agent
@@ -4108,7 +4253,7 @@ binaries:
         )
         .expect("profile should parse");
 
-        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
+        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
         assert_eq!(
             profile.endpoints[0]
                 .mcp
@@ -4559,7 +4704,7 @@ endpoints:
             "versions: [\"2025-03-26\", \"2025-03-26\"]",
             "versions: [latest]",
             "versions: [draft]",
-            "versions: ['2026-07-28']",
+            "versions: ['2026-07-29']",
             "versions: [\"2025-03-26 \"]",
         ] {
             let yaml = format!(
@@ -5762,6 +5907,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "space.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: " alex-api ".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5780,6 +5926,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "underscore.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "alex_api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5798,6 +5945,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "case.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "Alex-API".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -7818,5 +7966,30 @@ binaries:
                 .contains("mcp options are only valid for protocol mcp")),
             "expected mcp-options-on-non-mcp rejection: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn managed_file_example_validates_and_renders_only_config_fields() {
+        let yaml = include_str!("../../../examples/provider-managed-files/acme-config.yaml");
+        let profile = parse_profile_yaml(yaml).expect("example profile parses");
+        let diagnostics =
+            validate_profile_set(&[("acme-config.yaml".to_string(), profile.clone())]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let rendered = profile.files[0]
+            .render(&HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "https://api.acme.example".to_string(),
+                ),
+                ("project".to_string(), "production".to_string()),
+            ]))
+            .expect("render provider config");
+        assert!(rendered.contains("project = \"production\""));
+        assert!(!rendered.contains("{{"));
+
+        let mut invalid = profile;
+        invalid.files[0].content = "token = \"{{credential.API_KEY}}\"".to_string();
+        let diagnostics = validate_profile_set(&[("invalid.yaml".to_string(), invalid)]);
+        assert!(diagnostics.iter().any(|d| d.field == "files.content"));
     }
 }

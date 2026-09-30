@@ -3,16 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Snap wrapper for openshell-gateway. Sets snap-specific defaults:
-#   - OPENSHELL_DB_URL  -> sqlite:$SNAP_COMMON/gateway.db (overridable)
-#   - OPENSHELL_DISABLE_TLS -> true
-# It bootstraps package-managed credentials and validates, but never creates or
-# rewrites, an operator-provided config before starting the gateway.
+#   - OPENSHELL_DB_URL        -> sqlite:$SNAP_COMMON/gateway.db (overridable)
+#   - OPENSHELL_LOCAL_TLS_DIR -> $SNAP_COMMON/tls (overridable)
+# The gateway serves TLS from the generated bundle and requires client
+# certificates. It bootstraps package-managed credentials and validates, but
+# never creates or rewrites, an operator-provided config before starting.
 
 set -eu
 
 CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"
 export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
-export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"
 export OPENSHELL_LOCAL_TLS_DIR="${OPENSHELL_LOCAL_TLS_DIR:-${SNAP_COMMON}/tls}"
 
 # Mirror clap's CLI-over-environment precedence so preflight always inspects
@@ -64,9 +64,9 @@ if [ "$expect_config_path" = true ] || { [ "$config_seen" = true ] && [ -z "$cli
     exit 2
 fi
 
-# Docker sandboxes require gateway-minted, launch-scoped credentials for the
-# supervisor. Generate the local JWT bundle alongside the otherwise-unused TLS
-# material; generate-certs is idempotent and preserves an existing bundle.
+# Generate the local TLS bundle and the JWT bundle used for launch-scoped
+# supervisor credentials; generate-certs is idempotent and preserves an
+# existing bundle.
 "${SNAP}/bin/openshell-gateway" generate-certs \
     --output-dir "$OPENSHELL_LOCAL_TLS_DIR" \
     --server-san host.openshell.internal

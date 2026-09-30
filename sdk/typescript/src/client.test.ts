@@ -20,9 +20,16 @@ import {
   SandboxClient,
   SandboxTemplateClient,
   SCOPE_NAMES,
+  ServiceAuthorizationMode,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import {
+  OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  SandboxPhase,
+  SandboxRestartPolicy,
+  ServiceStatus,
+} from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
@@ -276,7 +283,9 @@ describe('exec / execStream', () => {
 
 describe('create', () => {
   it('sends create-time service exposures', async () => {
-    let created: { serviceExposures?: Array<{ service?: string; targetPort?: number }> } = {};
+    let created: {
+      serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+    } = {};
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -292,12 +301,29 @@ describe('create', () => {
 
     const result = await sandbox.create({
       image: 'img',
-      serviceExposures: [{ targetPort: 4500 }, { service: 'metrics', targetPort: 9090 }],
+      serviceExposures: [
+        { targetPort: 4500 },
+        {
+          service: 'metrics',
+          targetPort: 9090,
+          authorizationMode: ServiceAuthorizationMode.BearerPassthrough,
+        },
+      ],
     });
 
-    expect(created.serviceExposures?.map(({ service, targetPort }) => ({ service, targetPort }))).toEqual([
-      { service: '', targetPort: 4500 },
-      { service: 'metrics', targetPort: 9090 },
+    expect(
+      created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
+        service,
+        targetPort,
+        authorizationMode,
+      })),
+    ).toEqual([
+      { service: '', targetPort: 4500, authorizationMode: ProtoServiceAuthorizationMode.STRIP },
+      {
+        service: 'metrics',
+        targetPort: 9090,
+        authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
+      },
     ]);
     expect(result.serviceUrls).toEqual({
       '': 'https://sb.example.test/',
@@ -334,6 +360,20 @@ describe('create', () => {
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+  });
+
+  it('sends the restart policy', async () => {
+    let created: { spec?: { restartPolicy?: SandboxRestartPolicy } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', restartPolicy: 'on-failure' });
+
+    expect(created.spec?.restartPolicy).toBe(SandboxRestartPolicy.ON_FAILURE);
   });
 
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
@@ -540,7 +580,7 @@ describe('create', () => {
     await sandbox.createSshSession('ssh', { workspace: 'staging' });
     const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
-    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
     await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
@@ -615,6 +655,44 @@ describe('create', () => {
     await expect(pager.nextPage()).rejects.toThrow('temporary failure');
     await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: '' });
     expect(tokens).toEqual(['resume', 'resume']);
+  });
+
+  it('rejects a repeated continuation token', async () => {
+    const pager = new Pager<number>(async (token) => ({ items: [1], nextPageToken: token }), 'resume');
+
+    await expect(pager.nextPage()).rejects.toThrow('pager received a repeated continuation token');
+  });
+
+  it('prevents a request when the token-count budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: 'next' };
+      },
+      'first',
+      1,
+    );
+
+    await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: 'next' });
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual(['first']);
+  });
+
+  it('prevents a request when the token-byte budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: '' };
+      },
+      'too-large',
+      10,
+      1,
+    );
+
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual([]);
   });
 
   it('createFromTemplate rejects an empty template name locally', async () => {
@@ -803,6 +881,29 @@ describe('sandbox templates', () => {
     await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('maps restart controller status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.STARTING,
+            restartCount: 3,
+            nextRestartTime: { seconds: 1_700_000_000n, nanos: 0 },
+            mainProcessStartedTime: { seconds: 1_699_999_000n, nanos: 0 },
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'starting',
+      restartCount: 3,
+      nextRestartAtMs: 1_700_000_000_000,
+      mainProcessStartedAtMs: 1_699_999_000_000,
+    });
   });
 });
 
@@ -1308,23 +1409,66 @@ describe('providers', () => {
     expect(detach.changed).toBe(false);
   });
 
-  it('lists providers with u64 resourceVersion rendered as a string', async () => {
+  it('lists one provider page with its continuation token', async () => {
+    const pageTokens: string[] = [];
     const sandbox = client({
-      listSandboxProviders: () => ({
-        providers: [
-          {
-            metadata: {
-              id: 'p1',
-              name: 'claude',
-              labels: { a: 'b' },
-              resourceVersion: 99n,
+      listSandboxProviders: ({ pageToken, pageSize }) => {
+        pageTokens.push(pageToken);
+        expect(pageSize).toBe(1);
+        return {
+          providers: [
+            {
+              metadata: { id: 'p1', name: 'claude', resourceVersion: 99n },
+              type: 'claude',
             },
-            type: 'claude',
-          },
-        ],
-      }),
+          ],
+          nextPageToken: 'page-2',
+        };
+      },
     });
-    const providers = await sandbox.listProviders('sb');
+
+    const page = await sandbox.listProviders('sb', { pageSize: 1 }).nextPage();
+    expect(page).toMatchObject({ nextPageToken: 'page-2' });
+    expect(page?.items.map((provider) => provider.name)).toEqual(['claude']);
+    expect(pageTokens).toEqual(['']);
+  });
+
+  it('lists all providers with u64 resourceVersion rendered as a string', async () => {
+    const pageTokens: string[] = [];
+    const sandbox = client({
+      listSandboxProviders: ({ pageToken }) => {
+        pageTokens.push(pageToken);
+        return pageToken === ''
+          ? {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p1',
+                    name: 'claude',
+                    labels: { a: 'b' },
+                    resourceVersion: 99n,
+                  },
+                  type: 'claude',
+                },
+              ],
+              nextPageToken: 'page-2',
+            }
+          : {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p2',
+                    name: 'github',
+                    resourceVersion: 100n,
+                  },
+                  type: 'github',
+                },
+              ],
+              nextPageToken: '',
+            };
+      },
+    });
+    const providers = await sandbox.listAllProviders('sb');
     expect(providers).toEqual([
       {
         id: 'p1',
@@ -1333,7 +1477,15 @@ describe('providers', () => {
         labels: { a: 'b' },
         resourceVersion: '99',
       },
+      {
+        id: 'p2',
+        name: 'github',
+        type: 'github',
+        labels: {},
+        resourceVersion: '100',
+      },
     ]);
+    expect(pageTokens).toEqual(['', 'page-2']);
   });
 });
 

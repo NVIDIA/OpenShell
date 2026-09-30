@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Capture the default rootless Podman user-namespace mapping
+- name: Capture the default Podman user-namespace mapping
   hosts: all
   gather_facts: false
   vars:
@@ -12,26 +12,28 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Read OpenShell gateway service user
-      become: true
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - show
-          - openshell-gateway.service
-          - --property
-          - User
-          - --value
-      changed_when: false
-      register: openshell_gateway_service_user
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
 
-    - name: Require the rootless Podman gateway user
+    - name: Require a Podman gateway
       ansible.builtin.assert:
         that:
-          - openshell_gateway_service_user.stdout == "tmachine"
+          - tmachine_container_runtime_name == "podman"
         fail_msg: >-
-          The Podman default-userns suite requires a rootless Podman gateway
-          running as tmachine, not {{ openshell_gateway_service_user.stdout | default("unknown") }}
+          The Podman default-userns suite requires a Podman gateway, not
+          {{ tmachine_container_runtime_name }}
+
+    # podman_reference_user only selects who runs the direct `podman`
+    # reference commands below; it must match the daemon's rootful/rootless
+    # mode. The captured reference file itself stays owned by tmachine
+    # (the inventory's ansible_user), since the archived test binary that
+    # later reads it always runs unprivileged as tmachine, in both modes.
+    - name: Resolve the Podman reference execution context
+      ansible.builtin.set_fact:
+        podman_reference_user: "{{ 'tmachine' if tmachine_container_runtime_is_rootless else 'root' }}"
+        podman_reference_home: "{{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}"
+        podman_reference_uid: "{{ tmachine_container_runtime_tmachine_uid.stdout if tmachine_container_runtime_is_rootless else '0' }}"
 
     - name: Read OpenShell gateway configuration
       become: true
@@ -49,15 +51,6 @@
           The Podman default-userns suite requires gateway.toml to omit userns,
           uidmap, and gidmap.
 
-    - name: Resolve tmachine UID
-      ansible.builtin.command:
-        argv:
-          - id
-          - -u
-          - tmachine
-      changed_when: false
-      register: tmachine_uid
-
     - name: Create Podman test-input directory
       become: true
       ansible.builtin.file:
@@ -69,17 +62,17 @@
 
     - name: Pull the Podman reference image
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv: [podman, pull, "{{ podman_reference_image }}"]
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
 
     - name: Capture direct Podman default UID mapping
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv:
           - podman
@@ -92,8 +85,8 @@
           - "{{ podman_reference_image }}"
           - /proc/self/uid_map
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       register: podman_default_uid_map
 
@@ -101,7 +94,7 @@
       ansible.builtin.assert:
         that:
           - podman_default_uid_map.stdout | trim | length > 0
-        fail_msg: Direct rootless Podman reference container returned no UID mapping
+        fail_msg: Direct Podman reference container returned no UID mapping
 
     - name: Store direct Podman default UID mapping
       become: true

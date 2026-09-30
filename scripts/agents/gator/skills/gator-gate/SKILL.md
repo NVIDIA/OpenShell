@@ -918,7 +918,9 @@ Use `test:e2e` for changes that affect:
 
 Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavior.
 
-Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
+Use `test:e2e` for Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, workspace mode, or controller behavior; it runs the Kubernetes, managed-workspace, and operator-workspace suites.
+
+Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets and Vault credential driver storage. It runs only the HA and credential-driver suites, so apply it alongside `test:e2e` when other Kubernetes coverage is also needed.
 
 Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
 

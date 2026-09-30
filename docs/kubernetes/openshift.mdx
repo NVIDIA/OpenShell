@@ -5,7 +5,7 @@ title: "OpenShift"
 sidebar-title: "OpenShift"
 description: "Install the OpenShell Helm chart on OpenShift with capability-free sandbox workloads."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
-position: 6
+position: 7
 ---
 
 The Kubernetes driver resolves the UID range assigned to each OpenShift
@@ -30,7 +30,7 @@ operations that write results back into workload memory — `getpeername`,
 per-message length write-backs. Outbound-oriented workloads run unchanged;
 server workloads that read the peer address on accept need a node kernel with
 `WAIT_KILLABLE_RECV` (Linux 5.19+, or a distribution backport). See the
-[support matrix](/reference/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
+[support matrix](/about/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
 for the full behavior; the selected mode is reported as `seccomp_listener_mode`
 in the sandbox qualification output.
 
@@ -41,17 +41,23 @@ in the sandbox qualification output.
 - [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs.
 - A CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces.
 
+<Warning>
+Your cluster MUST enforce ingress and egress `NetworkPolicy` in every sandbox
+namespace. OpenShell creates the policies, but Kubernetes does not verify that
+the CNI applies them. Without enforcement, sandbox workloads may bypass
+supervisor network policy through direct connections.
+</Warning>
+
 ## Install OpenShell
 
 Pre-create the namespace, then install the chart. Keep the default restricted
-security posture and acknowledge NetworkPolicy only after validating the CNI.
+security posture.
 
 ```shell
 oc create ns openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --namespace openshell
 ```
 
 The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and

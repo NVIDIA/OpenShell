@@ -229,6 +229,10 @@ overrides that persist across package upgrades.
 
 The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
 the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
+The SQLite database runs in WAL mode with `synchronous=FULL` (SSH session
+issuance alone uses `NORMAL`), so
+`openshell.db-wal` and `openshell.db-shm` sit next to it and must be kept
+together with it; back it up with `sqlite3 openshell.db ".backup <copy>"`.
 
 ### Driver TOML settings
 

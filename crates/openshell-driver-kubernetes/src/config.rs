@@ -78,9 +78,6 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// Explicit operator assertion that the cluster CNI enforces
-    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
-    pub network_policy_enforced: bool,
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
 }
@@ -88,7 +85,6 @@ pub struct KubernetesSandboxRuntimeConfig {
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
-            network_policy_enforced: false,
             boundary_port: 5500,
         }
     }
@@ -96,12 +92,6 @@ impl Default for KubernetesSandboxRuntimeConfig {
 
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if !self.network_policy_enforced {
-            return Err(
-                "sandbox_runtime.network_policy_enforced must be true after the operator has verified CNI NetworkPolicy enforcement"
-                    .to_string(),
-            );
-        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -634,6 +624,20 @@ impl KubernetesComputeConfig {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
     }
 
+    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// shared mode it is staged into each generation's bootstrap Secret.
+    #[must_use]
+    pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
+        use crate::sandbox_runtime::SupervisorClientTls;
+        if self.client_tls_secret_name.is_empty() {
+            SupervisorClientTls::Disabled
+        } else if self.is_multi_namespace() {
+            SupervisorClientTls::Bootstrap
+        } else {
+            SupervisorClientTls::Secret(&self.client_tls_secret_name)
+        }
+    }
+
     /// Compute the K8s resource name for a sandbox.
     ///
     /// - **Shared:** `{workspace}--{name}` (namespace doesn't provide isolation).
@@ -843,7 +847,7 @@ mod tests {
 
     #[test]
     fn published_kubernetes_example_is_valid_toml() {
-        let docs = include_str!("../../../docs/reference/gateway-config.mdx");
+        let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
         let section = docs
             .split_once("### Kubernetes")
             .expect("Kubernetes documentation section")
@@ -871,19 +875,6 @@ mod tests {
     fn default_workspace_storage_class_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.workspace_storage_class.is_empty());
-    }
-
-    #[test]
-    fn sandbox_runtime_requires_network_policy_enforcement_acknowledgement() {
-        let mut cfg = KubernetesComputeConfig::default();
-        assert!(
-            cfg.validate_proxy_uid()
-                .unwrap_err()
-                .contains("network_policy_enforced")
-        );
-
-        cfg.sandbox_runtime.network_policy_enforced = true;
-        cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]

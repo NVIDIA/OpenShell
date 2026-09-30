@@ -194,6 +194,10 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Allow the WebSocket tunnel used by authenticated edge proxies.
+    /// Disabled for local gateways by default.
+    pub enable_websocket_tunnel: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -800,14 +804,22 @@ pub struct GatewayJwtConfig {
     /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Omit the field for a non-expiring token.
+    /// Token lifetime in seconds. Omission selects non-expiring sandbox
+    /// session credentials and the default lifetime for extension tokens.
     /// Explicit zero is invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<NonZeroU64>,
 }
 
 impl GatewayJwtConfig {
-    /// Effective token lifetime. `None` represents a non-expiring token.
+    /// Effective typed extension-token lifetime.
+    pub fn token_ttl(&self) -> Duration {
+        self.ttl_secs.map_or(Duration::from_mins(15), |ttl| {
+            Duration::from_secs(ttl.get())
+        })
+    }
+
+    /// Effective sandbox session-token lifetime. `None` is non-expiring.
     pub fn sandbox_token_ttl(&self) -> Option<Duration> {
         self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
     }
@@ -842,6 +854,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -1012,6 +1025,13 @@ impl Config {
     #[must_use]
     pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
         self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[must_use]
+    pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
+        self.enable_websocket_tunnel = enabled;
         self
     }
 }
@@ -1213,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+    fn gateway_jwt_omitted_ttl_defaults_extension_and_nonexpiring_session_tokens() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
             "public_key_path": "/tmp/public.pem",
@@ -1222,6 +1242,7 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, None);
+        assert_eq!(cfg.token_ttl(), Duration::from_mins(15));
         assert_eq!(cfg.sandbox_token_ttl(), None);
 
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
@@ -1238,6 +1259,7 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with positive ttl");
 
+        assert_eq!(cfg.token_ttl(), Duration::from_hours(1));
         assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert_eq!(serialized["ttl_secs"], 3600);

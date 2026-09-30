@@ -44,6 +44,17 @@ let
         };
       }
       {
+        name = "ubuntu-k3s";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = false;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/k3s.yaml"
+          ];
+        };
+      }
+      {
         name = "fedora-podman-rootful";
         machine = "fedora";
         setup = {
@@ -70,6 +81,19 @@ let
     ];
 
     installers = [
+      {
+        name = "k3s";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        inputs = {
+          agent_sandbox_version = "0.5.0";
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        };
+      }
       {
         name = "none";
         use_galaxy = false;
@@ -119,11 +143,26 @@ let
         };
       }
       {
+        name = "policy-advisor";
+        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
+        inputs = {
+          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+        };
+      }
+      {
         name = "provider-refresh";
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {
           keycloak_realm_file = "../scripts/keycloak-realm.json";
           provider_refresh_keycloak_test_bundle = "../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
+        };
+      }
+      {
+        name = "e2e-podman";
+        playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
+        inputs = {
+          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
+          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
         };
       }
       {

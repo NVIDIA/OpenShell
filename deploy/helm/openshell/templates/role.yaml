@@ -1,5 +1,5 @@
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
-{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
+{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) (include "openshell.rbacCreate" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -59,9 +59,9 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery lists them by label and
-    # deletes stale generations with UID preconditions before retrying creation.
-    verbs: ["create", "list", "delete"]
+    # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
+    # name.
+    verbs: ["create", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

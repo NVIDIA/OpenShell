@@ -40,7 +40,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -78,6 +78,7 @@ const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
 const MAX_CREATE_SERVICE_EXPOSURES: usize = 32;
+const SANDBOX_CAS_RETRY_LIMIT: usize = 16;
 
 #[cfg(test)]
 #[path = "interactive_exec_tests.rs"]
@@ -222,6 +223,13 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
         }
     })?;
     Ok(sandbox)
+}
+
+fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(()),
+        _ => Err(Status::failed_precondition("sandbox is not ready")),
+    }
 }
 
 fn generate_routable_name() -> String {
@@ -406,6 +414,13 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -440,12 +455,16 @@ async fn handle_create_sandbox_inner(
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
         resolved.tty = governance_spec.tty;
+        resolved.restart_policy = governance_spec.restart_policy;
         (resolved, Some(provenance))
     };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
     spec.provider_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
 
     // Leave an omitted command empty rather than persisting a concrete shell:
     // the sandbox boundary resolves the default login shell against the agent image
@@ -616,19 +635,13 @@ async fn handle_create_sandbox_inner(
     } else {
         None
     };
-    let sandbox_token = if let Some(authentication) = &launch_authentication {
-        Some(
-            authentication
-                .supervisor
-                .gateway_token
-                .expose_secret()
-                .to_string(),
-        )
-    } else if let Some(issuer) = &state.sandbox_jwt_issuer {
-        Some(issuer.mint(&id)?.token)
-    } else {
-        None
-    };
+    let sandbox_token = launch_authentication.as_ref().map(|authentication| {
+        authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string()
+    });
     let launch_authentication = launch_authentication
         .map(|authentication| {
             serde_json::to_vec(&authentication)
@@ -654,6 +667,11 @@ async fn handle_create_sandbox_inner(
             &sandbox,
             &exposure.service,
             exposure.target_port,
+            super::service::validate_service_exposure_request(
+                &exposure.service,
+                exposure.target_port,
+                exposure.authorization_mode,
+            )?,
         )
         .await
         {
@@ -715,7 +733,11 @@ fn validate_create_sandbox_request_pre_io(
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
-        super::service::validate_service_exposure_request(&exposure.service, exposure.target_port)?;
+        super::service::validate_service_exposure_request(
+            &exposure.service,
+            exposure.target_port,
+            exposure.authorization_mode,
+        )?;
         if !service_names.insert(exposure.service.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "duplicate service exposure name: '{}'",
@@ -1208,8 +1230,43 @@ pub(super) async fn handle_list_sandbox_providers(
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
-    let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
-    Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListSandboxProviders",
+        &[&workspace, &req.sandbox],
+    )?;
+    let mut providers = providers_for_sandbox(state, &sandbox, &workspace)
+        .await?
+        .into_iter()
+        .map(|provider| {
+            let name = provider
+                .metadata
+                .as_ref()
+                .filter(|metadata| !metadata.name.is_empty())
+                .map(|metadata| metadata.name.clone())
+                .ok_or_else(|| Status::internal("provider metadata name is missing"))?;
+            Ok((name, provider))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    providers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let start = pagination.provider_cursor()?.map_or(0, |cursor| {
+        providers.partition_point(|(name, _)| name.as_str() <= cursor)
+    });
+    let end = start
+        .saturating_add(usize::try_from(pagination.page_size()).expect("u32 fits in usize"))
+        .min(providers.len());
+    let next_page_token = pagination
+        .next_provider_token((end < providers.len()).then(|| providers[end - 1].0.as_str()));
+    Ok(Response::new(ListSandboxProvidersResponse {
+        providers: providers
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, provider)| provider)
+            .collect(),
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_attach_sandbox_provider(
@@ -1339,38 +1396,37 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached_clone = attached.clone();
     let mutation_id = uuid::Uuid::new_v4().to_string();
 
-    let sandbox = state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            &sandbox_id,
-            request.expected_resource_version,
-            |sandbox| {
-                attached_clone.store(false, Ordering::Relaxed);
-                let Some(ref mut spec) = sandbox.spec else {
-                    // Spec should always exist post-creation; if missing, fail CAS to surface error
-                    return;
-                };
+    let sandbox = update_sandbox_cas(
+        state,
+        &sandbox_id,
+        request.expected_resource_version,
+        |sandbox| {
+            attached_clone.store(false, Ordering::Relaxed);
+            let Some(ref mut spec) = sandbox.spec else {
+                // Spec should always exist post-creation; if missing, fail CAS to surface error
+                return;
+            };
 
-                if spec.provider_attachment_epoch.is_empty() {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                }
+            if spec.provider_attachment_epoch.is_empty() {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+            }
 
-                dedupe_provider_names(&mut spec.providers);
-                if !spec.providers.iter().any(|name| name == &provider_name)
-                    && spec.providers.len() < MAX_PROVIDERS
-                {
-                    spec.providers.push(provider_name.clone());
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                    attached_clone.store(true, Ordering::Relaxed);
-                    crate::compute::provisioning_deadline::attachments_changed(
-                        sandbox,
-                        current_time_ms(),
-                    );
-                }
-            },
-        )
-        .await
-        .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
+            dedupe_provider_names(&mut spec.providers);
+            if !spec.providers.iter().any(|name| name == &provider_name)
+                && spec.providers.len() < MAX_PROVIDERS
+            {
+                spec.providers.push(provider_name.clone());
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+                attached_clone.store(true, Ordering::Relaxed);
+                crate::compute::provisioning_deadline::attachments_changed(
+                    sandbox,
+                    current_time_ms(),
+                );
+            }
+        },
+    )
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
     let receipt = super::provider_readiness::record_provider_mutation(
@@ -1463,38 +1519,37 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached_clone = detached.clone();
     let mutation_id = uuid::Uuid::new_v4().to_string();
 
-    let sandbox = state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            &sandbox_id,
-            request.expected_resource_version,
-            |sandbox| {
-                detached_clone.store(false, Ordering::Relaxed);
-                let Some(ref mut spec) = sandbox.spec else {
-                    // Spec should always exist post-creation; if missing, fail CAS to surface error
-                    return;
-                };
+    let sandbox = update_sandbox_cas(
+        state,
+        &sandbox_id,
+        request.expected_resource_version,
+        |sandbox| {
+            detached_clone.store(false, Ordering::Relaxed);
+            let Some(ref mut spec) = sandbox.spec else {
+                // Spec should always exist post-creation; if missing, fail CAS to surface error
+                return;
+            };
 
-                if spec.provider_attachment_epoch.is_empty() {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                }
+            if spec.provider_attachment_epoch.is_empty() {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+            }
 
-                let before_len = spec.providers.len();
-                spec.providers.retain(|name| name != &provider_name);
-                if spec.providers.len() != before_len {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                    detached_clone.store(true, Ordering::Relaxed);
-                    // Only dedupe after making a change
-                    dedupe_provider_names(&mut spec.providers);
-                    crate::compute::provisioning_deadline::attachments_changed(
-                        sandbox,
-                        current_time_ms(),
-                    );
-                }
-            },
-        )
-        .await
-        .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+            let before_len = spec.providers.len();
+            spec.providers.retain(|name| name != &provider_name);
+            if spec.providers.len() != before_len {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+                detached_clone.store(true, Ordering::Relaxed);
+                // Only dedupe after making a change
+                dedupe_provider_names(&mut spec.providers);
+                crate::compute::provisioning_deadline::attachments_changed(
+                    sandbox,
+                    current_time_ms(),
+                );
+            }
+        },
+    )
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
 
     let detached = detached.load(Ordering::Relaxed);
     let receipt = super::provider_readiness::record_provider_mutation(
@@ -1720,6 +1775,33 @@ async fn providers_for_sandbox(
         providers.push(provider);
     }
     Ok(providers)
+}
+
+/// Retry a pure server-owned mutation on a fresh resource version. Explicit
+/// client versions still fail on conflict so clients retain their CAS contract.
+async fn update_sandbox_cas<F>(
+    state: &ServerState,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    mut mutate: F,
+) -> crate::persistence::PersistenceResult<Sandbox>
+where
+    F: FnMut(&mut Sandbox),
+{
+    for attempt in 1..=SANDBOX_CAS_RETRY_LIMIT {
+        match state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, &mut mutate)
+            .await
+        {
+            Ok(sandbox) => return Ok(sandbox),
+            Err(crate::persistence::PersistenceError::Conflict { .. })
+                if expected_resource_version == 0 && attempt < SANDBOX_CAS_RETRY_LIMIT => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("sandbox CAS retry loop always returns on its final attempt")
 }
 
 fn dedupe_provider_names(provider_names: &mut Vec<String>) {
@@ -2391,9 +2473,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2906,9 +2986,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -3031,7 +3109,9 @@ pub(super) async fn handle_create_ssh_session(
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(session.metadata.as_ref(), "ssh_session")?;
 
-    // Use MustCreate to atomically ensure the session token is unique
+    // `create_relaxed` fails if the token already exists, like MustCreate, but
+    // skips the per-commit fsync on SQLite. Losing a freshly minted token in a
+    // crash only makes it invalid; revocation stays on the durable `put_if`.
     let session_labels = session.object_labels();
     let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
         None
@@ -3043,14 +3123,13 @@ pub(super) async fn handle_create_ssh_session(
     };
     state
         .store
-        .put_if(
+        .create_relaxed(
             SshSession::object_type(),
             &token,
             session.object_name(),
             session.object_workspace(),
             &session.encode_to_vec(),
             session_labels_json.as_deref(),
-            WriteCondition::MustCreate,
         )
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
@@ -3218,16 +3297,17 @@ fn exec_ssh_client_config() -> russh::client::Config {
     }
 }
 
-/// Treat channel EOF before an exit status as relay failure, not exit code 1.
-fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
-    exit_code.map_or_else(
-        || {
-            Err(Status::unavailable(
-                "exec relay closed before the command reported an exit status",
-            ))
-        },
-        Ok,
-    )
+/// Require both the command status and channel close before reporting success.
+fn exec_loop_result(exit_code: Option<i32>, close_seen: bool) -> Result<i32, Status> {
+    match (exit_code, close_seen) {
+        (Some(code), true) => Ok(code),
+        (None, _) => Err(Status::unavailable(
+            "exec relay closed before the command reported an exit status",
+        )),
+        (Some(_), false) => Err(Status::unavailable(
+            "exec relay closed before the SSH channel finished",
+        )),
+    }
 }
 
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
@@ -3576,6 +3656,7 @@ async fn run_interactive_exec_with_russh(
 
     let output = async {
         let mut exit_code: Option<i32> = None;
+        let mut close_seen = false;
         loop {
             // Bound the post-ExitStatus wait against a lost Close.
             let msg = if exit_code.is_some() {
@@ -3618,12 +3699,15 @@ async fn run_interactive_exec_with_russh(
                     let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
                     exit_code = Some(converted);
                 }
-                ChannelMsg::Close => break,
+                ChannelMsg::Close => {
+                    close_seen = true;
+                    break;
+                }
                 _ => {}
             }
         }
 
-        exec_loop_result(exit_code)
+        exec_loop_result(exit_code, close_seen)
     };
 
     let result = {
@@ -3802,6 +3886,7 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to close ssh stdin: {e}")))?;
 
     let mut exit_code: Option<i32> = None;
+    let mut close_seen = false;
     loop {
         // Bound the post-ExitStatus wait against a lost Close.
         let msg = if exit_code.is_some() {
@@ -3842,7 +3927,10 @@ async fn run_exec_with_russh(
                 let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
                 exit_code = Some(converted);
             }
-            ChannelMsg::Close => break,
+            ChannelMsg::Close => {
+                close_seen = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -3852,7 +3940,7 @@ async fn run_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    exec_loop_result(exit_code)
+    exec_loop_result(exit_code, close_seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -3863,12 +3951,21 @@ async fn run_exec_with_russh(
 mod tests {
     use super::*;
     use crate::compute::NoopTestDriver;
+
+    #[test]
+    fn exec_requires_ssh_channel_close_after_exit_status() {
+        assert_eq!(exec_loop_result(Some(0), true).unwrap(), 0);
+        assert!(exec_loop_result(Some(0), false).is_err());
+        assert!(exec_loop_result(None, true).is_err());
+    }
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_compute_driver,
         test_server_state_with_driver,
     };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
+    use openshell_core::proto::{
+        GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
+    };
 
     // ---- shell_escape ----
 
@@ -6076,6 +6173,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_sandbox_providers_returns_attached_provider_records() {
+        use openshell_core::proto::CreateWorkspaceRequest;
+
         let state = test_server_state().await;
         state
             .store
@@ -6084,29 +6183,120 @@ mod tests {
             .unwrap();
         state
             .store
-            .put_message(&test_sandbox("work", vec!["work-github".to_string()]))
+            .put_message(&test_provider("work-gitlab", "gitlab"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "work",
+                vec!["work-github".to_string(), "work-gitlab".to_string()],
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("other", vec!["work-github".to_string()]))
             .await
             .unwrap();
 
-        let response = handle_list_sandbox_providers(
+        let first_page = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
                 sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                page_size: 1,
+                page_token: String::new(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
 
-        assert_eq!(response.providers.len(), 1);
-        assert_eq!(response.providers[0].r#type, "github");
+        assert_eq!(first_page.providers.len(), 1);
+        assert_eq!(first_page.providers[0].r#type, "github");
         assert_eq!(
-            response.providers[0].credentials.get("TOKEN"),
+            first_page.providers[0].credentials.get("TOKEN"),
             Some(&"REDACTED".to_string())
         );
+        assert!(!first_page.next_page_token.is_empty());
+
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "beta".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("beta workspace should be created");
+        let mut beta_provider = test_provider("work-github", "github");
+        beta_provider.metadata.as_mut().unwrap().id = "provider-beta-work-github".to_string();
+        beta_provider.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_provider).await.unwrap();
+        let mut beta_sandbox = test_sandbox("work", vec!["work-github".to_string()]);
+        beta_sandbox.metadata.as_mut().unwrap().id = "sandbox-beta-work".to_string();
+        beta_sandbox.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_sandbox).await.unwrap();
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("beta")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one workspace must not list a same-named sandbox elsewhere");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let mut sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "work")
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        sandbox
+            .spec
+            .as_mut()
+            .expect("sandbox has a spec")
+            .providers
+            .retain(|name| name != "work-github");
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "other".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one sandbox must not list another sandbox");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let second_page = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                page_size: 100,
+                page_token: first_page.next_page_token,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(second_page.providers.len(), 1);
+        assert_eq!(second_page.providers[0].r#type, "gitlab");
+        assert!(second_page.next_page_token.is_empty());
     }
 
     #[tokio::test]
@@ -6609,7 +6799,11 @@ mod tests {
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    policy: Some(mcp_policy_with_versions(&[
+                        "2026-07-28",
+                        "2025-11-25",
+                        "2025-03-26",
+                    ])),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -6639,7 +6833,7 @@ mod tests {
             .as_ref()
             .expect("MCP options")
             .versions;
-        assert_eq!(versions, &["2025-03-26", "2025-11-25"]);
+        assert_eq!(versions, &["2025-03-26", "2025-11-25", "2026-07-28"]);
     }
 
     #[tokio::test]
@@ -6830,7 +7024,7 @@ mod tests {
         let state = test_server_state().await;
         let cases: &[(&str, &[&str])] = &[
             ("mcp-duplicate-versions", &["2025-11-25", "2025-11-25"]),
-            ("mcp-unsupported-version", &["2026-07-28"]),
+            ("mcp-unsupported-version", &["2026-07-29"]),
         ];
 
         for &(sandbox_name, versions) in cases {
@@ -6894,6 +7088,10 @@ mod tests {
 
         let created = response.sandbox.expect("created sandbox");
         assert_eq!(
+            created.spec.as_ref().unwrap().restart_policy(),
+            SandboxRestartPolicy::Never
+        );
+        assert_eq!(
             created
                 .metadata
                 .as_ref()
@@ -6938,10 +7136,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: String::new(),
                         target_port: 4500,
+                        authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                     },
                 ],
                 ..Default::default()
@@ -6974,7 +7174,44 @@ mod tests {
             assert_eq!(endpoint.name, service);
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
+            let expected_mode = if service.is_empty() {
+                ServiceAuthorizationMode::Strip
+            } else {
+                ServiceAuthorizationMode::BearerPassthrough
+            };
+            assert_eq!(endpoint.authorization_mode(), expected_mode);
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_unknown_service_authorization_mode_before_persisting() {
+        let state = test_server_state().await;
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "invalid-service-authorization".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: vec![SandboxServiceExposure {
+                    service: String::new(),
+                    target_port: 4500,
+                    authorization_mode: 99,
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("unknown service authorization mode should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "invalid-service-authorization")
+                .await
+                .expect("sandbox lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -7006,10 +7243,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -7093,10 +7332,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8081,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -7785,7 +8026,7 @@ mod tests {
     fn template_create_sandbox_spec_field_policy_is_exhaustive() {
         assert_proto_fields_classified(
             "openshell.v1.SandboxSpec",
-            &["policy", "providers", "command", "tty"],
+            &["policy", "providers", "command", "tty", "restart_policy"],
             &[
                 "log_level",
                 "environment",
@@ -8688,6 +8929,59 @@ mod tests {
 
     // ---- CAS (Client-driven optimistic concurrency) tests ----
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn server_managed_sandbox_cas_retries_concurrent_updates() {
+        use std::sync::Barrier;
+
+        const WRITERS: usize = 5;
+
+        let state = Arc::new(test_server_state().await);
+        let sandbox = test_sandbox("server-cas-retry", Vec::new());
+        let sandbox_id = sandbox.object_id().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+        for _ in 0..WRITERS {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let sandbox_id = sandbox_id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut first_attempt = true;
+                update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
+                    if first_attempt {
+                        first_attempt = false;
+                        barrier.wait();
+                    }
+                    let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
+                    let count = annotations
+                        .get("internal-update-count")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_default();
+                    annotations
+                        .insert("internal-update-count".to_string(), (count + 1).to_string());
+                })
+                .await
+            }));
+        }
+
+        for result in future::join_all(handles).await {
+            result.unwrap().unwrap();
+        }
+
+        let updated = state
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.metadata.as_ref().unwrap().annotations["internal-update-count"],
+            WRITERS.to_string()
+        );
+        assert_eq!(updated.get_resource_version(), WRITERS as u64 + 1);
+    }
+
     #[tokio::test]
     async fn attach_sandbox_provider_client_driven_cas_succeeds_with_correct_version() {
         let state = test_server_state().await;
@@ -9318,6 +9612,8 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "no-such-ws".to_string(),
                 )),
+                page_size: 0,
+                page_token: String::new(),
             }),
         )
         .await

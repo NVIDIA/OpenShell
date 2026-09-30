@@ -1,0 +1,231 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Policy Prover"
+sidebar-title: "Policy Prover"
+description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a boundary policy you define."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
+position: 4
+---
+
+The policy prover is OpenShell's policy verification engine. It uses an SMT
+solver to check whether policies satisfy specified properties, such as staying
+within an allowed access boundary. Its guarantees apply to the policy features
+and behavior represented by its model. OpenShell is actively extending the model
+to cover more policy features.
+
+OpenShell uses the prover for two types of checks:
+
+- A boundary check verifies that a policy allows no access beyond a boundary
+  policy, which defines the most access allowed in an environment.
+- A proposal risk check verifies that a proposed network rule adds no risky
+  access compared with the sandbox's current policy, such as access to cloud
+  metadata addresses or new destinations for provider credentials.
+
+You run a boundary check with the `openshell-prover` CLI, which is primarily
+intended for agents. For example, a parent agent can check that a policy it
+writes for a subagent stays within the parent's own maximum allowed policy. A
+proposal risk check runs automatically each time an agent proposes a network
+rule through the [policy advisor](/how-it-works/policies/advisor).
+
+The two checks answer different questions, so passing one does not imply
+passing the other. A proposed rule that passes the proposal risk check can still
+exceed your boundary, and a policy that passes the boundary check can still
+contain access that the proposal risk check would flag.
+
+This page covers the boundary check. To learn about the proposal risk check,
+refer to [Policy Advisor](/how-it-works/policies/advisor).
+
+## Run a Boundary Check
+
+A boundary check compares the policy you are testing, called the candidate, with
+a boundary policy that you write. The boundary is usually the most access that
+an environment allows, such as an enterprise's maximum policy for its agents. If
+the candidate allows something the boundary does not, the prover shows an
+example.
+
+The check covers filesystem access, process identity, Landlock settings, network
+connections, and REST requests. If a policy uses anything else, such as GraphQL
+or MCP rules, the prover reports that it cannot check the policy instead of
+ignoring those rules. [What the Boundary Check
+Covers](#what-the-boundary-check-covers) describes each part and its limits.
+
+The Homebrew, Debian, and RPM packages install the `openshell-prover` CLI. The
+snap package does not include it, so on a snap installation, download the
+`openshell-prover` archive for your platform from the [OpenShell
+releases](https://github.com/NVIDIA/OpenShell/releases). The CLI reads policy
+files on your machine, does not need a gateway, and does not apply or approve
+policies.
+
+Create `boundary.yaml`, a boundary that allows reading `/usr` and `/etc`:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+    - /etc
+```
+
+Create `candidate.yaml`, a candidate that allows reading only `/usr`:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+```
+
+Check the candidate against the boundary:
+
+```shell
+openshell-prover check candidate.yaml --boundary boundary.yaml
+```
+
+The candidate allows less than the boundary, so the check passes:
+
+```text
+result: within_boundary
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+```
+
+The `coverage` line lists the parts of a policy that the prover can check. Now
+change the candidate so that it also allows writing to `/tmp`, which the
+boundary does not allow:
+
+```yaml
+version: 1
+filesystem_policy:
+  read_only:
+    - /usr
+  read_write:
+    - /tmp
+```
+
+Run the same command again. The check fails, and the `counterexample` line
+shows access that the candidate allows but the boundary does not:
+
+```text
+result: exceeds_boundary
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+counterexample: filesystem write /tmp
+```
+
+### Check a Sandbox's Policy
+
+To check the policy that a sandbox enforces, save its effective policy and use
+it as the candidate:
+
+```shell
+openshell sandbox get my-sandbox --policy-only > candidate.yaml
+openshell-prover check candidate.yaml --boundary boundary.yaml
+```
+
+The effective policy includes rules from attached providers, so the check
+includes network access that providers add. The prover does not add provider
+rules itself.
+To check a change before you apply it, give the prover the complete effective
+policy as it would be after the change.
+
+## Read the Result
+
+The prover reports one of these results:
+
+| Result | Exit code | Meaning |
+|---|---|---|
+| `within_boundary` | `0` | The candidate allows nothing beyond the boundary in the parts of the policy that the prover checks. |
+| `exceeds_boundary` | `1` | The candidate allows access that the boundary does not. The counterexample shows one example. |
+| `error` | `2` | The prover could not run the check, for example because a file is missing or a policy is invalid. |
+| `unsupported` | `3` | A policy uses something the prover cannot check. The reason explains what. |
+| `inconclusive` | `3` | The prover could not finish, for example because it ran out of time or the policies are too large. |
+
+Only `within_boundary` means that the check passed. Treat every other result as
+a failure. For example, a candidate with a GraphQL rule returns:
+
+```text
+result: unsupported
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+reason: candidate policy rule 'g' uses protocol 'graphql'; only L4 TCP and REST are modeled
+```
+
+For agents and scripts, add `--output json`. Read the `result` and
+`reason_code` fields instead of parsing the text output. `reason_code` is a
+stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also
+check that `coverage.domains` includes every part of the policy that you rely
+on. Run `openshell-prover check --help` for all options, including `--timeout`,
+which changes the default 10-second time limit.
+
+## What the Boundary Check Covers
+
+A passing result means that the candidate allows nothing beyond the boundary in
+the parts of the policy that the prover checks. It does not mean that the policy
+is as narrow as it could be, that it is safe for a particular task, or that a
+running sandbox enforces it.
+
+The check currently covers five parts of a policy. Within each part, some
+comparisons depend on information that the prover does not have, such as the
+files in the sandbox image. For those comparisons, the prover returns
+`unsupported` instead of guessing. Very large policies, for example with more
+than 1,024 network rules or 4,096 endpoints across both files, return
+`inconclusive` with the `reason_code` `resource_limit`.
+
+### Filesystem Access
+
+The prover compares read and write access path by path, so both policies must
+list the same paths. The candidate can remove a path that the boundary lists or
+change it from read-write to read-only, and a boundary entry for `/` covers
+every path. If the boundary grants no access of a kind, such as no write access
+at all, any candidate path with that access exceeds the boundary.
+
+Comparing different paths returns `unsupported`, even when one path is inside
+the other. For example, a candidate that allows writing to `/tmp/cache` under a
+boundary that allows writing to `/tmp` returns `unsupported`, because a symlink
+in the sandbox image could make `/tmp/cache` point outside `/tmp`. A policy
+whose result depends on the sandbox's working directory also returns
+`unsupported`.
+
+### Process Identity
+
+The prover compares `run_as_user` and `run_as_group`. Matching values pass, and
+a change from a non-root identity to root exceeds the boundary. Any other
+change, such as from UID `1500` to `1600`, returns `unsupported`, because the
+prover cannot look up accounts in the sandbox image.
+
+### Landlock
+
+The prover compares the `compatibility` setting. Keeping the setting or changing
+it to `hard_requirement` passes, and changing `hard_requirement` to
+`best_effort` exceeds the boundary. The prover compares the settings, not what
+a kernel enforces.
+
+### Network Connections
+
+The prover compares which binaries can reach which hosts, ports, and destination
+addresses, including `allowed_ips` ranges. It checks each policy both with and
+without binary identity enforcement, because a sandbox runtime can turn
+enforcement off. It does not resolve hostnames.
+
+The prover returns `unsupported` in these cases:
+
+- The candidate lists an exact binary path that the boundary covers only with a
+  glob, such as `/usr/bin/curl` under `/usr/bin/*`. A symlink in the sandbox
+  image could make the exact path refer to an executable outside the glob. Use
+  the same exact paths in both policies when you can.
+- Endpoints on the same port set different `allowed_ips`, and their hosts are
+  the same or one of them is a wildcard. The prover treats a wildcard host as
+  overlapping every host on its port.
+- An exact host and a wildcard host share a port and neither sets
+  `allowed_ips`, such as `github.com` and `*.githubusercontent.com` on port 443.
+- An endpoint omits `host`, sets both `port` and `ports`, or uses an IPv6
+  address as its host.
+- A host, path, method, or binary contains non-ASCII characters.
+
+### REST Requests
+
+The prover compares method and path allow and deny rules on endpoints with
+`protocol: rest`. These endpoints must use `enforcement: enforce`. An endpoint
+in audit mode returns `unsupported`, because it does not block requests. A host
+and port that has both a REST endpoint and an endpoint without request rules
+also returns `unsupported`, as do REST rules that match query parameters or use
+`?` or bracket expressions in paths. Other request protocols, such as WebSocket,
+GraphQL, MCP, and JSON-RPC, return `unsupported`.

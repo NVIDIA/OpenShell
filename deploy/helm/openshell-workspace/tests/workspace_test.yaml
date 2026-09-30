@@ -51,6 +51,18 @@ tests:
             resources: ["persistentvolumeclaims"]
             verbs: ["get"]
 
+  - it: grants generation Secret lifecycle and names no Secrets
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+      - notExists:
+          path: rules[*].resourceNames
+
   - it: binds the shared gateway service account
     template: templates/rolebinding.yaml
     set:

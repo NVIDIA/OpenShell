@@ -7,7 +7,7 @@ OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 Caller driver config is disabled by default, so command-based MXC workflows
 need explicit administrator opt-in. Host filesystem grants have no trusted
 label resolver and are rejected while resource admission is enabled.
-See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission)
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission)
 for the independent controls and the security consequences of opting out.
 
 This driver implements the gateway's ordinary in-process `ComputeDriver`
