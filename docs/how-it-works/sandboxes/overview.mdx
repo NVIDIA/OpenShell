@@ -776,10 +776,24 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 By default, uploads inside a Git repository respect `.gitignore` rules so that
 build artifacts, dependency caches, and other ignored files are not transferred.
-If `.gitignore` filtering excludes every file in the upload path, the CLI falls
-back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
-opt into unfiltered uploads explicitly, upload a path outside the Git work
-tree, or force-add the intended files if they should remain Git-aware.
+The CLI stops the affected upload if Git filtering fails or selects no files.
+When the CLI confirms that the source is outside a Git work tree, it uploads
+without filtering and warns that `.gitignore` rules are not applied. Git must
+be installed to determine whether filtering applies. A broken or inaccessible
+repository stops the upload. Pass `--no-git-ignore` to intentionally upload
+without filtering. These rules apply to both `sandbox upload` and
+`sandbox create --upload`.
+
+`sandbox create --upload` provisions the sandbox before checking Git filtering.
+If filtering rejects an upload, the command exits with an error, but the sandbox
+remains running. Earlier uploads in the same command may already have completed.
+Use `openshell sandbox upload` to retry against the existing sandbox, or
+`openshell sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
+if you intend to upload without filtering.
+
+Uploads preserve symlinks, including dangling links, instead of dereferencing
+their targets. A symlink source bypasses Git filtering so the link itself is
+archived.
 
 ## Stop and Start Sandboxes
 

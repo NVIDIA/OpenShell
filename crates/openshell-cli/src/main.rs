@@ -1443,8 +1443,10 @@ enum SandboxCommands {
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
         /// working directory.
-        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
-        /// upload everything.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1739,6 +1741,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.

@@ -3064,6 +3064,98 @@ async fn run_cli_sandbox_create(
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
 }
 
+#[tokio::test]
+async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_empty() {
+    let server = run_server().await;
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("runs")).unwrap();
+    fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
+    fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+
+    // A broken repository must not be mistaken for a non-repository source.
+    fs::create_dir(source.path().join(".git")).unwrap();
+    let path = source.path().join("runs");
+    let args = ["--detach", "--upload", path.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-no-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("Git filtering failed"), "{stderr}");
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(
+        stderr.contains("Sandbox 'upload-no-repository' was created and still exists"),
+        "{stderr}",
+    );
+    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+
+    fs::remove_dir(source.path().join(".git")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = run_cli_sandbox_create(&server, "upload-empty-selection", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+    assert!(
+        stderr.contains("Git returned 0 uploadable paths"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(
+        stderr.contains("Sandbox 'upload-empty-selection' was created and still exists"),
+        "{stderr}",
+    );
+    // Upload rejection intentionally leaves the provisioned sandbox available
+    // for an explicit retry; it does not roll back sandbox creation.
+    assert_eq!(create_requests(&server).await.len(), 2);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0,
+        "a rejected creation-time upload must not open an SSH session",
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("marker.txt"), "dummy content").unwrap();
+    let args = ["--detach", "--upload", source.path().to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-non-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // The fake SSH transport fails; preflight must still let it try.
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("outside a Git work tree"), "{stderr}");
+    assert!(
+        stderr.contains(".gitignore rules are not applied"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst)
+            > 0,
+        "an upload outside a repository must reach the SSH transport",
+    );
+}
+
 async fn run_cli_sandbox_template_create(
     server: &TestServer,
     name: &str,
