@@ -224,23 +224,18 @@ fn all_example_policies_split_with_expected_invariants() {
             .iter()
             .filter(|item| item.severity == "error")
             .collect();
-        if policy.network_middlewares.is_empty() {
-            assert!(
-                errors.is_empty(),
-                "processcontainer split must not emit error losses for {}: {:?}",
-                path.display(),
-                result.loss
-            );
-        } else {
-            assert_eq!(
-                errors.len(),
-                1,
-                "middleware policy must have one fail-closed loss for {}: {:?}",
-                path.display(),
-                result.loss
-            );
-            assert_eq!(errors[0].path, "network_middlewares");
-        }
+        assert!(
+            errors.is_empty(),
+            "processcontainer split must not emit error losses for {}: {:?}",
+            path.display(),
+            result.loss
+        );
+        assert_eq!(
+            result.proxy_policy.network_middlewares,
+            policy.network_middlewares,
+            "supervisor handoff must preserve middleware for {}",
+            path.display()
+        );
     }
 }
 

@@ -72,6 +72,10 @@ pub struct MxcComputeConfig {
     pub state_dir: PathBuf,
     pub grpc_endpoint: String,
     pub backend: MxcBackend,
+    /// Legacy isolation-session setting, accepted for existing
+    /// `ProcessContainer` configurations but unused by that backend.
+    #[serde(skip_serializing)]
+    pub default_configuration_id: Option<String>,
     pub pc_least_privilege: bool,
     pub pc_capabilities: Vec<String>,
     pub pc_allow_local_network: bool,
@@ -103,6 +107,7 @@ impl Default for MxcComputeConfig {
             state_dir,
             grpc_endpoint: String::new(),
             backend: MxcBackend::ProcessContainer,
+            default_configuration_id: None,
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
             pc_allow_local_network: true,
@@ -278,9 +283,6 @@ impl MxcComputeBackend {
                 "mxc state_dir must be an absolute Windows path",
             ));
         }
-        launch_authentication(sandbox)?
-            .validate()
-            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         self.map_sandbox_policy(
             &sandbox.id,
@@ -328,9 +330,18 @@ impl MxcComputeBackend {
 
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         self.validate_sandbox_create(sandbox)?;
+        // Gateway preflight runs before it mints generation-scoped credentials.
+        // Require authentication at the provisioning boundary, before any state
+        // directories, registry entries, or runtime processes are created.
+        let launch = launch_authentication(sandbox)?;
+        launch
+            .validate()
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
         let sandbox_id = sandbox.id.clone();
         let sandbox_config = sandbox_config(sandbox)?;
-        let generation = uuid::Uuid::new_v4().to_string();
+        // The gateway owns the authenticated generation. A driver-local UUID
+        // would make the boundary descriptor disagree with the signed bundle.
+        let generation = safe_component(launch.supervisor.runtime_generation.as_str())?.to_string();
         let host_state_dir = self
             .config
             .state_dir
@@ -1151,10 +1162,101 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
 mod tests {
     use super::*;
 
+    fn preflight_fixture() -> (MxcComputeBackend, DriverSandbox, tempfile::TempDir) {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        let dir = tempfile::tempdir().expect("test directory");
+        let binary = std::env::current_exe().expect("test executable");
+        let backend = MxcComputeBackend::new(MxcComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:1".into(),
+            supervisor_binary_path: binary.display().to_string(),
+            sandbox_binary_path: binary.display().to_string(),
+            state_dir: dir.path().join("not-created"),
+            ..Default::default()
+        });
+        let serde_json::Value::Object(config) = serde_json::json!({
+            "command": ["C:\\Windows\\System32\\cmd.exe", "/c", "exit 0"],
+            "cwd": dir.path(),
+        }) else {
+            unreachable!()
+        };
+        let sandbox = DriverSandbox {
+            id: "preflight".into(),
+            name: "preflight".into(),
+            spec: Some(DriverSandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    ..Default::default()
+                }),
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(
+                        openshell_core::proto_struct::json_object_to_struct(config)
+                            .expect("config"),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        (backend, sandbox, dir)
+    }
+
+    #[test]
+    fn preflight_does_not_require_not_yet_minted_authentication() {
+        let (backend, sandbox, _dir) = preflight_fixture();
+        backend
+            .validate_sandbox_create(&sandbox)
+            .expect("static preflight");
+        assert!(!backend.config.state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn provisioning_rejects_missing_authentication_before_side_effects() {
+        let (backend, sandbox, _dir) = preflight_fixture();
+        let error = backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("authentication required");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("launch authentication"));
+        assert!(!backend.config.state_dir.exists());
+        assert!(backend.get_sandbox(&sandbox.id).await.is_none());
+    }
+
     #[test]
     fn capabilities_delegate_readiness_to_supervisor() {
         let backend = MxcComputeBackend::new(MxcComputeConfig::default());
         assert!(!backend.capabilities().driver_reports_runtime_readiness);
+    }
+
+    #[test]
+    fn legacy_isolation_setting_does_not_change_processcontainer_contract() {
+        let config: MxcComputeConfig = serde_json::from_value(serde_json::json!({
+            "backend": "process_container",
+            "default_configuration_id": "composable",
+        }))
+        .expect("legacy ProcessContainer config");
+        assert_eq!(config.backend, MxcBackend::ProcessContainer);
+        assert_eq!(
+            config.default_configuration_id.as_deref(),
+            Some("composable")
+        );
+        assert!(
+            serde_json::to_value(&config)
+                .expect("config")
+                .get("default_configuration_id")
+                .is_none()
+        );
+        let (mut backend, sandbox, _dir) = preflight_fixture();
+        backend.config.backend = MxcBackend::IsolationSession;
+        backend.config.default_configuration_id = config.default_configuration_id;
+        assert!(
+            backend
+                .validate_sandbox_create(&sandbox)
+                .expect_err("IsolationSession still unsupported")
+                .message()
+                .contains("requires process_container")
+        );
     }
 
     #[test]

@@ -1290,7 +1290,11 @@ fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::
     writeln!(file, "exit_code={exit_code}")?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()
+    // Windows cannot open directories through File::open. The marker data is
+    // flushed above and rename still atomically replaces the previous value.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.

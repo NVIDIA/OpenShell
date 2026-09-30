@@ -971,6 +971,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_pump_reads_output_and_writes_input() {
         let (session, mut slave) = MainSession::terminal_for_test();

@@ -70,6 +70,10 @@ etw_audit = false
 Only `process_container` supports this architecture. `isolation_session` is
 rejected during sandbox validation.
 
+Legacy configurations may retain `default_configuration_id`; it remains unused
+by ProcessContainer and does not enable IsolationSession. New configurations
+should omit that field.
+
 Supply the workload command and working directory per sandbox:
 
 ```powershell
@@ -102,13 +106,32 @@ into the host supervisor; driver-owned copies of these fields are rejected.
 Run the Windows build lane on a native Windows MSVC host:
 
 ```powershell
-mise run windows:check:x64
-mise run windows:lint:x64
-mise run windows:build:x64
-mise run windows:test:mxc-real:x64
+mise run --skip-tools windows:check:x64
+mise run --skip-tools windows:lint:x64
+mise run --skip-tools windows:build:x64
+mise run --skip-tools windows:test:mxc-real:x64
+mise run --skip-tools windows:e2e:mxc:mock
+mise run --skip-tools windows:e2e:mxc
 ```
 
 The real-MXC tests are skip-safe when `wxc-exec.exe` or the required host
 capabilities are absent. A complete integration run still requires a qualified
 Windows MXC host; cross-compilation validates code shape but cannot validate
 ProcessContainer networking or DACL behavior.
+
+The real runtime requires native ProcessContainer directional egress and ingress
+host-loopback support, reported by `wxc-exec.exe --probe`. AppContainer fallback
+cannot supply these guarantees. Count test-internal `SKIP` messages separately
+from Cargo's passed count.
+
+The E2E runner uses native release artifacts (override with `-BinaryDir`), OpenSSL
+on PATH for disposable Ed25519 keys, and per-run writable fixtures under
+`target/windows-e2e-results`. It preserves the tracked gateway TOML and isolates
+CLI registration via `XDG_CONFIG_HOME`. Signing keys have an owner-only DACL,
+remain outside result bundles, and are removed unless `-KeepRunning` is requested.
+
+Mock E2E verifies authenticated rejection of a non-AppContainer boundary before
+workload execution. Workload filesystem and network-policy scenarios skip in
+mock mode; do not treat the mock as isolation or successful-runtime coverage.
+`network-policy` checks admission and workload execution, not real network
+enforcement. All-skipped real runs report `SKIP`, not `PASS`.

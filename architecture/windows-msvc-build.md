@@ -197,6 +197,25 @@ native rather than emulated coverage.
 
 ## Validation Contract
 
+Static MXC preflight runs before the gateway mints launch credentials. Actual
+provisioning requires the validated authentication bundle and uses its runtime
+generation for both the descriptor and state paths; the driver must not invent
+another generation.
+
+Legacy ProcessContainer configuration accepts the IsolationSession-only
+`default_configuration_id` field without applying it. This parsing compatibility
+does not enable the unsupported IsolationSession backend.
+
+Real runtime E2E requires the native ProcessContainer PSEC contract, including
+directional egress filters and ingress host-loopback support. An AppContainer
+fallback or a sufficiently new OS build number alone does not establish this
+contract. Probe-gated skips are not isolation coverage.
+
+The local E2E harness uses .NET listener discovery rather than account-restricted
+CIM queries. It renders disposable configuration and owner-only JWT keys without
+rewriting the tracked TOML. Its nonisolating mock must fail boundary audit before
+executing workloads; mock results cannot certify filesystem or network isolation.
+
 A successful Windows build report should include:
 
 - x64 and ARM64 `cargo check` status.

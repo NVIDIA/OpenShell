@@ -228,7 +228,8 @@ fn dryrun_current_schema_rejects_isolation_session_ui() {
         return;
     }
 
-    let base = serde_json::json!({
+    let mut base = serde_json::json!({
+        "version": "0.8.0-alpha",
         "phase": "provision",
         "containment": "isolation_session",
         "network": {
@@ -236,7 +237,18 @@ fn dryrun_current_schema_rejects_isolation_session_ui() {
             "allowLocalNetwork": true,
         },
     });
-    let (code, stdout, stderr) = dry_run_with_args(&wxc, &base, &["--experimental"]);
+    let args: &[&str] = if (major, minor) >= (0, 9) {
+        base.as_object_mut().unwrap().remove("phase");
+        base["version"] = serde_json::json!("0.9.0-alpha");
+        base["network"] = serde_json::json!({
+            "egress": { "default": "allow" },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
+        });
+        &["--experimental", "--operation", "provision"]
+    } else {
+        &["--experimental"]
+    };
+    let (code, stdout, stderr) = dry_run_with_args(&wxc, &base, args);
     let output = format!("{stdout} {stderr}").to_ascii_lowercase();
     if code != 0
         && output.contains("backend_unavailable")
@@ -252,7 +264,7 @@ fn dryrun_current_schema_rejects_isolation_session_ui() {
 
     let mut with_ui = base;
     with_ui["ui"] = serde_json::json!({ "disable": true });
-    let (code, stdout, stderr) = dry_run_with_args(&wxc, &with_ui, &["--experimental"]);
+    let (code, stdout, stderr) = dry_run_with_args(&wxc, &with_ui, args);
     assert_ne!(
         code, 0,
         "current isolation_session schema unexpectedly accepted UI\nversion={raw_version}\nstdout={stdout}\nstderr={stderr}"
@@ -462,7 +474,30 @@ fn dryrun_accepts_split_policy_output() {
     );
     assert!(mxc_config.get("runtimeConfig").is_none());
 
+    // --dry-run also resolves host capabilities; it is not schema-only.
+    // Verify explicit rejection on an AppContainer-only host rather than
+    // weakening the mapper's required loopback fence to obtain a green test.
+    let probe = Command::new(&wxc)
+        .arg("--probe")
+        .output()
+        .expect("MXC probe");
+    let probe_json = serde_json::from_slice::<serde_json::Value>(&probe.stdout).ok();
+    let loopback_supported = probe_json
+        .as_ref()
+        .and_then(|value| value.pointer("/probes/baseContainerSupportsIngressHostLoopbackAllow"))
+        .and_then(serde_json::Value::as_bool);
     let (code, stdout, stderr) = dry_run(&wxc, &mxc_config);
+    if loopback_supported == Some(false) {
+        assert_ne!(code, 0, "unsupported host must reject the loopback fence");
+        assert!(
+            stderr.contains("hostLoopback"),
+            "unexpected rejection: {stderr}"
+        );
+        eprintln!(
+            "SKIP: positive split-policy admission requires native host-loopback support; unsupported-host rejection verified"
+        );
+        return;
+    }
     assert_eq!(
         code,
         0,

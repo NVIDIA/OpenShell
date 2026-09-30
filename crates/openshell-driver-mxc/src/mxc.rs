@@ -16,8 +16,8 @@ use tracing::{debug, info};
 pub const MXC_SCHEMA_VERSION: &str = "0.8.0-alpha";
 
 /// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
-/// `"1"`, the invoker does not spawn `wxc-exec.exe`; it simulates AppContainer
-/// filesystem enforcement for the one-shot ProcessContainer launch.
+/// `"1"`, the invoker does not spawn `wxc-exec.exe`. This wiring shim has no
+/// `AppContainer` token and must fail runtime audit before workload execution.
 pub const MOCK_ENV_VAR: &str = "OPENSHELL_MXC_MOCK_WXC";
 
 fn mock_enabled() -> bool {
@@ -266,30 +266,36 @@ impl WxcExecInvoker {
         self.mock
     }
 
-    /// Mock enforcement for the one-shot `processContainer` path.
-    ///
-    /// In-policy → run the real agent command (so the positive-proof artifact,
-    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
-    /// → refuse with an access-denied message on stderr and a non-zero exit,
-    /// mirroring how the `AppContainer` denies the write on the demo box.
+    /// Launch the real boundary runtime without OS isolation for wiring tests.
+    /// Filesystem denial must be tested with real MXC, not this mock.
     fn mock_spawn_with_grants(
         process: &MxcProcess,
         grants: &[String],
     ) -> Result<tokio::process::Child, InvokerError> {
         let cmd_norm = mock_normalize(&process.command_line);
+        // The RFC 0012 boundary is launched with its granted bootstrap directory.
+        // This check concerns bootstrap wiring, never workload authorization.
         let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
 
-        let mut cmd = Command::new("cmd");
+        // Spawn the encoded executable directly: a cmd.exe intermediary would
+        // survive only as a parent handle while kill_on_drop orphaned its child.
+        let (program, arguments) = process
+            .command_line
+            .strip_prefix('"')
+            .map_or_else(
+                || process.command_line.split_once(char::is_whitespace),
+                |quoted| quoted.split_once('"'),
+            )
+            .unwrap_or((&process.command_line, ""));
+        let mut cmd = Command::new(if in_policy { program } else { "cmd" });
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
         if in_policy {
             debug!(command = %process.command_line, "mock exec: in-policy, running agent");
-            // `command_line` is already encoded with Windows quoting rules.
-            // Pass it raw so this mock matches wxc-exec/CreateProcess instead
-            // of asking Rust to quote the entire command as one cmd.exe argv.
-            cmd.raw_arg(format!("/d /s /c \"{}\"", process.command_line));
+            // Retain the already-encoded Windows argv without another quoting pass.
+            cmd.raw_arg(arguments.trim_start());
         } else {
             debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
             cmd.arg("/c").arg(
