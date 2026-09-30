@@ -29,7 +29,6 @@ tests:
       sandboxRuntime.image.tag: legacy
       supervisor.image.repository: legacy.example/supervisor
       supervisor.image.tag: legacy
-      supervisor.sandboxRuntime.networkPolicyEnforced: true
       supervisor.sandboxRuntime.boundaryPort: 6600
       upstreamProxy.caBundle.configMapName: legacy-proxy-ca
       gatewayConfig:
@@ -37,7 +36,6 @@ tests:
           sandbox_runtime_image: schema.example/sandbox:2
           supervisor_image: schema.example/supervisor:2
           sandbox_runtime:
-            network_policy_enforced: false
             boundary_port: 7700
           proxy_ca_bundle: /schema-v2/ca.crt
     asserts:
@@ -52,10 +50,22 @@ tests:
           pattern: '(?m)^proxy_ca_bundle = "/schema-v2/ca\.crt"$'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 7700, network_policy_enforced = false \}$'
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 7700 \}$'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: legacy\.example|6600|proxy-ca
+
+  - it: does not serialize the removed NetworkPolicy acknowledgement alias
+    set:
+      supervisor.sandboxRuntime.networkPolicyEnforced: true
+      supervisor.sandboxRuntime.boundaryPort: 6600
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 6600 \}$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: network_policy_enforced
 
   - it: translates a deprecated workspace mode when schema-v2 keeps its default
     set:
@@ -75,6 +85,76 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?m)^workspace_mode = "shared"$'
+
+  - it: gives explicit schema-v2 gateway settings precedence over legacy aliases
+    set:
+      server.name: legacy-gateway
+      server.enableWebsocketTunnel: false
+      gatewayConfig:
+        openshell.gateway:
+          name: schema-v2-gateway
+          enable_websocket_tunnel: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name = "schema-v2-gateway"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel = true$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy-gateway
+
+  - it: translates legacy OIDC roles and scopes into schema-v2 field names
+    set:
+      server.oidc.issuer: https://issuer.example/realms/openshell
+      server.oidc.audience: openshell-cli
+      server.oidc.rolesClaim: custom.roles
+      server.oidc.adminRole: platform-admin
+      server.oidc.userRole: platform-user
+      server.oidc.scopesClaim: permissions
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?admin_role = "platform-admin"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?roles_claim = "custom\.roles"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?scopes_claim = "permissions"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?user_role = "platform-user"'
+
+  - it: translates legacy resource admission labels into snake_case
+    set:
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/approved: "true"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^required_labels = \{ "platform\.example\.com/approved" = "true" \}$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/approved" = "true"'
+
+  - it: gives schema-v2 resource admission precedence over the legacy alias
+    set:
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/source: legacy
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          resource_admission:
+            required_labels:
+              platform.example.com/source: schema-v2
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "schema-v2"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "legacy"'
 
   - it: renders all supported YAML shapes with deterministic TOML output
     set:

@@ -5,13 +5,14 @@ Chart schema v2 replaces application-specific Helm values with one non-secret
 inline tables. Kubernetes resource references (Secrets, certificates, Services,
 and mounts) remain chart values.
 
-## Breaking upgrade
+## Upgrade compatibility
 
-Remove every application-only `server.*` setting before upgrading. There is no
-compatibility translation. Runtime images, proxy settings, and NetworkPolicy
-acknowledgement all live in `gatewayConfig`. Kubernetes pull
-policy spellings such as `Always` are not aliases: use `always`,
-`if_not_present`, or `never`. `gatewayConfig` is strictly a non-secret
+The chart accepts the 0.1.x application values as deprecated aliases while
+moving to `gatewayConfig`. When both forms set the same runtime field,
+`gatewayConfig` wins. Runtime images and proxy settings may therefore be
+migrated incrementally. Kubernetes pull policy spellings such as `Always` are
+accepted aliases and normalize to `always`, `if_not_present`, or `never`.
+`gatewayConfig` is strictly a non-secret
 configuration contract: do not put passwords, tokens, private keys,
 `database_url`, or other secret material in it; use Secret-backed environment,
 file, or volume configuration instead. Helm serializes unknown fields
@@ -20,13 +21,13 @@ generically and cannot determine whether an arbitrary string such as
 and PEM private keys, but is not a general secret scanner.
 
 Keep `server.disableTls`, TLS Secret names, `server.hostGatewayIP`, `server.externalDbSecret`,
-`server.sandboxNamespace`, `oidc.caConfigMapName`, certificate settings and
+`server.sandboxNamespace`, `server.oidc.caConfigMapName`, certificate settings and
 Service settings: these own Kubernetes resources. The chart derives their
 runtime counterparts.
 
 ## Mapping
 
-| Removed value | New location |
+| Deprecated alias | Schema-v2 location |
 | --- | --- |
 | `server.name`, `server.logLevel`, `server.enableLoopbackServiceHttp`, `server.policyValidationFailureMode` | `openshell.gateway.{name,log_level,enable_loopback_service_http,policy_validation_failure_mode}` |
 | `server.grpcRateLimit.{requests,windowSeconds}` | `openshell.gateway.{grpc_rate_limit_requests,grpc_rate_limit_window_seconds}` |
@@ -58,9 +59,8 @@ gatewayConfig:
     image_pull_policy: if_not_present
     supervisor_image: registry.example/openshell-supervisor:latest
     sandbox_runtime:
-      network_policy_enforced: true
+      boundary_port: 5500
     workspace_mode: managed
-    grpc_rate_limit_requests: null
   openshell.gateway:
     grpc_rate_limit_requests: 120
     grpc_rate_limit_window_seconds: 60

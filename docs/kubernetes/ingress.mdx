@@ -176,6 +176,7 @@ helm upgrade --install openshell \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
   --values oidc-values.yaml \
+  --set server.disableTls=false \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 

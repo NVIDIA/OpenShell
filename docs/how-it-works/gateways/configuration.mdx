@@ -524,7 +524,7 @@ credential_drivers = ["vault"]
 
 [openshell.credential_drivers.vault]
 address = "https://vault.vault.svc.cluster.local:8200"
-ca_bundle = "/etc/openshell-tls/vault/ca.crt"
+ca_bundle = "/etc/openshell-tls/vault-ca/ca.crt"
 mount = "secret"
 kv_version = "2"
 auth_method = "kubernetes"

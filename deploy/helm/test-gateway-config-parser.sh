@@ -22,7 +22,6 @@ render() {
   helm template parser-validation "${chart}" \
     --namespace parser-namespace \
     --set agentSandbox.preflight.enabled=false \
-    --set gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime.network_policy_enforced=true \
     "$@" >"${output}"
 }
 
@@ -39,14 +38,7 @@ preflight() {
   "${gateway_bin}" config preflight --path "${toml}"
 }
 
-if helm template parser-validation "${chart}" --namespace parser-namespace \
-  --set agentSandbox.preflight.enabled=false >"${work_dir}/unacknowledged-default.yaml" 2>"${work_dir}/unacknowledged-default.err"; then
-  echo "the chart must require explicit NetworkPolicy enforcement acknowledgement" >&2
-  exit 1
-fi
-grep -F 'gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced must be true' "${work_dir}/unacknowledged-default.err" >/dev/null
-
-# The runtime default is valid after the required infrastructure acknowledgement.
+# The runtime default must render and pass the Rust loader validation.
 render "${work_dir}/default.yaml"
 extract_toml "${work_dir}/default.yaml" "${work_dir}/default.toml"
 preflight "${work_dir}/default.toml"
@@ -63,9 +55,9 @@ if grep -Fq 'omitted_value' "${work_dir}/shapes.toml"; then
   exit 1
 fi
 
-# The loader gives absent and empty credential-driver selection deliberately
+# The chart gives absent and empty credential-driver selection deliberately
 # different meanings: absent retains encrypted storage, while an empty list is
-# an invalid and ambiguous external-driver selection.
+# invalid before a manifest is rendered.
 render "${work_dir}/credential-drivers-absent.yaml" \
   --set-json 'gatewayConfig.openshell\.gateway.credential_drivers=null'
 extract_toml "${work_dir}/credential-drivers-absent.yaml" "${work_dir}/credential-drivers-absent.toml"
@@ -74,11 +66,9 @@ if grep -Fq 'credential_drivers' "${work_dir}/credential-drivers-absent.toml"; t
   echo "null credential_drivers must be absent from gateway.toml" >&2
   exit 1
 fi
-render "${work_dir}/credential-drivers-empty.yaml" \
-  --set-json 'gatewayConfig.openshell\.gateway.credential_drivers=[]'
-extract_toml "${work_dir}/credential-drivers-empty.yaml" "${work_dir}/credential-drivers-empty.toml"
-if preflight "${work_dir}/credential-drivers-empty.toml" >"${work_dir}/credential-drivers-empty.err" 2>&1; then
-  echo "the gateway loader accepted empty credential_drivers" >&2
+if render "${work_dir}/credential-drivers-empty.yaml" \
+  --set-json 'gatewayConfig.openshell\.gateway.credential_drivers=[]' >"${work_dir}/credential-drivers-empty.err" 2>&1; then
+  echo "the chart accepted empty credential_drivers" >&2
   exit 1
 fi
 

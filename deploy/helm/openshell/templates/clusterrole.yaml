@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
-{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{ $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" }}
 {{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
+{{- $managedSshIngressEnabled := .Values.networkPolicy.enabled -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $managedSshIngress := get $gatewayConfig "openshell.drivers.kubernetes.managed_ssh_ingress" | default dict -}}
-{{- $managedSshIngressEnabled := true -}}
 {{- if hasKey $managedSshIngress "enabled" -}}
 {{- $managedSshIngressEnabled = get $managedSshIngress "enabled" -}}
-{{- end }}
+{{- end -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -98,73 +98,20 @@ rules:
       - patch
       - watch
   {{- end }}
-  {{- $copiedSecretNames := list }}
-  {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
-  {{- $copiedSecretNames = append $copiedSecretNames .Values.server.tls.clientTlsSecretName }}
-  {{- end }}
-  {{- if eq $workspaceMode "managed" }}
-  {{- range (get $kubernetesConfig "image_pull_secrets" | default list) }}
-  {{- if . }}
-  {{- $copiedSecretNames = append $copiedSecretNames . }}
-  {{- end }}
-  {{- end }}
-{{- end }}
-  {{- end }}
   {{- if ne $workspaceMode "shared" }}
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery lists them by label and
-    # deletes stale generations with UID preconditions before retrying creation.
-    verbs: ["create", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
   {{- end }}
-  {{- $copiedSecretNames = uniq $copiedSecretNames }}
-  {{- if $copiedSecretNames }}
-  # Copy only explicitly configured TLS and image-pull Secrets into workspace
-  # namespaces. Server-side apply authorizes these requests as patch operations.
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    resourceNames:
-      {{- range $copiedSecretNames }}
-      - {{ . | quote }}
-      {{- end }}
-    verbs:
-      - get
-      - patch
-  # Server-side apply uses PATCH for an existing Secret, but the API server
-  # additionally authorizes CREATE when the named Secret does not exist yet.
-  # Kubernetes RBAC cannot restrict CREATE by resourceNames because create
-  # authorization happens before the object name is available to RBAC. Keep
-  # reads and mutations name-restricted above; this broader grant is required
-  # only to create the initial copy in a gateway-owned managed namespace.
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - create
-  {{- end }}
-  {{- if and (ne $workspaceMode "shared") (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") }}
-  # The kubernetes-secrets credential driver uses dynamic hashed names in
-  # workspace namespaces, so Kubernetes RBAC cannot restrict resourceNames.
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - get
-      - create
-      - patch
-      - delete
-  {{- end }}
   {{- if eq $workspaceMode "managed" }}
+  # Operator-mode namespaces receive Secret permissions from the
+  # openshell-workspace chart Role instead.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
   # ServiceAccount creation in managed namespaces.
   - apiGroups:
       - ""
@@ -186,3 +133,4 @@ rules:
       - update
   {{- end }}
   {{- end }}
+{{- end }}
