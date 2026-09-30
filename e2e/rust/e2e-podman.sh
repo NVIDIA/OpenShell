@@ -38,6 +38,7 @@ PODMAN_CI_TESTS=(
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
+  podman_oci_identity
   provider_token_exchange
 )
 

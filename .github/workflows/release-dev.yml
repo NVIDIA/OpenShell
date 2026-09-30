@@ -137,7 +137,10 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"oci-image"}
         ]
 
   docker-e2e:
