@@ -4072,6 +4072,7 @@ name = "openshell-core"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "chrono",
  "glob",
@@ -4654,6 +4655,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-sts",
  "axum",
  "base64 0.22.1",

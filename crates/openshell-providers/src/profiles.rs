@@ -1152,6 +1152,21 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
             | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            | ProviderCredentialRefreshStrategy::OciInstancePrincipal
+            | ProviderCredentialRefreshStrategy::OciResourcePrincipal
+            | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity
+    )
+}
+
+/// True for the OCI principal strategies, which all mint an `ST$` security
+/// token as `OCI_KEY_ID` and a session key as `OCI_PRIVATE_KEY`.
+#[must_use]
+pub fn is_oci_principal_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
+    matches!(
+        strategy,
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal
+            | ProviderCredentialRefreshStrategy::OciResourcePrincipal
+            | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity
     )
 }
 
@@ -1168,6 +1183,9 @@ pub fn strategy_output_spec(
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             (&["secret_access_key", "session_token"], &[])
         }
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal
+        | ProviderCredentialRefreshStrategy::OciResourcePrincipal
+        | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => (&["private_key"], &[]),
         _ => (&[], &[]),
     }
 }
@@ -1183,6 +1201,9 @@ pub fn strategy_primary_env_key(
 ) -> Option<&'static str> {
     match strategy {
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => Some("AWS_ACCESS_KEY_ID"),
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal
+        | ProviderCredentialRefreshStrategy::OciResourcePrincipal
+        | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => Some("OCI_KEY_ID"),
         _ => None,
     }
 }
@@ -1198,6 +1219,12 @@ pub fn strategy_output_env_key(
         (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "secret_access_key") => {
             Some("AWS_SECRET_ACCESS_KEY")
         }
+        (
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal
+            | ProviderCredentialRefreshStrategy::OciResourcePrincipal
+            | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
+            "private_key",
+        ) => Some("OCI_PRIVATE_KEY"),
         (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "session_token") => {
             Some("AWS_SESSION_TOKEN")
         }
@@ -1402,6 +1429,11 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "oci_instance_principal" => Some(ProviderCredentialRefreshStrategy::OciInstancePrincipal),
+        "oci_resource_principal" => Some(ProviderCredentialRefreshStrategy::OciResourcePrincipal),
+        "oci_oke_workload_identity" => {
+            Some(ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity)
+        }
         _ => None,
     }
 }
@@ -1417,6 +1449,9 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal => "oci_instance_principal",
+        ProviderCredentialRefreshStrategy::OciResourcePrincipal => "oci_resource_principal",
+        ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => "oci_oke_workload_identity",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -6168,6 +6203,56 @@ binaries:
             assert!(
                 profile.allows_empty_provider_credentials(),
                 "{id} should allow empty provider credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_principal_strategies_round_trip_and_pin_the_signing_env_keys() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy as S;
+        for (yaml, strategy) in [
+            ("oci_instance_principal", S::OciInstancePrincipal),
+            ("oci_resource_principal", S::OciResourcePrincipal),
+            ("oci_oke_workload_identity", S::OciOkeWorkloadIdentity),
+        ] {
+            assert_eq!(
+                super::provider_refresh_strategy_from_yaml(yaml),
+                Some(strategy)
+            );
+            assert_eq!(super::provider_refresh_strategy_to_yaml(strategy), yaml);
+            assert!(super::is_gateway_mintable_strategy(strategy), "{yaml}");
+            assert!(super::is_oci_principal_strategy(strategy), "{yaml}");
+            assert_eq!(
+                super::strategy_primary_env_key(strategy),
+                Some("OCI_KEY_ID")
+            );
+            assert_eq!(super::strategy_output_spec(strategy).0, &["private_key"]);
+            assert_eq!(
+                super::strategy_output_env_key(strategy, "private_key"),
+                Some("OCI_PRIVATE_KEY")
+            );
+        }
+        assert!(!super::is_oci_principal_strategy(S::AwsStsAssumeRole));
+    }
+
+    #[test]
+    fn oci_principal_profiles_parse_and_allow_runtime_credentials() {
+        for id in [
+            "oci-instance-principal",
+            "oci-resource-principal",
+            "oci-oke-workload-identity",
+        ] {
+            let profile = example_profile(id);
+            let key_id = profile
+                .credentials
+                .iter()
+                .find(|c| c.name == "key_id")
+                .unwrap_or_else(|| panic!("{id}: key_id credential"));
+            let refresh = key_id.refresh.as_ref().unwrap();
+            assert!(super::is_oci_principal_strategy(refresh.strategy), "{id}");
+            assert!(
+                profile.allows_empty_provider_credentials(),
+                "{id} should allow --runtime-credentials"
             );
         }
     }

@@ -4632,6 +4632,20 @@ pub(super) async fn handle_configure_provider_refresh(
             "sts_endpoint_url material is not permitted",
         ));
     }
+    // The OCI identity endpoints are likewise derived from the region and the
+    // cluster; reject caller-supplied overrides so a signed federation request
+    // cannot be redirected at an arbitrary service (CWE-918).
+    for key in [
+        "metadata_base_url",
+        "federation_endpoint_url",
+        "proxymux_endpoint_url",
+    ] {
+        if request.material.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "{key} material is not permitted"
+            )));
+        }
+    }
     // Explicit AWS source credentials are all-or-nothing. Reject a partial pair
     // early so a lone key can't later fall through to the gateway's ambient
     // identity at mint time (CWE-20).
@@ -6378,7 +6392,10 @@ mod tests {
                 "oci",
                 "oci-genai",
                 "oci-genai-native",
+                "oci-instance-principal",
                 "oci-object-storage",
+                "oci-oke-workload-identity",
+                "oci-resource-principal",
                 "openai",
                 "openrouter",
                 "pypi"
@@ -13520,6 +13537,151 @@ mod tests {
             response.strategy,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32
         );
+    }
+
+    #[tokio::test]
+    async fn configure_oci_instance_principal_succeeds_with_empty_material_and_pins_the_key_output()
+    {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "oci-instance".to_string(),
+                    created_time: None,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_time: None,
+                }),
+                r#type: "oci-instance-principal".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
+                provider: "oci-instance".to_string(),
+                credential_key: "OCI_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::OciInstancePrincipal as i32,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expiration_time: None,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .expect("status");
+        assert_eq!(response.credential_key, "OCI_KEY_ID");
+        assert_eq!(
+            response.strategy,
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal as i32
+        );
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "oci-instance")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "OCI_KEY_ID",
+        )
+        .await
+        .unwrap()
+        .expect("refresh state should exist");
+        assert_eq!(
+            stored.additional_output_keys.get("private_key"),
+            Some(&"OCI_PRIVATE_KEY".to_string()),
+            "the session key output is pinned from the profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_oci_principals_reject_identity_endpoint_override_material() {
+        let state = test_server_state().await;
+        for (provider_type, strategy, key) in [
+            (
+                "oci-instance-principal",
+                ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+                "metadata_base_url",
+            ),
+            (
+                "oci-instance-principal",
+                ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+                "federation_endpoint_url",
+            ),
+            (
+                "oci-oke-workload-identity",
+                ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
+                "proxymux_endpoint_url",
+            ),
+        ] {
+            let name = format!("oci-override-{key}").replace('_', "-");
+            create_provider_record(
+                state.store.as_ref(),
+                "default",
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: name.clone(),
+                        created_time: None,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: "default".to_string(),
+                        deletion_time: None,
+                    }),
+                    r#type: provider_type.to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expiration_times: HashMap::new(),
+                    profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let err = handle_configure_provider_refresh(
+                &state,
+                authed_request(ConfigureProviderRefreshRequest {
+                    request_id: String::new(),
+                    provider: name.clone(),
+                    credential_key: "OCI_KEY_ID".to_string(),
+                    strategy: strategy as i32,
+                    material: HashMap::from([(key.to_string(), "http://127.0.0.1:1/".to_string())]),
+                    secret_material_keys: Vec::new(),
+                    expiration_time: None,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "{key}");
+            assert!(err.message().contains(key), "{key}: {}", err.message());
+        }
     }
 
     #[tokio::test]
