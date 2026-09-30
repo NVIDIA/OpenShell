@@ -25,6 +25,12 @@
 //!   `;jsessionid` ACL-bypass mitigation). Stripping happens *before*
 //!   dot-segment resolution so that `..;` cannot evade the traversal guard
 //!   and then revert to `..` on the way out.
+//! - Only a literal `;` from the request is a path-parameter delimiter. `%3B`
+//!   is percent-encoded data (RFC 3986) and is preserved as `%3B` in both the
+//!   policy input and the forwarded request line; treating it as a delimiter
+//!   would silently retarget the request. For traversal detection a `%3B`
+//!   still terminates its segment, so `..%3B` cannot smuggle `..` past the
+//!   guard.
 //! - Reject any `.`/`..` that survives to the end of canonicalization. The
 //!   policy engine trusts this function to have removed them.
 //! - Reject `%2F` (encoded slash) inside a segment by default. Operators
@@ -71,6 +77,10 @@ pub struct CanonicalizeOptions {
     /// Defaults to `true`: path parameters are an ambiguity surface
     /// historically used to bypass ACLs and are not part of any policy
     /// we author.
+    ///
+    /// Only a literal `;` in the request counts as the delimiter. A
+    /// percent-encoded `%3B` is data under RFC 3986 and is preserved, so an
+    /// encoded semicolon cannot truncate the segment it appears in.
     pub strip_path_parameters: bool,
 }
 
@@ -102,6 +112,17 @@ pub(crate) const MAX_PATH_LEN: usize = 4 * 1024;
 /// Chosen from the C0 control range so no legitimate decoded byte collides
 /// with it; any raw `0x01` in the input is rejected up front.
 const ENCODED_SLASH_SENTINEL: u8 = 0x01;
+
+/// Sentinel byte used to represent a `%3B`-decoded semicolon inside a segment.
+///
+/// A bare `;` is the path-parameter delimiter `strip_path_parameters` cuts on,
+/// while `%3B` is encoded data. Decoding the latter straight to `;` makes the
+/// two indistinguishable and silently truncates the segment -- and, because the
+/// canonical path is what gets written onto the wire, the forwarded request
+/// line with it. The encoded form is therefore carried as its own sentinel and
+/// re-emitted as `%3B`. Like `ENCODED_SLASH_SENTINEL` it is drawn from the C0
+/// range, which the input sweep and the percent-decoder both reject.
+const ENCODED_SEMICOLON_SENTINEL: u8 = 0x02;
 
 /// Canonicalize an HTTP request-target's path component.
 ///
@@ -244,7 +265,7 @@ fn percent_decode_with_sentinel(
     let mut i = 0;
     while i < raw.len() {
         let b = raw[i];
-        if b == ENCODED_SLASH_SENTINEL {
+        if b == ENCODED_SLASH_SENTINEL || b == ENCODED_SEMICOLON_SENTINEL {
             // Raw sentinel byte in input — already rejected by the C0
             // control-byte sweep above, but double-check here to avoid
             // collisions in case the sweep is ever relaxed.
@@ -263,6 +284,11 @@ fn percent_decode_with_sentinel(
                     return Err(CanonicalizeError::EncodedSlashNotAllowed);
                 }
                 out.push(ENCODED_SLASH_SENTINEL);
+            } else if decoded == b';' {
+                // An encoded semicolon is data, not a delimiter. Carry it as a
+                // sentinel so a literal `;` from the request stays the only
+                // thing that ends a segment.
+                out.push(ENCODED_SEMICOLON_SENTINEL);
             } else if decoded == 0 || decoded == 0x7F || (decoded < 0x20 && decoded != b'\t') {
                 return Err(CanonicalizeError::NullOrControlByte);
             } else if decoded == b'\n' || decoded == b'\r' || decoded == b'\t' {
@@ -294,11 +320,25 @@ fn split_path_segments(decoded: &[u8]) -> Vec<&[u8]> {
     decoded[1..].split(|&b| b == b'/').collect()
 }
 
+/// The form of a segment used to decide whether it is a dot-segment.
+///
+/// `%3B` is preserved as data when the path is rebuilt, but for traversal
+/// detection it has to end the segment all the same: `..%3B` and `..%3Bfoo`
+/// decode to a `..` segment plus an encoded-semicolon tail, so classifying
+/// them as ordinary segments would forward a traversal the policy never
+/// approved.
+fn dot_segment_view(seg: &[u8]) -> &[u8] {
+    seg.iter()
+        .position(|&b| b == ENCODED_SEMICOLON_SENTINEL)
+        .map_or(seg, |pos| &seg[..pos])
+}
+
 fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, CanonicalizeError> {
     let mut stack: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
     let last = segments.len().saturating_sub(1);
     for (idx, seg) in segments.into_iter().enumerate() {
-        if seg == b".." {
+        let view = dot_segment_view(seg);
+        if view == b".." {
             if stack.pop().is_none() {
                 return Err(CanonicalizeError::TraversalAboveRoot);
             }
@@ -308,7 +348,7 @@ fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, Canonicali
             }
             continue;
         }
-        if seg == b"." {
+        if view == b"." {
             if idx == last {
                 stack.push(Vec::new());
             }
@@ -342,6 +382,8 @@ fn build_canonical_path(
         for &b in trimmed {
             if b == ENCODED_SLASH_SENTINEL {
                 out.push_str("%2F");
+            } else if b == ENCODED_SEMICOLON_SENTINEL {
+                out.push_str("%3B");
             } else if is_pchar_unreserved(b) {
                 out.push(b as char);
             } else {
@@ -651,7 +693,8 @@ mod tests {
 
     #[test]
     fn regression_percent_encoded_dotdot_with_path_parameter() {
-        // `%2e%2e;` and `..%3B` both decode to `..;` before segmentation.
+        // `%2e%2e;` decodes to `..;`, `..%3B` to `..` plus an encoded
+        // semicolon; both must still classify as `..` for the guard to hold.
         assert_eq!(canon("/public/%2e%2e;/secret").unwrap(), "/secret");
         assert_eq!(canon("/public/..%3B/secret").unwrap(), "/secret");
         assert_eq!(canon("/public/..%3b/secret").unwrap(), "/secret");
@@ -747,5 +790,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // `%3B` is percent-encoded data, not a path-parameter delimiter. Only a
+    // literal `;` from the request terminates a segment; an encoded one must
+    // reach the policy engine and the upstream intact instead of silently
+    // truncating the forwarded request line.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn regression_percent_encoded_semicolon_is_not_a_path_parameter() {
+        assert_eq!(canon("/a/%3Bx").unwrap(), "/a/%3Bx");
+        assert_eq!(
+            canon("/objects/backup%3Bold").unwrap(),
+            "/objects/backup%3Bold"
+        );
+        assert_eq!(canon("/a/b%3Bc").unwrap(), "/a/b%3Bc");
+    }
+
+    #[test]
+    fn regression_percent_encoded_semicolon_survives_in_trailing_segment() {
+        assert_eq!(canon("/a/%3B").unwrap(), "/a/%3B");
+        assert_eq!(canon("/%3B").unwrap(), "/%3B");
+    }
+
+    #[test]
+    fn regression_percent_encoded_semicolon_normalizes_to_uppercase() {
+        assert_eq!(canon("/a/x%3by").unwrap(), "/a/x%3By");
+    }
+
+    #[test]
+    fn regression_literal_semicolon_still_strips_path_parameters() {
+        assert_eq!(canon("/a;jsessionid=xyz/b").unwrap(), "/a/b");
+        // A `%3B` ahead of the literal delimiter is data up to the delimiter.
+        assert_eq!(canon("/a%3Bb;jsessionid=xyz/c").unwrap(), "/a%3Bb/c");
+    }
+
+    #[test]
+    fn regression_percent_encoded_semicolon_keeps_dot_segment_guard() {
+        // `..%3B` must keep resolving (or be rejected) exactly as the literal
+        // `..;` spelling does, so the encoded delimiter cannot carry a
+        // traversal past the guard.
+        assert_eq!(canon("/public/..%3B/secret").unwrap(), "/secret");
+        assert_eq!(canon("/public/%2e%2e%3B/secret").unwrap(), "/secret");
+        assert_eq!(
+            canon("/public/..%3B/..%3B/secret"),
+            Err(CanonicalizeError::TraversalAboveRoot)
+        );
+    }
+
+    #[test]
+    fn regression_percent_encoded_semicolon_stays_distinct_when_stripping_disabled() {
+        // With the mitigation off, `;` and `%3B` must stay distinguishable
+        // rather than collapsing to the same byte on the wire.
+        let opts = CanonicalizeOptions {
+            strip_path_parameters: false,
+            ..CanonicalizeOptions::default()
+        };
+        assert_eq!(canon_with("/a%3Bb;c", opts).unwrap(), "/a%3Bb;c");
+        assert_eq!(canon_with("/a;b%3Bc", opts).unwrap(), "/a;b%3Bc");
+    }
+
+    #[test]
+    fn regression_percent_encoded_semicolon_forces_wire_rewrite() {
+        // The truncation is silent precisely because the canonical path
+        // replaces the request line. An encoded semicolon inside an otherwise
+        // non-canonical target must still mark the request rewritten, and the
+        // rewrite must preserve the semicolon.
+        let (path, _) =
+            canonicalize_request_target("/objects/a%3bb/./c", &CanonicalizeOptions::default())
+                .unwrap();
+        assert_eq!(path.path, "/objects/a%3Bb/c");
+        assert!(path.rewritten);
     }
 }
