@@ -131,22 +131,30 @@ function Quote-NativeArgument([string]$value) {
     return $quoted.ToString()
 }
 
-function Invoke-Cli([string[]]$CommandArgs) {
+function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = $cli
-    $start.Arguments = ((@("--gateway-endpoint", $gatewayEndpoint) + $CommandArgs |
-        ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $start.FileName = $filePath
+    $start.Arguments = (($argumentList | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
-    if (-not $process.Start()) { throw "failed to start OpenShell CLI" }
+    if (-not $process.Start()) { throw "failed to start $filePath" }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
-    return @{ ExitCode = $process.ExitCode; Text = ((@($stdout.Result, $stderr.Result) | Where-Object { $_ }) -join [Environment]::NewLine).Trim() }
+    $output = @($stdout.Result, $stderr.Result) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_ -split "`r?`n" } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    return @{ ExitCode = $process.ExitCode; Output = @($output) }
+}
+
+function Invoke-Cli([string[]]$CommandArgs) {
+    $result = Invoke-NativeCaptured $cli (@("--gateway-endpoint", $gatewayEndpoint) + $CommandArgs)
+    return @{ ExitCode = $result.ExitCode; Text = ($result.Output -join [Environment]::NewLine).Trim() }
 }
 
 # Escape backslashes for TOML basic strings.
