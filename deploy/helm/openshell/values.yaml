@@ -328,6 +328,13 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
+  # SCC namespace annotation if present, otherwise the driver default. Must be
+  # an integer between 1 and 4294967294.
+  sandboxUid: ""
+  # -- GID for sandbox pods (`sandbox_gid`). Empty (default) = same as
+  # sandboxUid. Must be an integer between 1 and 4294967294.
+  sandboxGid: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

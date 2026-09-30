@@ -247,6 +247,12 @@ data:
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
+    {{- with include "openshell.sandboxId" (dict "name" "server.sandboxUid" "value" .Values.server.sandboxUid) }}
+    sandbox_uid                  = {{ . }}
+    {{- end }}
+    {{- with include "openshell.sandboxId" (dict "name" "server.sandboxGid" "value" .Values.server.sandboxGid) }}
+    sandbox_gid                  = {{ . }}
+    {{- end }}
     {{- if (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) }}
     supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) | quote }}
     {{- end }}

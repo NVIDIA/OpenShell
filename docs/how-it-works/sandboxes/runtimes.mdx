@@ -226,6 +226,7 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
+| `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
 | `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |
 | `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |

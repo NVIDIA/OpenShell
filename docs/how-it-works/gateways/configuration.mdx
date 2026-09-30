@@ -814,6 +814,7 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # PVC init container. When unset, the driver auto-detects from OpenShift SCC
 # namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
 # back to 1000 on non-OpenShift clusters. Any non-root Linux UID/GID is valid.
+# Helm sets these with server.sandboxUid and server.sandboxGid.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
 # Operator-mode namespace discovery. At least one must be set when
