@@ -13,7 +13,7 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- Every PR must close an existing issue. The branch should follow `<issue-number>-<description>/<username>`.
+- Every PR must close an existing issue. The branch should follow `<type>/<issue-id>-<short-description>/<github-username>`.
 
 ## Before Creating a PR
 
@@ -47,10 +47,10 @@ Before creating a PR, verify:
    git branch --show-current
    ```
 
-2. **Branch follows naming convention** - Use `<issue-number>-<description>/<initials>`.
+2. **Branch follows naming convention** - Use `<type>/<issue-id>-<short-description>/<github-username>`, where `<type>` is a Conventional Commits type.
 
    ```bash
-   # Example: 1234-add-pagination/jd
+   # Example: feat/1234-add-pagination/johntmyers
    git branch --show-current
    ```
 

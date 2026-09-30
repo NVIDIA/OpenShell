@@ -24,7 +24,7 @@ Use a single issue comment beginning with `> **🏗️ build-plan**` when a plan
 
 ## Implement
 
-1. Check the current branch and working tree. Preserve unrelated work. Create an issue-specific branch or worktree as needed.
+1. Check the current branch and working tree. Preserve unrelated work. Create a branch or worktree as needed, with the branch named `<type>/<issue-id>-<short-description>/<github-username>`. Use a Conventional Commits type for `<type>`.
 2. Implement the smallest coherent change that fulfills the acceptance criteria. Update relevant skills when behavior or commands change. Keep published documentation minimal: explain exactly what users need, avoid duplication across pages, and omit internal details with no user impact.
 3. Add meaningful tests for changed behavior and follow the verification guidance in `CONTRIBUTING.md`. Select format, lint, compile or type checks, and tests for affected components and their dependencies. Run the relevant E2E lane for infrastructure, sandbox, or policy changes. Guidance and template edits need applicable Markdown, YAML, link, and consistency checks. Do not require full Rust, SDK, or repository CI solely because a commit or PR is being created; broaden checks only for a concrete remaining risk or failed check.
 4. Review the diff, use a signed-off Conventional Commit, and prepare a PR following `create-github-pr`.

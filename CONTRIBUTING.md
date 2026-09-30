@@ -353,7 +353,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 ## Pull Requests
 
-1. Create a feature branch from `main`.
+1. Create a branch from `main` named `<type>/<issue-id>-<short-description>/<github-username>`, using a Conventional Commits type such as `feat`, `fix`, `docs`, or `chore`.
 2. Make your changes with tests.
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).

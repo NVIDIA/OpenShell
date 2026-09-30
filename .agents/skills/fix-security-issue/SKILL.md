@@ -11,7 +11,7 @@ Use this skill after an authorized `review-security-issue` review identifies an 
 
 1. Fetch the issue and its comments with `gh issue view <id> --json number,title,body,state,labels,comments`. Inspect current repository labels and confirm this is a security issue. Find the review marked `> **🔒 security-review-agent**` and its remediation plan. If the review is missing or found the issue not actionable, stop and report that result.
 2. Verify the review against current code. Adapt the plan when code has changed, and record material deviations. Check for an existing owner, branch, or PR.
-3. Create an issue-specific branch or worktree, preserving unrelated changes. Implement the smallest safe fix and add regression tests for the security boundary. Avoid logging secrets or adding public exploit detail.
+3. Create a branch or worktree using `fix/<issue-id>-<short-description>/<github-username>`, preserving unrelated changes. Implement the smallest safe fix and add regression tests for the security boundary. Avoid logging secrets or adding public exploit detail.
 4. Follow the verification guidance in `CONTRIBUTING.md`. Run format, lint, compile or type checks, and regression tests for the affected security boundary and dependent components, plus the relevant E2E lane for sandbox or policy changes. Broaden verification when the fix spans components or a concrete risk remains; do not require unaffected Rust or SDK suites solely to create a signed-off commit or PR.
 5. Follow `create-github-pr` and use `Closes #<id>` for the reviewed issue. Every PR must close its own issue; split multi-PR remediations into separate issues in the authorized security workflow. Keep the PR description appropriately scoped to its disclosure venue.
 

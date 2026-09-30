@@ -161,4 +161,4 @@ Created issue [#123](https://github.com/OWNER/REPO/issues/123)
 Use the issue number to:
 
 - Reference in signed-off Conventional Commits: `git commit --signoff -m "fix(cli): validate empty requests (fixes #123)"`
-- Create a branch following project convention: `<issue-number>-<description>/<username>`
+- Create a branch following project convention: `<type>/<issue-id>-<short-description>/<github-username>`, where `<type>` is a Conventional Commits type.
