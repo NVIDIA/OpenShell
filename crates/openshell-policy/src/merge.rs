@@ -872,6 +872,10 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
+        && flag_covers(
+            loaded.allow_uninspected_credentials,
+            proposed.allow_uninspected_credentials,
+        )
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -3818,6 +3822,7 @@ mod tests {
             allow_encoded_slash: true,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: true,
+            allow_uninspected_credentials: true,
             advisor_proposed: true,
             ..endpoint("api.example.com", 443)
         };
@@ -5068,6 +5073,173 @@ mod tests {
                 ..
             }) if undeclared_binaries == ["/usr/bin/curl"]
         ));
+    }
+
+    #[test]
+    fn add_rule_rejects_enabling_allow_uninspected_credentials_for_undeclared_binary() {
+        let shared_endpoint = NetworkEndpoint {
+            protocol: "websocket".to_string(),
+            access: NetworkAccessPreset::ReadWrite as i32,
+            ..endpoint("realtime.example.com", 443)
+        };
+        let policy = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![shared_endpoint.clone()],
+                &["/usr/local/bin/tool-a", "/usr/local/bin/tool-b"],
+            ),
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: rule_with_authorizations(
+                    "realtime",
+                    vec![NetworkEndpoint {
+                        allow_uninspected_credentials: true,
+                        ..shared_endpoint
+                    }],
+                    &["/usr/local/bin/tool-a"],
+                ),
+            }],
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                    undeclared_binaries,
+                    ..
+                }) if undeclared_binaries == &["/usr/local/bin/tool-b"]
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn add_rule_enables_allow_uninspected_credentials_when_every_binary_is_declared() {
+        let shared_endpoint = NetworkEndpoint {
+            protocol: "websocket".to_string(),
+            access: NetworkAccessPreset::ReadWrite as i32,
+            ..endpoint("realtime.example.com", 443)
+        };
+        let policy = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![shared_endpoint.clone()],
+                &["/usr/local/bin/tool-a", "/usr/local/bin/tool-b"],
+            ),
+        );
+        let incoming = rule_with_authorizations(
+            "realtime",
+            vec![NetworkEndpoint {
+                allow_uninspected_credentials: true,
+                ..shared_endpoint
+            }],
+            &["/usr/local/bin/tool-a", "/usr/local/bin/tool-b"],
+        );
+        assert!(
+            !policy_covers_rule(&policy, &incoming),
+            "a loaded endpoint without the exception does not cover a proposal that sets it"
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: incoming.clone(),
+            }],
+        )
+        .expect("the operation declared every binary that receives the exception");
+
+        assert!(
+            result.policy.network_policies["realtime"].endpoints[0].allow_uninspected_credentials
+        );
+        assert!(policy_covers_rule(&result.policy, &incoming));
+    }
+
+    /// The merge only ever widens the flag, so a declaration that leaves it
+    /// unset neither clears it nor changes what the undeclared binaries hold.
+    #[test]
+    fn add_rule_without_allow_uninspected_credentials_keeps_the_existing_exception() {
+        let shared_endpoint = NetworkEndpoint {
+            protocol: "websocket".to_string(),
+            access: NetworkAccessPreset::ReadWrite as i32,
+            ..endpoint("realtime.example.com", 443)
+        };
+        let policy = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![NetworkEndpoint {
+                    allow_uninspected_credentials: true,
+                    ..shared_endpoint.clone()
+                }],
+                &["/usr/local/bin/tool-a", "/usr/local/bin/tool-b"],
+            ),
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: rule_with_authorizations(
+                    "realtime",
+                    vec![shared_endpoint],
+                    &["/usr/local/bin/tool-a"],
+                ),
+            }],
+        )
+        .expect("an unset flag is not an authorization change for tool-b");
+
+        assert!(!result.changed);
+        assert!(
+            result.policy.network_policies["realtime"].endpoints[0].allow_uninspected_credentials
+        );
+    }
+
+    #[test]
+    fn new_binary_must_declare_an_existing_allow_uninspected_credentials_exception() {
+        let shared_endpoint = NetworkEndpoint {
+            protocol: "websocket".to_string(),
+            access: NetworkAccessPreset::ReadWrite as i32,
+            ..endpoint("realtime.example.com", 443)
+        };
+        let policy = policy_with_rule(
+            "realtime",
+            rule_with_authorizations(
+                "realtime",
+                vec![NetworkEndpoint {
+                    allow_uninspected_credentials: true,
+                    ..shared_endpoint.clone()
+                }],
+                &["/usr/local/bin/tool-a"],
+            ),
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: rule_with_authorizations(
+                    "realtime",
+                    vec![shared_endpoint],
+                    &["/usr/local/bin/tool-c"],
+                ),
+            }],
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PolicyMergeError::NewBinaryWouldInheritAuthorization { binary_scope, .. })
+                    if binary_scope == "binary '/usr/local/bin/tool-c'"
+            ),
+            "got {result:?}"
+        );
     }
 
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {
