@@ -26,10 +26,12 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
-    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SANDBOX_RUNTIME_IMAGE_BINARY_PATH,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_FAILED_MESSAGE,
+    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -1863,7 +1865,7 @@ impl DockerComputeDriver {
                     .await;
                 cleanup_docker_boundary_state(sandbox, &self.config);
                 return Err(DockerProvisioningFailure::new(
-                    "ControlSupervisorStartFailed",
+                    supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
                     status.message(),
                 ));
             }
@@ -2155,7 +2157,7 @@ impl DockerComputeDriver {
             Err(status) => {
                 handle_docker_runtime_failure(
                     failure_context,
-                    "ControlSupervisorExited",
+                    supervisor_start_failure_reason(&status, "ControlSupervisorExited"),
                     format!(
                         "failed to start Docker control supervisor: {}",
                         status.message()
@@ -5282,9 +5284,11 @@ async fn spawn_docker_control_process(
                     ).await;
                     return;
                 }
+                let mut reason = "ControlSupervisorExited";
                 let mut message = match result {
                     Some(Ok(status)) => {
                     warn!(%sandbox_id, status = status.status_code, "Docker supervisor container exited unexpectedly");
+                        reason = supervisor_exit_reason(status.status_code);
                         format!("Docker supervisor container exited with status {}", status.status_code)
                     }
                     Some(Err(error)) => {
@@ -5309,12 +5313,7 @@ async fn spawn_docker_control_process(
                 if monitored_shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                handle_docker_runtime_failure(
-                    failure_context,
-                    "ControlSupervisorExited",
-                    message,
-                )
-                .await;
+                handle_docker_runtime_failure(failure_context, reason, message).await;
             },
         }
     });
@@ -5361,6 +5360,13 @@ async fn wait_for_docker_supervisor_ready(
         let state = inspected.state.unwrap_or_default();
         match state.health.and_then(|health| health.status) {
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
+            _ if state.running == Some(false)
+                && state.exit_code
+                    == Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)) =>
+            {
+                let log_tail = docker_container_log_tail(docker, supervisor_id).await;
+                return Err(workspace_validation_status(&log_tail));
+            }
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
@@ -5371,6 +5377,38 @@ async fn wait_for_docker_supervisor_ready(
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
+    }
+}
+
+/// Startup failure for a supervisor that exited because the sandbox rejected
+/// the image working directory. The fixed message prefix identifies it for
+/// [`supervisor_start_failure_reason`].
+fn workspace_validation_status(log_tail: &str) -> Status {
+    Status::failed_precondition(format!(
+        "{WORKSPACE_VALIDATION_FAILED_MESSAGE}{}",
+        format_log_tail(log_tail)
+    ))
+}
+
+/// Condition reason for a supervisor that failed before becoming ready.
+fn supervisor_start_failure_reason(status: &Status, default: &'static str) -> &'static str {
+    if status.code() == tonic::Code::FailedPrecondition
+        && status
+            .message()
+            .starts_with(WORKSPACE_VALIDATION_FAILED_MESSAGE)
+    {
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else {
+        default
+    }
+}
+
+/// Condition reason for a supervisor that exited with `status_code`.
+fn supervisor_exit_reason(status_code: i64) -> &'static str {
+    if status_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    } else {
+        "ControlSupervisorExited"
     }
 }
 

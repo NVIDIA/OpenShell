@@ -121,6 +121,10 @@ pub struct ContainerState {
     /// container-log marker. It is never deserialized from Podman.
     #[serde(skip)]
     pub startup_diagnostic: Option<String>,
+    /// Exit status of the sandbox's supervisor companion when it stopped
+    /// before the workload. It is never deserialized from Podman.
+    #[serde(skip)]
+    pub supervisor_exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
