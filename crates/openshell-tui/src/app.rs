@@ -871,6 +871,15 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             "aws_sts_assume_role"
         }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::OciInstancePrincipal => {
+            "oci_instance_principal"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::OciResourcePrincipal => {
+            "oci_resource_principal"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => {
+            "oci_oke_workload_identity"
+        }
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

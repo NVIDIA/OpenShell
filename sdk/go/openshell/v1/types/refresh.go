@@ -16,6 +16,9 @@ const (
 	RefreshStrategyOAuth2ClientCredentials RefreshStrategy = "OAuth2ClientCredentials"
 	RefreshStrategyGoogleServiceAccountJWT RefreshStrategy = "GoogleServiceAccountJWT"
 	RefreshStrategyAWSStsAssumeRole        RefreshStrategy = "AWSStsAssumeRole"
+	RefreshStrategyOCIInstancePrincipal    RefreshStrategy = "OCIInstancePrincipal"
+	RefreshStrategyOCIResourcePrincipal    RefreshStrategy = "OCIResourcePrincipal"
+	RefreshStrategyOCIOkeWorkloadIdentity  RefreshStrategy = "OCIOkeWorkloadIdentity"
 )
 
 // RefreshRecoveryAction describes the action required after a refresh failure.

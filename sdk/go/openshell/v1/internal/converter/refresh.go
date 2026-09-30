@@ -25,6 +25,12 @@ func RefreshStrategyFromProto(s pb.ProviderCredentialRefreshStrategy) types.Refr
 		return types.RefreshStrategyGoogleServiceAccountJWT
 	case pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE:
 		return types.RefreshStrategyAWSStsAssumeRole
+	case pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_INSTANCE_PRINCIPAL:
+		return types.RefreshStrategyOCIInstancePrincipal
+	case pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_RESOURCE_PRINCIPAL:
+		return types.RefreshStrategyOCIResourcePrincipal
+	case pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_OKE_WORKLOAD_IDENTITY:
+		return types.RefreshStrategyOCIOkeWorkloadIdentity
 	default:
 		return types.RefreshStrategy("")
 	}
@@ -63,6 +69,12 @@ func RefreshStrategyToProto(s types.RefreshStrategy) pb.ProviderCredentialRefres
 		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT
 	case types.RefreshStrategyAWSStsAssumeRole:
 		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE
+	case types.RefreshStrategyOCIInstancePrincipal:
+		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_INSTANCE_PRINCIPAL
+	case types.RefreshStrategyOCIResourcePrincipal:
+		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_RESOURCE_PRINCIPAL
+	case types.RefreshStrategyOCIOkeWorkloadIdentity:
+		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_OKE_WORKLOAD_IDENTITY
 	default:
 		return pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED
 	}

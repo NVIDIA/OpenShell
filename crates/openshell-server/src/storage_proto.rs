@@ -126,10 +126,14 @@ mod tests {
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
+    // ProviderCredentialRefreshStrategy gains the three OCI principal values.
+    // The enum is stored in refresh state, so the durable inventory moves with
+    // the public one; the overlap set is unchanged. Prior payloads carry only
+    // the earlier values and decode exactly as before.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2ed66dbc38c60eb96c7461c76d02813c177facfad93753b180534477270ad240";
+        "79121b0801f1f31083a1a41a0a20bbbdc080e1a6390467262ccfccf148afb84f";
     const DURABLE_SCHEMA_SHA256: &str =
-        "399737f2a367d2e3a9d78cf84e2a97eef041835554599790788e4bbf318116c3";
+        "70614df020414478f9eb27575556f6fbd86b1eb690a190ae39d9424730d2d2ee";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "d3c444ecdb42306af8a81791481fdfc147ddc54bf344e1c8e69bd06745c6cc3c";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

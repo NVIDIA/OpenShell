@@ -117,10 +117,12 @@ This keeps one source of credential-binding authority for each provider.
 `credential_binding` is sandbox-scoped and is not accepted in a gateway-global
 policy.
 
-For AWS endpoints, the binding and signing fields have separate jobs.
+For signed endpoints, the binding and signing fields have separate jobs.
 `credential_binding.provider` selects the provider instance that supplies
 credentials. `credential_signing`, `signing_service`, and `signing_region`
-control how the proxy applies those credentials:
+control how the proxy applies those credentials. AWS endpoints use the `sigv4`
+modes with a `signing_service`; Oracle Cloud Infrastructure endpoints use
+`credential_signing: oci`, which needs no service name:
 
 ```yaml showLineNumbers={false}
 network_policies:
@@ -139,12 +141,14 @@ network_policies:
 
 The binding applies to CONNECT and forward-proxy HTTP requests, including
 headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
-request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
+request bodies, AWS SigV4 and OCI request signing, and opted-in WebSocket text
+messages. Raw
 `tls: skip` and non-HTTP tunnels do not perform static credential substitution.
 
 Before it activates a sandbox policy, OpenShell verifies that every endpoint
-with `credential_signing` has an attached profile that declares
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. An endpoint-bearing profile must
+with `credential_signing` has an attached profile that declares the scheme's
+credentials: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for the `sigv4`
+modes, or `OCI_KEY_ID` and `OCI_PRIVATE_KEY` for `oci`. An endpoint-bearing profile must
 cover the signed host, port, and path. An endpointless profile must be selected
 by `credential_binding.provider` on that endpoint. A missing or mismatched
 source rejects the whole policy update with `FAILED_PRECONDITION`.
@@ -513,8 +517,11 @@ Profile YAML can declare these refresh strategies:
 | `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
 | `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
 | `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. |
+| `oci_instance_principal` | The gateway federates the host instance's OCI identity certificate into a security token and mints `OCI_KEY_ID` (`ST$<token>`) and an ephemeral `OCI_PRIVATE_KEY` session key in one operation. Requires a gateway on OCI Compute. |
+| `oci_resource_principal` | The gateway re-reads the platform-rotated OCI resource principal session token and key and republishes them as `OCI_KEY_ID` and `OCI_PRIVATE_KEY`. Requires a gateway where OCI provisions a resource principal. |
+| `oci_oke_workload_identity` | The gateway exchanges its Kubernetes service-account token at the OKE proxymux for an OCI security token bound to an ephemeral session key, minting `OCI_KEY_ID` and `OCI_PRIVATE_KEY`. Requires a gateway pod on an OKE enhanced cluster. |
 
-`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
+`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, `aws-sts-assume-role`, `oci-instance-principal`, `oci-resource-principal`, and `oci-oke-workload-identity`. Use `openshell provider update` for `static` and `external` refresh patterns.
 
 Gateway-managed refresh strategies use these material keys:
 
@@ -524,6 +531,9 @@ Gateway-managed refresh strategies use these material keys:
 | `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 | `aws_sts_assume_role` | `role_arn`, optional `session_name`, `external_id`, `aws_region`, and optional long-lived `aws_access_key_id` / `aws_secret_access_key` for gateways without ambient AWS credentials. |
+| `oci_instance_principal` | Optional `region` (defaults to the instance's region), `realm_domain` (defaults to `oraclecloud.com`), and `purpose`. Certificates and keys come from the instance metadata service at mint time and are never stored. |
+| `oci_resource_principal` | Optional `rpst_file` and `private_key_file` paths on the gateway host; default to the `OCI_RESOURCE_PRINCIPAL_RPST` and `OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM` environment variables of the gateway. |
+| `oci_oke_workload_identity` | Optional `service_account_token_file`, `kubernetes_service_host`, `proxymux_port`, and `ca_cert_file`; default to the projected service-account token, `KUBERNETES_SERVICE_HOST`, `12250`, and the projected cluster CA. |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
 
@@ -750,6 +760,9 @@ The profile YAML strategy values use underscores, while the CLI `--strategy` val
 |---|---|
 | `oauth2_refresh_token` | `oauth2-refresh-token` |
 | `oauth2_client_credentials` | `oauth2-client-credentials` |
+| `oci_instance_principal` | `oci-instance-principal` |
+| `oci_resource_principal` | `oci-resource-principal` |
+| `oci_oke_workload_identity` | `oci-oke-workload-identity` |
 | `google_service_account_jwt` | `google-service-account-jwt` |
 
 Create the provider instance first:

@@ -776,6 +776,9 @@ enum CliProviderRefreshStrategy {
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
     AwsStsAssumeRole,
+    OciInstancePrincipal,
+    OciResourcePrincipal,
+    OciOkeWorkloadIdentity,
 }
 
 impl CliProviderRefreshStrategy {
@@ -785,6 +788,9 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
             Self::AwsStsAssumeRole => "aws_sts_assume_role",
+            Self::OciInstancePrincipal => "oci_instance_principal",
+            Self::OciResourcePrincipal => "oci_resource_principal",
+            Self::OciOkeWorkloadIdentity => "oci_oke_workload_identity",
         }
     }
 }

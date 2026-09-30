@@ -404,6 +404,7 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 | Supported request body | An inspected REST endpoint opts in with `request_body_credential_rewrite: true`. | `{"api_key":"<placeholder>"}` |
 | WebSocket text message | A REST or WebSocket endpoint opts in with `websocket_credential_rewrite: true`. | `{"token":"<placeholder>"}` |
 | AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
+| OCI request signing | An endpoint configures `credential_signing: oci`, and the proxy signs with the endpoint-bound `OCI_KEY_ID` and `OCI_PRIVATE_KEY`. Bodies of POST, PUT, and PATCH requests are hashed into the signature. | `credential_signing: oci` |
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.

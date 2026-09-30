@@ -2065,6 +2065,11 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "oci_instance_principal" => Ok(ProviderCredentialRefreshStrategy::OciInstancePrincipal),
+        "oci_resource_principal" => Ok(ProviderCredentialRefreshStrategy::OciResourcePrincipal),
+        "oci_oke_workload_identity" => {
+            Ok(ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity)
+        }
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -2116,6 +2121,9 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal => "oci_instance_principal",
+        ProviderCredentialRefreshStrategy::OciResourcePrincipal => "oci_resource_principal",
+        ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => "oci_oke_workload_identity",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

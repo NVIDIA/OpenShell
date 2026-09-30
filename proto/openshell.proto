@@ -2318,6 +2318,17 @@ enum ProviderCredentialRefreshStrategy {
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE = 6;
+  // The gateway federates the host instance's identity certificate into an OCI
+  // security token and mints OCI_KEY_ID (ST$token) plus an ephemeral
+  // OCI_PRIVATE_KEY session key.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_INSTANCE_PRINCIPAL = 7;
+  // The gateway reads the platform-rotated OCI resource principal session token
+  // and key and republishes them as OCI_KEY_ID and OCI_PRIVATE_KEY.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_RESOURCE_PRINCIPAL = 8;
+  // The gateway exchanges its Kubernetes service-account token at the OKE
+  // proxymux for an OCI resource principal session token bound to an ephemeral
+  // session key.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OCI_OKE_WORKLOAD_IDENTITY = 9;
 }
 
 message ProviderCredentialRefreshMaterial {

@@ -37,6 +37,7 @@ pub mod middleware;
 pub mod net;
 #[cfg(feature = "oauth")]
 pub mod oauth;
+pub mod oci_signature;
 pub mod paths;
 pub mod policy;
 pub mod policy_identity;
