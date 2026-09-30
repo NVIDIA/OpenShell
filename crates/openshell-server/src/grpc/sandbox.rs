@@ -3996,22 +3996,20 @@ mod tests {
             .unwrap();
         std::fs::write(&slot.upload_path, b"archive").unwrap();
         let driver_config = Struct {
-            fields: [(
+            fields: std::iter::once((
                 "test".to_string(),
                 Value {
                     kind: Some(Kind::StructValue(Struct {
-                        fields: [(
+                        fields: std::iter::once((
                             crate::compute::rootfs_tar::STAGING_TOKEN_FIELD.to_string(),
                             Value {
                                 kind: Some(Kind::StringValue(slot.token.clone())),
                             },
-                        )]
-                        .into_iter()
+                        ))
                         .collect(),
                     })),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         driver.clear_calls();

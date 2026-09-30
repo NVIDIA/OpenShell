@@ -12,9 +12,11 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 
-/// Compute drivers require this capability when every launch needs a
-/// gateway-minted [`crate::jwt::SandboxLaunchAuthentication`] bundle. The
-/// gateway checks its configured signer before accepting sandbox creation.
+/// Capability for compute drivers that require gateway-minted launch credentials.
+///
+/// Drivers require this capability when every launch needs a
+/// [`crate::jwt::SandboxLaunchAuthentication`] bundle. The gateway checks its
+/// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;

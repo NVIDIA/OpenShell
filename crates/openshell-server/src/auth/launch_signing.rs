@@ -9,12 +9,12 @@ use openshell_core::{Error, GatewayJwtConfig};
 
 use super::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};
 
-pub(crate) struct LaunchSigningAuthorities {
+pub struct LaunchSigningAuthorities {
     pub extension: Arc<ExtensionJwtIssuer>,
     pub sandbox_session: Arc<SandboxSessionJwtAuthority>,
 }
 
-pub(crate) fn load(config: &GatewayJwtConfig) -> openshell_core::Result<LaunchSigningAuthorities> {
+pub fn load(config: &GatewayJwtConfig) -> openshell_core::Result<LaunchSigningAuthorities> {
     let signing_pem = std::fs::read(&config.signing_key_path).map_err(|error| {
         Error::config(format!(
             "cannot read sandbox launch-signing private key from {}: {error}",

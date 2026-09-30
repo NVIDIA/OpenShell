@@ -10262,7 +10262,7 @@ mod tests {
 
         #[tonic::async_trait]
         impl LifecycleExtension for RestoreObserver {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "restore-observer"
             }
 

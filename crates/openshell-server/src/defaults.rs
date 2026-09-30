@@ -98,7 +98,7 @@ pub fn complete_local_jwt_config() -> Result<Option<GatewayJwtConfig>> {
     local_jwt_config(&dir)
 }
 
-pub(crate) fn local_jwt_config(dir: &Path) -> Result<Option<GatewayJwtConfig>> {
+pub fn local_jwt_config(dir: &Path) -> Result<Option<GatewayJwtConfig>> {
     let paths = LocalJwtPaths::resolve(dir);
     let present = paths.files().iter().filter(|path| path.is_file()).count();
     match present {
