@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-conformance", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -397,7 +397,8 @@ function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
         [Parameter(Mandatory = $true)] [string] $CargoArgs,
-        [Parameter(Mandatory = $true)] [string] $LogName
+        [Parameter(Mandatory = $true)] [string] $LogName,
+        [switch] $AllowNonZeroExit
     )
 
     & rustup target add $RustTarget
@@ -464,6 +465,10 @@ function Invoke-VsCargo {
             Get-Content $logPath
         }
         if ($exitCode -ne 0) {
+            if ($AllowNonZeroExit) {
+                Write-Warning "Command completed with exit code $exitCode. See $logPath"
+                return
+            }
             throw "Command failed with exit code $exitCode. See $logPath"
         }
     } finally {
@@ -557,6 +562,106 @@ function Invoke-PreCommitTest([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features openshell-server/test-support $Z3ServerFeatures" `
         -LogName "test-$RustTarget-precommit.log"
+}
+
+function Invoke-ConformanceTest([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo build --target $RustTarget --bin openshell --bin openshell-gateway $Z3GatewayFeatures" `
+        -LogName "build-$RustTarget-conformance.log"
+
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test --locked --manifest-path tests/suites/conformance/Cargo.toml --package openshell-test-conformance-cli --target $RustTarget --no-run" `
+        -LogName "build-$RustTarget-conformance-tests.log"
+
+    $binaryDir = Join-Path $TargetDir "$RustTarget\debug"
+    $gateway = Join-Path $binaryDir "openshell-gateway.exe"
+    $cli = Join-Path $binaryDir "openshell.exe"
+
+    $buildRoot = Join-Path $binaryDir "build"
+    $z3Candidates = @(
+        Get-ChildItem -Path $buildRoot -Filter "libz3.dll" -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\z3-$PrebuiltZ3Version\bin\libz3.dll" } |
+            Sort-Object LastWriteTimeUtc -Descending
+    )
+    if ($z3Candidates.Count -eq 0) {
+        throw "The prebuilt Z3 runtime was not found under: $buildRoot"
+    }
+    Copy-Item -LiteralPath $z3Candidates[0].FullName -Destination (Join-Path $binaryDir "libz3.dll") -Force
+
+    $tempRoot = $env:RUNNER_TEMP
+    if ([string]::IsNullOrWhiteSpace($tempRoot)) {
+        $tempRoot = [System.IO.Path]::GetTempPath()
+    }
+    $testRoot = Join-Path $tempRoot "openshell-conformance-$RustTarget-$([guid]::NewGuid().ToString('N'))"
+    $configRoot = Join-Path $testRoot "config"
+    $stateRoot = Join-Path $testRoot "state"
+    $gatewayConfig = Join-Path $testRoot "gateway.toml"
+    $gatewayLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.log"
+    $gatewayErrorLog = Join-Path $LogDir "test-$RustTarget-conformance-gateway.err.log"
+    New-Item -ItemType Directory -Force -Path $configRoot, $stateRoot | Out-Null
+    @"
+[openshell]
+version = 2
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+backend = "process_container"
+"@ | Set-Content -LiteralPath $gatewayConfig -Encoding utf8
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+    $listener.Stop()
+
+    $env:OPENSHELL_GATEWAY_CONFIG = $gatewayConfig
+    $env:OPENSHELL_COMPUTE_DRIVER = "mxc"
+    $env:OPENSHELL_MXC_MOCK_WXC = "1"
+    $env:XDG_CONFIG_HOME = $configRoot
+    $env:XDG_STATE_HOME = $stateRoot
+    $env:OPENSHELL_BIN = $cli
+    $gatewayProcess = $null
+    try {
+        $gatewayProcess = Start-Process -FilePath $gateway `
+            -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--port", $port) `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $gatewayLog -RedirectStandardError $gatewayErrorLog
+
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $deadline) {
+            if ($gatewayProcess.HasExited) {
+                throw "Conformance gateway exited early with code $($gatewayProcess.ExitCode)."
+            }
+            if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)) {
+            throw "Conformance gateway did not listen on port $port within 30 seconds."
+        }
+
+        & $cli gateway add "http://127.0.0.1:$port" --local --name windows-conformance
+        if ($LASTEXITCODE -ne 0) { throw "Failed to register the conformance gateway." }
+        & $cli gateway select windows-conformance
+        if ($LASTEXITCODE -ne 0) { throw "Failed to select the conformance gateway." }
+
+        Invoke-VsCargo `
+            -RustTarget $RustTarget `
+            -CargoArgs "cargo test --locked --manifest-path tests/suites/conformance/Cargo.toml --package openshell-test-conformance-cli --target $RustTarget --no-fail-fast -- --test-threads=1 --nocapture" `
+            -LogName "test-$RustTarget-conformance.log" `
+            -AllowNonZeroExit
+    } catch {
+        Get-Content -LiteralPath $gatewayLog, $gatewayErrorLog -ErrorAction SilentlyContinue
+        throw
+    } finally {
+        if ($gatewayProcess -and -not $gatewayProcess.HasExited) {
+            Stop-Process -Id $gatewayProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-UnsupportedContractTests([string] $RustTarget) {
@@ -678,13 +783,13 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300")) {
+if ($Action -in @("test", "test-precommit", "test-conformance", "test-unsupported", "test-mxc-real", "test-mxc-gb300")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "ci")) {
+if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-conformance", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -720,6 +825,11 @@ switch ($Action) {
     "test-precommit" {
         foreach ($rustTarget in $targets) {
             Invoke-PreCommitTest $rustTarget
+        }
+    }
+    "test-conformance" {
+        foreach ($rustTarget in $targets) {
+            Invoke-ConformanceTest $rustTarget
         }
     }
     "test-unsupported" {

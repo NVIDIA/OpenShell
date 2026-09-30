@@ -30,6 +30,8 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:arm64
+mise run --skip-tools windows:test:conformance:x64
+mise run --skip-tools windows:test:conformance:arm64
 mise run --skip-tools windows:test:unsupported:x64
 mise run --skip-tools windows:test:unsupported:arm64
 mise run --skip-tools windows:ci
@@ -52,6 +54,19 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
 
 The native test tasks reject a target that does not match the host architecture.
 Do not report x64 compatibility-under-emulation coverage from an ARM64 run.
+
+The conformance tasks start a temporary gateway with the in-process mock MXC
+backend and run every atomic scenario through the standalone conformance
+runner. The task exits nonzero when any scenario fails so local runs retain an
+accurate result. Hosted Windows CI marks only this step as advisory and uploads
+the runner and gateway logs even when known MXC capability gaps fail.
+
+Interpret each failed leaf at its first public operation. Control-plane
+lifecycle coverage is independent of restart/exec persistence. File-transfer
+leaves must reach upload or download, and policy leaves must reach the public
+exec or policy boundary. A failure during sandbox creation caused by a Unix
+command, path, or policy is a conformance fixture defect rather than an MXC
+capability gap.
 
 The wrapper adds missing rustup targets and preserves an inherited
 `RUSTC_WRAPPER` when the command is available. Otherwise, it warns and clears
@@ -198,6 +213,9 @@ Use the log summaries from:
 |---|---|
 | `test-x86_64-pc-windows-msvc.log` | Full x64 workspace test pass. |
 | `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test pass. |
+| `test-<target>-conformance.log` | Complete mock-MXC conformance report. |
+| `test-<target>-conformance.err.log` | Conformance runner standard error. |
+| `test-<target>-conformance-gateway*.log` | Mock-MXC gateway output and errors. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-contract re-runs and filtered counts. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 re-runs and filtered counts. |
 
@@ -209,6 +227,7 @@ Separate:
 - filtered out
 - cfg-gated zero-test targets
 - package-level excludes
+- conformance scenarios that pass versus capability gaps that fail
 
 Package-level excludes are not printed as ignored tests by Cargo.
 

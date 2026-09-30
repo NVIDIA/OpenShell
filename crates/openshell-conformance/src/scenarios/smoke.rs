@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable phase-1 CLI conformance scenario.
+//! Portable smoke conformance scenarios.
 
 use std::time::{Duration, Instant};
 
+use crate::platform::{self, SmokeFixture};
 use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
 use serde::Deserialize;
 use tokio::time::sleep;
@@ -28,18 +29,29 @@ struct SandboxListPage {
     next_page_token: String,
 }
 
-/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-pub const SMOKE_SCENARIO: Scenario = Scenario {
-    name: "smoke",
-    description: "Create, inspect, execute in, and delete a base sandbox.",
-    run: run_smoke,
+/// Certify status -> create -> get/list Ready -> delete -> list empty.
+pub const SMOKE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
+    name: "smoke/control-plane",
+    description: "Create, inspect, and delete a sandbox without using sandbox exec.",
+    run: run_smoke_control_plane,
 };
 
-fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move { run_smoke_inner(runner).await })
+/// Certify create -> exec -> delete for drivers that support interactive exec.
+pub const SMOKE_EXEC_SCENARIO: Scenario = Scenario {
+    name: "smoke/exec",
+    description: "Create a sandbox, execute a command in it, and delete it.",
+    run: run_smoke_exec,
+};
+
+fn run_smoke_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move { run_smoke_control_plane_inner(runner).await })
 }
 
-async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
+fn run_smoke_exec(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move { run_smoke_exec_inner(runner).await })
+}
+
+async fn run_smoke_control_plane_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
     let status = runner
         .step("status")
         .description("openshell status succeeds")
@@ -49,30 +61,103 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     status.require_success()?;
 
-    let sandbox_name = format!("ct-{}-01", runner.id());
-    runner.track_sandbox(&sandbox_name);
+    let sandbox_name = format!("ct-{}-cp", runner.id());
+    let _fixture = create_sandbox(runner, &sandbox_name, "create").await?;
+    check_sandbox_ready(runner, &sandbox_name).await?;
+    check_sandbox_listed(runner, &sandbox_name).await?;
+
+    delete_sandbox(runner, &sandbox_name, "delete").await
+}
+
+async fn run_smoke_exec_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
+    let sandbox_name = format!("ct-{}-ex", runner.id());
+    let _fixture = create_sandbox(runner, &sandbox_name, "create").await?;
+    check_sandbox_ready(runner, &sandbox_name).await?;
+
+    let marker = format!("openshell-conformance-{}", runner.id());
+    let marker_command = platform::marker_command(&marker);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "exec".to_string(),
+        "--name".to_string(),
+        sandbox_name.clone(),
+        "--no-tty".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(marker_command.argv().iter().cloned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let exec = runner
+        .step("exec")
+        .description("sandbox exec exits successfully")
+        .with_timeout(EXEC_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())?;
+    exec.require_success()?;
+    let expected_stdout = marker_command.expected_stdout();
+    if exec.stdout() != expected_stdout {
+        return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
+    }
+
+    delete_sandbox(runner, &sandbox_name, "delete").await
+}
+
+async fn create_sandbox(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<SmokeFixture, String> {
+    let fixture = platform::smoke_fixture()?;
+    runner.track_sandbox(sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.to_string(),
+        "--detach".to_string(),
+    ];
+    args.extend(fixture.create_args().iter().cloned());
+    if let Some(command) = fixture.command() {
+        args.push("--".to_string());
+        args.extend(command.iter().cloned());
+    }
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let create = runner
-        .step("create")
+        .step(step)
         .description("sandbox creation succeeds")
         .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            &sandbox_name,
-            "--from",
-            "base",
-            "--detach",
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
+    Ok(fixture)
+}
 
+async fn delete_sandbox(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<(), String> {
+    let delete = runner
+        .step(step)
+        .description("sandbox deletion succeeds")
+        .with_timeout(DELETE_TIMEOUT)
+        .run(&["sandbox", "delete", sandbox_name])
+        .await
+        .map_err(|error| error.to_string())?;
+    delete.require_success()?;
+
+    check_empty_list(runner, sandbox_name).await?;
+    runner.forget_sandbox(sandbox_name);
+    Ok(())
+}
+
+async fn check_sandbox_ready(runner: &OpenShellRunner, sandbox_name: &str) -> Result<(), String> {
     let get = runner
         .step("get-ready")
         .description(format!("sandbox '{sandbox_name}' can be retrieved"))
         .with_timeout(LIST_ATTEMPT_TIMEOUT)
-        .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+        .run(&["sandbox", "get", sandbox_name, "--output", "json"])
         .await
         .map_err(|error| error.to_string())?;
     get.require_success()?;
@@ -92,43 +177,6 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
             sandbox.phase
         ));
     }
-
-    check_sandbox_listed(runner, &sandbox_name).await?;
-
-    let marker = format!("openshell-conformance-{}", runner.id());
-    let exec = runner
-        .step("exec")
-        .description("sandbox exec exits successfully")
-        .with_timeout(EXEC_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            &sandbox_name,
-            "--no-tty",
-            "--",
-            "echo",
-            &marker,
-        ])
-        .await
-        .map_err(|error| error.to_string())?;
-    exec.require_success()?;
-    let expected_stdout = format!("{marker}\n");
-    if exec.stdout() != expected_stdout {
-        return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
-    }
-
-    let delete = runner
-        .step("delete")
-        .description("sandbox deletion succeeds")
-        .with_timeout(DELETE_TIMEOUT)
-        .run(&["sandbox", "delete", &sandbox_name])
-        .await
-        .map_err(|error| error.to_string())?;
-    delete.require_success()?;
-
-    check_empty_list(runner, &sandbox_name).await?;
-    runner.forget_sandbox(&sandbox_name);
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 
 //! Standalone runner for `OpenShell` CLI conformance scenarios.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -28,9 +29,9 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
-    /// Run all registered scenarios, or named scenarios.
+    /// Run all registered scenarios, or named scenarios and groups.
     Run {
-        /// Scenario names. Omit to run every registered scenario.
+        /// Scenario or group names. Omit to run every registered scenario.
         scenarios: Vec<String>,
         /// Explicit path to the `OpenShell` CLI. Defaults to `openshell` on PATH.
         #[arg(long)]
@@ -119,6 +120,8 @@ async fn run(
     let selected = select_scenarios(requested)?;
     let mut results = Vec::with_capacity(selected.len());
     for candidate in selected {
+        // Scenario failures are captured in the report so every selected leaf
+        // runs before the command returns its aggregate exit status.
         results.push(run_scenario(candidate, binary.as_ref()).await);
     }
 
@@ -195,14 +198,35 @@ fn select_scenarios(requested: &[String]) -> Result<Vec<&'static Scenario>, Stri
     if requested.is_empty() {
         return Ok(scenarios().iter().collect());
     }
-    requested
-        .iter()
-        .map(|name| {
-            scenario(name).ok_or_else(|| {
-                format!("unknown scenario '{name}'; run `openshell-conformance list`")
-            })
-        })
-        .collect()
+
+    let mut selected = Vec::new();
+    let mut selected_names = BTreeSet::new();
+    for selector in requested {
+        if let Some(candidate) = scenario(selector) {
+            if selected_names.insert(candidate.name) {
+                selected.push(candidate);
+            }
+            continue;
+        }
+
+        let prefix = format!("{selector}/");
+        let mut matched = false;
+        for candidate in scenarios()
+            .iter()
+            .filter(|candidate| candidate.name.starts_with(&prefix))
+        {
+            matched = true;
+            if selected_names.insert(candidate.name) {
+                selected.push(candidate);
+            }
+        }
+        if !matched {
+            return Err(format!(
+                "unknown scenario or group '{selector}'; run `openshell-conformance list`"
+            ));
+        }
+    }
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -213,21 +237,73 @@ mod tests {
 
     #[test]
     fn selects_all_scenarios_by_default() {
-        assert_eq!(
-            select_scenarios(&[]).expect("select all").len(),
-            scenarios().len()
-        );
+        let selected = select_scenarios(&[]).expect("select all");
+        assert_eq!(selected.len(), 10);
+        assert_eq!(selected.len(), scenarios().len());
     }
 
     #[test]
     fn selects_named_scenario() {
-        let selected = select_scenarios(&["smoke".to_string()]).expect("select smoke");
-        assert_eq!(selected[0].name, "smoke");
+        let selected = select_scenarios(&["smoke/exec".to_string()]).expect("select smoke exec");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "smoke/exec");
+    }
+
+    #[test]
+    fn expands_group_to_all_leaf_scenarios() {
+        let selected = select_scenarios(&["smoke".to_string()]).expect("select smoke group");
+        let names = selected
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["smoke/control-plane", "smoke/exec"]);
+    }
+
+    #[test]
+    fn expands_lifecycle_group_to_independent_capabilities() {
+        let selected =
+            select_scenarios(&["sandbox/lifecycle".to_string()]).expect("select lifecycle group");
+        let names = selected
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "sandbox/lifecycle/control-plane",
+                "sandbox/lifecycle/restart-persistence",
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_selectors_do_not_run_a_leaf_twice() {
+        let selected = select_scenarios(&[
+            "smoke".to_string(),
+            "smoke/exec".to_string(),
+            "policy".to_string(),
+        ])
+        .expect("select overlapping scenarios");
+        let names = selected
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "smoke/control-plane",
+                "smoke/exec",
+                "policy/mechanistic-proposal",
+                "policy/new-hostname-proposal",
+                "policy/local",
+            ]
+        );
     }
 
     #[test]
     fn unknown_scenario_has_actionable_diagnostic() {
         let error = select_scenarios(&["missing".to_string()]).expect_err("unknown scenario");
+        assert!(error.contains("unknown scenario or group 'missing'"));
         assert!(error.contains("openshell-conformance list"));
     }
 
@@ -236,7 +312,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "openshell-conformance",
             "run",
-            "smoke",
+            "smoke/exec",
             "--openshell-bin",
             "/opt/openshell",
             "--output",

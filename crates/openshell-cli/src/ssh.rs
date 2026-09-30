@@ -9,8 +9,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, proxy_command_escape,
+    resolve_ssh_gateway, shell_escape, validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
@@ -854,15 +854,19 @@ async fn ssh_tar_upload(
     Ok(())
 }
 
-/// Split a sandbox path into (`parent_directory`, basename).
+/// Split a Unix or Windows sandbox path into (`parent_directory`, basename).
 ///
 /// Examples:
 ///   `"/sandbox/.bashrc"`  -> `("/sandbox", ".bashrc")`
 ///   `"/sandbox/sub/file"` -> `("/sandbox/sub", "file")`
+///   `r"C:\sandbox\file"`  -> `(r"C:\sandbox", "file")`
 ///   `"file.txt"`          -> `(".", "file.txt")`
 fn split_sandbox_path(path: &str) -> (&str, &str) {
-    match path.rfind('/') {
-        Some(0) => ("/", &path[1..]),
+    match path.rfind(['/', '\\']) {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(pos) if pos == 2 && path.as_bytes().get(1) == Some(&b':') => {
+            (&path[..=pos], &path[pos + 1..])
+        }
         Some(pos) => (&path[..pos], &path[pos + 1..]),
         None => (".", path),
     }
@@ -1543,13 +1547,13 @@ fn host_alias(name: &str, workspace: &str) -> String {
 
 fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
-    let exe = shell_escape(&exe.to_string_lossy());
+    let exe = proxy_command_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!(
         "{exe} ssh-proxy --gateway-name {} --name {} --workspace {}",
-        shell_escape(gateway),
-        shell_escape(name),
-        shell_escape(workspace),
+        proxy_command_escape(gateway),
+        proxy_command_escape(name),
+        proxy_command_escape(workspace),
     );
     let host_alias = host_alias(name, workspace);
     format!(
@@ -1825,12 +1829,13 @@ mod tests {
     #[test]
     fn render_ssh_config_includes_workspace_in_proxy_command() {
         let config = render_ssh_config("my-gw", "demo", "beta");
+        let escaped_workspace = proxy_command_escape("beta");
         assert!(
             config.contains("Host openshell-demo.beta"),
             "host alias should be workspace-qualified: {config}"
         );
         assert!(
-            config.contains("--workspace beta"),
+            config.contains(&format!("--workspace {escaped_workspace}")),
             "ProxyCommand should include --workspace: {config}"
         );
     }
@@ -2008,6 +2013,14 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+        assert_eq!(
+            split_sandbox_path(r"C:\sandbox\sub\file.txt"),
+            (r"C:\sandbox\sub", "file.txt")
+        );
+        assert_eq!(
+            split_sandbox_path(r"\\server\share\file.txt"),
+            (r"\\server\share", "file.txt")
+        );
     }
 
     #[test]
@@ -2524,6 +2537,8 @@ mod tests {
     fn split_sandbox_path_handles_root_and_bare_names() {
         // File directly under root
         assert_eq!(split_sandbox_path("/.bashrc"), ("/", ".bashrc"));
+        assert_eq!(split_sandbox_path(r"\file.txt"), (r"\", "file.txt"));
+        assert_eq!(split_sandbox_path(r"C:\file.txt"), (r"C:\", "file.txt"));
         // No directory component at all
         assert_eq!(split_sandbox_path("file.txt"), (".", "file.txt"));
     }

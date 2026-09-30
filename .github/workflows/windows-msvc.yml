@@ -98,6 +98,20 @@ jobs:
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
+      - name: Full MXC conformance
+        run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
+      - name: Upload MXC conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-mxc-conformance-${{ matrix.arch }}
+          path: |
+            build-${{ matrix.rust_target }}-conformance.log
+            build-${{ matrix.rust_target }}-conformance-tests.log
+            test-${{ matrix.rust_target }}-conformance.log
+            test-${{ matrix.rust_target }}-conformance-gateway.log
+            test-${{ matrix.rust_target }}-conformance-gateway.err.log
+          if-no-files-found: warn
       - name: Build MXC example E2E binaries
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: Run shipped MXC provider-credential example in mock mode
@@ -170,6 +184,20 @@ jobs:
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
+      - name: Full MXC conformance
+        run: mise run --skip-tools windows:test:conformance:${{ matrix.arch }}
+      - name: Upload MXC conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-mxc-conformance-${{ matrix.arch }}
+          path: |
+            build-${{ matrix.rust_target }}-conformance.log
+            build-${{ matrix.rust_target }}-conformance-tests.log
+            test-${{ matrix.rust_target }}-conformance.log
+            test-${{ matrix.rust_target }}-conformance-gateway.log
+            test-${{ matrix.rust_target }}-conformance-gateway.err.log
+          if-no-files-found: warn
       - name: sccache stats
         if: always()
         run: sccache --show-stats

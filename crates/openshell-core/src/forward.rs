@@ -778,7 +778,7 @@ pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
     format!("{scheme}://{}:{port}", bracket_ipv6_host(host))
 }
 
-/// Shell-escape a value for use inside a `ProxyCommand` string.
+/// POSIX shell-escape a value for use in command strings.
 pub fn shell_escape(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -795,11 +795,63 @@ pub fn shell_escape(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Quote one argument for the Windows command-line parser used by
+/// `CreateProcessW`-launched programs.
+///
+/// OpenSSH executes `ProxyCommand` directly on Windows instead of passing it
+/// through `/bin/sh`. Always quoting each argument keeps executable paths with
+/// spaces intact. Backslashes immediately before a quote or the closing quote
+/// are doubled according to the Windows C runtime argument parsing rules.
+#[cfg(any(windows, test))]
+fn windows_command_line_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+
+    let mut backslashes = 0;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+
+        if character == '"' {
+            for _ in 0..=(backslashes * 2) {
+                escaped.push('\\');
+            }
+        } else {
+            for _ in 0..backslashes {
+                escaped.push('\\');
+            }
+        }
+        backslashes = 0;
+        escaped.push(character);
+    }
+
+    for _ in 0..(backslashes * 2) {
+        escaped.push('\\');
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// Escape one argument for the command-launch behavior OpenSSH uses for
+/// `ProxyCommand` on the current host platform.
+pub fn proxy_command_escape(value: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        shell_escape(value)
+    }
+    #[cfg(windows)]
+    {
+        windows_command_line_escape(value)
+    }
+}
+
 /// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
 ///
-/// Every interpolated argument is shell-escaped so that server-supplied values
-/// (gateway URL, sandbox id, token, gateway name) cannot inject shell
-/// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
+/// On Unix, every interpolated argument is shell-escaped for the `/bin/sh -c`
+/// invocation used by OpenSSH. On Windows, every argument is quoted for the
+/// command line that OpenSSH launches through `CreateProcessW`.
 pub fn build_proxy_command(
     exe: &str,
     gateway_url: &str,
@@ -809,11 +861,11 @@ pub fn build_proxy_command(
 ) -> String {
     format!(
         "{} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
-        shell_escape(exe),
-        shell_escape(gateway_url),
-        shell_escape(sandbox_id),
-        shell_escape(token),
-        shell_escape(gateway_name),
+        proxy_command_escape(exe),
+        proxy_command_escape(gateway_url),
+        proxy_command_escape(sandbox_id),
+        proxy_command_escape(token),
+        proxy_command_escape(gateway_name),
     )
 }
 
@@ -1085,6 +1137,23 @@ mod tests {
         assert_eq!(shell_escape("it's"), "'it'\"'\"'s'");
     }
 
+    #[test]
+    fn windows_command_line_escape_quotes_paths_and_backslashes() {
+        assert_eq!(
+            windows_command_line_escape(r"C:\Program Files\OpenShell\openshell.exe"),
+            r#""C:\Program Files\OpenShell\openshell.exe""#
+        );
+        assert_eq!(windows_command_line_escape(""), r#""""#);
+        assert_eq!(
+            windows_command_line_escape(r"C:\directory\"),
+            r#""C:\directory\\""#
+        );
+        assert_eq!(
+            windows_command_line_escape(r#"say "hello""#),
+            r#""say \"hello\"""#
+        );
+    }
+
     fn valid_session_response() -> crate::proto::CreateSshSessionResponse {
         crate::proto::CreateSshSessionResponse {
             sandbox_id: "sb-1234".to_string(),
@@ -1192,6 +1261,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn build_proxy_command_escapes_shell_metacharacters() {
         // Attacker-controlled values in every escapable position.
         let cmd = build_proxy_command(
@@ -1214,6 +1284,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn build_proxy_command_empty_values_quote_rather_than_vanish() {
         // An empty value must become `''` rather than disappearing — otherwise
         // downstream argv splitting would misalign.
@@ -1222,6 +1293,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn build_proxy_command_safe_values_pass_through_unquoted() {
         let cmd = build_proxy_command(
             "/usr/local/bin/openshell",
@@ -1236,8 +1308,25 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn build_proxy_command_uses_windows_argument_quoting() {
+        let cmd = build_proxy_command(
+            r"C:\Program Files\OpenShell\openshell.exe",
+            "https://gateway.example:443",
+            "sb-123",
+            "tok.456",
+            "name_1",
+        );
+        assert_eq!(
+            cmd,
+            r#""C:\Program Files\OpenShell\openshell.exe" ssh-proxy --gateway "https://gateway.example:443" --sandbox-id "sb-123" --token "tok.456" --gateway-name "name_1""#
+        );
+    }
+
     /// Helper: return the concatenation of characters that appear outside
     /// POSIX single-quoted runs. Used by the metacharacter assertions above.
+    #[cfg(not(windows))]
     fn outside_single_quotes(s: &str) -> String {
         let mut out = String::new();
         let mut inside = false;

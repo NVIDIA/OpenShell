@@ -385,6 +385,7 @@ install the Windows compiler toolchain.
 | `windows:lint:<x64\|arm64>` | Run Clippy for the Windows-supported workspace on the selected target architecture. |
 | `windows:build:<x64\|arm64>` | Build the three Windows release executables. |
 | `windows:test:<x64\|arm64>` | Run the workspace suite natively; the target must match the host architecture. |
+| `windows:test:conformance:<x64\|arm64>` | Run the complete conformance suite against the mock MXC gateway and report every unsupported operation. The task exits nonzero when any scenario fails; hosted CI treats the report as advisory and always uploads its logs. |
 | `windows:test:unsupported:<x64\|arm64>` | Run the focused unsupported-driver contracts. |
 | `windows:test:mxc-real:<x64\|arm64>` | Run the probe-gated real-`wxc-exec` integration suite on the matching host. |
 | `windows:artifacts` | Report sizes and SHA256 hashes for release artifacts. |

@@ -55,6 +55,16 @@ description = "Run Windows ARM64 MSVC workspace tests with the CI nextest profil
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit aarch64-pc-windows-msvc"
 
+["windows:test:conformance:x64"]
+description = "Run all CLI conformance Cargo tests against a mock MXC gateway on native Windows x64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-conformance x86_64-pc-windows-msvc"
+
+["windows:test:conformance:arm64"]
+description = "Run all CLI conformance Cargo tests against a mock MXC gateway on native Windows ARM64"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-conformance aarch64-pc-windows-msvc"
+
 ["windows:test:unsupported:x64"]
 description = "Run focused Windows unsupported compute-driver contract tests"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
