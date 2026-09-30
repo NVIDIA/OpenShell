@@ -2594,8 +2594,6 @@ message GetSandboxProviderEnvironmentRequest {
   // provider credentials. Gateways withhold static credential material when
   // this capability is absent.
   bool supports_static_credential_bindings = 2;
-  // Whether this supervisor supports provider-managed workload files.
-  bool supports_provider_files = 3;
 }
 
 // One network endpoint at which a static provider credential may be resolved.

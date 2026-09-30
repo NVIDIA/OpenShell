@@ -3337,7 +3337,6 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
-    let supports_provider_files = request.get_ref().supports_provider_files;
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
@@ -3350,11 +3349,6 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let environment =
         load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
             .await?;
-    if !supports_provider_files && !environment.files.is_empty() {
-        return Err(Status::failed_precondition(
-            "supervisor does not support provider files",
-        ));
-    }
     Ok(Response::new(environment))
 }
 
@@ -11193,7 +11187,6 @@ mod tests {
         let environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-snapshot-consistency".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -12802,7 +12795,6 @@ mod tests {
         let legacy_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -12815,7 +12807,6 @@ mod tests {
         let v2_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-provider-env".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -12827,6 +12818,89 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_files_do_not_block_legacy_provider_environment_requests() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileFile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-config-only".to_string(),
+                    name: "config-only".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "config-only".to_string(),
+                    display_name: "Config only".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    files: vec![ProviderProfileFile {
+                        path: "client.toml".to_string(),
+                        content: "endpoint = '{{config.endpoint}}'".to_string(),
+                        env_var: "CLIENT_CONFIG_FILE".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let mut file_provider = test_provider("work-config", "config-only");
+        file_provider.credentials.clear();
+        file_provider
+            .config
+            .insert("endpoint".to_string(), "https://config.example".to_string());
+        state.store.put_message(&file_provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-files-and-credentials",
+                "files-and-credentials",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-config".to_string(), "work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        // An older supervisor sends this request without a provider-file
+        // capability field and ignores the additive files response field.
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-files-and-credentials".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert_eq!(
+            response.environment.get("CLIENT_CONFIG_FILE"),
+            Some(&"/run/openshell/providers/work-config/client.toml".to_string())
+        );
+        assert_eq!(
+            response
+                .files
+                .get("/run/openshell/providers/work-config/client.toml"),
+            Some(&"endpoint = 'https://config.example'".to_string())
+        );
     }
 
     #[tokio::test]
@@ -12852,7 +12926,6 @@ mod tests {
         let response = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-static-ready".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -12911,7 +12984,6 @@ mod tests {
         let response = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-legacy-provider-env".to_string(),
                 supports_static_credential_bindings: false,
             })),
@@ -12956,7 +13028,6 @@ mod tests {
         let response = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-unbound-provider-env".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13067,7 +13138,6 @@ mod tests {
         let environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13133,7 +13203,6 @@ mod tests {
         let next_environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13194,7 +13263,6 @@ mod tests {
         let unbound_environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-policy-binding".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13291,7 +13359,6 @@ mod tests {
         let response = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-mixed-provider-env".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13400,7 +13467,6 @@ mod tests {
         let response = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-token-exchange-subject".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13468,7 +13534,6 @@ mod tests {
         let first = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13508,7 +13573,6 @@ mod tests {
         let second = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-provider-revision".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13958,7 +14022,6 @@ mod tests {
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -13992,7 +14055,6 @@ mod tests {
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -14034,7 +14096,6 @@ mod tests {
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -14139,7 +14200,6 @@ mod tests {
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -14176,7 +14236,6 @@ mod tests {
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),
@@ -14217,7 +14276,6 @@ mod tests {
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
-                supports_provider_files: false,
                 sandbox_id: "sb-attach-lifecycle".to_string(),
                 supports_static_credential_bindings: true,
             })),

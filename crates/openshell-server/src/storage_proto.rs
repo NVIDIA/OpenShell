@@ -123,9 +123,11 @@ mod tests {
     // Unspecified (treated as Never), zero count, and absent timestamps.
     // ProviderProfileFile is reachable from stored provider profiles. Its
     // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only.
+    // inventories; the provider-environment file map is public-only. The
+    // request has no provider-file capability field: older supervisors ignore
+    // the additive file map while retaining the rest of the response.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "7e1d78dc48d47f1d348c4f61120c582211519c1d37190ac67d5c4f4f6c717d69";
+        "2ed66dbc38c60eb96c7461c76d02813c177facfad93753b180534477270ad240";
     const DURABLE_SCHEMA_SHA256: &str =
         "399737f2a367d2e3a9d78cf84e2a97eef041835554599790788e4bbf318116c3";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

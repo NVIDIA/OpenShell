@@ -10914,10 +10914,8 @@ type GetSandboxProviderEnvironmentRequest struct {
 	// provider credentials. Gateways withhold static credential material when
 	// this capability is absent.
 	SupportsStaticCredentialBindings bool `protobuf:"varint,2,opt,name=supports_static_credential_bindings,json=supportsStaticCredentialBindings,proto3" json:"supports_static_credential_bindings,omitempty"`
-	// Whether this supervisor supports provider-managed workload files.
-	SupportsProviderFiles bool `protobuf:"varint,3,opt,name=supports_provider_files,json=supportsProviderFiles,proto3" json:"supports_provider_files,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	unknownFields                    protoimpl.UnknownFields
+	sizeCache                        protoimpl.SizeCache
 }
 
 func (x *GetSandboxProviderEnvironmentRequest) Reset() {
@@ -10960,13 +10958,6 @@ func (x *GetSandboxProviderEnvironmentRequest) GetSandboxId() string {
 func (x *GetSandboxProviderEnvironmentRequest) GetSupportsStaticCredentialBindings() bool {
 	if x != nil {
 		return x.SupportsStaticCredentialBindings
-	}
-	return false
-}
-
-func (x *GetSandboxProviderEnvironmentRequest) GetSupportsProviderFiles() bool {
-	if x != nil {
-		return x.SupportsProviderFiles
 	}
 	return false
 }
@@ -18537,12 +18528,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"request_id\x18\x04 \x01(\tR\trequestId\"g\n" +
 	"\x1dDeleteProviderProfileResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\xcc\x01\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\x94\x01\n" +
 	"$GetSandboxProviderEnvironmentRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12M\n" +
-	"#supports_static_credential_bindings\x18\x02 \x01(\bR supportsStaticCredentialBindings\x126\n" +
-	"\x17supports_provider_files\x18\x03 \x01(\bR\x15supportsProviderFiles\"]\n" +
+	"#supports_static_credential_bindings\x18\x02 \x01(\bR supportsStaticCredentialBindings\"]\n" +
 	"\x1fStaticCredentialEndpointBinding\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +

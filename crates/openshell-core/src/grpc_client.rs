@@ -1093,7 +1093,6 @@ pub async fn fetch_provider_environment(
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
             supports_static_credential_bindings: true,
-            supports_provider_files: true,
         })
         .await
         .map_err(grpc_status_error)?;
