@@ -41,7 +41,7 @@ The launcher:
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
-- Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, require versioned review payloads, and reject `/ok to test` comments that do not carry the full current head SHA.
+- Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
 - Installs `gator/bin/resolve-gator-review-threads` so a follow-up commit that
   demonstrably fixes a Gator inline finding can resolve the corresponding

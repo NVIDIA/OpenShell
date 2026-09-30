@@ -201,39 +201,6 @@ guard_duplicate_gator_disposition() {
     fi
 }
 
-# copy-pr-bot only accepts `/ok to test` with the full 40-character commit SHA.
-# Require the comment to be exactly that command for the current PR head.
-guard_ok_to_test_command() {
-    local owner="$1"
-    local repo="$2"
-    local number="$3"
-    local body="$4"
-
-    local lowered="${body,,}"
-    [[ "$lowered" =~ ^[[:space:]]*/ok[[:space:]]+to[[:space:]]+test ]] || return 0
-
-    local pull_json head_sha
-    if ! pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null)"; then
-        echo "openshell-agent: blocked /ok to test because current PR head lookup failed for $owner/$repo#$number" >&2
-        return 21
-    fi
-    head_sha="$(printf '%s' "$pull_json" | jq -r '.head.sha // empty' 2>/dev/null || true)"
-    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-        echo "openshell-agent: blocked /ok to test because current PR head was missing for $owner/$repo#$number" >&2
-        return 21
-    fi
-
-    if [[ "$body" != "/ok to test $head_sha" ]]; then
-        echo "openshell-agent: blocked /ok to test for $owner/$repo#$number; post exactly: /ok to test $head_sha" >&2
-        echo "openshell-agent: copy-pr-bot requires the full 40-character current head SHA and no other text" >&2
-        return 22
-    fi
-}
-
-if [[ "${method^^}" == "POST" && "$endpoint" =~ ^repos/([^/]+)/([^/]+)/issues/([0-9]+)/comments$ ]]; then
-    guard_ok_to_test_command "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$(read_body)"
-fi
-
 if [[ "${OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT:-}" != "1" && "${method^^}" == "POST" ]]; then
     request_body="$(read_body)"
     if [[ "$endpoint" =~ ^repos/([^/]+)/([^/]+)/issues/([0-9]+)/comments$ ]]; then

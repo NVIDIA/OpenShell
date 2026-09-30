@@ -938,7 +938,7 @@ If a mirror is missing or stale and you have maintainer authority, post:
 gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
 ```
 
-The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment. The `gh` wrapper rejects `/ok to test` comments that do not exactly match the current full head SHA.
+The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
 
 If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <full-head-sha>` with the full current head SHA written out.
 
