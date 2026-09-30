@@ -145,11 +145,17 @@ fn log_response<B>(res: &Response<B>, latency: Duration, span: &Span) {
     if status.is_server_error() {
         crate::otel_tracing::mark_error(span);
     }
-    tracing::info!(
-        status = status.as_u16(),
-        latency_ms = latency.as_millis(),
-        "response"
-    );
+    // Polled requests get a DEBUG span, which is `None` when filtered out.
+    let polled = span
+        .metadata()
+        .is_none_or(|m| *m.level() == tracing::Level::DEBUG);
+    let server_error = status.is_server_error();
+    let (status, latency_ms) = (status.as_u16(), latency.as_millis());
+    match (polled, server_error) {
+        (false, _) => tracing::info!(status, latency_ms, "response"),
+        (true, true) => tracing::warn!(status, latency_ms, "response"),
+        (true, false) => tracing::debug!(status, latency_ms, "response"),
+    }
 }
 
 fn record_response_trailers(
@@ -2258,6 +2264,52 @@ mod tests {
         assert_eq!(
             level("/openshell.v1.OpenShell/CreateSandbox"),
             tracing::Level::INFO
+        );
+    }
+
+    #[test]
+    fn polled_path_responses_log_at_debug() {
+        let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuf(log_buf.clone());
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false),
+                )
+        };
+        {
+            let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let respond = |path: &str, status: u16| {
+                let req = Request::builder()
+                    .uri(path)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                let res = Response::builder()
+                    .status(status)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                log_response(&res, Duration::from_millis(1), &make_request_span(&req));
+            };
+            respond("/openshell.v1.OpenShell/GetSandboxConfig", 200);
+            respond("/healthz", 200);
+            respond("/openshell.v1.OpenShell/CreateSandbox", 201);
+            respond("/healthz", 503);
+        }
+
+        let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "got: {output}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("status=201"),
+            "got: {output}"
+        );
+        assert!(
+            lines[1].contains("WARN") && lines[1].contains("status=503"),
+            "got: {output}"
         );
     }
 
