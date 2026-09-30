@@ -178,10 +178,14 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
+    // ProviderCredentialRefreshStrategy gains the three OCI principal values.
+    // The enum is stored in refresh state, so the durable inventory moves with
+    // the public one; the overlap set is unchanged. Prior payloads carry only
+    // the earlier values and decode exactly as before.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "711a31c11baa7547d967a9a46d0932d92f08121d4195b6f29fb192d7c1ec25a7";
+        "97be7f881cf013d28397b8919fc18503a1d9f6b03177563964bd621cb891d0f7";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "cc84f9e22c4c5fb03c2973f959e2df04c8fdc15d3c11962ec6d9bf61ca280385";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these

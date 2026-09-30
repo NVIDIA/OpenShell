@@ -101,6 +101,30 @@ impl ProtocolBackend for AwsLc {
         &self,
         algorithm: &'static rcgen::SignatureAlgorithm,
     ) -> Result<crate::pki::KeyPair, rcgen::Error> {
+        if [
+            &rcgen::PKCS_RSA_SHA256,
+            &rcgen::PKCS_RSA_SHA384,
+            &rcgen::PKCS_RSA_SHA512,
+        ]
+        .contains(&algorithm)
+        {
+            // rcgen does not generate RSA keys; AWS-LC does. Match the OpenSSL
+            // backend's 2048-bit RSA generation so both backends offer the
+            // same key algorithms to callers such as OCI session keys.
+            use aws_lc_rs::{
+                encoding::{AsDer, Pkcs8V1Der},
+                rsa::KeySize,
+                signature::RsaKeyPair,
+            };
+            let key = RsaKeyPair::generate(KeySize::Rsa2048)
+                .map_err(|_| rcgen::Error::KeyGenerationUnavailable)?;
+            let der: Pkcs8V1Der<'static> =
+                key.as_der().map_err(|_| rcgen::Error::RemoteKeyError)?;
+            let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(der.as_ref());
+            return wrap_key(rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+                &pkcs8, algorithm,
+            )?);
+        }
         wrap_key(rcgen::KeyPair::generate_for(algorithm)?)
     }
     fn import_keypair_pem(&self, pem: &str) -> Result<crate::pki::KeyPair, rcgen::Error> {
@@ -203,6 +227,37 @@ impl crate::pki::SigningKey for Key {
 mod tests {
     use super::*;
     use rustls::client::danger::ServerCertVerifier as _;
+    #[test]
+    fn generates_rsa_keys_that_round_trip_and_sign() {
+        use rcgen::{PublicKeyData as _, SigningKey as _};
+        use rustls::pki_types::alg_id;
+        let key = AwsLc.generate_keypair(&rcgen::PKCS_RSA_SHA256).unwrap();
+        assert_eq!(key.algorithm(), &rcgen::PKCS_RSA_SHA256);
+        let der = key.serialize_der().unwrap();
+        let imported = AwsLc.import_keypair_der(&der).unwrap();
+        assert_eq!(imported.public_key_der(), key.public_key_der());
+        assert_eq!(imported.serialize_der().unwrap(), der);
+        let signature = key.sign(b"message").unwrap();
+        let verifier = AwsLc
+            .tls_provider()
+            .signature_verification_algorithms
+            .all
+            .iter()
+            .copied()
+            .find(|alg| {
+                alg.public_key_alg_id() == alg_id::RSA_ENCRYPTION
+                    && alg.signature_alg_id() == alg_id::RSA_PKCS1_SHA256
+            })
+            .unwrap();
+        verifier
+            .verify_signature(key.der_bytes(), b"message", &signature)
+            .unwrap();
+        assert!(
+            verifier
+                .verify_signature(key.der_bytes(), b"other", &signature)
+                .is_err()
+        );
+    }
     #[test]
     fn exported_keys_round_trip_and_sign_certificates() {
         for algorithm in [

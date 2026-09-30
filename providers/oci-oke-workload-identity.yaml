@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-oke-workload-identity.yaml
+#   openshell provider profile import -f providers/oci-oke-workload-identity.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared — this profile grants no egress.
+# Reference layout:  a gateway pod on an OKE enhanced cluster. The gateway
+#                    presents its projected Kubernetes service-account token to
+#                    the cluster's OCI proxymux (port 12250) together with an
+#                    ephemeral session public key and receives a resource
+#                    principal session token for the pod's workload identity.
+# Credential scope:  OCI_KEY_ID (`ST$<token>`) and OCI_PRIVATE_KEY (base64
+#                    PKCS#8 PEM of the session key), gateway-minted and rotated
+#                    before expiry. IAM: a policy for the OKE workload identity
+#                    (`request.principal.type='workload'` with the cluster,
+#                    namespace, and service account) granting the needed access.
+# Endpoint access:   none. Pair with a sandbox policy or another profile that
+#                    names the OCI hosts the workload needs, sets
+#                    `credential_signing: oci`, and selects this provider with
+#                    `credential_binding.provider`.
+# Smoke test:        openshell provider create --name oci-wi --type oci-oke-workload-identity \
+#                      --runtime-credentials
+#                    openshell provider refresh configure --provider oci-wi \
+#                      --credential-key OCI_KEY_ID --strategy oci-oke-workload-identity
+#                    then call a signed OCI endpoint from a sandbox with a
+#                    policy that binds `oci-wi`.
+
+id: oci-oke-workload-identity
+display_name: OCI OKE Workload Identity
+description: Oracle Cloud Infrastructure access as the gateway pod's OKE workload identity, with gateway-minted short-lived security tokens
+category: other
+credentials:
+  - name: key_id
+    description: OCI resource principal session token key id (ST$<token>), minted by the gateway from the pod's service-account token
+    env_vars: [OCI_KEY_ID]
+    required: true
+    refresh:
+      strategy: oci_oke_workload_identity
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      additional_outputs:
+        - output: private_key
+          credential: private_key
+      material:
+        - name: service_account_token_file
+          description: Projected service-account token path; defaults to /var/run/secrets/kubernetes.io/serviceaccount/token
+          required: false
+          secret: false
+        - name: kubernetes_service_host
+          description: Cluster API host that fronts the OCI proxymux; defaults to the KUBERNETES_SERVICE_HOST environment variable of the gateway
+          required: false
+          secret: false
+        - name: proxymux_port
+          description: OCI proxymux port; defaults to 12250
+          required: false
+          secret: false
+        - name: ca_cert_file
+          description: CA bundle that signs the proxymux certificate; defaults to /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          required: false
+          secret: false
+  - name: private_key
+    description: Ephemeral RSA session key (base64 PKCS#8 PEM) that pairs with the security token; co-managed with key_id
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true
