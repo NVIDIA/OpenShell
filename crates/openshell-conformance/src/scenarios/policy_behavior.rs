@@ -25,20 +25,20 @@ struct SandboxState {
     phase: String,
 }
 
-pub const POLICY_LOCAL_SCENARIO: Scenario = Scenario {
-    name: "policy-local",
+pub const SANDBOX_LOCAL_SCENARIO: Scenario = Scenario {
+    name: "policy-advisor/sandbox-local",
     description: "Read and request a rule through the sandbox-local policy HTTP API.",
-    run: run_policy_local,
+    run: run_sandbox_local,
 };
 
 pub const MECHANISTIC_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "mechanistic-proposal",
+    name: "policy-advisor/mechanistic-proposal",
     description: "Turn a denied transparent TCP open into a scoped policy draft.",
     run: run_mechanistic_proposal,
 };
 
 pub const NEW_HOSTNAME_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "new-hostname-proposal",
+    name: "policy-advisor/new-hostname-proposal",
     description: "Turn a denied TCP open to a hostname absent from policy into a scoped draft.",
     run: run_new_hostname_proposal,
 };
@@ -52,7 +52,7 @@ landlock: { compatibility: best_effort }
 network_policies: {}
 ";
 
-fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+fn run_sandbox_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
         let name = format!("ct-{}-pl", runner.id());
         create_sandbox(runner, &name, None).await?;

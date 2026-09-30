@@ -181,11 +181,14 @@ lifecycle management, output parsing, and cleanup.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
-  mechanistic drafts, and the sandbox-local API, including agent-authored
-  permission requests. Driver E2E wrappers run every scenario. The
-  installed-artifact conformance suite runs all scenarios and offers a focused
-  `policy-advisor` testsuite for manual integration runs.
+- CLI conformance (`tests/suites/conformance`) - installed-artifact tests of
+  portable public CLI behavior. Coverage is split into independent capability
+  tests so each driver runs only the contracts it implements and failures remain
+  isolated. Scenario implementations live in `openshell-conformance`; the
+  standalone `openshell-conformance` binary supports exact leaf and family-
+  prefix selection for manual runs and driver E2E wrappers. See the
+  [suite README](tests/suites/conformance/README.md) for scope and selection
+  guidance.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -222,20 +225,27 @@ starts. The task does not provision a gateway or select a compute driver. Set
 `OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
 the current checkout.
 
-The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
-depending on how the gateway was installed or which driver is configured. It
-requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with the configured default image, verifies the sandbox is `Ready` by finding its
-unique name in paginated JSON list output, executes `echo` with a run-specific
-marker, deletes the sandbox, and verifies that its name no longer appears.
-Driver suites enable the same profile
-instead of maintaining a separate smoke implementation. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
+The smoke contract verifies the CLI-to-gateway-to-driver path without depending
+on how the gateway was installed. Its control-plane test requires
+machine-readable status, creates a uniquely named detached sandbox, verifies it
+is `Ready` through get and paginated list output, deletes it, and verifies its
+name no longer appears. The exec test creates its own sandbox and checks
+`sandbox exec` with a run-specific marker. Drivers without exec support run the
+control-plane test alone. Smoke sandboxes use the runtime's default workload and
+create configuration. Lifecycle coverage follows the same split: its
+control-plane test covers stop and stopped deletion without requiring exec,
+while its restart-persistence test uses exec to verify workspace state across
+stop and start. Future environment or canonical-main coverage should use
+separate leaves when it has distinct runtime requirements. The standalone runner
+expands a family selector into independent leaf runs, while installed-artifact
+CI uses the leaf tests directly as its selection and failure-isolation boundary.
+Label matrices, VM overlay, and TLS-key permission assertions remain regular E2E
+coverage.
 
 Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
+Conformance sandboxes use names such as `ct-<run-id>-cp` and
+`ct-<run-id>-ex`. The runner tracks the exact name and uses it for cleanup;
+smoke conformance does not add ownership labels.
 
 The runner deletes owned resources after both success and failure. If the test
 process is interrupted before cleanup, locate leftovers without touching

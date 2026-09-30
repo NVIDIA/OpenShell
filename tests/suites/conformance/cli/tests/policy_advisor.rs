@@ -5,7 +5,7 @@
 
 use openshell_conformance::{
     MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, OpenShellRunner,
-    POLICY_LOCAL_SCENARIO, Scenario,
+    SANDBOX_LOCAL_SCENARIO, Scenario,
 };
 
 async fn run(scenario: &'static Scenario) {
@@ -32,6 +32,6 @@ async fn new_hostname_proposal() {
 }
 
 #[tokio::test]
-async fn policy_local() {
-    run(&POLICY_LOCAL_SCENARIO).await;
+async fn sandbox_local() {
+    run(&SANDBOX_LOCAL_SCENARIO).await;
 }

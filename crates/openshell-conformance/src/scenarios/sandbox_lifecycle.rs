@@ -20,18 +20,32 @@ struct SandboxState {
     phase: String,
 }
 
-/// Certify sandbox stop, start, and deletion lifecycle behavior.
-pub const SANDBOX_LIFECYCLE_SCENARIO: Scenario = Scenario {
-    name: "sandbox-lifecycle",
-    description: "Verify sandbox stop, start, and deletion lifecycle behavior.",
-    run: run_sandbox_lifecycle,
+#[derive(Debug, Deserialize)]
+struct SandboxListPage {
+    sandboxes: Vec<SandboxState>,
+    next_page_token: String,
+}
+
+/// Certify stop and stopped-deletion behavior without requiring exec.
+pub const SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO: Scenario = Scenario {
+    name: "sandbox-lifecycle/control-plane",
+    description: "Verify sandbox stop and stopped-deletion behavior.",
+    run: run_lifecycle_control_plane,
 };
 
-fn run_sandbox_lifecycle(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
-        stop_start_preserves_workspace(runner).await?;
-        stopped_can_be_deleted(runner).await
-    })
+/// Certify restart and workspace persistence through exec observations.
+pub const SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO: Scenario = Scenario {
+    name: "sandbox-lifecycle/restart-persistence",
+    description: "Verify sandbox restart and workspace persistence.",
+    run: run_lifecycle_restart_persistence,
+};
+
+fn run_lifecycle_control_plane(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(stopped_can_be_deleted(runner))
+}
+
+fn run_lifecycle_restart_persistence(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(stop_start_preserves_workspace(runner))
 }
 
 async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {
@@ -257,22 +271,60 @@ async fn wait_for_absence(
             &poll_step,
             TRANSITION_TIMEOUT,
             TRANSITION_INTERVAL,
-            async move |runner| {
-                let result = runner
-                    .step(format!("{step}/get"))
-                    .description(format!("sandbox '{sandbox_name}' is no longer retrievable"))
-                    .with_timeout(COMMAND_TIMEOUT)
-                    .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
-                    .await;
-                match result {
-                    Ok(result) if !result.success() => Poll::Ready(()),
-                    Ok(_) => {
-                        Poll::Pending(format!("sandbox '{sandbox_name}' is still retrievable"))
-                    }
-                    Err(error) => Poll::Pending(error.to_string()),
-                }
+            async move |runner| match sandbox_is_listed(runner, &sandbox_name, &step).await {
+                Ok(false) => Poll::Ready(()),
+                Ok(true) => Poll::Pending(format!("sandbox '{sandbox_name}' is still retrievable")),
+                Err(error) => Poll::Pending(error),
             },
         )
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn sandbox_is_listed(
+    runner: &OpenShellRunner,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<bool, String> {
+    let mut page_token = String::new();
+    let mut page = 0u32;
+    loop {
+        let result = runner
+            .step(format!("{step}/list/{page}"))
+            .description(format!(
+                "sandbox list confirms whether '{sandbox_name}' still exists"
+            ))
+            .with_timeout(COMMAND_TIMEOUT)
+            .run(&[
+                "sandbox",
+                "list",
+                "--page-size",
+                "1000",
+                "--page-token",
+                &page_token,
+                "--output",
+                "json",
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+        result.require_success()?;
+
+        let response = result
+            .json::<SandboxListPage>()
+            .map_err(|error| error.to_string())?;
+        if response
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.name == sandbox_name)
+        {
+            return Ok(true);
+        }
+        if response.next_page_token.is_empty() {
+            return Ok(false);
+        }
+        page_token = response.next_page_token;
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
+    }
 }

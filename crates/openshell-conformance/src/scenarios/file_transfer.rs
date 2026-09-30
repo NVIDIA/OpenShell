@@ -17,13 +17,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 const TRANSFER_TIMEOUT: Duration = Duration::from_mins(5);
 const LARGE_FILE_SIZE: usize = 512 * 1024;
 
-/// Certify portable upload and download behavior through the public CLI.
-pub const FILE_TRANSFER_SCENARIO: Scenario = Scenario {
-    name: "file-transfer",
-    description: "Verify sandbox uploads, downloads, Git filtering, and path safety.",
-    run: run_file_transfer,
-};
-
 /// Certify basic file and directory upload and download behavior.
 pub const FILE_TRANSFER_ROUND_TRIP_SCENARIO: Scenario = Scenario {
     name: "file-transfer/round-trip",
@@ -44,14 +37,6 @@ pub const FILE_TRANSFER_PATH_SAFETY_SCENARIO: Scenario = Scenario {
     description: "Verify workspace boundary enforcement and safe filename handling.",
     run: run_path_safety,
 };
-
-fn run_file_transfer(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
-        FILE_TRANSFER_ROUND_TRIP_SCENARIO.run(runner).await?;
-        FILE_TRANSFER_GIT_FILTERING_SCENARIO.run(runner).await?;
-        FILE_TRANSFER_PATH_SAFETY_SCENARIO.run(runner).await
-    })
-}
 
 fn run_round_trip(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {

@@ -55,14 +55,20 @@ contents write on the repository. The test auto-resolves the token from
 
 ## Conformance coverage
 
-The `mechanistic-proposal` and `new-hostname-proposal` conformance scenarios
-check draft generation for a denied IP address and for a hostname absent from
-policy. The `policy-local` scenario uses `policy.local` to inspect policy, submit
-a narrow permission request, and read the resulting proposal. Run them against a configured gateway
-with `--openshell-bin` pointing to the CLI under test:
+The `policy-advisor/mechanistic-proposal` and
+`policy-advisor/new-hostname-proposal` conformance scenarios check draft
+generation for a denied IP address and for a hostname absent from policy. The
+`policy-advisor/sandbox-local` scenario uses `policy.local` to inspect policy,
+submit a narrow permission request, and read the resulting proposal. Run them
+against a configured gateway with `--openshell-bin` pointing to the CLI under
+test:
 
 ```bash
-openshell-conformance run mechanistic-proposal new-hostname-proposal policy-local --openshell-bin target/debug/openshell
+openshell-conformance run \
+  policy-advisor/mechanistic-proposal \
+  policy-advisor/new-hostname-proposal \
+  policy-advisor/sandbox-local \
+  --openshell-bin target/debug/openshell
 ```
 
 Run `openshell-conformance list` to see all scenario names. A manual
