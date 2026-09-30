@@ -134,7 +134,8 @@ function Quote-NativeArgument([string]$value) {
 function Invoke-Cli([string[]]$CommandArgs) {
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = $cli
-    $start.Arguments = (($CommandArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+    $start.Arguments = ((@("--gateway-endpoint", $gatewayEndpoint) + $CommandArgs |
+        ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
@@ -169,6 +170,7 @@ if ($WsPort -ne 22000) {
 
 $gateway    = if ($GatewayPath) { [System.IO.Path]::GetFullPath($GatewayPath) } else { Join-Path $here "openshell-gateway.exe" }
 $cli        = if ($CliPath) { [System.IO.Path]::GetFullPath($CliPath) } else { Join-Path $here "openshell.exe" }
+$gatewayEndpoint = "http://127.0.0.1:$Port"
 $tomlSrc    = Join-Path $here "mxc-ws-gateway.toml"
 $toml       = Join-Path $resultDir "mxc-ws-gateway.toml"
 $policyFile = Join-Path $here "e2e-policies\ws-agent.yaml"
@@ -234,7 +236,7 @@ function Register-Cli {
     $env:OPENSHELL_GATEWAY = ""
     $addMsg = ""
     try {
-        & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 |
+        & $cli --gateway-endpoint $gatewayEndpoint gateway add $gatewayEndpoint --local --name $GatewayName 2>&1 |
             ForEach-Object { $addMsg += "$_`n"; Info $_ }
     } catch {
         $addMsg = $_.Exception.Message
@@ -243,13 +245,13 @@ function Register-Cli {
     if ($addMsg -match 'different endpoint') {
         # Registered at a stale port; remove and re-add.
         Info "removing stale gateway registration and re-adding at port $Port"
-        try { & $cli gateway remove $GatewayName 2>&1 | Out-Null } catch {}
+        try { & $cli --gateway-endpoint $gatewayEndpoint gateway remove $GatewayName 2>&1 | Out-Null } catch {}
         try {
-            & $cli gateway add "http://127.0.0.1:$Port" --local --name $GatewayName 2>&1 |
+            & $cli --gateway-endpoint $gatewayEndpoint gateway add $gatewayEndpoint --local --name $GatewayName 2>&1 |
                 ForEach-Object { Info $_ }
         } catch { Info "gateway add retry: $($_.Exception.Message) (continuing)" }
     }
-    try { & $cli gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ } }
+    try { & $cli --gateway-endpoint $gatewayEndpoint gateway select $GatewayName 2>&1 | ForEach-Object { Info $_ } }
     catch { Info "gateway select: $($_.Exception.Message) (continuing)" }
 }
 
@@ -655,7 +657,7 @@ try {
         if ($serverUp) {
             Step "openshell forward service --target-port $WsPort --local $RelayPort"
             $script:fwdProc = Start-Process -FilePath $cli `
-                -ArgumentList @("forward", "service", "--target-port", "$WsPort", "--local", "$RelayPort", $sandboxName) `
+                -ArgumentList @("--gateway-endpoint", $gatewayEndpoint, "forward", "service", "--target-port", "$WsPort", "--local", "$RelayPort", $sandboxName) `
                 -WorkingDirectory $here -PassThru -NoNewWindow `
                 -RedirectStandardOutput $fwdLog -RedirectStandardError $fwdErrLog
             Info "forward pid $($script:fwdProc.Id)"
@@ -738,7 +740,7 @@ try {
     if ($script:fwdProc -and -not $script:fwdProc.HasExited) {
         try { Stop-Process -Id $script:fwdProc.Id -Force -ErrorAction SilentlyContinue } catch {}
     }
-    try { & $cli sandbox delete $sandboxName 2>&1 | Out-Null } catch {}
+    try { [void](Invoke-Cli @("sandbox", "delete", $sandboxName)) } catch {}
 
     if (-not $KeepRunning) {
         Stop-Gw $script:gwProc

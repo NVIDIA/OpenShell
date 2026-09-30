@@ -45,6 +45,9 @@ New-Item -ItemType Directory -Path $stageDir | Out-Null
 $passed = $false
 $oldAppData = $env:APPDATA
 $oldLocalAppData = $env:LOCALAPPDATA
+$oldXdgConfigHome = $env:XDG_CONFIG_HOME
+$oldXdgStateHome = $env:XDG_STATE_HOME
+$oldXdgDataHome = $env:XDG_DATA_HOME
 
 function Get-AvailablePort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -57,7 +60,13 @@ function Get-AvailablePort {
 try {
     $env:APPDATA = Join-Path $stageDir "appdata"
     $env:LOCALAPPDATA = Join-Path $stageDir "localappdata"
-    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+    $env:XDG_CONFIG_HOME = Join-Path $stageDir "xdg-config"
+    $env:XDG_STATE_HOME = Join-Path $stageDir "xdg-state"
+    $env:XDG_DATA_HOME = Join-Path $stageDir "xdg-data"
+    New-Item -ItemType Directory -Force -Path @(
+        $env:APPDATA, $env:LOCALAPPDATA,
+        $env:XDG_CONFIG_HOME, $env:XDG_STATE_HOME, $env:XDG_DATA_HOME
+    ) | Out-Null
 
     New-Item -ItemType Directory -Path (Join-Path $stageDir "e2e-policies") | Out-Null
     foreach ($fixture in @("run-ws-agent-test.ps1", "mxc-ws-gateway.toml")) {
@@ -87,6 +96,9 @@ try {
 } finally {
     $env:APPDATA = $oldAppData
     $env:LOCALAPPDATA = $oldLocalAppData
+    $env:XDG_CONFIG_HOME = $oldXdgConfigHome
+    $env:XDG_STATE_HOME = $oldXdgStateHome
+    $env:XDG_DATA_HOME = $oldXdgDataHome
     if ($passed -and -not $KeepArtifacts -and (Test-Path -LiteralPath $stageDir)) {
         Remove-Item -LiteralPath $stageDir -Recurse -Force
     } else {

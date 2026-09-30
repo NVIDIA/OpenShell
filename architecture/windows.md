@@ -268,9 +268,11 @@ Windows validation separates source correctness from host capability:
   OpenClaw example as separate steps. The probe uses an explicitly absent
   `wxc-exec`; the other two use the in-process mock. They check the
   unavailable-backend report, sandbox lifecycle, and workload proof files.
-  The mock disables relay wrapping because it has no control channel. These
-  runs do not validate WebSocket connectivity, OpenClaw, dynamic forwarding,
-  proxy behavior, or MXC isolation.
+  The wrappers isolate CLI config, state, and data directories, and direct
+  sandbox calls to their temporary loopback gateways. The mock disables relay
+  wrapping because it has no control channel. These runs do not validate
+  WebSocket connectivity, OpenClaw, dynamic forwarding, proxy behavior, or MXC
+  isolation.
 - Real-`wxc-exec` tests validate the installed schema and selected filesystem,
   UI, network, and lifecycle behavior. A probe-gated skip is useful
   diagnostic output, not qualification evidence.
