@@ -178,13 +178,34 @@ Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
-Exposed service URLs use virtual hostnames for gateway routing. Tests of a
-loopback gateway must connect the TCP socket directly to the gateway's
-loopback address and send the service URL authority in the HTTP `Host` header.
-Do not resolve `*.openshell.localhost`; resolver support for arbitrary
-`.localhost` subdomains varies across local and CI environments. Readiness
-polls must retain the last connection error or HTTP response and include it in
-timeout diagnostics.
+Exposed service URLs use virtual hostnames for gateway routing. Host-side tests
+must connect the TCP socket directly to a reachable gateway listener address,
+normally loopback, and send the service URL authority in the HTTP `Host`
+header. Do not resolve `*.openshell.localhost`; resolver support for arbitrary
+`.localhost` subdomains varies across local and CI environments.
+
+Treat the advertised service URL scheme as authoritative. For HTTPS, use the
+virtual service hostname for TLS SNI and the configured gateway trust roots.
+When the listener requires mTLS, present the active gateway client identity;
+the local e2e wrappers register these materials under
+`$XDG_CONFIG_HOME/openshell/gateways/$OPENSHELL_GATEWAY/mtls/`. Do not downgrade
+an HTTPS service URL to plaintext when dialing loopback. Parse the URL and load
+TLS material before entering a readiness loop so permanent configuration
+errors fail immediately. Retry only transient connection failures and
+documented readiness responses, and include the last observation in timeout
+diagnostics.
+
+Verify exposed-service tests in both the default local mode and the
+CI-equivalent HTTPS mode:
+
+```shell
+mise run e2e:rust
+OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false mise run e2e:rust
+```
+
+When more than one test needs this behavior, put the transport in the shared
+Rust e2e harness and require callers to use it instead of duplicating DNS,
+HTTP `Host`, TLS SNI, and mTLS handling.
 
 Suites:
 
