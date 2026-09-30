@@ -178,6 +178,14 @@ Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
+Exposed service URLs use virtual hostnames for gateway routing. Tests of a
+loopback gateway must connect the TCP socket directly to the gateway's
+loopback address and send the service URL authority in the HTTP `Host` header.
+Do not resolve `*.openshell.localhost`; resolver support for arbitrary
+`.localhost` subdomains varies across local and CI environments. Readiness
+polls must retain the last connection error or HTTP response and include it in
+timeout diagnostics.
+
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.

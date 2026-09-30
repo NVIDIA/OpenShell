@@ -6,6 +6,7 @@
 //! Verifies application bearer authorization behavior through an exposed
 //! `OpenShell` service.
 
+use std::net::Ipv4Addr;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -62,15 +63,17 @@ async fn request_service(url: &str, authorization: &str) -> Result<(StatusCode, 
             url.scheme()
         ));
     }
-    let host = url
-        .host_str()
+    url.host_str()
         .ok_or_else(|| "service URL omitted its host".to_string())?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "service URL omitted its port".to_string())?;
-    let stream = TcpStream::connect((host, port))
+    // The service hostname is a virtual routing authority. Dial the loopback
+    // gateway directly so the test does not depend on the host resolver
+    // recognizing arbitrary subdomains of `.localhost`.
+    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .await
-        .map_err(|error| format!("connect to service: {error}"))?;
+        .map_err(|error| format!("connect to loopback service gateway: {error}"))?;
     let _ = stream.set_nodelay(true);
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
@@ -107,7 +110,8 @@ async fn request_service(url: &str, authorization: &str) -> Result<(StatusCode, 
 }
 
 async fn wait_for_authorization(url: &str, expected: &str) -> Result<(), String> {
-    timeout(READY_TIMEOUT, async {
+    let mut last_observation = "no request attempted".to_string();
+    let result = timeout(READY_TIMEOUT, async {
         loop {
             match request_service(url, BEARER_TOKEN).await {
                 Ok((StatusCode::OK, body)) if body == expected => return Ok(()),
@@ -116,13 +120,22 @@ async fn wait_for_authorization(url: &str, expected: &str) -> Result<(), String>
                         "service received unexpected Authorization value: {body:?}"
                     ));
                 }
-                Ok((
-                    StatusCode::BAD_GATEWAY
-                    | StatusCode::PRECONDITION_FAILED
-                    | StatusCode::SERVICE_UNAVAILABLE,
-                    _,
-                ))
-                | Err(_) => sleep(Duration::from_millis(250)).await,
+                Ok((status, body))
+                    if matches!(
+                        status,
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::PRECONDITION_FAILED
+                            | StatusCode::SERVICE_UNAVAILABLE
+                    ) =>
+                {
+                    last_observation =
+                        format!("service returned retryable status {status} with body {body:?}");
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    last_observation = error;
+                    sleep(Duration::from_millis(250)).await;
+                }
                 Ok((status, body)) => {
                     return Err(format!(
                         "service returned unexpected status {status} with body {body:?}"
@@ -131,8 +144,14 @@ async fn wait_for_authorization(url: &str, expected: &str) -> Result<(), String>
             }
         }
     })
-    .await
-    .map_err(|_| "timed out waiting for the exposed service".to_string())?
+    .await;
+
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "timed out waiting for the exposed service; last observation: {last_observation}"
+        )),
+    }
 }
 
 #[tokio::test]
