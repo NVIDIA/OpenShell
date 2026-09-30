@@ -50,8 +50,8 @@ Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:che
 
 ### PostgreSQL-backed tests
 
-Tests that need a real PostgreSQL server are `#[ignore]`d and named
-`postgres_*`. Run them with:
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
 
 ```shell
 mise run test:rust:postgres
@@ -59,13 +59,17 @@ mise run test:rust:postgres
 
 The task starts a disposable PostgreSQL container with Docker or Podman
 (set `CONTAINER_ENGINE` to choose), runs the tests one at a time, and removes
-the container. Each test works in its own temporary schema. To use your own
+the container. Each test works in its own temporary schema, except the replay
+and provider refresh lock tests, which use the default schema. To use your own
 disposable database, set `OPENSHELL_TEST_POSTGRES_URL`. The task overrides
 `OPENSHELL_REPLAY_TEST_DATABASE_URL` so legacy tests use that same database.
 Never point it at a database that a running gateway uses: the tests take
 fleet-wide advisory locks.
 CI does not run these tests; the Kubernetes HA e2e suite covers PostgreSQL end
 to end.
+Load-sensitive capacity checks are named `bench_postgres_*` instead, so that
+task skips them. Run them on an idle machine with
+`mise run test:rust:postgres:bench`.
 
 ### Native Windows validation
 

@@ -181,6 +181,18 @@ fn return_lock_connection(
     });
 }
 
+#[cfg(test)]
+impl PostgresAdvisoryLockGuard {
+    /// Backend process id of the session that holds the locks.
+    pub(super) async fn backend_pid(&mut self) -> i32 {
+        let Self { connection, .. } = self;
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read the lock session's backend pid")
+    }
+}
+
 /// A lock-pool connection whose acquisition is still in progress.
 ///
 /// Dropping it closes the session, which releases every advisory lock the
@@ -470,6 +482,18 @@ impl PostgresStore {
         } else {
             PersistenceError::Database(LOCK_CONNECTION_NOT_OPENED.into())
         }
+    }
+
+    /// Connections the lock pool holds, idle or in use.
+    #[cfg(test)]
+    pub(super) fn lock_pool_size(&self) -> u32 {
+        self.lock_pool.size()
+    }
+
+    /// Lock-pool connections that are connected and ready for reuse.
+    #[cfg(test)]
+    pub(super) fn lock_pool_idle(&self) -> usize {
+        self.lock_pool.num_idle()
     }
 
     /// Test support only: close the underlying connection pools.

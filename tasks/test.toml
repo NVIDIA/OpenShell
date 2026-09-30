@@ -126,8 +126,14 @@ description = "Run PostgreSQL-backed openshell-server tests against OPENSHELL_TE
 run = "tasks/scripts/run-postgres-tests.sh"
 run_windows = "echo Skipping test:rust:postgres: PostgreSQL integration tests need a Linux or macOS container engine."
 
+["test:rust:postgres:bench"]
+description = "Run the load-sensitive bench_postgres_* capacity checks that test:rust:postgres and CI skip"
+env = { OPENSHELL_TEST_POSTGRES_PREFIX = "bench_postgres_" }
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres:bench: PostgreSQL integration tests need a Linux or macOS container engine."
+
 ["test:postgres-runner"]
-description = "Test PostgreSQL test runner database selection without a database or container engine"
+description = "Test PostgreSQL test runner database and prefix selection without a database or container engine"
 run = "tasks/scripts/test-postgres-test-runner.sh"
 run_windows = "echo Skipping test:postgres-runner: the Unix PostgreSQL test runner does not apply on Windows."
 hide = true

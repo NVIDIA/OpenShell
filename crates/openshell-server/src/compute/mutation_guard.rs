@@ -382,11 +382,14 @@ mod tests {
     use crate::gateway_metrics::MetricsCapture;
     use crate::persistence::Store;
     use crate::persistence::mutation_lock::GLOBAL_MUTATION_LOCK_KEY;
+    use crate::persistence::test_postgres::TestSchema;
+    use openshell_core::GetResourceVersion;
     use openshell_core::proto::SandboxPhase;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::sync::atomic::{AtomicBool, AtomicIsize};
     use tokio::task::JoinHandle;
+    use uuid::Uuid;
 
     const BLOCKED_FOR: Duration = Duration::from_millis(100);
     const PROCEEDS_WITHIN: Duration = Duration::from_secs(5);
@@ -1061,5 +1064,203 @@ mod tests {
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Ready as i32);
         drop(held);
+    }
+
+    /// A runtime on its own store connected to `schema`, like one gateway
+    /// replica.
+    async fn postgres_runtime(schema: &TestSchema) -> ComputeRuntime {
+        let store = Arc::new(schema.connect_store().await);
+        super::super::new_test_runtime_for_driver(store, "test").await
+    }
+
+    fn stored_sandbox(sandbox_id: &str, workspace: &str) -> Sandbox {
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_id.to_string(),
+                workspace: workspace.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_compute_guards_random_scope_mix_never_deadlocks() {
+        let schema = TestSchema::create("mix").await;
+        let replicas = [
+            postgres_runtime(&schema).await,
+            postgres_runtime(&schema).await,
+        ];
+        // Advisory locks are database-wide, so the mix uses fresh names.
+        let prefix = format!("{}-", Uuid::new_v4().simple());
+
+        run_random_scope_mix(&replicas, &prefix, 32, 20, Duration::from_mins(1)).await;
+
+        for replica in &replicas {
+            replica.store.close().await;
+        }
+        schema.drop_schema().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_compute_guard_by_id_uses_the_sandbox_workspace() {
+        let schema = TestSchema::create("guard").await;
+        let replica_a = postgres_runtime(&schema).await;
+        let replica_b = postgres_runtime(&schema).await;
+        let workspace = format!("ws-{}", Uuid::new_v4());
+        let sandbox_id = format!("sb-{}", Uuid::new_v4());
+        replica_a
+            .store
+            .put_message(&stored_sandbox(&sandbox_id, &workspace))
+            .await
+            .expect("seed the sandbox");
+
+        // Only the database locks connect the two replicas.
+        let held = replica_b
+            .mutation_guard(MutationScope::Workspace(&workspace))
+            .await
+            .expect("workspace guard on replica B");
+        let mut by_id = {
+            let replica_a = replica_a.clone();
+            let sandbox_id = sandbox_id.clone();
+            tokio::spawn(async move { replica_a.sandbox_mutation_guard_by_id(&sandbox_id).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut by_id)
+                .await
+                .is_err(),
+            "the by-id guard should wait for the sandbox's workspace"
+        );
+        drop(held);
+        let guard = tokio::time::timeout(PROCEEDS_WITHIN, by_id)
+            .await
+            .expect("the by-id guard should proceed after release")
+            .expect("guard task")
+            .expect("by-id guard");
+        assert!(guard.is_some(), "the seeded sandbox exists");
+        drop(guard);
+
+        assert!(
+            replica_a
+                .sandbox_mutation_guard_by_id(&format!("sb-{}", Uuid::new_v4()))
+                .await
+                .expect("by-id guard for an unknown sandbox")
+                .is_none()
+        );
+
+        replica_a.store.close().await;
+        replica_b.store.close().await;
+        schema.drop_schema().await;
+    }
+
+    /// Measures lock waits in a paced reconnect burst into one replica: one
+    /// session every 12 ms (1000 sessions spread over 12 s), all into one
+    /// receiving replica with the production lock pool. Run it with
+    /// `--no-capture` to see the wait percentiles.
+    ///
+    /// This capacity check runs the lock pool near saturation, so machine load
+    /// moves the waits. `mise run test:rust:postgres` and CI skip it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres:bench"]
+    async fn bench_postgres_lock_pool_absorbs_a_12ms_reconnect_burst() {
+        /// Sessions that move to the receiving replica.
+        const RECONNECTS: usize = 500;
+        /// One reconnect every 12 ms, as for 1000 sessions spread over 12 s.
+        const RECONNECT_INTERVAL: Duration = Duration::from_millis(12);
+        /// Guarded operations per reconnect on the receiver: the pre-ack
+        /// endpoint-status reset and one endpoint report.
+        const GUARDED_OPS_PER_RECONNECT: usize = 2;
+        /// Extra time under the guard, so each critical section takes about
+        /// 20 ms, like one against a managed database.
+        const CRITICAL_SECTION_PADDING: Duration = Duration::from_millis(15);
+
+        let schema = TestSchema::create("envelope").await;
+        // The production lock pool, as on a real receiving replica.
+        let receiver = postgres_runtime(&schema).await;
+        let workspace = format!("ws-{}", Uuid::new_v4());
+        let mut sandbox_ids = Vec::with_capacity(RECONNECTS);
+        for _ in 0..RECONNECTS {
+            let sandbox_id = format!("sb-{}", Uuid::new_v4());
+            receiver
+                .store
+                .put_message(&stored_sandbox(&sandbox_id, &workspace))
+                .await
+                .expect("seed a sandbox");
+            sandbox_ids.push(sandbox_id);
+        }
+
+        let started = tokio::time::Instant::now();
+        let reconnects: Vec<_> = sandbox_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, sandbox_id)| {
+                let receiver = receiver.clone();
+                let arrives = started
+                    + RECONNECT_INTERVAL * u32::try_from(index).expect("reconnect index fits u32");
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(arrives).await;
+                    let mut waits = Vec::with_capacity(GUARDED_OPS_PER_RECONNECT);
+                    for op in 0..GUARDED_OPS_PER_RECONNECT {
+                        let called = tokio::time::Instant::now();
+                        let guard = receiver
+                            .sandbox_mutation_guard_by_id(&sandbox_id)
+                            .await?
+                            .expect("seeded sandbox");
+                        waits.push(called.elapsed());
+                        let sandbox = receiver
+                            .store
+                            .get_message::<Sandbox>(&sandbox_id)
+                            .await?
+                            .expect("seeded sandbox");
+                        receiver
+                            .store
+                            .update_message_cas::<Sandbox, _>(
+                                &sandbox_id,
+                                sandbox.get_resource_version(),
+                                |sandbox| {
+                                    sandbox
+                                        .metadata
+                                        .as_mut()
+                                        .expect("sandbox metadata")
+                                        .labels
+                                        .insert("envelope-op".to_string(), op.to_string());
+                                },
+                            )
+                            .await?;
+                        tokio::time::sleep(CRITICAL_SECTION_PADDING).await;
+                        drop(guard);
+                    }
+                    Ok::<_, PersistenceError>(waits)
+                })
+            })
+            .collect();
+        let mut waits = Vec::with_capacity(RECONNECTS * GUARDED_OPS_PER_RECONNECT);
+        for reconnect in reconnects {
+            match reconnect.await.expect("reconnect task") {
+                Ok(reconnect_waits) => waits.extend(reconnect_waits),
+                Err(error) => panic!("a guarded reconnect operation failed: {error:?}"),
+            }
+        }
+
+        waits.sort_unstable();
+        let percentile = |percent: usize| waits[(waits.len() * percent).div_ceil(100) - 1];
+        let (p50, p99) = (percentile(50), percentile(99));
+        let max = waits[waits.len() - 1];
+        eprintln!(
+            "reconnect burst: {} guarded ops from {RECONNECTS} reconnects {RECONNECT_INTERVAL:?} \
+             apart into one receiver: lock wait p50 {p50:?}, p99 {p99:?}, max {max:?}",
+            waits.len()
+        );
+        // Waits must stay far from the lock timeout, where requests fail.
+        assert!(
+            p99 * 5 < MUTATION_LOCK_TIMEOUT,
+            "p99 lock wait {p99:?} is too close to the {MUTATION_LOCK_TIMEOUT:?} timeout"
+        );
+
+        receiver.store.close().await;
+        schema.drop_schema().await;
     }
 }

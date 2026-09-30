@@ -7,6 +7,8 @@
 # database, or leave it unset to start a throwaway PostgreSQL container with
 # the local container engine (Docker or Podman). Never point it at a database
 # that a running gateway uses: the tests take fleet-wide advisory locks.
+# OPENSHELL_TEST_POSTGRES_PREFIX selects another test-name prefix, such as
+# `bench_postgres_` for the load-sensitive capacity checks.
 #
 # Extra arguments are passed to cargo nextest. Use test-name filters to run a
 # subset, for example `postgres_concurrency`; a second -E filterset
@@ -20,6 +22,13 @@ cd "${ROOT}"
 # Same pinned image as the Kubernetes e2e fixture (e2e/kubernetes/postgres-fixture.yaml).
 POSTGRES_IMAGE="${OPENSHELL_TEST_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:17.10-alpine3.23@sha256:979c4379dd698aba0b890599a6104e082035f98ef31d9b9291ec22f2b13059ca}"
 CONTAINER_NAME=""
+
+# The prefix lands in the nextest filterset, so allow only plain names.
+TEST_PREFIX="${OPENSHELL_TEST_POSTGRES_PREFIX:-postgres_}"
+if [[ ! "${TEST_PREFIX}" =~ ^[a-z_]+$ ]]; then
+  echo "ERROR: OPENSHELL_TEST_POSTGRES_PREFIX must match ^[a-z_]+\$, got '${TEST_PREFIX}'" >&2
+  exit 1
+fi
 
 cleanup() {
   if [ -n "${CONTAINER_NAME}" ]; then
@@ -80,4 +89,4 @@ export OPENSHELL_TELEMETRY_ENABLED=false
 # Advisory locks are database-wide, so run the tests one at a time.
 cargo nextest run -p openshell-server --features test-support \
   --run-ignored only --test-threads 1 \
-  -E 'test(/(^|::)postgres_/)' "$@"
+  -E "test(/(^|::)${TEST_PREFIX}/)" "$@"
