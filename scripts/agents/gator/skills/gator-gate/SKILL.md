@@ -38,7 +38,7 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 
 - Do not push commits to a contributor's PR branch by default.
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
-- Do not post `/ok to test <sha>` unless the current GitHub user has maintainer authority.
+- Do not post `/ok to test <full-head-sha>` unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
 - Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
 
@@ -440,7 +440,7 @@ Move to `gator:blocked` when any of these apply:
 - PR is blocked by the vouch system or was auto-closed for lack of vouch
 - DCO is missing or failing
 - PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
-- Required `/ok to test <sha>` is needed and the current user lacks maintainer authority
+- Required `/ok to test <full-head-sha>` is needed and the current user lacks maintainer authority
 - Required CI cannot run because the copy-pr mirror is missing or stale and maintainer authority is unavailable
 
 For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
@@ -932,13 +932,13 @@ If a mirror is missing or stale and you have maintainer authority, post:
 /ok to test <full-head-sha>
 ```
 
-`<full-head-sha>` is the full 40-character SHA of the current PR head. copy-pr-bot rejects abbreviated SHAs. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
+`<full-head-sha>` MUST be the full 40-character SHA-1 of the current PR head. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
 
 ```bash
 gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
 ```
 
-The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
 
 If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <full-head-sha>` with the full current head SHA written out.
 
