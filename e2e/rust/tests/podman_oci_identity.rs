@@ -258,8 +258,9 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     )
     .unwrap();
     assert_eq!(
-        workload_user, "0:0",
-        "the trusted rootless boundary starts as container root before dropping to the OCI identity"
+        workload_user,
+        format!("{OCI_UID}:{OCI_GID}"),
+        "the workload must start directly as the final OCI identity"
     );
     let supervisor_user = run_engine(
         &image.engine,

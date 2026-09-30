@@ -1454,8 +1454,6 @@ pub struct IsolationSpecInput<'a> {
     pub supervisor_bin: Option<&'a Path>,
     pub tls_secrets: Option<&'a [String; 3]>,
     pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Whether this workload is created by a rootless Podman service.
-    pub rootless: bool,
 }
 
 pub struct IsolationSpecs {
@@ -1507,44 +1505,19 @@ pub fn build_isolation_specs(
         .iter()
         .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
         .collect();
-    if input.rootless || input.identity.source == "default" {
-        // Podman's archive endpoint leaves named-volume contents owned by
-        // container root for rootless services and for a rootful USER-less
-        // image's newly-created workspace. Start the trusted runtime as root
-        // only long enough to chown the workspace, then irreversibly drop to
-        // the resolved workload identity before reading bootstrap material or
-        // accepting a control connection.
-        workload.command = vec![
-            "launch-capability-free".into(),
-            input.identity.uid.to_string(),
-            input.identity.gid.to_string(),
-            crate::isolation::BOOTSTRAP_PATH.into(),
-            driver_mounts::DEFAULT_WORKSPACE_ROOT.into(),
-        ];
-        workload.user = "0:0".into();
-        workload.groups.clear();
-        workload.cap_drop = vec!["ALL".into()];
-        workload.cap_add = vec![
-            "CHOWN".into(),
-            "SETGID".into(),
-            "SETUID".into(),
-            "SETPCAP".into(),
-        ];
-    } else {
-        workload.command = vec![
-            "--bootstrap".into(),
-            crate::isolation::BOOTSTRAP_PATH.into(),
-        ];
-        workload.user.clone_from(&user);
-        workload.groups = input
-            .identity
-            .supplementary_gids
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        workload.cap_drop = vec!["ALL".into()];
-        workload.cap_add.clear();
-    }
+    workload.command = vec![
+        "--bootstrap".into(),
+        crate::isolation::BOOTSTRAP_PATH.into(),
+    ];
+    workload.user.clone_from(&user);
+    workload.groups = input
+        .identity
+        .supplementary_gids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    workload.cap_drop = vec!["ALL".into()];
+    workload.cap_add.clear();
     workload.apparmor_profile = input
         .config
         .app_armor_profile
@@ -1842,7 +1815,6 @@ mod tests {
             supervisor_bin: None,
             tls_secrets: None,
             identity: &identity,
-            rootless: true,
         })
         .unwrap();
         for spec in [&specs.workload, &specs.supervisor] {
@@ -1850,21 +1822,14 @@ mod tests {
             assert!(spec.seccomp_profile_path.is_empty());
             assert!(spec.no_new_privileges);
         }
-        assert_eq!(specs.workload.user, "0:0");
-        assert!(specs.workload.groups.is_empty());
-        assert_eq!(
-            specs.workload.cap_add,
-            vec!["CHOWN", "SETGID", "SETUID", "SETPCAP"]
-        );
+        // The driver creates the managed workspace volume owned by the
+        // workload identity, so the workload never starts as root.
+        assert_eq!(specs.workload.user, "1000:1001");
+        assert_eq!(specs.workload.groups, vec!["2000"]);
+        assert!(specs.workload.cap_add.is_empty());
         assert_eq!(
             specs.workload.command,
-            vec![
-                "launch-capability-free",
-                "1000",
-                "1001",
-                crate::isolation::BOOTSTRAP_PATH,
-                driver_mounts::DEFAULT_WORKSPACE_ROOT,
-            ]
+            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         assert_eq!(specs.supervisor.user, "1000:1001");
         assert_eq!(specs.supervisor.groups, vec!["2000"]);
@@ -1893,7 +1858,7 @@ mod tests {
                 "sha256:image".into(),
             )
             .unwrap();
-        let rootful_specs = build_isolation_specs(IsolationSpecInput {
+        let default_specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &config,
             token_secret: Some("jwt"),
@@ -1906,19 +1871,13 @@ mod tests {
             supervisor_bin: None,
             tls_secrets: None,
             identity: &default_identity,
-            rootless: false,
         })
         .unwrap();
-        assert_eq!(rootful_specs.workload.user, "0:0");
+        assert_eq!(default_specs.workload.user, "1000:1000");
+        assert!(default_specs.workload.cap_add.is_empty());
         assert_eq!(
-            rootful_specs.workload.command,
-            vec![
-                "launch-capability-free",
-                "1000",
-                "1000",
-                crate::isolation::BOOTSTRAP_PATH,
-                driver_mounts::DEFAULT_WORKSPACE_ROOT,
-            ]
+            default_specs.workload.command,
+            vec!["--bootstrap", crate::isolation::BOOTSTRAP_PATH]
         );
         let workload_json = serde_json::to_string(&specs.workload).unwrap();
         assert!(workload_json.contains("\"apparmor_profile\":\"openshell-sandbox\""));

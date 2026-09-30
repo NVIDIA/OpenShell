@@ -43,7 +43,8 @@ stopped Podman container does not populate nested named volumes. Restart restore
 only the channel bootstrap into the existing channel volume, preserving the
 workspace. The workload starts before the supervisor so its user namespace exists
 when the supervisor joins it; a stopped supervisor resolves that namespace again
-on its next start.
+on its next start. The driver creates the managed workspace volume owned by
+the workload's final UID and GID, so the workload never starts as root.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
