@@ -191,6 +191,10 @@ pub struct ImageConfig {
     pub user: String,
     #[serde(default)]
     pub env: Vec<String>,
+    #[serde(default)]
+    pub working_dir: String,
+    #[serde(default)]
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// Whether a driver-owned volume has exactly the options `OpenShell` creates it
@@ -1226,12 +1230,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_image_reads_immutable_id_and_oci_user() {
+    async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project","Volumes":{"/workspace/project/cache":{}}}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -1245,6 +1249,20 @@ mod tests {
         assert_eq!(
             image.config.as_ref().map(|config| config.user.as_str()),
             Some("app:staff")
+        );
+        assert_eq!(
+            image
+                .config
+                .as_ref()
+                .map(|config| config.working_dir.as_str()),
+            Some("/workspace/project")
+        );
+        assert!(
+            image
+                .config
+                .as_ref()
+                .and_then(|config| config.volumes.as_ref())
+                .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
         );
         handle.await.expect("stub task should finish");
         assert_eq!(

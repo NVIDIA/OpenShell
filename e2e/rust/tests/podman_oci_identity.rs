@@ -10,7 +10,8 @@
 //! sandbox from its mutable tag, and verifies both the child identity and the
 //! image ID recorded on the real sandbox container. This exercises the Podman
 //! API inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries.
+//! serialization boundaries. Workspace behavior shared with Docker is covered
+//! by the `oci-image` feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
@@ -54,7 +55,16 @@ impl ImageGuard {
         let containerfile = context.path().join("Containerfile");
         std::fs::write(
             &containerfile,
-            format!("FROM {BASE_IMAGE}\nUSER {OCI_UID}:{OCI_GID}\n"),
+            format!(
+                r"FROM {BASE_IMAGE}
+USER 0:0
+RUN mkdir -p /home/app/project && \
+    chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
+    chmod 0700 /home/app /home/app/project
+WORKDIR /home/app/project
+USER {OCI_UID}:{OCI_GID}
+"
+            ),
         )
         .map_err(|err| format!("write Containerfile: {err}"))?;
 
@@ -260,7 +270,7 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     assert_eq!(
         workload_user,
         format!("{OCI_UID}:{OCI_GID}"),
-        "the workload must start directly as the final OCI identity"
+        "a custom OCI workspace must start directly as the final identity"
     );
     let supervisor_user = run_engine(
         &image.engine,
@@ -300,6 +310,8 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     .unwrap();
     assert!(!mounts.contains("/etc/openshell/tls"));
     assert!(!mounts.contains("/.openshell/supervisor"));
+    assert!(!mounts.lines().any(|path| path == "/home/app/project"));
+    assert!(!mounts.lines().any(|path| path == "/sandbox"));
     let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
     assert!(posture.contains("0000000000000000"));
 }
