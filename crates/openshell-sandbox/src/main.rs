@@ -1840,9 +1840,11 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
         .with(
-            OcsfShorthandLayer::new(std::io::stderr())
-                .with_non_ocsf(true)
-                .with_filter(console_filter),
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;

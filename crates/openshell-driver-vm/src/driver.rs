@@ -4171,16 +4171,6 @@ impl VmDriver {
                     || format!("{component} process exited"),
                     |code| format!("{component} process exited with status {code}"),
                 );
-                if component == "VM"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
-                        .expect("writing to String cannot fail");
-                }
                 if component == "host supervisor"
                     && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
@@ -4189,16 +4179,6 @@ impl VmDriver {
                     )
                 {
                     write!(message, "; supervisor stderr tail:\n{stderr}")
-                        .expect("writing to String cannot fail");
-                }
-                if component == "host supervisor"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
                         .expect("writing to String cannot fail");
                 }
                 if let Some(snapshot) = self
@@ -7515,6 +7495,63 @@ mod tests {
         assert!(status.conditions.iter().any(|condition| {
             condition.reason == "ProcessExited" && condition.status == "False"
         }));
+    }
+
+    #[tokio::test]
+    async fn process_exit_status_omits_guest_console_output() {
+        let running_child = || {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        for (component, child) in [
+            ("VM", spawn_exited_child()),
+            ("host supervisor", running_child()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("rootfs-console.log"), "agent output\n").unwrap();
+            std::fs::write(temp.path().join("supervisor.err.log"), "supervisor error\n").unwrap();
+            let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            let mut events = driver.events.subscribe();
+            insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
+
+            driver.monitor_sandbox("sb-exit".to_string()).await;
+
+            let condition = driver.registry.lock().await["sb-exit"]
+                .snapshot
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .find(|condition| condition.reason == "ProcessExited")
+                        .cloned()
+                })
+                .expect("ProcessExited condition");
+            let mut event_message = None;
+            while let Ok(event) = events.try_recv() {
+                if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload
+                    && let Some(event) = platform.event
+                    && event.reason == "ProcessExited"
+                {
+                    event_message = Some(event.message);
+                }
+            }
+            let event_message = event_message.expect("ProcessExited platform event");
+            for message in [&condition.message, &event_message] {
+                assert!(message.starts_with(&format!("{component} process exited")));
+                assert!(!message.contains("agent output"), "{component}: {message}");
+            }
+            if component == "host supervisor" {
+                assert!(condition.message.contains("supervisor error"));
+            }
+        }
     }
 
     #[tokio::test]

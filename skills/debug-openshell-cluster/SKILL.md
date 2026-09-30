@@ -240,6 +240,10 @@ errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 
+The sandbox container's log holds the sandbox runtime's warnings and the
+main process's stdout and stderr when it runs without a TTY. The supervisor
+container's log holds supervisor diagnostics.
+
 ```bash
 docker info
 docker ps --filter name=openshell

@@ -27,15 +27,14 @@ use tempfile::TempDir;
 #[test]
 fn startup_error_log_tails_fit_grpc_header_budget() {
     // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
-    // percent encoding. Preserve the final diagnostic from each container.
+    // percent encoding. Preserve the supervisor's final diagnostic.
     let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
     let message = format!(
-        "Docker supervisor exited before becoming ready{}{}",
+        "Docker supervisor exited before becoming ready{}",
         format_log_tail(&logs),
-        format_named_log_tail("sandbox log tail", &logs),
     );
-    assert_eq!(message.matches("[truncated]").count(), 2);
-    assert_eq!(message.matches("startup timed out").count(), 2);
+    assert_eq!(message.matches("[truncated]").count(), 1);
+    assert_eq!(message.matches("startup timed out").count(), 1);
     let response = Status::unavailable(message).into_http::<()>();
     let header_bytes: usize = response
         .headers()
