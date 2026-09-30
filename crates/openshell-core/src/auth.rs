@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC authentication interceptor shared by CLI and TUI.
+//! gRPC authentication helpers shared by the CLI, TUI, gateway, and sandbox
+//! backends.
 
 use miette::Result;
 
@@ -82,5 +83,52 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
             req.metadata_mut().insert("cookie", val.clone());
         }
         Ok(req)
+    }
+}
+
+/// Strip the `Bearer` authentication scheme from an `authorization` header
+/// value and return the credential that follows it.
+///
+/// The scheme is matched ASCII case-insensitively, as required by RFC 7235
+/// §2.1 and RFC 6750 §2.1, so `bearer`, `Bearer`, and `BEARER` are all
+/// accepted. Returns `None` when the value uses a different scheme or has no
+/// space separating the scheme from the credential. The credential is
+/// returned verbatim; callers remain responsible for validating it.
+#[must_use]
+pub fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    let (scheme, credential) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(credential)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_bearer_scheme;
+
+    #[test]
+    fn strip_bearer_scheme_accepts_any_scheme_case() {
+        for value in ["Bearer abc", "bearer abc", "BEARER abc", "bEaReR abc"] {
+            assert_eq!(strip_bearer_scheme(value), Some("abc"), "{value}");
+        }
+    }
+
+    #[test]
+    fn strip_bearer_scheme_rejects_other_schemes() {
+        for value in [
+            "Basic abc",
+            "Bearerabc",
+            "Bearer",
+            "",
+            "Bear abc",
+            "Bearers abc",
+        ] {
+            assert_eq!(strip_bearer_scheme(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn strip_bearer_scheme_returns_credential_verbatim() {
+        assert_eq!(strip_bearer_scheme("Bearer "), Some(""));
+        assert_eq!(strip_bearer_scheme("bearer  abc"), Some(" abc"));
+        assert_eq!(strip_bearer_scheme("bearer a b"), Some("a b"));
     }
 }

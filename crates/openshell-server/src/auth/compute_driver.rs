@@ -37,7 +37,7 @@ impl Authenticator for ComputeDriverAuthenticator {
         let Some(credential) = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(openshell_core::auth::strip_bearer_scheme)
         else {
             return Ok(None);
         };

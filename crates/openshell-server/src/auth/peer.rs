@@ -96,7 +96,7 @@ impl Authenticator for PeerServiceAccountAuthenticator {
         let Some(token) = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(openshell_core::auth::strip_bearer_scheme)
         else {
             return Ok(None);
         };

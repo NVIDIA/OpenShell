@@ -103,8 +103,7 @@ impl SandboxProtocolAuthenticator {
         let value = value
             .to_str()
             .map_err(|_| SandboxAuthError::InvalidBearer)?;
-        let token = value
-            .strip_prefix("Bearer ")
+        let token = openshell_core::auth::strip_bearer_scheme(value)
             .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
             .ok_or(SandboxAuthError::InvalidBearer)?;
         let session = self.verifier.verify(token)?;
@@ -457,6 +456,40 @@ mod tests {
             authenticator.authenticate(SandboxConnectionId::new(), &duplicate),
             Err(SandboxAuthError::DuplicateBearer)
         );
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let (authenticator, token) = fixture(1);
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut metadata = MetadataMap::new();
+            metadata.insert(
+                "authorization",
+                format!("{scheme} {}", token.token.expose_secret())
+                    .parse()
+                    .expect("metadata value"),
+            );
+            assert!(
+                authenticator
+                    .authenticate(SandboxConnectionId::new(), &metadata)
+                    .is_ok(),
+                "{scheme} scheme should authenticate"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_rejects_empty_or_whitespace_tokens() {
+        let (authenticator, _token) = fixture(1);
+        for value in ["bearer ", "BEARER  x", "bearer a b", "Basic abc"] {
+            let mut metadata = MetadataMap::new();
+            metadata.insert("authorization", value.parse().expect("metadata value"));
+            assert_eq!(
+                authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+                Err(SandboxAuthError::InvalidBearer),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

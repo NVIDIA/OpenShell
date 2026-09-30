@@ -894,7 +894,7 @@ impl Authenticator for OidcAuthenticator {
         let Some(token) = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(openshell_core::auth::strip_bearer_scheme)
         else {
             return Ok(None);
         };
@@ -1456,6 +1456,34 @@ mod tests {
         assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
         assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
         assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn authenticator_accepts_case_insensitive_bearer_scheme() {
+        let server = wiremock::MockServer::start().await;
+        let cache = Arc::new(cache_with_mock_issuer(&server).await);
+        let authenticator = OidcAuthenticator::new(cache);
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            TEST_KID,
+        );
+
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "authorization",
+                http::HeaderValue::from_str(&format!("{scheme} {token}")).unwrap(),
+            );
+            let principal = authenticator
+                .authenticate(&headers, "/openshell.v1.OpenShell/ListSandboxes")
+                .await
+                .expect("a correctly signed token must be accepted")
+                .unwrap_or_else(|| panic!("{scheme} scheme must be recognized"));
+            let Principal::User(UserPrincipal { identity }) = principal else {
+                panic!("expected a user principal");
+            };
+            assert_eq!(identity.subject, "user-42");
+        }
     }
 
     #[tokio::test]
