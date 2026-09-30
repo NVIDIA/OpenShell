@@ -275,7 +275,7 @@ The client-certificate handshake policy has no `require_client_auth` TOML field.
 
 `[openshell.gateway.gateway_jwt] ttl_secs` controls generation-bound gateway-facing and Sandbox Protocol credentials minted for a sandbox session, plus typed extension JWTs. Omit it for non-expiring local sandbox session credentials: both session tokens carry `exp = 0`, supervisors skip periodic session-token renewal, and refresh responses omit their expiration timestamps. Typed extension JWTs retain a 900-second default when the field is omitted. Use omission only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
-Listener TLS and sandbox launch signing use separate keys. A working HTTPS listener or mTLS client certificate does not supply the signing key needed to start a VM sandbox. Configure `signing_key_path`, `public_key_path`, `kid_path`, and `gateway_id` in `[openshell.gateway.gateway_jwt]`, as shown above. For a local installation, `openshell-gateway generate-certs` writes a signing bundle alongside the TLS bundle. Without explicit `gateway_jwt` configuration, the gateway discovers `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under `OPENSHELL_LOCAL_TLS_DIR`, or under the OpenShell state directory's `tls/` directory when that variable is unset. Explicit signing configuration takes precedence over local discovery.
+Listener TLS and sandbox launch signing use separate keys. A working HTTPS listener or mTLS client certificate does not supply the signing key needed to start a VM sandbox. Configure `signing_key_path`, `public_key_path`, `kid_path`, and `gateway_id` in `[openshell.gateway.gateway_jwt]`, as shown above. For a local installation, `openshell-gateway generate-certs --output-dir <tls-dir>` writes a signing bundle alongside the TLS bundle. Without explicit `gateway_jwt` configuration, the gateway discovers `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under `OPENSHELL_LOCAL_TLS_DIR`, or under the OpenShell state directory's `tls/` directory when that variable is unset. Explicit signing configuration takes precedence over local discovery.
 
 The gateway rejects partial or invalid signing bundles at startup, including private and public keys that do not match. When the selected driver requires launch signing and no bundle is configured, sandbox creation fails before the driver validates or prepares the sandbox. The error names the signing configuration and discovery location; it does not print keys or tokens. The VM driver also validates launch material before resolving images or creating sandbox state.
 
@@ -1134,6 +1134,8 @@ runtime-selected profile.
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
 
+The example uses explicit launch-signing paths. Point them at an existing signing bundle, or omit the `gateway_jwt` table to use local discovery. Listener and guest TLS certificates do not supply these signing credentials.
+
 ```toml
 [openshell]
 version = 2
@@ -1145,6 +1147,13 @@ log_level       = "info"
 compute_driver = "vm"
 # Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/var/lib/openshell/guest-tls/ca.pem"
+
+# Sandbox launch signing is separate from listener and guest TLS.
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/etc/openshell/jwt/signing.pem"
+public_key_path  = "/etc/openshell/jwt/public.pem"
+kid_path         = "/etc/openshell/jwt/kid"
+gateway_id       = "openshell"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
@@ -1213,6 +1222,15 @@ overlay_disk_mib = 4096
 # rootfs_tar_max_bytes = 10737418240
 ```
 
+To generate a local bundle for discovery, run these commands in fish and retain the same environment when starting the gateway:
+
+```shell
+set -gx OPENSHELL_LOCAL_TLS_DIR ~/.local/state/openshell/tls
+openshell-gateway generate-certs --output-dir "$OPENSHELL_LOCAL_TLS_DIR"
+```
+
+The command also installs local CLI mTLS credentials. For explicit signing configuration, set the example's signing paths to `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` under that directory. The gateway loads those paths in preference to local discovery.
+
 Rootfs tar staging requires the gateway and the VM driver to share a filesystem
 and run as the same user. That holds for the managed VM driver, which the
 gateway starts as a subprocess. If you point `compute_driver_endpoints` at an
@@ -1251,6 +1269,8 @@ openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
 Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
+
+Config preflight validates configuration without loading launch-signing keys, so a successful result does not confirm that the key files exist or form a usable pair. Gateway startup validates configured or discovered signing bundles. Sandbox creation checks the selected driver's launch-signing requirement before image preparation.
 
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
