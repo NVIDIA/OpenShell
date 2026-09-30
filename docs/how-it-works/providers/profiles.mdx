@@ -117,10 +117,12 @@ This keeps one source of credential-binding authority for each provider.
 `credential_binding` is sandbox-scoped and is not accepted in a gateway-global
 policy.
 
-For AWS endpoints, the binding and signing fields have separate jobs.
+For signed endpoints, the binding and signing fields have separate jobs.
 `credential_binding.provider` selects the provider instance that supplies
 credentials. `credential_signing`, `signing_service`, and `signing_region`
-control how the proxy applies those credentials:
+control how the proxy applies those credentials. AWS endpoints use the `sigv4`
+modes with a `signing_service`; Oracle Cloud Infrastructure endpoints use
+`credential_signing: oci`, which needs no service name:
 
 ```yaml showLineNumbers={false}
 network_policies:
@@ -139,12 +141,14 @@ network_policies:
 
 The binding applies to CONNECT and forward-proxy HTTP requests, including
 headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
-request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
+request bodies, AWS SigV4 and OCI request signing, and opted-in WebSocket text
+messages. Raw
 `tls: skip` and non-HTTP tunnels do not perform static credential substitution.
 
 Before it activates a sandbox policy, OpenShell verifies that every endpoint
-with `credential_signing` has an attached profile that declares
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. An endpoint-bearing profile must
+with `credential_signing` has an attached profile that declares the scheme's
+credentials: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for the `sigv4`
+modes, or `OCI_KEY_ID` and `OCI_PRIVATE_KEY` for `oci`. An endpoint-bearing profile must
 cover the signed host, port, and path. An endpointless profile must be selected
 by `credential_binding.provider` on that endpoint. A missing or mismatched
 source rejects the whole policy update with `FAILED_PRECONDITION`.
