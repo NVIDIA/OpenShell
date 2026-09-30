@@ -498,12 +498,40 @@ the live gateway pods. Deployment-backed gateway pods should also publish
 token-file convention used by `OPENSHELL_SANDBOX_TOKEN_FILE` and
 `OPENSHELL_K8S_SA_TOKEN_FILE`.
 
-For TLS-enabled gateways, peer clients verify the stable gateway Service DNS
-name and load the chart CA plus client identity from
-`OPENSHELL_PEER_TLS_CA_FILE`, `OPENSHELL_PEER_TLS_CERT_FILE`, and
-`OPENSHELL_PEER_TLS_KEY_FILE`. If peer calls fail during TLS negotiation, verify
-the `peer-client-tls` volume exists, those files are readable, and the server
-certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
+Gateways on PostgreSQL require TLS between peers. Peer clients trust only
+the CA in `OPENSHELL_PEER_TLS_CA_FILE` (the chart mounts `ca.crt` from the
+server TLS Secret at `/etc/openshell-tls/server/ca.crt`), verify the stable
+gateway Service DNS name in `OPENSHELL_PEER_TLS_SERVER_NAME`, and present
+`OPENSHELL_PEER_TLS_CERT_FILE` and `OPENSHELL_PEER_TLS_KEY_FILE` when the
+gateway requires client certificates. At startup, each gateway also checks
+that its own server certificate chains to that CA and carries that name. A
+gateway that serves plaintext accepts plaintext peers only with
+`OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT=true` (Helm
+`server.peer.allowInsecureTransport=true`) and then logs
+`gateway peer plaintext transport is enabled` at every startup. If the gateway
+exits at startup or peer calls fail during TLS negotiation, check the peer
+environment, the CA, and the server certificate names:
+
+```bash
+kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o yaml \
+  | grep -A1 -E 'name: OPENSHELL_PEER_(ENDPOINT|TLS_CA_FILE|TLS_SERVER_NAME|ALLOW_INSECURE_TRANSPORT)$'
+kubectl -n openshell get secret openshell-server-tls \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/peer-ca.crt
+kubectl -n openshell get secret openshell-server-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/peer-server.crt
+openssl verify -CAfile /tmp/peer-ca.crt -untrusted /tmp/peer-server.crt /tmp/peer-server.crt
+openssl x509 -in /tmp/peer-server.crt -noout -ext subjectAltName
+kubectl -n openshell logs "${GATEWAY_DEPLOYMENT}" -c openshell-gateway --tail=200 \
+  | grep -E 'gateway peer|OPENSHELL_PEER_'
+```
+
+`openssl verify` must print `OK`, which means the server certificate (with any
+intermediates carried in `tls.crt`) chains to `ca.crt`, and the subject
+alternative names must include the `OPENSHELL_PEER_TLS_SERVER_NAME`
+value. Most peer transport startup errors end with a link to the published
+gateway configuration reference. See the published
+[High Availability guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability.md)
+for custom TLS Secrets and ingress TLS termination.
 
 Check required Helm deployment secrets:
 
@@ -970,11 +998,19 @@ credential failures.
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
-| HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
+| HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | SQLite gateway: set `server.disableTls=true` so Envoy forwards plaintext to the pod. PostgreSQL gateway: keep pod TLS and set `grpcRoute.backendTLSPolicy.enabled=true` with `server.tls.enableMtls=false` (see the peer transport rows below). Verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
 | Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
 | Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `server.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
+| Gateway exits at startup with `is plaintext, but peer routing (PostgreSQL store with a peer endpoint) requires https` or `is plaintext but this gateway serves TLS`, or `helm install`/`helm upgrade` fails with `server.disableTls=true with PostgreSQL` | A gateway on PostgreSQL (`server.externalDbSecret` or a `postgres://` or `postgresql://` `server.dbUrl`) runs with `server.disableTls=true`, often to let an HTTPS ingress terminate TLS, so peer traffic would be plaintext. The second message means `OPENSHELL_PEER_ENDPOINT` was overridden with `http://` on a TLS gateway | Existing plaintext release: set `server.peer.allowInsecureTransport=true` to keep its behavior on a trusted network; turning gateway TLS on in place strands existing sandboxes. New install: keep gateway TLS, or re-encrypt at the proxy through an HTTPS listener (`grpcRoute.backendTLSPolicy.enabled=true` with `server.tls.enableMtls=false`) |
+| Gateway exits at startup with `OPENSHELL_PEER_TLS_CA_FILE is required to dial https gateway peers`, `gateway peer TLS CA ... is unusable`, or `contains no usable CA certificates` | The server TLS Secret (`server.tls.certSecretName`) has no `ca.crt`, or it holds no PEM certificate. `kubectl create secret tls` omits `ca.crt` | `kubectl -n openshell get secret <server-tls-secret> -o jsonpath='{.data}'`; recreate the Secret with `tls.crt`, `tls.key`, and `ca.crt` |
+| Gateway exits at startup with `would fail peer verification` | The server certificate in `tls.crt` is not signed by the CA in `ca.crt`, or its subject alternative names lack the `OPENSHELL_PEER_TLS_SERVER_NAME` value (the gateway Service DNS name). When the message names `external_server_names`, the peer server name selects the external certificate by SNI, and that certificate must also chain to that CA | Reissue the server certificate from that CA with the Service DNS name, then update the Secret |
+| Gateway exits at startup with `must be configured together`, `gateway peer TLS client identity ... is unusable`, `do not match`, or `the gateway listener requires client certificates` | Only one of the peer client certificate and key is configured, or the client TLS Secret does not parse or its key does not match the certificate. The last message means the listener requires client certificates (a client CA without OIDC) but no peer client certificate and key are configured | Inspect the `peer-client-tls` volume and the Secret named by `server.tls.clientTlsSecretName` |
+| Exec, forwarding, or file transfer through some gateway replicas fails with `UNAVAILABLE` (`supervisor session not connected` after about 15 seconds), and gateway logs show `gateway peer connection failed:` with a TLS cause such as `invalid peer certificate: UnknownIssuer` or `certificate not valid for name` | Replicas mount different server TLS material, for example during a Secret rotation, or the owner's server certificate expired (its gateway logs `outside its validity period` at startup) | Make every replica mount the same current server TLS Secret; renew expired certificates and restart the gateway pods |
+| Exec, forwarding, or file transfer fails immediately with `gateway peer transport refused a plaintext http:// peer endpoint` | The owner replica advertises an `http://` peer endpoint, for example an old pod while a release moves from `server.disableTls=true` to TLS | Let the rollout finish; confirm every pod's `OPENSHELL_PEER_ENDPOINT` uses `https://` |
+| Gateway logs `gateway peer plaintext transport is enabled` at every startup, or `gateway peer insecure transport opt-out is ignored` | `server.peer.allowInsecureTransport=true` keeps plaintext peers. The second message means `OPENSHELL_PEER_ALLOW_INSECURE_TRANSPORT` is set directly on a gateway that serves TLS, where it has no effect; the chart does not render it when TLS is on | Expected only on trusted networks; enable gateway TLS and remove the setting |
+| `openshell logs` misses lines or events on a multi-replica gateway | Sandbox log buffers are replica-local, so each replica returns only what reached it | Known limitation; read logs again or check gateway pod logs on each replica |
 
 ## Reporting
 

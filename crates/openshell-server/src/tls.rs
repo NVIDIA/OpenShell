@@ -281,7 +281,7 @@ struct DualCertResolver {
 /// Supports exact matches and single-level wildcard matches per RFC 6125:
 /// `*.example.com` matches `foo.example.com` but not `bar.foo.example.com`
 /// or `example.com` itself.
-fn sni_matches(pattern: &str, sni: &str) -> bool {
+pub fn sni_matches(pattern: &str, sni: &str) -> bool {
     pattern.strip_prefix("*.").map_or(pattern == sni, |suffix| {
         // Wildcard: SNI must have exactly one label before the suffix.
         // e.g. "foo." for "foo.example.com" against "*.example.com"
@@ -311,7 +311,7 @@ impl std::fmt::Debug for DualCertResolver {
 }
 
 /// Build a `CertifiedKey` from certificate and key file paths.
-fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
+pub fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let signing_key = sign::any_supported_type(&key)
@@ -433,7 +433,7 @@ fn build_server_config(
 }
 
 /// Load certificates from a PEM file.
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file =
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);
@@ -450,7 +450,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Load a private key from a PEM file.
-fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).map_err(|e| Error::tls(format!("failed to open key file: {e}")))?;
     let mut reader = BufReader::new(file);
 

@@ -28,6 +28,8 @@ An HA gateway deployment requires:
 - PostgreSQL reachable from every gateway pod.
 - A Kubernetes Secret in the OpenShell namespace with the PostgreSQL connection
   URI in a key named `uri`.
+- Gateway TLS on every replica, which the chart enables by default. Refer to
+  [Secure Peer Transport](#secure-peer-transport).
 - `workload.kind: deployment`. The default StatefulSet and per-pod SQLite
   database are intended for a single gateway replica.
 - An ingress or load balancer that routes clients to the gateway Service. Refer
@@ -98,6 +100,124 @@ The chart shares its retained sandbox JWT signing material, TLS material, and
 default credential-storage encryption key across the gateway pods. Do not
 create different copies of those Secrets for individual replicas.
 
+## Secure Peer Transport
+
+Gateway replicas relay sandbox traffic to each other through the same listener
+that serves clients, so peer traffic is only as protected as that listener.
+Every gateway on PostgreSQL routes to peers, even with one replica, and peer
+routing requires TLS. Unless you set the plaintext opt-out described below, a
+gateway refuses to start with a plaintext peer endpoint, and each replica
+refuses to dial a plaintext peer.
+
+Every peer connection must pass three checks:
+
+- The owner's server certificate chains to the peer CA, which the chart reads
+  from `ca.crt` in the server TLS Secret. Peers never use platform trust roots.
+- The certificate carries the gateway Service DNS name,
+  `<fullname>.<namespace>.svc.cluster.local` (for the install above,
+  `openshell.openshell.svc.cluster.local`), as a subject alternative name.
+  Peers verify that name while connecting to individual pods.
+- The caller presents its pod-bound ServiceAccount token, plus the chart client
+  certificate when the gateway requires client certificates.
+
+Each gateway also checks at startup that its own server certificate passes the
+first two checks. Refer to
+[Gateway Configuration](/how-it-works/gateways/configuration#peer-transport-contract)
+for the underlying settings and startup errors.
+
+### Chart-Generated Certificates
+
+The default `pkiInitJob` and the cert-manager integration issue certificates
+that pass these checks, and the chart configures the peer settings for you.
+With `certManager.serverIssuerRef`, peers still receive the internal
+certificate because they connect with the internal Service name.
+
+### Custom TLS Secrets
+
+When you disable both `pkiInitJob` and `certManager` and supply your own
+Secrets, the Secret named by `server.tls.certSecretName` must contain these
+keys:
+
+- `tls.crt` and `tls.key` for a server certificate whose subject alternative
+  names include the gateway Service DNS name.
+- `ca.crt` with the CA that signs that certificate.
+
+`kubectl create secret tls` does not add `ca.crt`. Create the Secret with all
+three keys instead:
+
+```shell
+kubectl -n openshell create secret generic openshell-server-tls \
+  --type=kubernetes.io/tls \
+  --from-file=tls.crt=server.crt \
+  --from-file=tls.key=server.key \
+  --from-file=ca.crt=ca.crt
+```
+
+When client certificates are required, peers present the certificate from the
+Secret named by `server.tls.clientTlsSecretName`, so it must be signed by the
+client CA. That certificate only completes the handshake; the ServiceAccount
+token identifies the peer.
+
+Compare the name that peers verify with the names on the server certificate:
+
+```shell
+kubectl -n openshell get deployment openshell \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_TLS_SERVER_NAME")].value}{"\n"}'
+kubectl -n openshell get secret openshell-server-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -ext subjectAltName
+```
+
+A gateway whose server Secret lacks a usable `ca.crt`, or whose certificate
+does not chain to it or lacks the Service DNS name, stops at startup with
+`contains no usable CA certificates`, `gateway peer TLS CA ... is unusable`, or
+`would fail peer verification`.
+
+### TLS Termination at the Ingress
+
+The HTTPS termination example in [Ingress](/kubernetes/ingress) sets
+`server.disableTls=true`, which also makes peer traffic plaintext. The chart
+rejects `server.disableTls=true` for a gateway on PostgreSQL. Keep TLS on the
+gateway pods and have the proxy re-encrypt instead, with an HTTPS Gateway
+listener and
+[BackendTLSPolicy](/kubernetes/ingress#end-to-end-tls-backendtlspolicy).
+BackendTLSPolicy requires `server.tls.enableMtls=false`, so peers then use
+one-way TLS and rely on the ServiceAccount token for identity. On OpenShift, a
+passthrough Route (`openshiftRoute.enabled=true`) also keeps TLS on the gateway
+pods; refer to
+[OpenShift](/kubernetes/openshift#end-to-end-tls-using-pass-through-route-all-openshift-versions).
+
+<Warning>
+When every network path between gateway pods is trusted, you can keep
+plaintext peers by setting `server.peer.allowInsecureTransport=true` together
+with `server.disableTls=true`. Peer tokens and relayed exec, file transfer, and
+forwarding traffic then cross the pod network unencrypted. Anyone who captures
+a peer token can call peer RPCs until the token expires or its pod is deleted,
+for up to one hour. Each gateway logs a warning at every startup while the
+setting is active. The setting has no effect when the gateway serves TLS.
+</Warning>
+
+### Upgrade an Existing Release
+
+The transport requirement applies to every release that uses PostgreSQL
+through `server.externalDbSecret` or a `postgres://` or `postgresql://`
+`server.dbUrl`, including
+single-replica releases:
+
+- Releases that use chart-generated certificates with TLS enabled upgrade
+  without changes.
+- Releases that use custom TLS Secrets need `ca.crt` in the server Secret, and
+  a server certificate signed by it that carries the Service DNS name, before
+  the upgrade.
+- Releases that set `server.disableTls=true` fail to render until you set
+  `server.peer.allowInsecureTransport=true`, which keeps the previous
+  behavior. Do not turn on gateway TLS in the same upgrade.
+
+Enabling gateway TLS on a release that ran with `server.disableTls=true`
+strands its existing sandboxes. Each sandbox pod keeps the plaintext gateway
+endpoint it received at creation and has no CA to verify the gateway, so its
+supervisor cannot reconnect. Recreate those sandboxes after the upgrade, or
+make the change during a maintenance window.
+
 ## Verify the Deployment
 
 Wait for all gateway replicas to become ready:
@@ -153,6 +273,77 @@ Apply the manifest separately from the OpenShell chart. Match the namespace and
 release labels to your installation. A PodDisruptionBudget controls voluntary
 evictions; it does not protect against an unavailable node or failure domain.
 
+## Supported Operations
+
+Any gateway replica accepts every operation below. The replica that holds a
+sandbox's supervisor session is its owner. The routing column shows how a
+replica that is not the owner serves the operation:
+
+- Relay: the replica streams the traffic to the owner over a peer relay.
+- Owner RPC: the replica forwards a single call to the owner.
+- Shared: the replica reads and writes PostgreSQL and does not involve the
+  owner.
+- Local: the replica answers from its own memory only.
+
+| Operation | CLI commands | Routing | Through a non-owner replica | After an interruption | HA tests |
+|---|---|---|---|---|---|
+| Sandbox lifecycle and watch | `sandbox create`, `get`, `list`, `delete` | Shared | Supported. Watches see changes from other replicas within about a second. | Reopen watches that passed through a stopped pod. | `sandbox create`, `get`, `delete` |
+| Command execution | `sandbox exec`, with or without a terminal | Relay | Supported. | The command's stream ends. Run the command again. | Yes, without a terminal |
+| SSH sessions | `sandbox connect`, IDE and `ssh` access | Relay | Supported. | `sandbox connect` reattaches to the same main process and retries transport failures for up to 60 seconds. Run it again if it exits while the sandbox is not `Ready`. | No |
+| File transfer | `sandbox upload`, `sandbox download` | Relay | Supported. | The CLI restarts the transfer with a new SSH session. | Yes |
+| SSH port forwarding | `forward start` | Relay | Supported. | The forward stops. Start it again. | Yes |
+| TCP service forwarding | `forward service` | Relay | Supported. | Open connections close. Each new local connection opens a new relay. | Yes |
+| Sandbox service URLs | HTTP requests to exposed services | Relay | Supported. | Replayable requests are retried once. WebSocket connections close. | No |
+| Policy and settings updates | `policy set`, `policy update --wait`, `settings set` | Shared | Supported. Supervisors pick up changes through the replica they are connected to. | `--wait` keeps polling until the supervisor reports the new revision. | `policy update --wait` |
+| Provider attachment and readiness | `sandbox provider attach --wait`, `sandbox provider status` | Shared and owner RPC | Supported. Credential refresh uses shared state. | Readiness returns to pending until the supervisor reports again to its new owner; `--wait` keeps polling. | Yes |
+| Tool endpoint status | Status of MCP endpoints declared in policy | Owner RPC | Supported. | The status resets when the supervisor reconnects. | Gateway unit tests |
+| Sandbox logs and events | `logs`, the log view of `sandbox create` and the terminal UI | Local | Partial. Each replica returns only the log lines and events that reached it. | Lines held by a stopped replica are lost. A resume cursor from another replica fails with `OUT_OF_RANGE`. | No |
+
+After a sandbox's main process exits, only the owner accepts new SSH, file
+transfer, and forwarding sessions; other replicas return `FAILED_PRECONDITION`
+with the message `sandbox is not ready`.
+
+Sandbox logs are a known limitation of multi-replica gateways. The sandbox
+supervisor sends its logs to whichever replica its log connection reaches,
+which can differ from the owner and from the replica that serves `logs`.
+Platform events come from the replica that runs the sandbox reconciler. Until
+log storage is shared, `logs` through one replica can miss lines and events,
+and followed logs stop when the serving replica stops.
+
+### During Scaling and Replacement
+
+Gateway changes affect operations by routing type:
+
+- Scale-up: new replicas own no sessions and relay to the existing owners.
+  Nothing moves, and running operations are unaffected.
+- Scale-down or deletion of a non-owner pod: streams that pass through the
+  stopped pod end. New requests go to the remaining replicas.
+- Graceful loss of the owner, such as `kubectl delete pod` or a scale-down that
+  removes it: the sandbox reports `Provisioning` until its supervisor reconnects
+  to another replica. New relay requests fail with `FAILED_PRECONDITION` and
+  the message `sandbox is not ready`, and service URLs return `412`, until the
+  sandbox is `Ready` again. Requests already routed wait up to 15 seconds for
+  the supervisor.
+- Forced loss of the owner, such as a force-deleted pod or a failed node: new
+  requests fail or retry until the supervisor reconnects to another replica,
+  then succeed.
+- Rolling replacement: each pod stops in turn, so every sandbox goes through
+  at least one graceful owner loss, more if its supervisor reconnects to a pod
+  that has not been replaced yet.
+
+Shared operations keep working through every event; retry any request whose
+connection passed through a stopped pod. Established relay streams never move
+between replicas.
+
+The HA end-to-end operation test keeps one sandbox running while two gateway
+replicas that serve TLS and mTLS scale to three and back, lose the sandbox's
+owner through a graceful and a forced pod deletion, and complete a rolling
+restart. After each step it waits until the sandbox is `Ready` again, then runs
+a subset of the operations marked in the table through a replica that does not
+own the sandbox. Every marked operation runs after at least one step, relay and
+owner RPC operations cross an HTTPS peer connection, and shared operations do
+not involve the owner. No operation is in flight while a step runs.
+
 ## How Peer Routing Works
 
 A sandbox supervisor keeps one active control stream to one gateway replica.
@@ -164,8 +355,9 @@ Service.
 Peer RPCs use a projected, pod-bound ServiceAccount token with the
 `openshell-gateway-peer` audience. The receiving gateway validates the token
 with the Kubernetes TokenReview API, verifies the live pod identity and release
-labels, and authorizes only peer methods. When gateway TLS is enabled, peer
-connections also use the chart's TLS materials.
+labels, and authorizes only peer methods. Peer connections use TLS and trust
+only the peer CA, unless you set the plaintext opt-out. Refer to
+[Secure Peer Transport](#secure-peer-transport).
 
 You do not need session affinity at the ingress or client-facing Service.
 

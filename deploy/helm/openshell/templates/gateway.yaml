@@ -19,7 +19,7 @@ spec:
       {{- fail "grpcRoute.gateway.listener.tls.certificateRefs is required when grpcRoute.gateway.listener.protocol is HTTPS" }}
       {{- end }}
       {{- if and (not .Values.server.disableTls) (not .Values.grpcRoute.backendTLSPolicy.enabled) }}
-      {{- fail "grpcRoute.gateway.listener.protocol=HTTPS terminates TLS at the Gateway listener. Either set server.disableTls=true so the pod listens plaintext, or enable grpcRoute.backendTLSPolicy for end-to-end TLS re-encryption to the gateway pod." }}
+      {{- fail "grpcRoute.gateway.listener.protocol=HTTPS terminates TLS at the Gateway listener. Either enable grpcRoute.backendTLSPolicy (with server.tls.enableMtls=false) for end-to-end TLS re-encryption to the gateway pod, or, without PostgreSQL, set server.disableTls=true so the pod listens plaintext." }}
       {{- end }}
       tls:
         mode: Terminate

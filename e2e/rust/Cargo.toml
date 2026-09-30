@@ -154,6 +154,11 @@ path = "tests/kubernetes_ha_rebalancing.rs"
 required-features = ["e2e-kubernetes-ha"]
 
 [[test]]
+name = "kubernetes_ha_operations"
+path = "tests/kubernetes_ha_operations.rs"
+required-features = ["e2e-kubernetes-ha"]
+
+[[test]]
 name = "kubernetes_corporate_proxy"
 path = "tests/kubernetes_corporate_proxy.rs"
 required-features = ["e2e-kubernetes"]
