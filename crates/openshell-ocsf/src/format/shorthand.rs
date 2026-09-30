@@ -50,12 +50,16 @@ pub fn severity_char(severity_id: u8) -> char {
 #[must_use]
 pub fn severity_tag(severity_id: u8) -> &'static str {
     match severity_id {
+        1 => "[INFO]",
         2 => "[LOW]",
         3 => "[MED]",
         4 => "[HIGH]",
         5 => "[CRIT]",
         6 => "[FATAL]",
-        _ => "[INFO]",
+        // Unknown (0), Other (99), and any unrecognized byte are unclassified;
+        // matching the blank `severity_char`, so tag them distinctly from
+        // Informational instead of silently folding them into it.
+        _ => "[UNK]",
     }
 }
 
@@ -600,6 +604,26 @@ mod tests {
         assert_eq!(severity_char(4), 'H');
         assert_eq!(severity_char(5), 'C');
         assert_eq!(severity_char(6), 'F');
+    }
+
+    #[test]
+    fn test_severity_tag_mapping() {
+        // #3886: Unknown (0) and Other (99) must not fold into [INFO], must be
+        // identical to each other, and must match the blank rendering of the two
+        // sibling helpers so the three helpers can't drift apart again.
+        assert_eq!(severity_tag(0), "[UNK]");
+        assert_eq!(severity_tag(99), "[UNK]");
+        assert_ne!(severity_tag(0), severity_tag(1));
+        assert_eq!(severity_tag(0), severity_tag(99));
+        assert_eq!(severity_char(0), ' ');
+        assert_eq!(severity_char(99), ' ');
+        // 1..=6 keep their existing tags so current log consumers are unaffected.
+        assert_eq!(severity_tag(1), "[INFO]");
+        assert_eq!(severity_tag(2), "[LOW]");
+        assert_eq!(severity_tag(3), "[MED]");
+        assert_eq!(severity_tag(4), "[HIGH]");
+        assert_eq!(severity_tag(5), "[CRIT]");
+        assert_eq!(severity_tag(6), "[FATAL]");
     }
 
     #[test]
