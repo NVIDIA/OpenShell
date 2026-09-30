@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run OCI image feature tests
+  hosts: all
+  gather_facts: false
+  vars:
+    oci_image_test_root: /var/lib/openshell-oci-image/tests
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
+
+    # Tests build images into the store the gateway reads. Rootful Podman's
+    # store belongs to root, so the unprivileged test user builds through sudo.
+    - name: Select the gateway's container engine command
+      ansible.builtin.set_fact:
+        oci_image_container_engine: >-
+          {{ 'docker' if tmachine_container_runtime_name == 'docker'
+             else 'podman' if tmachine_container_runtime_is_rootless
+             else 'sudo -n podman' }}
+
+    - name: Create OCI image test directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ oci_image_test_root }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Extract OCI image test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ oci_image_test_bundle }}"
+        dest: "{{ oci_image_test_root }}"
+        owner: tmachine
+        group: tmachine
+
+    - name: Check OCI image nextest archive
+      ansible.builtin.stat:
+        path: "{{ oci_image_test_root }}/tests.tar.zst"
+      register: oci_image_archive
+
+    - name: Require OCI image nextest archive
+      ansible.builtin.assert:
+        that:
+          - oci_image_archive.stat.isreg | default(false)
+        fail_msg: OCI image test bundle did not contain tests.tar.zst
+
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
+    - name: Run OCI image archive
+      ansible.builtin.command:
+        argv:
+          - cargo-nextest
+          - nextest
+          - run
+          - --archive-file
+          - "{{ oci_image_test_root }}/tests.tar.zst"
+          - --workspace-remap
+          - "{{ oci_image_test_root }}"
+          - --no-capture
+          # The guest has 4 GiB; keep sandbox creates from competing for it.
+          - --test-threads
+          - "1"
+          - --no-fail-fast
+      environment:
+        HOME: /home/tmachine
+        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+        OPENSHELL_TEST_CONTAINER_ENGINE: "{{ oci_image_container_engine }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
+      register: oci_image_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show OCI image diagnostics
+      ansible.builtin.debug:
+        var: oci_image_result
+      when: oci_image_result.rc != 0
+
+    - name: Read OpenShell gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --no-pager
+          - --lines
+          - "500"
+          - _SYSTEMD_UNIT=openshell-gateway.service
+          - "+"
+          - _SYSTEMD_USER_UNIT=openshell-gateway.service
+      register: openshell_gateway_logs
+      changed_when: false
+      failed_when: false
+      when: oci_image_result.rc != 0
+
+    - name: Show OpenShell gateway logs
+      ansible.builtin.debug:
+        var: openshell_gateway_logs.stdout_lines
+      when: oci_image_result.rc != 0
+
+    - name: Require OCI image success
+      ansible.builtin.assert:
+        that:
+          - oci_image_result.rc == 0
+        fail_msg: OCI image feature tests failed
