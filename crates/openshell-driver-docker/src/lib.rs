@@ -6559,10 +6559,12 @@ fn default_docker_supervisor_grpc_endpoint(
     format!("{scheme}://{host}:{gateway_port}")
 }
 
+/// Docker Desktop reports `OperatingSystem` as `Docker Desktop`, or with a
+/// variant suffix such as `Docker Desktop (containerized)` (4.71, WSL 2).
 fn docker_info_reports_docker_desktop(info: &SystemInfo) -> bool {
     info.operating_system
         .as_deref()
-        .is_some_and(|os| os.trim().eq_ignore_ascii_case("docker desktop"))
+        .is_some_and(|os| os.trim().to_ascii_lowercase().starts_with("docker desktop"))
 }
 
 /// Whether the gateway process itself runs inside WSL. This is about the

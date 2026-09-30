@@ -2972,6 +2972,15 @@ fn docker_supervisor_network_uses_host_alias_for_wsl_gateway_on_docker_desktop()
         DockerSupervisorNetwork::detect(&docker_desktop_wsl2_info(), true),
         DockerSupervisorNetwork::WslDockerDesktop
     );
+    // Docker Desktop 4.71 on WSL 2 reports a variant suffix.
+    let containerized = SystemInfo {
+        operating_system: Some("Docker Desktop (containerized)".to_string()),
+        ..docker_desktop_wsl2_info()
+    };
+    assert_eq!(
+        DockerSupervisorNetwork::detect(&containerized, true),
+        DockerSupervisorNetwork::WslDockerDesktop
+    );
 }
 
 #[test]
