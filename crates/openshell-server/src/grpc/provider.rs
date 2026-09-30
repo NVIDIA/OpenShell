@@ -5177,9 +5177,20 @@ pub(super) async fn handle_delete_provider(
         MinWorkspaceRole::Admin,
     )
     .await?;
+    // Reject after authorization but before taking the workspace lock, which
+    // a request that can never succeed should not wait for.
+    if req.name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // Sandbox create and attach hold this guard while they write provider
+    // references, so no sandbox can start referencing the provider between
+    // the attached-sandbox check and the delete.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire provider mutation lock")
+    })?;
     let name = req.name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
@@ -9233,6 +9244,102 @@ mod tests {
         assert_eq!(
             response.provider.expect("provider").object_name(),
             "guarded-provider"
+        );
+    }
+
+    fn default_workspace_selector() -> openshell_core::proto::WorkspaceSelector {
+        openshell_core::proto::workspace_selector("default".to_string())
+    }
+
+    async fn create_openai_provider(state: &Arc<ServerState>, name: &str) -> Provider {
+        let provider = provider_with_credential_value(name, "openai", "OPENAI_API_KEY", "sk-test");
+        handle_create_provider(
+            state,
+            authed_request(CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider),
+                workspace_scope: Some(default_workspace_selector()),
+            }),
+        )
+        .await
+        .expect("create provider")
+        .into_inner()
+        .provider
+        .expect("created provider")
+    }
+
+    fn delete_provider_request(name: &str) -> Request<DeleteProviderRequest> {
+        authed_request(DeleteProviderRequest {
+            request_id: String::new(),
+            allow_missing: false,
+            name: name.to_string(),
+            workspace_scope: Some(default_workspace_selector()),
+        })
+    }
+
+    fn sandbox_in_default_workspace(id: &str, providers: Vec<String>) -> Sandbox {
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                providers,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_provider_rejects_provider_attached_while_waiting() {
+        let state = test_server_state().await;
+        create_openai_provider(&state, "raced-provider").await;
+        let sandbox = sandbox_in_default_workspace("raced-sandbox", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        // An attach holds the sandbox sync guard while it writes the provider
+        // into the sandbox spec.
+        let attach_guard = state.compute.sandbox_sync_guard().await.unwrap();
+
+        let task_state = state.clone();
+        let mut delete = tokio::spawn(async move {
+            handle_delete_provider(&task_state, delete_provider_request("raced-provider")).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "provider delete should wait for the in-flight attach"
+        );
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
+                sandbox
+                    .spec
+                    .get_or_insert_with(Default::default)
+                    .providers
+                    .push("raced-provider".to_string());
+            })
+            .await
+            .unwrap();
+        drop(attach_guard);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+            .await
+            .expect("delete should finish after the attach")
+            .expect("join delete task")
+            .expect_err("a provider attached while the delete waited must not be deleted");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("attached to sandbox"), "{error}");
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Provider>("default", "raced-provider")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
