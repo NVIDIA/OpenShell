@@ -7342,7 +7342,10 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "oci",
                 "oci-genai",
+                "oci-genai-native",
+                "oci-object-storage",
                 "openai",
                 "openrouter",
                 "pypi"
