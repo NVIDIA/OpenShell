@@ -227,6 +227,9 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal => "oci_instance_principal",
+        ProviderCredentialRefreshStrategy::OciResourcePrincipal => "oci_resource_principal",
+        ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity => "oci_oke_workload_identity",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -245,7 +248,15 @@ pub fn strategy_secret_material_keys(
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             &["aws_secret_access_key", "aws_session_token"]
         }
-        ProviderCredentialRefreshStrategy::Static
+        // Instance and workload principals fetch their material from the platform
+        // at mint time; nothing secret is stored. A resource principal may carry
+        // the platform-provided token and key as literal values.
+        ProviderCredentialRefreshStrategy::OciResourcePrincipal => {
+            &["rpst", "private_key", "private_key_passphrase"]
+        }
+        ProviderCredentialRefreshStrategy::OciInstancePrincipal
+        | ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity
+        | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Unspecified => &[],
     }
@@ -262,6 +273,9 @@ struct OAuth2RefreshToken;
 struct OAuth2ClientCredentials;
 struct GoogleServiceAccountJwt;
 struct AwsStsAssumeRole;
+struct OciInstancePrincipal;
+struct OciResourcePrincipal;
+struct OciOkeWorkloadIdentity;
 
 #[async_trait]
 impl TokenMinter for OAuth2RefreshToken {
@@ -291,9 +305,30 @@ impl TokenMinter for AwsStsAssumeRole {
     }
 }
 
+#[async_trait]
+impl TokenMinter for OciInstancePrincipal {
+    async fn mint(&self, request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+        mint_oci_instance_principal(request).await
+    }
+}
+
+#[async_trait]
+impl TokenMinter for OciResourcePrincipal {
+    async fn mint(&self, request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+        mint_oci_resource_principal(request).await
+    }
+}
+
+#[async_trait]
+impl TokenMinter for OciOkeWorkloadIdentity {
+    async fn mint(&self, request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+        mint_oci_oke_workload_identity(request).await
+    }
+}
+
 /// Immutable built-in-only registry. There is deliberately no registration API.
 pub struct BuiltInMinterRegistry {
-    entries: [(&'static str, &'static dyn TokenMinter); 4],
+    entries: [(&'static str, &'static dyn TokenMinter); 7],
 }
 
 static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
@@ -302,6 +337,9 @@ static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
         ("oauth2_client_credentials", &OAuth2ClientCredentials),
         ("google_service_account_jwt", &GoogleServiceAccountJwt),
         ("aws_sts_assume_role", &AwsStsAssumeRole),
+        ("oci_instance_principal", &OciInstancePrincipal),
+        ("oci_resource_principal", &OciResourcePrincipal),
+        ("oci_oke_workload_identity", &OciOkeWorkloadIdentity),
     ],
 };
 
@@ -865,6 +903,426 @@ fn google_token_url(state: &MintRequest) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OCI principal strategies
+// ---------------------------------------------------------------------------
+
+/// Instance metadata service base for OCI Compute instances.
+const OCI_IMDS_BASE_URL: &str = "http://169.254.169.254/opc/v2";
+/// Every IMDS v2 request must carry this header.
+const OCI_IMDS_AUTHORIZATION: &str = "Bearer Oracle";
+/// Realm domain for the commercial realm; other realms override it.
+const OCI_DEFAULT_REALM_DOMAIN: &str = "oraclecloud.com";
+/// Default OKE proxymux port that fronts resource principal session tokens.
+const OCI_OKE_PROXYMUX_PORT: u16 = 12250;
+const KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+const KUBERNETES_SERVICE_ACCOUNT_CA_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+/// Semantic output id the OCI principal strategies co-mint with the token.
+const OCI_PRIVATE_KEY_OUTPUT: &str = "private_key";
+
+#[derive(Debug, Deserialize)]
+struct OciSecurityTokenEnvelope {
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OciInstanceMetadata {
+    tenant_id: Option<String>,
+    canonical_region_name: Option<String>,
+}
+
+fn oci_http_client(root_ca_pem: Option<&[u8]>) -> Result<reqwest::Client, Status> {
+    openshell_crypto::tls::ensure_default_provider();
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    if let Some(pem) = root_ca_pem {
+        let certificate = reqwest::Certificate::from_pem(pem).map_err(|e| {
+            Status::invalid_argument(format!("OCI refresh CA bundle is invalid: {e}"))
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|e| Status::internal(format!("build OCI refresh HTTP client failed: {e}")))
+}
+
+/// Map an OCI identity endpoint status to the recovery action operators need:
+/// authorization failures are configuration problems, everything else retries.
+fn oci_endpoint_error(what: &str, status: reqwest::StatusCode, hint: &str) -> Status {
+    match status.as_u16() {
+        401 | 403 => Status::permission_denied(format!("{what} returned {status}; {hint}")),
+        400 | 404 | 422 => Status::invalid_argument(format!("{what} returned {status}; {hint}")),
+        _ => Status::internal(format!("{what} returned {status}")),
+    }
+}
+
+/// Read a file when `value` is an absolute path, otherwise treat it as the
+/// literal material. OCI platforms publish resource principal material as
+/// file paths in environment variables; operators may also paste the values.
+async fn oci_path_or_value(value: &str, what: &str) -> Result<String, Status> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('/') {
+        tokio::fs::read_to_string(trimmed)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("{what}: cannot read {trimmed}: {e}")))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// Assemble the minted pair every OCI principal strategy produces: the security
+/// token as `OCI_KEY_ID` (`ST$<token>`) and the paired private key on the
+/// `private_key` output, expiring at the token's `exp` capped by the state's
+/// maximum lifetime.
+fn oci_security_token_credential(
+    state: &MintRequest,
+    token: &str,
+    private_key_credential: String,
+) -> Result<MintedCredential, RefreshFailure> {
+    use openshell_core::oci_signature::{SECURITY_TOKEN_KEY_ID_PREFIX, security_token_expiry_ms};
+    let token = token.trim();
+    let token = token
+        .strip_prefix(SECURITY_TOKEN_KEY_ID_PREFIX)
+        .unwrap_or(token);
+    if token.is_empty() {
+        return Err(
+            Status::internal("OCI identity endpoint returned an empty security token").into(),
+        );
+    }
+    let now_ms = current_time_ms();
+    let max_expires = now_ms.saturating_add(max_lifetime_seconds(state).saturating_mul(1000));
+    let expires_at_ms =
+        security_token_expiry_ms(token).map_or(max_expires, |exp| exp.min(max_expires));
+    let env_key = state
+        .additional_output_keys
+        .get(OCI_PRIVATE_KEY_OUTPUT)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "refresh state missing resolved output key for 'private_key'; reconfigure the OCI principal refresh",
+            )
+        })?;
+    Ok(MintedCredential {
+        access_token: format!("{SECURITY_TOKEN_KEY_ID_PREFIX}{token}"),
+        expires_at_ms,
+        refresh_token: None,
+        additional_credentials: HashMap::from([(env_key.clone(), private_key_credential)]),
+    })
+}
+
+/// Colon-separated uppercase SHA-1 fingerprint of a PEM certificate, the form
+/// OCI expects in the `fed-x509` key id.
+pub fn oci_certificate_sha1_fingerprint(certificate_pem: &str) -> Result<String, Status> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+    use sha1::Digest as _;
+    let der = CertificateDer::from_pem_slice(certificate_pem.as_bytes()).map_err(|e| {
+        Status::internal(format!(
+            "instance certificate PEM has no valid CERTIFICATE block: {e}"
+        ))
+    })?;
+    // OCI names the federating certificate by its SHA-1 fingerprint, the same
+    // value its SDKs compute. It identifies the certificate; it proves
+    // nothing, so it stays outside the crypto facade (see CRYPTO.md).
+    let digest = sha1::Sha1::digest(der.as_ref());
+    Ok(digest
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":"))
+}
+
+async fn oci_imds_get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, Status> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, OCI_IMDS_AUTHORIZATION)
+        .send()
+        .await
+        .map_err(|e| Status::unavailable(format!("instance metadata request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(oci_endpoint_error(
+            "instance metadata service",
+            response.status(),
+            "the gateway must run on an OCI Compute instance with instance principals enabled",
+        ));
+    }
+    Ok(response)
+}
+
+/// Federate the gateway host's instance identity into an OCI security token.
+///
+/// Mirrors the OCI SDKs: read the leaf certificate, its key, and the
+/// intermediate certificate from the instance metadata service; generate an
+/// ephemeral session key pair; sign a request to the regional identity
+/// endpoint with the leaf key under the `<tenancy>/fed-x509/<fingerprint>`
+/// key id; and receive a token bound to the session public key.
+async fn mint_oci_instance_principal(
+    state: &MintRequest,
+) -> Result<MintedCredential, RefreshFailure> {
+    use openshell_core::oci_signature::{
+        OciSigningKey, SessionKeyPair, SigningInput, sanitize_pem, sign_headers,
+    };
+    let metadata_base = test_oci_loopback_override(state, "metadata_base_url")
+        .unwrap_or_else(|| OCI_IMDS_BASE_URL.to_string());
+    let client = oci_http_client(None)?;
+
+    let instance: OciInstanceMetadata =
+        oci_imds_get(&client, &format!("{metadata_base}/instance/"))
+            .await?
+            .json()
+            .await
+            .map_err(|e| Status::internal(format!("instance metadata is not JSON: {e}")))?;
+    let tenancy_id = instance
+        .tenant_id
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| Status::internal("instance metadata has no tenantId"))?;
+    let region = material_value(&state.material, &["region"])
+        .or(instance.canonical_region_name)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "oci_instance_principal needs a region: set the region material or run on an instance whose metadata reports canonicalRegionName",
+            )
+        })?;
+
+    let leaf_certificate = oci_imds_get(&client, &format!("{metadata_base}/identity/cert.pem"))
+        .await?
+        .text()
+        .await
+        .map_err(|e| Status::internal(format!("instance certificate read failed: {e}")))?;
+    let leaf_key = oci_imds_get(&client, &format!("{metadata_base}/identity/key.pem"))
+        .await?
+        .text()
+        .await
+        .map_err(|e| Status::internal(format!("instance key read failed: {e}")))?;
+    let intermediate = match oci_imds_get(
+        &client,
+        &format!("{metadata_base}/identity/intermediate.pem"),
+    )
+    .await
+    {
+        Ok(response) => response
+            .text()
+            .await
+            .ok()
+            .filter(|pem| pem.contains("-----BEGIN")),
+        Err(_) => None,
+    };
+
+    let fingerprint = oci_certificate_sha1_fingerprint(&leaf_certificate)?;
+    let signing_key =
+        OciSigningKey::from_credentials(&format!("{tenancy_id}/fed-x509/{fingerprint}"), &leaf_key)
+            .map_err(|e| Status::internal(format!("instance identity key unusable: {e}")))?;
+    let session = SessionKeyPair::generate()
+        .map_err(|e| Status::internal(format!("session key generation failed: {e}")))?;
+
+    let mut payload = serde_json::json!({
+        "certificate": sanitize_pem(&leaf_certificate),
+        "publicKey": sanitize_pem(&session.public_key_pem),
+    });
+    if let Some(intermediate) = intermediate {
+        payload["intermediateCertificates"] = serde_json::json!([sanitize_pem(&intermediate)]);
+    }
+    if let Some(purpose) = material_value(&state.material, &["purpose"]) {
+        payload["purpose"] = serde_json::Value::String(purpose);
+    }
+    let body = serde_json::to_vec(&payload)
+        .map_err(|e| Status::internal(format!("encode federation request failed: {e}")))?;
+
+    let realm_domain = material_value(&state.material, &["realm_domain"])
+        .unwrap_or_else(|| OCI_DEFAULT_REALM_DOMAIN.to_string());
+    let endpoint = test_oci_loopback_override(state, "federation_endpoint_url")
+        .unwrap_or_else(|| format!("https://auth.{region}.{realm_domain}/v1/x509"));
+    let url = reqwest::Url::parse(&endpoint)
+        .map_err(|e| Status::invalid_argument(format!("federation endpoint is invalid: {e}")))?;
+    let signed = sign_headers(
+        SigningInput {
+            method: "POST",
+            request_target_path: url.path(),
+            // The federation signer covers `date (request-target)` and the body
+            // headers, but not `host`, exactly as the OCI SDKs do.
+            host: None,
+            body: Some(&body),
+            content_type: Some("application/json"),
+            now: std::time::SystemTime::now(),
+        },
+        &signing_key,
+    )
+    .map_err(|e| Status::internal(format!("sign federation request failed: {e}")))?;
+
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::DATE, signed.date)
+        .header(reqwest::header::AUTHORIZATION, signed.authorization)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if let Some(hash) = signed.x_content_sha256 {
+        request = request.header("x-content-sha256", hash);
+    }
+    let response = request
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| Status::unavailable(format!("federation request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(oci_endpoint_error(
+            "OCI identity federation",
+            response.status(),
+            "check that the instance is in a dynamic group with a policy for the requested access",
+        )
+        .into());
+    }
+    let envelope: OciSecurityTokenEnvelope = response
+        .json()
+        .await
+        .map_err(|e| Status::internal(format!("federation response is not JSON: {e}")))?;
+    oci_security_token_credential(state, &envelope.token, session.private_key_credential())
+}
+
+/// Republish the resource principal session token and key that the OCI
+/// platform provisions and rotates for Functions, Data Science, Container
+/// Instances, and similar hosts. Nothing is exchanged; the files are re-read
+/// on every refresh so rotation flows through.
+async fn mint_oci_resource_principal(
+    state: &MintRequest,
+) -> Result<MintedCredential, RefreshFailure> {
+    use base64::Engine as _;
+    use openshell_core::oci_signature::OciSigningKey;
+    if material_value(&state.material, &["private_key_passphrase"]).is_some_and(|v| !v.is_empty()) {
+        return Err(Status::invalid_argument(
+            "oci_resource_principal: passphrase-protected private keys are not supported",
+        )
+        .into());
+    }
+    let rpst_source = material_value(&state.material, &["rpst"])
+        .or_else(|| material_value(&state.material, &["rpst_file"]))
+        .or_else(|| std::env::var("OCI_RESOURCE_PRINCIPAL_RPST").ok())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "oci_resource_principal needs the session token: set rpst_file or rpst material, or run where OCI_RESOURCE_PRINCIPAL_RPST is set",
+            )
+        })?;
+    let key_source = material_value(&state.material, &["private_key"])
+        .or_else(|| material_value(&state.material, &["private_key_file"]))
+        .or_else(|| std::env::var("OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM").ok())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "oci_resource_principal needs the private key: set private_key_file or private_key material, or run where OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM is set",
+            )
+        })?;
+    let token = oci_path_or_value(&rpst_source, "resource principal session token").await?;
+    let key_material = oci_path_or_value(&key_source, "resource principal private key").await?;
+    // Validate the key now so a bad file surfaces as a configuration error
+    // instead of a signing failure inside every sandbox later.
+    OciSigningKey::from_credentials("resource-principal", &key_material)
+        .map_err(|e| Status::invalid_argument(format!("resource principal private key: {e}")))?;
+    let private_key_credential = if key_material.contains("-----BEGIN") {
+        base64::prelude::BASE64_STANDARD.encode(key_material.trim().as_bytes())
+    } else {
+        key_material.trim().to_string()
+    };
+    oci_security_token_credential(state, &token, private_key_credential)
+}
+
+/// Exchange the gateway pod's Kubernetes service-account token at the OKE
+/// proxymux for a resource principal session token bound to an ephemeral
+/// session key, mirroring the OCI SDKs' OKE workload identity signer.
+async fn mint_oci_oke_workload_identity(
+    state: &MintRequest,
+) -> Result<MintedCredential, RefreshFailure> {
+    use base64::Engine as _;
+    use openshell_core::oci_signature::{SessionKeyPair, sanitize_pem};
+    let token_path = material_value(&state.material, &["service_account_token_file"])
+        .unwrap_or_else(|| KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH.to_string());
+    let service_account_token = tokio::fs::read_to_string(&token_path).await.map_err(|e| {
+        Status::invalid_argument(format!(
+            "oci_oke_workload_identity: cannot read the service-account token at {token_path}: {e}"
+        ))
+    })?;
+    let service_account_token = service_account_token.trim();
+    if service_account_token.is_empty() {
+        return Err(Status::invalid_argument(
+            "oci_oke_workload_identity: the service-account token file is empty",
+        )
+        .into());
+    }
+    let endpoint = if let Some(endpoint) =
+        test_oci_loopback_override(state, "proxymux_endpoint_url")
+    {
+        endpoint
+    } else {
+        let host = material_value(&state.material, &["kubernetes_service_host"])
+            .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST").ok())
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "oci_oke_workload_identity needs the cluster host: set kubernetes_service_host material or run inside the cluster",
+                )
+            })?;
+        let port = match material_value(&state.material, &["proxymux_port"]) {
+            Some(port) => port.trim().parse::<u16>().map_err(|_| {
+                Status::invalid_argument(
+                    "oci_oke_workload_identity: proxymux_port must be a port number",
+                )
+            })?,
+            None => OCI_OKE_PROXYMUX_PORT,
+        };
+        format!("https://{host}:{port}/resourcePrincipalSessionTokens")
+    };
+    let ca_path = material_value(&state.material, &["ca_cert_file"])
+        .unwrap_or_else(|| KUBERNETES_SERVICE_ACCOUNT_CA_PATH.to_string());
+    let root_ca = if endpoint.starts_with("https://") {
+        tokio::fs::read(&ca_path).await.ok()
+    } else {
+        None
+    };
+    let client = oci_http_client(root_ca.as_deref())?;
+
+    let session = SessionKeyPair::generate()
+        .map_err(|e| Status::internal(format!("session key generation failed: {e}")))?;
+    let payload = serde_json::json!({ "podKey": sanitize_pem(&session.public_key_pem) });
+    let response = client
+        .post(&endpoint)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {service_account_token}"),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("opc-request-id", uuid::Uuid::new_v4().simple().to_string())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| Status::unavailable(format!("OKE proxymux request failed: {e}")))?;
+    if !response.status().is_success() {
+        let hint = if response.status().as_u16() == 403 {
+            "workload identity needs an OKE enhanced cluster and an IAM policy for this service account"
+        } else {
+            "check the service-account token and the proxymux endpoint"
+        };
+        return Err(oci_endpoint_error("OKE proxymux", response.status(), hint).into());
+    }
+    let raw = response
+        .bytes()
+        .await
+        .map_err(|e| Status::internal(format!("OKE proxymux response read failed: {e}")))?;
+    // The proxymux wraps its JSON envelope in base64; accept plain JSON too.
+    let decoded = base64::prelude::BASE64_STANDARD
+        .decode(
+            raw.iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap_or_else(|_| raw.to_vec());
+    let envelope: OciSecurityTokenEnvelope = serde_json::from_slice(&decoded).map_err(|e| {
+        Status::internal(format!(
+            "OKE proxymux response is not a token envelope: {e}"
+        ))
+    })?;
+    oci_security_token_credential(state, &envelope.token, session.private_key_credential())
+}
+
 fn required_material(material: &HashMap<String, String>, key: &str) -> Result<String, Status> {
     material_value(material, &[key])
         .ok_or_else(|| Status::invalid_argument(format!("{key} material is required")))
@@ -909,6 +1367,26 @@ fn test_sts_endpoint_override(_state: &MintRequest) -> Option<String> {
     None
 }
 
+/// Loopback-only endpoint overrides for the OCI identity endpoints. Like the
+/// STS override, these exist only so tests (or explicit test-support builds) can point the
+/// strategies at a mock server; production always derives the endpoints from the region and the
+/// cluster, and the configure API rejects these material keys (CWE-918).
+#[cfg(any(test, feature = "test-support"))]
+fn test_oci_loopback_override(state: &MintRequest, key: &str) -> Option<String> {
+    material_value(&state.material, &[key]).filter(|endpoint| {
+        reqwest::Url::parse(endpoint)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(is_loopback_host))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+#[allow(clippy::missing_const_for_fn)]
+fn test_oci_loopback_override(_state: &MintRequest, _key: &str) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_contains_exactly_four_canonical_strategies() {
+    fn built_in_registry_contains_exactly_seven_canonical_strategies() {
         let registry = built_in_minters();
         assert_eq!(
             registry.strategy_names().collect::<Vec<_>>(),
@@ -929,6 +1407,9 @@ mod tests {
                 "oauth2_client_credentials",
                 "google_service_account_jwt",
                 "aws_sts_assume_role",
+                "oci_instance_principal",
+                "oci_resource_principal",
+                "oci_oke_workload_identity",
             ]
         );
         for strategy in [
@@ -936,6 +1417,9 @@ mod tests {
             ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
             ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+            ProviderCredentialRefreshStrategy::OciInstancePrincipal,
+            ProviderCredentialRefreshStrategy::OciResourcePrincipal,
+            ProviderCredentialRefreshStrategy::OciOkeWorkloadIdentity,
         ] {
             assert!(registry.can_mint(strategy as i32));
             assert!(

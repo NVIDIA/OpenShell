@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/oci-instance-principal.yaml
+#   openshell provider profile import -f providers/oci-instance-principal.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared — this profile grants no egress.
+# Reference layout:  a gateway running on an OCI Compute instance. The gateway
+#                    reads the instance identity certificate from the instance
+#                    metadata service, federates it at the regional identity
+#                    endpoint, and mints an OCI security token bound to an
+#                    ephemeral session key. No long-lived key exists anywhere.
+# Credential scope:  OCI_KEY_ID (`ST$<token>`) and OCI_PRIVATE_KEY (base64
+#                    PKCS#8 PEM of the session key), both gateway-minted and
+#                    rotated before expiry. The instance's own key never leaves
+#                    the gateway host.
+# Endpoint access:   none. Pair with a sandbox policy or another profile that
+#                    names the OCI hosts the workload needs, sets
+#                    `credential_signing: oci`, and selects this provider with
+#                    `credential_binding.provider`.
+# Smoke test:        openshell provider create --name oci-ip --type oci-instance-principal \
+#                      --runtime-credentials
+#                    openshell provider refresh configure --provider oci-ip \
+#                      --credential-key OCI_KEY_ID --strategy oci-instance-principal
+#                    then call a signed OCI endpoint from a sandbox with a
+#                    policy that binds `oci-ip`. IAM: a dynamic group matching
+#                    the instance, with a policy granting it the needed access.
+
+id: oci-instance-principal
+display_name: OCI Instance Principal
+description: Oracle Cloud Infrastructure access as the gateway host's instance principal, with gateway-minted short-lived security tokens
+category: other
+credentials:
+  - name: key_id
+    description: OCI security token key id (ST$<token>), minted by the gateway from the instance identity certificate
+    env_vars: [OCI_KEY_ID]
+    required: true
+    refresh:
+      strategy: oci_instance_principal
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      # One federation exchange mints the token and pairs it with a fresh
+      # session key. The refresh is attached to key_id (primary); this output
+      # co-manages the session key on its sibling credential.
+      additional_outputs:
+        - output: private_key
+          credential: private_key
+      material:
+        - name: region
+          description: Region identifier (for example us-chicago-1) whose identity endpoint federates the instance; defaults to the instance's own region
+          required: false
+          secret: false
+        - name: realm_domain
+          description: Realm domain of the identity endpoint (auth.<region>.<realm_domain>); defaults to oraclecloud.com for the commercial realm
+          required: false
+          secret: false
+        - name: purpose
+          description: Optional federation purpose; leave unset for a plain instance principal
+          required: false
+          secret: false
+  - name: private_key
+    description: Ephemeral RSA session key (base64 PKCS#8 PEM) that pairs with the security token; co-managed with key_id
+    env_vars: [OCI_PRIVATE_KEY]
+    required: true
