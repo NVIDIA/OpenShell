@@ -1624,6 +1624,10 @@ async fn request_token(
     let response = client
         .post(parsed)
         .form(form)
+        // Some token endpoints (e.g. GitHub's) content-negotiate on Accept and
+        // return application/x-www-form-urlencoded when it is absent, which
+        // TokenResponse below cannot parse.
+        .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
         .map_err(|error| {
@@ -2092,7 +2096,7 @@ mod tests {
         list_refresh_states_for_provider, max_lifetime_seconds, new_refresh_state,
         next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name, request_token,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
     };
@@ -2131,7 +2135,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ts(milliseconds: i64) -> prost_types::Timestamp {
@@ -3123,6 +3127,40 @@ mod tests {
             Some(2),
             "only the access token and current refresh token remain"
         );
+    }
+
+    #[tokio::test]
+    async fn request_token_sends_accept_json_header() {
+        // GitHub's token endpoint returns application/x-www-form-urlencoded
+        // unless Accept: application/json is present; only match the mock
+        // when the header is sent, so a regression here fails this test
+        // instead of silently falling back to form-encoded parsing.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-issued-for-json-accept",
+                "expires_in": 3600,
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let form = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("client_id".to_string(), "client-id".to_string()),
+            ("refresh_token".to_string(), "refresh-token".to_string()),
+        ];
+
+        let minted = request_token(
+            &format!("{}/token", mock_server.uri()),
+            &form,
+            3600,
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await
+        .expect("request carrying Accept: application/json should match the mock and parse");
+        assert_eq!(minted.access_token, "token-issued-for-json-accept");
     }
 
     #[tokio::test]
