@@ -411,9 +411,13 @@ within it.
 ### Execute a non-interactive command
 
 ```bash
-openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
+openshell sandbox exec my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
+
+The sandbox is a positional name or `--name`, not both; omit it to use the
+last-used sandbox. `--` is required and everything after it is the remote
+command, so put options such as `--tty` before it.
 
 `sandbox exec` starts an independent sibling process and streams output. After
 stdout and stderr drain, it returns the remote command's exit code if delivery
