@@ -2020,27 +2020,23 @@ pub(super) async fn handle_watch_sandbox(
                 // to that point.
                 //
                 // `tail_with_floor` reports each source's own coverage floor:
-                // the *oldest* event its window excluded, i.e. the smallest
-                // seq that source cannot vouch for. It has to be the oldest,
-                // not the newest: a source's own excluded set is a prefix of
-                // its own tail, so a sibling source's event can carry a seq
-                // that falls strictly between this source's oldest and
-                // newest excluded items. A boundary at the newest excluded
-                // item would let that sibling event pass as safe, and
-                // delivering it would still let the client's remembered
-                // cursor reach past the excluded range -- a later resume
-                // would then skip the older withheld events in that range
-                // with no gap reported, since nothing was evicted, just
-                // never sent. The nearest such point across both followed
-                // sources bounds what this whole batch may hand out -- not
-                // only the deeper source's excess over the shallower one.
+                // the *newest* event its window excluded. The source's
+                // excluded set is a prefix of its own tail, so it delivered
+                // everything it retains above the floor. The batch as a whole
+                // is therefore safe above the highest floor across followed
+                // sources: every event from either source past that point is
+                // in the batch, and everything at or below it is outside the
+                // window, the same as ordinary tail truncation. A source never
+                // withholds its own window this way; only a sibling's deeper
+                // window can be cut back to the shallower source's floor.
                 //
-                // This can mean far fewer events than `log_tail_lines` /
-                // `event_tail` asked for -- even zero -- whenever a followed
-                // sibling has any unreplayed backlog (e.g. `event_tail`
-                // unset, its default, on a sandbox with platform history).
-                // That's the deliberate trade-off of a single shared scalar
-                // cursor: silent loss is worse than an emptier initial batch.
+                // That can mean fewer events than the deeper source's depth
+                // asked for when a followed sibling has newer unreplayed
+                // backlog (e.g. `event_tail` unset, its default, with a
+                // platform event newer than some of the requested logs).
+                // That's the trade-off of a single shared scalar cursor: an
+                // event handed out below the sibling's floor would let a
+                // resume skip the sibling's withheld events past it.
                 let mut logs = Vec::new();
                 let log_floor = if follow_logs {
                     let (l, floor) = state
@@ -2064,27 +2060,16 @@ pub(super) async fn handle_watch_sandbox(
                     0_u64
                 };
 
-                // 0 means "nothing excluded" for a source, not "excluded up
-                // to 0" -- exclude it from the minimum so a fully-covered
-                // source never becomes the binding constraint.
-                let critical_floor = [
-                    follow_logs.then_some(log_floor),
-                    follow_events.then_some(platform_floor),
-                ]
-                .into_iter()
-                .flatten()
-                .filter(|&floor| floor > 0)
-                .min();
+                // 0 means "nothing excluded" for a source, so a fully-covered
+                // source never raises the maximum.
+                let critical_floor = log_floor.max(platform_floor);
 
-                let mut log_withheld = 0;
-                let platform_withheld = critical_floor.map_or(0, |cap| {
-                    let before = logs.len();
-                    logs.retain(|cursored| cursored.seq < cap);
-                    log_withheld = before - logs.len();
-                    let before = events.len();
-                    events.retain(|cursored| cursored.seq < cap);
-                    before - events.len()
-                });
+                let before = logs.len();
+                logs.retain(|cursored| cursored.seq > critical_floor);
+                let log_withheld = before - logs.len();
+                let before = events.len();
+                events.retain(|cursored| cursored.seq > critical_floor);
+                let platform_withheld = before - events.len();
 
                 // Cutoffs reflect only what this batch actually delivered.
                 // Withheld backlog was already published before this
@@ -2112,8 +2097,8 @@ pub(super) async fn handle_watch_sandbox(
                 // stream indefinitely, since the backlog behind the floor
                 // was published before subscribe and will never arrive live
                 // to fill it in. The client has to learn the gap exists from
-                // this warning; a resume from any cursor at or above the
-                // floor cannot recover it, and `tail_after` reports no gap
+                // this warning; a resume from any cursor this batch hands out
+                // cannot recover it, and `tail_after` reports no gap
                 // when asked, since nothing was evicted, only never sent.
                 if log_withheld > 0 || platform_withheld > 0 {
                     let warning = crate::sandbox_watch::coverage_gap_warning_event(
@@ -4639,17 +4624,55 @@ mod tests {
         assert_eq!(got, vec![1, 2, 3, 4]);
     }
 
-    /// The A2 repro: a platform event exists (seq 1) that `event_tail: 0`
-    /// deliberately withholds from the initial batch, while `follow_logs`
-    /// delivers two later logs (seq 2, 3). Without the cross-source
-    /// coverage floor, the client would see cursors 2 and 3, remember 3 as
-    /// its high-water mark, and a future resume from 3 would exclude the
-    /// platform event forever -- `tail_after` reports no gap, since nothing
-    /// was evicted, it was just never sent. The floor must instead withhold
-    /// the logs too, since platform's own floor (1) is the nearest point
-    /// neither source can vouch past.
+    /// Regression for the inverted coverage-floor clamp: a single followed
+    /// source with more buffered events than `log_tail_lines` must still
+    /// deliver its newest window. A source never withholds its own window,
+    /// and the older lines it excluded are ordinary tail truncation, so no
+    /// coverage-gap warning is due either.
     #[tokio::test]
-    async fn initial_tail_withholds_logs_behind_a_sibling_sources_unreplayed_backlog() {
+    async fn initial_tail_delivers_a_truncated_single_source_window() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("truncated", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 5); // cursors 1..=5
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                log_tail_lines: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![4, 5]);
+
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(next.is_err(), "expected nothing further, got {next:?}");
+    }
+
+    /// A sibling's excluded backlog that is older than everything the deeper
+    /// source delivers imposes nothing: `event_tail: 0` leaves out platform
+    /// seq 1, but logs 2 and 3 both sit above it, so a resume from 3 skips
+    /// only an event outside the requested window.
+    #[tokio::test]
+    async fn initial_tail_delivers_logs_newer_than_a_sibling_sources_unreplayed_backlog() {
         use tokio_stream::StreamExt as _;
 
         let state = test_server_state().await;
@@ -4679,25 +4702,78 @@ mod tests {
         let snap = stream.next().await.unwrap().unwrap();
         assert!(snap.cursor.is_empty());
 
-        // Platform's floor (1) is the binding constraint: nothing at or
-        // above it may be handed out, so both logs are withheld even though
-        // `log_tail_lines` alone would have covered them. The client learns
-        // about it from an explicit warning rather than discovering it
-        // silently on a later reconnect.
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![2, 3]);
+
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(
+            next.is_err(),
+            "expected no warning or further events, got {next:?}"
+        );
+    }
+
+    /// The A2 repro: a platform event (seq 2) that `event_tail: 0` leaves
+    /// out sits between two logs. Handing out log 3 would let the client
+    /// remember cursor 3, and a resume from 3 would exclude the platform
+    /// event forever -- `tail_after` reports no gap, since nothing was
+    /// evicted, it was just never sent. Platform's floor (2) instead cuts the
+    /// log window back to seq 3 and withholds log 1 with a warning.
+    #[tokio::test]
+    async fn initial_tail_withholds_logs_behind_a_sibling_sources_unreplayed_backlog() {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("floorcut", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1); // cursor 1, withheld (at or below floor)
+        seed_platform_event(&state, &id, "e2"); // cursor 2, never replayed (event_tail: 0)
+        seed_log_lines(&state, &id, 1); // cursor 3, delivered
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                event_tail: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        // The client learns about the withheld log from an explicit warning
+        // rather than discovering it silently on a later reconnect.
         let warning = stream.next().await.unwrap().unwrap();
         match warning.payload {
-            Some(openshell_core::proto::sandbox_stream_event::Payload::Warning(w)) => {
-                assert!(w.message.contains('2'), "message: {}", w.message);
+            Some(Payload::Warning(w)) => {
+                assert!(
+                    w.message
+                        .contains("withheld 1 log line(s) and 0 platform event(s)"),
+                    "message: {}",
+                    w.message
+                );
             }
             other => panic!("expected a coverage-gap warning, got {other:?}"),
         }
         assert!(warning.cursor.is_empty());
 
+        let delivered = stream.next().await.unwrap().unwrap();
+        assert_eq!(seq_of(&delivered), 3);
+
         let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
-        assert!(
-            next.is_err(),
-            "expected nothing further after the warning, got {next:?}"
-        );
+        assert!(next.is_err(), "expected nothing further, got {next:?}");
     }
 
     /// The coverage-gap warning discloses the withheld backlog once, up
@@ -4717,8 +4793,8 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
         let id = sandbox.object_id().to_string();
 
-        seed_platform_event(&state, &id, "e1"); // cursor 1, withheld (event_tail: 0)
-        seed_log_lines(&state, &id, 1); // cursor 2, withheld too (below critical_floor)
+        seed_log_lines(&state, &id, 1); // cursor 1, withheld (below critical_floor)
+        seed_platform_event(&state, &id, "e2"); // cursor 2, withheld (event_tail: 0)
 
         let response = handle_watch_sandbox(
             &state,
@@ -4753,16 +4829,11 @@ mod tests {
         assert_eq!(seq_of(&live), 3);
     }
 
-    /// Regression for the oldest-vs-newest-excluded floor bug.
-    ///
     /// `event_tail: 0` excludes *both* of the platform bus's own events
     /// (seqs 1 and 3); a log event (seq 2) sits interleaved between them and
-    /// is otherwise fully covered by `log_tail_lines`. A floor drawn at the
-    /// *newest* excluded platform seq (3) would let the log event (2 < 3)
-    /// pass as safe -- delivering it lets the client remember cursor 2, and
-    /// a resume from 2 would then permanently skip platform's seq 1, which
-    /// was never evicted and never sent. The floor must be the *oldest*
-    /// excluded seq (1) so the interleaved log event is withheld too.
+    /// is otherwise fully covered by `log_tail_lines`. Delivering it would let
+    /// the client remember cursor 2 while platform's seq 3 was never sent, so
+    /// the floor (3, the newest excluded platform seq) withholds it too.
     #[tokio::test]
     async fn initial_tail_withholds_an_interleaved_sibling_event_between_two_excluded_seqs() {
         use tokio_stream::StreamExt as _;

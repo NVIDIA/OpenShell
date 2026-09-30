@@ -190,33 +190,30 @@ fn tail_after_impl(
 /// that bound leaves behind.
 ///
 /// `max` may return fewer events than the tail currently retains; the ones
-/// excluded are the oldest, at the front. The floor is the *oldest* excluded
-/// event's seq -- the smallest seq this call cannot vouch for. `0` means
-/// `max` covered everything currently retained, so there's nothing this call
-/// withheld.
+/// excluded are the oldest, at the front. The floor is the *newest* excluded
+/// event's seq: this bus returned every event it retains above the floor and
+/// none at or below it. `0` means `max` covered everything currently
+/// retained, so there's nothing this call withheld.
 ///
-/// It must be the oldest, not the newest, excluded seq. This bus's own
-/// excluded set is a prefix of its own retained deque, so nothing above the
-/// newest excluded item is ever missing *from this bus* -- but a sibling
-/// bus's event can carry a seq that falls strictly between this bus's oldest
-/// and newest excluded items, since the two buses interleave in one shared
-/// seq space. A boundary drawn at the newest excluded item would let that
-/// sibling event pass as safe, when delivering it would still let a client's
-/// cursor reach past this bus's oldest withheld item on a later resume.
+/// Because the excluded set is a prefix of this bus's retained deque, the
+/// floor is the only boundary a caller needs: an event from any followed
+/// source with a seq above the floor is safe to hand out as far as this bus
+/// is concerned, and one at or below it may sit next to an event this bus
+/// withheld. Excluding events below the delivered window is ordinary tail
+/// truncation, the same as a single-source `log_tail_lines`.
 ///
 /// This is what lets a caller answer "is a cursor from this batch safe to
 /// resume from," which `tail_after`'s eviction-only gap check can't: a
 /// shallow request and a bus eviction both withhold events, but only the
 /// eviction leaves a trace in `last_trimmed_seq`.
 fn tail_with_floor_impl(tail: &VecDeque<CursoredEvent>, max: usize) -> (Vec<CursoredEvent>, u64) {
-    let total = tail.len();
-    let events: Vec<CursoredEvent> = tail.iter().rev().take(max).cloned().collect();
-    let floor = if events.len() >= total {
-        0
-    } else {
-        tail.front().map_or(0, |cursored| cursored.seq)
-    };
-    (events.into_iter().rev().collect(), floor)
+    let excluded = tail.len().saturating_sub(max);
+    let floor = excluded
+        .checked_sub(1)
+        .and_then(|newest_excluded| tail.get(newest_excluded))
+        .map_or(0, |cursored| cursored.seq);
+    let events = tail.iter().skip(excluded).cloned().collect();
+    (events, floor)
 }
 
 impl Default for TracingLogBus {
@@ -630,26 +627,25 @@ mod tests {
     }
 
     #[test]
-    fn tail_with_floor_impl_truncated_reports_oldest_excluded_seq() {
+    fn tail_with_floor_impl_truncated_reports_newest_excluded_seq() {
         let tail = tail_of(1, 5);
-        // Newest 2 returned (4, 5); 1..=3 excluded, oldest of those is 1.
-        // Must be the oldest: a sibling source's event carrying seq 2 or 3
-        // would otherwise pass a boundary drawn at 3 (the newest excluded)
-        // as safe, even though this bus hasn't vouched for anything below 3
-        // either -- only above it.
+        // Newest 2 returned (4, 5); 1..=3 excluded, newest of those is 3.
+        // Every returned event sits above the floor, so a bus never
+        // withholds its own delivered window.
         let (events, floor) = tail_with_floor_impl(&tail, 2);
         assert_eq!(cursors(&events), vec![4, 5]);
-        assert_eq!(floor, 1);
+        assert_eq!(floor, 3);
+        assert!(events.iter().all(|cursored| cursored.seq > floor));
     }
 
     #[test]
     fn tail_with_floor_impl_zero_max_excludes_everything() {
         let tail = tail_of(1, 5);
         // Nothing returned; every event is excluded, so the floor is the
-        // oldest of them, 1 -- the smallest seq this bus cannot vouch for.
+        // newest of them, 5.
         let (events, floor) = tail_with_floor_impl(&tail, 0);
         assert!(events.is_empty());
-        assert_eq!(floor, 1);
+        assert_eq!(floor, 5);
     }
 
     /// `snapshot_after` must take the same lock `publish` holds across its own
@@ -885,7 +881,7 @@ mod tests {
         }
         let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
         assert_eq!(cursors(&events), vec![4, 5]);
-        assert_eq!(floor, 1);
+        assert_eq!(floor, 3);
 
         // Wide enough to cover everything: no floor.
         let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
@@ -908,8 +904,8 @@ mod tests {
         }
         let (events, floor) = platform.tail_with_floor(sandbox_id, 0);
         assert!(events.is_empty());
-        // Nothing returned: floor is the oldest of everything excluded, 1.
-        assert_eq!(floor, 1);
+        // Nothing returned: floor is the newest of everything excluded, 5.
+        assert_eq!(floor, 5);
     }
 
     #[test]
@@ -1198,7 +1194,7 @@ mod tests {
         // Tail with smaller max should return most recent events
         let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
         assert_eq!(events.len(), 2);
-        assert_eq!(floor, 1, "oldest excluded event is Event0 (seq 1)");
+        assert_eq!(floor, 3, "newest excluded event is Event2 (seq 3)");
         if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].event.payload {
             assert_eq!(e.reason, "Event3");
         }

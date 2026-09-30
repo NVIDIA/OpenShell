@@ -550,19 +550,18 @@ sent.
 `log_tail_lines` and `event_tail` bound the two tails independently, so their
 depths are routinely asymmetric — `event_tail` has no default, so `follow_events`
 without setting it replays no platform backlog at all. On connect, the server
-computes each followed source's **coverage floor** — the *oldest* event that
-source's own window excluded, i.e. the smallest seq it cannot vouch for — and
-withholds every event, from either source, at or above the smallest nonzero
-floor. It has to be the oldest, not the newest: a source's own excluded set is a
-prefix of its own tail, but a sibling source's event can carry a seq strictly
-between that source's oldest and newest excluded items. A boundary drawn at the
-newest excluded item would let such a sibling event pass as safe, and handing it
-out would still let the client's cursor outrun the source's older, still-
-unreplayed backlog underneath it.
+computes each followed source's **coverage floor** — the *newest* event that
+source's own window excluded — and withholds every event, from either source,
+at or below the highest floor. A source's excluded set is a prefix of its own
+tail, so it delivered everything it retains above its floor; above the highest
+floor, the batch therefore contains every event from every followed source.
+Events at or below it are outside the window, the same as ordinary tail
+truncation. A source never withholds its own window this way, so a
+single-source watch is unaffected.
 
-This can withhold far more than either depth parameter alone implies — even the
-entire batch — whenever a followed sibling has any backlog the request didn't
-ask to replay. That is a deliberate trade-off: an emptier initial batch is
+With asymmetric depths this can deliver fewer events than the deeper source
+asked for — whenever the shallower sibling left out an event newer than part of
+the deeper window. That is a deliberate trade-off: a shorter initial batch is
 preferable to a resume that silently and permanently drops events.
 
 Withholding alone would just move the silent loss from resume time to a live
