@@ -11,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -454,6 +454,7 @@ fn main() -> Result<()> {
                     args.main_exit_marker,
                 ))
                 .await
+                .or_else(workspace_validation_exit)
             }
             SupervisorRole::NetworkProxy => {
                 let listen = args.listen.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
@@ -478,9 +479,50 @@ fn main() -> Result<()> {
     std::process::exit(exit_code);
 }
 
+/// Exit with the reserved status when the sandbox rejects the image working
+/// directory, so the compute driver can report the specific failure.
+fn workspace_validation_exit(error: miette::Report) -> Result<i32> {
+    use openshell_core::driver_utils::{
+        SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
+    };
+    // Display keeps the message on one line; Debug may wrap it.
+    if !error
+        .to_string()
+        .contains(WORKSPACE_VALIDATION_ERROR_CONTEXT)
+    {
+        return Err(error);
+    }
+    error!("Image workspace validation failed");
+    eprintln!("{error:?}");
+    Ok(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_validation_failure_exits_with_reserved_status() {
+        use miette::WrapErr as _;
+        use openshell_core::driver_utils::{
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_ERROR_CONTEXT,
+        };
+        // Mirror how the sandbox reports the rejection across the boundary.
+        let sandbox_error = Err::<(), _>(miette::miette!(
+            "workspace path component '/workspace/project' is not writable by the sandbox \
+             identity in the image: Permission denied (os error 13)"
+        ))
+        .wrap_err(WORKSPACE_VALIDATION_ERROR_CONTEXT)
+        .unwrap_err();
+        let error = miette::miette!(
+            "process error: boundary process leaf: start process supervisor leaf: {sandbox_error:?}"
+        );
+        assert_eq!(
+            workspace_validation_exit(error).expect("reserved exit status"),
+            SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
+        );
+        assert!(workspace_validation_exit(miette::miette!("connect failed")).is_err());
+    }
 
     #[test]
     fn isolation_backend_is_the_default_role() {

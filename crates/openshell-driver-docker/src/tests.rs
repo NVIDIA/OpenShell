@@ -3620,6 +3620,28 @@ fn docker_oom_kill_stays_terminal_despite_137() {
 }
 
 #[test]
+fn supervisor_workspace_validation_exit_is_reported_explicitly() {
+    let status = workspace_validation_status("image workspace validation failed: denied");
+    assert!(status.message().contains("log tail: image workspace"));
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(
+        supervisor_start_failure_reason(
+            &Status::failed_precondition("provider SPIFFE socket has no parent directory"),
+            "ControlSupervisorStartFailed"
+        ),
+        "ControlSupervisorStartFailed"
+    );
+    assert_eq!(
+        supervisor_exit_reason(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+}
+
+#[test]
 fn concurrent_container_removal_is_idempotent() {
     let removing = BollardError::DockerResponseServerError {
         status_code: 409,
