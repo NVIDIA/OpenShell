@@ -852,12 +852,29 @@ impl ComputeRuntime {
     /// across gateway replicas.
     ///
     /// The local mutex preserves lock ordering within one process. `PostgreSQL`
-    /// deployments also hold a session-level advisory lock for the duration.
+    /// deployments also hold the global advisory lock exclusively on the
+    /// dedicated lock pool, and fail with a lock timeout when it is not
+    /// acquired within `MUTATION_LOCK_TIMEOUT` of taking the local mutex.
     pub(crate) async fn sandbox_sync_guard(
         &self,
     ) -> crate::persistence::PersistenceResult<SandboxSyncGuard> {
         let local = self.sync_lock.clone().lock_owned().await;
-        let distributed = self.store.acquire_distributed_mutation_guard().await?;
+        let mut locks = crate::persistence::MutationLockSet::default();
+        locks.insert(
+            crate::persistence::MutationLockKey::Global,
+            crate::persistence::LockMode::Exclusive,
+        );
+        let deadline =
+            tokio::time::Instant::now() + crate::persistence::mutation_lock::MUTATION_LOCK_TIMEOUT;
+        let distributed = self
+            .store
+            .acquire_distributed_mutation_guard(&locks, deadline)
+            .await
+            .inspect_err(|error| {
+                if let crate::persistence::PersistenceError::LockTimeout(detail) = error {
+                    warn!(scope = "global", %detail, "mutation lock acquisition timed out");
+                }
+            })?;
         Ok(SandboxSyncGuard {
             _distributed: distributed,
             _local: local,
