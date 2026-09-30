@@ -357,11 +357,11 @@ fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
 
 #[cfg(target_os = "linux")]
 fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Digest, ResolveError> {
-    use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
     let path = format!("/proc/{pid}/exe");
-    let mut digest = Sha256::new();
+    let crypto_error = |error| ResolveError::Failed(format!("hash executable: {error}"));
+    let mut digest = openshell_crypto::sha256_digest().map_err(crypto_error)?;
     let mut buffer = [0_u8; 8 * 1024];
     loop {
         let length = executable
@@ -370,9 +370,11 @@ fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Dig
         if length == 0 {
             break;
         }
-        digest.update(&buffer[..length]);
+        digest.update(&buffer[..length]).map_err(crypto_error)?;
     }
-    format!("{:x}", digest.finalize()).parse()
+    let bytes = digest.finish().map_err(crypto_error)?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex.parse()
 }
 
 #[cfg(target_os = "linux")]

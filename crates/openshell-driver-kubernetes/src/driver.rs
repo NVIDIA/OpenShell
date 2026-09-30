@@ -66,7 +66,6 @@ use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
     generate_sandbox_tls_material,
 };
-use rand::RngCore as _;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -281,16 +280,16 @@ const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
-fn random_sandbox_runtime_token() -> String {
+fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
     use std::fmt::Write as _;
 
-    let mut bytes = [0_u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    let bytes = openshell_crypto::random_bytes::<32>()
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
     let mut token = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn decode_launch_authentication(
@@ -1835,7 +1834,7 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
-        let generation = random_sandbox_runtime_token();
+        let generation = random_sandbox_runtime_token()?;
         let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
         let image_pull_secrets = self.generation_image_pull_secret_names(&proxy_names);
         let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(

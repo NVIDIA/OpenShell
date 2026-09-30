@@ -15,7 +15,8 @@ use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header};
+use openshell_crypto::jwt::encode;
 pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
@@ -160,7 +161,9 @@ impl SandboxSessionJwtAuthority {
         let token_metadata = identity
             .refresh_replay
             .as_ref()
-            .map(|replay| (replay.sandbox_token_id(), replay.issued_at));
+            .map(|replay| replay.sandbox_token_id().map(|id| (id, replay.issued_at)))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.mint_launch_with_metadata(
             sandbox_id,
             identity.runtime_generation.clone(),

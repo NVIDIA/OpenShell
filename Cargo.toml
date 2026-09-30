@@ -13,6 +13,8 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [workspace.dependencies]
+# Product backend selection. Consumer crates inherit this choice.
+openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["aws-lc"] }
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
@@ -37,10 +39,10 @@ http-body-util = "0.1"
 h2 = "0.4"
 
 # TLS
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
 
@@ -107,7 +109,7 @@ base64 = "0.22"
 # Crypto / Auth
 sha2 = "0.10"
 rand = "0.9"
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.3"
 aws-lc-rs = "1.16"
@@ -130,12 +132,12 @@ url = "2"
 indexmap = "2"
 
 # Database
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "sqlite", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "migrate", "macros"] }
 # SQLx's facade couples native roots to ring; select native roots independently.
 sqlx-core = { version = "0.9", default-features = false, features = ["rustls-native-certs"] }
 
 # Kubernetes
-kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
+kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
 kube-runtime = "0.99"
 k8s-openapi = { version = "0.24", features = ["v1_29"] }
 
