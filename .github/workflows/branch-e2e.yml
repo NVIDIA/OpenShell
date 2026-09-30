@@ -284,7 +284,10 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"oci-image"}
         ]
 
   # Run driver-specific integration tests:

@@ -59,11 +59,6 @@ path = "tests/vm_overlay.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "custom_image"
-path = "tests/custom_image.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "service_bearer_passthrough"
 path = "tests/service_bearer_passthrough.rs"
 required-features = ["e2e-docker"]
