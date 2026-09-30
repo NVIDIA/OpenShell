@@ -942,7 +942,7 @@ impl PodmanComputeDriver {
             "Creating sandbox container"
         );
 
-        let (image, immutable_image_id, image_user, image_env) = async {
+        let (image, resolved_image) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 // The sandbox runtime is shipped in a standalone OCI image.
@@ -1000,10 +1000,8 @@ impl PodmanComputeDriver {
                         "podman image '{image}' inspection did not return an immutable image ID"
                     )));
                 }
-                let image_user = inspected_image
-                    .config
-                    .as_ref()
-                    .map_or_else(String::new, |config| config.user.clone());
+                let resolved_image =
+                    container::ResolvedPodmanImage::from_inspect(&inspected_image)?;
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
@@ -1018,8 +1016,7 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?;
                 }
 
-                let image_env = inspected_image.config.as_ref().map_or_else(Vec::new, |config| config.env.clone());
-                Ok((image.to_string(), inspected_image.id, image_user, image_env))
+                Ok((image.to_string(), resolved_image))
             }
             .await;
             phase_status.finish(result)
@@ -1030,6 +1027,7 @@ impl PodmanComputeDriver {
             otel.status_code = tracing::field::Empty,
         ))
         .await?;
+        let managed_workspace = resolved_image.uses_managed_workspace();
 
         // Fail closed on a missing/unreadable corporate proxy CA bundle before
         // creating any resources, so the operator gets a clear error
@@ -1043,7 +1041,7 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)?;
 
         let identity = self
-            .resolve_workload_identity(sandbox, &immutable_image_id, &image_user)
+            .resolve_workload_identity(sandbox, &resolved_image.id, &resolved_image.oci_user)
             .await?;
         let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
         let mut runtime_config = self.config.clone();
@@ -1068,19 +1066,21 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Create the workspace volume and per-sandbox runtime files.
+        // Create the managed workspace volume, if needed, and runtime files.
         let (resolver_secret_name, token_secret_name, proxy_auth_secret_name) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                self.client
-                    .create_owned_volume(
-                        &vol_name,
-                        &sandbox.id,
-                        &sandbox.workspace,
-                        Some((identity.uid, identity.gid)),
-                    )
-                    .await
-                    .map_err(ComputeDriverError::from)?;
+                if managed_workspace {
+                    self.client
+                        .create_owned_volume(
+                            &vol_name,
+                            &sandbox.id,
+                            &sandbox.workspace,
+                            Some((identity.uid, identity.gid)),
+                        )
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                }
                 let resolver_secret_name =
                     match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
                         Ok(name) => name,
@@ -1200,9 +1200,7 @@ impl PodmanComputeDriver {
                     resolver_secret: &resolver_secret_name,
                     gpu_devices: gpu_devices.as_deref(),
                     requested_image: &image,
-                    image_id: &immutable_image_id,
-                    image_user: &image_user,
-                    image_env: &image_env,
+                    image: &resolved_image,
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),
                     identity: &identity,
@@ -1227,7 +1225,7 @@ impl PodmanComputeDriver {
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
-                    let child_env = podman_child_environment(sandbox, &image_env);
+                    let child_env = podman_child_environment(sandbox, &resolved_image.environment);
                     let launch_authentication = sandbox
                         .spec
                         .as_ref()
@@ -1263,9 +1261,11 @@ impl PodmanComputeDriver {
                             archives.channel,
                         )
                         .await?;
-                    self.client
-                        .copy_to_container(&workload_id, "/sandbox", archives.workspace)
-                        .await?;
+                    if managed_workspace {
+                        self.client
+                            .copy_to_container(&workload_id, "/sandbox", archives.workspace)
+                            .await?;
+                    }
                     let supervisor_id = self
                         .client
                         .create_typed_container(&specs.supervisor)
