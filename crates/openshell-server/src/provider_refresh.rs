@@ -4691,6 +4691,83 @@ mod tests {
         assert_eq!(stored.credential_handles, original_handles);
     }
 
+    #[tokio::test]
+    async fn apply_minted_credential_returns_unavailable_when_guard_times_out() {
+        use super::apply_minted_credential;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .compute
+            .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+        let credentials = test_credentials();
+        let mut prov = provider("guarded-aws", "aws");
+        let original_handles = credentials
+            .store_provider_credentials(
+                prov.object_name(),
+                prov.object_workspace(),
+                prov.object_id(),
+                &HashMap::from([(
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "old-access-key".to_string(),
+                )]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        prov.credential_handles.clone_from(&original_handles);
+        let stored_credential_count = credentials.stored_credential_count();
+        state.store.put_message(&prov).await.unwrap();
+        let provider_writer = state
+            .compute
+            .mutation_guard(crate::compute::MutationScope::Workspace("default"))
+            .await
+            .unwrap();
+
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: None,
+            additional_credentials: HashMap::new(),
+        };
+        let err = apply_minted_credential(
+            &state.store,
+            "default",
+            Some(&credentials),
+            Some(&state.compute),
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let details = openshell_core::rpc_error::decode_details(&err).expect("error details");
+        assert_eq!(
+            details.error_info().expect("error info").reason,
+            "MUTATION_LOCK_TIMEOUT"
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Provider>("default", "guarded-aws")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential_handles, original_handles);
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
+            Some(&"old-access-key".to_string())
+        );
+        assert_eq!(
+            credentials.stored_credential_count(),
+            stored_credential_count
+        );
+        drop(provider_writer);
+    }
+
     // A wiremock responder that blocks the STS response until the test releases
     // it, so a delete-refresh can be interleaved deterministically while the
     // rotation is parked awaiting STS.
