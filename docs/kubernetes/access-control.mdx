@@ -5,7 +5,7 @@ title: "Access Control"
 sidebar-title: "Access Control"
 description: "Configure OIDC user authentication or reverse-proxy auth termination for a Kubernetes-deployed OpenShell gateway."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Authentication, mTLS, OIDC, Keycloak, Entra ID, Okta, Gateway Auth"
-position: 5
+position: 6
 ---
 
 The OpenShell gateway supports these access-control models for human callers on Kubernetes:
@@ -18,11 +18,11 @@ The OpenShell gateway supports these access-control models for human callers on 
 
 The Helm chart generates a gateway TLS certificate and a user client certificate at install time. Supervisor Pods project only `ca.crt` from the client Secret so they can authenticate the gateway; the client certificate and private key are not exposed to sandboxes. Supervisors authenticate their RPCs with gateway-minted sandbox JWTs.
 
-For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
+For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/how-it-works/gateways/authentication).
 
 ## Sandbox Supervisor Identity
 
-Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID to the gateway. The gateway verifies the sandbox still exists and mints its own sandbox JWT.
+Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID plus a stable runtime identity to the gateway. The gateway requires that identity to match the namespace, immutable Sandbox resource UID, and supervisor Pod UID recorded during provisioning before it mints its own sandbox JWT.
 
 Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 

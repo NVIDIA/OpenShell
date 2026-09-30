@@ -67,6 +67,8 @@ async fn max_middleware_body_bytes() -> usize {
     chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
+const MAX_CHUNK_LINE_BYTES: usize = MAX_HEADER_BYTES;
+const MAX_CHUNK_TRAILER_FIELDS: usize = 128;
 const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -82,6 +84,9 @@ const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
 pub(crate) const HTTP2_PRIOR_KNOWLEDGE_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
     "HTTP/2 cleartext upgrade (h2c) is not supported for L7-inspected endpoints";
+pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
+    "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
+pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -743,6 +748,7 @@ where
         RelayRequestOptions {
             resolver,
             body_classifier: None,
+            mcp_request_validation: None,
             credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
@@ -769,6 +775,8 @@ pub(crate) enum WebSocketExtensionMode {
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) body_classifier: Option<&'a openshell_core::secrets::body::BodyCredentialClassifier>,
+    /// Revalidate buffered MCP requests after header transformations.
+    pub(crate) mcp_request_validation: Option<McpRequestValidation<'a>>,
     pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
@@ -779,6 +787,14 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+/// Policy and logging context for checking the MCP request sent upstream.
+#[derive(Clone, Copy)]
+pub(crate) struct McpRequestValidation<'a> {
+    pub(crate) config: &'a crate::l7::L7EndpointConfig,
+    pub(crate) ctx: &'a crate::l7::relay::L7EvalContext,
+    pub(crate) redacted_target: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -912,6 +928,33 @@ where
 
     let rewrite_result =
         rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+
+    if let Some(validation) = options.mcp_request_validation {
+        // Header credential resolution and hop-by-hop cleanup must finish
+        // before checking MCP mirrors. MCP bodies are already fully buffered
+        // and are not eligible for credential body rewriting.
+        let mut raw_header = rewrite_result.rewritten.clone();
+        raw_header.extend_from_slice(&req.raw_header[header_end..]);
+        let outgoing = L7Request {
+            action: req.action.clone(),
+            target: req.target.clone(),
+            query_params: req.query_params.clone(),
+            raw_header,
+            body_length: req.body_length,
+        };
+        if !crate::l7::relay::enforce_final_mcp_protocol_version(
+            validation.config,
+            &outgoing,
+            client,
+            validation.ctx,
+            validation.redacted_target,
+            observer,
+        )
+        .await?
+        {
+            return Ok(RelayOutcome::Consumed);
+        }
+    }
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -2391,6 +2434,71 @@ pub(crate) fn request_is_h2c_upgrade(raw_header: &[u8]) -> bool {
     upgrade_h2c && connection_upgrade
 }
 
+/// Returns why an L7 endpoint using `protocol` must refuse this request's
+/// upgrade, or `None` when the request may continue.
+///
+/// Every inspected protocol refuses h2c. Protocols named by
+/// `upgrade_refusal_for_protocol` refuse every request that carries an
+/// `Upgrade` header. Callers apply this before the L7 policy decision and
+/// regardless of enforcement mode, because an upgrade would end inspection
+/// rather than break a rule that audit mode could log.
+pub(crate) fn unsupported_upgrade_detail(
+    raw_header: &[u8],
+    protocol: crate::l7::L7Protocol,
+) -> Option<&'static str> {
+    if request_is_h2c_upgrade(raw_header) {
+        return Some(UNSUPPORTED_H2C_UPGRADE_DETAIL);
+    }
+    let refusal = upgrade_refusal_for_protocol(protocol)?;
+    request_has_upgrade_header(raw_header).then_some(refusal)
+}
+
+/// Returns the refusal detail for a protocol whose policy applies only to
+/// individual HTTP requests, or `None` for a protocol that may relay an
+/// allowed upgrade.
+///
+/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// After an upgrade the relay would copy frames that no rule of these
+/// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
+/// served by separate `protocol: websocket` endpoints with GraphQL operation
+/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// endpoints keep their existing upgrade behavior. The match is exhaustive so
+/// a new protocol must choose.
+pub(crate) fn upgrade_refusal_for_protocol(
+    protocol: crate::l7::L7Protocol,
+) -> Option<&'static str> {
+    use crate::l7::L7Protocol;
+    match protocol {
+        L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+        L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
+    }
+}
+
+/// Returns true when a request carries an `Upgrade` header, whatever its
+/// value.
+///
+/// Both relay checks that can lead to a protocol switch require that header:
+/// `request_is_websocket_upgrade`, which decides whether upgrade headers are
+/// forwarded, and `client_requested_upgrade`, which decides whether an
+/// upstream `101` may reach the client. A refusal based on this test therefore
+/// covers every request either one treats as an upgrade. Headers that are not
+/// UTF-8 return false; the shared relay rejects them before forwarding.
+fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw_header.len(), |p| p + 4);
+    let Ok(header_str) = std::str::from_utf8(&raw_header[..header_end]) else {
+        return false;
+    };
+
+    header_str.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("upgrade"))
+    })
+}
+
 fn rewrite_websocket_extensions_for_mode(
     raw_header: &[u8],
     mode: WebSocketExtensionMode,
@@ -2783,12 +2891,26 @@ pub(crate) async fn send_json_response<C: AsyncWrite + Unpin>(
     client: &mut C,
     status: &str,
 ) -> Result<()> {
+    send_json_response_with_allow(policy_name, body, client, status, None).await
+}
+
+/// Send a JSON response, including the required `Allow` field for an HTTP 405.
+/// The allowed methods are supplied by the protocol adapter, never the peer.
+pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    allowed_methods: Option<&'static str>,
+) -> Result<()> {
     let body_bytes = body.to_string();
+    let allow = allowed_methods.map_or_else(String::new, |methods| format!("Allow: {methods}\r\n"));
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\
+         {allow}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -3113,8 +3235,8 @@ where
 /// Handles chunk extensions and trailers per RFC 7230.
 ///
 /// `already_forwarded` are overflow bytes that were already written to the
-/// writer during header parsing. They are seeded into the parser buffer so
-/// termination can still be detected when boundaries span reads.
+/// writer during header parsing. The parser consumes them before reading more
+/// bytes so it can detect boundaries without forwarding them twice.
 async fn relay_chunked<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -3126,32 +3248,19 @@ where
     W: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut read_buf = [0u8; RELAY_BUF_SIZE];
-    let mut parse_buf = Vec::from(already_forwarded);
-    let mut pos = 0usize;
+    let mut input = ChunkedRelayInput::new(already_forwarded);
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
 
-    // Parse chunk-size lines + chunk payloads until final 0-size chunk, then
-    // parse trailers until the terminating empty trailer line.
     loop {
-        // Parse one chunk size line: "<hex>[;extensions]\r\n"
-        let size_line_end = loop {
-            if let Some(end) = find_crlf(&parse_buf, pos) {
-                break end;
-            }
-            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended before chunk-size line"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-            parse_buf.extend_from_slice(&read_buf[..n]);
-        };
-
-        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+        let size_line = input
+            .read_line(
+                reader,
+                "Chunked body ended before chunk-size line",
+                "Chunk-size line exceeds limit",
+            )
+            .await?;
+        let size_line = std::str::from_utf8(&size_line)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
         let size_token = size_line
@@ -3162,30 +3271,26 @@ where
         let chunk_size = usize::from_str_radix(size_token, 16)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
-        pos = size_line_end + 2;
 
         if chunk_size == 0 {
-            // Parse trailers (if any). Terminates on empty trailer line.
             let mut trailer_count = 0usize;
+            let mut trailer_bytes = 0usize;
             loop {
-                let trailer_end = loop {
-                    if let Some(end) = find_crlf(&parse_buf, pos) {
-                        break end;
-                    }
-                    let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-                    if n == 0 {
-                        return Err(miette!("Chunked body ended before trailer terminator"));
-                    }
-                    if let Some(guard) = generation_guard {
-                        guard.ensure_current()?;
-                    }
-                    writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-                    parse_buf.extend_from_slice(&read_buf[..n]);
-                };
-
-                let trailer_line = &parse_buf[pos..trailer_end];
-                pos = trailer_end + 2;
+                let trailer_line = input
+                    .read_line(
+                        reader,
+                        "Chunked body ended before trailer terminator",
+                        "Chunk trailer line exceeds limit",
+                    )
+                    .await?;
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer_line.len() + 2)
+                    .ok_or_else(|| miette!("Chunk trailer size overflow"))?;
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(miette!("Chunk trailers exceed {MAX_HEADER_BYTES} bytes"));
+                }
                 if trailer_line.is_empty() {
+                    input.flush_pending(writer, generation_guard).await?;
                     debug!(
                         chunk_count,
                         chunk_payload_bytes,
@@ -3195,49 +3300,167 @@ where
                     );
                     return Ok(());
                 }
+                if trailer_count == MAX_CHUNK_TRAILER_FIELDS {
+                    return Err(miette!(
+                        "Chunk trailers exceed {MAX_CHUNK_TRAILER_FIELDS} fields"
+                    ));
+                }
                 trailer_count += 1;
+                if input.pending_len() >= RELAY_BUF_SIZE {
+                    input.flush_pending(writer, generation_guard).await?;
+                }
             }
         }
 
-        // Ensure the full chunk payload + trailing CRLF is available.
-        let chunk_end = pos
-            .checked_add(chunk_size)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-        let chunk_with_crlf_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-
-        while parse_buf.len() < chunk_with_crlf_end {
-            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended mid-chunk"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-            parse_buf.extend_from_slice(&read_buf[..n]);
-        }
-        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+        input
+            .consume_exact(
+                reader,
+                writer,
+                chunk_size,
+                generation_guard,
+                "Chunked body ended mid-chunk",
+            )
+            .await?;
+        let terminator = [
+            input
+                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .await?,
+            input
+                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .await?,
+        ];
+        if terminator != *b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
-        pos = chunk_with_crlf_end;
+        input.flush_pending(writer, generation_guard).await?;
         chunk_count += 1;
         chunk_payload_bytes = chunk_payload_bytes.saturating_add(chunk_size);
-
-        // Keep parser memory bounded for long streams.
-        if pos > RELAY_BUF_SIZE * 4 {
-            parse_buf.drain(..pos);
-            pos = 0;
-        }
     }
 }
 
-fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
-    buf.get(start..)?
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .map(|offset| start + offset)
+struct ChunkedRelayInput<'a> {
+    already_forwarded: &'a [u8],
+    already_forwarded_pos: usize,
+    pending: Vec<u8>,
+}
+
+impl<'a> ChunkedRelayInput<'a> {
+    fn new(already_forwarded: &'a [u8]) -> Self {
+        Self {
+            already_forwarded,
+            already_forwarded_pos: 0,
+            pending: Vec::with_capacity(RELAY_BUF_SIZE),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    async fn read_line<R>(
+        &mut self,
+        reader: &mut R,
+        eof_message: &'static str,
+        limit_message: &'static str,
+    ) -> Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut line = Vec::new();
+        loop {
+            if line.len() == MAX_CHUNK_LINE_BYTES {
+                return Err(miette!(limit_message));
+            }
+            line.push(self.read_byte(reader, eof_message).await?);
+            if line.ends_with(b"\r\n") {
+                line.truncate(line.len() - 2);
+                return Ok(line);
+            }
+        }
+    }
+
+    async fn consume_exact<R, W>(
+        &mut self,
+        reader: &mut R,
+        writer: &mut W,
+        mut remaining: usize,
+        generation_guard: Option<&PolicyGenerationGuard>,
+        eof_message: &'static str,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        if self.already_forwarded_pos < self.already_forwarded.len() {
+            let available = self.already_forwarded.len() - self.already_forwarded_pos;
+            let consumed = available.min(remaining);
+            self.already_forwarded_pos += consumed;
+            remaining -= consumed;
+        }
+
+        while remaining > 0 {
+            if self.pending.len() >= RELAY_BUF_SIZE {
+                self.flush_pending(writer, generation_guard).await?;
+            }
+            let available = RELAY_BUF_SIZE - self.pending.len();
+            let to_read = remaining.min(available);
+            let start = self.pending.len();
+            self.pending.resize(start + to_read, 0);
+            let read = reader
+                .read(&mut self.pending[start..])
+                .await
+                .into_diagnostic()?;
+            if read == 0 {
+                self.pending.truncate(start);
+                return Err(miette!(eof_message));
+            }
+            self.pending.truncate(start + read);
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            remaining -= read;
+        }
+        Ok(())
+    }
+
+    async fn read_byte<R>(&mut self, reader: &mut R, eof_message: &'static str) -> Result<u8>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if self.already_forwarded_pos < self.already_forwarded.len() {
+            let byte = self.already_forwarded[self.already_forwarded_pos];
+            self.already_forwarded_pos += 1;
+            return Ok(byte);
+        }
+        let byte = match reader.read_u8().await {
+            Ok(byte) => byte,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(miette!(eof_message));
+            }
+            Err(error) => return Err(error).into_diagnostic(),
+        };
+        self.pending.push(byte);
+        Ok(byte)
+    }
+
+    async fn flush_pending<W>(
+        &mut self,
+        writer: &mut W,
+        generation_guard: Option<&PolicyGenerationGuard>,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
+        writer.write_all(&self.pending).await.into_diagnostic()?;
+        self.pending.clear();
+        Ok(())
+    }
 }
 
 fn validate_websocket_response(
@@ -3560,7 +3783,7 @@ mod tests {
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum ResponseRelayScript {
         HeadersOnly,
         WholeBody,
@@ -3609,6 +3832,12 @@ mod tests {
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-response-relay",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -3849,6 +4078,113 @@ mod tests {
             self.position = end;
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_streams_max_sized_incomplete_chunk_without_retaining_payload() {
+        let payload_len = RELAY_BUF_SIZE * 32;
+        let mut wire = format!("{:x}\r\n", usize::MAX).into_bytes();
+        wire.resize(wire.len() + payload_len, b'a');
+        let wire_len = wire.len();
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an incomplete chunk must fail");
+
+        assert!(error.to_string().contains("ended mid-chunk"));
+        assert_eq!(
+            reader.position, wire_len,
+            "the relay must stream the payload instead of rejecting or accumulating the declared chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_oversized_chunk_size_line() {
+        let mut wire = b"1;".to_vec();
+        wire.resize(MAX_CHUNK_LINE_BYTES + 1, b'x');
+        wire.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an oversized chunk-size line must fail");
+
+        assert!(error.to_string().contains("Chunk-size line exceeds"));
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_oversized_trailer_block() {
+        let mut wire = b"0\r\n".to_vec();
+        for name in [b'a', b'b'] {
+            wire.extend_from_slice(&[name, b':']);
+            wire.resize(wire.len() + MAX_HEADER_BYTES / 2, b'x');
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an oversized trailer block must fail");
+
+        assert!(error.to_string().contains("Chunk trailers exceed"));
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_excessive_trailer_fields() {
+        let mut wire = b"0\r\n".to_vec();
+        for _ in 0..=MAX_CHUNK_TRAILER_FIELDS {
+            wire.extend_from_slice(b"x: y\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("too many trailer fields must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Chunk trailers exceed 128 fields")
+        );
     }
 
     fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
@@ -4551,6 +4887,134 @@ mod tests {
             BodyLength::Chunked => {}
             other => panic!("Expected Chunked, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_leaves_pipelined_request_for_next_policy_decision() {
+        let chunked_body = b"0\r\n\r\n";
+        let pipelined_request =
+            b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let mut wire = chunked_body.to_vec();
+        wire.extend_from_slice(pipelined_request);
+
+        let (relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        client_writer.write_all(&wire).await.unwrap();
+        let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
+        let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
+
+        relay_chunked(&mut relay_reader, &mut relay_writer, &[], None)
+            .await
+            .expect("chunked body should relay");
+
+        let mut remaining = vec![0; pipelined_request.len()];
+        relay_reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+
+        drop(relay_writer);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, chunked_body);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_with_forwarded_prefix_and_trailers_preserves_pipeline_boundary() {
+        let already_forwarded = b"3\r\na";
+        let body_remainder = b"bc\r\n0\r\nX-Checksum: abc123\r\n\r\n";
+        let pipelined_request =
+            b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let mut later_read = body_remainder.to_vec();
+        later_read.extend_from_slice(pipelined_request);
+
+        let (relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        client_writer.write_all(&later_read).await.unwrap();
+        let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
+        let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
+        relay_writer.write_all(already_forwarded).await.unwrap();
+
+        relay_chunked(
+            &mut relay_reader,
+            &mut relay_writer,
+            already_forwarded,
+            None,
+        )
+        .await
+        .expect("chunked body with trailers should relay");
+
+        let mut remaining = vec![0; pipelined_request.len()];
+        relay_reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+
+        drop(relay_writer);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        let mut expected = already_forwarded.to_vec();
+        expected.extend_from_slice(body_remainder);
+        assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_handles_tiny_chunks_without_an_aggregate_framing_limit() {
+        let mut chunked_body = Vec::new();
+        for _ in 0..10_000 {
+            chunked_body.extend_from_slice(b"1\r\na\r\n");
+        }
+        chunked_body.extend_from_slice(b"0\r\n\r\n");
+        let pipelined_request = b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut wire = chunked_body.clone();
+        wire.extend_from_slice(pipelined_request);
+
+        let mut reader =
+            tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, CountingReader::new(wire));
+        let mut writer = CountingWriter::default();
+        relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect("valid tiny chunks must not be rejected by an aggregate framing limit");
+
+        let reads_after_body = reader.get_ref().reads;
+        let mut remaining = vec![0; pipelined_request.len()];
+        reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+        assert_eq!(writer.bytes, chunked_body);
+        assert!(
+            reads_after_body < 100,
+            "connection buffering required {reads_after_body} underlying reads"
+        );
+        assert!(
+            writer.writes <= 10_001,
+            "chunk forwarding should require at most one write per chunk, got {}",
+            writer.writes
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_forwards_complete_chunk_before_stream_ends() {
+        let (relay_reader, mut source_writer) = tokio::io::duplex(4096);
+        let (relay_writer, mut destination_reader) = tokio::io::duplex(4096);
+
+        let relay = tokio::spawn(async move {
+            let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
+            let mut relay_writer = relay_writer;
+            relay_chunked(&mut relay_reader, &mut relay_writer, &[], None).await
+        });
+
+        let first_chunk = b"5\r\nhello\r\n";
+        source_writer.write_all(first_chunk).await.unwrap();
+
+        let mut forwarded = vec![0; first_chunk.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            destination_reader.read_exact(&mut forwarded),
+        )
+        .await
+        .expect("complete chunk must be forwarded while the stream remains open")
+        .unwrap();
+        assert_eq!(forwarded, first_chunk);
+
+        source_writer.write_all(b"0\r\n\r\n").await.unwrap();
+        relay
+            .await
+            .expect("relay task must complete")
+            .expect("terminal chunk must relay");
     }
 
     #[test]
@@ -5683,6 +6147,95 @@ mod tests {
         (observer, receiver)
     }
 
+    #[tokio::test]
+    async fn endpoint_observation_records_mcp_denial_after_header_cleanup() {
+        for disconnect_client in [false, true] {
+            let (observer, mut receiver) = test_endpoint_observer().await;
+            let config = crate::l7::parse_l7_config(
+                &regorus::Value::from_json_str(
+                    r#"{"protocol":"mcp","mcp_versions":["2025-11-25"]}"#,
+                )
+                .expect("parse MCP config JSON"),
+            )
+            .expect("parse MCP config");
+            let ctx = crate::l7::relay::L7EvalContext {
+                host: "mcp.example.test".into(),
+                port: 8000,
+                policy_name: "mcp-policy".into(),
+                ..Default::default()
+            };
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+            // The incoming version is allowed, but Connection nominates it for
+            // removal. The final gate must observe the outgoing request's denial.
+            let raw_request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nConnection: close, MCP-Protocol-Version\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            let request =
+                request_from_buffered_http("POST", "/mcp", "/mcp", raw_request.into_bytes())
+                    .expect("parse buffered MCP request");
+            let (mut client, peer) = tokio::io::duplex(4096);
+            let mut peer = Some(peer);
+            if disconnect_client {
+                drop(peer.take());
+            }
+            let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                relay_http_request_with_response_middleware_guarded_observed(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    RelayRequestOptions {
+                        mcp_request_validation: Some(McpRequestValidation {
+                            config: &config,
+                            ctx: &ctx,
+                            redacted_target: "/mcp",
+                        }),
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&observer),
+                ),
+            )
+            .await
+            .expect("reject before upstream I/O");
+            if disconnect_client {
+                assert!(
+                    result.is_err(),
+                    "denial delivery must fail after disconnect"
+                );
+            } else {
+                assert!(matches!(
+                    result.expect("deliver denial"),
+                    RelayOutcome::Consumed
+                ));
+            }
+            assert!(matches!(
+                receiver.try_recv().expect("final MCP denial observation"),
+                EndpointStatusCommand::Observe {
+                    result: EndpointResult::PolicyDenied,
+                    ..
+                }
+            ));
+            assert!(receiver.try_recv().is_err(), "one result per exchange");
+            drop(client);
+            drop(upstream);
+            let mut sent = Vec::new();
+            upstream_peer.read_to_end(&mut sent).await.unwrap();
+            assert!(sent.is_empty(), "rejected request reached upstream");
+            if let Some(mut peer) = peer {
+                let mut response = String::new();
+                peer.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("mcp_protocol_version_not_allowed"),
+                    "{response}"
+                );
+            }
+        }
+    }
+
     async fn assert_observed_response_result(response: &'static [u8], expected: EndpointResult) {
         let (observer, mut receiver) = test_endpoint_observer().await;
         let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
@@ -6810,7 +7363,7 @@ mod tests {
             ResponseRelayScript::HeadersOnly,
         )
         .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
 
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\n\r\n",
@@ -7588,6 +8141,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_persistence_is_independent_of_framing_and_middleware() {
+        for script in [
+            None,
+            Some(ResponseRelayScript::HeadersOnly),
+            Some(ResponseRelayScript::Stream),
+            Some(ResponseRelayScript::WholeBody),
+        ] {
+            for (method, response, closes) in [
+                (
+                    "GET",
+                    "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    true,
+                ),
+                ("HEAD", "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n", true),
+                ("GET", "HTTP/1.0 204 No Content\r\n\r\n", true),
+                (
+                    "GET",
+                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    false,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    false,
+                ),
+                (
+                    "HEAD",
+                    "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n",
+                    false,
+                ),
+            ] {
+                // Body-inspecting scripts reject bodiless responses at preflight.
+                if (method == "HEAD"
+                    || response.contains("204 No Content")
+                    || response.contains("304 Not Modified"))
+                    && matches!(
+                        script,
+                        Some(ResponseRelayScript::Stream | ResponseRelayScript::WholeBody)
+                    )
+                {
+                    continue;
+                }
+                let fixture = script.map(response_middleware_fixture);
+                let middleware = fixture
+                    .as_ref()
+                    .map(|(runner, chain)| response_middleware_context(runner, chain, method));
+                let mut upstream = response.as_bytes();
+                let (mut reader, mut writer) = tokio::io::duplex(4096);
+                let outcome = relay_response(
+                    method,
+                    &mut upstream,
+                    &mut writer,
+                    RelayResponseOptions::default(),
+                    middleware,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    matches!(outcome, RelayOutcome::Consumed),
+                    closes,
+                    "{response}"
+                );
+                let mut delivered = Vec::new();
+                if closes {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        reader.read_to_end(&mut delivered),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{script:?} {method} {response:?}: {error}"))
+                    .unwrap();
+                } else {
+                    // A second write demonstrates that persistent output is still open.
+                    writer.write_all(b"next response").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                    reader.read_to_end(&mut delivered).await.unwrap();
+                    assert!(delivered.ends_with(b"next response"));
+                }
+                if let Some(script) = script {
+                    let expected = match script {
+                        ResponseRelayScript::HeadersOnly => "hello",
+                        ResponseRelayScript::Stream => "HELLO",
+                        ResponseRelayScript::WholeBody => "whole:hello",
+                        _ => unreachable!(),
+                    };
+                    if response.ends_with("hello") {
+                        assert!(String::from_utf8_lossy(&delivered).contains(expected));
+                    }
+                } else {
+                    assert!(delivered.starts_with(response.as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn relay_response_connection_close_with_content_length() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
 
@@ -7612,18 +8276,19 @@ mod tests {
         .expect("relay must not deadlock");
 
         let outcome = result.expect("relay_response should succeed");
-        // With explicit framing, Connection: close is still reported as reusable
-        // so the relay loop continues.  The *next* upstream write will fail and
-        // exit the loop via the normal error path.
-        assert!(
-            matches!(outcome, RelayOutcome::Reusable),
-            "explicit framing keeps loop alive despite Connection: close"
-        );
+        assert!(matches!(outcome, RelayOutcome::Consumed));
 
-        client_write.shutdown().await.unwrap();
+        // Keep the relay-side stream alive: EOF must come from shutdown,
+        // not from dropping the stream or the test closing it manually.
         let mut received = Vec::new();
-        client_read.read_to_end(&mut received).await.unwrap();
-        assert!(String::from_utf8_lossy(&received).contains("hello"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_read.read_to_end(&mut received),
+        )
+        .await
+        .expect("closing response must deliver EOF")
+        .unwrap();
+        assert_eq!(received, response);
     }
 
     #[tokio::test]
@@ -8442,6 +9107,175 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_upgrade_detail_refuses_h2c_for_every_protocol() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n";
+        for protocol in [
+            crate::l7::L7Protocol::Rest,
+            crate::l7::L7Protocol::Websocket,
+            crate::l7::L7Protocol::Graphql,
+            crate::l7::L7Protocol::JsonRpc,
+            crate::l7::L7Protocol::Mcp,
+        ] {
+            assert_eq!(
+                unsupported_upgrade_detail(raw, protocol),
+                Some(UNSUPPORTED_H2C_UPGRADE_DETAIL),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_any_upgrade_on_jsonrpc_family() {
+        let websocket = format!(
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nAccept: text/event-stream\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        // Any request that carries an `Upgrade` header is refused, including
+        // one without `Connection: upgrade` that the relay would not upgrade.
+        let requests: [&[u8]; 3] = [
+            websocket.as_bytes(),
+            b"POST /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, upgrade\r\nContent-Length: 0\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: custom\r\n\r\n",
+        ];
+        for raw in requests {
+            for protocol in [crate::l7::L7Protocol::JsonRpc, crate::l7::L7Protocol::Mcp] {
+                assert_eq!(
+                    unsupported_upgrade_detail(raw, protocol),
+                    Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+                    "{protocol:?}: {}",
+                    String::from_utf8_lossy(raw)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_allows_ordinary_requests_and_relaying_protocols() {
+        let websocket = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        for protocol in [
+            crate::l7::L7Protocol::Rest,
+            crate::l7::L7Protocol::Websocket,
+        ] {
+            assert_eq!(
+                unsupported_upgrade_detail(websocket.as_bytes(), protocol),
+                None,
+                "{protocol:?}"
+            );
+        }
+
+        // Streamable HTTP requests, a look-alike header name, and a stray
+        // `Connection: upgrade` without an `Upgrade` header stay allowed;
+        // none of them can switch protocols.
+        let ordinary: [&[u8]; 4] = [
+            b"POST /mcp HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n{}",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nAccept: text/event-stream\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade-Insecure-Requests: 1\r\n\r\n",
+            b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n\r\n",
+        ];
+        for raw in ordinary {
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
+                assert_eq!(
+                    unsupported_upgrade_detail(raw, protocol),
+                    None,
+                    "{protocol:?}: {}",
+                    String::from_utf8_lossy(raw)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_upgrades_on_graphql() {
+        let requests = [
+            format!(
+                "GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n"
+            ),
+            "POST /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: custom\r\nConnection: upgrade\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        ];
+        for raw in &requests {
+            assert_eq!(
+                unsupported_upgrade_detail(raw.as_bytes(), crate::l7::L7Protocol::Graphql),
+                Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_refusal_for_protocol_names_every_per_request_protocol() {
+        use crate::l7::L7Protocol;
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::JsonRpc),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Mcp),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Graphql),
+            Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+            assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_covers_every_relay_upgrade_check() {
+        // The refusal must be at least as broad as both relay checks that can
+        // lead to a protocol switch, across header spellings that pass
+        // ingress validation.
+        let valid_websocket = |head: &str| {
+            format!("{head}Sec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        };
+        let requests = [
+            valid_websocket(
+                "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUPGRADE: WebSocket\r\nCONNECTION: UPGRADE\r\n",
+            ),
+            valid_websocket(
+                "GET /mcp HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nConnection: upgrade\r\nUpgrade: websocket\r\n",
+            ),
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade:\r\nConnection: upgrade\r\n\r\n"
+                .to_string(),
+            "GET /mcp HTTP/1.0\r\nUpgrade: websocket\r\nConnection:upgrade\r\n\r\n".to_string(),
+            "POST /mcp HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nUpgrade: custom\r\nConnection: close, Upgrade\r\n\r\n"
+                .to_string(),
+            "GET /mcp HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: upgrade\r\n\r\n"
+                .to_string(),
+        ];
+        for raw in &requests {
+            assert!(
+                validate_http_request_header_block(raw.as_bytes()).is_ok(),
+                "fixture must pass ingress validation: {raw}"
+            );
+            assert!(
+                client_requested_upgrade(raw) || request_is_websocket_upgrade(raw.as_bytes()),
+                "fixture must be an upgrade to the relay: {raw}"
+            );
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
+                assert!(
+                    unsupported_upgrade_detail(raw.as_bytes(), protocol).is_some(),
+                    "{protocol:?} must refuse: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn client_requested_upgrade_handles_comma_separated_connection() {
         let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
         assert!(client_requested_upgrade(headers));
@@ -8569,12 +9403,12 @@ mod tests {
     /// placeholders in request headers before forwarding to upstream.
     ///
     /// This is the code path exercised when an endpoint has `protocol: rest`
-    /// and `tls: terminate` — the proxy terminates TLS, sees plaintext HTTP,
-    /// and replaces placeholder tokens with real secrets.
+    /// and terminated TLS — the proxy sees plaintext HTTP and replaces
+    /// placeholder tokens with real secrets.
     ///
-    /// Without this test, a misconfigured endpoint (missing `tls: terminate`)
-    /// silently leaks placeholder strings like `openshell:resolve:env:NVIDIA_API_KEY`
-    /// to the upstream API, causing 401 Unauthorized errors.
+    /// Without this test, a misconfigured endpoint silently leaks placeholder
+    /// strings like `openshell:resolve:env:NVIDIA_API_KEY` to the upstream
+    /// API, causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
         let provider_env: HashMap<String, String> = [(

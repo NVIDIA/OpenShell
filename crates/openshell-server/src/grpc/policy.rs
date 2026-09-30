@@ -14,7 +14,9 @@ mod endpoint_status;
 mod provisioning_clock;
 pub use provisioning_clock::configuration_change;
 
-pub(super) use endpoint_status::handle_report_endpoint_status;
+pub(super) use endpoint_status::{
+    handle_peer_report_endpoint_status, handle_report_endpoint_status,
+};
 pub use endpoint_status::{
     invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
     retry_endpoint_status_after_supervisor_disconnect,
@@ -65,14 +67,12 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    GetResourceVersion, VERSION,
+    GetResourceVersion,
     endpoint_path::EndpointPathPattern,
     host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, OcsfEvent, SeverityId, StateId, StatusId};
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
     compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
@@ -90,7 +90,7 @@ use openshell_prover::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -267,7 +267,7 @@ fn emit_gateway_policy_audit_log(
     version: i64,
     policy_hash: &str,
 ) {
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         state_label,
@@ -275,12 +275,7 @@ fn emit_gateway_policy_audit_log(
         version,
         policy_hash,
         &[],
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
 /// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
@@ -305,7 +300,7 @@ fn emit_gateway_policy_auto_approve_audit_log(
         ("prover_delta", "empty".to_string()),
         ("resolved_from", resolved_from.to_string()),
     ];
-    let message = build_gateway_policy_audit_message(
+    openshell_ocsf::ocsf_emit!(build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         "approved",
@@ -313,15 +308,10 @@ fn emit_gateway_policy_auto_approve_audit_log(
         version,
         policy_hash,
         &extra,
-    );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    ));
 }
 
-fn build_gateway_policy_audit_message(
+fn build_gateway_policy_audit_event(
     sandbox_id: &str,
     sandbox_name: &str,
     state_label: &str,
@@ -329,16 +319,8 @@ fn build_gateway_policy_audit_message(
     version: i64,
     policy_hash: &str,
     extra_fields: &[(&str, String)],
-) -> String {
-    let ctx = EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    };
+) -> OcsfEvent {
+    let ctx = crate::gateway_ocsf::context(sandbox_id, sandbox_name);
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Other, state_label)
         .severity(SeverityId::Informational)
@@ -353,8 +335,7 @@ fn build_gateway_policy_audit_message(
     for (key, value) in extra_fields {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    builder.build()
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -2528,6 +2509,9 @@ async fn resolve_sandbox_by_name_for_principal(
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals may not resolve sandbox configuration",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
         )),
@@ -2808,7 +2792,7 @@ pub(super) async fn load_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
-        state.sandbox_jwt_issuer.is_some(),
+        state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_binding_context(
@@ -2847,7 +2831,7 @@ pub(super) async fn load_sandbox_config(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
-        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
+        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
             .as_ref()
@@ -3362,10 +3346,10 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    Ok(Response::new(
+    let environment =
         load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
-            .await?,
-    ))
+            .await?;
+    Ok(Response::new(environment))
 }
 
 /// Materialize a privileged provider snapshot after the caller has authorized
@@ -3492,6 +3476,7 @@ pub(super) async fn load_sandbox_provider_environment(
         .collect();
     Ok(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
+        files: provider_environment.files,
         provider_env_revision,
         credential_expiration_times,
         dynamic_credentials: provider_environment.dynamic_credentials,
@@ -3598,7 +3583,9 @@ async fn handle_update_config_inner(
             ));
         }
         let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3787,7 +3774,9 @@ async fn handle_update_config_inner(
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -3882,7 +3871,9 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire policy mutation lock")
+    })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4413,7 +4404,9 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let _guard = state.compute.sandbox_sync_guard().await;
+    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire configuration admission lock")
+    })?;
     let mut sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
@@ -4613,7 +4606,9 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -4697,7 +4692,7 @@ pub(super) async fn handle_get_sandbox_logs(
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
                 if let Some(since_time) = since_time.as_ref() {
                     let event_time = log.event_time.as_ref()?;
@@ -10004,14 +9999,12 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn l7_scope_policy() -> ProtoSandboxPolicy {
         let endpoint = NetworkEndpoint {
             host: "api.example.com".to_string(),
             port: 443,
             ports: vec![443, 8443],
             protocol: "rest".to_string(),
-            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
             access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
@@ -10967,7 +10960,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = 2;
         endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -11280,6 +11272,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "generic".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -11373,6 +11366,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -11444,6 +11438,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -12601,6 +12596,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-policy".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -12825,6 +12821,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_files_do_not_block_legacy_provider_environment_requests() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileFile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-config-only".to_string(),
+                    name: "config-only".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "config-only".to_string(),
+                    display_name: "Config only".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    files: vec![ProviderProfileFile {
+                        path: "client.toml".to_string(),
+                        content: "endpoint = '{{config.endpoint}}'".to_string(),
+                        env_var: "CLIENT_CONFIG_FILE".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let mut file_provider = test_provider("work-config", "config-only");
+        file_provider.credentials.clear();
+        file_provider
+            .config
+            .insert("endpoint".to_string(), "https://config.example".to_string());
+        state.store.put_message(&file_provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-files-and-credentials",
+                "files-and-credentials",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-config".to_string(), "work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        // An older supervisor sends this request without a provider-file
+        // capability field and ignores the additive files response field.
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-files-and-credentials".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert_eq!(
+            response.environment.get("CLIENT_CONFIG_FILE"),
+            Some(&"/run/openshell/providers/work-config/client.toml".to_string())
+        );
+        assert_eq!(
+            response
+                .files
+                .get("/run/openshell/providers/work-config/client.toml"),
+            Some(&"endpoint = 'https://config.example'".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
         let state = test_server_state().await;
         state
@@ -13032,7 +13111,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
-        bound_endpoint.tls = 2;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store
@@ -13722,6 +13800,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-token".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -14052,6 +14131,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
+                        files: Vec::new(),
                         id: "custom-api".to_string(),
                         resource_version: 0,
                         annotations: HashMap::new(),
@@ -17725,6 +17805,7 @@ mod tests {
                     deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
+                    files: Vec::new(),
                     id: "custom-api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -18969,8 +19050,8 @@ mod tests {
     }
 
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
+    fn build_gateway_policy_audit_event_formats_ocsf_config_line() {
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "merged",
@@ -18978,7 +19059,8 @@ mod tests {
             7,
             "sha256:testhash",
             &[],
-        );
+        )
+        .format_shorthand();
 
         assert_eq!(
             message,
@@ -18993,13 +19075,13 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+    fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
             ("auto", "true".to_string()),
             ("source", "agent_authored".to_string()),
             ("prover_delta", "empty".to_string()),
         ];
-        let message = build_gateway_policy_audit_message(
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "approved",
@@ -19007,7 +19089,8 @@ mod tests {
             12,
             "sha256:autohash",
             &extra,
-        );
+        )
+        .format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
@@ -19028,6 +19111,58 @@ mod tests {
             message.contains("prover_delta:empty"),
             "missing prover_delta field: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_policy_audit_events_reach_ocsf_jsonl() {
+        use tracing_subscriber::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let config = toml::from_str(&format!(
+            "path = {:?}\nrotation = 'never'\n",
+            path.display().to_string()
+        ))
+        .unwrap();
+        let log = crate::ocsf_log::OcsfLog::start(config).unwrap();
+        let subscriber = tracing_subscriber::registry().with(log.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            emit_gateway_policy_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "approved",
+                "approved chunk abc",
+                7,
+                "sha256:manual",
+            );
+            emit_gateway_policy_auto_approve_audit_log(
+                "sb-123",
+                "demo-sandbox",
+                "auto-approved: no new prover findings",
+                8,
+                "sha256:auto",
+                "mechanistic",
+                "gateway",
+            );
+        });
+        log.shutdown().await;
+
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
+            assert_eq!(event["container"]["uid"], "sb-123");
+            assert!(event["container"].get("image").is_none());
+        }
+        assert_eq!(events[0]["unmapped"]["policy_hash"], "sha256:manual");
+        assert!(events[0]["unmapped"].get("auto").is_none());
+        assert_eq!(events[1]["unmapped"]["policy_hash"], "sha256:auto");
+        assert_eq!(events[1]["unmapped"]["auto"], "true");
+        assert_eq!(events[1]["unmapped"]["resolved_from"], "gateway");
     }
 
     #[test]

@@ -9,6 +9,88 @@
 # Keep an explicit override so telemetry-specific tests can opt back in.
 export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
 
+# Resolve a test image override. Repository-only values inherit the caller's
+# tag, while tagged and digest-pinned references are already complete.
+e2e_image_reference_is_complete() {
+  local image=$1
+  local last_component="${image##*/}"
+
+  [[ "${image}" == *@* || "${last_component}" == *:* ]]
+}
+
+e2e_image_reference_has_digest() {
+  [[ "$1" == *@* ]]
+}
+
+e2e_resolve_image_reference() {
+  local image=$1
+  local tag=$2
+
+  if e2e_image_reference_is_complete "${image}"; then
+    printf '%s\n' "${image}"
+  else
+    printf '%s:%s\n' "${image%/}" "${tag}"
+  fi
+}
+
+e2e_image_reference_repository() {
+  local image=$1
+  local repository="${image%%@*}"
+  local last_component="${repository##*/}"
+
+  if [[ "${last_component}" == *:* ]]; then
+    repository="${repository%:*}"
+  fi
+  printf '%s\n' "${repository}"
+}
+
+# Return the registry portion of an image repository. Docker treats the first
+# path component as a registry when it contains a dot or colon, or is
+# `localhost`; otherwise the image uses the configured/default registry.
+e2e_image_reference_registry() {
+  local repository
+  local first_component
+
+  repository="$(e2e_image_reference_repository "$1")"
+  first_component="${repository%%/*}"
+  if [[ "${repository}" == */* ]] \
+    && { [[ "${first_component}" == *.* ]] || [[ "${first_component}" == *:* ]] || [[ "${first_component}" == "localhost" ]]; }; then
+    printf '%s\n' "${first_component}"
+  fi
+}
+
+# Return the repository path without its registry, suitable for Helm's
+# <component>.image.repository values.
+e2e_image_reference_repository_path() {
+  local repository
+  local registry
+
+  repository="$(e2e_image_reference_repository "$1")"
+  registry="$(e2e_image_reference_registry "$1")"
+  if [ -n "${registry}" ]; then
+    printf '%s\n' "${repository#"${registry}"/}"
+  else
+    printf '%s\n' "${repository}"
+  fi
+}
+
+e2e_image_reference_tag() {
+  local image=$1
+  local repository="${image%%@*}"
+  local last_component="${repository##*/}"
+
+  if [[ "${image}" == *@* || "${last_component}" != *:* ]]; then
+    return 0
+  fi
+  printf '%s\n' "${last_component##*:}"
+}
+
+e2e_image_reference_digest() {
+  if [[ "$1" == *@* ]]; then
+    printf '%s\n' "${1#*@}"
+  fi
+}
+
 e2e_cargo_target_dir() {
   local root=$1
   shift

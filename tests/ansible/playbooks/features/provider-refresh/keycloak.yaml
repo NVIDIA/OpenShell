@@ -49,6 +49,15 @@
           - provider_refresh_keycloak_test_archive.stat.isreg | default(false)
         fail_msg: Keycloak provider refresh test bundle did not contain tests.tar.zst
 
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
     - name: Run Keycloak provider refresh archive
       ansible.builtin.command:
         argv:
@@ -61,7 +70,7 @@
           - /var/lib/openshell-provider-refresh/tests
           - --no-capture
       environment:
-        OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
         OPENSHELL_E2E_OIDC_ISSUER: http://127.0.0.1:8180/realms/openshell
         OPENSHELL_E2E_OIDC_USERNAME: admin@test
         OPENSHELL_E2E_OIDC_PASSWORD: admin

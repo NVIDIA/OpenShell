@@ -4,7 +4,6 @@
 {% block driver %}
 [openshell.drivers.docker]
 socket_path = "{{ openshell_runtime_socket }}"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "if_not_present"
 sandbox_label = "tmachine"
 grpc_endpoint = "http://127.0.0.1:17670"

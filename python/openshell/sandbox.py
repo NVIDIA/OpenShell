@@ -17,6 +17,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -37,6 +38,8 @@ _ClientCallDetailsBase = namedtuple(
 )
 
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
+_PAGER_MAX_CONSUMED_TOKENS = 10_000
+_PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
 T = TypeVar("T")
 
 
@@ -49,20 +52,46 @@ class Page(Generic[T]):
 
 
 class Pager(Generic[T]):
-    """Lazy, single-pass iterator that fetches one RPC page per advance."""
+    """Lazy, single-pass iterator over the continuation-token contract.
+
+    The repeated-token guard has bounded memory and raises ``SandboxError`` if
+    the traversal exceeds that guard's token-count or byte budget.
+    """
 
     def __init__(self, fetch: Callable[[str], Page[T]], page_token: str = "") -> None:
         self._fetch = fetch
         self._page_token: str | None = page_token
+        self._consumed_page_tokens: set[str] = set()
+        self._consumed_page_token_bytes = 0
 
     def __iter__(self) -> Pager[T]:
         return self
 
+    def _validate_page_token_budget(self, page_token: str) -> int:
+        if not page_token:
+            return 0
+        token_bytes = len(page_token.encode("utf-8"))
+        if (
+            len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
+            or self._consumed_page_token_bytes + token_bytes
+            > _PAGER_MAX_CONSUMED_TOKEN_BYTES
+        ):
+            raise SandboxError("pager continuation token history limit exceeded")
+        return token_bytes
+
     def __next__(self) -> Page[T]:
         if self._page_token is None:
             raise StopIteration
-        page = self._fetch(self._page_token)
-        self._page_token = page.next_page_token or None
+        page_token = self._page_token
+        token_bytes = self._validate_page_token_budget(page_token)
+        page = self._fetch(page_token)
+        if page_token:
+            self._consumed_page_tokens.add(page_token)
+            self._consumed_page_token_bytes += token_bytes
+        next_page_token = page.next_page_token
+        if next_page_token and next_page_token in self._consumed_page_tokens:
+            raise SandboxError("pager received a repeated continuation token")
+        self._page_token = next_page_token or None
         return page
 
     def all(self) -> builtins.list[T]:
@@ -78,6 +107,24 @@ def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
 
 def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
     return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
+
+
+def _service_exposure_messages(
+    exposures: Sequence[ServiceExposure] | None,
+) -> list[openshell_pb2.SandboxServiceExposure]:
+    return [
+        openshell_pb2.SandboxServiceExposure(
+            service=exposure.service,
+            target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
+        )
+        for exposure in exposures or ()
+    ]
 
 
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
@@ -408,6 +455,25 @@ class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
+
+
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
+
+
+@dataclass(frozen=True)
+class ServiceExposure:
+    """A loopback HTTP service to expose during sandbox creation."""
+
+    target_port: int
+    service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -451,9 +517,14 @@ class SandboxRef:
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
     labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
     created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
+    # Populated by create operations. The empty key identifies the unnamed service.
+    service_urls: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
+        object.__setattr__(self, "service_urls", _ImmutableLabels(self.service_urls))
 
     @property
     def phase(self) -> int:
@@ -764,6 +835,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -772,10 +844,11 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -788,6 +861,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -799,10 +873,11 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -814,9 +889,17 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
-            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+            self,
+            self.create(
+                workspace=workspace,
+                spec=spec,
+                name=name,
+                labels=labels,
+                service_exposures=service_exposures,
+            ),
         )
 
     def create_session_from_template(
@@ -827,6 +910,7 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -836,6 +920,7 @@ class SandboxClient:
                 spec=spec,
                 name=name,
                 labels=labels,
+                service_exposures=service_exposures,
             ),
         )
 
@@ -1677,7 +1762,10 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
-def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
+def _sandbox_ref(
+    sandbox: openshell_pb2.Sandbox,
+    service_urls: Mapping[str, str] | None = None,
+) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
     provenance = (
         SandboxWorkloadTemplateProvenanceRef(
@@ -1697,9 +1785,17 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
             else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
+            else None,
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
+            else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
+        service_urls=service_urls or {},
     )
 
 

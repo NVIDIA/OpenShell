@@ -23,21 +23,19 @@
 //! 4. Deleting the sandbox removes the per-sandbox Podman secret.
 
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::wait_for_healthy;
-use openshell_e2e::harness::container::{ContainerEngine, SupportContainer};
+use openshell_e2e::harness::container::{ContainerEngine, HostSupportContainer};
 use openshell_e2e::harness::gateway::ManagedGateway;
+use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
 
-const PROXY_ALIAS: &str = "corp-proxy.openshell.test";
-const PROXY_PORT: u16 = 3128;
-const ALLOWED_ALIAS: &str = "tls-upstream.openshell.test";
-const DENIED_ALIAS: &str = "denied-upstream.openshell.test";
-const UPSTREAM_PORT: u16 = 8443;
+const HOST_ALIAS: &str = "host.openshell.internal";
 
 const PROXY_USER: &str = "proxyuser";
 const PROXY_PASS: &str = "proxypass";
@@ -52,7 +50,7 @@ const SECRET_PREFIX: &str = "openshell-proxy-auth-";
 ///
 /// The log lines are the test's evidence: they record the exact CONNECT target
 /// (proving validated-IP vs hostname form) and whether credentials arrived.
-fn proxy_script() -> String {
+fn proxy_script(port: u16) -> String {
     format!(
         r#"
 import base64, select, socket, threading
@@ -127,7 +125,7 @@ def handle(conn):
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', {PROXY_PORT}))
+server.bind(('0.0.0.0', {port}))
 server.listen(64)
 log('proxy-listening')
 while True:
@@ -156,7 +154,7 @@ const CA_END: &str = "---PROXY-CA-END---";
 /// what a real intercepting proxy does. No Basic auth: this test isolates the
 /// `https://` proxy + corporate-CA path; credential delivery is covered by the
 /// plaintext-proxy test.
-fn tls_proxy_script() -> String {
+fn tls_proxy_script(port: u16) -> String {
     format!(
         r"
 import os, select, socket, ssl, subprocess, tempfile, threading
@@ -179,10 +177,10 @@ run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
 
 with open(ext, 'w') as fh:
     fh.write('basicConstraints=critical,CA:FALSE\n'
-             'subjectAltName=DNS:{PROXY_ALIAS}\n'
+             'subjectAltName=DNS:{HOST_ALIAS}\n'
              'extendedKeyUsage=serverAuth\n')
 run('openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
-    '-keyout', leaf_key, '-out', leaf_csr, '-subj', '/CN={PROXY_ALIAS}')
+    '-keyout', leaf_key, '-out', leaf_csr, '-subj', '/CN={HOST_ALIAS}')
 run('openssl', 'x509', '-req', '-in', leaf_csr, '-CA', ca_crt, '-CAkey', ca_key,
     '-CAcreateserial', '-out', leaf_crt, '-days', '1', '-extfile', ext)
 
@@ -253,7 +251,7 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(chain, leaf_key)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('0.0.0.0', {PROXY_PORT}))
+server.bind(('0.0.0.0', {port}))
 server.listen(64)
 log('tls-proxy-listening')
 while True:
@@ -287,7 +285,7 @@ fn ca_cert_from_logs(logs: &str) -> Result<String, String> {
 /// The sandbox workload uses an unverified TLS context, so the certificate only
 /// needs to exist — but the TLS handshake itself must be real, because it is
 /// what proves bytes flowed end to end through the tunnel.
-fn tls_upstream_script(common_name: &str, marker: &str) -> String {
+fn tls_upstream_script(common_name: &str, marker: &str, port: u16) -> String {
     format!(
         r#"
 import http.server, os, ssl, subprocess, tempfile
@@ -320,7 +318,7 @@ class Server(http.server.HTTPServer):
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(crt, key)
-server = Server(('0.0.0.0', {UPSTREAM_PORT}), Handler)
+server = Server(('0.0.0.0', {port}), Handler)
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
 print('tls-upstream-listening', flush=True)
 server.serve_forever()
@@ -330,7 +328,7 @@ server.serve_forever()
 
 /// Workload: one approved HTTPS request, one denied, then idle so the test can
 /// inspect the live sandbox's Podman secret before deleting it.
-fn workload_script() -> String {
+fn workload_script(allowed_port: u16, denied_port: u16) -> String {
     format!(
         r"
 import json, ssl, time, urllib.request
@@ -351,10 +349,10 @@ def fetch(url, retries):
 # The approved request is retried: policy reload during sandbox startup can
 # transiently surface as a 403 in the forward proxy.
 print('ALLOWED_RESULT ' + json.dumps(
-    fetch('https://{ALLOWED_ALIAS}:{UPSTREAM_PORT}/', 6)), flush=True)
+    fetch('https://{HOST_ALIAS}:{allowed_port}/', 6)), flush=True)
 # The denied request must fail, so a single attempt is enough.
 print('DENIED_RESULT ' + json.dumps(
-    fetch('https://{DENIED_ALIAS}:{UPSTREAM_PORT}/', 1)), flush=True)
+    fetch('https://{HOST_ALIAS}:{denied_port}/', 1)), flush=True)
 print('{READY_MARKER}', flush=True)
 while True:
     time.sleep(1)
@@ -365,7 +363,7 @@ while True:
 /// Policy allowing only the approved upstream. `tls: skip` keeps the tunnel raw
 /// so the workload's TLS session runs end to end to the upstream, which is what
 /// makes the proxied CONNECT path observable.
-fn policy_yaml() -> String {
+fn policy_yaml(allowed_port: u16) -> String {
     format!(
         r#"version: 1
 
@@ -395,8 +393,8 @@ network_policies:
   corporate_proxy_e2e:
     name: corporate_proxy_e2e
     endpoints:
-      - host: {ALLOWED_ALIAS}
-        port: {UPSTREAM_PORT}
+      - host: {HOST_ALIAS}
+        port: {allowed_port}
         tls: skip
         enforcement: enforce
         allowed_ips:
@@ -473,19 +471,26 @@ impl GatewayProxyConfig {
             proxy_config.push_str(&format!("proxy_ca_bundle = \"{ca_bundle}\"\n"));
         }
 
-        // The managed gateway config ends in nested gateway tables. Insert
-        // proxy fields before the first one, while the active TOML table is
-        // still [openshell.drivers.podman].
-        let insertion = b"\n[openshell.gateway.";
-        let offset = original
-            .windows(insertion.len())
-            .position(|window| window == insertion)
+        // Insert the proxy fields at the end of the Podman driver table. The
+        // generated config may add driver subtables (for example
+        // `resource_admission`) before the gateway JWT and auth tables, so a
+        // gateway-table marker is not a reliable boundary.
+        let podman_table = b"[openshell.drivers.podman]";
+        let table_start = original
+            .windows(podman_table.len())
+            .position(|window| window == podman_table)
             .ok_or_else(|| {
                 format!(
-                    "gateway config '{}' has no nested gateway table insertion point",
+                    "gateway config '{}' has no Podman driver table",
                     config_path.display()
                 )
             })?;
+        let table_body = table_start + podman_table.len();
+        let next_table = b"\n[";
+        let offset = original[table_body..]
+            .windows(next_table.len())
+            .position(|window| window == next_table)
+            .map_or(original.len(), |relative| table_body + relative);
         let mut updated = Vec::with_capacity(original.len() + proxy_config.len() + 1);
         updated.extend_from_slice(&original[..offset]);
         if !updated.ends_with(b"\n") {
@@ -594,7 +599,7 @@ async fn wait_for_secret_removal(secret: &str, timeout: Duration) -> Result<(), 
 /// `output` is the sandbox's stdout; `proxy_logs` is the fake proxy's log,
 /// which is the only place the CONNECT target form and the credential outcome
 /// are observable.
-fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denied_ip: &str) {
+fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_port: u16, denied_port: u16) {
     // The approved request succeeded and its body came from the upstream,
     // proving bytes traversed the tunnel rather than the proxy short-circuiting.
     assert!(
@@ -606,18 +611,18 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denie
         "approved HTTPS request should have returned 200:\n{output}"
     );
 
-    // The denied destination failed inside the sandbox — and specifically with
-    // a 403 from the supervisor's own proxy. Asserting the status rather than
-    // just "it failed" is what rules out a vacuous pass: an unresolvable host
-    // or a dead upstream would also fail, but neither would prove the request
-    // was stopped by policy.
+    // The denied destination failed inside the sandbox. Depending on where the
+    // isolated Podman path rejects it, this is either the supervisor's HTTP 403
+    // or a fail-closed socket permission error. The proxy-log assertion below
+    // rules out a vacuous failure after upstream contact.
     let denied_line = output
         .lines()
         .find(|line| line.contains("DENIED_RESULT"))
         .unwrap_or_default();
     assert!(
-        denied_line.contains(r#""status": -1"#) && denied_line.contains("403"),
-        "denied destination should have been refused by policy with 403:\n{output}"
+        denied_line.contains(r#""status": -1"#)
+            && (denied_line.contains("403") || denied_line.contains("Permission denied")),
+        "denied destination should have been refused by policy:\n{output}"
     );
     assert!(
         !output.contains(DENIED_MARKER),
@@ -627,9 +632,11 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denie
     // Credentials arrived through the mounted secret: the proxy answers 407
     // without them, so a completed CONNECT is proof of delivery.
     assert!(
-        proxy_logs.contains(&format!("CONNECT {allowed_ip}:{UPSTREAM_PORT} auth=ok")),
+        proxy_logs.lines().any(|line| {
+            line.starts_with("CONNECT ") && line.contains(&format!(":{allowed_port} auth=ok"))
+        }),
         "proxy should have seen an authenticated validated-IP CONNECT to \
-         {allowed_ip}:{UPSTREAM_PORT}.\nProxy logs:\n{proxy_logs}\nSandbox output:\n{output}"
+         host port {allowed_port}.\nProxy logs:\n{proxy_logs}\nSandbox output:\n{output}"
     );
     assert!(
         !proxy_logs.contains("auth=fail"),
@@ -640,17 +647,18 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denie
     // no DNS resolution of its own, so the tunnel stays bound to the address
     // that passed SSRF and allowed_ips validation.
     assert!(
-        !proxy_logs.contains(ALLOWED_ALIAS),
+        !proxy_logs.contains(HOST_ALIAS),
         "CONNECT should target a validated IP, not the hostname:\n{proxy_logs}"
     );
 
     // The denied destination never reached the proxy: policy denial happens
-    // before any upstream contact. The port is part of the needle so a shorter
-    // IP cannot match inside a longer one (10.89.0.2 within 10.89.0.20).
+    // before any upstream contact. Its dedicated host port makes this
+    // observable even though both fixtures use the driver-neutral host alias.
     assert!(
-        !proxy_logs.contains(&format!("{denied_ip}:{UPSTREAM_PORT}"))
-            && !proxy_logs.contains(DENIED_ALIAS),
-        "policy-denied destination {denied_ip} ({DENIED_ALIAS}) must never reach the proxy:\n{proxy_logs}"
+        !proxy_logs
+            .lines()
+            .any(|line| line.starts_with("CONNECT ") && line.contains(&format!(":{denied_port} "))),
+        "policy-denied host port {denied_port} must never reach the proxy:\n{proxy_logs}"
     );
 }
 
@@ -669,33 +677,32 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
         return;
     }
 
-    // ── Fixtures on the shared e2e network ────────────────────────────
-    let proxy = SupportContainer::start_python(PROXY_ALIAS, &proxy_script(), PROXY_PORT)
-        .await
-        .expect("start fake corporate proxy");
-    let allowed = SupportContainer::start_python(
-        ALLOWED_ALIAS,
-        &tls_upstream_script(ALLOWED_ALIAS, ALLOWED_MARKER),
-        UPSTREAM_PORT,
+    // The split Podman supervisor uses host networking and cannot resolve
+    // container-network aliases. Run each fixture on a distinct host port and
+    // reach it through the driver-neutral host alias.
+    let proxy_port = find_free_port();
+    let proxy =
+        HostSupportContainer::start_python_on_host_network(&proxy_script(proxy_port), proxy_port)
+            .await
+            .expect("start fake corporate proxy");
+    let allowed_port = find_free_port();
+    let allowed = HostSupportContainer::start_python_on_host_network(
+        &tls_upstream_script(HOST_ALIAS, ALLOWED_MARKER, allowed_port),
+        allowed_port,
     )
     .await
     .expect("start approved TLS upstream");
-    // A separate container, not another alias on the approved one: CONNECT
-    // targets are IPs, so a shared IP would make "the proxy never saw the
-    // denied destination" unprovable.
-    let denied = SupportContainer::start_python(
-        DENIED_ALIAS,
-        &tls_upstream_script(DENIED_ALIAS, DENIED_MARKER),
-        UPSTREAM_PORT,
+    let denied_port = find_free_port();
+    let denied = HostSupportContainer::start_python_on_host_network(
+        &tls_upstream_script(HOST_ALIAS, DENIED_MARKER, denied_port),
+        denied_port,
     )
     .await
     .expect("start denied TLS upstream");
 
-    let allowed_ip = allowed.ip().expect("resolve approved upstream IP");
-    let denied_ip = denied.ip().expect("resolve denied upstream IP");
     assert_ne!(
-        allowed_ip, denied_ip,
-        "approved and denied upstreams must have distinct IPs"
+        allowed.port, denied.port,
+        "approved and denied upstreams must have distinct host ports"
     );
 
     // ── Point the gateway at the corporate proxy ──────────────────────
@@ -711,14 +718,14 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
     let secrets_before = proxy_auth_secret_names().expect("snapshot proxy-auth secrets");
 
     let mut gateway_config =
-        GatewayProxyConfig::apply(&format!("http://{PROXY_ALIAS}:{PROXY_PORT}"), &auth_path)
+        GatewayProxyConfig::apply(&format!("http://{HOST_ALIAS}:{}", proxy.port), &auth_path)
             .await
             .expect("apply corporate proxy gateway config");
 
     // ── Run the workload ──────────────────────────────────────────────
     let mut policy = NamedTempFile::new().expect("create policy file");
     policy
-        .write_all(policy_yaml().as_bytes())
+        .write_all(policy_yaml(allowed.port).as_bytes())
         .expect("write policy file");
     policy.flush().expect("flush policy file");
     let policy_path = policy
@@ -727,7 +734,7 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
         .expect("policy path should be utf-8")
         .to_string();
 
-    let script = workload_script();
+    let script = workload_script(allowed.port, denied.port);
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--policy", &policy_path],
         &["python3", "-c", &script],
@@ -739,8 +746,8 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
     assert_proxied_egress(
         &sandbox.create_output,
         &proxy.logs().expect("read fake proxy logs"),
-        &allowed_ip,
-        &denied_ip,
+        allowed.port,
+        denied.port,
     );
 
     // ── Secret lifecycle ──────────────────────────────────────────────
@@ -772,7 +779,12 @@ async fn podman_corporate_proxy_routes_approved_tls_egress() {
 /// Assert the approved destination reached the `https://` proxy over the
 /// tunnel and the denied one never did. The TLS proxy logs `CONNECT
 /// <ip>:<port> ok` (no auth dimension in this test).
-fn assert_https_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str, denied_ip: &str) {
+fn assert_https_proxied_egress(
+    output: &str,
+    proxy_logs: &str,
+    allowed_port: u16,
+    denied_port: u16,
+) {
     assert!(
         output.contains(READY_MARKER),
         "workload did not finish; output:\n{output}"
@@ -784,13 +796,16 @@ fn assert_https_proxied_egress(output: &str, proxy_logs: &str, allowed_ip: &str,
         "approved upstream body missing — egress did not complete through the https proxy:\n{output}"
     );
     assert!(
-        proxy_logs.contains(&format!("CONNECT {allowed_ip}:{UPSTREAM_PORT} ok")),
-        "https proxy should have seen a validated-IP CONNECT to the approved upstream:\n{proxy_logs}"
+        proxy_logs.lines().any(|line| {
+            line.starts_with("CONNECT ") && line.contains(&format!(":{allowed_port} ok"))
+        }),
+        "https proxy should have seen a validated-IP CONNECT to approved host port {allowed_port}:\n{proxy_logs}"
     );
     assert!(
-        !proxy_logs.contains(DENIED_ALIAS)
-            && !proxy_logs.contains(&format!("{denied_ip}:{UPSTREAM_PORT}")),
-        "policy-denied destination {denied_ip} ({DENIED_ALIAS}) must never reach the https proxy:\n{proxy_logs}"
+        !proxy_logs
+            .lines()
+            .any(|line| line.starts_with("CONNECT ") && line.contains(&format!(":{denied_port} "))),
+        "policy-denied host port {denied_port} must never reach the https proxy:\n{proxy_logs}"
     );
 }
 
@@ -811,30 +826,31 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
         return;
     }
 
-    // ── Fixtures on the shared e2e network ────────────────────────────
-    let proxy = SupportContainer::start_python(PROXY_ALIAS, &tls_proxy_script(), PROXY_PORT)
-        .await
-        .expect("start fake https corporate proxy");
-    let allowed = SupportContainer::start_python(
-        ALLOWED_ALIAS,
-        &tls_upstream_script(ALLOWED_ALIAS, ALLOWED_MARKER),
-        UPSTREAM_PORT,
+    let proxy_port = find_free_port();
+    let proxy = HostSupportContainer::start_python_on_host_network(
+        &tls_proxy_script(proxy_port),
+        proxy_port,
+    )
+    .await
+    .expect("start fake https corporate proxy");
+    let allowed_port = find_free_port();
+    let allowed = HostSupportContainer::start_python_on_host_network(
+        &tls_upstream_script(HOST_ALIAS, ALLOWED_MARKER, allowed_port),
+        allowed_port,
     )
     .await
     .expect("start approved TLS upstream");
-    let denied = SupportContainer::start_python(
-        DENIED_ALIAS,
-        &tls_upstream_script(DENIED_ALIAS, DENIED_MARKER),
-        UPSTREAM_PORT,
+    let denied_port = find_free_port();
+    let denied = HostSupportContainer::start_python_on_host_network(
+        &tls_upstream_script(HOST_ALIAS, DENIED_MARKER, denied_port),
+        denied_port,
     )
     .await
     .expect("start denied TLS upstream");
 
-    let allowed_ip = allowed.ip().expect("resolve approved upstream IP");
-    let denied_ip = denied.ip().expect("resolve denied upstream IP");
     assert_ne!(
-        allowed_ip, denied_ip,
-        "approved and denied upstreams must have distinct IPs"
+        allowed.port, denied.port,
+        "approved and denied upstreams must have distinct host ports"
     );
 
     // Recover the proxy's self-signed CA from its logs and hand it back as the
@@ -846,6 +862,10 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
         .write_all(ca_pem.as_bytes())
         .expect("write proxy CA bundle");
     ca_file.flush().expect("flush proxy CA bundle");
+    ca_file
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o644))
+        .expect("make proxy CA bundle readable by the non-root supervisor");
     let ca_path = ca_file
         .path()
         .to_str()
@@ -854,7 +874,7 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
 
     // ── Point the gateway at the https:// proxy with the CA bundle ─────
     let mut gateway_config = GatewayProxyConfig::apply_with(
-        &format!("https://{PROXY_ALIAS}:{PROXY_PORT}"),
+        &format!("https://{HOST_ALIAS}:{}", proxy.port),
         None,
         Some(&ca_path),
     )
@@ -864,7 +884,7 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
     // ── Run the workload ──────────────────────────────────────────────
     let mut policy = NamedTempFile::new().expect("create policy file");
     policy
-        .write_all(policy_yaml().as_bytes())
+        .write_all(policy_yaml(allowed.port).as_bytes())
         .expect("write policy file");
     policy.flush().expect("flush policy file");
     let policy_path = policy
@@ -873,7 +893,7 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
         .expect("policy path should be utf-8")
         .to_string();
 
-    let script = workload_script();
+    let script = workload_script(allowed.port, denied.port);
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--policy", &policy_path],
         &["python3", "-c", &script],
@@ -885,8 +905,8 @@ async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
     assert_https_proxied_egress(
         &sandbox.create_output,
         &proxy.logs().expect("read fake proxy logs"),
-        &allowed_ip,
-        &denied_ip,
+        allowed.port,
+        denied.port,
     );
 
     sandbox.cleanup().await;

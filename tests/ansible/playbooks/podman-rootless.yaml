@@ -9,29 +9,9 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Enable lingering for tmachine
-      become: true
-      ansible.builtin.command:
-        argv:
-          - loginctl
-          - enable-linger
-          - tmachine
-      changed_when: false
-
-    - name: Resolve tmachine UID
-      ansible.builtin.command:
-        argv:
-          - id
-          - -u
-          - tmachine
-      changed_when: false
-      register: tmachine_uid
-
     - name: Start tmachine user manager
-      become: true
-      ansible.builtin.systemd_service:
-        name: "user@{{ tmachine_uid.stdout }}.service"
-        state: started
+      ansible.builtin.include_role:
+        name: tmachine_user_manager
 
     - name: Enable rootless Podman socket
       become: true
@@ -43,5 +23,5 @@
         state: started
       environment:
         HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
-        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ tmachine_uid.stdout }}/bus"
+        XDG_RUNTIME_DIR: /run/user/1000
+        DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus

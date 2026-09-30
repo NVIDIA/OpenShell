@@ -56,6 +56,16 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def image_repository(reference: str) -> str:
+    """Return an OCI image repository without a tag or digest."""
+    repository = reference.split("@", 1)[0]
+    last_slash = repository.rfind("/")
+    last_colon = repository.rfind(":")
+    if last_colon > last_slash:
+        repository = repository[:last_colon]
+    return repository
+
+
 def verify_conformance_report(path: Path) -> None:
     report = load_json(path)
     require(report.get("passed") is True, f"{path}: conformance report did not pass")
@@ -330,7 +340,8 @@ def verify_variant(
     sandbox_alias = launch.get("sandbox_client_image_alias")
     require(
         isinstance(sandbox_alias, str)
-        and sandbox_alias == sandbox_runtime.rsplit("@", 1)[0] + ":latest"
+        and "@" not in sandbox_alias
+        and image_repository(sandbox_alias) == image_repository(sandbox_runtime)
         and launch.get("sandbox_client_image_alias_id") == sandbox_id,
         f"{launch_path}: sandbox client alias is not bound to the pinned image",
     )

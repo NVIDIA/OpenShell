@@ -396,8 +396,28 @@ pub async fn inspect_workload(
             }
             Err(error) => return Err(error),
         }
+    } else if matches!(workload.state.status.as_str(), "exited" | "stopped") {
+        workload.state.startup_diagnostic = client
+            .container_logs(&workload.id)
+            .await
+            .ok()
+            .and_then(|logs| boundary_startup_termination_marker(&logs));
     }
     Ok(workload)
+}
+
+/// Extract only fixed, OpenShell-owned startup diagnostics from container
+/// output. Workload and supervisor output may contain secrets, so it must not
+/// be propagated to driver conditions or tracing.
+fn boundary_startup_termination_marker(logs: &[u8]) -> Option<String> {
+    const SIGTERM_MARKER: &str = "sandbox boundary received SIGTERM before supervisor confirmation";
+    const SIGINT_MARKER: &str = "sandbox boundary received SIGINT before supervisor confirmation";
+
+    let logs = String::from_utf8_lossy(logs);
+    [SIGTERM_MARKER, SIGINT_MARKER]
+        .into_iter()
+        .find(|marker| logs.contains(marker))
+        .map(str::to_string)
 }
 
 /// Construct a `DriverSandbox` from common fields.
@@ -528,7 +548,7 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
             // exiting on its own — the signature of a machine/daemon restart
             // killing running containers. Those are recoverable at gateway
             // startup; ordinary application exits (0, non-zero, faults) are not.
-            let (reason, msg) = if state.oom_killed {
+            let (reason, mut msg) = if state.oom_killed {
                 (
                     "OOMKilled",
                     "Container was killed by the OOM killer".to_string(),
@@ -552,6 +572,10 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
                     format!("Container exited with code {}", state.exit_code),
                 )
             };
+            if let Some(diagnostic) = &state.startup_diagnostic {
+                msg.push_str(": ");
+                msg.push_str(diagnostic);
+            }
             ("False", reason, msg)
         }
         other => (
@@ -594,7 +618,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
                 ),
                 StubResponse::new(StatusCode::NOT_FOUND, "missing companion"),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
@@ -627,7 +651,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
                 ),
                 StubResponse::new(
                     StatusCode::OK,
@@ -668,6 +692,7 @@ mod tests {
             health: None,
             started_at: Some("2026-08-12T16:38:58Z".to_string()),
             finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+            startup_diagnostic: None,
         };
 
         assert!(fences.matches_previous_exit(
@@ -716,6 +741,7 @@ mod tests {
             }),
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
+            startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
         assert_eq!(cond.r#type, "Ready");
@@ -734,6 +760,7 @@ mod tests {
             health: None,
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
+            startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
         assert_eq!(cond.r#type, "Ready");
@@ -755,6 +782,7 @@ mod tests {
             }),
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
+            startup_diagnostic: None,
         };
         let condition = condition_from_state(&state);
         assert_eq!(condition.r#type, "Ready");
@@ -772,6 +800,7 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T11:00:00Z".to_string()),
+            startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
         assert_eq!(cond.status, "False");
@@ -789,11 +818,44 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
+            startup_diagnostic: None,
         };
         let cond = condition_from_state(&state);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "ContainerExited");
         assert!(cond.message.contains("code 1"));
+    }
+
+    #[test]
+    fn condition_includes_allow_listed_boundary_startup_diagnostic() {
+        let state = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 1,
+            oom_killed: false,
+            health: None,
+            started_at: None,
+            finished_at: Some("2026-04-14T12:00:00Z".to_string()),
+            startup_diagnostic: boundary_startup_termination_marker(
+                b"untrusted workload output\nsandbox boundary received SIGTERM before supervisor confirmation\n",
+            ),
+        };
+
+        let condition = condition_from_state(&state);
+
+        assert_eq!(condition.reason, CONDITION_EXITED);
+        assert_eq!(
+            condition.message,
+            "Container exited with code 1: sandbox boundary received SIGTERM before supervisor confirmation"
+        );
+    }
+
+    #[test]
+    fn boundary_startup_diagnostic_does_not_forward_unrecognized_logs() {
+        assert_eq!(
+            boundary_startup_termination_marker(b"token=not-for-the-driver"),
+            None
+        );
     }
 
     #[test]
@@ -806,6 +868,7 @@ mod tests {
             health: None,
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
+            startup_diagnostic: None,
         };
 
         let cond = condition_from_state(&state);
@@ -829,6 +892,7 @@ mod tests {
                 health: None,
                 started_at: None,
                 finished_at: Some("2026-04-14T12:30:00Z".to_string()),
+                startup_diagnostic: None,
             };
             let cond = condition_from_state(&state);
             assert_eq!(cond.status, "False");

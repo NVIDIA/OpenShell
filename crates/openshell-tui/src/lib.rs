@@ -23,8 +23,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::{SandboxPhase, SandboxRestartPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -1272,10 +1272,6 @@ fn render_policy_lines(
 
             // Rule header — include L7/TLS/allowed_ips annotation if any endpoint has it.
             let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
-            let has_tls_term = rule
-                .endpoints
-                .iter()
-                .any(|e| openshell_policy::network_tls_mode_to_str(e.tls) == Some("terminate"));
             let has_allowed_ips = rule.endpoints.iter().any(|e| !e.allowed_ips.is_empty());
             let mut annotations = Vec::new();
             if has_l7 {
@@ -1288,9 +1284,6 @@ fn render_policy_lines(
                 {
                     annotations.push(format!("L7 {proto}"));
                 }
-            }
-            if has_tls_term {
-                annotations.push("TLS terminate".to_string());
             }
             if has_allowed_ips {
                 annotations.push("private IP".to_string());
@@ -1424,9 +1417,8 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
         let template = if has_custom_image {
-            let resolved = openshell_core::image::resolve_community_image(&image);
             Some(openshell_core::proto::SandboxTemplate {
-                image: resolved,
+                image,
                 ..Default::default()
             })
         } else {
@@ -1457,6 +1449,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
             await_main_process_attachment: false,
             workload_template: String::new(),
+            service_exposures: Vec::new(),
         };
 
         let sandbox_name =
@@ -2774,6 +2767,41 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(|s| s.object_name().to_string())
         .collect();
     app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_restart_policies = sandboxes
+        .iter()
+        .map(|s| {
+            match s
+                .spec
+                .as_ref()
+                .and_then(|spec| SandboxRestartPolicy::try_from(spec.restart_policy).ok())
+            {
+                Some(SandboxRestartPolicy::OnFailure) => "on-failure",
+                Some(SandboxRestartPolicy::Always) => "always",
+                _ => "never",
+            }
+            .to_string()
+        })
+        .collect();
+    app.sandbox_restart_counts = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().map_or(0, |status| status.restart_count))
+        .collect();
+    app.sandbox_exit_codes = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().and_then(|status| status.exit_code))
+        .collect();
+    app.sandbox_next_restart_at = sandboxes
+        .iter()
+        .map(|s| {
+            format_timestamp(
+                s.status
+                    .as_ref()
+                    .and_then(|status| status.next_restart_time.as_ref())
+                    .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
     app.sandbox_images = sandboxes
         .iter()
         .map(|s| {

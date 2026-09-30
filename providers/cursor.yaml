@@ -11,8 +11,8 @@
 #
 # Client binaries:   curl, wget, and the Cursor remote server.
 # Reference layout:  the server path below (/sandbox/.cursor-server/**) is where
-#                    Cursor unpacks itself when it connects to an OpenShell
-#                    Community image over SSH. A different HOME or user means a
+#                    Cursor may unpack itself when it connects over SSH. A
+#                    different HOME or user means a
 #                    different path — check where the server actually lands.
 # Credential scope:  none. This profile only opens the bootstrap and update
 #                    endpoints; Cursor authenticates the user separately.

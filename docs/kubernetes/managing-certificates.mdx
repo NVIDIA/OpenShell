@@ -5,7 +5,7 @@ title: "Managing Certificates"
 sidebar-title: "Managing Certificates"
 description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
 keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
-position: 3
+position: 4
 ---
 
 The OpenShell gateway uses TLS for transport to sandbox supervisors. Supervisor Pods receive the gateway CA, not a client certificate or private key, and authenticate RPCs with sandbox JWTs. The generated client certificate can authenticate user clients when gateway mTLS user authentication is enabled; shared deployments can instead configure OIDC or a trusted access proxy. The Helm chart supports two ways to provision and manage the certificate bundle:
@@ -52,7 +52,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set certManager.enabled=true
 ```
 
@@ -74,7 +73,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set certManager.enabled=true \
   --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \

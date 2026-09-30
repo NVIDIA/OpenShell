@@ -58,6 +58,7 @@ pub fn read_exact(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<
         Ok(copied) => require_exact(copied, destination.len(), "task-memory read"),
         Err(error) if syscall_profile_denied(&error) => {
             read_exact_from_proc_mem(tid, address, destination)
+                .map_err(|fallback| fallback_error("read", &error, fallback))
         }
         Err(error) => Err(error),
     }
@@ -104,6 +105,7 @@ pub fn write_exact(tid: u32, address: u64, source: &[u8]) -> io::Result<()> {
         Ok(copied) => require_exact(copied, source.len(), "task-memory write"),
         Err(error) if syscall_profile_denied(&error) => {
             write_exact_to_proc_mem(tid, address, source)
+                .map_err(|fallback| fallback_error("write", &error, fallback))
         }
         Err(error) => Err(error),
     }
@@ -114,6 +116,27 @@ fn syscall_profile_denied(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
     )
+}
+
+fn fallback_error(operation: &str, process_vm: &io::Error, proc_mem: io::Error) -> io::Error {
+    let process_vm = describe_error(process_vm);
+    let proc_mem_description = describe_error(&proc_mem);
+    io::Error::new(
+        proc_mem.kind(),
+        format!(
+            "task-memory {operation} unavailable: process_vm_{operation}v failed: {process_vm}; /proc/<tid>/mem failed: {proc_mem_description}"
+        ),
+    )
+}
+
+fn describe_error(error: &io::Error) -> String {
+    let name = match error.raw_os_error() {
+        Some(libc::EACCES) => Some("EACCES"),
+        Some(libc::ENOSYS) => Some("ENOSYS"),
+        Some(libc::EPERM) => Some("EPERM"),
+        _ => None,
+    };
+    name.map_or_else(|| error.to_string(), |name| format!("{name} ({error})"))
 }
 
 fn read_exact_from_proc_mem(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<()> {
@@ -374,6 +397,20 @@ mod tests {
         )
         .expect("write through proc mem");
         assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn fallback_error_reports_both_memory_backends() {
+        let error = fallback_error(
+            "read",
+            &io::Error::from_raw_os_error(libc::ENOSYS),
+            io::Error::from_raw_os_error(libc::EACCES),
+        );
+        let message = error.to_string();
+        assert!(message.contains("process_vm_readv failed"));
+        assert!(message.contains("ENOSYS"));
+        assert!(message.contains("/proc/<tid>/mem failed"));
+        assert!(message.contains("EACCES"));
     }
 
     #[test]

@@ -11,8 +11,8 @@ When an endpoint in the sandbox policy includes an `allowed_ips` field, the
 proxy validates the resolved IP against that CIDR allowlist instead of
 blanket-blocking. Loopback and link-local remain always-blocked regardless.
 
-The default sandbox policy (baked into the community base image) includes a `cluster_pods`
-entry that allows any binary to reach port 8080 on the configured pod network:
+Save an explicit policy as `private-policy.yaml` that allows the client binary
+to reach port 8080 on the configured pod network:
 
 ```yaml
 cluster_pods:
@@ -62,7 +62,10 @@ Create a sandbox and curl the private API through the proxy. Replace the IP
 with whatever `kubectl get pod` showed above:
 
 ```bash
-openshell sandbox create -- bash -c \
+openshell sandbox create \
+  --from registry.example.com/tools/curl:latest \
+  --policy ./private-policy.yaml \
+  -- bash -c \
   'curl -s --proxytunnel -x http://10.200.0.1:3128 http://10.42.0.128:8080/'
 ```
 

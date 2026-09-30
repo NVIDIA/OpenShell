@@ -667,7 +667,7 @@ func TestSandbox_ListProviders(t *testing.T) {
 	require.NoError(t, err)
 
 	// No providers yet
-	providers, err := sc.ListProviders(ctx, "default", "test-sb")
+	providers, err := sc.ListAllProviders(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Empty(t, providers)
 
@@ -678,7 +678,14 @@ func TestSandbox_ListProviders(t *testing.T) {
 	_, err = sc.AttachProvider(ctx, "default", "test-sb", "anthropic", result.Sandbox.ResourceVersion)
 	require.NoError(t, err)
 
-	providers, err = sc.ListProviders(ctx, "default", "test-sb")
+	pager, err := sc.ListProviders("default", "test-sb", v1.ListOptions{PageSize: 1})
+	require.NoError(t, err)
+	firstPage, err := pager.NextPage(ctx)
+	require.NoError(t, err)
+	require.Len(t, firstPage.Items, 1)
+	require.NotEmpty(t, firstPage.NextPageToken)
+
+	providers, err = sc.ListAllProviders(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Len(t, providers, 2)
 
@@ -692,9 +699,8 @@ func TestSandbox_ListProviders(t *testing.T) {
 
 func TestSandbox_ListProviders_SandboxNotFound(t *testing.T) {
 	sc := newTestSandboxClient()
-	ctx := context.Background()
 
-	_, err := sc.ListProviders(ctx, "default", "nonexistent")
+	_, err := sc.ListProviders("default", "nonexistent")
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
 }

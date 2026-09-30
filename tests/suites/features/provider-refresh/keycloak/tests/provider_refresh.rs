@@ -197,7 +197,7 @@ binaries:
 
 async fn delete_provider_resources() {
     let _ = run_cli(&["provider", "delete", PROVIDER_NAME], &[]).await;
-    let _ = run_cli(&["provider", "profile", "delete", PROFILE_ID], &[]).await;
+    let _ = run_cli(&["profile", "delete", PROFILE_ID], &[]).await;
 }
 
 #[tokio::test]
@@ -216,7 +216,7 @@ async fn revoked_refresh_grant_requires_user_reauthorization() -> Result<(), Str
     delete_provider_resources().await;
     let result = async {
         run_cli_success(
-            &["provider", "profile", "import", "--file", &profile_path],
+            &["profile", "import", "--file", &profile_path],
             &[],
         )
         .await?;

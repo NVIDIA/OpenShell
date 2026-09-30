@@ -216,15 +216,25 @@ if [ -f openshell.kconfig ]; then
     CONFIG_SECURITY \
     CONFIG_SECURITY_LANDLOCK \
     CONFIG_SECCOMP \
-    CONFIG_SECCOMP_FILTER; do
-    val="$(grep "^${opt}=" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
-    if [ -n "$val" ]; then
-      echo "    ${opt}: ${val#*=}"
+    CONFIG_SECCOMP_FILTER \
+    CONFIG_HARDENED_USERCOPY \
+    CONFIG_INIT_STACK_ALL_ZERO \
+    CONFIG_INIT_ON_ALLOC_DEFAULT_ON \
+    CONFIG_SLAB_FREELIST_RANDOM; do
+    val="$(grep -E "^(# )?${opt}(=| )" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
+    if [ "$val" = "${opt}=y" ]; then
+      echo "    ${opt}: y"
     else
-      echo "    WARNING: ${opt} not set after merge!" >&2
+      echo "    WARNING: ${opt} is not enabled after merge: ${val:-unset}" >&2
       all_ok=false
     fi
   done
+  if grep -qx '# CONFIG_INIT_ON_FREE_DEFAULT_ON is not set' "${KERNEL_SOURCES}/.config"; then
+    echo "    CONFIG_INIT_ON_FREE_DEFAULT_ON: disabled"
+  else
+    echo "    WARNING: CONFIG_INIT_ON_FREE_DEFAULT_ON is not explicitly disabled after merge!" >&2
+    all_ok=false
+  fi
   lsm_order="$(grep '^CONFIG_LSM=' "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
   if [[ "$lsm_order" == *landlock* ]]; then
     echo "    CONFIG_LSM: ${lsm_order#*=}"

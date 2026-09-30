@@ -59,7 +59,7 @@ Then run:
 export XDG_CONFIG_HOME="$(mktemp -d)"
 export GATEWAY=http://127.0.0.1:8097
 
-openshell --gateway-endpoint "$GATEWAY" provider profile import \
+openshell --gateway-endpoint "$GATEWAY" profile import \
   -f examples/spiffe-token-grant-demo/provider-profile.yaml
 
 openshell --gateway-endpoint "$GATEWAY" provider create \

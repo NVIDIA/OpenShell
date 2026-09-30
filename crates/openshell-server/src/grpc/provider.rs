@@ -74,6 +74,7 @@ pub(super) struct ProviderEnvironment {
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
+    pub files: HashMap<String, String>,
 }
 
 /// Immutable provider records used to build one provider-environment response.
@@ -1127,6 +1128,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut expires = HashMap::new();
     let mut static_credential_bindings = HashMap::new();
     let mut static_credential_keys = HashSet::new();
+    let mut files = HashMap::new();
+    let mut file_env_keys = HashSet::new();
     let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
@@ -1369,9 +1372,57 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         // or populates its own keys. Cross-provider credential/config
         // collisions have already been rejected by the validation above.
         inject_provider_plugin_environment(catalog, provider, &registry, &mut provider_env);
+        if let Some(profile) = profile.as_ref() {
+            if !profile.files.is_empty()
+                && (name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+            {
+                return Err(Status::failed_precondition(
+                    "provider name cannot be used in a managed file path",
+                ));
+            }
+            for file in &profile.files {
+                let path = format!("/run/openshell/providers/{name}/{}", file.path);
+                let content = file.render(&provider.config).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "provider '{name}' file '{}': {error}",
+                        file.path
+                    ))
+                })?;
+                if files.insert(path.clone(), content).is_some() {
+                    return Err(Status::failed_precondition(
+                        "duplicate provider file destination",
+                    ));
+                }
+                if !file.env_var.is_empty() {
+                    if provider_env.insert(file.env_var.clone(), path).is_some()
+                        || env.contains_key(&file.env_var)
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "provider file environment key '{}' conflicts with another provider output",
+                            file.env_var
+                        )));
+                    }
+                    file_env_keys.insert(file.env_var.clone());
+                }
+            }
+        }
         for (key, value) in provider_env {
+            if env.contains_key(&key) && file_env_keys.contains(&key) {
+                return Err(Status::failed_precondition(format!(
+                    "provider file environment key '{key}' conflicts with another provider output"
+                )));
+            }
             env.entry(key).or_insert(value);
         }
+    }
+
+    if files.len() > 64 || files.values().map(String::len).sum::<usize>() > 262_144 {
+        return Err(Status::failed_precondition(
+            "provider file set exceeds sandbox limits",
+        ));
     }
 
     Ok(ProviderEnvironment {
@@ -1381,6 +1432,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
         static_credential_bindings,
         static_credential_keys,
+        files,
     })
 }
 
@@ -2548,7 +2600,9 @@ pub(super) async fn handle_create_provider(
         ));
     }
     let provider_type = provider.r#type.clone();
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire provider mutation lock")
+    })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2775,7 +2829,10 @@ pub(super) async fn handle_import_provider_profiles(
     .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2867,7 +2924,10 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3027,7 +3087,10 @@ pub(super) async fn handle_delete_provider_profile(
     .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3323,6 +3386,26 @@ fn validate_provider_credentials(
     provider: &Provider,
     pending_credentials: &HashMap<String, String>,
 ) -> Result<(), Status> {
+    if !profile.files.is_empty() {
+        let name = provider.object_name();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(Status::invalid_argument(
+                "provider name cannot be used in a managed file path",
+            ));
+        }
+        for file in &profile.files {
+            file.render(&provider.config).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "provider file '{}' cannot be rendered: {error}",
+                    file.path
+                ))
+            })?;
+        }
+    }
     let declared_keys = profile
         .credentials
         .iter()
@@ -3831,7 +3914,9 @@ pub(super) async fn handle_update_provider(
     // Provider material contributes to the route-report configuration epoch.
     // Serialize its mutation with route-status validation so a report derived
     // from the prior revision cannot commit after this update.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire provider mutation lock")
+    })?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -4587,7 +4672,10 @@ pub(super) async fn handle_configure_provider_refresh(
     // configures of providers attached to the same sandbox could each pass
     // validation before either persisted and both reserve the same key (CWE-362).
     // This is the same guard sandbox create/attach and profile changes take.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire provider mutation lock")
+        })?;
 
     let provider = state
         .store
@@ -5326,6 +5414,7 @@ mod tests {
             }),
         };
         let profile = ProviderProfile {
+            files: Vec::new(),
             id: "keycloak-sso".to_string(),
             resource_version: 0,
             annotations: HashMap::new(),
@@ -5549,7 +5638,7 @@ mod tests {
     #[tokio::test]
     async fn import_provider_profile_waits_for_sandbox_sync_guard() {
         let state = test_server_state().await;
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_import_provider_profiles(
@@ -6107,6 +6196,7 @@ mod tests {
 
     fn custom_profile(id: &str) -> ProviderProfile {
         ProviderProfile {
+            files: Vec::new(),
             id: id.to_string(),
             resource_version: 0,
             annotations: HashMap::new(),
@@ -6285,7 +6375,9 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "oci-genai",
                 "openai",
+                "openrouter",
                 "pypi"
             ]
         );
@@ -6933,6 +7025,7 @@ mod tests {
                 request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
+                        files: Vec::new(),
                         id: "advanced-api".to_string(),
                         resource_version: 0,
                         annotations: HashMap::new(),
@@ -8730,7 +8823,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_delete_provider_profile(
@@ -8785,7 +8878,7 @@ mod tests {
         .await
         .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             let mut provider = provider_with_values("guarded-provider", "guarded-create");
@@ -10318,6 +10411,7 @@ mod tests {
                 request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
+                        files: Vec::new(),
                         id: "delegated-refresh-api".to_string(),
                         resource_version: 0,
                         annotations: HashMap::new(),

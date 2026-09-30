@@ -140,6 +140,14 @@
             type = "app";
             program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
           };
+          build-artifacts-test-images = {
+            type = "app";
+            program = "${artifacts.testImages}/bin/build-artifacts-test-images";
+          };
+          generate-podman-e2e-ci-tests = {
+            type = "app";
+            program = "${artifacts.podmanE2eCiTests}/bin/generate-podman-e2e-ci-tests";
+          };
           build-artifacts-helm = {
             type = "app";
             program = "${artifacts.helm}/bin/build-artifacts-helm";

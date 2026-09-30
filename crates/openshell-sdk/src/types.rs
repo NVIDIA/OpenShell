@@ -81,6 +81,61 @@ pub enum ServiceStatus {
     Unhealthy,
 }
 
+/// One item from a reusable sandbox stream.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum WatchEvent {
+    /// A server/supervisor log line. Carries an opaque resume cursor.
+    Log { line: LogLine, cursor: String },
+    /// A platform event. Carries an opaque resume cursor.
+    Event {
+        event: PlatformEvent,
+        cursor: String,
+    },
+    /// Recoverable loss — the stream continues. No cursor (empty).
+    Warning { message: String },
+}
+
+/// Options for [`crate::client::OpenShellClient::watch_logs`].
+#[derive(Debug, Clone, Default)]
+pub struct WatchOptions {
+    pub follow_logs: bool,
+    pub follow_events: bool,
+    pub log_sources: Vec<String>,
+    pub log_min_level: Option<String>,
+    /// Opaque cursor to resume after. Empty starts from the tail.
+    ///
+    /// Use a cursor taken from a [`WatchEvent`] of a previous watch on the same
+    /// sandbox. Do not construct or parse one: the encoding is not part of the
+    /// gateway's contract.
+    pub resume_after_cursor: String,
+    pub log_tail_lines: u32,
+    pub event_tail: u32,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct LogLine {
+    pub sandbox_id: String,
+    pub timestamp_ms: i64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+    pub source: String,
+    pub fields: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PlatformEvent {
+    pub timestamp_ms: i64,
+    pub source: String,
+    pub r#type: String,
+    pub reason: String,
+    pub message: String,
+    pub metadata: HashMap<String, String>,
+}
+
 impl From<proto::ServiceStatus> for ServiceStatus {
     fn from(value: proto::ServiceStatus) -> Self {
         match value {
@@ -88,6 +143,54 @@ impl From<proto::ServiceStatus> for ServiceStatus {
             proto::ServiceStatus::Degraded => Self::Degraded,
             proto::ServiceStatus::Unhealthy => Self::Unhealthy,
             proto::ServiceStatus::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
+impl From<proto::SandboxLogLine> for LogLine {
+    fn from(value: proto::SandboxLogLine) -> Self {
+        // The wire contract treats an empty source as "gateway" for backward
+        // compatibility with pre-`source` producers. Normalize here so callers
+        // never have to special-case the empty string.
+        let source = if value.source.is_empty() {
+            "gateway".to_string()
+        } else {
+            value.source
+        };
+        Self {
+            sandbox_id: value.sandbox_id,
+            // The wire contract carries `google.protobuf.Timestamp`; these
+            // curated types stay dependency-light and expose milliseconds, the
+            // same reduction the CLI applies at its own presentation edge. An
+            // absent or unrepresentable timestamp reads as 0, which is what
+            // this field meant before the wire types gained presence.
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
+            level: value.level,
+            target: value.target,
+            message: value.message,
+            source,
+            fields: value.fields,
+        }
+    }
+}
+
+impl From<proto::PlatformEvent> for PlatformEvent {
+    fn from(value: proto::PlatformEvent) -> Self {
+        Self {
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
+            source: value.source,
+            r#type: value.r#type,
+            reason: value.reason,
+            message: value.message,
+            metadata: value.metadata,
         }
     }
 }
@@ -137,6 +240,25 @@ impl From<i32> for SandboxPhase {
     }
 }
 
+/// Gateway policy for replacing the canonical main process after it exits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SandboxRestartPolicy {
+    #[default]
+    Never,
+    OnFailure,
+    Always,
+}
+
+impl From<SandboxRestartPolicy> for proto::SandboxRestartPolicy {
+    fn from(value: SandboxRestartPolicy) -> Self {
+        match value {
+            SandboxRestartPolicy::Never => Self::Never,
+            SandboxRestartPolicy::OnFailure => Self::OnFailure,
+            SandboxRestartPolicy::Always => Self::Always,
+        }
+    }
+}
+
 /// Caller intent for a new sandbox.
 ///
 /// Only the most commonly used fields are exposed. Callers that need the
@@ -146,7 +268,7 @@ impl From<i32> for SandboxPhase {
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
     pub name: Option<String>,
-    /// Container image reference (e.g. `ghcr.io/nvidia/openshell-community/sandboxes/python:latest`).
+    /// Container image reference (e.g. `registry.example.com/agents/python:latest`).
     pub image: Option<String>,
     /// Labels attached to the sandbox.
     pub labels: HashMap<String, String>,
@@ -161,6 +283,40 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
+    /// Restart behavior after the canonical main process exits.
+    pub restart_policy: SandboxRestartPolicy,
+}
+
+/// A loopback HTTP service to expose during sandbox creation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceExposure {
+    /// Service name. Empty selects the sandbox's unnamed endpoint.
+    pub service: String,
+    /// Loopback TCP port inside the sandbox.
+    pub target_port: u16,
+    /// Whether the gateway strips or forwards an application bearer credential.
+    pub authorization_mode: ServiceAuthorizationMode,
+}
+
+/// Handling for an incoming application `Authorization` header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServiceAuthorizationMode {
+    /// Remove the header before proxying to the sandbox service.
+    #[default]
+    Strip,
+    /// Forward one syntactically valid bearer credential unchanged.
+    BearerPassthrough,
+}
+
+impl From<ServiceAuthorizationMode> for proto::ServiceAuthorizationMode {
+    fn from(value: ServiceAuthorizationMode) -> Self {
+        match value {
+            ServiceAuthorizationMode::Strip => Self::Strip,
+            ServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
 }
 
 /// Caller intent for creating a sandbox from a named workload template.
@@ -178,6 +334,8 @@ pub struct SandboxTemplateCreateSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
@@ -227,6 +385,12 @@ pub struct SandboxRef {
     pub resource_version: u64,
     pub exit_code: Option<i32>,
     pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+    /// Service URLs returned by sandbox creation, keyed by service name. The
+    /// empty key identifies the unnamed service. Non-create reads leave this empty.
+    pub service_urls: HashMap<String, String>,
+    pub restart_count: u32,
+    pub next_restart_at_ms: Option<i64>,
+    pub main_process_started_at_ms: Option<i64>,
 }
 
 /// Reusable workload template revision used to create a sandbox.
@@ -240,7 +404,6 @@ pub struct SandboxWorkloadTemplateProvenance {
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
-        let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
         let created_from_workload_template =
             sandbox
                 .created_from_workload_template
@@ -248,6 +411,23 @@ impl SandboxRef {
                     name: p.name,
                     resource_version: p.resource_version,
                 });
+        let (exit_code, restart_count, next_restart_at_ms, main_process_started_at_ms) = sandbox
+            .status
+            .as_ref()
+            .map_or((None, 0, None, None), |status| {
+                (
+                    status.exit_code,
+                    status.restart_count,
+                    status
+                        .next_restart_time
+                        .as_ref()
+                        .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+                    status
+                        .main_process_started_time
+                        .as_ref()
+                        .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok()),
+                )
+            });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -258,6 +438,10 @@ impl SandboxRef {
             resource_version: meta.resource_version,
             exit_code,
             created_from_workload_template,
+            service_urls: HashMap::new(),
+            restart_count,
+            next_restart_at_ms,
+            main_process_started_at_ms,
         }
     }
 }

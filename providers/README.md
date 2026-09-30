@@ -30,7 +30,7 @@ Every file opens with a comment block naming its expected client binaries, the
 image layout those paths assume, the credential scope, the endpoint access it
 grants, and a smoke test. Read it. A profile's `binaries` list is the control
 that decides which processes may reach its endpoints, and several of these
-examples name paths that only exist in the OpenShell Community image
+examples name paths from a particular reference image layout
 (`/sandbox/.venv`, `/app/.venv`, `/sandbox/.cursor-server`,
 `/usr/lib/node_modules/...`). Imported unchanged into a different image, such a
 profile matches nothing: the catalog still advertises it, but the credential is
@@ -50,5 +50,5 @@ workload, and import your copy.
   credential is only sent to the endpoints its profile declares.
 - Run `openshell provider profile lint` before importing.
 
-See [Provider profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.html) for the
+See [Provider profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles) for the
 full schema.

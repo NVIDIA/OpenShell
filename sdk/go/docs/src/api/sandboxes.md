@@ -17,8 +17,17 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
     Providers: []string{"openai"},
 }, map[string]string{
     "team": "platform",
-})
+}, v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
+    {TargetPort: 8080},
+}})
+fmt.Println(sb.ServiceURLs[""])
 ```
+
+Create-time service exposures register loopback HTTP endpoints with the
+sandbox. Leave `Service` empty for the unnamed endpoint or set it to create a
+named endpoint. Routing begins when the sandbox is ready.
+`ServiceURLs` returns the routed URLs keyed by service name; the empty key is
+the unnamed endpoint.
 
 Set `GPU: true` to request the active driver's default GPU assignment. Set
 `GPUCount` when the sandbox needs a specific GPU count; a non-nil `GPUCount`

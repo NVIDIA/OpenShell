@@ -80,3 +80,16 @@ runs:
           docker image save --platform linux/amd64 --output "$archive" "$image"
           kind load image-archive "$archive" --name "$CLUSTER_NAME"
         done
+
+    - name: Preload default sandbox image into kind
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+        SANDBOX_IMAGE: nvcr.io/nvidia/base/ubuntu:24.04
+      run: |
+        set -euo pipefail
+        archive="${RUNNER_TEMP:-/tmp}/openshell-default-sandbox-linux-amd64.tar"
+        docker pull --platform linux/amd64 "$SANDBOX_IMAGE"
+        docker image inspect "$SANDBOX_IMAGE" --format 'default sandbox image: {{join .RepoDigests ", "}}'
+        docker image save --platform linux/amd64 --output "$archive" "$SANDBOX_IMAGE"
+        kind load image-archive "$archive" --name "$CLUSTER_NAME"

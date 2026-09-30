@@ -55,6 +55,19 @@ pub const DEFAULT_GATEWAY_ID: &str = "openshell";
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 
+/// Hard upper bound on a `proxy_ca_bundle` staged into a bootstrap Secret.
+///
+/// The shared reader already bounds the file at
+/// [`MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`](openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES),
+/// but that bound is exactly the apiserver's own ~1 MiB limit on a Secret,
+/// and the bootstrap Secret carries four other keys besides this one. A
+/// bundle between the two limits would be accepted on the gateway host and
+/// then fail every sandbox create with an opaque apiserver `data: Too long`
+/// error, so this driver bounds it well clear of that ceiling and names the
+/// operator setting in the error. A bundle holding every corporate trust
+/// anchor is a few tens of kilobytes.
+pub const MAX_STAGED_PROXY_CA_BUNDLE_BYTES: usize = 256 * 1024;
+
 /// Default Kubernetes `ServiceAccount` assigned to sandbox pods.
 pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 
@@ -65,9 +78,6 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// Explicit operator assertion that the cluster CNI enforces
-    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
-    pub network_policy_enforced: bool,
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
 }
@@ -75,7 +85,6 @@ pub struct KubernetesSandboxRuntimeConfig {
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
-            network_policy_enforced: false,
             boundary_port: 5500,
         }
     }
@@ -83,12 +92,6 @@ impl Default for KubernetesSandboxRuntimeConfig {
 
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if !self.network_policy_enforced {
-            return Err(
-                "sandbox_runtime.network_policy_enforced must be true after the operator has verified CNI NetworkPolicy enforcement"
-                    .to_string(),
-            );
-        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -153,6 +156,10 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
     /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
     /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
@@ -217,6 +224,25 @@ pub struct KubernetesComputeConfig {
     /// Send hostnames rather than validated IPs in CONNECT requests. This is a
     /// last-resort compatibility mode for hostname-filtering proxy ACLs.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Path, on the gateway Pod's filesystem, to a PEM CA bundle trusted for
+    /// the corporate proxy.
+    ///
+    /// A CA certificate is not secret, so the gateway reads this file and
+    /// stages it into the per-generation supervisor bootstrap Secret, which
+    /// kubelet mounts read-only in the supervisor Pod. The supervisor trusts
+    /// it for the TLS handshake with an `https://` proxy and, because a
+    /// TLS-intercepting proxy re-signs tunneled server certificates with the
+    /// same CA, folds it into the sandbox trust bundle and upstream
+    /// verification.
+    ///
+    /// The bundle is deliberately read from the gateway's own filesystem
+    /// rather than referenced as an object in the sandbox namespace: it
+    /// becomes a trust anchor for every upstream the sandbox reaches, so it
+    /// must stay in the gateway's trust domain. The staging Secret is
+    /// immutable, so the anchor cannot change underneath a running sandbox.
+    /// Only meaningful with `https_proxy` set; the bundle must exist and
+    /// contain at least one usable trust anchor.
+    pub proxy_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -294,6 +320,9 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             workspace_mode: WorkspaceMode::default(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             operator_namespace_label: None,
@@ -318,6 +347,7 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -376,25 +406,46 @@ impl KubernetesComputeConfig {
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
+    ///
+    /// The URL grammar and the pairing rules for `no_proxy`,
+    /// `proxy_connect_by_hostname`, and `proxy_ca_bundle` are delegated to
+    /// [`validate_upstream_proxy_settings`](openshell_core::driver_utils::validate_upstream_proxy_settings)
+    /// so this driver can never accept a value the supervisor rejects, or
+    /// drift from the Podman and VM drivers.
+    ///
+    /// Credential validation stays local, because this driver takes
+    /// credentials from a Kubernetes Secret reference rather than the
+    /// `proxy_auth_file` the shared rules describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending key.
     pub fn validate_upstream_proxy_config(&self) -> Result<(), String> {
-        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+        use openshell_core::driver_utils::{
+            UpstreamProxySettings, parse_upstream_proxy_url, validate_upstream_proxy_settings,
+        };
 
-        if let Some(url) = &self.https_proxy {
-            parse_upstream_proxy_url(url).map_err(|err| match err {
-                UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
-                UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials in the URL; supply them through proxy_auth_secret_name and proxy_auth_secret_key".to_string(),
-                err => format!("https_proxy {err}"),
-            })?;
-        }
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: self.https_proxy.as_deref(),
+            no_proxy: self.no_proxy.as_deref(),
+            connect_by_hostname: self.proxy_connect_by_hostname,
+            ca_bundle: self.proxy_ca_bundle.as_deref(),
+            // Credentials are validated below, so the shared auth fields stay
+            // unset; this label only redirects the inline-credential
+            // diagnostic away from `proxy_auth_file`, which this driver
+            // rejects as an unknown key.
+            auth_setting_label: Some("proxy_auth_secret_name and proxy_auth_secret_key"),
+            ..UpstreamProxySettings::default()
+        })?;
 
-        if let Some(list) = self.no_proxy.as_deref() {
-            if list.trim().is_empty() {
-                return Err("no_proxy must not be empty when set; omit it instead".to_string());
-            }
-            if self.https_proxy.is_none() {
-                return Err("no_proxy is set but no https_proxy is configured".to_string());
-            }
-        }
+        // A credential sent to an `https://` proxy travels inside the verified
+        // TLS session to that proxy, so the cleartext acknowledgement below is
+        // only meaningful for an `http://` one. The URL already parsed above.
+        let proxy_secure = self
+            .https_proxy
+            .as_deref()
+            .and_then(|url| parse_upstream_proxy_url(url).ok())
+            .is_some_and(|addr| addr.secure);
 
         let secret_name = self.proxy_auth_secret_name.as_deref();
         let secret_key = self.proxy_auth_secret_key.as_deref();
@@ -444,8 +495,8 @@ impl KubernetesComputeConfig {
                             .to_string(),
                     );
                 }
-                if self.proxy_auth_allow_insecure != Some(true) {
-                    return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
+                if !proxy_secure && self.proxy_auth_allow_insecure != Some(true) {
+                    return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, use an https:// proxy, or remove the credential Secret".to_string());
                 }
             }
             _ => {
@@ -456,11 +507,6 @@ impl KubernetesComputeConfig {
             }
         }
 
-        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
-            return Err(
-                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
-            );
-        }
         Ok(())
     }
 
@@ -576,6 +622,20 @@ impl KubernetesComputeConfig {
     #[must_use]
     pub fn is_multi_namespace(&self) -> bool {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
+    }
+
+    /// Where supervisor Pods read the gateway CA. Outside
+    /// shared mode it is staged into each generation's bootstrap Secret.
+    #[must_use]
+    pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
+        use crate::sandbox_runtime::SupervisorClientTls;
+        if self.client_tls_secret_name.is_empty() {
+            SupervisorClientTls::Disabled
+        } else if self.is_multi_namespace() {
+            SupervisorClientTls::Bootstrap
+        } else {
+            SupervisorClientTls::Secret(&self.client_tls_secret_name)
+        }
     }
 
     /// Compute the K8s resource name for a sandbox.
@@ -787,7 +847,7 @@ mod tests {
 
     #[test]
     fn published_kubernetes_example_is_valid_toml() {
-        let docs = include_str!("../../../docs/reference/gateway-config.mdx");
+        let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
         let section = docs
             .split_once("### Kubernetes")
             .expect("Kubernetes documentation section")
@@ -815,19 +875,6 @@ mod tests {
     fn default_workspace_storage_class_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.workspace_storage_class.is_empty());
-    }
-
-    #[test]
-    fn sandbox_runtime_requires_network_policy_enforcement_acknowledgement() {
-        let mut cfg = KubernetesComputeConfig::default();
-        assert!(
-            cfg.validate_proxy_uid()
-                .unwrap_err()
-                .contains("network_policy_enforced")
-        );
-
-        cfg.sandbox_runtime.network_policy_enforced = true;
-        cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]
@@ -1166,10 +1213,15 @@ mod tests {
                 proxy_auth_secret_key = "credentials"
                 proxy_auth_allow_insecure = true
                 proxy_connect_by_hostname = true
+                proxy_ca_bundle = "/etc/openshell-tls/proxy-ca/ca.crt"
             "#,
         )
         .unwrap();
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+        assert_eq!(
+            cfg.proxy_ca_bundle.as_deref(),
+            Some("/etc/openshell-tls/proxy-ca/ca.crt")
+        );
         assert_eq!(
             cfg.https_proxy.as_deref(),
             Some("http://proxy.corp.example:8080")
@@ -1315,6 +1367,90 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_a_ca_bundle_with_an_https_proxy() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_a_ca_bundle_for_an_intercepting_http_proxy() {
+        // A proxy reached over plain HTTP still re-signs tunneled upstream
+        // certificates when it intercepts TLS, so the bundle is meaningful
+        // without an `https://` proxy URL.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_a_ca_bundle_without_a_proxy() {
+        let cfg = KubernetesComputeConfig {
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_an_empty_ca_bundle() {
+        // Present-but-empty is a misconfiguration, not "unset": the supervisor
+        // treats an empty driver-supplied argument as a fatal error.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_ca_bundle: Some("   ".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_credentials_without_acknowledgement_for_an_https_proxy() {
+        // The credential travels inside the verified TLS session to the proxy,
+        // so the cleartext acknowledgement is not meaningful here.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_still_requires_acknowledgement_for_an_http_proxy() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_names_the_secret_keys_for_inline_credentials() {
+        // `proxy_auth_file` is a Podman/VM key that this driver rejects under
+        // `deny_unknown_fields`, so it must never appear in the diagnostic.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://user:pass@proxy.corp.example:8080".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_secret_name"), "{err}");
+        assert!(!err.contains("proxy_auth_file"), "{err}");
     }
 
     #[test]

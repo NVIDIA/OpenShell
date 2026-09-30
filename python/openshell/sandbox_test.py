@@ -32,6 +32,8 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     SandboxTemplateClient,
+    ServiceAuthorizationMode,
+    ServiceExposure,
     TlsConfig,
     _atomic_replace,
     _BearerAuthInterceptor,
@@ -2073,7 +2075,11 @@ class _FakeSandboxStub:
                 request.name or "generated",
                 dict(request.labels),
                 workspace=_request_workspace(request) or "default",
-            )
+            ),
+            service_urls={
+                exposure.service: f"https://{exposure.service}.example.test/"
+                for exposure in request.service_exposures
+            },
         )
 
     def ListSandboxes(
@@ -2203,6 +2209,41 @@ def test_create_forwards_name_and_labels() -> None:
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
     assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_create_forwards_service_exposures() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(
+        workspace="default",
+        name="app-server",
+        service_exposures=[
+            ServiceExposure(target_port=4500),
+            ServiceExposure(
+                service="metrics",
+                target_port=9090,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+            ),
+        ],
+    )
+
+    assert stub.create_request is not None
+    assert [
+        (exposure.service, exposure.target_port, exposure.authorization_mode)
+        for exposure in stub.create_request.service_exposures
+    ] == [
+        ("", 4500, openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP),
+        (
+            "metrics",
+            9090,
+            openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
+        ),
+    ]
+    assert dict(ref.service_urls) == {
+        "": "https://.example.test/",
+        "metrics": "https://metrics.example.test/",
+    }
 
 
 def test_create_from_template_forwards_workload_template() -> None:
@@ -2623,6 +2664,49 @@ def test_pager_retries_same_token_after_fetch_error() -> None:
     assert tokens == ["resume", "resume"]
 
 
+def test_pager_rejects_a_repeated_continuation_token() -> None:
+    pager = Pager(
+        lambda token: Page(items=[1], next_page_token=token),
+        page_token="resume",
+    )
+
+    with pytest.raises(SandboxError, match="repeated continuation token"):
+        next(pager)
+
+
+def test_pager_bounds_consumed_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKENS", 1)
+    requests: list[str] = []
+    pager = Pager(
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
+        page_token="first",
+    )
+
+    assert next(pager).items == ["first"]
+    with pytest.raises(SandboxError, match="token history limit exceeded"):
+        next(pager)
+    assert requests == ["first"]
+
+
+def test_pager_bounds_consumed_token_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PAGER_MAX_CONSUMED_TOKEN_BYTES", 1)
+    requests: list[str] = []
+    pager = Pager(
+        lambda token: (
+            requests.append(token),
+            Page(items=[token], next_page_token="next"),
+        )[1],
+        page_token="too-large",
+    )
+
+    with pytest.raises(SandboxError, match="token history limit exceeded"):
+        next(pager)
+    assert requests == []
+
+
 def test_list_ids_forwards_label_selector() -> None:
     stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
     client = _client_with_fake_stub(stub)
@@ -2647,10 +2731,16 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
+    proto.status.restart_count = 2
+    proto.status.next_restart_time.FromMilliseconds(1_700_000_000_000)
+    proto.status.main_process_started_time.FromMilliseconds(1_699_999_000_000)
 
     status = _sandbox_ref(proto).status
 
     assert status.exit_code == 0
+    assert status.restart_count == 2
+    assert status.next_restart_at_ms == 1_700_000_000_000
+    assert status.main_process_started_at_ms == 1_699_999_000_000
 
 
 def test_returned_labels_are_immutable() -> None:

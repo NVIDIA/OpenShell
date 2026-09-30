@@ -12,7 +12,7 @@
 # Client binaries:   copilot.
 # Reference layout:  /usr/bin/copilot plus the npm global install under
 #                    /usr/lib/node_modules/@github/copilot/**. That npm path is
-#                    an OpenShell Community image layout; check `npm root -g` in
+#                    one reference image layout; check `npm root -g` in
 #                    your image.
 # Credential scope:  COPILOT_GITHUB_TOKEN, GH_TOKEN or GITHUB_TOKEN, sent as a
 #                    bearer authorization header to the Copilot API hosts below.

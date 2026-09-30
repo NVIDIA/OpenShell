@@ -172,9 +172,7 @@ pub struct Networking {
 /// the workload child (entered via `setns()` in `pre_exec`).
 ///
 /// `denial_tx` and `denial_rx` are owned by the caller. The proxy uses the
-/// sender; the aggregator owns the receiver. The caller is also responsible
-/// for cloning `denial_tx` for the bypass monitor (which lives in
-/// `openshell-supervisor-process`).
+/// sender; the aggregator owns the receiver.
 ///
 /// # Errors
 ///

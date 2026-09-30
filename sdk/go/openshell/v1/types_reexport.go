@@ -29,9 +29,9 @@ const (
 	NetworkTLSModeUnspecified = types.NetworkTLSModeUnspecified
 	// NetworkTLSModeSkip disables TLS inspection.
 	NetworkTLSModeSkip = types.NetworkTLSModeSkip
-	// NetworkTLSModeTerminate is retained for wire compatibility.
+	// NetworkTLSModeTerminate is rejected by policy validation.
 	NetworkTLSModeTerminate = types.NetworkTLSModeTerminate
-	// NetworkTLSModePassthrough is retained for wire compatibility.
+	// NetworkTLSModePassthrough is rejected by policy validation.
 	NetworkTLSModePassthrough = types.NetworkTLSModePassthrough
 
 	// NetworkEnforcementModeUnspecified uses the documented audit default.

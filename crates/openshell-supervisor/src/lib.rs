@@ -90,31 +90,99 @@ where
     }
 }
 
+/// Where the supervisor publishes readiness. The listener exists only while
+/// the supervisor session is ready, so a successful connect means ready.
+#[derive(Clone, Debug)]
+enum ReadinessEndpoint {
+    Unix(std::path::PathBuf),
+    /// Wildcard TCP port reachable from the node, for kubelet `tcpSocket` probes.
+    Tcp(u16),
+}
+
+enum ReadinessListener {
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+impl ReadinessEndpoint {
+    fn bind(&self) -> Result<ReadinessListener> {
+        match self {
+            Self::Unix(path) => {
+                prepare_control_readiness_path(path)?;
+                tokio::net::UnixListener::bind(path)
+                    .map(ReadinessListener::Unix)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("bind supervisor readiness socket on {}", path.display())
+                    })
+            }
+            Self::Tcp(port) => bind_readiness_tcp(*port)
+                .and_then(tokio::net::TcpListener::from_std)
+                .map(ReadinessListener::Tcp)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("bind supervisor readiness listener on port {port}")),
+        }
+    }
+
+    fn remove(&self) {
+        if let Self::Unix(path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Falls back to IPv4 when the network namespace has IPv6 disabled.
+fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let bind = |domain: Domain, address: std::net::SocketAddr| {
+        let socket = Socket::new(domain, Type::STREAM, None)?;
+        if domain == Domain::IPV6 {
+            socket.set_only_v6(false)?;
+        }
+        socket.set_reuse_address(true)?;
+        socket.bind(&address.into())?;
+        socket.listen(128)?;
+        socket.set_nonblocking(true)?;
+        Ok::<_, std::io::Error>(std::net::TcpListener::from(socket))
+    };
+    bind(Domain::IPV6, (std::net::Ipv6Addr::UNSPECIFIED, port).into())
+        .or_else(|_| bind(Domain::IPV4, (std::net::Ipv4Addr::UNSPECIFIED, port).into()))
+}
+
+impl ReadinessListener {
+    async fn accept(&self) -> std::io::Result<()> {
+        match self {
+            Self::Unix(listener) => listener.accept().await.map(drop),
+            Self::Tcp(listener) => listener.accept().await.map(drop),
+        }
+    }
+}
+
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
-    path: std::path::PathBuf,
+    endpoint: ReadinessEndpoint,
 }
 
 impl ControlReadiness {
     fn start(
-        path: std::path::PathBuf,
+        endpoint: ReadinessEndpoint,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if session_readiness
+        if let ReadinessEndpoint::Unix(path) = &endpoint {
+            prepare_control_readiness_path(path)?;
+        }
+        let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
         {
-            return Err(miette::miette!(
-                "supervisor session is not ready when starting health listener"
-            ));
-        }
-        prepare_control_readiness_path(&path)?;
-        let listener = tokio::net::UnixListener::bind(&path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("bind supervisor readiness socket on {}", path.display()))?;
-        let task_path = path.clone();
+            None
+        } else {
+            Some(endpoint.bind()?)
+        };
+        let task_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            let mut listener = Some(listener);
+            let mut listener = listener;
             loop {
                 let session_unready = session_readiness
                     .as_ref()
@@ -122,7 +190,7 @@ impl ControlReadiness {
                 if listener.is_none() || session_unready {
                     if session_unready {
                         listener.take();
-                        let _ = std::fs::remove_file(&task_path);
+                        task_endpoint.remove();
                         let Some(readiness) = session_readiness.as_mut() else {
                             break;
                         };
@@ -130,16 +198,7 @@ impl ControlReadiness {
                             break;
                         }
                     }
-                    match prepare_control_readiness_path(&task_path).and_then(|()| {
-                        tokio::net::UnixListener::bind(&task_path)
-                            .into_diagnostic()
-                            .wrap_err_with(|| {
-                                format!(
-                                    "rebind supervisor readiness socket on {}",
-                                    task_path.display()
-                                )
-                            })
-                    }) {
+                    match task_endpoint.bind() {
                         Ok(rebound) => listener = Some(rebound),
                         Err(error) => {
                             tracing::warn!(%error, "control-mode readiness rebind failed; retrying");
@@ -156,7 +215,7 @@ impl ControlReadiness {
                 if let Some(readiness) = session_readiness.as_mut() {
                     tokio::select! {
                         accepted = active_listener.accept() => match accepted {
-                            Ok((stream, _)) => drop(stream),
+                            Ok(()) => {}
                             Err(error) => {
                                 tracing::warn!(%error, "control-mode readiness accept failed; retrying");
                                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -170,7 +229,7 @@ impl ControlReadiness {
                     }
                 } else {
                     match active_listener.accept().await {
-                        Ok((stream, _)) => drop(stream),
+                        Ok(()) => {}
                         Err(error) => {
                             tracing::warn!(%error, "control-mode readiness accept failed; retrying");
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -178,9 +237,9 @@ impl ControlReadiness {
                     }
                 }
             }
-            let _ = std::fs::remove_file(&task_path);
+            task_endpoint.remove();
         });
-        Ok(Self { task, path })
+        Ok(Self { task, endpoint })
     }
 }
 
@@ -225,7 +284,7 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        self.endpoint.remove();
     }
 }
 
@@ -460,6 +519,7 @@ pub async fn run_network_proxy(
         product_version: openshell_core::VERSION.to_string(),
         proxy_ip: listen.ip(),
         proxy_port: listen.port(),
+        origin: openshell_ocsf::EventOrigin::Supervisor,
     }) {
         debug!("OCSF context already initialized, keeping existing");
     }
@@ -568,7 +628,9 @@ pub async fn run_sandbox(
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
     health_socket_path: Option<std::path::PathBuf>,
+    health_port: Option<u16>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
@@ -601,6 +663,7 @@ pub async fn run_sandbox(
             product_version: openshell_core::VERSION.to_string(),
             proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         }) {
             debug!("OCSF context already initialized, keeping existing");
         }
@@ -649,7 +712,7 @@ pub async fn run_sandbox(
         loaded_policy_origin,
         initial_agent_proposals_enabled,
         initial_extension_authentication_enabled,
-        captured_provider_credentials,
+        captured_provider_environment,
     ) = load_policy_with_gateway(
         sandbox_id.clone(),
         sandbox.clone(),
@@ -674,8 +737,8 @@ pub async fn run_sandbox(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(credentials) = captured_provider_credentials {
-        credentials
+    let provider_credentials = if let Some(environment) = captured_provider_environment {
+        environment.install(&provider_readiness)
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -1011,6 +1074,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -1031,6 +1095,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             provider_readiness: provider_readiness.clone(),
             policy_local_ctx: poll_policy_local,
@@ -1119,14 +1184,12 @@ pub async fn run_sandbox(
                         running.exec(),
                     )
                 });
-        let mut control_readiness = if let Some(path) = health_socket_path {
-            Some(ControlReadiness::start(
-                path,
-                boundary_access.session_readiness(),
-            )?)
-        } else {
-            None
-        };
+        let mut control_readiness = health_socket_path
+            .map(ReadinessEndpoint::Unix)
+            .into_iter()
+            .chain(health_port.map(ReadinessEndpoint::Tcp))
+            .map(|endpoint| ControlReadiness::start(endpoint, boundary_access.session_readiness()))
+            .collect::<Result<Vec<_>>>()?;
         let instance_id = boundary_access.instance_id().to_string();
         let wait_agent = agent.clone();
         let shutdown_requested = wait_for_control_shutdown_signal();
@@ -1180,7 +1243,7 @@ pub async fn run_sandbox(
             }
         };
         if !retain_access {
-            control_readiness.take();
+            control_readiness.clear();
         }
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
@@ -1225,7 +1288,7 @@ pub async fn run_sandbox(
         }
         if completion_cancelled {
             retain_access = false;
-            control_readiness.take();
+            control_readiness.clear();
         }
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
@@ -1425,139 +1488,17 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 // policy.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp", "/dev/null"];
 
-/// GPU read-only paths.
-///
-/// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
-/// socket at init time.  If the directory exists but Landlock denies traversal
-/// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
-/// even though the daemon is optional.  Only read/traversal access is needed.
-///
-/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
-/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
-/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
-/// not be covered by the parent-directory Landlock rule when the mount crosses
-/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
-/// is permitted regardless of Landlock's cross-mount behaviour.
-const GPU_BASELINE_READ_ONLY: &[&str] = &[
-    "/run/nvidia-persistenced",
-    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
-];
-
-/// GPU read-write paths (static).
-///
-/// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
-/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
-/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
-/// These devices do not exist on WSL2 and will be skipped by the existence
-/// check in `enrich_proto_baseline_paths()`.
-///
-/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
-/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
-/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
-/// and will be skipped there by the existence check.
-///
-/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
-/// to set thread names.  Without write access, `cuInit()` returns error 304.
-/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
-/// inodes and child processes have different procfs inodes than the parent.
-///
-/// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
-/// `enumerate_gpu_device_nodes()` since the count varies.
-const GPU_BASELINE_READ_WRITE: &[&str] = &[
-    "/dev/nvidiactl",
-    "/dev/nvidia-uvm",
-    "/dev/nvidia-uvm-tools",
-    "/dev/nvidia-modeset",
-    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
-    "/proc",
-];
-
-/// Returns true if GPU devices are present in the container.
-///
-/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
-/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
-/// depending on the host kernel; the other will not exist.
-fn has_gpu_devices() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
-}
-
-/// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
-fn enumerate_gpu_device_nodes() -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix("nvidia") {
-                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
-                paths.push(entry.path().to_string_lossy().into_owned());
-            }
-        }
-    }
-    paths
-}
-
-fn push_unique(paths: &mut Vec<String>, path: String) {
-    if !paths.iter().any(|p| p == &path) {
-        paths.push(path);
-    }
-}
-
-fn collect_baseline_enrichment_paths(
-    include_proxy: bool,
-    include_gpu: bool,
-    gpu_device_nodes: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut ro = Vec::new();
-    let mut rw = Vec::new();
-
-    if include_proxy {
-        for &path in PROXY_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in PROXY_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-    }
-
-    if include_gpu {
-        for &path in GPU_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in GPU_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-        for path in gpu_device_nodes {
-            push_unique(&mut rw, path);
-        }
-    }
-
-    // A path promoted to read_write (e.g. /proc for GPU) should not also
-    // appear in read_only — Landlock handles the overlap correctly but the
-    // duplicate is confusing when inspecting the effective policy.
-    ro.retain(|p| !rw.contains(p));
-
-    (ro, rw)
-}
-
-fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
-    let include_gpu = has_gpu_devices();
-    let gpu_device_nodes = if include_gpu {
-        enumerate_gpu_device_nodes()
-    } else {
-        Vec::new()
-    };
-    collect_baseline_enrichment_paths(include_proxy, include_gpu, gpu_device_nodes)
-}
-
-/// Collect all active baseline paths for tests and diagnostics.
-/// Returns `(read_only, read_write)` as owned `String` vecs.
-#[cfg(test)]
-fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    active_baseline_enrichment_paths(true)
+fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
+    (
+        PROXY_BASELINE_READ_ONLY
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+        PROXY_BASELINE_READ_WRITE
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+    )
 }
 
 fn enrich_proto_baseline_paths_with<F>(
@@ -1606,15 +1547,6 @@ where
             continue;
         }
         if fs.read_only.iter().any(|p| p == path) {
-            if path == "/proc" {
-                info!(
-                    path,
-                    "Promoting /proc from read-only to read-write for GPU runtime compatibility"
-                );
-                fs.read_only.retain(|p| p != path);
-                fs.read_write.push(path.clone());
-                modified = true;
-            }
             continue;
         }
         fs.read_write.push(path.clone());
@@ -1625,12 +1557,15 @@ where
 }
 
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
-/// required by proxy-mode sandboxes and GPU runtimes. Paths are only added if
+/// required by proxy-mode sandboxes. Paths are only added if
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
 fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
+    if proto.network_policies.is_empty() {
+        return false;
+    }
+    let (ro, rw) = proxy_baseline_paths();
 
     // Baseline paths are system-injected, not user-specified.  Skip paths
     // that do not exist in this container image to avoid noisy warnings from
@@ -1673,14 +1608,13 @@ fn proto_sync_payload_for_enriched_policy(
 }
 
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
-/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
+/// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
 fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
+    let (ro, rw) = proxy_baseline_paths();
 
     let mut modified = false;
     for path in &ro {
@@ -1740,61 +1674,23 @@ mod baseline_tests {
     use std::path::PathBuf;
 
     #[test]
-    fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
-        // When GPU devices are present, /proc is promoted to read_write
-        // (CUDA needs to write /proc/<pid>/task/<tid>/comm). It should
-        // NOT also appear in read_only.
-        if !has_gpu_devices() {
-            // Can't test GPU dedup without GPU devices; skip silently.
-            return;
-        }
-        let (ro, rw) = baseline_enrichment_paths();
-        assert!(
-            rw.contains(&"/proc".to_string()),
-            "/proc should be in read_write when GPU is present"
-        );
-        assert!(
-            !ro.contains(&"/proc".to_string()),
-            "/proc should NOT be in read_only when it is already in read_write"
-        );
-    }
-
-    #[test]
-    fn proc_in_read_only_without_gpu() {
-        if has_gpu_devices() {
-            // On a GPU host we can't test the non-GPU path; skip silently.
-            return;
-        }
-        let (ro, _rw) = baseline_enrichment_paths();
-        assert!(
-            ro.contains(&"/proc".to_string()),
-            "/proc should be in read_only when GPU is not present"
-        );
+    fn proxy_baseline_keeps_proc_read_only_on_every_host() {
+        let (ro, rw) = proxy_baseline_paths();
+        assert!(ro.contains(&"/proc".to_string()));
+        assert!(!rw.contains(&"/proc".to_string()));
     }
 
     #[test]
     fn baseline_read_write_does_not_hardcode_sandbox() {
-        let (_ro, rw) = baseline_enrichment_paths();
+        let (_ro, rw) = proxy_baseline_paths();
         assert!(rw.contains(&"/tmp".to_string()));
         assert!(rw.contains(&"/dev/null".to_string()));
         assert!(!rw.contains(&"/sandbox".to_string()));
     }
 
     #[test]
-    fn enumerate_gpu_device_nodes_skips_bare_nvidia() {
-        // "nvidia" (without a trailing digit) is a valid /dev entry on some
-        // systems but is not a per-GPU device node.  The enumerator must
-        // not match it.
-        let nodes = enumerate_gpu_device_nodes();
-        assert!(
-            !nodes.contains(&"/dev/nvidia".to_string()),
-            "bare /dev/nvidia should not be enumerated: {nodes:?}"
-        );
-    }
-
-    #[test]
     fn no_duplicate_paths_in_baseline() {
-        let (ro, rw) = baseline_enrichment_paths();
+        let (ro, rw) = proxy_baseline_paths();
         // No path should appear in both lists.
         for path in &ro {
             assert!(
@@ -1808,7 +1704,7 @@ mod baseline_tests {
     fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
-            read_only: vec!["/tmp".to_string()],
+            read_only: vec!["/tmp".to_string(), "/proc".to_string()],
             read_write: vec![],
             include_workdir: false,
         });
@@ -1828,6 +1724,8 @@ mod baseline_tests {
         enrich_proto_baseline_paths(&mut policy);
 
         let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(filesystem.read_only.contains(&"/proc".to_string()));
+        assert!(!filesystem.read_write.contains(&"/proc".to_string()));
         assert!(
             filesystem.read_only.contains(&"/tmp".to_string()),
             "explicit read_only baseline path should be preserved"
@@ -1922,47 +1820,26 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_promotes_proc_without_network_policy() {
+    fn no_network_policy_is_unchanged_by_supervisor_baseline() {
+        // A CPU-only workload must start with this policy even when the
+        // supervisor's host has GPUs. No GPU hardware is needed by this test.
         let mut policy = openshell_policy::restrictive_default_policy();
+        assert!(policy.network_policies.is_empty());
         assert!(
-            policy.network_policies.is_empty(),
-            "regression setup must exercise the no-network default path"
+            policy
+                .filesystem
+                .as_ref()
+                .unwrap()
+                .read_only
+                .contains(&"/proc".to_string())
         );
-        let (ro, rw) =
-            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+        let original = policy.clone();
 
-        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
-            matches!(path, "/proc" | "/dev/nvidia0")
-        });
+        let enriched = enrich_proto_baseline_paths(&mut policy);
 
-        let filesystem = policy.filesystem.expect("filesystem policy");
-        assert!(
-            enriched,
-            "GPU enrichment should not require network policies"
-        );
-        assert!(
-            filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
-            "GPU enrichment should add enumerated device nodes without network policies"
-        );
-        assert!(
-            !filesystem.read_only.contains(&"/proc".to_string()),
-            "GPU enrichment should remove /proc from read_only"
-        );
-        assert!(
-            filesystem.read_write.contains(&"/proc".to_string()),
-            "GPU enrichment should promote /proc to read_write"
-        );
-    }
-
-    #[test]
-    fn gpu_baseline_read_write_contains_dxg() {
-        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
-        // read-write rule for the CDI-injected DXG device.  The existence
-        // check in enrich_proto_baseline_paths() skips it on native Linux.
-        assert!(
-            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
-            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
-        );
+        assert!(!enriched);
+        assert_eq!(policy, original);
+        assert!(proto_sync_payload_for_enriched_policy(&policy, enriched).is_none());
     }
 
     #[test]
@@ -1994,29 +1871,6 @@ mod baseline_tests {
                 .read_write
                 .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
-        );
-    }
-
-    #[test]
-    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
-        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
-        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
-        assert!(
-            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
-            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
-        );
-    }
-
-    #[test]
-    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
-        // Verify the OR logic: result must match the manual disjunction of
-        // the two path checks.  Passes in all environments.
-        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
-        let dxg = std::path::Path::new("/dev/dxg").exists();
-        assert_eq!(
-            has_gpu_devices(),
-            nvidiactl || dxg,
-            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
         );
     }
 }
@@ -2190,6 +2044,35 @@ enum LocalPolicyIdentity {
     EndpointOnly,
 }
 
+struct CapturedProviderEnvironment {
+    credentials: ProviderCredentialState,
+    expires_at_ms: Option<i64>,
+    identity: EnvironmentIdentity,
+}
+
+impl CapturedProviderEnvironment {
+    fn install(self, readiness: &ProviderReadinessTracker) -> ProviderCredentialState {
+        readiness.credentials_installed(self.identity, &self.credentials, self.expires_at_ms);
+        self.credentials
+    }
+
+    fn new(
+        credentials: ProviderCredentialState,
+        provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
+    ) -> Self {
+        Self {
+            credentials,
+            expires_at_ms: provider
+                .credential_expires_at_ms
+                .values()
+                .copied()
+                .filter(|expiry| *expiry > 0)
+                .min(),
+            identity: EnvironmentIdentity::from_environment(provider),
+        }
+    }
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -2206,7 +2089,7 @@ async fn load_policy(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     load_policy_with_gateway(
         sandbox_id,
@@ -2246,7 +2129,7 @@ async fn load_policy_with_gateway(
     LoadedPolicyOrigin,
     bool,
     bool,
-    Option<ProviderCredentialState>,
+    Option<CapturedProviderEnvironment>,
 )> {
     use openshell_core::proto::ConfigurationAdmissionState;
     // File mode: load OPA engine from rego rules + YAML data (dev override)
@@ -2609,7 +2492,10 @@ async fn load_policy_with_gateway(
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
-                Some(captured_provider_credentials),
+                Some(CapturedProviderEnvironment::new(
+                    captured_provider_credentials,
+                    &provider,
+                )),
             ));
         }
     }
@@ -2696,7 +2582,7 @@ fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool 
 fn prepare_provider_environment(
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
-    ProviderCredentialState::from_bound_environment(
+    let prepared = ProviderCredentialState::from_bound_environment(
         provider.provider_env_revision,
         provider.environment.clone(),
         provider.credential_expires_at_ms.clone(),
@@ -2704,7 +2590,9 @@ fn prepare_provider_environment(
         provider.static_credential_bindings.clone(),
         provider.non_secret_environment_keys.clone(),
     )
-    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))
+    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
+    prepared.set_managed_files(provider.files.clone());
+    Ok(prepared)
 }
 
 // Retain only the most recent rejection, so A -> B -> A emits all transitions.
@@ -3239,6 +3127,7 @@ fn initial_provider_credentials(
         result.non_secret_environment_keys,
     ) {
         Ok(credentials) => {
+            credentials.set_managed_files(result.files);
             readiness.credentials_installed(identity, &credentials, expires_at_ms);
             credentials
         }
@@ -3513,6 +3402,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
@@ -4034,6 +3924,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     );
                     current_policy_generation = Some(generation.clone());
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4072,6 +3963,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4680,6 +4572,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -4734,6 +4627,38 @@ fn extract_bool_setting(
         .and_then(|sv| sv.value.as_ref())
         .and_then(|v| match v {
             setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+fn apply_ocsf_schema_version_setting(
+    version: &std::sync::Mutex<String>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    if let Ok(mut current) = version.lock()
+        && *current != new_version
+    {
+        info!(
+            ocsf_schema_version = %new_version,
+            "OCSF schema version target changed"
+        );
+        *current = new_version;
+    }
+}
+
+/// Extract a string value from an effective setting, if present.
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(value) => Some(value.clone()),
             _ => None,
         })
 }
@@ -4911,8 +4836,8 @@ mod tests {
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let readiness =
-            ControlReadiness::start(path.clone(), None).expect("start readiness listener");
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Unix(path.clone()), None)
+            .expect("start readiness listener");
         check_control_readiness(&path).expect("running supervisor accepts readiness probes");
 
         drop(readiness);
@@ -4924,10 +4849,20 @@ mod tests {
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
-        let _readiness = ControlReadiness::start(path.clone(), Some(session_rx))
-            .expect("start readiness listener");
-        check_control_readiness(&path).expect("accepted session is ready");
+        let (session_tx, session_rx) = tokio::sync::watch::channel(false);
+        let _readiness =
+            ControlReadiness::start(ReadinessEndpoint::Unix(path.clone()), Some(session_rx))
+                .expect("start readiness listener");
+        assert!(check_control_readiness(&path).is_err());
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while check_control_readiness(&path).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first accepted session creates readiness socket");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
@@ -4946,6 +4881,65 @@ mod tests {
         })
         .await
         .expect("replacement session restores readiness socket");
+    }
+
+    #[test]
+    fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|reserved| reserved.local_addr())
+            .expect("reserve loopback port")
+            .port();
+        let listener = bind_readiness_tcp(port).expect("bind readiness listener");
+        if listener.local_addr().expect("local address").is_ipv6() {
+            assert!(
+                !socket2::SockRef::from(&listener)
+                    .only_v6()
+                    .expect("read IPV6_V6ONLY"),
+                "net.ipv6.bindv6only=1 must not make the wildcard listener IPv6-only"
+            );
+        }
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("IPv4 kubelet probe reaches the readiness listener");
+    }
+
+    #[tokio::test]
+    async fn tcp_control_readiness_tracks_supervisor_session() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|reserved| reserved.local_addr())
+            .expect("reserve loopback port")
+            .port();
+        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(session_rx))
+            .expect("start TCP readiness listener");
+        let connects = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        assert!(connects(), "accepted session is ready");
+
+        session_tx.send_replace(false);
+        timeout(Duration::from_secs(1), async {
+            while connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lost session closes readiness listener");
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while !connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement session reopens readiness listener");
+
+        drop(readiness);
+        timeout(Duration::from_secs(1), async {
+            while connects() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped guard closes readiness listener");
     }
 
     #[test]
@@ -5059,6 +5053,37 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_schema_version_setting_updates_from_initial_settings_snapshot() {
+        let version = std::sync::Mutex::new(String::new());
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "ocsf_schema_version".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "1.3".into(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        apply_ocsf_schema_version_setting(&version, &settings);
+
+        assert_eq!(*version.lock().unwrap(), "1.3");
+    }
+
+    #[test]
+    fn apply_ocsf_schema_version_setting_clears_when_setting_is_unset() {
+        let version = std::sync::Mutex::new("1.1".to_string());
+        let settings = std::collections::HashMap::new();
+
+        apply_ocsf_schema_version_setting(&version, &settings);
+
+        assert_eq!(*version.lock().unwrap(), "");
     }
 
     #[test]
@@ -5542,6 +5567,7 @@ network_policies:
 
     fn startup_provider(revision: u64) -> openshell_core::grpc_client::ProviderEnvironmentResult {
         openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: std::collections::HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),
             policy_hash: String::new(),
@@ -5568,6 +5594,22 @@ network_policies:
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
+    }
+
+    #[test]
+    fn startup_environment_seeds_provider_readiness() {
+        let mut provider = startup_provider(10);
+        provider.provider_attachment_epoch = "epoch".to_string();
+        provider.policy_hash = "policy".to_string();
+        let identity = EnvironmentIdentity::from_environment(&provider);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        let readiness = ProviderReadinessTracker::new();
+
+        let credentials =
+            CapturedProviderEnvironment::new(credentials, &provider).install(&readiness);
+
+        assert_eq!(credentials.revision(), 10);
+        assert!(!readiness.needs_environment(&identity));
     }
 
     #[test]
@@ -5798,6 +5840,7 @@ network_policies:
         use std::collections::HashMap;
 
         let mut result = openshell_core::grpc_client::ProviderEnvironmentResult {
+            files: HashMap::new(),
             environment: HashMap::new(),
             provider_env_revision: revision,
             provider_attachment_epoch: String::new(),
@@ -6208,6 +6251,65 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn provider_readiness_startup_environment_avoids_unchanged_refresh() {
+        let policy = proto_policy_fixture();
+        let mut settings = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        settings.provider_env_revision = 6;
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let mut provider = static_provider_environment(6, Some("initial"));
+        provider.policy_hash.clone_from(&settings.policy_hash);
+        let credentials = prepare_provider_environment(&provider).unwrap();
+        ctx.provider_credentials = CapturedProviderEnvironment::new(credentials, &provider)
+            .install(&ctx.provider_readiness);
+        let generation = engine.current_generation();
+        let guard = engine.generation_guard(generation).unwrap();
+        let (policy_gateway, polls, mut reports) = scripted_policy_gateway();
+        let observed_polls = policy_gateway.polled_sandboxes.clone();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway {
+                policy: policy_gateway,
+                requests,
+            },
+        ));
+
+        polls.send(settings.clone()).unwrap();
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(settings).unwrap();
+        timeout(Duration::from_secs(1), async {
+            while observed_polls.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), received.recv())
+                .await
+                .is_err(),
+            "unchanged settings must not refetch the startup environment"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(!guard.is_stale());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn provider_poll_installs_fail_closed_environment_and_acknowledges_policy() {
         let policy = proto_policy_fixture();
         let initial = settings_poll_result(
@@ -6396,6 +6498,7 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials,
             provider_readiness,
             policy_local_ctx: None,

@@ -12,7 +12,7 @@
 # Client binaries:   codex.
 # Reference layout:  /usr/bin/codex or /usr/local/bin/codex, plus the npm global
 #                    install at /usr/lib/node_modules/@openai/**. The npm path is
-#                    an OpenShell Community image layout; check where `npm root
+#                    one reference image layout; check where `npm root
 #                    -g` points in your image.
 # Credential scope:  the CODEX_AUTH_* OAuth tokens and account id. They are
 #                    injected into the sandbox environment for the codex CLI to

@@ -31,7 +31,7 @@ PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
 STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-podman-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
@@ -214,7 +214,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.podman]
 default_image = "${SANDBOX_IMAGE}"

@@ -18,10 +18,11 @@ pub struct PreparedSandbox {
     policy: SandboxPolicy,
 }
 
-/// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
+/// Phase 1: Prepare sandbox restrictions with strict path opening.
 ///
-/// Opens Landlock `PathFds` while the process still has root privileges,
-/// ensuring paths like mode-700 directories are accessible.
+/// Opens configured paths as the calling identity and handles failures according
+/// to the policy's Landlock compatibility mode.
+/// The capability-free launch path uses [`prepare_capability_free`] instead.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
     Ok(PreparedSandbox {
@@ -66,7 +67,7 @@ pub fn prepare_capability_free(
     })
 }
 
-/// Phase 2: Enforce prepared sandbox restrictions (after `drop_privileges`).
+/// Phase 2: Enforce prepared sandbox restrictions in the child before exec.
 ///
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.

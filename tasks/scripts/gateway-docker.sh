@@ -34,7 +34,7 @@ PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-docker-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
 SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
 SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
@@ -213,6 +213,9 @@ if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
 fi
 if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
   printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
+  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
 fi
 if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
   printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"

@@ -82,6 +82,10 @@ const (
 	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
 	OpenShell_FinalizeMainProcessExit_FullMethodName       = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
 	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
+	OpenShell_PeerRelay_FullMethodName                     = "/openshell.v1.OpenShell/PeerRelay"
+	OpenShell_PeerReportProviderReadiness_FullMethodName   = "/openshell.v1.OpenShell/PeerReportProviderReadiness"
+	OpenShell_PeerReportEndpointStatus_FullMethodName      = "/openshell.v1.OpenShell/PeerReportEndpointStatus"
+	OpenShell_PeerGetSandboxProviderStatus_FullMethodName  = "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
 	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
@@ -267,6 +271,18 @@ type OpenShellClient interface {
 	// This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
 	// no new TLS handshake, no reverse HTTP CONNECT.
 	RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error)
+	// Internal gateway-to-gateway relay forwarding.
+	//
+	// A gateway replica that receives a user request for a sandbox whose
+	// supervisor session is owned by a different replica opens this stream to the
+	// owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+	// bytes in either direction. This RPC is authenticated as a gateway peer, not
+	// as a user or sandbox supervisor.
+	PeerRelay(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame], error)
+	// Internal gateway-to-owner forwarding for supervisor-bound state.
+	PeerReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
+	PeerReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error)
+	PeerGetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -943,9 +959,52 @@ func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOpti
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_RelayStreamClient = grpc.BidiStreamingClient[RelayFrame, RelayFrame]
 
+func (c *openShellClient) PeerRelay(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_PeerRelay_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[PeerRelayFrame, PeerRelayFrame]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_PeerRelayClient = grpc.BidiStreamingClient[PeerRelayFrame, PeerRelayFrame]
+
+func (c *openShellClient) PeerReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportProviderReadinessResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PeerReportProviderReadiness_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) PeerReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportEndpointStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PeerReportEndpointStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) PeerGetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxProviderStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PeerGetSandboxProviderStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) WatchSandbox(ctx context.Context, in *WatchSandboxRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SandboxStreamEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[6], OpenShell_WatchSandbox_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_WatchSandbox_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1306,6 +1365,18 @@ type OpenShellServer interface {
 	// This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
 	// no new TLS handshake, no reverse HTTP CONNECT.
 	RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error
+	// Internal gateway-to-gateway relay forwarding.
+	//
+	// A gateway replica that receives a user request for a sandbox whose
+	// supervisor session is owned by a different replica opens this stream to the
+	// owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+	// bytes in either direction. This RPC is authenticated as a gateway peer, not
+	// as a user or sandbox supervisor.
+	PeerRelay(grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]) error
+	// Internal gateway-to-owner forwarding for supervisor-bound state.
+	PeerReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
+	PeerReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error)
+	PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1544,6 +1615,18 @@ func (UnimplementedOpenShellServer) FinalizeMainProcessExit(context.Context, *Fi
 }
 func (UnimplementedOpenShellServer) RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error {
 	return status.Error(codes.Unimplemented, "method RelayStream not implemented")
+}
+func (UnimplementedOpenShellServer) PeerRelay(grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]) error {
+	return status.Error(codes.Unimplemented, "method PeerRelay not implemented")
+}
+func (UnimplementedOpenShellServer) PeerReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PeerReportProviderReadiness not implemented")
+}
+func (UnimplementedOpenShellServer) PeerReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PeerReportEndpointStatus not implemented")
+}
+func (UnimplementedOpenShellServer) PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PeerGetSandboxProviderStatus not implemented")
 }
 func (UnimplementedOpenShellServer) WatchSandbox(*WatchSandboxRequest, grpc.ServerStreamingServer[SandboxStreamEvent]) error {
 	return status.Error(codes.Unimplemented, "method WatchSandbox not implemented")
@@ -2623,6 +2706,67 @@ func _OpenShell_RelayStream_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type OpenShell_RelayStreamServer = grpc.BidiStreamingServer[RelayFrame, RelayFrame]
 
+func _OpenShell_PeerRelay_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(OpenShellServer).PeerRelay(&grpc.GenericServerStream[PeerRelayFrame, PeerRelayFrame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_PeerRelayServer = grpc.BidiStreamingServer[PeerRelayFrame, PeerRelayFrame]
+
+func _OpenShell_PeerReportProviderReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportProviderReadinessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PeerReportProviderReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PeerReportProviderReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PeerReportProviderReadiness(ctx, req.(*ReportProviderReadinessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_PeerReportEndpointStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportEndpointStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PeerReportEndpointStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PeerReportEndpointStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PeerReportEndpointStatus(ctx, req.(*ReportEndpointStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_PeerGetSandboxProviderStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxProviderStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PeerGetSandboxProviderStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PeerGetSandboxProviderStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PeerGetSandboxProviderStatus(ctx, req.(*GetSandboxProviderStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_WatchSandbox_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(WatchSandboxRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -3178,6 +3322,18 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_FinalizeMainProcessExit_Handler,
 		},
 		{
+			MethodName: "PeerReportProviderReadiness",
+			Handler:    _OpenShell_PeerReportProviderReadiness_Handler,
+		},
+		{
+			MethodName: "PeerReportEndpointStatus",
+			Handler:    _OpenShell_PeerReportEndpointStatus_Handler,
+		},
+		{
+			MethodName: "PeerGetSandboxProviderStatus",
+			Handler:    _OpenShell_PeerGetSandboxProviderStatus_Handler,
+		},
+		{
 			MethodName: "SubmitPolicyAnalysis",
 			Handler:    _OpenShell_SubmitPolicyAnalysis_Handler,
 		},
@@ -3282,6 +3438,12 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "RelayStream",
 			Handler:       _OpenShell_RelayStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PeerRelay",
+			Handler:       _OpenShell_PeerRelay_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

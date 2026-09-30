@@ -66,6 +66,7 @@ async fn renewing_boundary_client(
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            confirmation: test_confirmation(),
         },
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

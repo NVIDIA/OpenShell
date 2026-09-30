@@ -12,6 +12,7 @@ export type {
   ExecExitEvent,
   ExecInteractiveOptions,
   ExecInteractiveSession,
+  ExecInteractiveSessionControl,
   ExecOptions,
   ExecResult,
   ExecStreamChunk,
@@ -32,6 +33,7 @@ export type {
   SandboxPolicy,
   SandboxRef,
   SandboxResources,
+  SandboxRestartPolicyName,
   SandboxServiceLevel,
   SandboxSpec,
   SandboxStartup,
@@ -41,6 +43,7 @@ export type {
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateProvenance,
   SandboxWorkloadTemplateSpec,
+  ServiceExposure,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
@@ -50,7 +53,14 @@ export type {
   WaitOptions,
   WorkspaceListScope,
 } from './client.js';
-export { errorCode, OpenShellClient, Pager, SandboxClient, SandboxTemplateClient } from './client.js';
+export {
+  errorCode,
+  OpenShellClient,
+  Pager,
+  SandboxClient,
+  SandboxTemplateClient,
+  ServiceAuthorizationMode,
+} from './client.js';
 export type { ErrorInfo, FieldViolation, SdkErrorCode } from './errors.js';
 export { fromConnect, SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';

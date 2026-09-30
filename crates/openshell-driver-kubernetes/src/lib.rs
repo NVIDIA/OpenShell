@@ -6,6 +6,7 @@ pub mod driver;
 pub mod grpc;
 pub mod isolation;
 pub mod otel_tracing;
+mod resource_admission;
 mod sandbox_runtime;
 
 pub use config::{

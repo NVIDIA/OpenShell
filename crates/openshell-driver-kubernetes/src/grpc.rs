@@ -62,22 +62,31 @@ impl ComputeDriver for ComputeDriverService {
                 if credential.is_empty() {
                     return Err(Status::invalid_argument("credential is required"));
                 }
-                let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
-                Ok(Response::new(AuthenticateSandboxResponse { sandbox_id }))
+                let (sandbox_id, runtime_identity) =
+                    self.driver.authenticate_sandbox(&credential).await?;
+                Ok(Response::new(AuthenticateSandboxResponse {
+                    sandbox_id,
+                    runtime_identity,
+                }))
             })
             .await
     }
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.rpc_tracer
             .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
-                self.driver
-                    .capabilities()
-                    .map(Response::new)
-                    .map_err(Status::internal)
+                let capabilities = self.driver.capabilities().map_err(Status::internal)?;
+                openshell_core::extension_protocol::validate_gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    "kubernetes",
+                    capabilities.extension.as_ref(),
+                    request.into_inner().gateway,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                Ok(Response::new(capabilities))
             })
             .await
     }
@@ -148,11 +157,11 @@ impl ComputeDriver for ComputeDriverService {
                         .into_inner()
                         .sandbox
                         .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                    self.driver
-                        .create_sandbox(&sandbox)
-                        .await
-                        .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-                    Ok(Response::new(CreateSandboxResponse {}))
+                    let runtime_identity =
+                        self.driver.create_sandbox(&sandbox).await.map_err(|e| {
+                            Status::from(openshell_core::ComputeDriverError::from(e))
+                        })?;
+                    Ok(Response::new(CreateSandboxResponse { runtime_identity }))
                 }),
         )
         .await
@@ -190,16 +199,17 @@ impl ComputeDriver for ComputeDriverService {
                     if request.sandbox_id.is_empty() {
                         return Err(Status::invalid_argument("sandbox_id is required"));
                     }
-                    Box::pin(self.driver.start_sandbox(
+                    let runtime_identity = Box::pin(self.driver.start_sandbox(
                         &request.sandbox_id,
                         &request.generation_id,
                         &request.launch_authentication,
+                        &request.expected_runtime_identity,
                     ))
                     .await
                     .map_err(|error| {
                         Status::from(openshell_core::ComputeDriverError::from(error))
                     })?;
-                    Ok(Response::new(StartSandboxResponse {}))
+                    Ok(Response::new(StartSandboxResponse { runtime_identity }))
                 }),
         )
         .await
@@ -359,9 +369,16 @@ mod tests {
                 otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
                 otel.kind = "client"
             );
-            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
-                .instrument(gateway_span)
-                .await?;
+            ComputeDriver::get_capabilities(
+                &service,
+                Request::new(GetCapabilitiesRequest {
+                    gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    )),
+                }),
+            )
+            .instrument(gateway_span)
+            .await?;
 
             ComputeDriver::validate_sandbox_create(
                 &service,

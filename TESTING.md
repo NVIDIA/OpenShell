@@ -106,6 +106,21 @@ requires mTLS.
 
 ### Python E2E (`e2e/python/`)
 
+`mise run e2e:python` builds `openshell/e2e-python:dev` from
+`e2e/python/Dockerfile.workload` and selects it only for the test gateway.
+This Noble-based fixture supplies the `sandbox` user, Python tooling, Git,
+and a writable `/sandbox/.venv`. Its Python version comes from `.python-version`
+so cloudpickle code objects match the test runner. The production workload
+default remains the unmodified NVIDIA Ubuntu image.
+
+The Rust Docker harness also selects this fixture for tests that need tools
+or the named user. Explicit `--from` or `--template` arguments and the default-image
+tests retain their own image selection. Docker sandbox and support-container
+fixtures use the fixed image name; no workload-image override is needed.
+Podman, VM, and Kubernetes retain their existing pinned, pullable fixture and
+image setup. Conformance-only runs do not need the Docker fixture.
+Build the Docker fixture separately with `mise run e2e:workload:build`.
+
 Tests use the `sandbox` fixture from `conftest.py` to create real sandboxes:
 
 ```python
@@ -163,11 +178,43 @@ Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
+Exposed service URLs use virtual hostnames for gateway routing. Host-side tests
+must connect the TCP socket directly to a reachable gateway listener address,
+normally loopback, and send the service URL authority in the HTTP `Host`
+header. Do not resolve `*.openshell.localhost`; resolver support for arbitrary
+`.localhost` subdomains varies across local and CI environments.
+
+Treat the advertised service URL scheme as authoritative. For HTTPS, use the
+virtual service hostname for TLS SNI and the configured gateway trust roots.
+When the listener requires mTLS, present the active gateway client identity;
+the local e2e wrappers register these materials under
+`$XDG_CONFIG_HOME/openshell/gateways/$OPENSHELL_GATEWAY/mtls/`. Do not downgrade
+an HTTPS service URL to plaintext when dialing loopback. Parse the URL and load
+TLS material before entering a readiness loop so permanent configuration
+errors fail immediately. Retry only transient connection failures and
+documented readiness responses, and include the last observation in timeout
+diagnostics.
+
+Verify exposed-service tests in both the default local mode and the
+CI-equivalent HTTPS mode:
+
+```shell
+mise run e2e:rust
+OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false mise run e2e:rust
+```
+
+When more than one test needs this behavior, put the transport in the shared
+Rust e2e harness and require callers to use it instead of duplicating DNS,
+HTTP `Host`, TLS SNI, and mTLS handling.
+
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - the portable deployment smoke
-  scenario plus focused tests for its reusable command runner.
+- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
+  mechanistic drafts, and the sandbox-local API, including agent-authored
+  permission requests. Driver E2E wrappers run every scenario. The
+  installed-artifact conformance suite runs all scenarios and offers a focused
+  `policy-advisor` testsuite for manual integration runs.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -207,7 +254,7 @@ the current checkout.
 The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
 depending on how the gateway was installed or which driver is configured. It
 requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with `--from base`, verifies the sandbox is `Ready` by finding its
+sandbox with the configured default image, verifies the sandbox is `Ready` by finding its
 unique name in paginated JSON list output, executes `echo` with a run-specific
 marker, deletes the sandbox, and verifies that its name no longer appears.
 Driver suites enable the same profile
@@ -235,6 +282,31 @@ Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
 ```shell
 mise run e2e:podman
 ```
+
+Run the portable subset in a disposable rootless Podman guest:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
+```
+
+Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
+
+```shell
+nix run .#generate-podman-e2e-ci-tests
+```
+
+The `e2e-podman` testsuite runs a nextest archive built with the corresponding
+Rust feature and preloads its Python workload image into the rootless Podman
+store. The separate `driver-podman` testsuite compares OpenShell and direct
+Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
+profiles. The E2E archive excludes binaries that still depend on wrapper-owned
+gateway controls, host fixtures, missing guest tools, or nondeterministic relay
+setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+the same filter for the generated inventory, so excluded binaries cannot appear
+as false passes or silently re-enter the archive.
 
 Run the VM-backed Rust CLI e2e suite:
 
@@ -344,9 +416,40 @@ TAG=0.0.115
 skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
 ```
 
-`IMAGE_TAG` sets only the gateway/supervisor image; the CLI under test is always
-built from your branch. To validate against images from your exact commit
-instead, build and push them and point `OPENSHELL_REGISTRY`/`IMAGE_TAG` at them.
+`IMAGE_TAG` sets the default tag for the gateway/supervisor image pair; the CLI
+under test is always built from your branch. To validate against images from
+your exact commit instead, build and push them and point
+`OPENSHELL_REGISTRY`/`IMAGE_TAG` at them.
+
+Test wrappers accept independent image overrides:
+
+```shell
+GATEWAY_IMAGE=registry.example.com/custom/gateway:test \
+SUPERVISOR_IMAGE=registry.example.com/custom/supervisor:test \
+SANDBOX_IMAGE=registry.example.com/custom/sandbox:test \
+mise run e2e:kubernetes
+```
+
+`GATEWAY_IMAGE` applies to the Kubernetes gateway container. `SUPERVISOR_IMAGE`
+applies to the trusted supervisor image selected by the Kubernetes, Docker, and
+Podman wrappers. `SANDBOX_IMAGE` applies to the trusted workload-side runtime
+image that stages the `openshell-sandbox` binary. A repository-only value
+inherits `IMAGE_TAG`; a value with an explicit tag or `@sha256:` digest is used
+as-is. When these variables are unset, the existing `OPENSHELL_REGISTRY` plus
+`IMAGE_TAG` behavior is retained.
+The Docker and Podman wrappers continue to give
+`OPENSHELL_DOCKER_SUPERVISOR_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE` precedence
+over `SUPERVISOR_IMAGE`.
+
+Digest-pinned Kubernetes overrides require disabling local image builds, because
+Docker cannot tag a locally built image with a digest reference:
+
+```shell
+OPENSHELL_E2E_KUBE_BUILD_IMAGES=0 \
+GATEWAY_IMAGE=registry.example.com/custom/gateway@sha256:<digest> \
+SUPERVISOR_IMAGE=registry.example.com/custom/supervisor@sha256:<digest> \
+mise run e2e:kubernetes
+```
 
 Available task variants:
 
@@ -371,6 +474,9 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
 | `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
+| `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
+| `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
+| `SANDBOX_IMAGE` | Trusted sandbox runtime image repository or complete tagged/digest-pinned image reference |
 
 Run a single test directly with cargo:
 

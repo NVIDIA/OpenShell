@@ -11,8 +11,8 @@ model. The application calls the provider's native endpoint and owns its base
 URL, model, request format, and timeout.
 
 Use installed `openshell --help` output as the authority for command syntax.
-Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
-and [provider profile guide](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
+Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
+and [provider profile guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
 for current behavior.
 
 ## Diagnostic Workflow
@@ -34,7 +34,7 @@ container; bind it to an address reachable from the gateway runtime.
 
 ```bash
 openshell provider get <provider>
-openshell provider profile export <profile-id> -o yaml
+openshell profile export <profile-id> -o yaml
 ```
 
 Check that the profile:
@@ -49,8 +49,8 @@ endpoint-bearing profile. A base URL stored only in provider configuration does
 not authorize a new endpoint.
 
 ```bash
-openshell provider profile lint -f ./provider-profile.yaml
-openshell provider profile import -f ./provider-profile.yaml
+openshell profile lint -f ./provider-profile.yaml
+openshell profile import -f ./provider-profile.yaml
 openshell provider create --name <provider> --type <profile-id>
 ```
 

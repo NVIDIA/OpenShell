@@ -13,6 +13,13 @@ identity, DNS, TCP, and loopback-forwarding semantics.
 
 ## Runtime posture
 
+Caller driver config is disabled by default. Existing volumes require
+administrator-controlled approval labels; bind and supplemental image mounts
+are denied under enforcement. Private-volume names alone do not prove
+ownership. GPU devices are temporarily exempt. Admission runs before launch,
+restart, and periodically for running workloads.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 | Property | Workload | Supervisor |
 |---|---|---|
 | UID/GID | Pinned non-root workload identity | Same mapped identity |
@@ -108,10 +115,12 @@ requires the authenticated supervisor session before publishing Ready.
 
 User `bind`, `volume`, `tmpfs`, and `image` mounts and CDI GPU selection remain
 native Podman features and apply only to the workload. Bind mounts require the
-operator's `enable_bind_mounts` opt-in. Reserved control paths and the workspace
+operator's `enable_bind_mounts` opt-in and disabled label admission. Supplemental
+image mounts also require disabled admission. Driver JSON requires
+`allow_driver_config = true`. Reserved control paths and the workspace
 root cannot be replaced. User-owned volumes are never created or deleted.
 
-See [gateway configuration](../../docs/reference/gateway-config.mdx) for
+See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
 operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
 Omit `health_check_interval_secs` to disable Podman's periodic health command.

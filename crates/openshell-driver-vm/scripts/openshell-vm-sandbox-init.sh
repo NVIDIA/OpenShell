@@ -162,25 +162,30 @@ prepare_guest_image_rootfs() {
 
     rm -rf "$image_root" "$partial_root"
 
+    # Build the rootfs under $partial_root and rename it into place last. The
+    # host only caches a prepared disk that has $image_root, and guest exit
+    # codes do not reach the host, so $image_root must not exist until every
+    # step has succeeded.
     case "$source" in
         local-docker)
-            mkdir -p "$image_root"
-            tar -xpf "$payload_dir/source-rootfs.tar" -C "$image_root"
+            mkdir -p "$partial_root"
+            tar -xpf "$payload_dir/source-rootfs.tar" -C "$partial_root"
             ;;
         oci-layout)
             if [ ! -x /opt/openshell/bin/umoci ]; then
                 ts "FATAL: umoci not found in VM bootstrap image"
                 exit 1
             fi
+            # `umoci raw unpack` extracts the image filesystem directly into
+            # the target directory; unlike `umoci unpack`, it does not create
+            # a bundle with a rootfs/ subdirectory.
             /opt/openshell/bin/umoci raw unpack \
                 --image "$payload_dir/oci:openshell" \
                 "$partial_root"
-            if [ ! -d "$partial_root/rootfs" ]; then
-                ts "FATAL: umoci unpack did not produce rootfs directory"
+            if [ ! -d "$partial_root" ]; then
+                ts "FATAL: umoci unpack did not produce a rootfs directory"
                 exit 1
             fi
-            mv "$partial_root/rootfs" "$image_root"
-            rm -rf "$partial_root"
             ;;
         *)
             ts "FATAL: unknown guest image payload source: ${source:-missing}"
@@ -188,11 +193,12 @@ prepare_guest_image_rootfs() {
             ;;
     esac
 
-    ensure_target_runtime "$image_root"
+    ensure_target_runtime "$partial_root"
     if [ -f "$payload_dir/identity" ]; then
-        cp "$payload_dir/identity" "$image_root/.openshell-rootfs-variant"
+        cp "$payload_dir/identity" "$partial_root/.openshell-rootfs-variant"
     fi
     rm -rf "$payload_dir"
+    mv "$partial_root" "$image_root"
 }
 
 exec_supervisor_in_newroot() {

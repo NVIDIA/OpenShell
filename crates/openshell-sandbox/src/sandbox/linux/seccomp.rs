@@ -25,7 +25,7 @@
 //! The risk is contained by existing sandbox layers:
 //! - **Privilege drop**: `CAP_NET_ADMIN` is not granted, so all write operations
 //!   (add/delete routes, addresses, interfaces) fail with `EPERM` regardless.
-//! - **Driver outer fence**: direct workload egress is rejected outside this
+//! - **Outer network fence**: direct workload egress is rejected outside this
 //!   process by Docker network-none, Kubernetes `NetworkPolicy`, or a NIC-less
 //!   VM.
 //!

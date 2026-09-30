@@ -59,6 +59,11 @@ depends = ["sdk:ts:proto"]
 dir = "sdk/typescript"
 run = "npm test"
 
+["e2e:sdk:ts:exec"]
+description = "Test public TypeScript interactive exec against a Docker-backed gateway"
+depends = ["sdk:ts:build"]
+run = "e2e/with-docker-gateway.sh node --test sdk/typescript/e2e/interactive-exec.mjs"
+
 ["sdk:ts:ci"]
 description = "TypeScript SDK checks (proto lint, Biome lint, codegen, typecheck, test, build)"
 depends = [

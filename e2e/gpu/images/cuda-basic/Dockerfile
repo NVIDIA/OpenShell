@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG CUDA_BUILD_IMAGE=nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04
-ARG OPENSHELL_SANDBOX_BASE_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+ARG OPENSHELL_SANDBOX_BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04
 
 FROM ${CUDA_BUILD_IMAGE} AS builder
 
@@ -68,5 +68,5 @@ RUN chmod 0755 /usr/local/bin/openshell-gpu-workload \
     /usr/local/lib/openshell-gpu-workload/deviceQuery \
     /usr/local/lib/openshell-gpu-workload/vectorAdd
 
-USER sandbox
+USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/openshell-gpu-workload"]

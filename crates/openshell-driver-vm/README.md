@@ -8,6 +8,13 @@ The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest
 
 ## How it fits together
 
+Caller driver config is disabled by default, including upload workflows
+encoded in driver JSON. GPU devices and their trusted VFIO plumbing are
+temporarily exempt from approval labels; existing GPU selection validation
+still applies. Private rootfs staging does not authorize arbitrary host paths.
+The gateway passes its common policy to its managed VM subprocess.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 ```mermaid
 flowchart LR
     subgraph host["Host"]
@@ -47,6 +54,7 @@ First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw
 By default `mise run gateway:vm`:
 
 - Listens on plaintext HTTP at `127.0.0.1:18081`.
+- Uses `nvcr.io/nvidia/base/ubuntu:24.04` as the sandbox and bootstrap image.
 - Configures the gateway installation name as `vm-dev` and registers the same
   name with the CLI by writing
   `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the
@@ -153,7 +161,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
-| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
+| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
@@ -196,11 +204,20 @@ payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
 Linux-owned ext4 storage. The resulting disk is cached under
 `<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
 sandboxes. Local Docker images are still exported as rootfs tar archives and
-prepared inside the bootstrap VM. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
+prepared inside the bootstrap VM. The driver checks that a prepared disk
+contains the unpacked rootfs before caching it; on failure it caches nothing
+and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
-embedded supervisor.
+embedded supervisor. Host-side bootstrap layer assembly preserves relative
+symlinks that remain inside the rootfs, but rejects absolute or escaping
+cross-layer symlink traversal before applying later files or whiteouts. The
+layer applier performs rootfs mutations relative to opened directory handles
+and creates destination files without following symlinks.
+The requested sandbox image is never selected as the bootstrap image. Operators
+must configure either `bootstrap_image` or `default_image`; when both are empty,
+the driver fails during startup.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

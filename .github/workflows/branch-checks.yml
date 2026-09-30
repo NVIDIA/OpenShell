@@ -105,8 +105,46 @@ jobs:
       - name: Check dependencies
         run: cargo deny check licenses bans sources
 
-  rust:
-    name: Rust (${{ matrix.system }})
+  rust-format:
+    name: Rust format
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Format
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+
+  cargo-lockfiles:
+    name: Cargo lockfiles
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Verify Cargo lockfiles
+        shell: nix develop -c bash -euo pipefail {0}
+        run: tasks/scripts/check-cargo-lockfiles.sh
+
+  rust-lint:
+    name: Rust lint (${{ matrix.system }})
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
@@ -120,117 +158,196 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: ./.github/actions/setup-nix
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: ./.github/actions/setup-rust
         with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - name: Realize Nix development shell
-        shell: bash
-        run: nix build --no-link ".#devShells.${{ matrix.system }}.default"
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Keep branch-check caches partitioned by target system; lint
-          # and test intentionally share the same job-local target directory.
-          shared-key: rust-checks-${{ matrix.system }}
-          # Preserve compiled artifacts from failed lint/test runs so the next
-          # push to the same PR branch does not start from a cold cache.
-          cache-on-failure: "true"
-          cache-workspace-crates: "true"
-          cache-bin: "false"
-          cmd-format: nix develop .#devShells.${{ matrix.system }}.default -c {0}
-
-      - name: Format
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
-          cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
-          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+          cache-key: rust-checks-v2
+          save-cache: "false"
 
       - name: Lint
+        shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+
+  rust-test:
+    name: Rust test (${{ matrix.system }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "true"
 
       - name: Test
+        shell: nix develop -c bash -euo pipefail {0}
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
-          cargo nextest run --profile ci --workspace --features openshell-server/test-support
-          cargo nextest run --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
-      - name: Verify standalone policy prover package
-        if: matrix.system == 'x86_64-linux'
-        env:
-          CARGO_NET_OFFLINE: "true"
+  rust-build-modes:
+    name: Rust build modes (${{ matrix.system }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-amd64-cpu8
+            system: x86_64-linux
+          - runner: linux-arm64-cpu8
+            system: aarch64-linux
+          - runner: macos-15-xlarge
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify build modes
+        shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo test --locked -p openshell-prover-cli
-          cargo build --locked --release -p openshell-prover-cli --bin openshell-prover
+          cargo build --locked -p openshell-gateway --bin openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
+          cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
+          cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
+          cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
+
+      - name: Verify system CA roots dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-supervisor --prefix none --no-default-features --features system-ca-roots > /tmp/openshell-supervisor-dependencies.txt
+          if grep -Eq '^(webpki-roots|webpki-root-certs) v' /tmp/openshell-supervisor-dependencies.txt; then
+            echo "ERROR: bundled Mozilla roots found in system CA roots build" >&2
+            cat /tmp/openshell-supervisor-dependencies.txt >&2
+            exit 1
+          fi
+
+      - name: Verify standalone prover dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
           cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
           if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
             echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
             cat /tmp/openshell-prover-dependencies.txt >&2
             exit 1
           fi
-          target/release/openshell-prover check \
-            crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
-            --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \
-            --output json > /tmp/openshell-prover-result.json
-          grep -q '"result"[[:space:]]*:[[:space:]]*"within_boundary"' /tmp/openshell-prover-result.json
 
-      - name: Verify telemetry can be compiled out
+  rust-feature-alias:
+    name: Rust feature alias
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify defaults-without-telemetry feature alias
+        shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo build -p openshell-gateway --bin openshell-gateway
-          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
-          cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
-          cargo build -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
-
-      - name: Verify selective gateway compute-driver builds
-        run: |
-          cargo test -p openshell-gateway --all-targets --no-default-features
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
-          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
-
-      - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
-        run: tasks/scripts/verify-defaults-without-telemetry.sh
-
-      - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
-        run: |
-          cargo check -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
-          if cargo tree -p openshell-supervisor -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
-            echo "ERROR: webpki-roots found in system CA roots build" >&2
-            exit 1
-          fi
-          if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
-            echo "ERROR: webpki-root-certs found in system CA roots build" >&2
-            exit 1
-          fi
-
-      - name: Verify Cargo lockfiles unchanged
-        run: |
-          tasks/scripts/check-cargo-lockfiles.sh
+          tasks/scripts/verify-defaults-without-telemetry.sh
           git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
+
+  rust-gateway-core-features:
+    name: Rust gateway core features
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify core gateway compute-driver feature sets
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+
+  rust-gateway-extended-features:
+    name: Rust gateway extended features
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Verify extended gateway compute-driver feature sets
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
   python:
     name: Python (${{ matrix.runner }})

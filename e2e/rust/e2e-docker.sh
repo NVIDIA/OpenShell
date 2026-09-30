@@ -44,5 +44,9 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   exit 0
 fi
 
+if [ -n "${E2E_FEATURES}" ]; then
+  CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
+fi
+
 exec "${ROOT}/e2e/with-docker-gateway.sh" \
   bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}"

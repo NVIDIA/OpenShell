@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Enable lingering for tmachine
+  become: true
+  ansible.builtin.command:
+    argv:
+      - loginctl
+      - enable-linger
+      - tmachine
+  changed_when: false
+
+- name: Start tmachine user manager
+  become: true
+  ansible.builtin.systemd_service:
+    name: user@1000.service
+    state: started

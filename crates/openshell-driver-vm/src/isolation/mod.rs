@@ -9,13 +9,50 @@
 //! the common control and boundary behavior.
 
 use openshell_isolation_interface::contract::{
-    BackendError, DriverFenceEvidence, ResolvedWorkloadIdentity,
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+
+#[derive(Serialize)]
+struct VmOuterFenceEvidence<'a> {
+    generation: &'a str,
+    network_device_count: u32,
+}
+
+impl VmOuterFenceEvidence<'_> {
+    fn project(&self) -> Result<OuterFenceGuarantees, BackendError> {
+        if self.generation.is_empty() {
+            return Err(BackendError::Descriptor(
+                "VM outer fence evidence is incomplete".to_string(),
+            ));
+        }
+        let established = (self.network_device_count == 0).then_some([
+            // A guest with no NIC has no kernel network path. Closing the
+            // supervisor-owned channel revokes access, and controller loss
+            // cannot introduce a device.
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ]);
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode VM outer fence evidence: {error}"))
+        })?;
+        let projection = OuterFenceGuarantees::from_enforcement_evidence(
+            self.generation,
+            established.into_iter().flatten(),
+            &encoded,
+        )?;
+        projection.validate(self.generation)?;
+        Ok(projection)
+    }
+}
 
 /// Driver-owned inputs that bind one VM generation to one supervisor boundary.
 pub struct VmBoundarySpec {
@@ -34,6 +71,7 @@ pub struct VmBoundarySpec {
     pub agent_uid: u32,
     pub agent_gid: u32,
     pub child_env: HashMap<String, String>,
+    pub gpu_requested: bool,
 }
 
 /// The protected guest config and matching host descriptor for one VM.
@@ -53,14 +91,18 @@ impl VmBoundarySpec {
             "vm-config".to_string(),
             self.image_identity.clone(),
         )?;
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             ("vm.generation".to_string(), self.generation.clone()),
             ("vm.image_identity".to_string(), self.image_identity),
         ]);
-        let driver_fence = DriverFenceEvidence::Vm {
-            generation: self.generation.clone(),
+        if self.gpu_requested {
+            resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
+        }
+        let outer_fence = VmOuterFenceEvidence {
+            generation: &self.generation,
             network_device_count: 0,
-        };
+        }
+        .project()?;
         Ok(VmBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -77,7 +119,7 @@ impl VmBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: workload_identity.clone(),
-                driver_fence: driver_fence.clone(),
+                outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -92,7 +134,7 @@ impl VmBoundarySpec {
                 // after crossing the authenticated boundary channel.
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
-                driver_fence,
+                outer_fence,
             },
         })
     }
@@ -107,7 +149,33 @@ mod tests {
     };
 
     #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        assert!(
+            VmOuterFenceEvidence {
+                generation: "",
+                network_device_count: 0,
+            }
+            .project()
+            .is_err()
+        );
+        assert!(
+            VmOuterFenceEvidence {
+                generation: "generation-1",
+                network_device_count: 1,
+            }
+            .project()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn provisioning_binds_identical_resource_claims() {
+        for gpu_requested in [false, true] {
+            assert_provisioning_claims(gpu_requested);
+        }
+    }
+
+    fn assert_provisioning_claims(gpu_requested: bool) {
         let session_id = openshell_core::SandboxSessionId::new();
         let material = generate_sandbox_tls_material(session_id).unwrap();
         let provisioned = VmBoundarySpec {
@@ -138,6 +206,7 @@ mod tests {
             agent_uid: 1000,
             agent_gid: 1000,
             child_env: HashMap::new(),
+            gpu_requested,
         }
         .provision()
         .unwrap();
@@ -145,6 +214,14 @@ mod tests {
         assert_eq!(
             provisioned.boundary_config.resource_claims,
             provisioned.runtime_descriptor.resource_claims
+        );
+        assert_eq!(
+            provisioned
+                .runtime_descriptor
+                .resource_claims
+                .get(GPU_RESOURCE_CLAIM)
+                .map(String::as_str),
+            gpu_requested.then_some("true")
         );
         assert_eq!(
             provisioned.runtime_descriptor.resource_claims["vm.generation"],
@@ -155,14 +232,14 @@ mod tests {
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
         assert_eq!(
-            provisioned.boundary_config.driver_fence,
-            provisioned.runtime_descriptor.driver_fence
+            provisioned.boundary_config.outer_fence,
+            provisioned.runtime_descriptor.outer_fence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .driver_fence
-                .validate()
+                .outer_fence
+                .validate("generation-1")
                 .is_ok()
         );
     }

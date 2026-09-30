@@ -2,6 +2,14 @@
 
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
+Caller driver config is disabled by default. External resource references need
+administrator-controlled approval labels in every workspace mode, including
+before restart and scheduling-gate release. GPU devices are temporarily exempt.
+Image-pull Secrets are operator-selected gateway configuration rather than caller
+attachments. Managed mode stages an immutable copy for each sandbox runtime
+generation.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:
@@ -73,14 +81,17 @@ and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
 authenticated Sandbox Protocol binds each connection to the exact sandbox and
 supervisor Pod identities. Supervisors have normal egress for gateway, DNS,
 and policy-approved upstream connections unless an operator policy restricts
-them. Set
-`sandbox_runtime.network_policy_enforced = true` only after verifying that the cluster
-CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
+them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
+sandbox namespace. Kubernetes accepts policy objects without confirming
+enforcement, so operators must verify CNI support before running sandboxes.
 
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
-supervisor. The TLS channel binds the namespace, Sandbox CR, workload Pod,
+supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
+corporate proxy CA bundle, which the gateway reads from its own filesystem so
+the anchor stays in the gateway's trust domain rather than the sandbox
+namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
 supervisor Pod, and shared network-policy identities. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. The shared network fence remains for
@@ -140,11 +151,16 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 
 Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
 explicit audience-bound projected token for the one-shot `IssueSandboxToken`
-exchange. The driver verifies that token and the gateway returns the
-sandbox-scoped JWT used by the supervisor session. The sandbox Pod receives
-neither token. For HTTPS gateway connections, the supervisor projects only
-`ca.crt` from the configured TLS Secret. User client certificates and private
-keys are not mounted into either Pod.
+exchange. The driver verifies that token and returns an opaque runtime identity
+derived from the namespace, immutable Sandbox resource UID, and supervisor Pod
+UID. Restart requires exactly one matching Sandbox resource and preserves its
+namespace and UID while rotating the supervisor Pod UID. The gateway requires
+the authenticated identity to match the durable binding before returning the
+generation-bound session JWT used by the supervisor. The sandbox Pod receives
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.

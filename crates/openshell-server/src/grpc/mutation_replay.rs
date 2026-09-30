@@ -56,6 +56,8 @@ struct Admission {
     #[serde(default)]
     protection: Option<Protection>,
     workspace_id: Option<String>,
+    #[serde(default)]
+    target_id: Option<String>,
     success: Option<Success>,
     completed_at_ms: Option<i64>,
 }
@@ -65,6 +67,8 @@ struct Protection {
     key_id: String,
     effective_payload_hash: String,
     effective_workspace_id: Option<String>,
+    #[serde(default)]
+    effective_target_id: Option<String>,
 }
 
 /// Gateway-owned, in-memory input before hydration and interceptor modification.
@@ -78,19 +82,39 @@ pub(super) enum Success {
     Resource { id: String, version: u64 },
     Deletion { outcome: i32 },
     Ordinary(ordinary::Outcome),
+    StreamTerminal,
 }
 
 pub(super) struct Scope {
     name: String,
     workspace_id: Option<String>,
+    // Name-addressed exec requests must remain bound to one sandbox instance.
+    target_id: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AuthorizationBarrier {
+    resolved: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[tonic::async_trait]
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
-    type Output: Message + Default + Send + 'static;
+    type Output: Send + 'static;
     const METHOD: &'static str;
     const PROTECTED: bool = false;
+    // Streaming producers, not returned stream handles, confirm completion.
+    const DEFERRED: bool = false;
     fn request_id(&self) -> &str;
+    /// Name-addressed targets must keep their identity unless an interceptor
+    /// actually changes the selector, not merely another request field.
+    fn target_selector(&self) -> Option<(&str, &WorkspaceSelector)> {
+        None
+    }
+    fn canonical_message(&self) -> Result<DynamicMessage, Status> {
+        decode_request_message(&format!("{}Request", Self::METHOD), self)
+    }
     async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status>;
     async fn execute(
         state: &Arc<ServerState>,
@@ -132,7 +156,19 @@ pub(super) async fn run<M: Mutation>(
         ));
     };
     let scope = original.authorize(state, &principal).await?;
+    #[cfg(test)]
+    if let Some(barrier) = request.extensions().get::<Arc<AuthorizationBarrier>>() {
+        barrier.resolved.notify_one();
+        barrier.resume.notified().await;
+    }
     let effective_scope = request.get_ref().authorize(state, &principal).await?;
+    if original.target_selector().is_some()
+        && original.target_selector() == request.get_ref().target_selector()
+        && (scope.workspace_id != effective_scope.workspace_id
+            || scope.target_id != effective_scope.target_id)
+    {
+        return Err(replay_unavailable());
+    }
     let (payload_hash, protection) = if M::PROTECTED {
         let key = fingerprint_key(state).await?;
         (
@@ -141,6 +177,7 @@ pub(super) async fn run<M: Mutation>(
                 key_id: key.id(),
                 effective_payload_hash: key.fingerprint(request.get_ref())?,
                 effective_workspace_id: effective_scope.workspace_id,
+                effective_target_id: effective_scope.target_id,
             }),
         )
     } else {
@@ -207,11 +244,12 @@ async fn execute_owned<M: Mutation>(
     protection: Option<Protection>,
     scope: Scope,
 ) -> Result<Response<M::Output>, Status> {
-    let mut admission = Admission {
+    let admission = Admission {
         format_version: 1,
         payload_hash,
         protection,
         workspace_id: scope.workspace_id,
+        target_id: scope.target_id,
         success: None,
         completed_at_ms: None,
     };
@@ -256,6 +294,7 @@ async fn execute_owned<M: Mutation>(
                 ));
             }
             if previous.workspace_id != admission.workspace_id
+                || previous.target_id != admission.target_id
                 || previous.protection != admission.protection
             {
                 return Err(replay_unavailable());
@@ -302,32 +341,85 @@ async fn execute_owned<M: Mutation>(
         };
         // Any error or panic from here leaves the claim unresolved. Status codes
         // do not establish that a handler performed no effects.
+        let completion = Completion {
+            store: state.store.clone(),
+            claim_id,
+            key: key.into(),
+            bucket: bucket.into(),
+            version,
+            admission: payload,
+        };
+        if M::DEFERRED {
+            request.extensions_mut().insert(completion.clone());
+        }
         let facts = ordinary::Facts::default();
         request.extensions_mut().insert(facts.clone());
         let mut response = M::execute(state, request).await?;
+        if M::DEFERRED {
+            return Ok(response);
+        }
         response.extensions_mut().insert(facts);
-        admission.success = Some(M::capture(&response)?);
+        completion.complete(M::capture(&response)?).await?;
+        return Ok(response);
+    }
+    Err(uncertain())
+}
+
+/// Only the admitted owner can finalize this exact incarnation of a claim.
+/// A dropped finalizer leaves a permanent unresolved admission, never a lease.
+#[derive(Clone)]
+pub(super) struct Completion {
+    store: Arc<Store>,
+    claim_id: String,
+    key: String,
+    bucket: String,
+    version: u64,
+    admission: Vec<u8>,
+}
+
+impl Completion {
+    /// Reject replacement between admission authorization and relay creation.
+    pub(super) fn ensure_target(&self, target_id: &str) -> Result<(), Status> {
+        let admission: Admission =
+            serde_json::from_slice(&self.admission).map_err(|_| uncertain())?;
+        if admission
+            .protection
+            .as_ref()
+            .and_then(|protection| protection.effective_target_id.as_deref())
+            != Some(target_id)
+        {
+            return Err(uncertain());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn stream_terminal(&self) -> Result<(), Status> {
+        self.complete(Success::StreamTerminal).await
+    }
+
+    async fn complete(&self, success: Success) -> Result<(), Status> {
+        let mut admission: Admission =
+            serde_json::from_slice(&self.admission).map_err(|_| uncertain())?;
+        admission.success = Some(success);
         admission.completed_at_ms = Some(current_time_ms());
         let payload = serde_json::to_vec(&admission).map_err(|_| uncertain())?;
         if payload.len() > 64 * 1024 {
             return Err(uncertain());
         }
-        state
-            .store
+        self.store
             .put_if(
                 OBJECT_TYPE,
-                &claim_id,
-                key,
-                bucket,
+                &self.claim_id,
+                &self.key,
+                &self.bucket,
                 &payload,
                 None,
-                WriteCondition::MatchResourceVersion(version),
+                WriteCondition::MatchResourceVersion(self.version),
             )
             .await
             .map_err(|_| uncertain())?;
-        return Ok(response);
+        Ok(())
     }
-    Err(uncertain())
 }
 
 async fn prune_expired(store: &Store, bucket: &str) -> Result<bool, Status> {
@@ -377,12 +469,16 @@ fn validate_request_id(value: &str) -> Result<String, Status> {
     Ok(id.hyphenated().to_string())
 }
 
-fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
+fn decode_request_message(name: &str, request: &impl Message) -> Result<DynamicMessage, Status> {
     let descriptor = DESCRIPTORS
-        .get_message_by_name(&format!("openshell.v1.{}Request", M::METHOD))
+        .get_message_by_name(&format!("openshell.v1.{name}"))
         .ok_or_else(|| Status::internal("mutation request descriptor missing"))?;
-    let mut message = DynamicMessage::decode(descriptor, request.encode_to_vec().as_slice())
-        .map_err(|_| Status::internal("decode mutation request"))?;
+    DynamicMessage::decode(descriptor, request.encode_to_vec().as_slice())
+        .map_err(|_| Status::internal("decode mutation request"))
+}
+
+fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
+    let mut message = request.canonical_message()?;
     message.clear_field_by_name("request_id");
     let value = serde_json::to_value(message)
         .map_err(|_| Status::internal("canonicalize mutation request"))?;
@@ -492,6 +588,7 @@ async fn named_scope(state: &ServerState, name: &str) -> Result<Scope, Status> {
     Ok(Scope {
         name: name.into(),
         workspace_id: Some(resource.object_id().into()),
+        target_id: None,
     })
 }
 
@@ -500,6 +597,7 @@ fn global_scope(state: &ServerState, principal: &Principal) -> Result<Scope, Sta
     Ok(Scope {
         name: String::new(),
         workspace_id: None,
+        target_id: None,
     })
 }
 
@@ -719,3 +817,4 @@ deletion_mutation!(
 mod tests;
 
 pub(super) mod ordinary;
+pub(super) mod streaming;

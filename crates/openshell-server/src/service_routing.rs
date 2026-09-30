@@ -9,19 +9,21 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
-use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
-use openshell_core::{ObjectId, VERSION};
+use openshell_core::proto::{
+    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
+};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
-    OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
+    OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
@@ -31,6 +33,113 @@ const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
 const ROUTING_RULE_TYPE: &str = "gateway";
 const RELAY_RULE_NAME: &str = "sandbox_service_relay";
 const RELAY_TARGET_HOST: &str = "127.0.0.1";
+/// How long an idle upstream is kept. Deliberately short: a sandbox app can
+/// close its side at any time, and a connection we hand out after it died
+/// fails the request.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle upstreams kept per endpoint. Concurrent requests need one each,
+/// because HTTP/1 serves a single request at a time per connection.
+const UPSTREAM_MAX_IDLE_PER_ENDPOINT: usize = 8;
+/// Minimum gap between full sweeps of the pool.
+const UPSTREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
+
+struct PooledUpstream {
+    sender: UpstreamSender,
+    idle_since: Instant,
+}
+
+#[derive(Default)]
+struct UpstreamPoolInner {
+    idle: HashMap<String, Vec<PooledUpstream>>,
+    last_sweep: Option<Instant>,
+}
+
+impl UpstreamPoolInner {
+    /// Full sweeps are rate-limited so a large pool can't turn every insert
+    /// into a scan of every endpoint.
+    fn sweep_if_due(&mut self, now: Instant) {
+        if let Some(last) = self.last_sweep
+            && now.duration_since(last) < UPSTREAM_SWEEP_INTERVAL
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
+        self.idle.retain(|_, entries| {
+            entries.retain(|entry| is_reusable(entry, now));
+            !entries.is_empty()
+        });
+    }
+}
+
+/// Idle upstream connections to sandbox services, keyed by endpoint.
+///
+/// Without this every HTTP request opened its own supervisor relay, which
+/// meant a new TCP connection inside the sandbox and a new HTTP/1 handshake
+/// per request, and counted against the 32 in-flight relay cap per sandbox.
+#[derive(Default)]
+pub struct ServiceUpstreamPool {
+    inner: Mutex<UpstreamPoolInner>,
+}
+
+impl std::fmt::Debug for ServiceUpstreamPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceUpstreamPool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceUpstreamPool {
+    /// Takes an upstream that is connected and free.
+    ///
+    /// `is_ready` is what makes reuse safe: HTTP/1 can't start a request until
+    /// the previous response body has been read, and hyper only reports ready
+    /// once that has happened.
+    fn take(&self, key: &str) -> Option<UpstreamSender> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let entries = inner.idle.get_mut(key)?;
+        entries.retain(|entry| is_reusable(entry, now));
+        let taken = entries
+            .iter()
+            .position(|entry| entry.sender.is_ready())
+            .map(|index| entries.swap_remove(index).sender);
+        if entries.is_empty() {
+            inner.idle.remove(key);
+        }
+        taken
+    }
+
+    fn put(&self, key: &str, sender: UpstreamSender) {
+        if sender.is_closed() {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.sweep_if_due(now);
+        let entries = inner.idle.entry(key.to_string()).or_default();
+        if entries.len() >= UPSTREAM_MAX_IDLE_PER_ENDPOINT {
+            return;
+        }
+        entries.push(PooledUpstream {
+            sender,
+            idle_since: now,
+        });
+    }
+
+    fn evict(&self, key: &str) {
+        self.inner.lock().unwrap().idle.remove(key);
+    }
+}
+
+fn is_reusable(entry: &PooledUpstream, now: Instant) -> bool {
+    !entry.sender.is_closed() && now.duration_since(entry.idle_since) <= UPSTREAM_IDLE_TIMEOUT
+}
+
+fn upstream_pool_key(endpoint_id: &str, target_port: u16) -> String {
+    format!("{endpoint_id}|{target_port}")
+}
 
 impl ObjectType for ServiceEndpoint {
     fn object_type() -> &'static str {
@@ -321,79 +430,74 @@ async fn proxy_to_endpoint(
         );
         return Err(err);
     }
+    let authorization_mode = effective_authorization_mode(endpoint.authorization_mode);
+    if validate_application_authorization(&req, authorization_mode).is_err() {
+        let err = ServiceRouteError::invalid_request();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
 
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let (_channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            relay_open::Target::Tcp(TcpRelayTarget {
-                host: RELAY_TARGET_HOST.to_string(),
-                port: u32::from(target_port),
-            }),
-            endpoint.object_id().to_string(),
-            Duration::from_secs(15),
-        )
-        .await
-        .map_err(|err| {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
-        .await
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim timed out");
-            err
-        })?
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim canceled");
-            err
-        })?
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: relay target open failed");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake(TokioIo::new(relay))
-        .await
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    if websocket_upgrade {
-        tokio::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
-            }
-        });
+    // An upgrade takes the connection over, so it is never pooled.
+    let pool_key = upstream_pool_key(endpoint.object_id(), target_port);
+    let pooled = if websocket_upgrade {
+        None
     } else {
-        tokio::spawn(async move {
-            if let Err(err) = conn.await {
-                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
-            }
-        });
-    }
+        state.service_upstreams.take(&pool_key)
+    };
 
-    let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
-    let mut response = sender.send_request(upstream).await.map_err(|err| {
-        warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
-        let route_err = ServiceRouteError::service_unreachable();
-        emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-        route_err
-    })?;
+    let reused = pooled.is_some();
+    let mut sender = match pooled {
+        Some(sender) => sender,
+        None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
+    };
+
+    let upstream = build_upstream_request(req, target_port, websocket_upgrade, authorization_mode)?;
+    let replay = reused.then(|| replayable_request(&upstream)).flatten();
+    let first_attempt = if reused {
+        sender.try_send_request(upstream).await.map_err(|mut err| {
+            let request = err.take_message();
+            (err.into_error(), request)
+        })
+    } else {
+        sender
+            .send_request(upstream)
+            .await
+            .map_err(|err| (err, None))
+    };
+    let mut response = match first_attempt {
+        Ok(response) => response,
+        Err((err, recovered)) => {
+            warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
+            state.service_upstreams.evict(&pool_key);
+            let Some(retry_request) = recovered.or(replay) else {
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                return Err(route_err);
+            };
+            sender =
+                open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
+            sender.send_request(retry_request).await.map_err(|err| {
+                warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                route_err
+            })?
+        }
+    };
+
+    if !websocket_upgrade {
+        state.service_upstreams.put(&pool_key, sender);
+    }
 
     if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let upstream_upgrade = hyper::upgrade::on(&mut response);
@@ -428,6 +532,77 @@ async fn proxy_to_endpoint(
     Ok(Response::from_parts(parts, Body::new(body)))
 }
 
+async fn open_upstream(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+    websocket_upgrade: bool,
+) -> Result<UpstreamSender, ServiceRouteError> {
+    let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Tcp(TcpRelayTarget {
+            host: RELAY_TARGET_HOST.to_string(),
+            port: u32::from(target_port),
+        }),
+        endpoint.object_id().to_string(),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|err| {
+        warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
+        let route_err = ServiceRouteError::service_unreachable();
+        emit_service_relay_failure(endpoint, target_port, route_err.reason);
+        route_err
+    })?;
+
+    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
+        .await
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim timed out");
+            err
+        })?
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim canceled");
+            err
+        })?
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: relay target open failed");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(relay))
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    if websocket_upgrade {
+        tokio::spawn(async move {
+            if let Err(err) = conn.with_upgrades().await {
+                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
+            }
+        });
+    }
+
+    Ok(sender)
+}
+
 async fn load_endpoint(
     store: &Store,
     workspace: &str,
@@ -445,10 +620,28 @@ async fn load_endpoint(
         .ok_or_else(ServiceRouteError::endpoint_not_found)
 }
 
+/// Copies a request that can be sent again on a fresh connection.
+///
+/// A pooled connection can be closed by the sandbox between the liveness check
+/// and the send. Only bodyless methods are replayable, because the original
+/// body is consumed by the failed attempt.
+fn replayable_request(request: &Request<Body>) -> Option<Request<Body>> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return None;
+    }
+    let mut replay = Request::new(Body::empty());
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    Some(replay)
+}
+
 fn build_upstream_request(
     req: Request<Body>,
     target_port: u16,
     preserve_upgrade_headers: bool,
+    authorization_mode: ServiceAuthorizationMode,
 ) -> Result<Request<Body>, ServiceRouteError> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
@@ -467,7 +660,7 @@ fn build_upstream_request(
     for (name, value) in &parts.headers {
         if (is_hop_by_hop_header(name)
             && !(preserve_upgrade_headers && is_websocket_hop_by_hop_header(name)))
-            || is_gateway_auth_header(name)
+            || is_gateway_auth_header(name, authorization_mode)
         {
             continue;
         }
@@ -547,15 +740,83 @@ fn is_websocket_hop_by_hop_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "connection" | "upgrade")
 }
 
-fn is_gateway_auth_header(name: &header::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "authorization"
-            | "cf-access-jwt-assertion"
-            | "x-forwarded-client-cert"
-            | "x-ssl-client-cert"
-            | "x-client-cert"
-    )
+pub fn effective_authorization_mode(value: i32) -> ServiceAuthorizationMode {
+    match ServiceAuthorizationMode::try_from(value) {
+        Ok(ServiceAuthorizationMode::BearerPassthrough) => {
+            ServiceAuthorizationMode::BearerPassthrough
+        }
+        Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip) | Err(_) => {
+            ServiceAuthorizationMode::Strip
+        }
+    }
+}
+
+fn authorization_mode_label(value: i32) -> &'static str {
+    match effective_authorization_mode(value) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
+}
+
+fn validate_application_authorization<B>(
+    req: &Request<B>,
+    authorization_mode: ServiceAuthorizationMode,
+) -> Result<(), ServiceRouteError> {
+    if authorization_mode != ServiceAuthorizationMode::BearerPassthrough {
+        return Ok(());
+    }
+
+    let mut values = req.headers().get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(ServiceRouteError::invalid_request());
+    }
+
+    let value = value
+        .to_str()
+        .map_err(|_| ServiceRouteError::invalid_request())?;
+    let Some((scheme, credential)) = value.split_once(' ') else {
+        return Err(ServiceRouteError::invalid_request());
+    };
+    let credential = credential.trim_start_matches(' ');
+    if !scheme.eq_ignore_ascii_case("bearer") || !is_bearer_token68(credential) {
+        return Err(ServiceRouteError::invalid_request());
+    }
+    Ok(())
+}
+
+fn is_bearer_token68(value: &str) -> bool {
+    let mut saw_data = false;
+    let mut saw_padding = false;
+    for byte in value.bytes() {
+        if byte == b'=' {
+            saw_padding = true;
+        } else if !saw_padding
+            && (byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+        {
+            saw_data = true;
+        } else {
+            return false;
+        }
+    }
+    saw_data
+}
+
+fn is_gateway_auth_header(
+    name: &header::HeaderName,
+    authorization_mode: ServiceAuthorizationMode,
+) -> bool {
+    match name.as_str() {
+        "authorization" => authorization_mode != ServiceAuthorizationMode::BearerPassthrough,
+        "cf-access-jwt-assertion"
+        | "x-forwarded-client-cert"
+        | "x-ssl-client-cert"
+        | "x-client-cert" => true,
+        _ => false,
+    }
 }
 
 fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
@@ -582,12 +843,12 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
     let event = build_service_endpoint_config_event(endpoint, url, created);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
     let event = build_service_endpoint_delete_event(endpoint);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
@@ -623,13 +884,12 @@ fn emit_service_http_failure(
         endpoint,
         err,
     );
-    let sandbox_id = endpoint.map_or("", |endpoint| endpoint.sandbox_id.as_str());
-    emit_gateway_ocsf_event(sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 fn emit_service_relay_failure(endpoint: &ServiceEndpoint, target_port: u16, reason: &str) {
     let event = build_service_relay_failure_event(endpoint, target_port, reason);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 fn build_service_endpoint_config_event(
@@ -654,7 +914,11 @@ fn build_service_endpoint_config_event(
         ))
         .unmapped("endpoint_name", endpoint_name(endpoint))
         .unmapped("service_name", endpoint.name.clone())
-        .unmapped("target_port", u64::from(endpoint.target_port));
+        .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        );
 
     if !url.is_empty() {
         builder = builder.unmapped("url", url.to_string());
@@ -673,6 +937,10 @@ fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent 
         .unmapped("endpoint_name", endpoint_name(endpoint))
         .unmapped("service_name", endpoint.name.clone())
         .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        )
         .build()
 }
 
@@ -745,25 +1013,8 @@ fn build_service_relay_failure_event(
         .build()
 }
 
-fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
-    let message = event.format_shorthand();
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
-}
-
 fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
-    EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
+    crate::gateway_ocsf::context(sandbox_id, sandbox_name)
 }
 
 fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
@@ -820,9 +1071,9 @@ mod tests {
                 id: "endpoint-id".to_string(),
                 name: "my-sandbox--web".to_string(),
                 created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
-                labels: std::collections::HashMap::default(),
+                labels: HashMap::default(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
@@ -831,6 +1082,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         }
     }
 
@@ -1074,6 +1326,7 @@ mod tests {
         assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
         assert_eq!(json["unmapped"]["service_name"], "web");
         assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
         assert!(
             event
                 .format_shorthand()
@@ -1090,6 +1343,7 @@ mod tests {
         assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
         assert_eq!(json["unmapped"]["service_name"], "web");
         assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
         assert!(
             event
                 .format_shorthand()
@@ -1150,7 +1404,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, false).unwrap();
+        let upstream =
+            build_upstream_request(request, 8080, false, ServiceAuthorizationMode::Strip).unwrap();
 
         assert_eq!(upstream.uri(), "/path");
         assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
@@ -1161,6 +1416,145 @@ mod tests {
             "theme=dark; app=session"
         );
         assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn unspecified_endpoint_authorization_mode_strips_authorization() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = effective_authorization_mode(ServiceAuthorizationMode::Unspecified as i32);
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(mode, ServiceAuthorizationMode::Strip);
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_valid_authorization_and_strips_gateway_identity() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "bEaReR application-token")
+            .header("cf-access-jwt-assertion", "edge-token")
+            .header("x-forwarded-client-cert", "cert")
+            .header(header::PROXY_AUTHORIZATION, "Basic proxy-secret")
+            .header(
+                header::COOKIE,
+                "theme=dark; CF_Authorization=edge-cookie; app=session",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "bEaReR application-token"
+        );
+        assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
+        assert!(!upstream.headers().contains_key("x-forwarded-client-cert"));
+        assert!(!upstream.headers().contains_key(header::PROXY_AUTHORIZATION));
+        assert_eq!(
+            upstream.headers()[header::COOKIE],
+            "theme=dark; app=session"
+        );
+    }
+
+    #[test]
+    fn bearer_passthrough_allows_missing_authorization() {
+        let request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_rejects_ambiguous_or_malformed_authorization() {
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            "Basic abc",
+            "Bearer abc extra",
+            "Bearer abc,def",
+            "Bearer abc=def",
+            "Bearer\tabc",
+            " Bearer abc",
+        ] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            assert!(
+                validate_application_authorization(
+                    &request,
+                    ServiceAuthorizationMode::BearerPassthrough,
+                )
+                .is_err()
+            );
+        }
+
+        for value in ["Bearer abc", "bearer abc-._~+/==", "Bearer  abc"] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .unwrap();
+        }
+
+        let mut request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert!(
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authorization_value_is_not_in_service_routing_events() {
+        const SENTINEL: &str = "never-log-this-capability";
+        let request = Request::builder()
+            .uri("/private")
+            .header(header::AUTHORIZATION, format!("Bearer {SENTINEL}"))
+            .body(Body::empty())
+            .unwrap();
+        let err = ServiceRouteError::invalid_request();
+        let event = build_service_http_failure_event(
+            18080,
+            &request,
+            "my-sandbox",
+            "web",
+            Some(&endpoint()),
+            &err,
+        );
+
+        assert!(!event.to_json().unwrap().to_string().contains(SENTINEL));
+        assert!(!event.format_shorthand().contains(SENTINEL));
     }
 
     #[test]
@@ -1187,13 +1581,38 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let upstream = build_upstream_request(request, 8080, true).unwrap();
+        let upstream =
+            build_upstream_request(request, 8080, true, ServiceAuthorizationMode::Strip).unwrap();
 
         assert_eq!(upstream.uri(), "/chat?session=main");
         assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
         assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
         assert_eq!(upstream.headers()["sec-websocket-key"], "abc");
         assert_eq!(upstream.headers()[header::HOST], "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_authorization_on_websocket_upgrade() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/chat")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "abc")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, true, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "Bearer application-token"
+        );
+        assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
     }
 
     #[tokio::test]
@@ -1205,9 +1624,9 @@ mod tests {
                 id: "ep-1".to_string(),
                 name: "my-sandbox--web".to_string(),
                 created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
-                labels: std::collections::HashMap::default(),
+                labels: HashMap::default(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
@@ -1216,6 +1635,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         };
         store.put_message(&ep).await.unwrap();
 
@@ -1227,5 +1647,234 @@ mod tests {
             not_found.is_err(),
             "should not find endpoint in wrong workspace"
         );
+    }
+    /// Returns a live upstream plus the sandbox end of the connection. Hold
+    /// the returned half: dropping it closes the upstream.
+    async fn test_upstream() -> (UpstreamSender, tokio::io::DuplexStream) {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (sender, server_io)
+    }
+
+    #[test]
+    fn upstream_pool_key_separates_endpoints_and_ports() {
+        assert_eq!(upstream_pool_key("ep-a", 8080), "ep-a|8080");
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-b", 8080)
+        );
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-a", 9090)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_hands_back_a_ready_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(
+            pool.take("ep-a|8080").is_some(),
+            "put upstream should be reusable"
+        );
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "an upstream in use must not be handed out twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_removes_an_endpoint_left_with_no_upstreams() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-a|8080").is_some());
+        assert!(
+            !pool.inner.lock().unwrap().idle.contains_key("ep-a|8080"),
+            "an emptied endpoint must not linger until the next sweep"
+        );
+    }
+
+    #[test]
+    fn only_bodyless_requests_are_replayable() {
+        for method in [Method::GET, Method::HEAD] {
+            let mut request = Request::new(Body::empty());
+            *request.method_mut() = method.clone();
+            *request.uri_mut() = "/health".parse().unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("svc"));
+
+            let replay =
+                replayable_request(&request).expect("bodyless method should be replayable");
+            assert_eq!(*replay.method(), method);
+            assert_eq!(replay.uri().path(), "/health");
+            assert_eq!(replay.headers().get(header::HOST).unwrap(), "svc");
+        }
+
+        let mut post = Request::new(Body::empty());
+        *post.method_mut() = Method::POST;
+        assert!(
+            replayable_request(&post).is_none(),
+            "a request with a body cannot be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_does_not_hand_out_another_endpoints_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-b|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_drops_an_upstream_the_sandbox_closed() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "a closed upstream must never be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_upstream_recovers_an_unsent_post_for_retry() {
+        let (mut sender, sandbox) = test_upstream().await;
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut request = Request::new(Body::from("payload"));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "/write".parse().unwrap();
+        let mut error = sender
+            .try_send_request(request)
+            .await
+            .expect_err("a closed connection must reject the request");
+        let recovered = error
+            .take_message()
+            .expect("an unsent request must be recoverable for a fresh connection");
+
+        assert_eq!(recovered.method(), Method::POST);
+        assert_eq!(recovered.uri().path(), "/write");
+    }
+
+    #[tokio::test]
+    async fn pool_drops_upstreams_past_the_idle_timeout() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.inner.lock().unwrap().idle.insert(
+            "ep-a|8080".to_string(),
+            vec![PooledUpstream {
+                sender,
+                idle_since: Instant::now()
+                    .checked_sub(UPSTREAM_IDLE_TIMEOUT + Duration::from_secs(1))
+                    .unwrap(),
+            }],
+        );
+
+        assert!(pool.take("ep-a|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_caps_idle_upstreams_per_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let mut sandboxes = Vec::new();
+        for _ in 0..(UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4) {
+            let (sender, sandbox) = test_upstream().await;
+            sandboxes.push(sandbox);
+            pool.put("ep-a|8080", sender);
+        }
+
+        let held = pool
+            .inner
+            .lock()
+            .unwrap()
+            .idle
+            .get("ep-a|8080")
+            .map_or(0, Vec::len);
+        assert_eq!(held, UPSTREAM_MAX_IDLE_PER_ENDPOINT);
+        // Every connection stayed open, so the cap dropped the surplus rather
+        // than the pool losing entries to closure.
+        assert_eq!(sandboxes.len(), UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4);
+    }
+
+    #[tokio::test]
+    async fn evict_drops_every_upstream_for_an_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let (first, _sandbox_a) = test_upstream().await;
+        let (second, _sandbox_b) = test_upstream().await;
+        pool.put("ep-a|8080", first);
+        pool.put("ep-b|8080", second);
+
+        pool.evict("ep-a|8080");
+
+        assert!(pool.take("ep-a|8080").is_none());
+        assert!(
+            pool.take("ep-b|8080").is_some(),
+            "eviction must be scoped to one endpoint"
+        );
+    }
+
+    /// Captures structured OCSF events during tracing dispatch.
+    #[derive(Clone, Default)]
+    struct ProbeLayer {
+        seen: Arc<Mutex<Vec<Option<OcsfEvent>>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == openshell_ocsf::OCSF_TARGET {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(openshell_ocsf::clone_current_event());
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_ocsf_events_expose_the_structured_event_to_layers() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let probe = ProbeLayer::default();
+        let subscriber = tracing_subscriber::registry().with(probe.clone());
+
+        let endpoint = endpoint();
+        let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        let expected_shorthand = expected.format_shorthand();
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        });
+
+        let seen = probe.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
+        let event = seen[0]
+            .as_ref()
+            .expect("structured OCSF event should be reachable from the layer");
+        assert_eq!(event.format_shorthand(), expected_shorthand);
     }
 }

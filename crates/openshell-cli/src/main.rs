@@ -19,7 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::GpuResourceRequirements;
+use openshell_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -267,6 +267,7 @@ const HELP_TEMPLATE: &str = "\
   policy:      Manage sandbox policy
   settings:    Manage sandbox and global settings
   provider:    Manage provider configuration
+  profile:     Browse and manage profiles
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
   gateway:     Manage gateways
@@ -319,7 +320,7 @@ const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell sandbox create
-  $ openshell sandbox create --from python
+  $ openshell sandbox create --from registry.example.com/agents/python:latest
   $ openshell sandbox connect my-sandbox
   $ openshell sandbox list
   $ openshell sandbox delete my-sandbox
@@ -386,6 +387,14 @@ const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell provider list
   $ openshell provider get openai
   $ openshell provider delete openai
+";
+
+const PROFILE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell profile list
+  $ openshell profile list --type provider -o json
+  $ openshell profile describe openai
+  $ openshell profile export openai
+  $ openshell profile import -f custom-api.yaml
 ";
 
 const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
@@ -576,6 +585,13 @@ enum Commands {
         command: Option<ProviderCommands>,
     },
 
+    /// Browse and manage profiles.
+    #[command(after_help = PROFILE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile {
+        #[command(subcommand)]
+        command: Option<ProfileCommands>,
+    },
+
     /// Manage workspaces.
     #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Workspace {
@@ -754,6 +770,22 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceAuthorizationMode {
+    #[default]
+    Strip,
+    BearerPassthrough,
+}
+
+impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
+    fn from(value: CliServiceAuthorizationMode) -> Self {
+        match value {
+            CliServiceAuthorizationMode::Strip => Self::Strip,
+            CliServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
@@ -898,7 +930,7 @@ enum ProviderCommands {
         all_workspaces: bool,
     },
 
-    /// List available provider profiles.
+    /// List available provider profiles (alias for `profile list --type provider`).
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     ListProfiles {
         /// Output format.
@@ -910,9 +942,9 @@ enum ProviderCommands {
         global: bool,
     },
 
-    /// Manage provider profiles.
+    /// Manage provider profiles (alias for `profile`).
     #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
-    Profile(ProviderProfileCommands),
+    Profile(ProfileCommands),
 
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1034,8 +1066,46 @@ enum ProviderRefreshCommands {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum ProviderProfileCommands {
+/// Profile kinds exposed by the gateway's profile catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ProfileType {
+    /// Credential, endpoint, and policy definitions for providers.
+    Provider,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum ProfileCommands {
+    /// List available profiles.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Filter profiles by type.
+        #[arg(long = "type", value_enum)]
+        profile_type: Option<ProfileType>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// List platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Describe a profile's credentials, endpoints, and policy defaults.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Describe {
+        /// Profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// Describe a platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
     /// Export a provider profile.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Export {
@@ -1051,8 +1121,8 @@ enum ProviderProfileCommands {
         global: bool,
     },
 
-    /// Import provider profiles from a file or directory.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    /// Import provider profiles from a file, directory, or HTTP URL.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Import {
         /// Profile file to import.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1061,6 +1131,10 @@ enum ProviderProfileCommands {
         /// Directory containing profile files to import.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Import as platform-scoped profiles (ignores --workspace).
         #[arg(long)]
@@ -1083,7 +1157,7 @@ enum ProviderProfileCommands {
     },
 
     /// Validate provider profile files without registering them.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Lint {
         /// Profile file to lint.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1092,6 +1166,10 @@ enum ProviderProfileCommands {
         /// Directory containing profile files to lint.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Lint against platform scope (ignores --workspace).
         #[arg(long)]
@@ -1109,6 +1187,95 @@ enum ProviderProfileCommands {
         #[arg(long)]
         global: bool,
     },
+}
+
+impl ProfileCommands {
+    /// Execute either command spelling against the same authenticated gateway.
+    async fn run(self, endpoint: &str, workspace: &str, tls: &TlsOptions) -> Result<()> {
+        let profile_workspace = |global: bool| -> &str { if global { "" } else { workspace } };
+        match self {
+            Self::List {
+                profile_type,
+                output,
+                global,
+            } => {
+                // The catalog currently contains only provider profiles. An exhaustive
+                // match requires a routing decision when another profile kind is added.
+                match profile_type {
+                    None | Some(ProfileType::Provider) => {
+                        run::provider_list_profiles(
+                            endpoint,
+                            output.as_str(),
+                            profile_workspace(global),
+                            tls,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Self::Describe { id, output, global } => {
+                run::provider_profile_describe(
+                    endpoint,
+                    &id,
+                    output.as_str(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Export { id, output, global } => {
+                run::provider_profile_export(
+                    endpoint,
+                    &id,
+                    output.as_str(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Import {
+                file,
+                from,
+                url,
+                global,
+            } => {
+                run::provider_profile_import(
+                    endpoint,
+                    file.as_deref(),
+                    from.as_deref(),
+                    url.as_deref(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Update { id, file, global } => {
+                run::provider_profile_update(endpoint, &id, &file, profile_workspace(global), tls)
+                    .await?;
+            }
+            Self::Lint {
+                file,
+                from,
+                url,
+                global,
+            } => {
+                run::provider_profile_lint(
+                    endpoint,
+                    file.as_deref(),
+                    from.as_deref(),
+                    url.as_deref(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Delete { ids, global } => {
+                run::provider_profile_delete(endpoint, &ids, profile_workspace(global), tls)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1278,13 +1445,8 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
         template: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
-        /// tar archive (`.tar`, `.tar.gz`, or `.tgz`), or a full container
-        /// image reference (e.g., `myregistry.com/img:tag`).
-        ///
-        /// Community names are resolved to
-        /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
-        /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
+        /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
+        /// or a container image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// To use a local Dockerfile, build and tag it with the container
         /// engine used by your local gateway, then pass the resulting image
@@ -1316,7 +1478,7 @@ enum SandboxCommands {
         keep: bool,
 
         /// Delete the sandbox after the initial command or shell exits.
-        #[arg(long, conflicts_with_all = ["keep", "editor", "forward"])]
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "expose"])]
         no_keep: bool,
 
         /// Launch a remote editor after the sandbox is ready.
@@ -1339,8 +1501,9 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
-        /// Validation behavior is not yet finalized.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Disabled unless the gateway administrator enables `allow_driver_config`.
+        /// External resource attachments still require approval labels.
         ///
         /// For Kubernetes, pass a value such as
         /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
@@ -1363,6 +1526,20 @@ enum SandboxCommands {
         #[arg(long, conflicts_with = "no_keep")]
         forward: Option<String>,
 
+        /// Expose a loopback HTTP or WebSocket service after the sandbox is ready.
+        /// Keeps the sandbox alive. Use `openshell service expose` to add a named service.
+        #[arg(
+            long,
+            value_name = "PORT",
+            value_parser = clap::value_parser!(u16).range(1..),
+            conflicts_with = "no_keep"
+        )]
+        expose: Option<u16>,
+
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t, requires = "expose")]
+        expose_authorization_mode: CliServiceAuthorizationMode,
+
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
         /// Use --tty to force a PTY even when auto-detection fails, or
@@ -1377,6 +1554,14 @@ enum SandboxCommands {
         /// Start the canonical main process without attaching to it.
         #[arg(long, conflicts_with = "editor")]
         detach: bool,
+
+        /// Restart behavior after the canonical main process exits.
+        #[arg(
+            long,
+            value_parser = ["never", "on-failure", "always"],
+            default_value = "never"
+        )]
+        restart_policy: String,
 
         /// Auto-create missing providers from local credentials.
         ///
@@ -1416,7 +1601,7 @@ enum SandboxCommands {
         approval_mode: String,
 
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "no_keep", "forward"])]
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
@@ -1509,13 +1694,18 @@ enum SandboxCommands {
     /// For interactive shell sessions, use `sandbox connect` instead.
     ///
     /// Examples:
+    ///   openshell sandbox exec my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
     ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Exec {
         /// Sandbox name (defaults to last-used sandbox).
-        #[arg(long, short = 'n', add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Sandbox name; same as the positional argument.
+        #[arg(long, short = 'n', conflicts_with = "sandbox", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Working directory inside the sandbox.
@@ -1552,15 +1742,15 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
-        /// Command and arguments to execute.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Command and arguments to execute, after `--`.
+        #[arg(required = true, last = true)]
         command: Vec<String>,
     },
 
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
-    /// Press Ctrl-P Ctrl-Q to disconnect without terminating the main process.
+    /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1662,6 +1852,14 @@ enum SandboxProviderCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Maximum number of attached providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -1749,7 +1947,8 @@ enum SandboxTemplateCommands {
         #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
         gpu: Option<GpuCliRequest>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Requires administrator opt-in; resource admission still applies.
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
@@ -2190,6 +2389,10 @@ enum ServiceCommands {
 
         /// Service name.
         service: Option<String>,
+
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t)]
+        authorization_mode: CliServiceAuthorizationMode,
     },
 
     /// List exposed sandbox service endpoints.
@@ -2735,6 +2938,7 @@ async fn run_async() -> Result<()> {
                     sandbox,
                     service,
                     target_port,
+                    authorization_mode,
                 } => {
                     let service = service.unwrap_or_default();
                     run::service_expose(
@@ -2742,6 +2946,7 @@ async fn run_async() -> Result<()> {
                         &sandbox,
                         &service,
                         target_port,
+                        authorization_mode.into(),
                         &cli.workspace,
                         &tls,
                     )
@@ -3144,9 +3349,12 @@ async fn run_async() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    expose,
+                    expose_authorization_mode,
                     tty,
                     no_tty,
                     detach,
+                    restart_policy,
                     auto_providers,
                     no_auto_providers,
                     labels,
@@ -3211,7 +3419,11 @@ async fn run_async() -> Result<()> {
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
-                    let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let keep = keep
+                        || !no_keep
+                        || editor.is_some()
+                        || forward.is_some()
+                        || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -3235,6 +3447,8 @@ async fn run_async() -> Result<()> {
                             providers: &providers,
                             policy: policy.as_deref(),
                             forward,
+                            expose,
+                            expose_authorization_mode: expose_authorization_mode.into(),
                             command: &command,
                             tty_override,
                             auto_providers_override,
@@ -3244,6 +3458,7 @@ async fn run_async() -> Result<()> {
                             output: output.as_str(),
                             detach,
                             suppress_credential_warnings: no_credential_warnings,
+                            restart_policy: &restart_policy,
                         },
                         &cli.workspace,
                         &tls,
@@ -3387,6 +3602,7 @@ async fn run_async() -> Result<()> {
                             let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }
                         SandboxCommands::Exec {
+                            sandbox,
                             name,
                             workdir,
                             timeout,
@@ -3396,7 +3612,8 @@ async fn run_async() -> Result<()> {
                             command,
                             no_login_shell,
                         } => {
-                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            let name =
+                                resolve_sandbox_name(name.or(sandbox), &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
                             let tty_override = if no_tty {
                                 Some(false)
@@ -3429,11 +3646,18 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name, output } => {
+                            SandboxProviderCommands::List {
+                                name,
+                                page_size,
+                                page_token,
+                                output,
+                            } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                                 run::sandbox_provider_list(
                                     endpoint,
                                     &name,
+                                    page_size,
+                                    &page_token,
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,
@@ -3756,6 +3980,20 @@ async fn run_async() -> Result<()> {
                         .await?;
                     }
                 },
+                ProviderCommands::ListProfiles { output, global } => {
+                    // Normalize the legacy list command before execution so output,
+                    // pagination, and scope handling stay identical for both spellings.
+                    ProfileCommands::List {
+                        profile_type: Some(ProfileType::Provider),
+                        output,
+                        global,
+                    }
+                    .run(endpoint, &cli.workspace, &tls)
+                    .await?;
+                }
+                ProviderCommands::Profile(command) => {
+                    command.run(endpoint, &cli.workspace, &tls).await?;
+                }
                 ProviderCommands::Get { name } => {
                     run::provider_get(endpoint, &name, &cli.workspace, &tls).await?;
                 }
@@ -3777,65 +4015,6 @@ async fn run_async() -> Result<()> {
                         &tls,
                     )
                     .await?;
-                }
-                ProviderCommands::ListProfiles { output, global } => {
-                    let ws = if global { "" } else { &cli.workspace };
-                    run::provider_list_profiles(endpoint, output.as_str(), ws, &tls).await?;
-                }
-                ProviderCommands::Profile(command) => {
-                    let profile_workspace =
-                        |global: bool| -> &str { if global { "" } else { &cli.workspace } };
-                    match command {
-                        ProviderProfileCommands::Export { id, output, global } => {
-                            run::provider_profile_export(
-                                endpoint,
-                                &id,
-                                output.as_str(),
-                                profile_workspace(global),
-                                &tls,
-                            )
-                            .await?;
-                        }
-                        ProviderProfileCommands::Import { file, from, global } => {
-                            run::provider_profile_import(
-                                endpoint,
-                                file.as_deref(),
-                                from.as_deref(),
-                                profile_workspace(global),
-                                &tls,
-                            )
-                            .await?;
-                        }
-                        ProviderProfileCommands::Update { id, file, global } => {
-                            run::provider_profile_update(
-                                endpoint,
-                                &id,
-                                &file,
-                                profile_workspace(global),
-                                &tls,
-                            )
-                            .await?;
-                        }
-                        ProviderProfileCommands::Lint { file, from, global } => {
-                            run::provider_profile_lint(
-                                endpoint,
-                                file.as_deref(),
-                                from.as_deref(),
-                                profile_workspace(global),
-                                &tls,
-                            )
-                            .await?;
-                        }
-                        ProviderProfileCommands::Delete { ids, global } => {
-                            run::provider_profile_delete(
-                                endpoint,
-                                &ids,
-                                profile_workspace(global),
-                                &tls,
-                            )
-                            .await?;
-                        }
-                    }
                 }
                 ProviderCommands::Update {
                     name,
@@ -3864,6 +4043,15 @@ async fn run_async() -> Result<()> {
                     run::provider_delete(endpoint, &names, &cli.workspace, &tls).await?;
                 }
             }
+        }
+        Some(Commands::Profile {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            command.run(endpoint, &cli.workspace, &tls).await?;
         }
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -3989,6 +4177,13 @@ async fn run_async() -> Result<()> {
                 .expect("workspace subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
+        }
+        Some(Commands::Profile { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("profile")
+                .ok_or_else(|| miette::miette!("profile command is unavailable"))?
+                .print_help()
+                .map_err(|error| miette::miette!("failed to print profile help: {error}"))?;
         }
         Some(Commands::Provider { command: None }) => {
             Cli::command()
@@ -4246,6 +4441,89 @@ mod tests {
 
         assert_eq!(name, "work-sandbox");
         assert_eq!(provider, "work-github");
+    }
+
+    #[test]
+    fn exec_grammar_requires_separator_before_remote_command() {
+        use clap::error::ErrorKind;
+
+        // Returns (target, command, tty) or the clap error kind.
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["openshell", "sandbox", "exec"];
+            argv.extend(args);
+            let cli = Cli::try_parse_from(argv).map_err(|e| e.kind())?;
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Exec {
+                        sandbox,
+                        name,
+                        command,
+                        tty,
+                        ..
+                    }),
+            }) = cli.command
+            else {
+                panic!("expected sandbox exec command");
+            };
+            Ok::<_, ErrorKind>((name.or(sandbox), command, tty))
+        };
+        let check = |args: &[&str], target: Option<&str>, command: &[&str], tty: bool| {
+            let got = parse(args).unwrap_or_else(|kind| panic!("{args:?} failed: {kind:?}"));
+            let command = command.iter().map(ToString::to_string).collect();
+            assert_eq!(got, (target.map(str::to_string), command, tty), "{args:?}");
+        };
+
+        check(
+            &["a", "--", "echo", "hi"],
+            Some("a"),
+            &["echo", "hi"],
+            false,
+        );
+        check(&["-n", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--name", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--", "echo", "hi"], None, &["echo", "hi"], false);
+        // Flags on either side of the positional target.
+        check(&["--tty", "a", "--", "echo"], Some("a"), &["echo"], true);
+        check(&["a", "--tty", "--", "echo"], Some("a"), &["echo"], true);
+        check(
+            &["-n", "a", "--tty", "--", "echo"],
+            Some("a"),
+            &["echo"],
+            true,
+        );
+        // Hyphenated remote args are opaque.
+        check(&["a", "--", "ls", "-la"], Some("a"), &["ls", "-la"], false);
+        check(&["a", "--", "--tty"], Some("a"), &["--tty"], false);
+        check(&["--", "-n", "x"], None, &["-n", "x"], false);
+        // An inner delimiter belongs to the remote command.
+        let git = ["git", "log", "--", "path"];
+        check(
+            &["a", "--", "git", "log", "--", "path"],
+            Some("a"),
+            &git,
+            false,
+        );
+        check(&["--", "git", "log", "--", "path"], None, &git, false);
+
+        let err: &[(&[&str], ErrorKind)] = &[
+            // Target given twice.
+            (&["-n", "a", "b", "--", "echo"], ErrorKind::ArgumentConflict),
+            (&["b", "-n", "a", "--", "echo"], ErrorKind::ArgumentConflict),
+            // Missing `--`.
+            (&["a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["a", "--tty", "echo"], ErrorKind::UnknownArgument),
+            (&["-n", "a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["git", "log"], ErrorKind::UnknownArgument),
+            (&["a"], ErrorKind::MissingRequiredArgument),
+            (&[], ErrorKind::MissingRequiredArgument),
+            // Missing remote command.
+            (&["a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["-n", "a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["--"], ErrorKind::MissingRequiredArgument),
+        ];
+        for (args, kind) in err {
+            assert_eq!(parse(args).map(|_| ()), Err(*kind), "{args:?}");
+        }
     }
 
     #[test]
@@ -4781,118 +5059,271 @@ mod tests {
     }
 
     #[test]
-    fn provider_list_profiles_parses() {
-        let cli = Cli::try_parse_from(["openshell", "provider", "list-profiles"])
-            .expect("provider list-profiles should parse");
-
+    fn profile_list_defaults_and_type_filter_parse() {
+        let cli = Cli::try_parse_from(["openshell", "profile", "list"]).expect("profile list");
         assert!(matches!(
             cli.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::ListProfiles {
+            Some(Commands::Profile {
+                command: Some(ProfileCommands::List {
+                    profile_type: None,
                     output: OutputFormat::Table,
                     global: false,
                 })
             })
         ));
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "profile",
+                "list",
+                "--type",
+                "provider",
+                "-o",
+                format,
+                "--global",
+            ])
+            .expect("profile list with type, output, and scope");
+            assert!(matches!(cli.command, Some(Commands::Profile {
+                command: Some(ProfileCommands::List {
+                    profile_type: Some(ProfileType::Provider), output, global: true,
+                })
+            }) if output == expected));
+        }
+        assert!(
+            Cli::try_parse_from(["openshell", "profile", "list", "--type", "unknown"]).is_err()
+        );
     }
 
     #[test]
-    fn provider_list_profiles_accepts_output_format() {
-        let cli = Cli::try_parse_from(["openshell", "provider", "list-profiles", "-o", "json"])
-            .expect("provider list-profiles -o json should parse");
-
+    fn profile_describe_parses_output_and_scope() {
+        for (format, expected) in [
+            ("table", OutputFormat::Table),
+            ("json", OutputFormat::Json),
+            ("yaml", OutputFormat::Yaml),
+        ] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "--workspace",
+                "team",
+                "profile",
+                "describe",
+                "openai",
+                "-o",
+                format,
+                "--global",
+            ])
+            .expect("profile describe");
+            assert_eq!(cli.workspace, "team");
+            assert!(matches!(cli.command, Some(Commands::Profile {
+                command: Some(ProfileCommands::Describe {id, output, global: true})
+            }) if id == "openai" && output == expected));
+        }
+        let cli = Cli::try_parse_from(["openshell", "profile", "describe", "openai"])
+            .expect("profile describe defaults");
         assert!(matches!(
             cli.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::ListProfiles {
-                    output: OutputFormat::Json,
+            Some(Commands::Profile {
+                command: Some(ProfileCommands::Describe {
+                    output: OutputFormat::Table,
                     global: false,
+                    ..
                 })
             })
         ));
+        assert!(Cli::try_parse_from(["openshell", "profile", "describe"]).is_err());
     }
 
     #[test]
-    fn provider_profile_commands_parse() {
-        let export = Cli::try_parse_from([
-            "openshell",
-            "provider",
-            "profile",
-            "export",
-            "custom-api",
-            "-o",
-            "yaml",
-        ])
-        .expect("provider profile export should parse");
-        assert!(matches!(
-            export.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
-                    id,
-                    output: OutputFormat::Yaml,
-                    ..
-                }))
-            }) if id == "custom-api"
-        ));
-
-        let import = Cli::try_parse_from([
-            "openshell",
-            "provider",
-            "profile",
-            "import",
-            "--from",
-            "./profiles",
-        ])
-        .expect("provider profile import should parse");
-        assert!(matches!(
-            import.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Import {
-                    from: Some(_),
-                    ..
-                }))
-            })
-        ));
-
+    fn profile_crud_subcommands_parse() {
+        let export = Cli::try_parse_from(["openshell", "profile", "export", "custom-api"])
+            .expect("profile export");
+        assert!(matches!(export.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Export {id, output: OutputFormat::Yaml, global: false})
+        }) if id == "custom-api"));
         let update = Cli::try_parse_from([
             "openshell",
-            "provider",
             "profile",
             "update",
             "custom-api",
             "-f",
-            "./profiles/custom-api.yaml",
+            "custom-api.yaml",
+            "--global",
         ])
-        .expect("provider profile update should parse");
-        assert!(matches!(
-            update.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
-                    id,
-                    file: _,
-                    ..
-                }))
-            }) if id == "custom-api"
-        ));
-
+        .expect("profile update");
+        assert!(matches!(update.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Update {id, file, global: true})
+        }) if id == "custom-api" && file == std::path::Path::new("custom-api.yaml")));
         let delete = Cli::try_parse_from([
             "openshell",
-            "provider",
             "profile",
             "delete",
             "custom-api",
             "custom-alt",
+            "--global",
         ])
-        .expect("provider profile delete should parse");
+        .expect("profile delete");
+        assert!(matches!(delete.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Delete {ids, global: true})
+        }) if ids == ["custom-api", "custom-alt"]));
+    }
+
+    #[test]
+    fn profile_import_and_lint_require_exactly_one_source() {
+        for verb in ["import", "lint"] {
+            for source in ["-f", "--from", "--url"] {
+                let cli = Cli::try_parse_from([
+                    "openshell",
+                    "profile",
+                    verb,
+                    source,
+                    "./profiles",
+                    "--global",
+                ])
+                .expect("profile source should parse");
+                let (file, from, url, global) = match cli.command {
+                    Some(Commands::Profile {
+                        command:
+                            Some(
+                                ProfileCommands::Import {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                }
+                                | ProfileCommands::Lint {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                },
+                            ),
+                    }) => (file, from, url, global),
+                    other => panic!("unexpected profile command: {other:?}"),
+                };
+                assert!(global);
+                assert_eq!(file.is_some(), source == "-f");
+                assert_eq!(from.is_some(), source == "--from");
+                assert_eq!(url.is_some(), source == "--url");
+            }
+            assert!(Cli::try_parse_from(["openshell", "profile", verb]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "openshell",
+                    "profile",
+                    verb,
+                    "-f",
+                    "file.yaml",
+                    "--from",
+                    "./profiles"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_help_exposes_all_commands_without_gateway() {
+        let cli = Cli::try_parse_from(["openshell", "profile"]).expect("profile help");
         assert!(matches!(
-            delete.command,
-            Some(Commands::Provider {
-                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
-                    ids,
-                    ..
-                }))
-            }) if ids == vec!["custom-api".to_string(), "custom-alt".to_string()]
+            cli.command,
+            Some(Commands::Profile { command: None })
         ));
+        let mut root = Cli::command();
+        assert!(root.render_help().to_string().contains("profile:"));
+        let profile = root
+            .find_subcommand_mut("profile")
+            .expect("profile command");
+        assert!(!profile.is_hide_set());
+        for verb in [
+            "list", "describe", "export", "import", "update", "lint", "delete",
+        ] {
+            assert!(profile.find_subcommand(verb).is_some(), "missing {verb}");
+        }
+    }
+
+    #[test]
+    fn profile_legacy_list_preserves_output_and_scope_flags() {
+        let default = Cli::try_parse_from(["openshell", "provider", "list-profiles"])
+            .expect("legacy profile list");
+        assert!(matches!(
+            default.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {
+                    output: OutputFormat::Table,
+                    global: false
+                })
+            })
+        ));
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "provider",
+                "list-profiles",
+                "--workspace",
+                "team",
+                "--global",
+                "-o",
+                format,
+            ])
+            .expect("legacy list with output and scope");
+            assert_eq!(cli.workspace, "team");
+            assert!(matches!(cli.command, Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {output, global: true})
+            }) if output == expected));
+        }
+    }
+
+    #[test]
+    fn profile_legacy_subcommands_match_top_level_arguments() {
+        for args in [
+            vec!["export", "openai"],
+            vec!["export", "openai", "-o", "json", "--global"],
+            vec!["import", "-f", "profile.yaml"],
+            vec!["import", "--from", "profiles", "--global"],
+            vec!["update", "custom-api", "--file", "profile.yaml", "--global"],
+            vec!["lint", "--file", "profile.yaml", "--global"],
+            vec!["lint", "--from", "profiles"],
+            vec!["delete", "first", "second", "--global"],
+        ] {
+            let top = Cli::try_parse_from(
+                ["openshell", "--workspace", "team", "profile"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .expect("top-level profile command");
+            let legacy = Cli::try_parse_from(
+                ["openshell", "--workspace", "team", "provider", "profile"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .expect("nested profile command");
+            assert_eq!(top.workspace, legacy.workspace);
+            match (top.command, legacy.command) {
+                (
+                    Some(Commands::Profile { command: Some(top) }),
+                    Some(Commands::Provider {
+                        command: Some(ProviderCommands::Profile(legacy)),
+                    }),
+                ) => assert_eq!(top, legacy),
+                other => panic!("unexpected command pair: {other:?}"),
+            }
+        }
+        for verb in ["import", "lint"] {
+            assert!(Cli::try_parse_from(["openshell", "provider", "profile", verb]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "openshell",
+                    "provider",
+                    "profile",
+                    verb,
+                    "-f",
+                    "profile.yaml",
+                    "--from",
+                    "profiles"
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -5706,6 +6137,51 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_restart_policy_defaults_to_never() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "never"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_accepts_on_failure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--restart-policy",
+            "on-failure",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "on-failure"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--restart-policy",
+                "unless-stopped",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn sandbox_create_detach_parses_with_main_command() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -5837,7 +6313,6 @@ mod tests {
     fn sandbox_create_output_conflicts_with_side_effect_args() {
         for (label, extra_args) in [
             ("--editor", &["--editor", "code"][..]),
-            ("trailing command", &["--", "claude"][..]),
             ("--no-keep", &["--no-keep"][..]),
             ("--forward", &["--forward", "8080"][..]),
         ] {
@@ -5850,6 +6325,22 @@ mod tests {
                 "structured output should conflict with {label}"
             );
         }
+    }
+
+    #[test]
+    fn sandbox_create_detached_command_accepts_structured_output() {
+        Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--detach",
+            "--output",
+            "json",
+            "--",
+            "codex",
+            "app-server",
+        ])
+        .expect("a detached command should support structured create output");
     }
 
     #[test]
@@ -6240,6 +6731,98 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_accepts_service_exposure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--detach",
+        ])
+        .expect("sandbox create --expose should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        expose,
+                        expose_authorization_mode,
+                        detach,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(expose, Some(4500));
+                assert_eq!(
+                    expose_authorization_mode,
+                    CliServiceAuthorizationMode::Strip
+                );
+                assert!(detach);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_rejects_service_exposure_with_no_keep() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--no-keep",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_rejects_zero_service_port() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--expose", "0"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_parses_bearer_passthrough_and_requires_expose() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--expose-authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("create-time authorization mode should parse with --expose");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        expose_authorization_mode,
+                        ..
+                    }),
+            }) => assert_eq!(
+                expose_authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--expose-authorization-mode",
+                "bearer-passthrough",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn service_expose_accepts_positional_target_port_and_service() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -6258,11 +6841,13 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        authorization_mode,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service.as_deref(), Some("api"));
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
             }
             other => panic!("expected service expose command, got: {other:?}"),
         }
@@ -6280,12 +6865,41 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        authorization_mode,
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");
                 assert_eq!(target_port, 8080);
                 assert_eq!(service, None);
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
             }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_parses_bearer_passthrough() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "expose",
+            "my-sandbox",
+            "4500",
+            "--authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("service authorization mode should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        authorization_mode, ..
+                    }),
+            }) => assert_eq!(
+                authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
             other => panic!("expected service expose command, got: {other:?}"),
         }
     }
@@ -6302,6 +6916,7 @@ mod tests {
                         sandbox,
                         target_port,
                         service,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, "my-sandbox");

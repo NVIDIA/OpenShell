@@ -15,6 +15,7 @@ name = "openshell-gateway"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-server = { path = "../openshell-server", default-features = false }
 openshell-otel = { path = "../openshell-otel", optional = true }

@@ -414,7 +414,10 @@ unsafe impl Send for OpenedTrace {}
 /// thread. The driver seeds `index` (pid → sandbox_id) as it launches sandboxes.
 ///
 /// Returns an [`EtwSession`] that must be kept alive; dropping it stops capture.
-pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSession, String> {
+pub(crate) fn start_session(
+    index: Arc<Mutex<AttributionIndex>>,
+    gateway_name: String,
+) -> Result<EtwSession, String> {
     let session_name = new_session_name();
 
     let handle = start_trace_session(&session_name)?;
@@ -423,6 +426,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     let health = Arc::new(CaptureHealth::default());
     let consumer_health = health.clone();
     let (tx, rx) = mpsc::sync_channel::<RawEtwEvent>(EVENT_QUEUE_CAPACITY);
+    let processor = EtwEventProcessor::new(index, gateway_name);
 
     let consumer_thread = std::thread::Builder::new()
         .name("etw-ocsf-consumer".into())
@@ -440,7 +444,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                     Ok(mut raw) => {
                         release_queue_bytes(&consumer_health, raw.queued_bytes);
                         if let Some(ev) = decode_raw(&mut raw) {
-                            process_event(&index, ev);
+                            processor.process_event(ev);
                         } else {
                             tracing::debug!(
                                 target: "mxc_etw",
@@ -450,11 +454,11 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                                 "TDH decode failed for event"
                             );
                         }
-                        drain_and_emit(&index);
+                        processor.drain_and_emit();
                         overload_reporter.report_if_due(&consumer_health, false);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        drain_and_emit(&index);
+                        processor.drain_and_emit();
                         overload_reporter.report_if_due(&consumer_health, false);
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -464,7 +468,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                 }
             }
             // Final drain on shutdown so anything still resolvable is emitted.
-            drain_and_emit(&index);
+            processor.drain_and_emit();
         })
         .map_err(|e| {
             stop_session(handle, &session_name);
@@ -1525,130 +1529,163 @@ impl AttributionIndex {
     }
 }
 
-/// Consumer-thread entry point: attribute one decoded event and, for the mapped
-/// classes, emit an OCSF row into the gateway trail. Unmapped/unresolved events
-/// are debug-logged (checkpoint-2 behaviour) so nothing is silently dropped.
-fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
-    // Activity STOP is the empty twin of START — never a distinct OCSF row.
-    if ev.opcode == OPCODE_STOP {
-        return;
-    }
+/// Consumer-thread state for attributing ETW events and emitting gateway OCSF.
+/// The gateway identity is stable for the processor lifetime, while each event
+/// is associated with a potentially different sandbox through `index`.
+struct EtwEventProcessor {
+    index: Arc<Mutex<AttributionIndex>>,
+    gateway_name: String,
+}
 
-    let resolved = {
-        let mut idx = index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sid) = idx.resolve(&ev) {
-            let name = idx.name_of(&sid);
-            Some((sid, name, ev))
-        } else {
-            // Not attributable yet: ETW delivers the create/config burst the
-            // instant `wxc-exec` starts, which can beat the driver's
-            // `register_launch`. Hold the event for replay instead of dropping
-            // it (see `drain_and_emit`).
-            idx.buffer_unresolved(ev);
-            None
+impl EtwEventProcessor {
+    fn new(index: Arc<Mutex<AttributionIndex>>, gateway_name: String) -> Self {
+        Self {
+            index,
+            gateway_name,
         }
-    };
-
-    if let Some((sandbox_id, sandbox_name, ev)) = resolved {
-        emit_resolved(index, &sandbox_id, &sandbox_name, &ev);
     }
-}
 
-/// Re-resolve and emit any buffered events that have since become attributable.
-/// Called by the consumer thread after each incoming event and on a periodic
-/// tick, so a create/config burst that raced `register_launch` still lands in
-/// the trail (and aged-out unresolvable events are dropped, bounded).
-fn drain_and_emit(index: &Mutex<AttributionIndex>) {
-    let ready = {
-        let mut idx = index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        idx.drain_resolved()
-    };
-    for (sandbox_id, sandbox_name, ev) in ready {
-        emit_resolved(index, &sandbox_id, &sandbox_name, &ev);
-    }
-}
+    /// Attribute one decoded event and emit an OCSF row for mapped classes.
+    /// Unresolved events are buffered for replay; attributed but unmapped events
+    /// are debug-logged by [`Self::emit_resolved`].
+    fn process_event(&self, ev: DecodedEtwEvent) {
+        // Activity STOP is the empty twin of START — never a distinct OCSF row.
+        if ev.opcode == OPCODE_STOP {
+            return;
+        }
 
-/// Map one attributed event to its OCSF class and emit it into the gateway trail.
-fn emit_resolved(
-    index: &Mutex<AttributionIndex>,
-    sandbox_id: &str,
-    sandbox_name: &str,
-    ev: &DecodedEtwEvent,
-) {
-    // STOP twins are already filtered before buffering, so activity events
-    // reaching here are STARTs.
-    match ev.event_name.as_deref().unwrap_or("") {
-        // Lifecycle [6002]: MXC emits two create events per sandbox —
-        // `SandboxEngineCreate` and `SandboxCreateWithPolicyEnforcement` — and
-        // ETW drops them interchangeably under buffer pressure (observed: one run
-        // keeps the former, the next keeps the latter). Anchor on whichever
-        // arrives first and dedupe so the row is emitted exactly once.
-        "SandboxEngineCreate" | "SandboxCreateWithPolicyEnforcement"
-            if ev.opcode == OPCODE_START =>
-        {
-            let first = index
+        let resolved = {
+            let mut idx = self
+                .index
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take_lifecycle_once(sandbox_id);
-            if first {
-                let ctx = etw_ctx(sandbox_id, sandbox_name);
-                emit_ocsf(sandbox_id, map_lifecycle_create(&ctx, sandbox_name));
-            }
-        }
-        // Process [1007]: `CreateProcessInSandbox` carries the real agent command
-        // line + working directory. The activity fires once empty (probe) and
-        // once with the command. Emit only the populated event, and map the
-        // command to a safe executable identity rather than durable arguments.
-        "CreateProcessInSandbox" if ev.opcode == OPCODE_START => {
-            if let Some(cmd) = ev.get_unquoted("commandLine") {
-                let ctx = etw_ctx(sandbox_id, sandbox_name);
-                emit_ocsf(sandbox_id, map_process_launch(&ctx, ev, &cmd));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(sid) = idx.resolve(&ev) {
+                let name = idx.name_of(&sid);
+                Some((sid, name, ev))
             } else {
+                // Not attributable yet: ETW delivers the create/config burst the
+                // instant `wxc-exec` starts, which can beat the driver's
+                // `register_launch`. Hold the event for replay instead of dropping
+                // it (see `drain_and_emit`).
+                idx.buffer_unresolved(ev);
+                None
+            }
+        };
+
+        if let Some((sandbox_id, sandbox_name, ev)) = resolved {
+            self.emit_resolved(&sandbox_id, &sandbox_name, &ev);
+        }
+    }
+
+    /// Re-resolve and emit any buffered events that have since become attributable.
+    /// Called by the consumer thread after each incoming event and on a periodic
+    /// tick, so a create/config burst that raced `register_launch` still lands in
+    /// the trail (and aged-out unresolvable events are dropped, bounded).
+    fn drain_and_emit(&self) {
+        let ready = {
+            let mut idx = self
+                .index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            idx.drain_resolved()
+        };
+        for (sandbox_id, sandbox_name, ev) in ready {
+            self.emit_resolved(&sandbox_id, &sandbox_name, &ev);
+        }
+    }
+
+    /// Map one attributed event to its OCSF class and emit it into the gateway trail.
+    fn emit_resolved(&self, sandbox_id: &str, sandbox_name: &str, ev: &DecodedEtwEvent) {
+        // STOP twins are already filtered before buffering, so activity events
+        // reaching here are STARTs.
+        match ev.event_name.as_deref().unwrap_or("") {
+            // Lifecycle [6002]: MXC emits two create events per sandbox —
+            // `SandboxEngineCreate` and `SandboxCreateWithPolicyEnforcement` — and
+            // ETW drops them interchangeably under buffer pressure (observed: one run
+            // keeps the former, the next keeps the latter). Anchor on whichever
+            // arrives first and dedupe so the row is emitted exactly once.
+            "SandboxEngineCreate" | "SandboxCreateWithPolicyEnforcement"
+                if ev.opcode == OPCODE_START =>
+            {
+                let first = self
+                    .index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take_lifecycle_once(sandbox_id);
+                if first {
+                    let ctx = self.event_context(sandbox_id, sandbox_name);
+                    emit_ocsf(sandbox_id, map_lifecycle_create(&ctx, sandbox_name));
+                }
+            }
+            // Process [1007]: `CreateProcessInSandbox` carries the real agent command
+            // line + working directory. The activity fires once empty (probe) and
+            // once with the command. Emit only the populated event, and map the
+            // command to a safe executable identity rather than durable arguments.
+            "CreateProcessInSandbox" if ev.opcode == OPCODE_START => {
+                if let Some(cmd) = ev.get_unquoted("commandLine") {
+                    let ctx = self.event_context(sandbox_id, sandbox_name);
+                    emit_ocsf(sandbox_id, map_process_launch(&ctx, ev, &cmd));
+                } else {
+                    tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
+                }
+            }
+            // Process [1007]: `ProcessLaunched` is the confirmation twin of
+            // `CreateProcessInSandbox` — it carries the *actual* `processId`/`threadId`
+            // of the started in-sandbox process (the create event only has the request +
+            // command line). We emit it as a distinct PROC row so the trail records both
+            // the launch request (with executable identity) and confirmed start (with pid).
+            "ProcessLaunched" => {
+                let ctx = self.event_context(sandbox_id, sandbox_name);
+                emit_ocsf(sandbox_id, map_process_started(&ctx, ev));
+            }
+            // Config [5019]: several distinct config/hardening/setup state changes. Each
+            // is a genuine audit-worthy config event; `SandboxConfig` is the richest but
+            // drops intermittently, so the reliably-captured hardening events
+            // (`Win32kLockdownApplied`, `ApplyUILimits`, `EnforceOsPolicy`) guarantee
+            // coverage. `SandboxProxyConfigured` (network/proxy setup — the one
+            // network-plane event the provider emits) and `SandboxConsoleReferencePlumbed`
+            // (console-handle plumbing) are additional per-sandbox setup state changes.
+            "SandboxConfig"
+            | "Win32kLockdownApplied"
+            | "ApplyUILimits"
+            | "EnforceOsPolicy"
+            | "SandboxProxyConfigured"
+            | "SandboxConsoleReferencePlumbed" => {
+                // Dump the raw decoded field set for config-family events at debug so we
+                // can confirm the exact property names MXC emits (e.g. which key carries
+                // the proxy port on `SandboxProxyConfigured`). Guarded by `debug=true`.
+                tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
+                let ctx = self.event_context(sandbox_id, sandbox_name);
+                emit_ocsf(sandbox_id, map_config_state(&ctx, ev));
+            }
+            // Finding [2004]: MXC surfaces WIL error/fallback activities during
+            // sandbox setup. Captured as informational (non-alert) findings so the
+            // audit trail records setup anomalies without crying wolf.
+            "ActivityError" | "FallbackError" => {
+                let ctx = self.event_context(sandbox_id, sandbox_name);
+                emit_ocsf(sandbox_id, map_finding(&ctx, ev));
+            }
+            _ => {
                 tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
             }
         }
-        // Process [1007]: `ProcessLaunched` is the confirmation twin of
-        // `CreateProcessInSandbox` — it carries the *actual* `processId`/`threadId`
-        // of the started in-sandbox process (the create event only has the request +
-        // command line). We emit it as a distinct PROC row so the trail records both
-        // the launch request (with executable identity) and confirmed start (with pid).
-        "ProcessLaunched" => {
-            let ctx = etw_ctx(sandbox_id, sandbox_name);
-            emit_ocsf(sandbox_id, map_process_started(&ctx, ev));
-        }
-        // Config [5019]: several distinct config/hardening/setup state changes. Each
-        // is a genuine audit-worthy config event; `SandboxConfig` is the richest but
-        // drops intermittently, so the reliably-captured hardening events
-        // (`Win32kLockdownApplied`, `ApplyUILimits`, `EnforceOsPolicy`) guarantee
-        // coverage. `SandboxProxyConfigured` (network/proxy setup — the one
-        // network-plane event the provider emits) and `SandboxConsoleReferencePlumbed`
-        // (console-handle plumbing) are additional per-sandbox setup state changes.
-        "SandboxConfig"
-        | "Win32kLockdownApplied"
-        | "ApplyUILimits"
-        | "EnforceOsPolicy"
-        | "SandboxProxyConfigured"
-        | "SandboxConsoleReferencePlumbed" => {
-            // Dump the raw decoded field set for config-family events at debug so we
-            // can confirm the exact property names MXC emits (e.g. which key carries
-            // the proxy port on `SandboxProxyConfigured`). Guarded by `debug=true`.
-            tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
-            let ctx = etw_ctx(sandbox_id, sandbox_name);
-            emit_ocsf(sandbox_id, map_config_state(&ctx, ev));
-        }
-        // Finding [2004]: MXC surfaces WIL error/fallback activities during
-        // sandbox setup. Captured as informational (non-alert) findings so the
-        // audit trail records setup anomalies without crying wolf.
-        "ActivityError" | "FallbackError" => {
-            let ctx = etw_ctx(sandbox_id, sandbox_name);
-            emit_ocsf(sandbox_id, map_finding(&ctx, ev));
-        }
-        _ => {
-            tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
+    }
+
+    /// Build a per-event OCSF context rather than using the process-wide `ctx()`
+    /// singleton: one gateway process hosts many sandboxes. The gateway identity
+    /// comes from this processor, while the affected sandbox varies per event.
+    fn event_context(&self, sandbox_id: &str, sandbox_name: &str) -> EventContext {
+        EventContext {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_name: sandbox_name.to_string(),
+            container_image: "mxc/appcontainer".to_string(),
+            origin: openshell_ocsf::EventOrigin::Gateway {
+                name: self.gateway_name.clone(),
+            },
+            hostname: gateway_hostname().to_string(),
+            product_version: env!("CARGO_PKG_VERSION").to_string(),
+            proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            proxy_port: 0,
         }
     }
 }
@@ -1878,20 +1915,6 @@ fn gateway_hostname() -> &'static str {
     })
 }
 
-/// Build a per-event OCSF context (not the process-wide `ctx()` singleton, since
-/// one gateway process hosts many sandboxes — wrinkle #1).
-fn etw_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
-    EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "mxc/appcontainer".to_string(),
-        hostname: gateway_hostname().to_string(),
-        product_version: env!("CARGO_PKG_VERSION").to_string(),
-        proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1945,6 +1968,13 @@ fn wide_str_at(buf: &[u8], offset: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_processor(gateway_name: &str) -> EtwEventProcessor {
+        EtwEventProcessor::new(
+            Arc::new(Mutex::new(AttributionIndex::new())),
+            gateway_name.to_string(),
+        )
+    }
 
     fn empty_raw_event(queued_bytes: usize) -> RawEtwEvent {
         RawEtwEvent {
@@ -2066,9 +2096,25 @@ mod tests {
     }
 
     #[test]
+    fn mxc_events_identify_the_gateway_and_affected_sandbox_separately() {
+        let processor = event_processor("production");
+        let ctx = processor.event_context("sbx-123", "agent-01");
+        let event = map_lifecycle_create(&ctx, "agent-01");
+        let json = event.to_json().expect("lifecycle event should serialize");
+
+        assert_eq!(json["metadata"]["product"]["name"], "OpenShell Gateway");
+        assert_eq!(json["device"]["name"], "production");
+        assert_eq!(json["device"]["uid"], "production");
+        assert_eq!(json["device"]["type"], "Server");
+        assert_eq!(json["container"]["name"], "agent-01");
+        assert_eq!(json["container"]["uid"], "sbx-123");
+    }
+
+    #[test]
     fn process_launch_omits_command_arguments_from_audit_output() {
         const SECRET: &str = "secret-value";
-        let ctx = etw_ctx("sbx-secret-test", "secret-test");
+        let processor = event_processor("production");
+        let ctx = processor.event_context("sbx-secret-test", "secret-test");
         let mut ev = mk_event(4242, "CreateProcessInSandbox");
         ev.props
             .push(("currentDirectory".into(), r#""C:\work\openshell""#.into()));
