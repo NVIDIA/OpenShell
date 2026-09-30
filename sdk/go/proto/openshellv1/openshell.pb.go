@@ -7467,8 +7467,13 @@ type WatchSandboxRequest struct {
 	// Stream platform events correlated to this sandbox.
 	FollowEvents bool `protobuf:"varint,4,opt,name=follow_events,json=followEvents,proto3" json:"follow_events,omitempty"`
 	// Replay the last N log lines (best-effort) before following.
+	//
+	// When following both sources, the replay can return fewer lines: events
+	// older than one the other source's replay left out are withheld and
+	// reported with a warning, even if both depths are equal.
 	LogTailLines uint32 `protobuf:"varint,5,opt,name=log_tail_lines,json=logTailLines,proto3" json:"log_tail_lines,omitempty"`
 	// Replay the last N platform events (best-effort) before following.
+	// Defaults to 0. Can return fewer events; see log_tail_lines.
 	EventTail uint32 `protobuf:"varint,6,opt,name=event_tail,json=eventTail,proto3" json:"event_tail,omitempty"`
 	// Stop streaming once the sandbox reaches READY or a terminal result phase
 	// (COMPLETED, STOPPED, or ERROR).
@@ -7497,6 +7502,8 @@ type WatchSandboxRequest struct {
 	// empty resume_after_cursor, because retrying the same token fails
 	// identically. A cursor this server could not have issued is rejected with
 	// INVALID_ARGUMENT.
+	//
+	// One cursor covers both log and platform events.
 	ResumeAfterCursor string `protobuf:"bytes,12,opt,name=resume_after_cursor,json=resumeAfterCursor,proto3" json:"resume_after_cursor,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache

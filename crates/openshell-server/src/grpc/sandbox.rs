@@ -2025,13 +2025,15 @@ pub(super) async fn handle_watch_sandbox(
                 // sources: every event from either source past that point is
                 // in the batch, and everything at or below it is outside the
                 // window, the same as ordinary tail truncation. A source never
-                // withholds its own window this way; only a sibling's deeper
-                // window can be cut back to the shallower source's floor.
+                // withholds its own window this way; only a sibling's floor
+                // can cut a source's window back.
                 //
-                // That can mean fewer events than the deeper source's depth
-                // asked for when a followed sibling has newer unreplayed
-                // backlog (e.g. `event_tail` unset, its default, with a
-                // platform event newer than some of the requested logs).
+                // That can mean fewer events than a source's depth asked for
+                // whenever a followed sibling left out an event newer than
+                // part of its window. This depends on where the histories
+                // fall in the cursor order, not on the depths being unequal:
+                // logs at 1-2 and platform at 3-4 with both depths at 1
+                // leaves out platform 3, so log 2 is withheld.
                 // That's the trade-off of a single shared scalar cursor: an
                 // event handed out below the sibling's floor would let a
                 // resume skip the sibling's withheld events past it.
@@ -4872,8 +4874,8 @@ mod tests {
         );
     }
 
-    /// Symmetric depths (or a source that's fully covered) impose no floor:
-    /// this is the common case and must behave exactly as before A2.
+    /// Windows that leave nothing out impose no floor: every buffered event
+    /// is delivered, as before A2.
     #[tokio::test]
     async fn initial_tail_unclamped_when_no_source_has_unreplayed_backlog() {
         use tokio_stream::StreamExt as _;
@@ -4910,6 +4912,122 @@ mod tests {
             got.push(seq_of(&stream.next().await.unwrap().unwrap()));
         }
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    /// Open an initial watch following both sources with the given depths and
+    /// collect what the initial batch delivers: the coverage-gap warning
+    /// message, if any, and the delivered cursors in order.
+    async fn initial_tail_following_both(
+        state: &Arc<ServerState>,
+        sandbox: &Sandbox,
+        log_tail_lines: u32,
+        event_tail: u32,
+    ) -> (Option<String>, Vec<u64>) {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        use tokio_stream::StreamExt as _;
+
+        let response = handle_watch_sandbox(
+            state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                log_tail_lines,
+                event_tail,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let mut warning = None;
+        let mut delivered = Vec::new();
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await
+        {
+            let event = item.unwrap();
+            match event.payload {
+                Some(Payload::Warning(w)) => {
+                    assert!(delivered.is_empty(), "warning must precede the batch");
+                    assert!(warning.replace(w.message).is_none(), "one warning at most");
+                }
+                _ => delivered.push(seq_of(&event)),
+            }
+        }
+        (warning, delivered)
+    }
+
+    /// Equal depths do not rule out trimming. Logs sit at cursors 1-2 and
+    /// platform events at 3-4; with both depths at 1 the platform window
+    /// leaves out 3, which is newer than log 2, so log 2 is withheld even
+    /// though `log_tail_lines` alone would have delivered it.
+    #[tokio::test]
+    async fn initial_tail_equal_depths_withhold_an_older_log_window() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("equallogsfirst", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 2); // cursors 1, 2
+        seed_platform_event(&state, &id, "e3"); // cursor 3, left out by event_tail
+        seed_platform_event(&state, &id, "e4"); // cursor 4
+
+        let (warning, delivered) = initial_tail_following_both(&state, &sandbox, 1, 1).await;
+        let warning = warning.expect("withheld log 2 must be disclosed");
+        assert!(
+            warning.contains("withheld 1 log line(s) and 0 platform event(s)"),
+            "message: {warning}"
+        );
+        assert_eq!(delivered, vec![4]);
+    }
+
+    /// The mirror case: platform events at cursors 1-2 and logs at 3-4. The
+    /// log window leaves out 3, which is newer than platform 2, so this time
+    /// the platform event is withheld.
+    #[tokio::test]
+    async fn initial_tail_equal_depths_withhold_an_older_platform_window() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("equalplatformfirst", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_platform_event(&state, &id, "e1"); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        seed_log_lines(&state, &id, 2); // cursors 3, 4; 3 left out by log_tail_lines
+
+        let (warning, delivered) = initial_tail_following_both(&state, &sandbox, 1, 1).await;
+        let warning = warning.expect("withheld platform event 2 must be disclosed");
+        assert!(
+            warning.contains("withheld 0 log line(s) and 1 platform event(s)"),
+            "message: {warning}"
+        );
+        assert_eq!(delivered, vec![4]);
+    }
+
+    /// Equal depths over interleaved histories withhold nothing when neither
+    /// window leaves out an event newer than part of the other: logs at 1 and
+    /// 3, platform at 2 and 4, both depths 1. Each window's excluded event is
+    /// older than everything delivered, so both 3 and 4 arrive, no warning.
+    #[tokio::test]
+    async fn initial_tail_equal_depths_over_interleaved_histories_withhold_nothing() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("equalinterleaved", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 1); // cursor 1, left out by log_tail_lines
+        seed_platform_event(&state, &id, "e2"); // cursor 2, left out by event_tail
+        seed_log_lines(&state, &id, 1); // cursor 3
+        seed_platform_event(&state, &id, "e4"); // cursor 4
+
+        let (warning, delivered) = initial_tail_following_both(&state, &sandbox, 1, 1).await;
+        assert_eq!(warning, None);
+        assert_eq!(delivered, vec![3, 4]);
     }
 
     #[tokio::test]

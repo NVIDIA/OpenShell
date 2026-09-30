@@ -549,9 +549,11 @@ or `event_tail`), and anything a shallower source withheld below that cursor is
 excluded forever with no gap reported, since it was never evicted, just never
 sent.
 
-`log_tail_lines` and `event_tail` bound the two tails independently, so their
-depths are routinely asymmetric — `event_tail` has no default, so `follow_events`
-without setting it replays no platform backlog at all. On connect, the server
+`log_tail_lines` and `event_tail` bound the two tails independently, and the two
+sources interleave in the shared cursor order, so one source's window can leave
+out an event that is newer than part of the other's — `event_tail` has no
+default, so `follow_events` without setting it replays no platform backlog at
+all. On connect, the server
 computes each followed source's **coverage floor** — the *newest* event that
 source's own window excluded — and withholds every event, from either source,
 at or below the highest floor. A source's excluded set is a prefix of its own
@@ -561,23 +563,23 @@ Events at or below it are outside the window, the same as ordinary tail
 truncation. A source never withholds its own window this way, so a
 single-source watch is unaffected.
 
-With asymmetric depths this can deliver fewer events than the deeper source
-asked for — whenever the shallower sibling left out an event newer than part of
-the deeper window. That is a deliberate trade-off: a shorter initial batch is
-preferable to a resume that silently and permanently drops events.
+This can deliver fewer events than a source's depth asked for whenever the other
+followed source left out an event newer than part of its window. That depends on
+where the two histories fall in the cursor order, not on whether the depths are
+equal: with logs at cursors 1–2, platform events at 3–4, and both depths set to
+1, platform leaves out 3, so log 2 is withheld. That is a deliberate trade-off:
+a shorter initial batch is preferable to a resume that silently and permanently
+drops events.
 
-Withholding alone would just move the silent loss from resume time to a live
-event delivered moments later: nothing raises `log_cutoff`/`platform_cutoff`
-past what this batch actually sent, so the very next live event past the floor
-would still be delivered and would still let the client's cursor outrun the
-withheld backlog. Refusing that delivery too doesn't help either — the withheld
-events were published before subscribe and will never arrive live to fill the
-gap in, so gating every later event on them would starve the stream
-indefinitely instead of surfacing one bounded gap. The producer instead emits a
-coverage-gap warning ahead of the batch, naming how many events were withheld
-per source, and then proceeds with ordinary cutoffs. The gap is disclosed once,
-up front, rather than silently, which is the bar the whole loss-awareness design
-holds to — not that nothing is ever lost.
+Withheld events sit at or below the snapshot's high-water mark, so the live
+cutoffs keep any live copy of them from arriving after a higher cursor, while
+live events above the mark are delivered normally. Holding back later events
+until the withheld ones arrive would not help: they were published before the
+snapshot and never arrive live, so the stream would stall. The producer instead
+emits a coverage-gap warning ahead of the batch, naming how many events were
+withheld per source. The gap is disclosed once, up front, rather than silently,
+which is the bar the whole loss-awareness design holds to — not that nothing is
+ever lost.
 
 ## Persistence
 
