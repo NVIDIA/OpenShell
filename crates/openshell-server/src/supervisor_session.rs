@@ -2072,10 +2072,18 @@ pub async fn handle_finalize_main_process_exit(
         .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
         .await
         .map_err(Status::failed_precondition)?;
-    if !state
+    let session_finalized = state
         .supervisor_sessions
-        .finalize_main_process_exit(&report.sandbox_id)
-    {
+        .finalize_main_process_exit(&report.sandbox_id);
+    // The session can close between durable result validation and this mark.
+    // Schedule cleanup in either case so a disconnect with an unfinalized
+    // in-memory session cannot strand the ephemeral sandbox.
+    state
+        .compute
+        .cleanup_finalized_ephemeral_sandbox(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::internal)?;
+    if !session_finalized {
         return Err(Status::failed_precondition(
             "supervisor session is not connected",
         ));

@@ -411,6 +411,7 @@ run_e2e_test() {
 if [ -n "${E2E_TEST_OVERRIDE}" ]; then
   run_e2e_test "${E2E_TEST_OVERRIDE}"
 else
+  run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start

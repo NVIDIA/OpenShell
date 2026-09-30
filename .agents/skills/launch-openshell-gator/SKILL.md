@@ -158,7 +158,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the supervisor exits. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match the gateway driver.
 
 The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 
