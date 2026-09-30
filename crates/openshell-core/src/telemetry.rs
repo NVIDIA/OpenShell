@@ -193,60 +193,6 @@ impl Default for TelemetryComputeDriver {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderProfile {
-    Anthropic,
-    Claude,
-    Codex,
-    Copilot,
-    Deepinfra,
-    Github,
-    Gitlab,
-    Nvidia,
-    Openai,
-    Opencode,
-    Outlook,
-    Custom,
-}
-
-impl ProviderProfile {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Copilot => "copilot",
-            Self::Deepinfra => "deepinfra",
-            Self::Github => "github",
-            Self::Gitlab => "gitlab",
-            Self::Nvidia => "nvidia",
-            Self::Openai => "openai",
-            Self::Opencode => "opencode",
-            Self::Outlook => "outlook",
-            Self::Custom => "custom",
-        }
-    }
-
-    #[must_use]
-    pub fn from_raw(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "anthropic" => Self::Anthropic,
-            "claude" | "claude-code" => Self::Claude,
-            "codex" => Self::Codex,
-            "copilot" => Self::Copilot,
-            "deepinfra" => Self::Deepinfra,
-            "github" | "gh" => Self::Github,
-            "gitlab" | "glab" => Self::Gitlab,
-            "nvidia" => Self::Nvidia,
-            "openai" => Self::Openai,
-            "opencode" => Self::Opencode,
-            "outlook" => Self::Outlook,
-            _ => Self::Custom,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DenyGroup {
     Bypass,
@@ -487,20 +433,22 @@ pub fn emit_lifecycle(
     );
 }
 
-pub fn emit_provider_lifecycle(
-    operation: LifecycleOperation,
-    outcome: TelemetryOutcome,
-    provider_profile: ProviderProfile,
-) {
+pub fn emit_provider_lifecycle(operation: LifecycleOperation, outcome: TelemetryOutcome) {
     emit_event(
         "openshell_provider_lifecycle_event",
-        json!({
-            "nvidiaSource": SOURCE.as_str(),
-            "operation": operation.as_str(),
-            "outcome": outcome.as_str(),
-            "providerProfile": provider_profile.as_str(),
-        }),
+        provider_lifecycle_parameters(operation, outcome),
     );
+}
+
+fn provider_lifecycle_parameters(
+    operation: LifecycleOperation,
+    outcome: TelemetryOutcome,
+) -> Value {
+    json!({
+        "nvidiaSource": SOURCE.as_str(),
+        "operation": operation.as_str(),
+        "outcome": outcome.as_str(),
+    })
 }
 
 pub fn emit_sandbox_create(
@@ -705,12 +653,20 @@ mod tests {
     #[test]
     fn telemetry_validation_maps_privacy_sensitive_strings_to_safe_buckets() {
         assert_eq!(
-            ProviderProfile::from_raw("corp-llm-prod"),
-            ProviderProfile::Custom
-        );
-        assert_eq!(
             DenyGroup::from_raw("host=private.example"),
             DenyGroup::Unknown
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_parameters_exclude_profile_identity() {
+        assert_eq!(
+            provider_lifecycle_parameters(LifecycleOperation::Create, TelemetryOutcome::Success),
+            json!({
+                "nvidiaSource": "openshell",
+                "operation": "create",
+                "outcome": "success",
+            })
         );
     }
 
@@ -757,11 +713,7 @@ mod disabled_tests {
             LifecycleOperation::Create,
             TelemetryOutcome::Success,
         );
-        emit_provider_lifecycle(
-            LifecycleOperation::Create,
-            TelemetryOutcome::Success,
-            ProviderProfile::Custom,
-        );
+        emit_provider_lifecycle(LifecycleOperation::Create, TelemetryOutcome::Success);
         emit_sandbox_create(
             TelemetryOutcome::Success,
             false,
