@@ -16,6 +16,7 @@ pub mod extension_mint_limit;
 pub mod guard;
 mod http;
 pub mod identity;
+pub(crate) mod launch_signing;
 pub mod method_authz;
 pub mod oidc;
 pub mod peer;

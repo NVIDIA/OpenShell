@@ -1032,6 +1032,29 @@ impl ComputeRuntime {
         .await
     }
 
+    /// Check the selected driver's launch contract without contacting the driver.
+    pub(crate) fn validate_launch_signer_configured(&self, configured: bool) -> Result<(), Status> {
+        // AuthenticateSandbox handles driver-native bootstrap credentials. It
+        // does not declare whether launches require a gateway signing bundle.
+        let required = self
+            .driver_info
+            .negotiated_extension
+            .required_capabilities
+            .iter()
+            .any(|capability| {
+                capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
+            });
+        if required && !configured {
+            return Err(Status::failed_precondition(
+                "the selected compute driver requires sandbox launch signing; configure \
+                 [openshell.gateway.gateway_jwt] or provide jwt/signing.pem, jwt/public.pem, \
+                 and jwt/kid under OPENSHELL_LOCAL_TLS_DIR (default: the OpenShell state \
+                 directory's tls/). Listener TLS does not configure sandbox launch signing",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn create_sandbox_authenticated(
         &self,
         sandbox: Sandbox,
@@ -1066,6 +1089,13 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         global_guard: SandboxSyncGuard,
     ) -> Result<Sandbox, Status> {
+        // Defend the internal create path too, before consuming a staged archive
+        // or persisting the sandbox. The gRPC handler checks before driver validation.
+        self.validate_launch_signer_configured(
+            launch_authentication
+                .as_ref()
+                .is_some_and(|auth| !auth.is_empty()),
+        )?;
         self.validate_caller_driver_config(
             sandbox
                 .spec
@@ -7561,6 +7591,8 @@ mod tests {
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
         omit_protocol_metadata: bool,
+        requires_launch_authentication: bool,
+        create_calls: AtomicUsize,
     }
 
     #[tonic::async_trait]
@@ -7597,12 +7629,19 @@ mod tests {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 extension: (!self.omit_protocol_metadata).then(|| {
-                    openshell_core::extension_protocol::extension_metadata(
+                    let mut metadata = openshell_core::extension_protocol::extension_metadata(
                         ExtensionFamily::Compute,
                         "openshell/test-driver",
                         "test",
                         [],
-                    )
+                    );
+                    if self.requires_launch_authentication {
+                        metadata.required_capabilities.push(
+                            openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
+                                .to_string(),
+                        );
+                    }
+                    metadata
                 }),
             }))
         }
@@ -7662,6 +7701,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
             Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
@@ -15422,6 +15462,94 @@ mod tests {
             driver.calls(),
             vec![FakeComputeDriverCall::GetCapabilities; 3]
         );
+    }
+
+    #[tokio::test]
+    async fn negotiated_launch_requirement_rejects_create_before_driver_or_store() {
+        let driver = Arc::new(TestDriver {
+            requires_launch_authentication: true,
+            ..Default::default()
+        });
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::from_driver(
+            "external-requires-launch".to_string(),
+            driver.clone(),
+            None,
+            store.clone(),
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        for authentication in [None, Some(Vec::new())] {
+            let sandbox = sandbox_record(
+                "sb-missing-signer",
+                "missing-signer",
+                SandboxPhase::Provisioning,
+            );
+            let error = runtime
+                .create_sandbox_authenticated(sandbox, None, authentication, false)
+                .await
+                .expect_err("the negotiated launch requirement must be checked before create");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains("[openshell.gateway.gateway_jwt]"));
+            assert!(error.message().contains("OPENSHELL_LOCAL_TLS_DIR"));
+            assert!(error.message().contains("Listener TLS"));
+            assert!(
+                store
+                    .get_message::<Sandbox>("sb-missing-signer")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(driver.create_calls.load(Ordering::SeqCst), 0);
+        }
+
+        let sandbox = sandbox_record("sb-with-signer", "with-signer", SandboxPhase::Provisioning);
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let authentication = test_session_authority()
+            .mint_persisted_launch("sb-with-signer", &identity)
+            .unwrap();
+        runtime
+            .create_sandbox_authenticated(
+                sandbox,
+                None,
+                Some(serde_json::to_vec(&authentication).unwrap()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_driver_without_launch_requirement_can_create_without_signer() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = ComputeRuntime::from_driver(
+            "external-other-auth".to_string(),
+            driver.clone(),
+            None,
+            Arc::new(Store::connect("sqlite::memory:").await.unwrap()),
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        runtime.validate_launch_signer_configured(false).unwrap();
+        runtime
+            .create_sandbox(
+                sandbox_record("sb-other-auth", "other-auth", SandboxPhase::Provisioning),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(driver.create_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
