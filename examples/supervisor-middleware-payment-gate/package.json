@@ -1,0 +1,23 @@
+{
+  "name": "openshell-example-payment-gate",
+  "private": true,
+  "version": "0.1.0",
+  "description": "OpenShell supervisor middleware example: a deterministic payment gate for agents that move money through Stripe.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.4",
+    "@grpc/proto-loader": "^0.7.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": { "node": ">=20" },
+  "license": "Apache-2.0"
+}

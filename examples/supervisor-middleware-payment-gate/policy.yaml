@@ -1,0 +1,71 @@
+# Axiru payment gate for NVIDIA OpenShell
+# Reference sandbox policy for agents that move money through Stripe.
+#
+# Two layers:
+#   1. network_policies: the agent can reach api.stripe.com only for the listed calls.
+#      Everything else on Stripe is denied by default. Wallet RPCs and x402 endpoints are not listed, so they are unreachable.
+#   2. network_middlewares: every allowed Stripe request passes through the Axiru middleware, which reads the amount,
+#      charge, and counterparty, evaluates policy, and returns allow or deny. on_error: fail_closed means an unreachable
+#      gate is a denied payment, never an allowed one.
+#
+# The agent does not have to call anything. It cannot skip the check because the sandbox routes the call through it.
+#
+#   openshell sandbox create --name support-agent --policy policy.yaml
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+network_middlewares:
+  axiru-payment-gate:
+    name: Axiru payment gate
+    middleware: axiru-payment-gate
+    order: 10
+    on_error: fail_closed
+    config:
+      policy_id: support-agent-stripe
+      per_transfer_ceiling_minor: 50000
+      hold_above_minor: 10000
+      daily_cap_per_agent_minor: 100000
+      duplicate_window_days: 30
+    endpoints:
+      include:
+        - api.stripe.com
+
+network_policies:
+  stripe-money-moves:
+    name: Stripe money-moving calls, gated by Axiru
+    endpoints:
+      - host: api.stripe.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /v1/refunds
+          - allow:
+              method: POST
+              path: /v1/charges/*/refunds
+          - allow:
+              method: POST
+              path: /v1/customers/*/balance_transactions
+          - allow:
+              method: POST
+              path: /v1/transfers
+          - allow:
+              method: POST
+              path: /v1/payouts
+          - allow:
+              method: GET
+              path: /v1/*
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/node
+      - path: /usr/bin/python3

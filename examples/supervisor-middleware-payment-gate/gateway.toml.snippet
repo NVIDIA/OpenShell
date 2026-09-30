@@ -1,0 +1,8 @@
+# Add to the OpenShell gateway TOML to register the Axiru middleware service.
+# Run the service first:  AXIRU_MW_BIND=0.0.0.0:50052 npx @axiru/openshell-middleware
+[[openshell.supervisor.middleware]]
+name = "axiru-payment-gate"
+grpc_endpoint = "http://host.openshell.internal:50052"
+allow_insecure_transport = true   # local only; use TLS in production
+max_payload_bytes = 262144
+timeout = "2s"
