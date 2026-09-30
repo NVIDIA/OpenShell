@@ -21,8 +21,15 @@
 # Credential scope:  OCI_KEY_ID and OCI_PRIVATE_KEY, signed by the proxy. The
 #                    sandbox never holds a usable key.
 # Endpoint access:   the regional Object Storage hosts in the commercial realm,
-#                    read-write, TLS terminated so the proxy can sign each
-#                    request. PUT and POST bodies are buffered for hashing.
+#                    read-write (GET, HEAD, POST, PUT, PATCH), TLS terminated
+#                    so the proxy can sign each request. PUT and POST bodies
+#                    are buffered for hashing. DELETE is not in read-write:
+#                    grant it in your copy with `access: full` or explicit
+#                    `rules`, as with aws-s3.yaml.
+#                    Attach one OCI signing profile per sandbox: two attached
+#                    profiles may not both provide OCI_KEY_ID. To reach several
+#                    OCI services from one sandbox, attach the endpointless
+#                    oci.yaml profile and bind it from a sandbox policy.
 # Smoke test:        openshell sandbox create --provider <name> -- \
 #                      curl -sS https://objectstorage.us-chicago-1.oraclecloud.com/n/<namespace>/b/<bucket>/o
 
