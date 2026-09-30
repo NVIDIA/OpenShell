@@ -39,6 +39,13 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+### K3s conformance version baseline
+
+The tmachine `ubuntu-k3s` conformance lane pins Agent Sandbox v0.5.0 as the
+compatibility baseline for the v1beta1 Sandbox API. It does not track the local
+K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
+its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
+
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an

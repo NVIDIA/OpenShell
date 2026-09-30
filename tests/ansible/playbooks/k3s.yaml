@@ -24,6 +24,7 @@
     - name: Download K3s installer
       ansible.builtin.get_url:
         url: https://get.k3s.io
+        checksum: sha256:e5cc3b3d9dfc1662c2d9be6da5abc9a4cd317d6abc3a5ffc02e3dd3248207fee
         dest: /tmp/install-k3s.sh
         mode: "0755"
 
@@ -52,7 +53,8 @@
 
     - name: Download Helm installer
       ansible.builtin.get_url:
-        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+        url: https://raw.githubusercontent.com/helm/helm/06468084e85c244c712834933d25ea232a4c2093/scripts/get-helm-4
+        checksum: sha256:b68c5f694cff19f14ee8a5784ffd3de27fa7034ec8f973d703fc6fb85496ced7
         dest: /tmp/install-helm.sh
         mode: "0755"
 
