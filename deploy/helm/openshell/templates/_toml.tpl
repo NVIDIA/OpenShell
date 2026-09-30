@@ -101,8 +101,108 @@ field must not require a Helm template change.
 {{- define "openshell.gatewayConfigToml" -}}
 {{- $root := . -}}
 {{- $config := deepCopy (.Values.gatewayConfig | default dict) -}}
+{{- $legacyServer := .Values.server | default dict -}}
+{{- $gateway := get $config "openshell.gateway" | default dict -}}
+{{- if not (hasKey $gateway "name") -}}{{- $_ := set $gateway "name" (get $legacyServer "name" | default (include "openshell.fullname" .)) -}}{{- end -}}
+{{- if not (hasKey $gateway "bind_address") -}}{{- $_ := set $gateway "bind_address" (printf "0.0.0.0:%v" .Values.service.port) -}}{{- end -}}
+{{- if and .Values.service.healthPort (not (hasKey $gateway "health_bind_address")) -}}{{- $_ := set $gateway "health_bind_address" (printf "0.0.0.0:%v" .Values.service.healthPort) -}}{{- end -}}
+{{- if and .Values.service.metricsPort (not (hasKey $gateway "metrics_bind_address")) -}}{{- $_ := set $gateway "metrics_bind_address" (printf "0.0.0.0:%v" .Values.service.metricsPort) -}}{{- end -}}
+{{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
+{{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
+{{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames (not (hasKey $gateway "server_sans")) -}}
+{{- $_ := set $gateway "server_sans" (deepCopy .Values.certManager.serverDnsNames) -}}
+{{- end -}}
+{{- $_ := set $config "openshell.gateway" $gateway -}}
+{{- $gatewayJwt := get $config "openshell.gateway.gateway_jwt" | default dict -}}
+{{- $legacyJwt := get $legacyServer "sandboxJwt" | default dict -}}
+{{- range $key, $value := dict "signing_key_path" "/etc/openshell-jwt/signing.pem" "public_key_path" "/etc/openshell-jwt/public.pem" "kid_path" "/etc/openshell-jwt/kid" -}}
+{{- if not (hasKey $gatewayJwt $key) -}}{{- $_ := set $gatewayJwt $key $value -}}{{- end -}}
+{{- end -}}
+{{- if not (hasKey $gatewayJwt "gateway_id") -}}{{- $_ := set $gatewayJwt "gateway_id" (get $legacyJwt "gatewayId" | default (include "openshell.fullname" .)) -}}{{- end -}}
+{{- if not (hasKey $gatewayJwt "ttl_secs") -}}{{- $_ := set $gatewayJwt "ttl_secs" (get $legacyJwt "ttlSecs" | default 3600) -}}{{- end -}}
+{{- $_ := set $config "openshell.gateway.gateway_jwt" $gatewayJwt -}}
 {{- $kubernetesCompat := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
+{{- $legacyDrivers := get $legacyServer "drivers" | default dict -}}
+{{- $legacyKubernetes := get $legacyDrivers "kubernetes" | default dict -}}
+{{- if hasKey $kubernetesCompat "resource_admission" -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.resource_admission" (deepCopy (get $kubernetesCompat "resource_admission")) -}}
+{{- else -}}
+{{- $legacyAdmission := get $legacyKubernetes "resourceAdmission" | default dict -}}
+{{- $admission := dict -}}
+{{- if hasKey $legacyAdmission "enabled" -}}{{- $_ := set $admission "enabled" (get $legacyAdmission "enabled") -}}{{- end -}}
+{{- if and (hasKey $legacyAdmission "requiredLabels") (ne (get $legacyAdmission "requiredLabels") nil) -}}{{- $_ := set $admission "required_labels" (deepCopy (get $legacyAdmission "requiredLabels")) -}}{{- end -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.resource_admission" $admission -}}
+{{- end -}}
+{{- $_ := unset $kubernetesCompat "resource_admission" -}}
+{{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
+{{- if not (hasKey $config "openshell.drivers.kubernetes.managed_ssh_ingress") -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
+{{- end -}}
+{{- $legacyOidc := get $legacyServer "oidc" | default dict -}}
+{{- if and (get $legacyOidc "issuer") (not (hasKey $config "openshell.gateway.oidc")) -}}
+{{- $_ := set $config "openshell.gateway.oidc" (dict "issuer" (get $legacyOidc "issuer") "dangerously_allow_insecure_http" (get $legacyOidc "dangerouslyAllowInsecureHttp") "jwks_allowed_origins" (get $legacyOidc "jwksAllowedOrigins") "audience" (get $legacyOidc "audience") "jwks_ttl_secs" (get $legacyOidc "jwksTtl") "roles_claim" (get $legacyOidc "rolesClaim") "admin_role" (get $legacyOidc "adminRole") "user_role" (get $legacyOidc "userRole") "scopes_claim" (get $legacyOidc "scopesClaim")) -}}
+{{- end -}}
+{{- $legacyOtlp := get $legacyServer "otlp" | default dict -}}
+{{- if and (get $legacyOtlp "endpoint") (not (hasKey $config "openshell.gateway.otlp")) -}}{{- $_ := set $config "openshell.gateway.otlp" (dict "endpoint" (get $legacyOtlp "endpoint") "service_name" (get $legacyOtlp "serviceName")) -}}{{- end -}}
+{{- $legacyAuth := get $legacyServer "auth" | default dict -}}
+{{- if and (get $legacyAuth "allowUnauthenticatedUsers") (not (hasKey $config "openshell.gateway.auth")) -}}{{- $_ := set $config "openshell.gateway.auth" (dict "allow_unauthenticated_users" true) -}}{{- end -}}
+{{- $legacyOcsf := get $legacyServer "ocsfLog" | default dict -}}
+{{- if and (get $legacyOcsf "enabled") (not (hasKey $config "openshell.gateway.ocsf_log")) -}}
+{{- $rotation := get $legacyOcsf "rotation" | default "daily" -}}
+{{- if not (has $rotation (list "daily" "never")) -}}{{- fail "server.ocsfLog.rotation must be daily or never" -}}{{- end -}}
+{{- $path := get $legacyOcsf "path" -}}{{- if not $path -}}{{- fail "server.ocsfLog.path must be set when server.ocsfLog.enabled is true" -}}{{- end -}}
+{{- $queueCapacity := 10000 -}}{{- if and (hasKey $legacyOcsf "queueCapacity") (ne (get $legacyOcsf "queueCapacity") nil) -}}{{- $queueCapacity = get $legacyOcsf "queueCapacity" -}}{{- end -}}
+{{- $queueMaxBytes := 16777216 -}}{{- if and (hasKey $legacyOcsf "queueMaxBytes") (ne (get $legacyOcsf "queueMaxBytes") nil) -}}{{- $queueMaxBytes = get $legacyOcsf "queueMaxBytes" -}}{{- end -}}
+{{- if or (lt (int $queueCapacity) 1) (lt (int $queueMaxBytes) 1) -}}{{- fail "server.ocsfLog.queueCapacity and queueMaxBytes must be positive" -}}{{- end -}}
+{{- $schemaVersion := get $legacyOcsf "schemaVersion" | default "" -}}
+{{- if not (has $schemaVersion (list "" "1.1" "1.3")) -}}{{- fail "server.ocsfLog.schemaVersion must be empty, 1.1, or 1.3" -}}{{- end -}}
+{{- $ocsfConfig := dict "path" $path "rotation" $rotation "queue_capacity" (int $queueCapacity) "queue_max_bytes" (int $queueMaxBytes) -}}
+{{- if $schemaVersion -}}{{- $_ := set $ocsfConfig "schema_version" $schemaVersion -}}{{- end -}}
+{{- if eq $rotation "daily" -}}{{- $maxFiles := 7 -}}{{- if and (hasKey $legacyOcsf "maxFiles") (ne (get $legacyOcsf "maxFiles") nil) -}}{{- $maxFiles = get $legacyOcsf "maxFiles" -}}{{- end -}}{{- if lt (int $maxFiles) 1 -}}{{- fail "server.ocsfLog.maxFiles must be positive when rotation is daily" -}}{{- end -}}{{- $_ := set $ocsfConfig "max_files" (int $maxFiles) -}}{{- end -}}
+{{- $_ := set $config "openshell.gateway.ocsf_log" $ocsfConfig -}}
+{{- end -}}
+{{- $legacyRateLimit := get $legacyServer "grpcRateLimit" | default dict -}}
+{{- $rateRequests := int (get $legacyRateLimit "requests" | default 0) -}}
+{{- $rateWindow := int (get $legacyRateLimit "windowSeconds" | default 0) -}}
+{{- if or (lt $rateRequests 0) (lt $rateWindow 0) -}}{{- fail "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings" -}}{{- end -}}
+{{- if and (gt $rateRequests 0) (gt $rateWindow 0) -}}
+{{- if not (hasKey $gateway "grpc_rate_limit_requests") -}}{{- $_ := set $gateway "grpc_rate_limit_requests" $rateRequests -}}{{- end -}}
+{{- if not (hasKey $gateway "grpc_rate_limit_window_seconds") -}}{{- $_ := set $gateway "grpc_rate_limit_window_seconds" $rateWindow -}}{{- end -}}
+{{- else if or (gt $rateRequests 0) (gt $rateWindow 0) -}}{{- fail "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it" -}}{{- end -}}
+{{- $_ := set $config "openshell.gateway" $gateway -}}
+{{- $legacyCredentialDrivers := .Values.server.credentialDrivers | default dict -}}
+{{- $gatewayForCredentials := get $config "openshell.gateway" | default dict -}}
+{{- $rawConfiguredCredentialDrivers := get $gatewayForCredentials "credential_drivers" -}}
+{{- $hasConfiguredCredentialDrivers := and (hasKey $gatewayForCredentials "credential_drivers") (ne $rawConfiguredCredentialDrivers nil) -}}
+{{- $configuredCredentialDrivers := $rawConfiguredCredentialDrivers | default list -}}
+{{- if and $hasConfiguredCredentialDrivers (eq (len $configuredCredentialDrivers) 0) -}}
+{{- fail "gatewayConfig.openshell.gateway.credential_drivers must select exactly one backend or be omitted/null to use the chart default" -}}
+{{- end -}}
+{{- if gt (len $configuredCredentialDrivers) 1 -}}
+{{- fail "gatewayConfig.openshell.gateway.credential_drivers may select only one backend" -}}
+{{- end -}}
+{{- $legacyKubernetesSecrets := get $legacyCredentialDrivers "kubernetesSecrets" | default dict -}}
+{{- $legacyVault := get $legacyCredentialDrivers "vault" | default dict -}}
+{{- if and $legacyKubernetesSecrets.enabled $legacyVault.enabled -}}
+{{- fail "only one external server.credentialDrivers backend can be enabled at a time" -}}
+{{- end -}}
+{{- if and (not $hasConfiguredCredentialDrivers) (eq (len $configuredCredentialDrivers) 0) -}}
+{{- if $legacyKubernetesSecrets.enabled -}}
+{{- $_ := set $gatewayForCredentials "credential_drivers" (list "kubernetes-secrets") -}}
+{{- $_ := set $config "openshell.credential_drivers.kubernetes-secrets" (dict "namespace" (default .Release.Namespace $legacyKubernetesSecrets.namespace)) -}}
+{{- else if $legacyVault.enabled -}}
+{{- $_ := set $gatewayForCredentials "credential_drivers" (list "vault") -}}
+{{- $vaultConfig := dict "address" $legacyVault.address "auth_method" $legacyVault.authMethod "role" $legacyVault.role -}}
+{{- range $legacyKey, $runtimeKey := dict "mount" "mount" "kvVersion" "kv_version" "kubernetesAuthMount" "kubernetes_auth_mount" "serviceAccountTokenPath" "service_account_token_path" "tokenPath" "token_path" "timeoutSecs" "timeout_secs" -}}
+{{- if get $legacyVault $legacyKey -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.credential_drivers.vault" $vaultConfig -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.gateway" $gatewayForCredentials -}}
 {{/* External credential drivers own their storage. Do not configure the
 chart-managed encrypted database store when any driver is selected: its KEK
 environment variable is intentionally not mounted in that mode. */}}
@@ -110,6 +210,8 @@ environment variable is intentionally not mounted in that mode. */}}
 {{- $configuredCredentialDrivers := get $configuredGateway "credential_drivers" | default list -}}
 {{- if gt (len $configuredCredentialDrivers) 0 -}}
 {{- $_ := unset $config "openshell.gateway.credential_storage" -}}
+{{- else if not (hasKey $config "openshell.gateway.credential_storage") -}}
+{{- $_ := set $config "openshell.gateway.credential_storage" (dict "key_encryption_key_env" (include "openshell.credentialStorageKeyEncryptionKeyEnvName" .)) -}}
 {{- end -}}
 {{/* Kubernetes packaging owns host aliases. Do not permit a second runtime
 source to make sandbox callback hostnames disagree with the pod spec. */}}
@@ -125,11 +227,13 @@ source to make sandbox callback hostnames disagree with the pod spec. */}}
 path. Derive its mounted path only from the chart-owned ConfigMap reference. */}}
 {{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
 {{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
+{{- $legacyVaultResources := get $legacyCredentialDrivers "vault" | default dict -}}
+{{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" | default (get $legacyVaultResources "caConfigMapName") -}}
 {{- if hasKey $config "openshell.credential_drivers.vault" -}}
 {{- $vaultConfig := get $config "openshell.credential_drivers.vault" | default dict -}}
 {{- $_ := unset $vaultConfig "ca_bundle" -}}
-{{- if and (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") (get $vaultResources "caConfigMapName") -}}
-{{- $_ := set $vaultConfig "ca_bundle" "/etc/openshell-tls/vault/ca.crt" -}}
+{{- if and (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") $vaultCaConfigMapName -}}
+{{- $_ := set $vaultConfig "ca_bundle" "/etc/openshell-tls/vault-ca/ca.crt" -}}
 {{- end -}}
 {{- $_ := set $config "openshell.credential_drivers.vault" $vaultConfig -}}
 {{- end -}}

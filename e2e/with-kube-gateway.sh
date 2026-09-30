@@ -1242,6 +1242,7 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+helm_values_args+=(--set-string "global.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")")
 if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   echo "OpenShift detected — applying SCC-compatible security context overrides."
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")

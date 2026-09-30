@@ -267,7 +267,8 @@ Namespace where Kubernetes Secret-backed provider credentials live.
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}
 {{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
 {{- $config := get $gatewayConfig "openshell.credential_drivers.kubernetes-secrets" | default dict -}}
-{{- get $config "namespace" | default .Release.Namespace -}}
+{{- $legacy := .Values.server.credentialDrivers.kubernetesSecrets | default dict -}}
+{{- get $config "namespace" | default (get $legacy "namespace") | default .Release.Namespace -}}
 {{- end }}
 
 {{/* Whether a credential driver is enabled in the generic gateway config. */}}
@@ -276,7 +277,14 @@ Namespace where Kubernetes Secret-backed provider credentials live.
 {{- $driver := index . 1 -}}
 {{- $gatewayConfig := $root.Values.gatewayConfig | default dict -}}
 {{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
-{{- if has $driver (get $gateway "credential_drivers" | default list) -}}true{{- end -}}
+{{- $configuredDrivers := get $gateway "credential_drivers" -}}
+{{- if and (hasKey $gateway "credential_drivers") (ne $configuredDrivers nil) -}}
+{{- if has $driver ($configuredDrivers | default list) -}}true{{- end -}}
+{{- else if eq $driver "kubernetes-secrets" -}}
+{{- if $root.Values.server.credentialDrivers.kubernetesSecrets.enabled -}}true{{- end -}}
+{{- else if eq $driver "vault" -}}
+{{- if $root.Values.server.credentialDrivers.vault.enabled -}}true{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -438,8 +446,14 @@ absent fields so every chart consumer observes the same configuration.
 {{- if and (include "openshell.sandboxRuntimeImageOverrideEnabled" .) (not (hasKey $kubernetes "sandbox_runtime_image")) -}}
 {{- $_ := set $kubernetes "sandbox_runtime_image" (include "openshell.sandboxRuntimeImage" .) -}}
 {{- end -}}
-{{- if and (get $legacySandbox "pullPolicy") (not (hasKey $kubernetes "sandbox_runtime_image_pull_policy")) -}}
-{{- $_ := set $kubernetes "sandbox_runtime_image_pull_policy" (include "openshell.canonicalImagePullPolicy" (get $legacySandbox "pullPolicy")) -}}
+{{- $legacySandboxImage := .Values.sandbox.image | default dict -}}
+{{- $legacySandboxPullPolicy := get $legacySandboxImage "pullPolicy" | default .Values.global.image.pullPolicy -}}
+{{- if and $legacySandboxPullPolicy (not (hasKey $kubernetes "image_pull_policy")) -}}
+{{- $_ := set $kubernetes "image_pull_policy" (include "openshell.canonicalImagePullPolicy" $legacySandboxPullPolicy) -}}
+{{- end -}}
+{{- $legacySandboxRuntimePullPolicy := get $legacySandbox "pullPolicy" | default .Values.global.image.pullPolicy -}}
+{{- if and $legacySandboxRuntimePullPolicy (not (hasKey $kubernetes "sandbox_runtime_image_pull_policy")) -}}
+{{- $_ := set $kubernetes "sandbox_runtime_image_pull_policy" (include "openshell.canonicalImagePullPolicy" $legacySandboxRuntimePullPolicy) -}}
 {{- end -}}
 {{- $legacySupervisor := .Values.supervisor.image | default dict -}}
 {{- $legacySupervisorImage := include "openshell.supervisorImage" . -}}
@@ -447,14 +461,12 @@ absent fields so every chart consumer observes the same configuration.
 {{- if and (ne $legacySupervisorImage $defaultSupervisorImage) (not (hasKey $kubernetes "supervisor_image")) -}}
 {{- $_ := set $kubernetes "supervisor_image" $legacySupervisorImage -}}
 {{- end -}}
-{{- if and (get $legacySupervisor "pullPolicy") (not (hasKey $kubernetes "supervisor_image_pull_policy")) -}}
-{{- $_ := set $kubernetes "supervisor_image_pull_policy" (include "openshell.canonicalImagePullPolicy" (get $legacySupervisor "pullPolicy")) -}}
+{{- $legacySupervisorPullPolicy := get $legacySupervisor "pullPolicy" | default .Values.global.image.pullPolicy -}}
+{{- if and $legacySupervisorPullPolicy (not (hasKey $kubernetes "supervisor_image_pull_policy")) -}}
+{{- $_ := set $kubernetes "supervisor_image_pull_policy" (include "openshell.canonicalImagePullPolicy" $legacySupervisorPullPolicy) -}}
 {{- end -}}
 {{- $legacyRuntime := .Values.supervisor.sandboxRuntime | default dict -}}
 {{- $runtimeConfig := get $kubernetes "sandbox_runtime" | default dict -}}
-{{- if and (get $legacyRuntime "networkPolicyEnforced") (not (hasKey $runtimeConfig "network_policy_enforced")) -}}
-{{- $_ := set $runtimeConfig "network_policy_enforced" true -}}
-{{- end -}}
 {{- if and (ne (int (get $legacyRuntime "boundaryPort" | default 5500)) 5500) (not (hasKey $runtimeConfig "boundary_port")) -}}
 {{- $_ := set $runtimeConfig "boundary_port" (int (get $legacyRuntime "boundaryPort")) -}}
 {{- end -}}
@@ -473,6 +485,8 @@ absent fields so every chart consumer observes the same configuration.
 {{- $_ := set $kubernetes "proxy_ca_bundle" "/etc/openshell-tls/proxy-ca/ca.crt" -}}
 {{- end -}}
 {{- $legacyKubernetes := .Values.server.drivers.kubernetes | default dict -}}
+{{- $legacyServer := .Values.server | default dict -}}
+{{- if not (hasKey $kubernetes "allow_driver_config") -}}{{- $_ := set $kubernetes "allow_driver_config" (get $legacyKubernetes "allowDriverConfig" | default false) -}}{{- end -}}
 {{- if and (ne (get $legacyKubernetes "workspaceMode" | default "shared") "shared") (not (hasKey $kubernetes "workspace_mode")) -}}
 {{- $_ := set $kubernetes "workspace_mode" (get $legacyKubernetes "workspaceMode") -}}
 {{- end -}}
@@ -481,15 +495,36 @@ absent fields so every chart consumer observes the same configuration.
 {{- $_ := set $kubernetes $runtimeKey (get $legacyKubernetes $legacyKey) -}}
 {{- end -}}
 {{- end -}}
-{{- if and (get $legacyKubernetes "allowDriverConfig") (not (hasKey $kubernetes "allow_driver_config")) -}}
-{{- $_ := set $kubernetes "allow_driver_config" true -}}
+{{- if not (hasKey $kubernetes "resource_admission") -}}
+{{- $legacyAdmission := get $legacyKubernetes "resourceAdmission" | default dict -}}
+{{- $admission := dict -}}
+{{- if hasKey $legacyAdmission "enabled" -}}{{- $_ := set $admission "enabled" (get $legacyAdmission "enabled") -}}{{- end -}}
+{{- if and (hasKey $legacyAdmission "requiredLabels") (ne (get $legacyAdmission "requiredLabels") nil) -}}{{- $_ := set $admission "required_labels" (deepCopy (get $legacyAdmission "requiredLabels")) -}}{{- end -}}
+{{- $_ := set $kubernetes "resource_admission" $admission -}}
+{{- end -}}
+{{- if and (get $legacyServer "enableUserNamespaces") (not (hasKey $kubernetes "enable_user_namespaces")) -}}{{- $_ := set $kubernetes "enable_user_namespaces" true -}}{{- end -}}
+{{- if and (get $legacyServer "hostGatewayIP") (not (hasKey $kubernetes "host_gateway_ip")) -}}{{- $_ := set $kubernetes "host_gateway_ip" (get $legacyServer "hostGatewayIP") -}}{{- end -}}
+{{- if not (hasKey $kubernetes "namespace") -}}{{- $_ := set $kubernetes "namespace" (include "openshell.sandboxNamespace" .) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "default_image") -}}{{- $_ := set $kubernetes "default_image" (include "openshell.sandboxImage" .) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "gateway_id") -}}{{- $_ := set $kubernetes "gateway_id" (get (.Values.server.sandboxJwt | default dict) "gatewayId" | default (include "openshell.fullname" .)) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "grpc_endpoint") -}}{{- $_ := set $kubernetes "grpc_endpoint" (include "openshell.grpcEndpoint" .) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "service_account_name") -}}{{- $_ := set $kubernetes "service_account_name" (include "openshell.sandboxServiceAccountName" .) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "sa_token_ttl_secs") -}}{{- $_ := set $kubernetes "sa_token_ttl_secs" (get (.Values.server.sandboxJwt | default dict) "k8sSaTokenTtlSecs" | default 3600) -}}{{- end -}}
+{{- if not (hasKey $kubernetes "image_pull_secrets") -}}
+{{- $imagePullSecrets := list -}}{{- range (get $legacyServer "sandboxImagePullSecrets" | default list) }}{{- if .name }}{{- $imagePullSecrets = append $imagePullSecrets .name }}{{- end }}{{- end -}}
+{{- if $imagePullSecrets }}{{- $_ := set $kubernetes "image_pull_secrets" $imagePullSecrets -}}{{- end -}}
+{{- end -}}
+{{- range $legacyKey, $runtimeKey := dict "workspaceDefaultStorageSize" "workspace_default_storage_size" "workspaceStorageClass" "workspace_storage_class" "defaultRuntimeClassName" "default_runtime_class_name" -}}
+{{- if and (get $legacyServer $legacyKey) (not (hasKey $kubernetes $runtimeKey)) -}}{{- $_ := set $kubernetes $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- $legacySpiffe := .Values.server.providerTokenGrants.spiffe | default dict -}}
+{{- if and (get $legacySpiffe "enabled") (not (hasKey $kubernetes "provider_spiffe_workload_api_socket_path")) -}}
+{{- $_ := set $kubernetes "provider_spiffe_workload_api_socket_path" (get $legacySpiffe "workloadApiSocketPath") -}}
 {{- end -}}
 {{/* Keep the rendered default configuration stable without making defaults look
 like user-supplied schema-v2 fields during compatibility resolution. */}}
 {{- if not (hasKey $kubernetes "workspace_mode") -}}{{- $_ := set $kubernetes "workspace_mode" "shared" -}}{{- end -}}
-{{- if not (hasKey $kubernetes "sandbox_runtime_image") -}}{{- $_ := set $kubernetes "sandbox_runtime_image" (printf "ghcr.io/nvidia/openshell/sandbox:%s" .Chart.AppVersion) -}}{{- end -}}
-{{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (printf "ghcr.io/nvidia/openshell/supervisor:%s" .Chart.AppVersion) -}}{{- end -}}
-{{- if not (hasKey $runtimeConfig "network_policy_enforced") -}}{{- $_ := set $runtimeConfig "network_policy_enforced" false -}}{{- end -}}
+{{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (include "openshell.supervisorImage" .) -}}{{- end -}}
 {{- if not (hasKey $runtimeConfig "boundary_port") -}}{{- $_ := set $runtimeConfig "boundary_port" 5500 -}}{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
 {{- toYaml $kubernetes -}}
@@ -525,6 +560,17 @@ Validate chart values that Helm would otherwise accept silently.
 {{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
 {{- include "openshell.validateSecretReference" (list "upstreamProxy.authSecret.name" .Values.upstreamProxy.authSecret.name) -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- $credentialDrivers := get $gateway "credential_drivers" -}}
+{{- if and (hasKey $gateway "credential_drivers") (ne $credentialDrivers nil) -}}
+{{- if eq (len $credentialDrivers) 0 -}}
+{{- fail "gatewayConfig.openshell.gateway.credential_drivers must select exactly one backend or be omitted/null to use the chart default" -}}
+{{- end -}}
+{{- if gt (len $credentialDrivers) 1 -}}
+{{- fail "gatewayConfig.openshell.gateway.credential_drivers may select only one backend" -}}
+{{- end -}}
+{{- end -}}
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- include "openshell.validateSecretReference" (list "gatewayConfig.openshell.drivers.kubernetes.proxy_auth_secret_name" (get $kubernetesConfig "proxy_auth_secret_name")) -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}

@@ -252,7 +252,7 @@ gatewayConfig:
     credential_drivers:
       - vault
   openshell.credential_drivers.vault:
-    address: http://vault.vault.svc.cluster.local:8200
+    address: https://vault.vault.svc.cluster.local:8200
     mount: secret
     kv_version: "2"
     auth_method: kubernetes

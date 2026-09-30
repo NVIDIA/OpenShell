@@ -16,14 +16,10 @@ render() {
   helm template resource-coherence "${chart}" \
     --namespace resource-namespace \
     --set agentSandbox.preflight.enabled=false \
-    --set gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime.network_policy_enforced=true \
     "$@" >"${work_dir}/${name}.yaml"
 
-  if ! awk 'BEGIN { RS="---" }
-    /^\n?# Source:/ && $0 !~ /\napiVersion:/ && $0 !~ /network-policy-ack\.yaml/ {
-      print "rendered an empty or invalid Kubernetes document:" $0 > "/dev/stderr"
-      exit 1
-    }' "${work_dir}/${name}.yaml"; then
+  if invalid_documents="$(yq ea -r 'select(. != null and ((has("apiVersion") | not) or (has("kind") | not))) | .kind // "<unknown>"' "${work_dir}/${name}.yaml")" && [[ -n "${invalid_documents}" ]]; then
+    printf 'rendered Kubernetes documents without apiVersion or kind:\n%s\n' "${invalid_documents}" >&2
     echo "${name}: rendered an invalid Kubernetes document" >&2
     exit 1
   fi
