@@ -1,0 +1,120 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Slack"
+sidebar-title: "Slack"
+description: "Give sandboxes governed Slack Web API access with gateway-managed user token rotation."
+keywords: "Slack, OAuth2, Token Rotation, Credentials, Provider Profile, Sandbox"
+---
+
+The `slack` example profile injects a Slack user token into sandboxes as a stable
+`SLACK_USER_TOKEN` placeholder and keeps the real token short lived. Slack
+apps with token rotation enabled issue access tokens that expire after
+12 hours together with a single-use refresh token. The gateway stores the
+refresh material, refreshes the access token through `oauth.v2.access`
+before it expires, and swaps the value behind the placeholder without
+restarting sandbox processes.
+
+<Note>
+Token rotation is an app-level setting in Slack and cannot be turned off
+once enabled. Apps without rotation issue non-expiring tokens; for those,
+create the provider with the static token and skip the refresh
+configuration below.
+</Note>
+
+## Prerequisites
+
+- A Slack app with token rotation enabled and the user scopes your workload
+  needs.
+- The app's client ID and client secret. Slack requires both on every
+  refresh, even for user tokens.
+- A completed OAuth authorization for the user, which returns an access
+  token, a refresh token, and `expires_in` under `authed_user`.
+
+| Variable | Value |
+|---|---|
+| `SLACK_CLIENT_ID` | Slack app client ID. |
+| `SLACK_CLIENT_SECRET` | Slack app client secret. |
+| `SLACK_USER_TOKEN` | Current user access token (`xoxe.xoxp-...`). |
+| `SLACK_REFRESH_TOKEN` | Current refresh token (`xoxe-1-...`). |
+| `SLACK_USER_TOKEN_EXPIRES_AT` | Absolute expiry of the current access token (RFC3339 or epoch milliseconds). |
+
+<Warning>
+Slack refresh tokens are single use. Every refresh returns a new refresh
+token and invalidates the previous one, so only the gateway should refresh a
+rotating grant. Do not reuse the refresh token you hand to the gateway
+elsewhere, and avoid manual `refresh rotate` calls that could race the
+gateway's own scheduled refresh.
+</Warning>
+
+## Import the Example Profile
+
+The repository ships `providers/slack.yaml` as a reviewable example. Lint and
+import it (drop `--global` to import into the current workspace only):
+
+```shell
+openshell provider profile lint   --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/slack.yaml
+openshell provider profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/slack.yaml --global
+```
+
+From a checkout, `-f providers/slack.yaml` works the same way. The example
+grants read-only access to `slack.com` for `curl`; copy and adapt it if your
+workload uses a different client binary or needs write methods such as
+`chat.postMessage`, which require explicit `rules` or `access: read-write`.
+
+## Create the Provider
+
+```shell
+openshell provider create \
+  --name my-slack \
+  --type slack \
+  --credential SLACK_USER_TOKEN="$SLACK_USER_TOKEN"
+```
+
+## Configure Refresh
+
+```shell
+openshell provider refresh configure my-slack \
+  --credential-key SLACK_USER_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$SLACK_CLIENT_ID" \
+  --secret-material-env client_secret=SLACK_CLIENT_SECRET \
+  --secret-material-env refresh_token=SLACK_REFRESH_TOKEN \
+  --credential-expires-at "$SLACK_USER_TOKEN_EXPIRES_AT"
+```
+
+The profile owns the token endpoint, the 43200-second lifetime cap, and a
+21600-second refresh lead time. The gateway refreshes the token on its own
+schedule; confirm the configuration took effect with:
+
+```shell
+openshell provider refresh status my-slack
+```
+
+## Failure Handling
+
+Slack reports token endpoint errors with an HTTP 200 status and an `error`
+field. The gateway classifies those like standard OAuth errors:
+
+| Slack error | `FAILURE_CODE` | Recovery |
+|---|---|---|
+| `invalid_refresh_token`, `token_revoked`, `token_expired`, `account_inactive`, `invalid_auth` | `oauth_invalid_grant` | `reauthorize`: the user must authorize the app again. |
+| `invalid_client_id`, `bad_client_secret` | `oauth_invalid_client` | `fix_configuration`: correct the client material. |
+| `ratelimited` and other transient Slack errors | `oauth_token_endpoint_retryable` | `retry`: the gateway retries automatically. |
+
+The Slack error name is recorded as `provider_error_subtype` in the refresh
+status API and echoed in the `LAST_ERROR` text of the status table.
+
+## Use the Provider in a Sandbox
+
+```shell
+openshell sandbox create --name slack-sandbox --provider my-slack
+openshell sandbox exec slack-sandbox -- \
+  curl -s https://slack.com/api/auth.test \
+    -H "Authorization: Bearer $SLACK_USER_TOKEN"
+```
+
+The sandbox sees only the placeholder; the sandbox proxy substitutes the
+current access token for requests to `slack.com`. The example allows read
+methods only; add `rules` for the specific Slack Web API paths your workload
+needs, including any write methods.

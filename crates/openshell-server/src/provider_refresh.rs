@@ -1651,12 +1651,28 @@ async fn request_token(
         let body = read_bounded_oauth_error_body(response).await;
         return Err(classify_oauth_token_error(status, &body, grant_kind));
     }
-    let token = response.json::<TokenResponse>().await.map_err(|_| {
+    let body = response.bytes().await.map_err(|_| {
         RefreshFailure::investigate(
-            Status::failed_precondition("token endpoint returned invalid JSON"),
+            Status::failed_precondition("token endpoint returned an unreadable body"),
             "oauth_invalid_success_response",
         )
     })?;
+    let token = match serde_json::from_slice::<TokenResponse>(&body) {
+        Ok(token) => token,
+        // RFC 6749 section 5.2 puts token endpoint errors on 4xx, but some
+        // issuers (Slack's oauth.v2.access, for example) answer HTTP 200 with
+        // an `error` body. Classify those like any other token error instead
+        // of leaving the state in a permanent invalid-success retry loop.
+        Err(_) if serde_json::from_slice::<OAuthErrorResponse>(&body).is_ok() => {
+            return Err(classify_oauth_token_error(status, &body, grant_kind));
+        }
+        Err(_) => {
+            return Err(RefreshFailure::investigate(
+                Status::failed_precondition("token endpoint returned invalid JSON"),
+                "oauth_invalid_success_response",
+            ));
+        }
+    };
     if token.access_token.trim().is_empty() {
         return Err(RefreshFailure::investigate(
             Status::failed_precondition("token endpoint returned empty access_token"),
@@ -1719,6 +1735,16 @@ fn classify_oauth_token_error(
             "oauth_unrecognized_error_response",
         );
     };
+
+    // Issuer-specific vocabulary is only consulted for errors that arrived in
+    // a 2xx envelope (see `request_token`); RFC 6749 error responses keep the
+    // RFC-only table below so no existing 4xx classification changes.
+    if status.is_success()
+        && let Some(failure) =
+            classify_issuer_token_error(error_response.error.as_str(), grant_kind)
+    {
+        return failure;
+    }
 
     match error_response.error.as_str() {
         "invalid_grant" if grant_kind == OAuthGrantKind::UserRefreshToken => {
@@ -1811,6 +1837,79 @@ fn classify_oauth_token_error(
             "oauth_unrecognized_error",
         ),
     }
+}
+
+/// Issuer-specific token endpoint error names (Slack's oauth.v2.access uses
+/// these instead of the RFC 6749 vocabulary). Each group folds onto the
+/// closest RFC failure code so status consumers keep a stable vocabulary; the
+/// issuer's own name is preserved as the provider error subtype.
+const ISSUER_INVALID_GRANT_ERRORS: &[&str] = &[
+    "invalid_refresh_token",
+    "token_revoked",
+    "token_expired",
+    "account_inactive",
+    "invalid_auth",
+];
+const ISSUER_INVALID_CLIENT_ERRORS: &[&str] = &["invalid_client_id", "bad_client_secret"];
+const ISSUER_UNSUPPORTED_GRANT_TYPE_ERRORS: &[&str] = &["invalid_grant_type"];
+const ISSUER_RETRYABLE_ERRORS: &[&str] = &[
+    "ratelimited",
+    "accesslimited",
+    "request_timeout",
+    "service_unavailable",
+    "internal_error",
+    "fatal_error",
+];
+
+fn known_issuer_error(names: &'static [&'static str], error: &str) -> Option<&'static str> {
+    names.iter().copied().find(|name| *name == error)
+}
+
+fn classify_issuer_token_error(error: &str, grant_kind: OAuthGrantKind) -> Option<RefreshFailure> {
+    if let Some(name) = known_issuer_error(ISSUER_INVALID_GRANT_ERRORS, error) {
+        return Some(if grant_kind == OAuthGrantKind::UserRefreshToken {
+            RefreshFailure::reauthorize(
+                Status::failed_precondition(format!(
+                    "OAuth refresh grant is no longer usable ({name}); user reauthorization is required"
+                )),
+                "oauth_invalid_grant",
+                Some(name),
+            )
+        } else {
+            RefreshFailure::fix_configuration_with_subtype(
+                Status::failed_precondition(format!(
+                    "OAuth token endpoint rejected the non-interactive grant ({name})"
+                )),
+                "oauth_invalid_grant",
+                name,
+            )
+        });
+    }
+    if let Some(name) = known_issuer_error(ISSUER_INVALID_CLIENT_ERRORS, error) {
+        return Some(RefreshFailure::fix_configuration_with_subtype(
+            Status::failed_precondition(format!(
+                "OAuth token endpoint rejected the client configuration ({name})"
+            )),
+            "oauth_invalid_client",
+            name,
+        ));
+    }
+    if let Some(name) = known_issuer_error(ISSUER_UNSUPPORTED_GRANT_TYPE_ERRORS, error) {
+        return Some(RefreshFailure::fix_configuration_with_subtype(
+            Status::failed_precondition(format!(
+                "OAuth token endpoint rejected the configured grant type ({name})"
+            )),
+            "oauth_unsupported_grant_type",
+            name,
+        ));
+    }
+    if ISSUER_RETRYABLE_ERRORS.contains(&error) {
+        return Some(RefreshFailure::retryable(
+            Status::unavailable("OAuth token endpoint reported a temporary failure"),
+            "oauth_token_endpoint_retryable",
+        ));
+    }
+    None
 }
 
 pub fn refresh_scopes(state: &StoredProviderCredentialRefreshState) -> Vec<String> {
@@ -2611,6 +2710,346 @@ mod tests {
         assert_eq!(
             stored.next_refresh_at_ms - stored.last_error_at_ms,
             60 * 60 * 1000
+        );
+    }
+
+    #[test]
+    fn issuer_invalid_grant_errors_map_onto_oauth_invalid_grant_by_grant_kind() {
+        for name in [
+            "invalid_refresh_token",
+            "token_revoked",
+            "token_expired",
+            "account_inactive",
+            "invalid_auth",
+        ] {
+            let body = format!(r#"{{"ok":false,"error":"{name}","needed":"chat:write"}}"#);
+
+            let user_failure = classify_oauth_token_error(
+                reqwest::StatusCode::OK,
+                body.as_bytes(),
+                OAuthGrantKind::UserRefreshToken,
+            );
+            assert_eq!(
+                user_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::Reauthorize,
+                "{name}"
+            );
+            assert_eq!(user_failure.failure_code, "oauth_invalid_grant");
+            assert_eq!(user_failure.provider_error_subtype, Some(name));
+            assert_eq!(user_failure.retry_schedule, RefreshRetrySchedule::Parked);
+            assert!(!user_failure.status.message().contains("chat:write"));
+
+            let service_failure = classify_oauth_token_error(
+                reqwest::StatusCode::OK,
+                body.as_bytes(),
+                OAuthGrantKind::NonInteractive,
+            );
+            assert_eq!(
+                service_failure.recovery_action,
+                ProviderCredentialRefreshRecoveryAction::FixConfiguration,
+                "{name}"
+            );
+            assert_eq!(service_failure.failure_code, "oauth_invalid_grant");
+            assert_eq!(service_failure.provider_error_subtype, Some(name));
+            assert_eq!(
+                service_failure.retry_schedule,
+                RefreshRetrySchedule::Configuration
+            );
+        }
+    }
+
+    #[test]
+    fn issuer_error_names_on_rfc_error_responses_stay_unrecognized() {
+        let failure = classify_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"token_expired"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(failure.failure_code, "oauth_unrecognized_error");
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
+    }
+
+    #[test]
+    fn issuer_client_and_transient_errors_keep_rfc_failure_codes() {
+        let client_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"bad_client_secret"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            client_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration
+        );
+        assert_eq!(client_failure.failure_code, "oauth_invalid_client");
+        assert_eq!(
+            client_failure.provider_error_subtype,
+            Some("bad_client_secret")
+        );
+
+        let grant_type_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"invalid_grant_type"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            grant_type_failure.failure_code,
+            "oauth_unsupported_grant_type"
+        );
+        assert_eq!(
+            grant_type_failure.provider_error_subtype,
+            Some("invalid_grant_type")
+        );
+
+        let transient_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"ratelimited"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            transient_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Retry
+        );
+        assert_eq!(
+            transient_failure.failure_code,
+            "oauth_token_endpoint_retryable"
+        );
+        assert_eq!(
+            transient_failure.retry_schedule,
+            RefreshRetrySchedule::Short
+        );
+
+        let unknown_failure = classify_oauth_token_error(
+            reqwest::StatusCode::OK,
+            br#"{"ok":false,"error":"not_a_known_error"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            unknown_failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(unknown_failure.failure_code, "oauth_unrecognized_error");
+    }
+
+    #[tokio::test]
+    async fn oauth_error_body_returned_with_http_200_is_classified() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "invalid_refresh_token",
+                "needed": "provider-controlled detail",
+                "provided": "provider-controlled detail"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("rotated-out-grant", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-used".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(43_200)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "rotated-out-grant",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let stored = get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "reauthorization_required");
+        assert_eq!(stored.next_refresh_at_ms, i64::MAX);
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Reauthorize as i32
+        );
+        assert_eq!(stored.failure_code, "oauth_invalid_grant");
+        assert_eq!(stored.provider_error_subtype, "invalid_refresh_token");
+        assert!(!stored.last_error.contains("provider-controlled detail"));
+    }
+
+    #[tokio::test]
+    async fn success_body_without_token_or_error_still_reports_invalid_success_response() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("odd-issuer", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-current".to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        refresh_provider_credential(
+            &store,
+            "default",
+            &test_credentials(),
+            None,
+            "odd-issuer",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap_err();
+
+        let stored = get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "investigation_required");
+        assert_eq!(stored.failure_code, "oauth_invalid_success_response");
+        assert_eq!(
+            stored.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate as i32
+        );
+        assert!(stored.next_refresh_at_ms < i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn oauth2_refresh_token_accepts_slack_shaped_success_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_id=client-id"))
+            .and(body_string_contains("client_secret=client-secret"))
+            .and(body_string_contains("refresh_token=xoxe-1-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "access_token": "xoxe.xoxp-1-rotated",
+                "refresh_token": "xoxe-1-new",
+                "expires_in": 43_200,
+                "token_type": "user",
+                "scope": "users:read"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("my-slack", "slack");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "SLACK_USER_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                    ("refresh_token".to_string(), "xoxe-1-old".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before: Some(proto_duration(21_600)),
+                max_lifetime: Some(proto_duration(43_200)),
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let before_ms = current_time_ms();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            &credentials,
+            None,
+            "my-slack",
+            "SLACK_USER_TOKEN",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(
+            refreshed.expires_at_ms >= before_ms + 43_000 * 1000,
+            "12h lifetime must not be clamped when the profile cap allows it"
+        );
+        assert!(
+            refreshed.next_refresh_at_ms >= before_ms + 21_000 * 1000,
+            "next refresh is scheduled refresh_before_seconds ahead of expiry"
+        );
+
+        let stored_state =
+            get_refresh_state(&store, "default", provider.object_id(), "SLACK_USER_TOKEN")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&stored_state),
+                    &stored_state.secret_material_handles,
+                )
+                .await
+                .unwrap()
+                .get("refresh_token"),
+            Some(&"xoxe-1-new".to_string())
         );
     }
 
