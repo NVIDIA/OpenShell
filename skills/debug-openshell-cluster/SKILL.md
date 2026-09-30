@@ -123,6 +123,19 @@ journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
+For installer telemetry opt-outs on Debian, RPM, or Homebrew, inspect the user
+`openshell/gateway.env` configuration file. The installer persists
+`OPENSHELL_TELEMETRY_ENABLED=false` before restarting the service. Homebrew resolves
+`XDG_CONFIG_HOME` from the target user's launchd environment, defaulting to
+`~/.config`, and reads `openshell/gateway.env` under that directory. For systemd,
+inspect the unit's expanded `EnvironmentFiles` after `daemon-reload`; its cached
+configuration prefix can differ from an imported `XDG_CONFIG_HOME`. The installer
+updates that file and aborts if its path cannot be resolved unambiguously.
+Homebrew prefix environment settings are retained when the installer creates
+the user file. Omitting the variable on a later install
+does not remove a persisted opt-out. Snap installs only warn that the option is
+unsupported. See the published telemetry documentation for install-time usage.
+
 Gateway configuration requires `[openshell] version = 2`, a singular
 `compute_driver` selector, and driver-owned settings under
 `[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers` and

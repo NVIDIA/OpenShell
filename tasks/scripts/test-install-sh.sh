@@ -14,6 +14,199 @@ export OPENSHELL_INSTALL_SH_TEST=1
 # shellcheck source=../../install.sh
 . "${ROOT}/install.sh"
 
+# %E is cached when the manager starts. Later environment imports can report a
+# different XDG_CONFIG_HOME; only the unit's expanded EnvironmentFiles is final.
+# Include spaces and shell metacharacters in the actual configuration path.
+for cached_config in default custom; do
+  (
+    TELEMETRY_ENABLED=false
+    TARGET_HOME="${tmpdir}/systemd-home-${cached_config}"
+    TARGET_USER=test-user
+    imported_config="${tmpdir}/imported config ${cached_config}"
+    if [ "$cached_config" = default ]; then
+      config_home="${TARGET_HOME}/.config"
+    else
+      config_home="${tmpdir}/cached config 'quoted' \"double\" \\backslash \$literal \`literal\`"
+    fi
+    env_file="${config_home}/openshell/gateway.env"
+    reload_marker="${tmpdir}/reload-${cached_config}"
+    calls_file="${tmpdir}/telemetry-calls-${cached_config}"
+    mkdir -p "${config_home}/openshell" "${imported_config}/openshell"
+    printf '%s\n' 'OTHER_SETTING=keep' 'OPENSHELL_TELEMETRY_ENABLED=true' > "$env_file"
+    printf '%s\n' 'OPENSHELL_TELEMETRY_ENABLED=true' > "${imported_config}/openshell/gateway.env"
+    as_target_user() {
+      if [ "$1" != systemctl ]; then "$@"; return; fi
+      printf '%s\n' "$*" >> "$calls_file"
+      case "$*" in
+        'systemctl --user daemon-reload') touch "$reload_marker" ;;
+        'systemctl --user show openshell-gateway --property=EnvironmentFiles --value')
+          [ -f "$reload_marker" ] || return 1
+          printf '%s (ignore_errors=yes)\n' "$env_file"
+          ;;
+        'systemctl --user show-environment')
+          printf "XDG_CONFIG_HOME=\$'%s'\n" "$imported_config"
+          ;;
+        'systemctl --user enable openshell-gateway' | 'systemctl --user restart openshell-gateway')
+          [ "$(tail -1 "$env_file")" = 'OPENSHELL_TELEMETRY_ENABLED=false' ]
+          ;;
+        'systemctl --user is-active --quiet openshell-gateway') return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    register_local_gateway() { :; }
+    wait_for_local_gateway_listener() { :; }
+    wait_for_local_gateway_status() { :; }
+    start_user_gateway || exit 1
+    expected=$(printf '%s\n' 'OTHER_SETTING=keep' 'OPENSHELL_TELEMETRY_ENABLED=false')
+    [ "$(cat "$env_file")" = "$expected" ] || exit 1
+    [ "$(cat "${imported_config}/openshell/gateway.env")" = 'OPENSHELL_TELEMETRY_ENABLED=true' ] || exit 1
+    expected_calls=$(printf '%s\n' \
+      'systemctl --user daemon-reload' \
+      'systemctl --user show openshell-gateway --property=EnvironmentFiles --value' \
+      'systemctl --user enable openshell-gateway' \
+      'systemctl --user restart openshell-gateway' \
+      'systemctl --user is-active --quiet openshell-gateway')
+    [ "$(cat "$calls_file")" = "$expected_calls" ] || exit 1
+  ) || { echo 'FAIL: telemetry must use the expanded EnvironmentFile after reload and before restart' >&2; exit 1; }
+done
+
+# Do not restart the gateway when the expanded path cannot be determined, or
+# when multiple environment files could override the opt-out in a later file.
+for path_failure in reload query missing multiple; do
+  restart_marker="${tmpdir}/unexpected-restart-${path_failure}"
+  if (
+    TELEMETRY_ENABLED=false
+    TARGET_USER=test-user
+    as_target_user() {
+      case "$*" in
+        'systemctl --user daemon-reload') [ "$path_failure" != reload ] ;;
+        'systemctl --user show openshell-gateway --property=EnvironmentFiles --value')
+          case "$path_failure" in
+            query) return 1 ;;
+            missing) return 0 ;;
+            multiple) printf '%s (ignore_errors=yes)\n' /unused/first.env /unused/second.env ;;
+          esac
+          ;;
+        'systemctl --user restart openshell-gateway') touch "$restart_marker" ;;
+        *) return 0 ;;
+      esac
+    }
+    start_user_gateway
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${path_failure} EnvironmentFile resolution must abort the opt-out" >&2
+    exit 1
+  fi
+  [ ! -e "$restart_marker" ] || { echo 'FAIL: gateway restarted without a persisted opt-out' >&2; exit 1; }
+done
+
+# Headless install: daemon-reload fails (no user systemd session). With
+# telemetry disabled the installer must write the opt-out to ~/.config and
+# continue rather than aborting, so there is no emission window when the
+# operator later starts the service manually.
+(
+  TELEMETRY_ENABLED=false
+  TARGET_HOME="${tmpdir}/headless-home"
+  TARGET_USER=test-user
+  restart_marker="${tmpdir}/headless-restart"
+  as_target_user() {
+    case "$*" in
+      'systemctl --user daemon-reload') return 1 ;;
+      'systemctl --user restart openshell-gateway') touch "$restart_marker" ;;
+      *) "$@" ;;
+    esac
+  }
+  register_local_gateway() { :; }
+  wait_for_local_gateway_listener() { :; }
+  wait_for_local_gateway_status() { :; }
+  start_user_gateway
+) || { echo 'FAIL: headless daemon-reload failure with telemetry disabled must not abort' >&2; exit 1; }
+[ -f "${tmpdir}/headless-home/.config/openshell/gateway.env" ] || { echo 'FAIL: opt-out must be written to ~/.config on headless install' >&2; exit 1; }
+grep -q 'OPENSHELL_TELEMETRY_ENABLED=false' "${tmpdir}/headless-home/.config/openshell/gateway.env" || { echo 'FAIL: opt-out value missing from headless gateway.env' >&2; exit 1; }
+[ ! -e "${tmpdir}/headless-restart" ] || { echo 'FAIL: gateway must not be restarted on headless install' >&2; exit 1; }
+
+# Homebrew must use launchd's configuration directory rather than the caller's.
+# Preserve an existing custom environment and retain the prefix fallback when
+# creating a new one. Mock launchctl; never change the host's launchd environment.
+for existing_env in yes no; do
+  (
+    TELEMETRY_ENABLED=false
+    TARGET_HOME="${tmpdir}/brew-home-${existing_env}"
+    TARGET_UID=1234
+    XDG_CONFIG_HOME="${tmpdir}/installer-only-config"
+    export XDG_CONFIG_HOME
+    config_home="${tmpdir}/launchd config ${existing_env}"
+    brew_prefix="${tmpdir}/brew-prefix-${existing_env}"
+    mkdir -p "${brew_prefix}/var/openshell"
+    printf '%s\n' 'PREFIX_SETTING=keep' 'OPENSHELL_TELEMETRY_ENABLED=true' > "${brew_prefix}/var/openshell/gateway.env"
+    if [ "$existing_env" = yes ]; then
+      mkdir -p "${config_home}/openshell"
+      printf '%s\n' 'USER_SETTING=keep' 'OPENSHELL_TELEMETRY_ENABLED=true' > "${config_home}/openshell/gateway.env"
+      retained_setting='USER_SETTING=keep'
+    else
+      retained_setting='PREFIX_SETTING=keep'
+    fi
+    as_target_user() {
+      case "$1" in
+        brew)
+          [ "$*" = 'brew --prefix' ] || return 1
+          printf '%s\n' "$brew_prefix"
+          ;;
+        /bin/launchctl)
+          [ "$*" = '/bin/launchctl asuser 1234 /bin/launchctl getenv XDG_CONFIG_HOME' ] || return 1
+          printf '%s\n' "$config_home"
+          ;;
+        *) "$@" ;;
+      esac
+    }
+    configure_macos_gateway_telemetry
+    expected=$(printf '%s\n' "$retained_setting" 'OPENSHELL_TELEMETRY_ENABLED=false')
+    [ "$(cat "${config_home}/openshell/gateway.env")" = "$expected" ] || exit 1
+    [ ! -e "${TARGET_HOME}/.config/openshell/gateway.env" ] || exit 1
+    [ ! -e "${XDG_CONFIG_HOME}/openshell/gateway.env" ] || exit 1
+    [ "$(tail -1 "${brew_prefix}/var/openshell/gateway.env")" = 'OPENSHELL_TELEMETRY_ENABLED=true' ] || exit 1
+  ) || { echo 'FAIL: Homebrew custom launchd configuration must receive the opt-out' >&2; exit 1; }
+done
+
+# XDG_CONFIG_HOME absent from launchd environment: getenv exits 0 with empty
+# output on macOS (success but key not present). Must fall back to ~/.config.
+(
+  TELEMETRY_ENABLED=false
+  TARGET_HOME="${tmpdir}/brew-home-unset-xdg"
+  TARGET_UID=1234
+  brew_prefix="${tmpdir}/brew-prefix-unset-xdg"
+  mkdir -p "${brew_prefix}/var/openshell"
+  as_target_user() {
+    case "$1" in
+      brew)
+        [ "$*" = 'brew --prefix' ] || return 1
+        printf '%s\n' "$brew_prefix"
+        ;;
+      /bin/launchctl)
+        [ "$*" = '/bin/launchctl asuser 1234 /bin/launchctl getenv XDG_CONFIG_HOME' ] || return 1
+        ;;
+      *) "$@" ;;
+    esac
+  }
+  configure_macos_gateway_telemetry
+  [ -f "${TARGET_HOME}/.config/openshell/gateway.env" ] || exit 1
+  grep -q 'OPENSHELL_TELEMETRY_ENABLED=false' "${TARGET_HOME}/.config/openshell/gateway.env" || exit 1
+) || { echo 'FAIL: unset launchd XDG_CONFIG_HOME must fall back to ~/.config' >&2; exit 1; }
+
+if (
+  TELEMETRY_ENABLED=false
+  TARGET_UID=1234
+  as_target_user() {
+    case "$1" in
+      brew) printf '/unused\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  configure_macos_gateway_telemetry
+) >"$out" 2>"$err"; then
+  echo 'FAIL: unable to read launchd environment must abort the opt-out' >&2
+  exit 1
+fi
+
 assert_glibc_preflight_passes() {
   local name=$1
   local ldd_output=$2
