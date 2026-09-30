@@ -312,13 +312,8 @@ input closure is not equivalent to sending a terminal Ctrl-D keystroke.
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
 ```shell
-openshell sandbox exec my-sandbox -- ls -la /workspace
+openshell sandbox exec -n my-sandbox -- ls -la /workspace
 ```
-
-Name the sandbox as a positional argument or with `-n`/`--name`, but not both.
-Omit both to use the last-used sandbox. The `--` separator is required, and
-everything after it is the remote command, including arguments that start with
-`-` or contain another `--`. Options such as `--tty` go before `--`.
 
 Pipe stdin into the command:
 
@@ -352,7 +347,7 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 
 | Flag              | Purpose                                                  |
 | ----------------- | -------------------------------------------------------- |
-| `-n`, `--name`    | Sandbox to target. Alternative to the positional name.   |
+| `-n`, `--name`    | Sandbox to target.                                       |
 | `--workdir`       | Working directory for the command inside the sandbox.    |
 | `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
 | `--tty`           | Force TTY allocation.                                    |
