@@ -9,8 +9,8 @@
 
 ## Testing
 <!-- Report current verification performed for this implementation. Do not copy diagnostics from the original issue. -->
-- [ ] `mise run pre-commit` passes
-- [ ] Unit tests added/updated
+- [ ] Checks appropriate to the affected code and behavior pass
+- [ ] Unit tests added/updated (if applicable)
 - [ ] E2E tests added/updated (if applicable)
 
 ## Checklist

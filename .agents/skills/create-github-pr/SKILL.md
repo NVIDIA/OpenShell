@@ -30,13 +30,11 @@ deployment docs.
 
 Use the `sync-agent-infra` skill's maintenance map to identify related skill updates when the branch changes behavior, commands, or development workflows. Run its full consistency check when the branch adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references. Resolve any drift before creating the PR.
 
-### Run Pre-commit Checks
+### Verify the Affected Areas
 
-Run the local pre-commit task before opening a PR:
+Use the verification guidance in `CONTRIBUTING.md` to select checks for the changed files and behavior. Guidance, skills, and template changes need applicable Markdown, YAML, link, and consistency checks. Run Rust or SDK suites when those components or their dependencies can be affected. Shared APIs, schemas, dependencies, and build changes may require broader checks even when component source files are unchanged.
 
-```bash
-mise run pre-commit
-```
+`mise run ci` and `mise run pre-commit` are broad convenience tasks, not blanket PR prerequisites. Broaden validation only for a concrete remaining risk or failed check, and report what actually ran.
 
 ### Verify Branch State
 
@@ -160,8 +158,8 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 
 ## Testing
 <!-- What testing was done? -->
-- [ ] `mise run pre-commit` passes
-- [ ] Unit tests added/updated
+- [ ] Checks appropriate to the affected code and behavior pass
+- [ ] Unit tests added/updated (if applicable)
 - [ ] E2E tests added/updated (if applicable)
 
 ## Checklist
@@ -193,7 +191,7 @@ Closes #456
 
 ## Testing
 
-- [x] `mise run pre-commit` passes
+- [x] Relevant CLI format, lint, and unit checks pass
 - [x] Unit tests added/updated
 - [ ] E2E tests added/updated (if applicable)
 

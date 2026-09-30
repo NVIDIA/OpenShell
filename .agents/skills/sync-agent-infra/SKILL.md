@@ -42,6 +42,7 @@ Search both `skills/` and `.agents/skills/` for affected commands, fields, and c
 4. Check issue templates, `create-github-issue`, `create-spike`, and `triage-issue` for the first-hand OpenShell User Story, OpenShell-only bug reproduction, notional UX examples, and consideration of applicable extension points.
 5. Check the PR template, `create-github-pr`, `build-from-issue`, `fix-security-issue`, and `CONTRIBUTING.md`: every PR must close an existing issue covering its scope. Multi-PR work needs an issue per PR; a separate issue may track the overall effort.
 6. Check `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/workflows/`, `.agents/agents/`, and related skill cross references for stale workflow statements. Keep user-facing documentation changes minimal and avoid duplicated internal explanations.
-7. Use `npx -y skills add . --list` from a disposable clean copy when skill discovery changes. It should expose public skills only; clean generated files afterward.
+7. Check that PR and build skills follow the scoped verification guidance in `CONTRIBUTING.md`; they must not require full Rust, SDK, or repository CI for changes that cannot affect those areas.
+8. Use `npx -y skills add . --list` from a disposable clean copy when skill discovery changes. It should expose public skills only; clean generated files afterward.
 
 Fix contradictions, then repeat the affected checks. Report files changed and any remaining drift. Do not treat an old document's label list as a source of truth over current GitHub metadata.

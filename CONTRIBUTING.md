@@ -355,10 +355,20 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 1. Create a feature branch from `main`.
 2. Make your changes with tests.
-3. Run `mise run ci` to verify.
+3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
 Every PR must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+
+### Choose Verification for the Change
+
+Choose checks based on the files changed and the behavior they can affect. Run the relevant formatter, linter, type or compile checks, and tests for those areas. Include dependent components when a shared API, schema, dependency, or build change can affect them.
+
+For contributor guidance, skills, Markdown, and issue or PR templates, validate formatting, links, YAML, and cross references as applicable. Run docs validation when published docs or navigation change. These changes do not require full Rust or SDK suites when they cannot affect those components.
+
+For code changes, run tests for the affected crates or SDKs and their dependent behavior. For sandbox, policy, or deployment infrastructure changes, run the relevant E2E lane. Broaden verification when the change spans components, focused checks fail, or a concrete regression risk remains.
+
+`mise run ci` runs the full repository checks, and `mise run pre-commit` runs broad formatting and lint checks. Use them when that scope is warranted; they are not blanket prerequisites for every change. Report what actually ran and any relevant limitation in the PR. Stop once the checks needed for the change have passed.
 
 ### Commit Messages
 
