@@ -1430,6 +1430,11 @@ async fn apply_minted_credential(
     credential_key: &str,
     minted: &MintedCredential,
 ) -> Result<(), Status> {
+    // Validate the expiration before staging anything, so this conversion can
+    // never leave staged credential handles behind.
+    let credential_expiration_time =
+        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?;
     let mut updated = provider.clone();
     let staging_id = format!("{}-refresh-{}", provider.object_id(), uuid::Uuid::new_v4());
     let staged_handles = if let Some(credentials) = credentials
@@ -1477,9 +1482,6 @@ async fn apply_minted_credential(
         }
         None
     };
-    let credential_expiration_time =
-        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
-            .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(expiration_time) = credential_expiration_time.as_ref() {
         updated
             .credential_expiration_times
@@ -1500,9 +1502,19 @@ async fn apply_minted_credential(
     // prevents route status from committing against the old provider revision
     // after the rotation writes, without holding the guard across network I/O.
     let _sandbox_sync_guard = if let Some(compute) = compute {
-        Some(compute.sandbox_sync_guard().await.map_err(|error| {
-            Status::internal(format!("acquire provider mutation lock: {error}"))
-        })?)
+        match compute.sandbox_sync_guard().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                if let Some(credentials) = credentials
+                    && let Some(handles) = &staged_handles
+                {
+                    cleanup_staged_refresh_handles(credentials, provider, handles).await;
+                }
+                return Err(Status::internal(format!(
+                    "acquire provider mutation lock: {error}"
+                )));
+            }
+        }
     } else {
         None
     };
@@ -4617,6 +4629,62 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
         assert_eq!(credentials.stored_credential_count(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn apply_minted_credential_rejects_invalid_expiry_without_staging() {
+        use super::apply_minted_credential;
+
+        let store = test_store().await;
+        let credentials = test_credentials();
+        let mut prov = provider("expiring-aws", "aws");
+        let original_handles = credentials
+            .store_provider_credentials(
+                prov.object_name(),
+                prov.object_workspace(),
+                prov.object_id(),
+                &HashMap::from([(
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "old-access-key".to_string(),
+                )]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        prov.credential_handles.clone_from(&original_handles);
+        let stored_credential_count = credentials.stored_credential_count();
+        store.put_message(&prov).await.unwrap();
+
+        // i64::MAX milliseconds is past the latest protobuf timestamp, so the
+        // expiration conversion fails.
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: i64::MAX,
+            refresh_token: None,
+            additional_credentials: HashMap::new(),
+        };
+        let err = apply_minted_credential(
+            &store,
+            "default",
+            Some(&credentials),
+            None,
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(
+            credentials.stored_credential_count(),
+            stored_credential_count
+        );
+        let stored = store
+            .get_message_by_name::<Provider>("default", "expiring-aws")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential_handles, original_handles);
     }
 
     // A wiremock responder that blocks the STS response until the test releases
