@@ -652,6 +652,7 @@ run_scenario() {
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
+    "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
     "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
     "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
@@ -942,6 +943,9 @@ SUPERVISOR_IMAGE="$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE:-${REGISTRY_
 SANDBOX_RUNTIME_IMAGE="$(e2e_resolve_image_reference "${SANDBOX_IMAGE:-${REGISTRY_VALUE}/sandbox}" "${IMAGE_TAG_VALUE}")"
 BUILD_GATEWAY_IMAGE="${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}"
 BUILD_SUPERVISOR_IMAGE="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+# Each image carries its own registry; clear the chart's default so a
+# registry-less local tag is not rewritten to ghcr.io.
+GLOBAL_HELM_IMAGE_ARGS=(--set-string "global.image.registry=")
 GATEWAY_HELM_IMAGE_ARGS=(--set-string "gateway.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")" --set-string "gateway.image.repository=$(e2e_image_reference_repository_path "${GATEWAY_IMAGE}")" --set-string "gateway.image.tag=$(e2e_image_reference_tag "${GATEWAY_IMAGE}")" --set-string "gateway.image.digest=$(e2e_image_reference_digest "${GATEWAY_IMAGE}")")
 SUPERVISOR_HELM_IMAGE_ARGS=(--set-string "supervisor.image.registry=$(e2e_image_reference_registry "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.repository=$(e2e_image_reference_repository_path "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.tag=$(e2e_image_reference_tag "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.digest=$(e2e_image_reference_digest "${SUPERVISOR_IMAGE}")")
 SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e2e_image_reference_registry "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.repository=$(e2e_image_reference_repository_path "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.tag=$(e2e_image_reference_tag "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.digest=$(e2e_image_reference_digest "${SANDBOX_RUNTIME_IMAGE}")")
@@ -1384,6 +1388,7 @@ else
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
+    "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
     "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
     "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
