@@ -2591,22 +2591,22 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: config.allow_encoded_slash,
+            ..Default::default()
+        });
+
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
-        let parsed = match crate::l7::graphql::parse_graphql_http_request(
-            client,
-            config.graphql_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
-                allow_encoded_slash: config.allow_encoded_slash,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(Some(parsed)) => parsed,
+        // Validate the head, including body framing, before deciding whether
+        // this endpoint can inspect the requested protocol. Upgrade refusal
+        // must not wait for a body or depend on its inspection size limit.
+        let mut req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
             Err(e) => {
                 if is_benign_connection_error(&e) {
@@ -2625,13 +2625,44 @@ where
             }
         };
 
-        let req = parsed.request;
-        let graphql_info = parsed.info;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
+            return Ok(());
+        }
+
+        let graphql_info = match crate::l7::graphql::inspect_graphql_request(
+            client,
+            &mut req,
+            config.graphql_max_body_bytes,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "GraphQL L7 connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7-graphql");
+                }
+                return Ok(());
+            }
+        };
+
+        // Inspection appends the body to raw_header. An HTTP/1.0 request
+        // without Host must still be denied if that body contains reserved
+        // credential markers, so repeat the authority check on the full request.
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
 
@@ -9694,6 +9725,156 @@ network_policies:
         )
         .await;
         assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_is_refused_before_body_read() {
+        // Send only the complete head. Neither an oversized declaration nor
+        // an incomplete allowed-size body may delay the upgrade refusal.
+        for content_length in [65537, 16] {
+            for enforcement in [EnforcementMode::Enforce, EnforcementMode::Audit] {
+                for upgrade in ["websocket", "custom"] {
+                    let (mut config, engine, ctx) = graphql_test_relay_context();
+                    config.enforcement = enforcement;
+                    assert_eq!(config.graphql_max_body_bytes, 65536);
+                    let request = format!(
+                        "POST /graphql HTTP/1.1\r\nHost: graphql.example.test:8000\r\nContent-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nContent-Length: {content_length}\r\n\r\n"
+                    );
+                    let started = tokio::time::Instant::now();
+                    let scenario = run_upgrade_scenario(
+                        request.as_bytes(),
+                        UNALLOWED_GRAPHQL_MUTATION,
+                        move |mut client, mut upstream| {
+                            tokio::spawn(async move {
+                                relay_with_inspection(
+                                    &config,
+                                    engine,
+                                    &mut client,
+                                    &mut upstream,
+                                    &ctx,
+                                )
+                                .await
+                            })
+                        },
+                    )
+                    .await;
+                    assert_graphql_upgrade_refused_before_forwarding(&scenario);
+                    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_preserves_head_validation() {
+        // Framing errors are rejected by the HTTP parser, and authority
+        // mismatches retain their specific denial before upgrade handling.
+        for (host, framing, expected) in [
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nTransfer-Encoding: chunked\r\n",
+                "",
+            ),
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nContent-Length: 17\r\n",
+                "",
+            ),
+            (
+                "other.example.test:8000",
+                "Content-Length: 16\r\n",
+                "request_authority_mismatch",
+            ),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let request = format!(
+                "POST /graphql HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: custom\r\n{framing}\r\n"
+            );
+            let scenario = run_upgrade_scenario(
+                request.as_bytes(),
+                UNALLOWED_GRAPHQL_MUTATION,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                            .await
+                    })
+                },
+            )
+            .await;
+            assert!(scenario.upstream_seen.is_empty());
+            if expected.is_empty() {
+                assert!(scenario.response.is_empty());
+            } else {
+                assert!(scenario.response.starts_with("HTTP/1.1 403"));
+                assert!(scenario.body.contains(expected));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_post_still_inspects_body() {
+        for (field, host, token) in [
+            ("viewer", "graphql.example.test:8000", ""),
+            ("admin", "graphql.example.test:8000", ""),
+            ("viewer", "", ""),
+            ("viewer", "", "openshell:resolve:env:v1_API_TOKEN"),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_inspection(&config, engine, &mut client, &mut relay_upstream, &ctx).await
+            });
+            let body = format!(r#"{{"query":"{{{field}}}","variables":{{"token":"{token}"}}}}"#);
+            let (version, authority) = if host.is_empty() {
+                ("HTTP/1.0", String::new())
+            } else {
+                ("HTTP/1.1", format!("Host: {host}\r\n"))
+            };
+            let request = format!(
+                "POST /graphql {version}\r\n{authority}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut forwarded = Vec::new();
+            if field == "viewer" && token.is_empty() {
+                let headers = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    read_http_headers(&mut upstream),
+                )
+                .await
+                .expect("allowed POST head must reach upstream");
+                assert!(headers.starts_with(format!("POST /graphql {version}\r\n").as_bytes()));
+                let mut bytes = vec![0; body.len()];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    upstream.read_exact(&mut bytes),
+                )
+                .await
+                .expect("allowed POST must reach upstream")
+                .unwrap();
+                assert_eq!(bytes, body.as_bytes());
+            } else {
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    app.read_to_end(&mut response),
+                )
+                .await
+                .expect("unlisted field or credential marker without Host must be denied")
+                .unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 403"));
+                if !token.is_empty() {
+                    assert!(
+                        String::from_utf8_lossy(&response).contains("request_authority_mismatch")
+                    );
+                }
+                upstream.read_to_end(&mut forwarded).await.unwrap();
+                assert!(forwarded.is_empty());
+            }
+            relay.abort();
+            let _ = relay.await;
+        }
     }
 
     #[tokio::test]
