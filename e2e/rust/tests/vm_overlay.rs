@@ -53,5 +53,46 @@ async fn vm_overlay() {
         output.status.code(),
     );
 
+    for cycle in 0..3 {
+        let output = openshell_cmd()
+            .args(["sandbox", "exec", "--name", &sandbox.name, "--no-tty", "--"])
+            .args(["sh", "-c"])
+            .arg(format!(
+                "set -eu; mkdir -p /sandbox/journal-{cycle}; \
+                 for i in $(seq 1 128); do printf '%s\\n' \"$i\" > /sandbox/journal-{cycle}/$i; done; sync"
+            ))
+            .output()
+            .await
+            .expect("write overlay before stop");
+        assert!(output.status.success(), "overlay writes failed: {output:?}");
+
+        for action in ["stop", "start"] {
+            let output = openshell_cmd()
+                .args(["sandbox", action, &sandbox.name])
+                .output()
+                .await
+                .expect("run sandbox lifecycle command");
+            assert!(
+                output.status.success(),
+                "{action} failed on cycle {cycle}: {output:?}"
+            );
+        }
+
+        let output = openshell_cmd()
+            .args(["sandbox", "exec", "--name", &sandbox.name, "--no-tty", "--"])
+            .args(["sh", "-c"])
+            .arg(format!(
+                "set -eu; test \"$(cat /sandbox/overlay-check)\" = overlay-write; \
+                 for i in $(seq 1 128); do test \"$(cat /sandbox/journal-{cycle}/$i)\" = \"$i\"; done"
+            ))
+            .output()
+            .await
+            .expect("read overlay after restart");
+        assert!(
+            output.status.success(),
+            "overlay contents changed on cycle {cycle}: {output:?}"
+        );
+    }
+
     sandbox.cleanup().await;
 }

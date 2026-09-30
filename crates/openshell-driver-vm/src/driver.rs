@@ -6178,6 +6178,7 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
         let generation_for_cleanup = generation.clone();
         tokio::task::spawn_blocking(move || {
+            recover_rootfs_image(&overlay)?;
             let tls = guest_boundary_tls_paths(&generation_for_cleanup);
             for guest_path in [
                 PathBuf::from(guest_boundary_config_path(&generation_for_cleanup)),
@@ -8886,6 +8887,45 @@ mod tests {
             serde_json::to_vec(&authentication).expect("encode launch authentication"),
             session_id,
         )
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_preserves_markers_when_overlay_recovery_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path();
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            b"generation-1\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(state_dir.join(HOST_AUTH_BUNDLE_FILE), b"auth")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE), b"descriptor")
+            .await
+            .unwrap();
+        let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
+        tokio::fs::write(&overlay, b"invalid ext4 image")
+            .await
+            .unwrap();
+
+        assert!(remove_runtime_generation_material(state_dir).await.is_err());
+
+        for marker in [
+            HOST_BOUNDARY_GENERATION_FILE,
+            HOST_AUTH_BUNDLE_FILE,
+            HOST_RUNTIME_DESCRIPTOR_FILE,
+        ] {
+            assert!(
+                state_dir.join(marker).is_file(),
+                "lost {marker} before recovery"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(overlay).await.unwrap(),
+            b"invalid ext4 image"
+        );
     }
 
     #[tokio::test]

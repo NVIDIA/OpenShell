@@ -244,6 +244,11 @@ marked sandboxes without launching compute. Start removes the marker and uses
 the normal persisted restore path with the existing overlay. Delete removes the
 entire sandbox state directory, including a stop marker and overlay.
 
+After stopping the VM, the driver recovers the overlay's ext4 journal before
+removing the previous generation's guest authentication files. If recovery
+fails, cleanup returns an error and retains the host generation markers so a
+later attempt can recover the disk before changing it.
+
 The host control writes and syncs a terminal tombstone when the canonical main
 process exits, before it reports completion and while it retains the boundary
 for exec and forwarding. Driver startup reports that sandbox as terminal
