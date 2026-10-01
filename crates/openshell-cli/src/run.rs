@@ -6618,8 +6618,8 @@ pub fn policy_check(path: &Path) -> Result<()> {
                 .iter()
                 .map(|violation| format!("  - {violation}"))
                 .collect::<Vec<_>>()
-                .join("\\n");
-            Err(miette!("policy validation failed:\\n{details}"))
+                .join("\n");
+            Err(miette!("policy validation failed:\n{details}"))
         }
     }
 }
@@ -6690,6 +6690,31 @@ mod tests {
         sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
         service_url_for_gateway, workspace_member_to_json,
     };
+
+    #[test]
+    fn policy_check_validates_without_gateway() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\\nprocess:\\n  run_as_user: \\\"0\\\"\\n  run_as_group: \\\"0\\\"\\n",
+        )
+        .expect("write policy");
+
+        let error = super::policy_check(&path).expect_err("root identity must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("run_as_user"));
+        assert!(message.contains("run_as_group"));
+    }
+
+    #[test]
+    fn policy_check_accepts_valid_file_without_gateway() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(&path, "version: 1\\n").expect("write policy");
+
+        super::policy_check(&path).expect("valid policy should pass");
+    }
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
