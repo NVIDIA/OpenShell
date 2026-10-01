@@ -366,6 +366,8 @@ check the sandbox log for the specific error:
 openshell sandbox get my-sandbox --output json
 ```
 
+The same repair window applies when the gateway refuses an image-policy upload or a policy update that adds baseline filesystem paths with `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. After the gateway acknowledges the rejection report, startup waits two seconds, reads a fresh configuration, and retries. If your repair reaches the gateway before that report, startup immediately reads the repaired configuration. The sandbox log records the gateway's reason; repeated refusals of the same write, status code, and configuration are logged once. Authentication and authorization failures still stop startup.
+
 You have 300 seconds to fix the configuration. Replace the policy with
 `openshell policy set`, or fix the provider configuration. Until the workload
 first starts, you can also change filesystem, Landlock, and process settings.
