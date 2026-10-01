@@ -107,13 +107,16 @@ its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
 ### K3s boot readiness and diagnostics
 
-The K3s installer checks readiness during provisioning and again after the test
-VM boots, including boots from cached installer disks. The checks wait for the
-API, nodes, gateway StatefulSet, and forwarder, then require `openshell status
---output json` to report the registered `tmachine` gateway as connected. Readiness
+The K3s installer checks readiness during provisioning and again after the automated
+test VM boots, including boots from cached installer disks. The checks wait for the
+API, nodes, and gateway StatefulSet, then require `openshell status --output json`
+to report the registered `tmachine` gateway as connected through the forwarder. Readiness
 failures stop the suite before its scenarios run; scenario timeouts are unchanged.
 The loopback forwarder retries every five seconds without a systemd start limit
 so it can recover after temporary K3s API failures.
+
+Interactive `shell` suites skip test-boot preparation so you can inspect a gateway
+that failed during boot. They still run the installer checks when provisioning.
 
 Installation, readiness, and conformance failures collect bounded K3s and
 forwarder journals, service state, listener state, Pod identity and container

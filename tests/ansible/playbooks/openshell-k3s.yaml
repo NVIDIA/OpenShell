@@ -166,11 +166,6 @@
             enabled: true
             state: started
 
-        - name: Wait for OpenShell gateway
-          ansible.builtin.wait_for:
-            host: 127.0.0.1
-            port: 17670
-            timeout: 60
       rescue:
         - name: Collect K3s installation diagnostics
           ansible.builtin.include_role:

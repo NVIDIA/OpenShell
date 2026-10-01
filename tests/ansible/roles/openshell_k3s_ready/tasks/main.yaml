@@ -27,16 +27,8 @@
       ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=190s --namespace openshell rollout status statefulset/openshell --timeout=180s
       changed_when: false
 
-    # Do not restart or reset-failed here: the unit must recover by itself.
-    - name: Wait for the gateway forwarder to run
-      become: true
-      ansible.builtin.command: systemctl is-active openshell-k3s-port-forward.service
-      register: k3s_forwarder_ready
-      changed_when: false
-      until: k3s_forwarder_ready.rc == 0
-      retries: 30
-      delay: 2
-
+    # A connected CLI proves the forwarder works. Allow time for it to recover
+    # without restarting or resetting the unit here.
     - name: Wait for the registered gateway to answer the CLI
       become: true
       become_user: tmachine
@@ -48,7 +40,7 @@
         (k3s_gateway_ready.stdout | from_json).status == 'connected' and
         (k3s_gateway_ready.stdout | from_json).gateway == 'tmachine' and
         (k3s_gateway_ready.stdout | from_json).server == 'http://127.0.0.1:17670'
-      retries: 12
+      retries: 24
       delay: 5
   rescue:
     - name: Collect K3s readiness diagnostics

@@ -40,7 +40,7 @@ pub struct Installer {
     pub use_galaxy: bool,
     pub playbooks: Vec<PathBuf>,
     pub inputs: BTreeMap<String, PathBuf>,
-    /// Readiness checks run on every test boot, including cached installations.
+    /// Readiness checks run on non-interactive test boots, including cached installations.
     #[serde(default)]
     pub prepare_playbooks: Vec<PathBuf>,
 }
