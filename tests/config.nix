@@ -85,7 +85,6 @@ let
         name = "k3s";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
-        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ready.yaml" ];
         inputs = {
           agent_sandbox_version = "0.5.0";
           openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
@@ -99,7 +98,7 @@ let
         name = "k3s-ha-tls";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
-        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ready.yaml" ];
+        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ha-tls-ready.yaml" ];
         inputs = {
           openshell_k3s_ha = "true";
           openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
