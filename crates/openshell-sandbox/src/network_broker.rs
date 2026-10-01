@@ -1580,8 +1580,19 @@ fn get_peer_name(
         return listener.respond_continue(notification.id);
     };
     let peer = match entry.state() {
+        // The relay path leaves the workload's descriptor connected to a
+        // loopback relay, so the kernel's peer is the relay address rather
+        // than the destination the workload asked for. The broker must keep
+        // writing `original_peer` itself.
         SocketState::Connected { original_peer } => *original_peer,
-        SocketState::Local { peer } | SocketState::AcceptedLocal { peer } => *peer,
+        // These descriptors really are connected to the recorded peer, so the
+        // kernel's own answer is identical to the broker's. Letting the kernel
+        // write it keeps the sockaddr store inside the workload's address
+        // space, which needs no cross-process task-memory write and therefore
+        // works on kernels without SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV.
+        SocketState::Local { .. } | SocketState::AcceptedLocal { .. } => {
+            return listener.respond_continue(notification.id);
+        }
         _ => return Err(io::Error::from_raw_os_error(libc::ENOTCONN)),
     };
     write_socket_addr(
@@ -2038,6 +2049,98 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let error = write_socket_addr(&listener, 1, 0, 0, 0, peer)
             .expect_err("legacy listener must reject socket-address writes");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+    }
+
+    /// Stage one registered TCP socket in `state` and return the registry
+    /// alongside the descriptor number the workload would see.
+    fn registry_with_state(state: SocketState) -> (Mutex<SocketRegistry>, OwnedFd) {
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        // SAFETY: a successful socket call returns one new owned descriptor.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let installed = duplicate_close_on_exec(fd).unwrap();
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry.commit_with_state(tentative, state).unwrap();
+        (Mutex::new(registry), installed)
+    }
+
+    /// A `NotificationListener` whose descriptor is not a seccomp listener, so
+    /// any ioctl fails. Only useful for discriminating *which* path was taken.
+    fn fake_legacy_listener() -> NotificationListener {
+        // SAFETY: dup returns a new descriptor or a negative error.
+        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(dup >= 0, "dup stderr");
+        NotificationListener::from_fd_with_mode(
+            // SAFETY: successful dup returned a new owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(dup) },
+            ListenerMode::LegacyReadOnly,
+        )
+    }
+
+    fn getpeername_notification(fd: RawFd) -> Notification {
+        Notification {
+            id: 1,
+            // SAFETY: gettid has no arguments or side effects.
+            tid: u32::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap(),
+            syscall: i32::try_from(libc::SYS_getpeername).unwrap(),
+            args: [u64::try_from(fd).unwrap(), 0x1000, 0x2000, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn legacy_getpeername_continues_for_locally_connected_sockets() {
+        // The descriptor really is connected to `peer`, so the kernel's own
+        // answer equals the broker's. Responding CONTINUE lets the kernel
+        // write the sockaddr in the workload's own address space, which needs
+        // no WAIT_KILLABLE_RECV and therefore works on kernels < 5.19.
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        for (label, state) in [
+            ("AcceptedLocal", SocketState::AcceptedLocal { peer }),
+            ("Local", SocketState::Local { peer }),
+        ] {
+            let (registry, installed) = registry_with_state(state);
+            let listener = fake_legacy_listener();
+            let error = get_peer_name(
+                &registry,
+                &listener,
+                getpeername_notification(installed.as_raw_fd()),
+            )
+            .expect_err("the fake listener cannot complete any ioctl");
+            assert_ne!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP),
+                "{label} must not route through the fail-closed task-memory write"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_getpeername_still_substitutes_the_original_peer_for_relayed_sockets() {
+        // A `Connected` descriptor is connected to a loopback relay, not to
+        // the destination the workload asked for. CONTINUE here would hand the
+        // workload the relay's ephemeral address, so the broker must keep
+        // writing `original_peer` itself -- and keep failing closed when it
+        // cannot.
+        let (registry, installed) = registry_with_state(SocketState::Connected {
+            original_peer: "203.0.113.7:443".parse().unwrap(),
+        });
+        let listener = fake_legacy_listener();
+        let error = get_peer_name(
+            &registry,
+            &listener,
+            getpeername_notification(installed.as_raw_fd()),
+        )
+        .expect_err("legacy listener must reject socket-address writes");
         assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
     }
 
