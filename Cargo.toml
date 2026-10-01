@@ -70,7 +70,7 @@ tracing-appender = "0.2"
 # tonic 0.14 / prost 0.14 via opentelemetry-proto's `grpc-tonic` feature.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "gzip-tonic", "tls-aws-lc", "tls-roots"] }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 
 # Metrics
