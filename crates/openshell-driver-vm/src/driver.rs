@@ -1084,6 +1084,7 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         self.validate_sandbox(sandbox)?;
+        validate_vm_launch_authentication(sandbox)?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1274,6 +1275,7 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
+        let launch_authentication = validate_vm_launch_authentication(&sandbox)?;
         let is_gpu = sandbox
             .spec
             .as_ref()
@@ -1353,29 +1355,6 @@ impl VmDriver {
                     )));
                 }
             };
-        let launch_authentication = sandbox
-            .spec
-            .as_ref()
-            .filter(|spec| !spec.launch_authentication.is_empty())
-            .ok_or_else(|| {
-                Status::failed_precondition("VM sandbox launch authentication is required")
-            })
-            .and_then(|spec| {
-                serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
-                    &spec.launch_authentication,
-                )
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "decode VM sandbox launch authentication: {error}"
-                    ))
-                })
-            })?;
-        launch_authentication.validate().map_err(|error| {
-            Status::failed_precondition(format!(
-                "validate VM sandbox launch authentication: {error}"
-            ))
-        })?;
-
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -4358,6 +4337,7 @@ impl ComputeDriver for VmDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.validate_sandbox(&sandbox)?;
+        validate_vm_launch_authentication(&sandbox)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -4546,6 +4526,36 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     validate_gpu_request(sandbox, gpu_enabled)?;
 
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_launch_authentication(
+    sandbox: &Sandbox,
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .filter(|spec| !spec.launch_authentication.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "VM sandbox launch authentication is required; configure [openshell.gateway.gateway_jwt] or provide a complete local gateway signing bundle",
+            )
+        })?;
+    let authentication =
+        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
+            &spec.launch_authentication,
+        )
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "decode VM sandbox launch authentication: {error}"
+            ))
+        })?;
+    authentication.validate().map_err(|error| {
+        Status::failed_precondition(format!(
+            "validate VM sandbox launch authentication: {error}"
+        ))
+    })?;
+    Ok(authentication)
 }
 
 #[allow(clippy::result_large_err)]
@@ -8061,6 +8071,47 @@ mod tests {
             validate_vm_sandbox(&sandbox, false).expect_err("platform config should be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("platform_config"));
+    }
+
+    #[test]
+    fn vm_launch_authentication_rejects_missing_before_provisioning() {
+        let sandbox = Sandbox {
+            id: "sandbox-auth-missing".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "ghcr.io/example/sandbox:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = validate_vm_launch_authentication(&sandbox).unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("gateway_jwt"));
+    }
+
+    #[test]
+    fn vm_launch_authentication_rejects_malformed_without_echoing_payload() {
+        const CANARY: &str = "launch-secret-canary";
+        let sandbox = Sandbox {
+            id: "sandbox-auth-malformed".to_string(),
+            spec: Some(SandboxSpec {
+                launch_authentication: format!("{{\"secret\":\"{CANARY}\"").into_bytes(),
+                template: Some(SandboxTemplate {
+                    image: "ghcr.io/example/sandbox:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = validate_vm_launch_authentication(&sandbox).unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("decode VM sandbox launch authentication"));
+        assert!(!error.message().contains(CANARY));
     }
 
     #[test]
