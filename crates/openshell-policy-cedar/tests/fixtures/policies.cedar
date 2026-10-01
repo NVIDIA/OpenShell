@@ -55,7 +55,7 @@ permit (
     resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
 )
 when {
-    context.binary == Sandbox::FilesystemPath::"/sandbox/.venv/bin/python3"
+    context.binary_path == "/sandbox/.venv/bin/python3"
     && context.method == "GET"          // access: read-only → GET only
 };
 
@@ -71,7 +71,7 @@ permit (
     resource  == Sandbox::NetworkEndpoint::"files.pythonhosted.org:443"
 )
 when {
-    context.binary == Sandbox::FilesystemPath::"/sandbox/.venv/bin/python3"
+    context.binary_path == "/sandbox/.venv/bin/python3"
     && context.method == "GET"          // access: read-only → GET only
 };
 
@@ -86,7 +86,7 @@ permit (
     resource  == Sandbox::NetworkEndpoint::"integrate.api.nvidia.com:443"
 )
 when {
-    context.binary == Sandbox::FilesystemPath::"/sandbox/.venv/bin/python3"
+    context.binary_path == "/sandbox/.venv/bin/python3"
     && (context.method == "GET"
         || context.method == "POST")
 };

@@ -25,6 +25,7 @@ fn sandbox_request(host: &str, port: u16, method: &str) -> NetworkRequest {
         port,
         protocol: "rest".to_string(),
         binary_path: "/sandbox/.venv/bin/python3".to_string(),
+        ancestors: Vec::new(),
         method: method.to_string(),
         path: String::new(),
         command: String::new(),

@@ -3,21 +3,35 @@
 
 // Rust guideline compliant 2026-09-19
 
-//! Experimental Cedar-based network policy evaluation engine for `OpenShell`.
+//! Experimental Cedar-based policy tooling for `OpenShell`.
 //!
-//! This crate is a proof of concept exploring Cedar as an alternative to the
-//! Rego-based `OpaEngine` in `openshell-supervisor-network`: it evaluates
-//! `NetworkConnect` authorization decisions against a Cedar schema and policy
-//! set instead of YAML compiled to Rego. It is not wired into the gateway or
-//! supervisor, and it covers network decisions only — filesystem and process
-//! policy stay on the existing YAML/Landlock path.
+//! Two distinct roles, scoped separately because they have different risk
+//! profiles (see `architecture/plans/cedar-policy-engine-rfc-draft.md`):
+//!
+//! - **Network** (crate root, this module): a proof of concept exploring
+//!   Cedar as an alternative to the Rego-based `OpaEngine` in
+//!   `openshell-supervisor-network` — evaluating `NetworkConnect`
+//!   authorization decisions against a Cedar schema and policy set instead
+//!   of YAML compiled to Rego. Not wired into the gateway or supervisor.
+//! - **Filesystem** ([`filesystem`]): advisory-only. Landlock remains the
+//!   sole runtime enforcer of filesystem policy; this module compiles the
+//!   authored allow-list into Cedar entities purely for offline
+//!   inspection/verification (conflicting or redundant grants). It is never
+//!   a runtime decision point and nothing depends on it at request time.
+//!
+//! Process/syscall policy has no authored surface to represent and is out
+//! of scope entirely.
 //!
 //! The schema itself lives in `openshell-policy-cedar-schema`, the single
 //! source of truth for Cedar entity/action names across every Cedar-aware
 //! consumer.
 
+pub mod compile;
 mod error;
+pub mod filesystem;
+pub mod glob;
 
+pub use compile::CompiledCedarPolicy;
 pub use error::CedarEngineError;
 
 use std::collections::{HashMap, HashSet};
@@ -27,7 +41,7 @@ use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
     PolicySet, Request, RestrictedExpression, Schema,
 };
-use openshell_policy_cedar_schema::{actions, entity_types};
+use openshell_policy_cedar_schema::{actions, context_fields, endpoint_fields, entity_types};
 
 /// Synthetic id for the single `Process` entity built per request; this
 /// proof of concept evaluates one request at a time and never
@@ -53,6 +67,9 @@ pub struct NetworkRequest {
     pub protocol: String,
     /// Absolute path of the binary making the connection.
     pub binary_path: String,
+    /// Absolute paths of the calling process's ancestors (parent,
+    /// grandparent, ...). Excludes cmdline/argv0, which is spoofable.
+    pub ancestors: Vec<String>,
     /// HTTP method, when known; empty string when not applicable.
     pub method: String,
     /// REST request path, when known; empty string when not applicable.
@@ -96,11 +113,12 @@ pub struct CedarNetworkEngine {
     schema: Schema,
     policies: PolicySet,
     authorizer: Authorizer,
-    /// `"host:port"` endpoints known to be an incomplete picture in
-    /// `policies` (planned: populated by a policy compiler, tracked
-    /// separately). Requests to these endpoints always evaluate to
-    /// [`NetworkDecision::Unsupported`] rather than a guessed Allow/Deny.
-    unsupported_endpoints: HashSet<String>,
+    /// Named policies [`compile::compile_normalized_data`] could not
+    /// represent in `policies`. Checked before trusting a Cedar `Deny`; see
+    /// [`compile::UncompiledPolicy`]. Empty for engines built from
+    /// hand-authored policy text ([`Self::from_cedar_str`],
+    /// [`Self::from_policy_str`]).
+    uncompiled: Vec<compile::UncompiledPolicy>,
 }
 
 impl CedarNetworkEngine {
@@ -119,7 +137,7 @@ impl CedarNetworkEngine {
             schema,
             policies,
             authorizer: Authorizer::new(),
-            unsupported_endpoints: HashSet::new(),
+            uncompiled: Vec::new(),
         })
     }
 
@@ -136,6 +154,26 @@ impl CedarNetworkEngine {
         )
     }
 
+    /// Builds an engine from a [`CompiledCedarPolicy`] produced by
+    /// [`compile::compile_normalized_data`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CedarEngineError`] if the canonical schema fails to parse
+    /// (should not happen; the schema is fixed and tested in
+    /// `openshell-policy-cedar-schema`).
+    pub fn from_compiled(compiled: CompiledCedarPolicy) -> Result<Self, CedarEngineError> {
+        let (schema, _warnings) =
+            Schema::from_cedarschema_str(openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC)
+                .map_err(|e| CedarEngineError::SchemaParse(Box::new(e)))?;
+        Ok(Self {
+            schema,
+            policies: compiled.policies,
+            authorizer: Authorizer::new(),
+            uncompiled: compiled.uncompiled,
+        })
+    }
+
     /// Evaluates one network-connect request against the loaded policy set.
     ///
     /// # Errors
@@ -147,21 +185,29 @@ impl CedarNetworkEngine {
         &self,
         request: &NetworkRequest,
     ) -> Result<NetworkDecision, CedarEngineError> {
-        let endpoint_key = format!("{}:{}", request.host, request.port);
-        if self.unsupported_endpoints.contains(&endpoint_key) {
+        if let Some(uncompiled) = self.uncompiled.iter().find(|policy| {
+            policy.matches(
+                &request.host,
+                request.port,
+                &request.binary_path,
+                &request.ancestors,
+            )
+        }) {
             return Ok(NetworkDecision::Unsupported {
                 reason: format!(
-                    "policy for endpoint {endpoint_key} includes a rule shape not yet \
-                     translated to Cedar"
+                    "request matches named policy {:?}, which could not be compiled to Cedar: {}",
+                    uncompiled.name, uncompiled.reason
                 ),
             });
         }
 
+        let host_lower = request.host.to_lowercase();
+        let host_port = format!("{host_lower}:{}", request.port);
+
         let user_uid = entity_uid(entity_types::USER, &request.user)?;
         let group_uid = entity_uid(entity_types::GROUP, &request.group)?;
         let process_uid = entity_uid(entity_types::PROCESS, CURRENT_PROCESS)?;
-        let binary_uid = entity_uid(entity_types::FILESYSTEM_PATH, &request.binary_path)?;
-        let endpoint_uid = entity_uid(entity_types::NETWORK_ENDPOINT, &endpoint_key)?;
+        let endpoint_uid = entity_uid(entity_types::NETWORK_ENDPOINT, &host_port)?;
         let action_uid = entity_uid(actions::ACTION_TYPE, actions::NETWORK_CONNECT)?;
 
         let process = Entity::new(
@@ -181,21 +227,24 @@ impl CedarNetworkEngine {
         .map_err(|e| CedarEngineError::EntityBuild(Box::new(e)))?;
         let user = Entity::new_no_attrs(user_uid, HashSet::new());
         let group = Entity::new_no_attrs(group_uid, HashSet::new());
-        let binary = Entity::new_no_attrs(binary_uid.clone(), HashSet::new());
         let endpoint = Entity::new(
             endpoint_uid.clone(),
             HashMap::from([
                 (
-                    "host".to_string(),
-                    RestrictedExpression::new_string(request.host.clone()),
+                    endpoint_fields::HOST.to_string(),
+                    RestrictedExpression::new_string(host_lower),
                 ),
                 (
-                    "port".to_string(),
+                    endpoint_fields::PORT.to_string(),
                     RestrictedExpression::new_long(i64::from(request.port)),
                 ),
                 (
-                    "protocol".to_string(),
+                    endpoint_fields::PROTOCOL.to_string(),
                     RestrictedExpression::new_string(request.protocol.clone()),
+                ),
+                (
+                    endpoint_fields::HOST_PORT.to_string(),
+                    RestrictedExpression::new_string(host_port),
                 ),
             ]),
             HashSet::new(),
@@ -203,24 +252,33 @@ impl CedarNetworkEngine {
         .map_err(|e| CedarEngineError::EntityBuild(Box::new(e)))?;
 
         let entities =
-            Entities::from_entities([process, user, group, binary, endpoint], Some(&self.schema))
+            Entities::from_entities([process, user, group, endpoint], Some(&self.schema))
                 .map_err(|e| CedarEngineError::EntitiesBuild(Box::new(e)))?;
 
         let context = Context::from_pairs([
             (
-                "binary".to_string(),
-                RestrictedExpression::new_entity_uid(binary_uid),
+                context_fields::BINARY_PATH.to_string(),
+                RestrictedExpression::new_string(request.binary_path.clone()),
             ),
             (
-                "method".to_string(),
+                context_fields::ANCESTORS.to_string(),
+                RestrictedExpression::new_set(
+                    request
+                        .ancestors
+                        .iter()
+                        .map(|a| RestrictedExpression::new_string(a.clone())),
+                ),
+            ),
+            (
+                context_fields::METHOD.to_string(),
                 RestrictedExpression::new_string(request.method.clone()),
             ),
             (
-                "path".to_string(),
+                context_fields::PATH.to_string(),
                 RestrictedExpression::new_string(request.path.clone()),
             ),
             (
-                "command".to_string(),
+                context_fields::COMMAND.to_string(),
                 RestrictedExpression::new_string(request.command.clone()),
             ),
         ])
@@ -253,7 +311,7 @@ impl CedarNetworkEngine {
 }
 
 /// Builds an [`EntityUid`] from a Cedar entity type name and id.
-fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> {
+pub(crate) fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> {
     let type_name = EntityTypeName::from_str(type_name)
         .map_err(|e| CedarEngineError::EntityTypeParse(Box::new(e)))?;
     // `EntityId::from_str` is infallible: any string is a valid entity id.
