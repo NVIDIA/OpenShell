@@ -2609,24 +2609,27 @@ async fn sandbox_exec_streaming_grpc(
         // The grace-period reader already owns an open pipe. Reuse its queued
         // chunks through the same bounded writer as explicit streaming so cap
         // violations and read failures never become a successful stdin EOF.
-        let result = if let Some(rest) = stdin_rest {
-            write_exec_stdin_frames(
-                PipedStdinReader {
-                    rest,
-                    chunk: std::io::Cursor::new(Vec::new()),
-                },
-                &stdin_prefix,
-                stdin_limit,
-                &stdin_tx,
-            )
-        } else {
-            write_exec_stdin_frames(
-                std::io::stdin().lock(),
-                &stdin_prefix,
-                stdin_limit,
-                &stdin_tx,
-            )
-        };
+        let result = stdin_rest.map_or_else(
+            || {
+                write_exec_stdin_frames(
+                    std::io::stdin().lock(),
+                    &stdin_prefix,
+                    stdin_limit,
+                    &stdin_tx,
+                )
+            },
+            |rest| {
+                write_exec_stdin_frames(
+                    PipedStdinReader {
+                        rest,
+                        chunk: std::io::Cursor::new(Vec::new()),
+                    },
+                    &stdin_prefix,
+                    stdin_limit,
+                    &stdin_tx,
+                )
+            },
+        );
         let _ = stdin_result_tx.send(result);
     });
 
