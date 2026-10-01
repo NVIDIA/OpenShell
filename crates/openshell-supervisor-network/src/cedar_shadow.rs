@@ -39,7 +39,7 @@ use crate::opa::{NetworkInput, inject_runtime_policy_data, proto_to_opa_data_jso
 /// (`binary_identity_required`) already captured via
 /// `require_binary_identity` in the generated policy's `when` clause. These
 /// values exist only to satisfy the Cedar schema's `Process` entity shape.
-const PLACEHOLDER_IDENTITY: &str = "sandbox";
+pub(crate) const PLACEHOLDER_IDENTITY: &str = "sandbox";
 
 /// Name of the environment variable that opts a sandbox into Cedar
 /// shadow-mode network evaluation.

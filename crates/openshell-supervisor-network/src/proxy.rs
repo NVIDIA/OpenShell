@@ -2860,9 +2860,13 @@ async fn handle_mediated_connection(
                 }
             };
             let tls_result = async {
-                let Some(relay_context) =
-                    relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
-                else {
+                let Some(relay_context) = relay::prepare_http_relay(
+                    l7_route,
+                    &opa_engine,
+                    network_engine.as_ref(),
+                    &decision,
+                    &ctx,
+                ) else {
                     return Ok(());
                 };
 
@@ -2935,8 +2939,13 @@ async fn handle_mediated_connection(
         // Plaintext HTTP detected.
         ctx.request_default_port = Some(80);
         let is_l7_relay = l7_route.is_some_and(|route| !route.configs.is_empty());
-        let Some(relay_context) = relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
-        else {
+        let Some(relay_context) = relay::prepare_http_relay(
+            l7_route,
+            &opa_engine,
+            network_engine.as_ref(),
+            &decision,
+            &ctx,
+        ) else {
             return Ok(());
         };
         if let Err(e) = relay::relay_http_stream(&mut client, &mut upstream, relay_context).await {
@@ -5322,7 +5331,11 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        let tunnel_engine = match relay::pin_l7_evaluator(&opa_engine, route.l7_policy_generation) {
+        let tunnel_engine = match relay::pin_l7_evaluator(
+            &opa_engine,
+            network_engine.as_ref(),
+            route.l7_policy_generation,
+        ) {
             Ok(engine) => engine,
             Err(e) => {
                 warn!(

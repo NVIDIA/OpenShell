@@ -133,6 +133,20 @@ pub trait NetworkPolicyEngine: Send + Sync {
     /// policies in this phase; the budget value itself is just a resource
     /// limit, harmless to report even when nothing uses it.
     fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget;
+
+    /// L7 decision override for a tunnel pinned at `captured_generation`,
+    /// if this engine provides one.
+    ///
+    /// `None` (the default, and `OpaEngine`'s only answer) means "use the
+    /// tunnel's own [`TunnelPolicyEngine`] as the L7 decision engine" — the
+    /// existing per-tunnel-cloned-regorus path, unchanged. A Cedar-sourced
+    /// sandbox's `CedarOnlyEngine` returns `Some`, so the tunnel's
+    /// (dummy-restrictive) `TunnelPolicyEngine` is used for middleware and
+    /// generation tracking only, while this handle makes the actual L7
+    /// allow/deny call.
+    fn l7_engine_for_tunnel(&self, _captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
+        None
+    }
 }
 
 /// Input for a network access policy evaluation.
@@ -303,9 +317,24 @@ pub struct TunnelPolicyEngine {
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    /// When set (a Cedar-sourced sandbox), [`L7PolicyEngine::evaluate_request`]
+    /// delegates here instead of evaluating this tunnel's regorus engine.
+    /// Middleware/generation/websocket-budget services above stay this
+    /// (possibly dummy-restrictive) OPA tunnel regardless — see
+    /// [`NetworkPolicyEngine::l7_engine_for_tunnel`].
+    l7_override: Option<Arc<dyn L7PolicyEngine>>,
 }
 
 impl TunnelPolicyEngine {
+    /// Sets the L7 decision override. Called once, right after
+    /// [`OpaEngine::clone_engine_for_tunnel`], by whichever code pins a
+    /// tunnel's generation (`proxy::relay::pin_l7_evaluator`).
+    #[must_use]
+    pub fn with_l7_override(mut self, l7_override: Option<Arc<dyn L7PolicyEngine>>) -> Self {
+        self.l7_override = l7_override;
+        self
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.generation_guard.captured_generation()
     }
@@ -320,10 +349,6 @@ impl TunnelPolicyEngine {
 
     pub fn generation_guard(&self) -> &PolicyGenerationGuard {
         &self.generation_guard
-    }
-
-    pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
-        &self.engine
     }
 
     pub(crate) fn middleware_runner(&self) -> &ChainRunner {
@@ -343,6 +368,88 @@ impl TunnelPolicyEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         query_middleware_chain_locked(&mut engine, input)
+    }
+}
+
+/// Per-request L7 policy decision.
+///
+/// Independent of middleware/generation services (which stay concretely
+/// [`TunnelPolicyEngine`]/OPA-coupled — see module docs on
+/// [`NetworkPolicyEngine`]). Implemented by [`TunnelPolicyEngine`] (OPA)
+/// and, for a Cedar-sourced sandbox, by a Cedar-backed equivalent in
+/// `openshell-supervisor-network::cedar_only`.
+pub trait L7PolicyEngine: Send + Sync {
+    /// Evaluates one L7 request. Returns `(allowed, reason)`; `reason` is
+    /// only meaningful when `!allowed`.
+    fn evaluate_request(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<(bool, String)>;
+}
+
+impl L7PolicyEngine for TunnelPolicyEngine {
+    fn evaluate_request(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<(bool, String)> {
+        if let Some(l7_override) = &self.l7_override {
+            return l7_override.evaluate_request(ctx, request);
+        }
+        if self.is_stale() {
+            return Err(miette::miette!(
+                "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
+                self.captured_generation(),
+                self.current_generation(),
+            ));
+        }
+
+        let input = serde_json::json!({
+            "network": {
+                "host": ctx.host,
+                "port": ctx.port,
+            },
+            "exec": {
+                "path": ctx.binary_path,
+                "ancestors": ctx.ancestors,
+                "cmdline_paths": ctx.cmdline_paths,
+            },
+            "request": {
+                "method": request.action,
+                "path": request.target,
+                "query_params": request.query_params.clone(),
+                "graphql": request.graphql.clone(),
+                "jsonrpc": request.jsonrpc.as_ref().map(crate::l7::relay::jsonrpc_policy_input),
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        set_regorus_input(&mut engine, input)?;
+
+        let allowed = engine
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let allowed = allowed == regorus::Value::from(true);
+
+        let reason = if allowed {
+            String::new()
+        } else {
+            let val = engine
+                .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            match val {
+                regorus::Value::String(s) => s.to_string(),
+                regorus::Value::Undefined => "request denied by policy".to_string(),
+                other => other.to_string(),
+            }
+        };
+
+        Ok((allowed, reason))
     }
 }
 
@@ -1184,6 +1291,7 @@ impl OpaEngine {
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
+            l7_override: None,
         })
     }
 }
@@ -7606,7 +7714,7 @@ network_policies:
             .unwrap();
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.engine.lock().unwrap();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -7648,7 +7756,7 @@ network_policies:
         let cloned = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.engine.lock().unwrap();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())

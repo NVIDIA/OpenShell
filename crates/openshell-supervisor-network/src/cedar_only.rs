@@ -13,21 +13,26 @@
 //! makes a sandbox use this engine instead of OPA, decided once at policy
 //! load (see `crates/openshell-supervisor/src/lib.rs::load_policy`).
 //!
-//! Same CONNECT-time-only scope as the rest of this crate's Cedar work:
-//! `openshell_policy_cedar::CedarNetworkEngine` covers host/binary/ancestor
-//! matching, not L7. `EgressAuthorization::{endpoint_configs,matched_endpoints}`
-//! are always empty from this engine — those feed L7 config lookup and the
+//! CONNECT-time matching (host/binary/ancestor) is covered directly by
+//! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_network`].
+//! Per-request L7 enforcement is covered by
+//! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_l7`] via
+//! [`CedarL7TunnelEngine`], this engine's [`crate::opa::L7PolicyEngine`]
+//! handle. `EgressAuthorization::{endpoint_configs,matched_endpoints}` are
+//! always empty from this engine — those feed L7 config lookup and the
 //! not-yet-landed policy-DNS adapter, both out of scope here.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use miette::Result;
-use openshell_policy_cedar::{CedarNetworkEngine, NetworkDecision};
+use openshell_policy_cedar::{CedarNetworkEngine, L7Request, NetworkDecision};
 use tokio::sync::watch;
 
-use crate::cedar_shadow::network_request_from_input;
-use crate::opa::{EgressAuthorization, MatchedEndpoint, NetworkAction, NetworkInput};
+use crate::cedar_shadow::{PLACEHOLDER_IDENTITY, network_request_from_input};
+use crate::opa::{
+    EgressAuthorization, L7PolicyEngine, MatchedEndpoint, NetworkAction, NetworkInput,
+};
 use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 
 /// Cedar-backed, fully authoritative network policy evaluator.
@@ -36,7 +41,11 @@ use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 /// network decision, or [`crate::opa::OpaEngine`] for every network
 /// decision, chosen once at policy load.
 pub struct CedarOnlyEngine {
-    engine: RwLock<CedarNetworkEngine>,
+    /// `Arc`-wrapped (rather than a plain `RwLock`) so [`Self::l7_handle`]
+    /// can hand out a lightweight, independently-staleness-checked clone
+    /// without needing the enclosing `Arc<CedarOnlyEngine>` — trait objects
+    /// reached through `&dyn NetworkPolicyEngine` only ever see `&self`.
+    engine: Arc<RwLock<CedarNetworkEngine>>,
     generation: Arc<AtomicU64>,
     generation_tx: watch::Sender<u64>,
 }
@@ -53,9 +62,19 @@ impl CedarOnlyEngine {
             CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
-            engine: RwLock::new(engine),
+            engine: Arc::new(RwLock::new(engine)),
             generation: Arc::new(AtomicU64::new(0)),
             generation_tx,
+        })
+    }
+
+    /// Builds an L7 decision handle for a tunnel pinned at
+    /// `captured_generation`. See [`crate::opa::NetworkPolicyEngine::l7_engine_for_tunnel`].
+    fn l7_handle(&self, captured_generation: u64) -> Arc<dyn L7PolicyEngine> {
+        Arc::new(CedarL7TunnelEngine {
+            engine: Arc::clone(&self.engine),
+            generation: Arc::clone(&self.generation),
+            captured_generation,
         })
     }
 
@@ -159,5 +178,202 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
 
     fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
         crate::l7::websocket::WebSocketAssemblyBudget::default()
+    }
+
+    fn l7_engine_for_tunnel(&self, captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
+        Some(self.l7_handle(captured_generation))
+    }
+}
+
+/// Per-tunnel L7 decision handle for a Cedar-sourced sandbox.
+///
+/// Unlike OPA's [`crate::opa::TunnelPolicyEngine`], this needs no actual
+/// per-tunnel engine clone — `Authorizer`/`PolicySet` are immutable, so
+/// concurrent evaluation is just concurrent `RwLock::read()` calls, same as
+/// [`CedarOnlyEngine::authorize_egress`]. Only `captured_generation` is
+/// per-tunnel state.
+struct CedarL7TunnelEngine {
+    engine: Arc<RwLock<CedarNetworkEngine>>,
+    generation: Arc<AtomicU64>,
+    captured_generation: u64,
+}
+
+impl L7PolicyEngine for CedarL7TunnelEngine {
+    fn evaluate_request(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<(bool, String)> {
+        let current_generation = self.generation.load(Ordering::Acquire);
+        if current_generation != self.captured_generation {
+            return Err(miette::miette!(
+                "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{current_generation}]",
+                self.captured_generation,
+            ));
+        }
+
+        let jsonrpc_method = request
+            .jsonrpc
+            .as_ref()
+            .and_then(|info| info.calls.first())
+            .map(|call| call.method.clone())
+            .unwrap_or_default();
+        let l7_request = L7Request {
+            user: PLACEHOLDER_IDENTITY.to_string(),
+            group: PLACEHOLDER_IDENTITY.to_string(),
+            binary_path: ctx.binary_path.clone(),
+            ancestors: ctx.ancestors.clone(),
+            host: ctx.host.clone(),
+            port: ctx.port,
+            // `request.action` carries the HTTP method for REST/GraphQL and
+            // is empty for a JSON-RPC-family request (jsonrpc_method covers
+            // that case instead) — same disambiguation-by-empty-string
+            // convention as the rest of the HttpRequest schema.
+            method: if jsonrpc_method.is_empty() {
+                request.action.clone()
+            } else {
+                String::new()
+            },
+            path: request.target.clone(),
+            command: String::new(),
+            jsonrpc_method,
+        };
+
+        let guard = self
+            .engine
+            .read()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
+        let (allowed, _matched) = guard
+            .evaluate_l7(&l7_request)
+            .map_err(|e| miette::miette!("{e}"))?;
+        let reason = if allowed {
+            String::new()
+        } else {
+            "denied by Cedar HttpRequest policy".to_string()
+        };
+        Ok((allowed, reason))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::l7::L7RequestInfo;
+    use crate::l7::relay::L7EvalContext;
+    use crate::opa::{L7PolicyEngine, NetworkPolicyEngine};
+
+    const POLICY: &str = r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"api.example.com:443"
+)
+when {
+    context.binary_path == "/usr/bin/curl"
+};
+
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"HttpRequest",
+    resource  == Sandbox::NetworkEndpoint::"api.example.com:443"
+)
+when {
+    context.binary_path == "/usr/bin/curl"
+    && context.method == "GET"
+    && context.path == "/v1/status"
+};
+"#;
+
+    fn ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "api.example.com".to_string(),
+            port: 443,
+            binary_path: "/usr/bin/curl".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn request(action: &str, target: &str) -> L7RequestInfo {
+        L7RequestInfo {
+            action: action.to_string(),
+            target: target.to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: None,
+        }
+    }
+
+    #[test]
+    fn l7_override_allows_the_permitted_request() {
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let generation = engine.current_generation();
+        let handle = engine
+            .l7_engine_for_tunnel(generation)
+            .expect("Cedar engine provides an L7 handle");
+        let (allowed, _) = handle
+            .evaluate_request(&ctx(), &request("GET", "/v1/status"))
+            .expect("request evaluates");
+        assert!(allowed);
+    }
+
+    #[test]
+    fn l7_override_denies_a_different_path() {
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let generation = engine.current_generation();
+        let handle = engine
+            .l7_engine_for_tunnel(generation)
+            .expect("Cedar engine provides an L7 handle");
+        let (allowed, reason) = handle
+            .evaluate_request(&ctx(), &request("GET", "/v1/admin"))
+            .expect("request evaluates");
+        assert!(!allowed);
+        assert!(!reason.is_empty());
+    }
+
+    #[test]
+    fn l7_override_fails_closed_when_tunnel_generation_is_stale() {
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let captured_generation = engine.current_generation();
+        let handle = engine
+            .l7_engine_for_tunnel(captured_generation)
+            .expect("Cedar engine provides an L7 handle");
+        engine
+            .reload_from_policy_str(POLICY)
+            .expect("reload with identical policy still advances the generation");
+
+        let result = handle.evaluate_request(&ctx(), &request("GET", "/v1/status"));
+        assert!(
+            result.is_err(),
+            "stale tunnel must fail closed, not silently re-evaluate"
+        );
+    }
+
+    #[test]
+    fn tunnel_policy_engine_delegates_to_cedar_override() {
+        let cedar = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let generation = cedar.current_generation();
+        let l7_override = cedar.l7_engine_for_tunnel(generation);
+
+        // A restrictive-default OPA engine (no network_policies at all) would
+        // deny every L7 request on its own — proving the override, not the
+        // underlying regorus engine, produced the Allow below.
+        let opa = crate::opa::OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}",
+        )
+        .expect("restrictive OPA engine builds");
+        let opa_generation = opa.current_generation();
+        let tunnel = opa
+            .clone_engine_for_tunnel(opa_generation)
+            .expect("tunnel clones")
+            .with_l7_override(l7_override);
+
+        let (allowed, _) = tunnel
+            .evaluate_request(&ctx(), &request("GET", "/v1/status"))
+            .expect("request evaluates");
+        assert!(
+            allowed,
+            "override must take priority over the dummy OPA engine"
+        );
     }
 }

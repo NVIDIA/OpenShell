@@ -2813,7 +2813,7 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 ///
 /// Returns `(allowed, deny_reason)`.
 pub fn evaluate_l7_request(
-    engine: &TunnelPolicyEngine,
+    engine: &dyn crate::opa::L7PolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
@@ -2822,14 +2822,14 @@ pub fn evaluate_l7_request(
         && !jsonrpc.calls.is_empty()
     {
         if jsonrpc.has_response {
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, request)?;
             if !allowed {
                 return Ok((false, reason));
             }
         }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
             if !allowed {
                 return Ok((false, reason));
             }
@@ -2837,17 +2837,17 @@ pub fn evaluate_l7_request(
         return Ok((true, String::new()));
     }
 
-    evaluate_l7_request_once(engine, ctx, request)
+    engine.evaluate_request(ctx, request)
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
-    engine: &TunnelPolicyEngine,
+    engine: &dyn crate::opa::L7PolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+        let (allowed, reason) = engine.evaluate_request(ctx, request)?;
         if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
             return Ok(JsonRpcEvaluation {
                 allowed,
@@ -2862,7 +2862,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         let mut first_denied_reason = None;
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
-            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            let (allowed, reason) = engine.evaluate_request(ctx, &item_request)?;
             if !allowed {
                 if first_denied_reason.is_none() {
                     first_denied_reason = Some(reason);
@@ -2892,7 +2892,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
         });
     }
 
-    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+    let (allowed, reason) = engine.evaluate_request(ctx, request)?;
     Ok(JsonRpcEvaluation {
         allowed,
         reason,
@@ -3039,7 +3039,9 @@ fn emit_transformed_body_decision(
     ocsf_emit!(event);
 }
 
-fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
+pub(crate) fn jsonrpc_policy_input(
+    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+) -> serde_json::Value {
     let call = if info.is_batch {
         None
     } else {
@@ -3058,66 +3060,6 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
             .as_ref()
             .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
     })
-}
-
-fn evaluate_l7_request_once(
-    engine: &TunnelPolicyEngine,
-    ctx: &L7EvalContext,
-    request: &L7RequestInfo,
-) -> Result<(bool, String)> {
-    if engine.is_stale() {
-        return Err(miette!(
-            "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
-            engine.captured_generation(),
-            engine.current_generation(),
-        ));
-    }
-
-    let input = serde_json::json!({
-        "network": {
-            "host": ctx.host,
-            "port": ctx.port,
-        },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    });
-
-    let mut engine = engine
-        .engine()
-        .lock()
-        .map_err(|_| miette!("OPA engine lock poisoned"))?;
-
-    crate::opa::set_regorus_input(&mut engine, input)?;
-
-    let allowed = engine
-        .eval_rule("data.openshell.sandbox.allow_request".into())
-        .map_err(|e| miette!("{e}"))?;
-    let allowed = allowed == regorus::Value::from(true);
-
-    let reason = if allowed {
-        String::new()
-    } else {
-        let val = engine
-            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
-            .map_err(|e| miette!("{e}"))?;
-        match val {
-            regorus::Value::String(s) => s.to_string(),
-            regorus::Value::Undefined => "request denied by policy".to_string(),
-            other => other.to_string(),
-        }
-    };
-
-    Ok((allowed, reason))
 }
 
 /// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).
