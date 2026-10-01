@@ -3,45 +3,31 @@
 
 //! Declarative provider type profiles.
 
-use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, ParseMcpVersionsError,
+    canonicalize_mcp_versions, parse_mcp_versions,
+};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
-    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
+    L7EndpointFields, L7Protocol, network_access_preset_from_str, network_access_preset_to_str,
+    network_enforcement_mode_from_str, network_enforcement_mode_to_str, network_tls_mode_from_str,
+    network_tls_mode_to_str, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
     validate_l7_endpoint_semantics,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::OnceLock;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision; use an exact supported revision; or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
-
-const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../../../providers/aws.yaml"),
-    include_str!("../../../providers/aws-bedrock.yaml"),
-    include_str!("../../../providers/aws-s3.yaml"),
-    include_str!("../../../providers/anthropic.yaml"),
-    include_str!("../../../providers/claude-code.yaml"),
-    include_str!("../../../providers/codex.yaml"),
-    include_str!("../../../providers/copilot.yaml"),
-    include_str!("../../../providers/cursor.yaml"),
-    include_str!("../../../providers/deepinfra.yaml"),
-    include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/google-cloud.yaml"),
-    include_str!("../../../providers/google-vertex-ai.yaml"),
-    include_str!("../../../providers/nvidia.yaml"),
-    include_str!("../../../providers/openai.yaml"),
-    include_str!("../../../providers/pypi.yaml"),
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
@@ -125,7 +111,66 @@ pub struct CredentialProfile {
     pub token_grant: Option<TokenGrantProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// Origin-aware protobuf duration presence retained across profile conversion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ProfileDurationWkt {
+    /// The profile came from YAML and uses the compatibility seconds field.
+    #[default]
+    FromYaml,
+    /// The protobuf duration was absent.
+    Absent,
+    /// The protobuf duration was present, including an explicit zero.
+    Present(prost_types::Duration),
+}
+
+impl ProfileDurationWkt {
+    fn from_proto(value: Option<prost_types::Duration>) -> Self {
+        value.map_or(Self::Absent, Self::Present)
+    }
+
+    pub fn to_proto(self, legacy_seconds: i64) -> Option<prost_types::Duration> {
+        match self {
+            Self::FromYaml => (legacy_seconds != 0).then_some(prost_types::Duration {
+                seconds: legacy_seconds,
+                nanos: 0,
+            }),
+            Self::Absent => None,
+            Self::Present(value) => Some(value),
+        }
+    }
+}
+
+impl Serialize for ProfileDurationWkt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Present(value) => serializer.serialize_str(&value.to_string()),
+            Self::FromYaml | Self::Absent => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileDurationWkt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value
+            .parse::<prost_types::Duration>()
+            .map(Self::Present)
+            .map_err(de::Error::custom)
+    }
+}
+
+fn profile_duration_is_legacy_or_absent(value: &ProfileDurationWkt) -> bool {
+    !matches!(value, ProfileDurationWkt::Present(_))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TokenGrantProfile {
     #[serde(
         default = "default_token_grant_type",
@@ -145,6 +190,14 @@ pub struct TokenGrantProfile {
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub cache_ttl_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(
+        default,
+        rename = "cache_ttl",
+        skip_serializing_if = "profile_duration_is_legacy_or_absent"
+    )]
+    #[doc(hidden)]
+    pub cache_ttl_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +205,23 @@ pub struct TokenGrantProfile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_token_type: String,
 }
+
+impl PartialEq for TokenGrantProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.grant_type == other.grant_type
+            && self.token_endpoint == other.token_endpoint
+            && self.audience == other.audience
+            && self.jwt_svid_audience == other.jwt_svid_audience
+            && self.client_assertion_type == other.client_assertion_type
+            && self.scopes == other.scopes
+            && self.cache_ttl_seconds == other.cache_ttl_seconds
+            && self.audience_overrides == other.audience_overrides
+            && self.subject_token == other.subject_token
+            && self.requested_token_type == other.requested_token_type
+    }
+}
+
+impl Eq for TokenGrantProfile {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantSubjectTokenProfile {
@@ -174,7 +244,7 @@ pub struct TokenGrantAudienceOverrideProfile {
     pub scopes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CredentialRefreshProfile {
     #[serde(
         default = "default_refresh_strategy",
@@ -188,8 +258,24 @@ pub struct CredentialRefreshProfile {
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub refresh_before_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(
+        default,
+        rename = "refresh_before",
+        skip_serializing_if = "profile_duration_is_legacy_or_absent"
+    )]
+    #[doc(hidden)]
+    pub refresh_before_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub max_lifetime_seconds: i64,
+    /// Exact protobuf value retained for lossless gRPC import/export.
+    #[serde(
+        default,
+        rename = "max_lifetime",
+        skip_serializing_if = "profile_duration_is_legacy_or_absent"
+    )]
+    #[doc(hidden)]
+    pub max_lifetime_wkt: ProfileDurationWkt,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub material: Vec<CredentialRefreshMaterialProfile>,
     /// Additional credentials this refresh mints beyond its primary credential.
@@ -198,6 +284,20 @@ pub struct CredentialRefreshProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_outputs: Vec<CredentialRefreshOutputProfile>,
 }
+
+impl PartialEq for CredentialRefreshProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.strategy == other.strategy
+            && self.token_url == other.token_url
+            && self.scopes == other.scopes
+            && self.refresh_before_seconds == other.refresh_before_seconds
+            && self.max_lifetime_seconds == other.max_lifetime_seconds
+            && self.material == other.material
+            && self.additional_outputs == other.additional_outputs
+    }
+}
+
+impl Eq for CredentialRefreshProfile {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CredentialRefreshMaterialProfile {
@@ -406,23 +506,12 @@ fn default_mcp_profile_versions() -> Vec<String> {
 fn validate_mcp_profile_versions(
     values: &[String],
 ) -> Result<BTreeSet<McpProtocolVersion>, String> {
-    if values.is_empty() {
-        return Err(
-            "mcp.versions must contain at least one supported protocol version".to_string(),
-        );
-    }
-
-    let mut versions = BTreeSet::new();
-    for value in values {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| format!("{error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !versions.insert(version) {
-            return Err(format!("duplicate MCP protocol version '{value}'"));
+    parse_mcp_versions(values).map_err(|error| match error {
+        ParseMcpVersionsError::Unsupported(error) => {
+            format!("{error}; {MCP_VERSION_REMEDIATION}")
         }
-    }
-
-    Ok(versions)
+        error => error.to_string(),
+    })
 }
 
 fn deserialize_mcp_profile_versions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -612,6 +701,10 @@ pub struct ProviderTypeProfile {
     pub category: ProviderProfileCategory,
     #[serde(default)]
     pub credentials: Vec<CredentialProfile>,
+    /// EXPERIMENTAL: Non-secret files served to sandbox workloads on demand.
+    /// This API and its behavior may change or be removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ProviderFileProfile>,
     #[serde(default)]
     pub endpoints: Vec<EndpointProfile>,
     #[serde(default)]
@@ -624,6 +717,81 @@ pub struct ProviderTypeProfile {
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scope: String,
+}
+
+/// EXPERIMENTAL: A non-secret provider file template. This API may change or be removed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderFileProfile {
+    pub path: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub env_var: String,
+}
+
+impl ProviderFileProfile {
+    fn validate_template(&self) -> Result<(), String> {
+        let mut remaining = self.content.as_str();
+        while let Some(start) = remaining.find("{{") {
+            if remaining[..start].contains("}}") {
+                return Err("unexpected provider file placeholder close".to_string());
+            }
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            remaining = &after[end + 2..];
+        }
+        if remaining.contains("}}") {
+            return Err("unexpected provider file placeholder close".to_string());
+        }
+        Ok(())
+    }
+
+    /// Render only explicitly referenced non-secret provider config values.
+    pub fn render(&self, config: &HashMap<String, String>) -> Result<String, String> {
+        self.validate_template()?;
+        let mut remaining = self.content.as_str();
+        let mut rendered = String::new();
+        while let Some(start) = remaining.find("{{") {
+            rendered.push_str(&remaining[..start]);
+            let after = &remaining[start + 2..];
+            let end = after
+                .find("}}")
+                .ok_or("unclosed provider file placeholder")?;
+            let key = after[..end]
+                .strip_prefix("config.")
+                .ok_or("provider files may reference only config.KEY")?;
+            if !valid_file_config_key(key) {
+                return Err("invalid provider file config key".to_string());
+            }
+            let value = config
+                .get(key)
+                .ok_or_else(|| format!("missing provider config key '{key}'"))?;
+            rendered.push_str(value);
+            remaining = &after[end + 2..];
+            if rendered.len() > 65_536 {
+                return Err("rendered provider file exceeds 64 KiB".to_string());
+            }
+        }
+        rendered.push_str(remaining);
+        if rendered.len() > 65_536 {
+            return Err("rendered provider file exceeds 64 KiB".to_string());
+        }
+        Ok(rendered)
+    }
+}
+
+fn valid_file_config_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -659,6 +827,15 @@ impl ProviderTypeProfile {
                         .map(credential_refresh_from_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_from_proto),
+                })
+                .collect(),
+            files: profile
+                .files
+                .iter()
+                .map(|file| ProviderFileProfile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -826,6 +1003,15 @@ impl ProviderTypeProfile {
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
+                })
+                .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|file| ProviderProfileFile {
+                    path: file.path.clone(),
+                    content: file.content.clone(),
+                    env_var: file.env_var.clone(),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -1267,8 +1453,10 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: refresh.refresh_before_seconds,
-        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        refresh_before_seconds: 0,
+        refresh_before_wkt: ProfileDurationWkt::from_proto(refresh.refresh_before),
+        max_lifetime_seconds: 0,
+        max_lifetime_wkt: ProfileDurationWkt::from_proto(refresh.max_lifetime),
         material: refresh
             .material
             .iter()
@@ -1290,13 +1478,32 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
     }
 }
 
+fn profile_duration_to_proto(
+    exact: ProfileDurationWkt,
+    seconds: i64,
+) -> Option<prost_types::Duration> {
+    exact.to_proto(seconds)
+}
+
+fn validate_profile_duration(value: &prost_types::Duration) -> Result<(), String> {
+    openshell_core::time::duration_to_std(value)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCredentialRefresh {
     ProviderCredentialRefresh {
         strategy: refresh.strategy as i32,
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: refresh.refresh_before_seconds,
-        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        refresh_before: profile_duration_to_proto(
+            refresh.refresh_before_wkt,
+            refresh.refresh_before_seconds,
+        ),
+        max_lifetime: profile_duration_to_proto(
+            refresh.max_lifetime_wkt,
+            refresh.max_lifetime_seconds,
+        ),
         material: refresh
             .material
             .iter()
@@ -1331,7 +1538,8 @@ fn token_grant_from_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl_seconds: 0,
+        cache_ttl_wkt: ProfileDurationWkt::from_proto(token_grant.cache_ttl),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -1355,7 +1563,10 @@ fn token_grant_to_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl: profile_duration_to_proto(
+            token_grant.cache_ttl_wkt,
+            token_grant.cache_ttl_seconds,
+        ),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -1430,9 +1641,10 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
-        tls: endpoint.tls.clone(),
-        enforcement: endpoint.enforcement.clone(),
-        access: endpoint.access.clone(),
+        tls: network_tls_mode_from_str(&endpoint.tls).map_or(-1, |value| value as i32),
+        enforcement: network_enforcement_mode_from_str(&endpoint.enforcement)
+            .map_or(-1, |value| value as i32),
+        access: network_access_preset_from_str(&endpoint.access).map_or(-1, |value| value as i32),
         rules: endpoint
             .rules
             .as_deref()
@@ -1479,9 +1691,14 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
-        tls: endpoint.tls.clone(),
-        access: endpoint.access.clone(),
-        enforcement: endpoint.enforcement.clone(),
+        tls: network_tls_mode_to_str(endpoint.tls)
+            .map_or_else(|| format!("unknown({})", endpoint.tls), str::to_owned),
+        access: network_access_preset_to_str(endpoint.access)
+            .map_or_else(|| format!("unknown({})", endpoint.access), str::to_owned),
+        enforcement: network_enforcement_mode_to_str(endpoint.enforcement).map_or_else(
+            || format!("unknown({})", endpoint.enforcement),
+            str::to_owned,
+        ),
         rules: if endpoint.rules.is_empty() {
             None
         } else {
@@ -1556,24 +1773,8 @@ fn materialize_and_canonicalize_mcp_profile_versions(versions: &mut Vec<String>)
     if versions.is_empty() {
         *versions = default_mcp_profile_versions();
     } else {
-        canonicalize_mcp_profile_versions(versions);
+        canonicalize_mcp_versions(versions);
     }
-}
-
-fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
-    // Preserve unsupported and duplicate values so subsequent validation can
-    // reject them; sorting must never repair malformed protobuf input.
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
 }
 
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
@@ -1800,6 +2001,14 @@ pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, Prof
     Ok(serde_json::to_string_pretty(profiles)?)
 }
 
+/// Parse several profile YAML documents as one validated, id-sorted catalog.
+///
+/// Nothing in a release binary parses a profile *set* from YAML any more: the
+/// gateway validates the sets its configured sources return, through
+/// `validate_profile_set`. This is the loader behind the example profiles in
+/// `providers/`, so it is compiled for tests and for the `example-profiles`
+/// feature only.
+#[cfg(any(test, feature = "example-profiles"))]
 pub fn parse_profile_catalog_yamls(
     inputs: &[&str],
 ) -> Result<Vec<ProviderTypeProfile>, ProfileError> {
@@ -1812,10 +2021,12 @@ pub fn parse_profile_catalog_yamls(
     Ok(profiles)
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn is_mcp_diagnostic_field(field: &str) -> bool {
     field.split('.').any(|segment| segment == "mcp")
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileError> {
     let diagnostics = validate_profile_set(
         &profiles
@@ -1929,8 +2140,80 @@ pub fn validate_profile_set(
             ));
         }
 
+        if profile.files.len() > 16 {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "files",
+                "at most 16 provider files are allowed",
+            ));
+        }
+        let mut file_paths = HashSet::new();
+        let mut file_env_vars = HashSet::new();
+        for file in &profile.files {
+            if file.path.is_empty()
+                || file.path == "."
+                || file.path == ".."
+                || !file
+                    .path
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+                || !file_paths.insert(file.path.as_str())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.path",
+                    "file path must be a unique, safe file name",
+                ));
+            }
+            if file.content.len() > 65_536 {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    "file template exceeds 64 KiB",
+                ));
+            }
+            if let Err(error) = file.validate_template() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.content",
+                    error,
+                ));
+            }
+            if !file.env_var.is_empty()
+                && (!file
+                    .env_var
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    || !file
+                        .env_var
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    || !file_env_vars.insert(file.env_var.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "files.env_var",
+                    "file environment key must be unique and use letters, digits, or underscores",
+                ));
+            }
+        }
+
         let mut credential_names = HashSet::new();
         for credential in &profile.credentials {
+            for env_var in &credential.env_vars {
+                if file_env_vars.contains(env_var.as_str()) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "files.env_var",
+                        format!("file environment key '{env_var}' conflicts with a credential"),
+                    ));
+                }
+            }
             let credential_name = credential.name.trim();
             if credential_name.is_empty() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2111,7 +2394,28 @@ pub fn validate_profile_set(
                         "refresh strategy is required",
                     ));
                 }
-                if refresh.refresh_before_seconds < 0 {
+                if matches!(refresh.refresh_before_wkt, ProfileDurationWkt::Present(_))
+                    && refresh.refresh_before_seconds != 0
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.refresh_before",
+                        "refresh_before and refresh_before_seconds cannot both be set",
+                    ));
+                }
+                if let ProfileDurationWkt::Present(value) = refresh.refresh_before_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.refresh_before",
+                        format!("refresh_before must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(refresh.refresh_before_wkt, ProfileDurationWkt::FromYaml)
+                    && refresh.refresh_before_seconds < 0
+                {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -2119,12 +2423,47 @@ pub fn validate_profile_set(
                         "refresh_before_seconds must be greater than or equal to 0",
                     ));
                 }
-                if refresh.max_lifetime_seconds < 0 {
+                if let ProfileDurationWkt::Present(value) = refresh.max_lifetime_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.max_lifetime",
+                        format!("max_lifetime must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(refresh.max_lifetime_wkt, ProfileDurationWkt::FromYaml)
+                    && refresh.max_lifetime_seconds < 0
+                {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
                         "credentials.refresh.max_lifetime_seconds",
                         "max_lifetime_seconds must be greater than or equal to 0",
+                    ));
+                }
+                if matches!(refresh.max_lifetime_wkt, ProfileDurationWkt::Present(_))
+                    && refresh.max_lifetime_seconds != 0
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.max_lifetime",
+                        "max_lifetime and max_lifetime_seconds cannot both be set",
+                    ));
+                }
+                if matches!(
+                    refresh.max_lifetime_wkt,
+                    ProfileDurationWkt::Present(prost_types::Duration {
+                        seconds: 0,
+                        nanos: 0
+                    })
+                ) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.max_lifetime",
+                        "max_lifetime must be greater than zero when present",
                     ));
                 }
                 let mut material_names = HashSet::new();
@@ -2278,15 +2617,44 @@ pub fn validate_profile_set(
                 }
             }
 
-            if let Some(token_grant) = credential.token_grant.as_ref()
-                && let Err(message) = validate_token_grant_endpoint(&token_grant.token_endpoint)
-            {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    "credentials.token_grant.token_endpoint",
-                    message,
-                ));
+            if let Some(token_grant) = credential.token_grant.as_ref() {
+                if let ProfileDurationWkt::Present(value) = token_grant.cache_ttl_wkt
+                    && let Err(error) = validate_profile_duration(&value)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.cache_ttl",
+                        format!("cache_ttl must be a valid non-negative duration: {error}"),
+                    ));
+                } else if matches!(token_grant.cache_ttl_wkt, ProfileDurationWkt::FromYaml)
+                    && token_grant.cache_ttl_seconds < 0
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.cache_ttl_seconds",
+                        "cache_ttl_seconds must be greater than or equal to 0",
+                    ));
+                }
+                if matches!(token_grant.cache_ttl_wkt, ProfileDurationWkt::Present(_))
+                    && token_grant.cache_ttl_seconds != 0
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.cache_ttl",
+                        "cache_ttl and cache_ttl_seconds cannot both be set",
+                    ));
+                }
+                if let Err(message) = validate_token_grant_endpoint(&token_grant.token_endpoint) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.token_grant.token_endpoint",
+                        message,
+                    ));
+                }
             }
             diagnostics.extend(validate_token_grant_subject_token(
                 source,
@@ -2371,6 +2739,16 @@ pub fn validate_profile_set(
                     .unwrap_or(false),
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+            for msg in
+                validate_endpoint_modes(&endpoint.tls, &endpoint.enforcement, &endpoint.access)
+            {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -3273,18 +3651,6 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
-static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
-
-#[must_use]
-pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
-    BUILTIN_PROFILES
-        .get_or_init(|| {
-            parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
-                .expect("built-in provider profiles must be valid YAML")
-        })
-        .as_slice()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3293,17 +3659,167 @@ mod tests {
     use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError,
-        ProviderTypeProfile, builtin_profiles, is_mcp_diagnostic_field, normalize_profile_id,
-        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml, profile_to_json,
-        profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
+        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
+        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
+        profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
+        validate_profile_set,
     };
 
-    fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
-        builtin_profiles()
+    /// The example profiles in `providers/`, parsed once per test binary.
+    ///
+    /// These files are reviewable examples an operator imports, not platform
+    /// data, so the tests below are golden tests over their content rather than
+    /// assertions about anything the gateway ships.
+    fn example_catalog() -> &'static [ProviderTypeProfile] {
+        static CATALOG: std::sync::OnceLock<Vec<ProviderTypeProfile>> = std::sync::OnceLock::new();
+        CATALOG
+            .get_or_init(crate::example_profiles::load_all)
+            .as_slice()
+    }
+
+    fn example_profile(id: &str) -> &'static ProviderTypeProfile {
+        example_catalog()
             .iter()
             .find(|profile| profile.id == id)
-            .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+            .unwrap_or_else(|| panic!("example profile {id} should exist"))
+    }
+
+    #[test]
+    fn profile_duration_conversion_preserves_presence_and_fractional_values() {
+        let fractional = prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        };
+        assert_eq!(
+            profile_duration_to_proto(ProfileDurationWkt::Present(fractional), 0),
+            Some(fractional)
+        );
+        assert_eq!(
+            profile_duration_to_proto(
+                ProfileDurationWkt::Present(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 0,
+                }),
+                0,
+            ),
+            Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 0,
+            })
+        );
+        assert_eq!(
+            profile_duration_to_proto(ProfileDurationWkt::Absent, 60),
+            None
+        );
+        assert_eq!(
+            profile_duration_to_proto(ProfileDurationWkt::FromYaml, 60),
+            Some(prost_types::Duration {
+                seconds: 60,
+                nanos: 0,
+            })
+        );
+        assert!(
+            validate_profile_duration(&prost_types::Duration {
+                seconds: 1,
+                nanos: -1,
+            })
+            .is_err()
+        );
+
+        let raw_grant = openshell_core::proto::ProviderCredentialTokenGrant {
+            cache_ttl: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 500_000_000,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            token_grant_to_proto(&token_grant_from_proto(&raw_grant)).cache_ttl,
+            raw_grant.cache_ttl
+        );
+
+        let absent_grant = openshell_core::proto::ProviderCredentialTokenGrant::default();
+        assert!(
+            token_grant_to_proto(&token_grant_from_proto(&absent_grant))
+                .cache_ttl
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protobuf_profile_durations_round_trip_through_yaml_exactly() {
+        let profile = parse_profile_yaml(
+            r"
+id: exact-durations
+display_name: Exact Durations
+credentials:
+  - name: access_token
+    refresh:
+      strategy: static
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .unwrap();
+        let mut proto = profile.to_proto();
+        let credential = &mut proto.credentials[0];
+        let refresh = credential.refresh.as_mut().unwrap();
+        refresh.refresh_before = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 0,
+        });
+        refresh.max_lifetime = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 500_000_000,
+        });
+        credential.token_grant.as_mut().unwrap().cache_ttl = Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        });
+
+        let exact = ProviderTypeProfile::from_proto(&proto);
+        let yaml = profile_to_yaml(&exact).unwrap();
+        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
+        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
+        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        assert!(!yaml.contains("refresh_before_seconds"));
+        assert!(!yaml.contains("max_lifetime_seconds"));
+        assert!(!yaml.contains("cache_ttl_seconds"));
+
+        let reparsed = parse_profile_yaml(&yaml).unwrap().to_proto();
+        assert_eq!(
+            reparsed.credentials[0].refresh,
+            proto.credentials[0].refresh
+        );
+        assert_eq!(
+            reparsed.credentials[0].token_grant,
+            proto.credentials[0].token_grant
+        );
+    }
+
+    #[test]
+    fn canonical_zero_max_lifetime_is_rejected() {
+        let profile = parse_profile_yaml(
+            r#"
+id: zero-max-lifetime
+display_name: Zero Max Lifetime
+credentials:
+  - name: access_token
+    refresh:
+      strategy: oauth2_client_credentials
+      token_url: https://auth.example.com/token
+      max_lifetime: "0s"
+"#,
+        )
+        .expect("profile should parse before semantic validation");
+
+        let diagnostics = validate_profile_set(&[("zero.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.refresh.max_lifetime"
+                && diagnostic.message.contains("greater than zero")
+        }));
     }
 
     #[test]
@@ -3326,7 +3842,7 @@ mod tests {
                 .collect(),
         };
         for id in ["codex", "claude-code", "copilot"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             let model_key = profile.credential_env_vars()[0].to_owned();
             let state = ProviderCredentialState::from_bound_environment(
                 42,
@@ -3337,7 +3853,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::from([
-                    ("GITHUB_TOKEN".into(), binding(builtin_profile("github"))),
+                    ("GITHUB_TOKEN".into(), binding(example_profile("github"))),
                     (model_key.clone(), binding(profile)),
                 ]),
                 vec![],
@@ -3376,19 +3892,40 @@ mod tests {
     }
 
     #[test]
-    fn builtin_profiles_are_sorted_by_id() {
-        let ids = builtin_profiles()
+    fn example_profiles_parse_and_validate_as_one_catalog() {
+        let profiles = example_catalog();
+        assert!(
+            !profiles.is_empty(),
+            "providers/ should contain example profiles"
+        );
+
+        let ids = profiles
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(ids, sorted);
+
+        let diagnostics = validate_profile_set(
+            &profiles
+                .iter()
+                .map(|profile| (String::new(), profile.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "example profiles must lint clean: {errors:?}"
+        );
     }
 
     #[test]
     fn github_profile_materializes_policy_metadata() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
@@ -3402,7 +3939,8 @@ mod tests {
                 endpoint.host == "api.github.com"
                     && endpoint.protocol == "graphql"
                     && endpoint.path == "/graphql"
-                    && endpoint.access == "read-only"
+                    && endpoint.access
+                        == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
             }),
             "github profile should include read-only GraphQL endpoint"
         );
@@ -3412,9 +3950,9 @@ mod tests {
                 // transport endpoint (github.com) carries explicit rules
                 // instead so it can allow clone/fetch while blocking push.
                 if endpoint.host == "github.com" {
-                    endpoint.access.is_empty()
+                    endpoint.access == 0
                 } else {
-                    endpoint.access == "read-only"
+                    endpoint.access == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
                 }
             }),
             "github API endpoints should be read-only; git transport uses explicit rules"
@@ -3424,7 +3962,7 @@ mod tests {
 
     #[test]
     fn github_git_transport_allows_clone_but_not_push() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let proto = profile.to_proto();
 
         let git_transport = proto
@@ -3436,7 +3974,7 @@ mod tests {
         // The git transport carries explicit rules rather than an access preset
         // (an empty preset would otherwise expand to GET/HEAD/OPTIONS).
         assert!(
-            git_transport.access.is_empty(),
+            git_transport.access == 0,
             "git transport must use explicit rules, not an access preset"
         );
 
@@ -3484,7 +4022,7 @@ mod tests {
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = builtin_profile("claude-code");
+        let profile = example_profile("claude-code");
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
@@ -3518,7 +4056,7 @@ credentials:
 
     #[test]
     fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = builtin_profile("google-vertex-ai");
+        let profile = example_profile("google-vertex-ai");
         let service_account_token = profile
             .credentials
             .iter()
@@ -3632,13 +4170,13 @@ endpoints:
 
     #[test]
     fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
-        let profile = builtin_profile("google-cloud");
+        let profile = example_profile("google-cloud");
         let adc = profile
             .adc_credential()
             .expect("google-cloud should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
 
-        let profile = builtin_profile("google-vertex-ai");
+        let profile = example_profile("google-vertex-ai");
         let adc = profile
             .adc_credential()
             .expect("vertex should have an ADC credential");
@@ -3647,10 +4185,10 @@ endpoints:
 
     #[test]
     fn adc_credential_returns_none_for_profiles_without_adc() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         assert!(profile.adc_credential().is_none());
 
-        let profile = builtin_profile("claude-code");
+        let profile = example_profile("claude-code");
         assert!(profile.adc_credential().is_none());
     }
 
@@ -3755,12 +4293,12 @@ credentials:
     fn stable_placeholder_rejects_co_minted_refresh_outputs() {
         for id in ["aws", "aws-s3"] {
             for output in ["secret_access_key", "session_token"] {
-                let mut profile = builtin_profile(id).clone();
+                let mut profile = crate::example_profiles::load(id);
                 let credential = profile
                     .credentials
                     .iter_mut()
                     .find(|credential| credential.name == output)
-                    .expect("built-in refresh output");
+                    .expect("example profile refresh output");
                 assert!(credential.refresh.is_none());
                 credential.stable_placeholder = true;
                 let diagnostics = validate_profile_set(&[(format!("{id}.yaml"), profile)]);
@@ -3877,7 +4415,7 @@ endpoints:
     path: /mcp
     protocol: mcp
     mcp:
-      versions: ["2025-11-25", "2025-03-26", "2025-06-18"]
+      versions: ["2026-07-28", "2025-11-25", "2025-03-26", "2025-06-18"]
       strict_tool_names: false
 binaries:
   - /usr/bin/example-agent
@@ -3885,7 +4423,7 @@ binaries:
         )
         .expect("profile should parse");
 
-        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
+        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
         assert_eq!(
             profile.endpoints[0]
                 .mcp
@@ -4336,7 +4874,7 @@ endpoints:
             "versions: [\"2025-03-26\", \"2025-03-26\"]",
             "versions: [latest]",
             "versions: [draft]",
-            "versions: ['2026-07-28']",
+            "versions: ['2026-07-29']",
             "versions: [\"2025-03-26 \"]",
         ] {
             let yaml = format!(
@@ -4642,15 +5180,15 @@ credentials:
         );
         assert_eq!(refresh.material.len(), 2);
 
-        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
-        assert_eq!(
-            from_proto.credentials[0].refresh,
-            profile.credentials[0].refresh
-        );
+        let proto = profile.to_proto();
+        let from_proto = ProviderTypeProfile::from_proto(&proto);
+        assert_eq!(from_proto.to_proto(), proto);
 
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("oauth2_client_credentials"));
         assert!(exported.contains("client_secret"));
+        let reparsed = parse_profile_yaml(&exported).expect("exported profile should parse");
+        assert_eq!(reparsed.to_proto(), proto);
     }
 
     #[test]
@@ -5225,7 +5763,7 @@ endpoints:
 
     #[test]
     fn profile_json_round_trip_preserves_compact_dto_shape() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let json = profile_to_json(profile).expect("profile should serialize");
         let parsed = parse_profile_json(&json).expect("profile should parse");
 
@@ -5267,6 +5805,10 @@ binaries: []
     }
 
     #[test]
+    #[allow(
+        deprecated,
+        reason = "this test verifies the deprecated terminate compatibility spelling"
+    )]
     fn profile_yaml_round_trip_preserves_full_network_policy_fields() {
         let profile = parse_profile_yaml(
             r"
@@ -5289,7 +5831,6 @@ endpoints:
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:
@@ -5318,7 +5859,10 @@ binaries:
         let proto = profile.to_proto();
 
         let graphql_ep = &proto.endpoints[0];
-        assert_eq!(graphql_ep.access, "read-only");
+        assert_eq!(
+            graphql_ep.access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert_eq!(graphql_ep.persisted_queries, "allow_registered");
         assert_eq!(graphql_ep.graphql_max_body_bytes, 131_072);
         assert_eq!(graphql_ep.path, "/graphql");
@@ -5333,7 +5877,6 @@ binaries:
         let rest_ep = &proto.endpoints[1];
         assert_eq!(rest_ep.port, 0);
         assert_eq!(rest_ep.ports, vec![443, 8443]);
-        assert_eq!(rest_ep.tls, "terminate");
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
         assert!(rest_ep.allow_uninspected_credentials);
@@ -5353,7 +5896,10 @@ binaries:
         assert!(serialized.contains("- /usr/bin/custom"));
         let reparsed = parse_profile_yaml(&serialized).expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].access, "read-only");
+        assert_eq!(
+            reprotoo.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
@@ -5531,6 +6077,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "space.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: " alex-api ".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5549,6 +6096,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "underscore.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "alex_api".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5567,6 +6115,7 @@ binaries: ["", /usr/bin/broken]
             (
                 "case.yaml".to_string(),
                 ProviderTypeProfile {
+                    files: Vec::new(),
                     id: "Alex-API".to_string(),
                     resource_version: 0,
                     annotations: HashMap::new(),
@@ -5682,7 +6231,7 @@ binaries:
 
     #[test]
     fn aws_profile_parses_correctly() {
-        let aws = builtin_profile("aws");
+        let aws = example_profile("aws");
         assert_eq!(aws.display_name, "AWS");
         assert_eq!(aws.credentials.len(), 3);
         let access_key = aws
@@ -5706,7 +6255,7 @@ binaries:
 
     #[test]
     fn aws_s3_profile_parses_with_endpoints() {
-        let aws_s3 = builtin_profile("aws-s3");
+        let aws_s3 = example_profile("aws-s3");
         assert_eq!(aws_s3.display_name, "AWS S3");
         assert!(!aws_s3.endpoints.is_empty());
         assert!(
@@ -5756,7 +6305,7 @@ binaries:
     #[test]
     fn aws_profile_declares_additional_outputs() {
         for id in ["aws", "aws-s3"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             let refresh = profile
                 .credentials
                 .iter()
@@ -5785,7 +6334,7 @@ binaries:
         // required credentials are runtime-resolvable, so `--runtime-credentials`
         // (empty provider creation) is allowed.
         for id in ["aws", "aws-s3"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             assert!(
                 profile.allows_empty_provider_credentials(),
                 "{id} should allow empty provider credentials"
@@ -6090,6 +6639,35 @@ credentials:
     }
 
     // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_unknown_security_sensitive_endpoint_values() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-modes
+display_name: Invalid modes
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    tls: skp
+    enforcement: enforc
+    access: read-wirte
+",
+        )
+        .expect("string values should parse before semantic validation");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let message = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(message.contains("unknown tls value 'skp'"));
+        assert!(message.contains("unknown enforcement value 'enforc'"));
+        assert!(message.contains("unknown access value 'read-wirte'"));
+    }
 
     #[test]
     fn validate_rejects_protocol_without_rules_or_access() {
@@ -7558,5 +8136,30 @@ binaries:
                 .contains("mcp options are only valid for protocol mcp")),
             "expected mcp-options-on-non-mcp rejection: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn managed_file_example_validates_and_renders_only_config_fields() {
+        let yaml = include_str!("../../../examples/provider-managed-files/acme-config.yaml");
+        let profile = parse_profile_yaml(yaml).expect("example profile parses");
+        let diagnostics =
+            validate_profile_set(&[("acme-config.yaml".to_string(), profile.clone())]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let rendered = profile.files[0]
+            .render(&HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "https://api.acme.example".to_string(),
+                ),
+                ("project".to_string(), "production".to_string()),
+            ]))
+            .expect("render provider config");
+        assert!(rendered.contains("project = \"production\""));
+        assert!(!rendered.contains("{{"));
+
+        let mut invalid = profile;
+        invalid.files[0].content = "token = \"{{credential.API_KEY}}\"".to_string();
+        let diagnostics = validate_profile_set(&[("invalid.yaml".to_string(), invalid)]);
+        assert!(diagnostics.iter().any(|d| d.field == "files.content"));
     }
 }

@@ -135,7 +135,7 @@ func TestProvider_Delete(t *testing.T) {
 
 	_, _ = pc.Create(ctx, "default", &types.Provider{Name: "openai"})
 
-	err := pc.Delete(ctx, "default", "openai")
+	_, err := pc.Delete(ctx, "default", "openai")
 	require.NoError(t, err)
 
 	_, err = pc.Get(ctx, "default", "openai")
@@ -147,7 +147,7 @@ func TestProvider_Delete_Idempotent(t *testing.T) {
 	pc := newTestProviderClient()
 	ctx := context.Background()
 
-	err := pc.Delete(ctx, "default", "nonexistent")
+	_, err := pc.Delete(ctx, "default", "nonexistent", types.DeleteOptions{AllowMissing: true})
 	require.NoError(t, err)
 }
 
@@ -268,7 +268,7 @@ func TestProvider_ConcurrentCreateGetListDeleteEnsure(_ *testing.T) {
 				_, _ = pc.ListAll(ctx, "default")
 				_, _ = pc.Update(ctx, "default", &types.Provider{Name: name, Type: "updated"})
 				_, _ = pc.Ensure(ctx, "default", &types.Provider{Name: name, Type: "ensured"})
-				_ = pc.Delete(ctx, "default", name)
+				_, _ = pc.Delete(ctx, "default", name)
 			}
 		}(i)
 	}

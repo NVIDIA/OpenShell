@@ -45,7 +45,7 @@ Use this map when product behavior, commands, or development workflows change. I
 | Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
 | Supervisor middleware policy, registrations, runtime, or failure behavior | `generate-sandbox-policy`, `openshell-cli`, `debug-openshell-cluster` |
 | Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
-| Inference providers, native model endpoints, or migration from `inference.local` | `debug-inference`, `openshell-cli`, `generate-sandbox-policy` |
+| Inference providers, native model endpoints, or migration from the retired managed endpoint | `debug-inference`, `openshell-cli`, `generate-sandbox-policy` |
 | TUI architecture, navigation, data fetching, or UX | `tui-development` |
 | Release artifacts or post-publish smoke coverage | `test-release-canary` |
 | GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |
@@ -150,8 +150,8 @@ For each file in the table above, check for the following inconsistencies:
 3. **Unique names** — Parse the `name` field from every `SKILL.md` under both roots. Every name must be globally unique and match the documented inventory.
 4. **Local references** — Every relative Markdown link and referenced file in a skill must resolve within that installed skill directory unless the reference is an explicit published URL.
 5. **Canonical paths** — Contributor skills that name the source location of a public skill must use `skills/<name>/...`, never `.agents/skills/<name>/...`.
-6. **Public portability** — Public skills must not require repository-relative files under `docs/`, `architecture/`, `crates/`, `deploy/`, or `.agents/`; source builds; `mise`; or repository E2E workflows. Use installed `openshell --help` for command syntax and Markdown endpoints under `https://docs.nvidia.com/openshell/latest/` (URLs ending in `.md`) for product documentation.
-7. **No canonical documentation copies** — Review public reference files and large command/schema blocks. Remove material that merely copies CLI help, policy schemas, architecture docs, or published operational documentation; retain only skill-specific reasoning and worked interactions.
+6. **Public portability** — Public skills must not require repository-relative files under `docs/`, `crates/`, `deploy/`, or `.agents/`; source builds; `mise`; or repository E2E workflows. Use installed `openshell --help` for command syntax and Markdown endpoints under `https://docs.nvidia.com/openshell/latest/` (URLs ending in `.md`) for product documentation.
+7. **No canonical documentation copies** — Review public reference files and large command/schema blocks. Remove material that merely copies CLI help, policy schemas, RFCs, or published operational documentation; retain only skill-specific reasoning and worked interactions.
 8. **Discovery** — Run `npx -y skills add . --list` from a clean checkout or disposable copy. It must list exactly the four public skills. Remove any generated lock file or installed directory after the check.
 
 ## Step 3: Report Drift

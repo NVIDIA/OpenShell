@@ -20,10 +20,18 @@ import {
   SandboxClient,
   SandboxTemplateClient,
   SCOPE_NAMES,
+  ServiceAuthorizationMode,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import {
+  OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  SandboxPhase,
+  SandboxRestartPolicy,
+  ServiceStatus,
+} from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
+import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
   const transport: Transport = createRouterTransport((router) => {
@@ -57,7 +65,30 @@ function readySandbox(
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
+describe('deletion outcomes', () => {
+  it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
+    const flags: boolean[] = [];
+    let outcome = 2;
+    const sandbox = client({
+      deleteSandbox: (req) => {
+        flags.push(req.allowMissing);
+        return { outcome, sandboxId: 'original-id' };
+      },
+    });
+    expect(await sandbox.delete('sandbox')).toEqual({ outcome: 'accepted', rawOutcome: 2, sandboxId: 'original-id' });
+    outcome = 99;
+    expect(await sandbox.delete('sandbox', { allowMissing: true })).toEqual({
+      outcome: 'unknown',
+      rawOutcome: 99,
+      sandboxId: 'original-id',
+    });
+    expect(flags).toEqual([false, true]);
+  });
+});
+
 type ScopedRequest = {
+  name?: string;
+  sandbox?: string;
   workspaceScope?: { selection?: { case?: string; value?: unknown } };
 };
 
@@ -66,13 +97,21 @@ function selectedWorkspace(req: ScopedRequest): string | undefined {
   return selection?.case === 'workspace' && typeof selection.value === 'string' ? selection.value : undefined;
 }
 
+function requestSandbox(req: ScopedRequest): string | undefined {
+  return req.name ?? req.sandbox;
+}
+
 function selectsAllWorkspaces(req: ScopedRequest): boolean {
   return req.workspaceScope?.selection?.case === 'allWorkspaces';
 }
 
 describe('exec / execStream', () => {
   it('resolves the id via get, frames tty:false, and buffers the result (backward compat)', async () => {
-    let execReq: { sandboxId?: string; tty?: boolean; command?: string[] } = {};
+    let execReq: ScopedRequest & {
+      tty?: boolean;
+      command?: string[];
+      executionTimeout?: { seconds: bigint; nanos: number };
+    } = {};
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),
       // eslint-disable-next-line require-yield
@@ -86,13 +125,28 @@ describe('exec / execStream', () => {
     });
 
     const result = await sandbox.exec('sb', ['/bin/sh', '-c', 'echo hi']);
-    expect(execReq.sandboxId).toBe('sb-id-1');
+    expect(requestSandbox(execReq)).toBe('sb');
     expect(execReq.tty).toBe(false);
     expect(execReq.command).toEqual(['/bin/sh', '-c', 'echo hi']);
+    expect(execReq.executionTimeout).toBeUndefined();
     expect(result.exitCode).toBe(3);
     expect(result.stdout.toString()).toBe('hello world');
     expect(result.stderr.toString()).toBe('warn');
     expect(Buffer.isBuffer(result.stdout)).toBe(true);
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid timeoutSecs %s', async (timeoutSecs) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+
+    await expect(sandbox.exec('sb', ['true'], { timeoutSecs })).rejects.toThrow(
+      'timeoutSecs must be a finite, non-negative number',
+    );
   });
 
   it('execStream yields incremental chunks then a terminal exit event', async () => {
@@ -228,6 +282,55 @@ describe('exec / execStream', () => {
 });
 
 describe('create', () => {
+  it('sends create-time service exposures', async () => {
+    let created: {
+      serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return {
+          ...readySandbox('sb', 'sb-id'),
+          serviceUrls: {
+            '': 'https://sb.example.test/',
+            metrics: 'https://metrics.sb.example.test/',
+          },
+        };
+      },
+    });
+
+    const result = await sandbox.create({
+      image: 'img',
+      serviceExposures: [
+        { targetPort: 4500 },
+        {
+          service: 'metrics',
+          targetPort: 9090,
+          authorizationMode: ServiceAuthorizationMode.BearerPassthrough,
+        },
+      ],
+    });
+
+    expect(
+      created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
+        service,
+        targetPort,
+        authorizationMode,
+      })),
+    ).toEqual([
+      { service: '', targetPort: 4500, authorizationMode: ProtoServiceAuthorizationMode.STRIP },
+      {
+        service: 'metrics',
+        targetPort: 9090,
+        authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
+      },
+    ]);
+    expect(result.serviceUrls).toEqual({
+      '': 'https://sb.example.test/',
+      metrics: 'https://metrics.sb.example.test/',
+    });
+  });
+
   it('sends the curated policy through spec.policy', async () => {
     let created: { spec?: { policy?: { version?: number } } } = {};
     const sandbox = client({
@@ -259,6 +362,20 @@ describe('create', () => {
     expect(created.spec?.tty).toBe(true);
   });
 
+  it('sends the restart policy', async () => {
+    let created: { spec?: { restartPolicy?: SandboxRestartPolicy } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ image: 'img', restartPolicy: 'on-failure' });
+
+    expect(created.spec?.restartPolicy).toBe(SandboxRestartPolicy.ON_FAILURE);
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {
@@ -288,9 +405,9 @@ describe('create', () => {
 
   it('createFromTemplate sends the workload template name with governance fields only', async () => {
     let created: {
-      workloadTemplateName?: string;
+      workloadTemplate?: string;
       name?: string;
-      workspaceScope?: ScopedRequest['workspaceScope'];
+      workspace?: string;
       labels?: Record<string, string>;
       spec?: {
         policy?: { version?: number };
@@ -309,7 +426,7 @@ describe('create', () => {
     const ref = await sandbox.createFromTemplate({
       name: 'job-1',
       workspace: 'staging',
-      templateName: 'gpu-kata',
+      workloadTemplate: 'gpu-kata',
       labels: { team: 'runtime' },
       providers: ['github'],
       command: ['/opt/worker', '--serve'],
@@ -317,7 +434,7 @@ describe('create', () => {
       policy: { version: 1, networkPolicies: {} },
     });
 
-    expect(created.workloadTemplateName).toBe('gpu-kata');
+    expect(created.workloadTemplate).toBe('gpu-kata');
     expect(created.name).toBe('job-1');
     expect(selectedWorkspace(created)).toBe('staging');
     expect(created.labels).toEqual({ team: 'runtime' });
@@ -353,13 +470,14 @@ describe('create', () => {
       },
       getSandbox: (req) => {
         const workspace = selectedWorkspace(req);
-        if (req.name === 'exec') observed.execGet = workspace;
-        else if (req.name === 'interactive') observed.interactiveGet = workspace;
-        else if (req.name === 'ssh') observed.sshGet = workspace;
-        else if (req.name === 'forward') observed.forwardGet = workspace;
-        else if (req.name === 'config' && workspace) observed.configGets.push(workspace);
+        const name = requestSandbox(req);
+        if (name === 'exec') observed.execGet = workspace;
+        else if (name === 'interactive') observed.interactiveGet = workspace;
+        else if (name === 'ssh') observed.sshGet = workspace;
+        else if (name === 'forward') observed.forwardGet = workspace;
+        else if (name === 'config' && workspace) observed.configGets.push(workspace);
         else observed.get = req;
-        return readySandbox(req.name, `${req.name}-id`, 7n, undefined, workspace ?? 'default');
+        return readySandbox(name ?? '', `${name}-id`, 7n, undefined, workspace ?? 'default');
       },
       listSandboxes: (req) => {
         observed.list = req;
@@ -380,21 +498,31 @@ describe('create', () => {
       },
       deleteSandbox: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
       attachSandboxProvider: (req) => {
         observed.attach = req;
         return {
-          sandbox: readySandbox(req.sandboxName, 'attach-id', 7n, undefined, selectedWorkspace(req) ?? 'default')
-            .sandbox,
+          sandbox: readySandbox(
+            requestSandbox(req) ?? '',
+            'attach-id',
+            7n,
+            undefined,
+            selectedWorkspace(req) ?? 'default',
+          ).sandbox,
           attached: true,
         };
       },
       detachSandboxProvider: (req) => {
         observed.detach = req;
         return {
-          sandbox: readySandbox(req.sandboxName, 'detach-id', 7n, undefined, selectedWorkspace(req) ?? 'default')
-            .sandbox,
+          sandbox: readySandbox(
+            requestSandbox(req) ?? '',
+            'detach-id',
+            7n,
+            undefined,
+            selectedWorkspace(req) ?? 'default',
+          ).sandbox,
           detached: true,
         };
       },
@@ -426,7 +554,7 @@ describe('create', () => {
         yield { payload: { case: 'exit', value: { exitCode: 0 } } };
       },
       createSshSession: (req) => ({
-        sandboxId: req.sandboxId,
+        sandboxId: `${requestSandbox(req) ?? ''}-id`,
         token: 'tok',
         gatewayHost: 'gw',
         gatewayPort: 443,
@@ -434,7 +562,7 @@ describe('create', () => {
         hostKeyFingerprint: '',
         expiresAtMs: 0n,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
@@ -452,7 +580,7 @@ describe('create', () => {
     await sandbox.createSshSession('ssh', { workspace: 'staging' });
     const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
-    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
     await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
@@ -465,7 +593,7 @@ describe('create', () => {
     expect(created.workspace).toBe('staging');
     expect(got.workspace).toBe('staging');
     expect(listed[0]?.workspace).toBe('staging');
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(attached.sandbox.workspace).toBe('staging');
     expect(detached.sandbox.workspace).toBe('staging');
     expect(selectedWorkspace(observed.create ?? {})).toBe('staging');
@@ -529,9 +657,47 @@ describe('create', () => {
     expect(tokens).toEqual(['resume', 'resume']);
   });
 
+  it('rejects a repeated continuation token', async () => {
+    const pager = new Pager<number>(async (token) => ({ items: [1], nextPageToken: token }), 'resume');
+
+    await expect(pager.nextPage()).rejects.toThrow('pager received a repeated continuation token');
+  });
+
+  it('prevents a request when the token-count budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: 'next' };
+      },
+      'first',
+      1,
+    );
+
+    await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: 'next' });
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual(['first']);
+  });
+
+  it('prevents a request when the token-byte budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: '' };
+      },
+      'too-large',
+      10,
+      1,
+    );
+
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual([]);
+  });
+
   it('createFromTemplate rejects an empty template name locally', async () => {
     const sandbox = client({});
-    await expect(sandbox.createFromTemplate({ templateName: ' ' })).rejects.toMatchObject({
+    await expect(sandbox.createFromTemplate({ workloadTemplate: ' ' })).rejects.toMatchObject({
       code: 'invalid_config',
     });
   });
@@ -620,7 +786,7 @@ describe('sandbox templates', () => {
         metadata: { name: 'python', labels: { team: 'runtime' } },
         spec: {
           workload: {
-            image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+            image: 'registry.example.com/agents/python:latest',
             environment: { FEATURE_FLAG: 'on' },
             resources: { cpu: '1', memory: '512Mi', gpu: { count: 1 } },
           },
@@ -668,7 +834,7 @@ describe('sandbox templates', () => {
       },
       deleteSandboxTemplate: (req) => {
         observed.delete = req;
-        return { deleted: true };
+        return { outcome: 1 };
       },
     });
 
@@ -678,7 +844,7 @@ describe('sandbox templates', () => {
 
     expect(got.metadata?.name).toBe('gpu-kata');
     expect(listed).toHaveLength(1);
-    expect(deleted).toBe(true);
+    expect(deleted.outcome).toBe('completed');
     expect(observed.get).toMatchObject({ name: 'gpu-kata' });
     expect(selectedWorkspace(observed.get ?? {})).toBe('staging');
     expect(observed.list).toMatchObject({
@@ -715,6 +881,29 @@ describe('sandbox templates', () => {
     await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
     await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
+
+  it('maps restart controller status', async () => {
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: {
+          metadata: { id: 'sb-id', name: 'sb', resourceVersion: 8n },
+          status: {
+            phase: SandboxPhase.STARTING,
+            restartCount: 3,
+            nextRestartTime: { seconds: 1_700_000_000n, nanos: 0 },
+            mainProcessStartedTime: { seconds: 1_699_999_000n, nanos: 0 },
+          },
+        },
+      }),
+    });
+
+    await expect(sandbox.get('sb')).resolves.toMatchObject({
+      phase: 'starting',
+      restartCount: 3,
+      nextRestartAtMs: 1_700_000_000_000,
+      mainProcessStartedAtMs: 1_699_999_000_000,
+    });
   });
 });
 
@@ -768,13 +957,82 @@ describe('waits', () => {
     });
   });
 
-  it('waitDeleted resolves when the gateway reports NotFound', async () => {
+  it.each([undefined, 'old-id'])('waitDeleted resolves on NotFound with expected ID %s', async (expectedSandboxId) => {
     const sandbox = client({
       getSandbox: () => {
         throw new ConnectError('gone', Code.NotFound);
       },
     });
-    await expect(sandbox.waitDeleted('sb', 1)).resolves.toBeUndefined();
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId })).resolves.toBeUndefined();
+  });
+
+  it.each([undefined, 'team'])(
+    'waitDeleted completes on replacement after accepted deletion in %s',
+    async (workspace) => {
+      let polls = 0;
+      const sandbox = client({
+        deleteSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          return { outcome: 2, sandboxId: 'old-id' };
+        },
+        getSandbox: (req) => {
+          expect(selectedWorkspace(req)).toBe(workspace ?? 'default');
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      const deletion = await sandbox.delete('sb', { workspace });
+      expect(deletion.outcome).toBe('accepted');
+      expect(deletion.sandboxId).toBe('old-id');
+      await expect(
+        sandbox.waitDeleted('sb', 1, {
+          workspace,
+          expectedSandboxId: deletion.sandboxId,
+        }),
+      ).resolves.toBeUndefined();
+      expect(polls).toBe(1);
+    },
+  );
+
+  it('waitDeleted keeps polling the original identity until it disappears', async () => {
+    let polls = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        if (++polls === 1) return readySandbox('sb', 'old-id');
+        throw new ConnectError('gone', Code.NotFound);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 5, { expectedSandboxId: 'old-id' })).resolves.toBeUndefined();
+    expect(polls).toBe(2);
+  });
+
+  it.each([undefined, 'replacement-id'])(
+    'waitDeleted times out while observed identity remains with expected ID %s',
+    async (expectedSandboxId) => {
+      let polls = 0;
+      const sandbox = client({
+        getSandbox: () => {
+          polls++;
+          return readySandbox('sb', 'replacement-id');
+        },
+      });
+      await expect(sandbox.waitDeleted('sb', 0.2, { expectedSandboxId })).rejects.toMatchObject({
+        code: 'connect',
+        message: "[connect] timed out waiting for sandbox 'sb' to delete",
+      });
+      expect(polls).toBeGreaterThan(0);
+    },
+  );
+
+  it.each([Code.PermissionDenied, Code.Unavailable])('waitDeleted propagates lookup error %s', async (code) => {
+    const sandbox = client({
+      getSandbox: () => {
+        throw new ConnectError('lookup failed', code);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 1, { expectedSandboxId: 'old-id' })).rejects.toMatchObject({
+      connectCode: code,
+    });
   });
 
   it('waitDeleted rejects rather than hanging when get() never resolves', async () => {
@@ -800,9 +1058,38 @@ describe('Pushable', () => {
 });
 
 describe('execInteractive', () => {
+  it('preserves legacy session implementations and exposes SDK lifecycle controls', async () => {
+    // These are exactly the original required members, checked through the
+    // public package exports so downstream wrappers can keep their old types.
+    const legacy: ExecInteractiveSession = {
+      output: (async function* () {
+        yield { type: 'exit' as const, exitCode: 0 };
+      })(),
+      write() {},
+      resize() {},
+      close() {},
+      done: Promise.resolve(0),
+    };
+    const wrap = (session: ExecInteractiveSession): ExecInteractiveSession => session;
+    expect(wrap(legacy)).toBe(legacy);
+
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const controlled: ExecInteractiveSessionControl = await sandbox.execInteractive('sb', ['true']);
+    expect(wrap(controlled)).toBe(controlled);
+    controlled.closeInput();
+    expect(await controlled.done).toBe(0);
+    expect(controlled.exitCode).toBe(0);
+    controlled.cancel();
+  });
+
   it('sends start first with tty/cols/rows, streams output, and resolves done', async () => {
     const cases: string[] = [];
-    let started: { tty?: boolean; cols?: number; rows?: number; sandboxId?: string } | undefined;
+    let started: (ScopedRequest & { tty?: boolean; cols?: number; rows?: number }) | undefined;
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-9'),
       execSandboxInteractive: async function* (requests) {
@@ -846,13 +1133,191 @@ describe('execInteractive', () => {
     expect(started?.tty).toBe(true);
     expect(started?.cols).toBe(120);
     expect(started?.rows).toBe(40);
-    expect(started?.sandboxId).toBe('sb-id-9');
+    expect(requestSandbox(started ?? {})).toBe('sb');
     expect(out.join('')).toContain('ready\n');
     expect(out.join('')).toContain('echo hi');
   });
 });
 
 describe('exec done settlement', () => {
+  it('starts the command and observes completion before output is consumed', async () => {
+    let started = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        started = true;
+        yield { payload: { case: 'stdout', value: { data: enc('started') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect.poll(() => started).toBe(true);
+    expect(await session.done).toBe(0);
+    const events = [];
+    for await (const event of session.output) events.push(event);
+    expect(events).toEqual([
+      { stream: 'stdout', data: Buffer.from('started') },
+      { type: 'exit', exitCode: 0 },
+    ]);
+  });
+
+  it('observes early transport failures without output consumption', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: () => {
+        throw new ConnectError('early failure', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toMatchObject({ connectCode: Code.Unavailable });
+  });
+
+  it('cancels a receiver blocked by output backpressure', async () => {
+    let released = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (_requests, ctx) {
+        ctx.signal.addEventListener('abort', () => {
+          released = true;
+        });
+        // More than the SDK queue budget, in one transport event.
+        yield { payload: { case: 'stdout', value: { data: new Uint8Array(4 * 1024 * 1024) } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(session.exitCode).toBeUndefined();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await expect.poll(() => released).toBe(true);
+    await expect(session.output[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'canceled' });
+  });
+
+  it('drains output larger than the queue budget without losing bytes', async () => {
+    const data = Buffer.alloc(2 * 1024 * 1024 + 7, 'x');
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data } } };
+        yield { payload: { case: 'stderr', value: { data: enc('last') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 3 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    const chunks: Buffer[] = [];
+    for await (const event of session.output) {
+      if ('type' in event) expect(await session.done).toBe(3);
+      else chunks.push(event.data);
+    }
+    const actual = Buffer.concat(chunks);
+    const expected = Buffer.concat([data, Buffer.from('last')]);
+    expect(actual.length).toBe(expected.length);
+    // Compare bytes natively: deep equality on a multi-MiB Buffer can exhaust
+    // the test timeout on CI even when the stream drains promptly.
+    expect(actual.equals(expected)).toBe(true);
+  });
+
+  it('retains the exit code but rejects completion on a later transport error', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 7 } } };
+        throw new ConnectError('connection lost after exit', Code.Unavailable);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain through trailers */
+        }
+      })(),
+    ).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    await expect(session.done).rejects.toMatchObject({ connectCode: Code.Unavailable });
+    expect(session.exitCode).toBe(7);
+  });
+
+  it.each(['stdout', 'exit'] as const)('rejects %s after an exit event', async (payload) => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+        if (payload === 'stdout') yield { payload: { case: 'stdout', value: { data: enc('late') } } };
+        else yield { payload: { case: 'exit', value: { exitCode: 1 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          /* drain */
+        }
+      })(),
+    ).rejects.toThrow('after exit');
+    await expect(session.done).rejects.toThrow('after exit');
+    expect(session.exitCode).toBe(0);
+  });
+
+  it('closes input idempotently and rejects later stdin and resize', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* (requests) {
+        for await (const _input of requests) {
+          /* wait for request EOF */
+        }
+        yield { payload: { case: 'stdout', value: { data: enc('drained') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.closeInput();
+    session.close();
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+    const output = [];
+    for await (const event of session.output) output.push(event);
+    expect(output).toHaveLength(2);
+    expect(await session.done).toBe(0);
+  });
+
+  it('cancel settles completion even before output is consumed', async () => {
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    session.cancel();
+    session.cancel();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.write(Buffer.from('late'))).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion before output is consumed', async () => {
+    const controller = new AbortController();
+    const sandbox = client({ getSandbox: () => readySandbox('sb', 'sb-id') });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    expect(() => session.resize(80, 24)).toThrow('input is closed');
+  });
+
+  it('external cancellation settles completion while output is paused', async () => {
+    const controller = new AbortController();
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash'], { signal: controller.signal });
+    const iterator = session.output[Symbol.asyncIterator]();
+    await iterator.next();
+    controller.abort();
+    await expect(session.done).rejects.toMatchObject({ code: 'canceled' });
+    await iterator.return?.();
+  });
+
   it('resolves done even when the consumer breaks right after the exit event', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
@@ -866,7 +1331,7 @@ describe('exec done settlement', () => {
     for await (const event of session.output) {
       if ('type' in event) break; // break on exit: the generator never resumes
     }
-    // Without settling `done` before the exit yield, this would hang forever.
+    // The public exit is yielded only after successful terminal status.
     expect(await session.done).toBe(3);
   });
 
@@ -910,8 +1375,9 @@ describe('exec done settlement', () => {
 describe('providers', () => {
   it('attach/detach assemble the request and map the changed flag + sandbox ref', async () => {
     let attachReq: {
-      sandboxName?: string;
-      providerName?: string;
+      sandbox?: string;
+      workspace?: string;
+      provider?: string;
       expectedResourceVersion?: bigint;
     } = {};
     let detachReq: { expectedResourceVersion?: bigint } = {};
@@ -930,8 +1396,8 @@ describe('providers', () => {
     });
 
     const attach = await sandbox.attachProvider('sb', 'claude');
-    expect(attachReq.sandboxName).toBe('sb');
-    expect(attachReq.providerName).toBe('claude');
+    expect(requestSandbox(attachReq)).toBe('sb');
+    expect(attachReq.provider).toBe('claude');
     expect(attachReq.expectedResourceVersion).toBe(0n);
     expect(attach.changed).toBe(true);
     expect(attach.sandbox.resourceVersion).toBe('7');
@@ -943,23 +1409,66 @@ describe('providers', () => {
     expect(detach.changed).toBe(false);
   });
 
-  it('lists providers with u64 resourceVersion rendered as a string', async () => {
+  it('lists one provider page with its continuation token', async () => {
+    const pageTokens: string[] = [];
     const sandbox = client({
-      listSandboxProviders: () => ({
-        providers: [
-          {
-            metadata: {
-              id: 'p1',
-              name: 'claude',
-              labels: { a: 'b' },
-              resourceVersion: 99n,
+      listSandboxProviders: ({ pageToken, pageSize }) => {
+        pageTokens.push(pageToken);
+        expect(pageSize).toBe(1);
+        return {
+          providers: [
+            {
+              metadata: { id: 'p1', name: 'claude', resourceVersion: 99n },
+              type: 'claude',
             },
-            type: 'claude',
-          },
-        ],
-      }),
+          ],
+          nextPageToken: 'page-2',
+        };
+      },
     });
-    const providers = await sandbox.listProviders('sb');
+
+    const page = await sandbox.listProviders('sb', { pageSize: 1 }).nextPage();
+    expect(page).toMatchObject({ nextPageToken: 'page-2' });
+    expect(page?.items.map((provider) => provider.name)).toEqual(['claude']);
+    expect(pageTokens).toEqual(['']);
+  });
+
+  it('lists all providers with u64 resourceVersion rendered as a string', async () => {
+    const pageTokens: string[] = [];
+    const sandbox = client({
+      listSandboxProviders: ({ pageToken }) => {
+        pageTokens.push(pageToken);
+        return pageToken === ''
+          ? {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p1',
+                    name: 'claude',
+                    labels: { a: 'b' },
+                    resourceVersion: 99n,
+                  },
+                  type: 'claude',
+                },
+              ],
+              nextPageToken: 'page-2',
+            }
+          : {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p2',
+                    name: 'github',
+                    resourceVersion: 100n,
+                  },
+                  type: 'github',
+                },
+              ],
+              nextPageToken: '',
+            };
+      },
+    });
+    const providers = await sandbox.listAllProviders('sb');
     expect(providers).toEqual([
       {
         id: 'p1',
@@ -968,7 +1477,15 @@ describe('providers', () => {
         labels: { a: 'b' },
         resourceVersion: '99',
       },
+      {
+        id: 'p2',
+        name: 'github',
+        type: 'github',
+        labels: {},
+        resourceVersion: '100',
+      },
     ]);
+    expect(pageTokens).toEqual(['', 'page-2']);
   });
 });
 
@@ -1007,7 +1524,8 @@ describe('config / policy', () => {
 
   it('setPolicy sends global=false + version pin and (wait) polls until the hash matches', async () => {
     let updateReq: {
-      name?: string;
+      sandbox?: string;
+      workspace?: string;
       global?: boolean;
       expectedResourceVersion?: bigint;
       policy?: unknown;
@@ -1048,7 +1566,7 @@ describe('config / policy', () => {
       },
       { wait: true, expectedResourceVersion: '7' },
     );
-    expect(updateReq.name).toBe('sb');
+    expect(requestSandbox(updateReq)).toBe('sb');
     expect(updateReq.global).toBe(false);
     expect(updateReq.expectedResourceVersion).toBe(7n);
     expect(updateReq.policy).toBeDefined();
@@ -1081,7 +1599,8 @@ describe('config / policy', () => {
 
   it('setSetting upserts a single sandbox-scoped setting (global=false)', async () => {
     let req: {
-      name?: string;
+      sandbox?: string;
+      workspace?: string;
       settingKey?: string;
       global?: boolean;
       settingValue?: unknown;
@@ -1100,7 +1619,7 @@ describe('config / policy', () => {
     const result = await sandbox.setSetting('sb', 'feature.enabled', {
       value: { case: 'boolValue', value: true },
     });
-    expect(req.name).toBe('sb');
+    expect(requestSandbox(req)).toBe('sb');
     expect(req.settingKey).toBe('feature.enabled');
     expect(req.global).toBe(false);
     expect(req.settingValue).toMatchObject({
@@ -1129,7 +1648,7 @@ describe('ssh sessions', () => {
         gatewayPort: 8443,
         gatewayScheme: 'https',
         hostKeyFingerprint: 'SHA256:abc',
-        expiresAtMs: 1730000000000n,
+        expirationTime: { seconds: 1730000000n, nanos: 0 },
       }),
     });
     const session = await withExpiry.createSshSession('sb');
@@ -1152,7 +1671,7 @@ describe('ssh sessions', () => {
         gatewayPort: 80,
         gatewayScheme: 'http',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
     });
     const bare = await noExpiry.createSshSession('sb');
@@ -1161,8 +1680,8 @@ describe('ssh sessions', () => {
   });
 
   it('revokeSshSession returns the revoked flag', async () => {
-    const sandbox = client({ revokeSshSession: () => ({ revoked: true }) });
-    expect(await sandbox.revokeSshSession('tok')).toBe(true);
+    const sandbox = client({ revokeSshSession: () => ({ outcome: 1 }) });
+    expect((await sandbox.revokeSshSession('tok')).outcome).toBe('completed');
   });
 
   it('rejects a response that violates the ProxyCommand trust-boundary contract', async () => {
@@ -1173,7 +1692,7 @@ describe('ssh sessions', () => {
       gatewayPort: 8443,
       gatewayScheme: 'https',
       hostKeyFingerprint: 'SHA256:abc',
-      expiresAtMs: 0n,
+      expirationTime: undefined,
     };
     const cases: Array<Record<string, unknown>> = [
       { ...base, sandboxId: 'different-sandbox' },
@@ -1207,7 +1726,7 @@ describe('ssh sessions', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         }),
       });
       await expect(sandbox.createSshSession('sb')).resolves.toMatchObject({ gatewayHost });
@@ -1217,9 +1736,9 @@ describe('ssh sessions', () => {
 
 describe('forward', () => {
   it('binds a local port and relays bytes both ways, minting + revoking a token', async () => {
-    let sshReq: { sandboxId?: string } = {};
+    let sshReq: ScopedRequest = {};
     let revokedToken: string | undefined;
-    let initFrame: { sandboxId?: string; authorizationToken?: string; target?: unknown } | undefined;
+    let initFrame: (ScopedRequest & { authorizationToken?: string; target?: unknown }) | undefined;
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-forward'),
       createSshSession: (req) => {
@@ -1231,12 +1750,12 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       revokeSshSession: (req) => {
         revokedToken = req.token;
-        return { revoked: true };
+        return { outcome: 1 };
       },
       forwardTcp: async function* (requests) {
         for await (const frame of requests) {
@@ -1270,8 +1789,8 @@ describe('forward', () => {
     });
 
     expect(echoed).toBe('ping-through-forward');
-    expect(sshReq.sandboxId).toBe('sb-id-forward');
-    expect(initFrame?.sandboxId).toBe('sb-id-forward');
+    expect(requestSandbox(sshReq)).toBe('sb');
+    expect(requestSandbox(initFrame ?? {})).toBe('sb');
     expect(initFrame?.authorizationToken).toBe('fwd-tok');
     expect(initFrame?.target).toMatchObject({
       case: 'tcp',
@@ -1314,9 +1833,9 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
       // Ignore inbound frames; just blast a large, verifiable byte stream back.
       forwardTcp: async function* () {
         for (let i = 0; i < CHUNKS; i++) {
@@ -1375,14 +1894,14 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       // biome-ignore lint/correctness/useYield: the socket is reset before any frame is relayed
       forwardTcp: async function* () {
         return;
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });
@@ -1445,7 +1964,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       forwardTcp: async function* (_requests, ctx) {
         streamStarted();
@@ -1461,7 +1980,7 @@ describe('forward', () => {
         });
         throw new ConnectError('canceled', Code.Canceled);
       },
-      revokeSshSession: () => ({ revoked: true }),
+      revokeSshSession: () => ({ outcome: 1 }),
     });
 
     const handle = await sandbox.forward('sb', { targetPort: 9000 });
@@ -1503,6 +2022,68 @@ describe('enum name maps', () => {
 });
 
 describe('raw escape hatch', () => {
+  it('preserves explicit L7 target scope and optional endpoint path on the wire', async () => {
+    const observed: MessageInitShape<typeof OpenShell.method.updateConfig.input>[] = [];
+    const sandbox = client({
+      updateConfig: (req) => {
+        observed.push(req);
+        return { version: 2, policyHash: 'updated' };
+      },
+    });
+    await sandbox.raw.updateConfig({
+      sandbox: 'sb',
+      workspaceScope: { selection: { case: 'workspace', value: 'default' } },
+      mergeOperations: [
+        {
+          operation: {
+            case: 'addAllowRules',
+            value: {
+              target: {
+                ruleName: 'internal_api',
+                host: 'api.example.com',
+                ports: [443, 8443],
+                path: '',
+                binaries: [{ path: '/usr/bin/curl' }, { path: '/usr/bin/python3' }],
+              },
+              rules: [{ allow: { method: 'POST', path: '/admin' } }],
+            },
+          },
+        },
+        {
+          operation: {
+            case: 'addDenyRules',
+            value: {
+              target: {
+                ruleName: 'public_api',
+                host: 'api.example.com',
+                ports: [443],
+                anyBinary: true,
+              },
+              denyRules: [{ method: 'POST', path: '/admin/private' }],
+            },
+          },
+        },
+      ],
+    });
+    const operations = observed[0]?.mergeOperations;
+    const allow = operations?.[0]?.operation;
+    const deny = operations?.[1]?.operation;
+    expect(allow?.case).toBe('addAllowRules');
+    expect(deny?.case).toBe('addDenyRules');
+    if (allow?.case !== 'addAllowRules' || deny?.case !== 'addDenyRules') throw new Error('wrong operations');
+    expect(allow.value.target).toMatchObject({
+      ruleName: 'internal_api',
+      host: 'api.example.com',
+      ports: [443, 8443],
+      path: '',
+      binaries: [{ path: '/usr/bin/curl' }, { path: '/usr/bin/python3' }],
+      anyBinary: false,
+    });
+    expect(deny.value.target?.anyBinary).toBe(true);
+    expect(deny.value.target?.binaries).toEqual([]);
+    expect(deny.value.target?.path).toBeUndefined();
+  });
+
   it('reaches uncurated RPCs and returns generated wire messages', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),
@@ -1515,7 +2096,10 @@ describe('raw escape hatch', () => {
 
     // raw returns the full generated message: the enum stays numeric, where the
     // curated get() would lowercase status.phase to 'ready'.
-    const resp = await sandbox.raw.getSandbox({ name: 'sb' });
+    const resp = await sandbox.raw.getSandbox({
+      name: 'sb',
+      workspaceScope: { selection: { case: 'workspace', value: 'default' } },
+    });
     expect(resp.sandbox?.status?.phase).toBe(SandboxPhase.READY);
     expect(resp.sandbox?.metadata?.name).toBe('sb');
 

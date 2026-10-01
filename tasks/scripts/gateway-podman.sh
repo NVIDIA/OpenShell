@@ -31,7 +31,7 @@ PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
 STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-podman-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
@@ -149,15 +149,6 @@ EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
 }
 
-if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" && "$(uname -s)" == "Darwin" ]]; then
-  # Podman Machine reserves IPv4 loopback for its callback-only listener.
-  # Keep the primary listener distinct while using a hostname that resolves
-  # to IPv6 loopback for local CLI connections. An explicit bind address
-  # overrides this platform default.
-  PRIMARY_BIND_IP="::1"
-  CLI_ENDPOINT_HOST="localhost"
-fi
-
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "ERROR: OPENSHELL_PODMAN_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
@@ -223,7 +214,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.podman]
 default_image = "${SANDBOX_IMAGE}"

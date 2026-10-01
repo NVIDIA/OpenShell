@@ -337,6 +337,12 @@ impl GovernanceInterceptorService {
                 ),
             ],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                "openshell/provider-governance",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 
@@ -549,9 +555,17 @@ impl GovernanceInterceptorService {
 impl GatewayInterceptor for GovernanceInterceptorService {
     async fn describe(
         &self,
-        _request: Request<DescribeRequest>,
+        request: Request<DescribeRequest>,
     ) -> Result<Response<InterceptorManifest>, Status> {
-        Ok(Response::new(self.manifest()))
+        let manifest = self.manifest();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+            "provider-governance",
+            manifest.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(manifest))
     }
 
     async fn evaluate(
@@ -1251,11 +1265,13 @@ async fn propagate_policy_to_running_sandboxes(
                 .map_or(0, |metadata| metadata.resource_version);
             let result = client
                 .update_config(UpdateConfigRequest {
-                    name: name.clone(),
+                    sandbox: name.clone(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
-                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 })
                 .await;

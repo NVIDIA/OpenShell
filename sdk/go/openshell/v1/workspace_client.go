@@ -80,18 +80,19 @@ func (w *workspaceClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*
 	return pager.All(ctx)
 }
 
-func (w *workspaceClient) Delete(ctx context.Context, name string) error {
+func (w *workspaceClient) Delete(ctx context.Context, name string, opts ...DeleteOptions) (*DeletionResult, error) {
 	if name == "" {
-		return &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
 
-	_, err := w.client.DeleteWorkspace(ctx, &pb.DeleteWorkspaceRequest{
-		Name: name,
+	resp, err := w.client.DeleteWorkspace(ctx, &pb.DeleteWorkspaceRequest{
+		AllowMissing: allowMissing(opts),
+		Name:         name,
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }
 
 func (w *workspaceClient) AddMember(ctx context.Context, workspace, principalSubject string, role WorkspaceRole) (*WorkspaceMember, error) {
@@ -108,7 +109,7 @@ func (w *workspaceClient) AddMember(ctx context.Context, workspace, principalSub
 	}
 
 	resp, err := w.client.AddWorkspaceMember(ctx, &pb.AddWorkspaceMemberRequest{
-		Workspace:        workspace,
+		WorkspaceScope:   namedWorkspaceScope(workspace),
 		PrincipalSubject: principalSubject,
 		Role:             protoRole,
 	})
@@ -118,22 +119,23 @@ func (w *workspaceClient) AddMember(ctx context.Context, workspace, principalSub
 	return converter.WorkspaceMemberFromProto(resp.GetMember()), nil
 }
 
-func (w *workspaceClient) RemoveMember(ctx context.Context, workspace, principalSubject string) error {
+func (w *workspaceClient) RemoveMember(ctx context.Context, workspace, principalSubject string, opts ...DeleteOptions) (*DeletionResult, error) {
 	if workspace == "" {
-		return &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
 	if principalSubject == "" {
-		return &StatusError{Code: ErrorInvalidArgument, Message: "principal subject must not be empty"}
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "principal subject must not be empty"}
 	}
 
-	_, err := w.client.RemoveWorkspaceMember(ctx, &pb.RemoveWorkspaceMemberRequest{
-		Workspace:        workspace,
+	resp, err := w.client.RemoveWorkspaceMember(ctx, &pb.RemoveWorkspaceMemberRequest{
+		AllowMissing:     allowMissing(opts),
+		WorkspaceScope:   namedWorkspaceScope(workspace),
 		PrincipalSubject: principalSubject,
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }
 
 func (w *workspaceClient) ListMembers(workspace string, opts ...ListOptions) (*Pager[*WorkspaceMember], error) {
@@ -150,7 +152,7 @@ func (w *workspaceClient) ListMembers(workspace string, opts ...ListOptions) (*P
 		pageToken = opts[0].PageToken
 	}
 	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*WorkspaceMember], error) {
-		req := &pb.ListWorkspaceMembersRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
+		req := &pb.ListWorkspaceMembersRequest{WorkspaceScope: namedWorkspaceScope(workspace), PageSize: pageSize, PageToken: pageToken}
 		resp, err := w.client.ListWorkspaceMembers(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)

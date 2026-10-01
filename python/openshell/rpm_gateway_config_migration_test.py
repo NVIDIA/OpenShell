@@ -31,8 +31,7 @@ version = 1
 
 [openshell.gateway]
 # Keep the primary listener on the built-in 127.0.0.1:17670 default. The
-# Podman driver reports the callback interface it needs, and the gateway
-# adds a separate listener scoped to that interface.
+# host-networked Podman supervisor uses this same loopback endpoint.
 
 # Pin to the Podman compute driver. Without this, the gateway auto-detects
 # in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver

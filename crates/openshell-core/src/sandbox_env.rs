@@ -185,7 +185,7 @@ pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
 /// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
 pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
-/// Path to the CA certificate for mTLS communication with the gateway.
+/// Path to the CA certificate used to authenticate the gateway TLS endpoint.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 
 /// Path to the client certificate for mTLS communication with the gateway.
@@ -242,6 +242,18 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+/// Default numeric UID assigned to a sandbox when the image declares no OCI
+/// `USER` (for example, a minimal base image).
+///
+/// Local container drivers (Docker, Podman) supply this in place of an empty
+/// OCI declaration so the supervisor runs the sandbox as a synthesized non-root
+/// account instead of rejecting the image, matching the numeric-identity
+/// behavior of the Kubernetes and VM drivers.
+pub const DEFAULT_SANDBOX_UID: u32 = 1000;
+
+/// Default numeric GID paired with [`DEFAULT_SANDBOX_UID`].
+pub const DEFAULT_SANDBOX_GID: u32 = 1000;
 
 /// Raw OCI `Config.User` declaration from the immutable image selected by a
 /// local container driver.

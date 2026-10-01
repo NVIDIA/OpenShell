@@ -14,6 +14,7 @@ use crate::policy_store::{
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 
@@ -34,6 +35,23 @@ pub struct PostgresStore {
     pool: PgPool,
 }
 
+// Stable cluster-wide key for serializing sandbox/provider cross-object
+// mutations. The bytes spell "OPENSHLL" and stay within PostgreSQL's signed
+// 64-bit advisory-lock key space.
+const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
+
+// Bounds the wait for the cross-object lock. The holder only validates and
+// writes, so a wait this long means a stuck replica; failing beats blocking
+// every sandbox and provider mutation in the fleet indefinitely.
+const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+
+pub(super) struct PostgresAdvisoryLockGuard {
+    // `close_on_drop` is set before this guard is constructed. Closing the
+    // dedicated session releases the session-level advisory lock even when a
+    // request is cancelled or returns early.
+    _connection: PoolConnection<Postgres>,
+}
+
 impl PostgresStore {
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let pool = PgPoolOptions::new()
@@ -49,7 +67,44 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))
+            .map_err(|e| map_migrate_error(&e))?;
+        self.migrate_legacy_time_payloads().await
+    }
+
+    async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
+        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // Serialize this application-level data migration across gateway replicas.
+        sqlx::query("SELECT pg_advisory_xact_lock(3052)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let rows =
+            sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+        for row in rows {
+            let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+            let object_type: String = row.try_get("object_type").map_err(|e| map_db_error(&e))?;
+            let payload: Vec<u8> = row.try_get("payload").map_err(|e| map_db_error(&e))?;
+            let migrated =
+                super::legacy_time_wire::migrate(&object_type, &payload).map_err(|error| {
+                    PersistenceError::Migration(format!(
+                        "failed to migrate {object_type} record {id}: {error}"
+                    ))
+                })?;
+            if migrated != payload {
+                sqlx::query("UPDATE objects SET payload = $1 WHERE id = $2")
+                    .bind(migrated)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+            }
+        }
+
+        transaction.commit().await.map_err(|e| map_db_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -57,6 +112,26 @@ impl PostgresStore {
     pub async fn ping(&self) -> PersistenceResult<()> {
         let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    pub(super) async fn acquire_cross_object_lock(
+        &self,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        connection.close_on_drop();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(PostgresAdvisoryLockGuard {
+            _connection: connection,
+        })
     }
 
     /// Test support only: close the underlying connection pool.
@@ -103,6 +178,29 @@ ON CONFLICT (object_type, workspace, name) WHERE name IS NOT NULL DO UPDATE SET
         .await
         .map_err(|e| map_db_error(&e))?;
         Ok(())
+    }
+
+    /// Create an object; Postgres commits are always durable, so this is
+    /// [`Self::put_if`] with [`WriteCondition::MustCreate`].
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        self.put_if(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            WriteCondition::MustCreate,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

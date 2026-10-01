@@ -15,6 +15,7 @@ name = "openshell-gateway"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-server = { path = "../openshell-server", default-features = false }
 openshell-otel = { path = "../openshell-otel", optional = true }
@@ -72,7 +73,7 @@ telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## telemetry-on build. Kept in sync with `default` by
 ## `rust:verify:defaults-without-telemetry`.
 defaults-without-telemetry = ["in-tree-compute-drivers"]
-bundled-z3 = ["openshell-server/bundled-z3"]
+vendored-z3 = ["openshell-server/vendored-z3"]
 
 [lints]
 workspace = true

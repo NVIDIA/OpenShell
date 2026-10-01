@@ -19,6 +19,9 @@ mkdir -p "$snap/bin" "$common"
 cat >"$snap/bin/openshell-gateway" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_GATEWAY_LOG"
+if [ "${1:-}" = generate-certs ]; then
+  exit 0
+fi
 printf 'env:%s|%s|%s\n' \
   "${OPENSHELL_GATEWAY_CONFIG:-}" \
   "${OPENSHELL_DB_URL:-}" \
@@ -63,7 +66,9 @@ run_wrapper() {
 }
 
 assert_log() {
-  printf '%s\n' "$1" >"$expected"
+  printf '%s\n' \
+    "generate-certs --output-dir $common/tls --server-san host.openshell.internal" \
+    "$1" >"$expected"
   if ! cmp -s "$expected" "$log"; then
     echo "FAIL: unexpected call sequence" >&2
     diff -u "$expected" "$log" >&2
@@ -77,9 +82,9 @@ cp "$override" "$work/override-before"
 : >"$log"
 run_wrapper "$override"
 assert_log "config preflight -- --trace
-env:$override|sqlite:$common/gateway.db?mode=rwc|true
+env:$override|sqlite:$common/gateway.db?mode=rwc|
 --trace
-env:$override|sqlite:$common/gateway.db?mode=rwc|true"
+env:$override|sqlite:$common/gateway.db?mode=rwc|"
 cmp -s "$work/override-before" "$override"
 
 cli_config="$work/cli.toml"
@@ -93,9 +98,9 @@ env \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --trace --config "$cli_config"
 assert_log "config preflight -- --trace --config $cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|true
+env:$override|sqlite:$common/gateway.db?mode=rwc|
 --trace --config $cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|true"
+env:$override|sqlite:$common/gateway.db?mode=rwc|"
 cmp -s "$work/cli-before" "$cli_config"
 
 : >"$log"
@@ -110,7 +115,7 @@ if env \
   exit 1
 fi
 assert_log "config preflight -- --config=$cli_config
-env:$override|sqlite:$common/gateway.db?mode=rwc|true"
+env:$override|sqlite:$common/gateway.db?mode=rwc|"
 cmp -s "$work/cli-before" "$cli_config"
 
 : >"$log"
@@ -125,7 +130,7 @@ if env \
   exit 1
 fi
 assert_log "config preflight -- --grpc-rate-limit-requests 10
-env:$override|sqlite:$common/gateway.db?mode=rwc|true"
+env:$override|sqlite:$common/gateway.db?mode=rwc|"
 
 for invalid_selector in terminator nested-config; do
   : >"$log"
@@ -157,9 +162,9 @@ env \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --config=--dash-leading
 assert_log "config preflight -- --config=--dash-leading
-env:$override|sqlite:$common/gateway.db?mode=rwc|true
+env:$override|sqlite:$common/gateway.db?mode=rwc|
 --config=--dash-leading
-env:$override|sqlite:$common/gateway.db?mode=rwc|true"
+env:$override|sqlite:$common/gateway.db?mode=rwc|"
 
 canonical="$common/gateway.toml"
 printf 'valid schema-v2\n' >"$canonical"
@@ -167,18 +172,18 @@ cp "$canonical" "$work/canonical-before"
 : >"$log"
 run_wrapper unset
 assert_log "config preflight -- --config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|true
+env:|sqlite:$common/gateway.db?mode=rwc|
 --config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|true"
+env:|sqlite:$common/gateway.db?mode=rwc|"
 cmp -s "$work/canonical-before" "$canonical"
 
 rm "$canonical"
 : >"$log"
 run_wrapper unset
 assert_log "config preflight -- --trace
-env:|sqlite:$common/gateway.db?mode=rwc|true
+env:|sqlite:$common/gateway.db?mode=rwc|
 --trace
-env:|sqlite:$common/gateway.db?mode=rwc|true"
+env:|sqlite:$common/gateway.db?mode=rwc|"
 
 assert_preflight_failure() {
   local name=$1
@@ -188,7 +193,7 @@ assert_preflight_failure() {
     exit 1
   fi
   assert_log "config preflight -- --config $canonical --trace
-env:|sqlite:$common/gateway.db?mode=rwc|true"
+env:|sqlite:$common/gateway.db?mode=rwc|"
 }
 
 printf 'legacy version = 1\n' >"$canonical"

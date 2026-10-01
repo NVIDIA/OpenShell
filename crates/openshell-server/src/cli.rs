@@ -180,10 +180,9 @@ struct RunArgs {
     )]
     oidc_jwks_allowed_origins: Vec<String>,
 
-    /// Enable mTLS client certificate authentication for local single-user gateways.
+    /// Enable mTLS client certificate authentication for gateway users.
     ///
-    /// When unset, this defaults on for drivers registered as local
-    /// single-player backends when client certificate verification is
+    /// When unset, this defaults on when client certificate verification is
     /// configured and no OIDC issuer is present.
     #[arg(
         long = "enable-mtls-auth",
@@ -257,6 +256,15 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_loopback_service_http: bool,
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_ENABLE_WEBSOCKET_TUNNEL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_websocket_tunnel: bool,
 }
 
 pub fn command() -> Command {
@@ -348,8 +356,6 @@ fn prepare_server_config_with_drivers(
     let compute_driver = compute_drivers
         .select(args.compute_driver.as_deref())
         .map_err(|error| miette::miette!("{error}"))?;
-    let selected_registration = compute_drivers.get(compute_driver.name());
-
     let local_tls = apply_runtime_defaults(args)?;
     let guest_tls = GuestTlsPaths::resolve(
         file.as_ref().map(|file| &file.openshell.gateway),
@@ -362,9 +368,7 @@ fn prepare_server_config_with_drivers(
     let bind = SocketAddr::new(args.bind_address, args.port);
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let has_oidc = args.oidc_issuer.is_some();
-    let mtls_auth_enabled =
-        resolve_mtls_auth_enabled(args, matches, file.as_ref(), selected_registration);
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file.as_ref());
 
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
@@ -381,14 +385,6 @@ fn prepare_server_config_with_drivers(
             "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
         ));
     }
-    if mtls_auth_enabled
-        && selected_registration.is_some_and(|registration| !registration.supports_mtls_user_auth())
-    {
-        return Err(miette::miette!(
-            "mTLS user authentication is not supported with the selected compute driver. Configure OIDC or a trusted fronting proxy for user authentication."
-        ));
-    }
-
     let tls = if args.disable_tls {
         None
     } else {
@@ -416,7 +412,11 @@ fn prepare_server_config_with_drivers(
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
-            require_client_auth: has_client_ca && !has_oidc,
+            // Sandboxes authenticate at the application layer with bearer
+            // identity, so TLS must permit clients without certificates.
+            // When present, CLI certificates are still verified and may be
+            // promoted to users by the independently configured mTLS policy.
+            require_client_auth: false,
             client_ca_path: args.tls_client_ca.clone(),
             external_cert_path: ext_cert,
             external_key_path: ext_key,
@@ -508,7 +508,8 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
-        .with_loopback_service_http(args.enable_loopback_service_http);
+        .with_loopback_service_http(args.enable_loopback_service_http)
+        .with_websocket_tunnel(args.enable_websocket_tunnel);
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -593,7 +594,23 @@ async fn run_from_args(
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
 
+    // Initialize OCSF identity before tracing can emit gateway events.
+    let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
+        name: prepared.config.name.clone(),
+        hostname: crate::compute::lease::replica_id(),
+    };
+    if !crate::gateway_ocsf::set_identity(gateway_identity) {
+        tracing::debug!("gateway OCSF identity already initialized, keeping existing");
+    }
+
     let tracing_log_bus = TracingLogBus::new();
+    let ocsf_log = prepared
+        .config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.ocsf_log.clone())
+        .map(crate::ocsf_log::OcsfLog::start)
+        .transpose()
+        .into_diagnostic()?;
     let otlp_config = prepared
         .config_file
         .as_ref()
@@ -607,9 +624,11 @@ async fn run_from_args(
         &prepared.config.compute_driver_endpoints,
     );
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        &EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
+            .to_string(),
         &tracing_log_bus,
+        ocsf_log.as_ref(),
         otlp_config,
         compute_driver_tracing,
         gateway_resource,
@@ -676,6 +695,10 @@ async fn run_from_args(
     let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
 
     tracing_handle.shutdown();
+
+    if let Some(log) = ocsf_log {
+        log.shutdown().await;
+    }
 
     result.into_diagnostic()
 }
@@ -798,12 +821,9 @@ fn run_effective_config_preflight(
             .map(|driver| compute_drivers.select(Some(driver)))
             .transpose()
             .map_err(|error| miette::miette!("{error}"))?;
-        let selected_registration = selection
-            .as_ref()
-            .and_then(|selection| compute_drivers.get(selection.name()));
         let empty_file = ConfigFile::default();
         let semantic_file = file.as_ref().unwrap_or(&empty_file);
-        validate_preflight_semantics(&run, matches, semantic_file, selected_registration)?;
+        validate_preflight_semantics(&run, matches, semantic_file)?;
 
         let mut endpoint_overrides = BTreeMap::new();
         if let Some(selection) = selection.as_ref()
@@ -866,7 +886,6 @@ fn validate_preflight_semantics(
     args: &RunArgs,
     matches: &ArgMatches,
     file: &ConfigFile,
-    selected_registration: Option<&crate::ComputeDriverRegistration>,
 ) -> Result<()> {
     let gateway = &file.openshell.gateway;
     validate_grpc_rate_limit_args(
@@ -877,8 +896,7 @@ fn validate_preflight_semantics(
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let mtls_auth_enabled =
-        resolve_mtls_auth_enabled(args, matches, Some(file), selected_registration);
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, Some(file));
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
             "--disable-tls and --tls-client-ca are mutually exclusive"
@@ -890,13 +908,6 @@ fn validate_preflight_semantics(
     if mtls_auth_enabled && !has_client_ca {
         return Err(miette::miette!(
             "mTLS user authentication requires --tls-client-ca"
-        ));
-    }
-    if mtls_auth_enabled
-        && selected_registration.is_some_and(|registration| !registration.supports_mtls_user_auth())
-    {
-        return Err(miette::miette!(
-            "mTLS user authentication is not supported with the selected compute driver"
         ));
     }
     if !args.disable_tls && args.tls_cert.is_some() != args.tls_key.is_some() {
@@ -1089,6 +1100,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_loopback_service_http = enabled;
     }
+    if let Some(enabled) = file.enable_websocket_tunnel
+        && arg_defaulted(matches, "enable_websocket_tunnel")
+    {
+        args.enable_websocket_tunnel = enabled;
+    }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
     {
@@ -1203,15 +1219,10 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn is_singleplayer_driver(registration: Option<&crate::ComputeDriverRegistration>) -> bool {
-    registration.is_some_and(crate::ComputeDriverRegistration::is_local_singleplayer)
-}
-
 fn resolve_mtls_auth_enabled(
     args: &RunArgs,
     matches: &ArgMatches,
     file: Option<&ConfigFile>,
-    selected_registration: Option<&crate::ComputeDriverRegistration>,
 ) -> bool {
     let file_configured = file
         .and_then(|f| f.openshell.gateway.mtls_auth.as_ref())
@@ -1224,7 +1235,7 @@ fn resolve_mtls_auth_enabled(
         return false;
     }
 
-    is_singleplayer_driver(selected_registration)
+    true
 }
 
 #[cfg(test)]
@@ -1308,14 +1319,11 @@ mod tests {
         }
     }
 
-    fn test_registry(name: &str, singleplayer: bool, mtls: bool) -> crate::ComputeDriverRegistry {
+    fn test_registry(name: &str, singleplayer: bool) -> crate::ComputeDriverRegistry {
         let mut registration =
             crate::ComputeDriverRegistration::new(name, 100, None, TestFactory).unwrap();
         if singleplayer {
             registration = registration.with_local_singleplayer();
-        }
-        if !mtls {
-            registration = registration.without_mtls_user_auth();
         }
         let mut registry = crate::ComputeDriverRegistry::new();
         registry.install(registration).unwrap();
@@ -1438,6 +1446,30 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn websocket_tunnel_is_disabled_by_default_and_can_be_enabled_from_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_WEBSOCKET_TUNNEL");
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        assert!(!args.enable_websocket_tunnel);
+
+        let file = config_file_from_toml("[openshell.gateway]\nenable_websocket_tunnel = true\n");
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(args.enable_websocket_tunnel);
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-websocket-tunnel=false",
+        ]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(!args.enable_websocket_tunnel, "CLI flag must override file");
     }
 
     #[test]
@@ -1611,7 +1643,7 @@ mod tests {
             "sqlite::memory:",
             "--disable-tls",
         ]);
-        let registry = test_registry("podman", true, true);
+        let registry = test_registry("podman", true);
 
         let prepared =
             super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
@@ -1897,7 +1929,7 @@ mod tests {
         let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
         let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "podman,docker");
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
-        let registry = test_registry("podman", true, true);
+        let registry = test_registry("podman", true);
 
         let error = super::run_config_preflight_with_drivers(
             super::ConfigPreflightArgs::default(),
@@ -2086,7 +2118,7 @@ mod tests {
     }
 
     #[test]
-    fn config_preflight_applies_selected_driver_mtls_capability() {
+    fn config_preflight_allows_driver_independent_mtls() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2108,16 +2140,15 @@ mod tests {
             "--enable-mtls-auth",
             "true",
         ]);
-        let registry = test_registry("shared", false, false);
+        let registry = test_registry("shared", false);
 
-        let error = super::run_config_preflight_with_drivers(
+        super::run_config_preflight_with_drivers(
             super::ConfigPreflightArgs::default(),
             run,
             &matches,
             &registry,
         )
-        .expect_err("selected shared driver must reject mTLS user authentication");
-        assert!(error.to_string().contains("not supported"));
+        .expect("gateway mTLS authentication is independent of the selected driver");
     }
 
     #[test]
@@ -2251,7 +2282,7 @@ mod tests {
             ),
             (
                 "guest-tls",
-                "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\n",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\ndisable_tls = true\n",
             ),
             (
                 "external-tls",
@@ -2346,7 +2377,7 @@ mod tests {
         let path = dir.path().join("gateway.toml");
         std::fs::write(
             &path,
-            "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/future/ca.pem'\nguest_tls_cert = '/future/client.pem'\nguest_tls_key = '/future/client-key.pem'\n",
+            "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/future/ca.pem'\n",
         )
         .unwrap();
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
@@ -2558,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_client_certificate_requirement_is_derived_from_ca_and_oidc() {
+    fn tls_accepts_bearer_clients_with_and_without_oidc() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2566,9 +2597,9 @@ mod tests {
         let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
         let _config_path = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
         let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
-        let registry = test_registry("shared", false, false);
+        let registry = test_registry("shared", false);
 
-        for (oidc_issuer, expected) in [(None, true), (Some("https://idp.example.com"), false)] {
+        for (oidc_issuer, expected) in [(None, false), (Some("https://idp.example.com"), false)] {
             let mut startup_args = vec![
                 "openshell-gateway",
                 "--db-url",
@@ -2598,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn mtls_auth_auto_defaults_for_local_tls_driver() {
+    fn mtls_auth_auto_defaults_when_client_ca_is_configured() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2618,12 +2649,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            test_registry("local", true, true).get("local")
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -2658,11 +2684,20 @@ mod tests {
         assert_eq!(prepared.compute_driver.name(), "local");
         assert!(prepared.config.compute_driver.is_none());
         assert!(prepared.config.mtls_auth.enabled);
+        assert!(
+            !prepared
+                .config
+                .tls
+                .as_ref()
+                .expect("TLS config")
+                .require_client_auth,
+            "sandbox bearer clients must be allowed through the TLS handshake"
+        );
         assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn mtls_auth_does_not_auto_default_for_shared_driver() {
+    fn mtls_auth_default_is_driver_independent() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2682,12 +2717,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(!super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            test_registry("shared", false, false).get("shared")
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -2722,8 +2752,7 @@ enabled = false
         assert!(!super::resolve_mtls_auth_enabled(
             &args,
             &matches,
-            Some(&file),
-            test_registry("local", true, true).get("local")
+            Some(&file)
         ));
     }
 
@@ -3026,15 +3055,6 @@ ssh_session_ttl_secs = 1234
 ",
         );
         assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
-    }
-
-    #[test]
-    fn singleplayer_behavior_comes_from_registration() {
-        let local = test_registry("local", true, true);
-        assert!(super::is_singleplayer_driver(local.get("local")));
-
-        let shared = test_registry("shared", false, true);
-        assert!(!super::is_singleplayer_driver(shared.get("shared")));
     }
 
     #[test]

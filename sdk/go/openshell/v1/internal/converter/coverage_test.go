@@ -31,9 +31,15 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"resource_requirements": true,
 		"command":               true,
 		"tty":                   true,
+		"restart_policy":        true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway owns this identity. Provider status exposes it through the
+	// raw API; callers must not supply it when constructing a sandbox spec.
+	skipped := fieldSet{
+		"provider_attachment_epoch": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
@@ -110,33 +116,36 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"endpoint_statuses":      true,
-		"current_policy_version": true,
-		"exit_code":              true,
+		"agent_pod":                 true,
+		"agent_fd":                  true,
+		"sandbox_fd":                true,
+		"phase":                     true,
+		"conditions":                true,
+		"endpoint_statuses":         true,
+		"current_policy_version":    true,
+		"exit_code":                 true,
+		"configuration_admission":   true,
+		"restart_count":             true,
+		"next_restart_time":         true,
+		"main_process_started_time": true,
 	}
-	// These fields coordinate internal gateway/supervisor lifecycle fencing
-	// and idempotent status reconciliation. They remain available only through
-	// the raw protobuf API.
-	skipped := fieldSet{
-		"main_process_instance_id": true,
-	}
+	// The instance ID coordinates internal gateway/supervisor lifecycle
+	// fencing. The first-activation marker governs static policy repair.
+	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
+	// the curated API exposes its outcome through phase and conditions. Detailed
+	// lifecycle bookkeeping remains available through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 	handled := fieldSet{
-		"type":                 true,
-		"status":               true,
-		"reason":               true,
-		"message":              true,
-		"last_transition_time": true,
+		"type":            true,
+		"status":          true,
+		"reason":          true,
+		"message":         true,
+		"transition_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxCondition{}).ProtoReflect().Descriptor(), handled, nil)
@@ -144,12 +153,12 @@ func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 	handled := fieldSet{
-		"endpoint_id":      true,
-		"host":             true,
-		"ports":            true,
-		"path":             true,
-		"last_result":      true,
-		"last_reported_at": true,
+		"endpoint_id":        true,
+		"host":               true,
+		"ports":              true,
+		"path":               true,
+		"last_result":        true,
+		"last_reported_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)
@@ -255,13 +264,13 @@ func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_Provider(t *testing.T) {
 	handled := fieldSet{
-		"metadata":                 true,
-		"type":                     true,
-		"credentials":              true,
-		"config":                   true,
-		"credential_expires_at_ms": true,
-		"profile_workspace":        true,
-		"credential_handles":       true,
+		"metadata":                    true,
+		"type":                        true,
+		"credentials":                 true,
+		"config":                      true,
+		"credential_expiration_times": true,
+		"profile_workspace":           true,
+		"credential_handles":          true,
 	}
 
 	assertAllFieldsCovered(t, (&dm.Provider{}).ProtoReflect().Descriptor(), handled, nil)
@@ -279,14 +288,14 @@ func TestConverterCoversAllProtoFields_CredentialHandle(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxPolicyRevision(t *testing.T) {
 	handled := fieldSet{
-		"version":       true,
-		"policy_hash":   true,
-		"status":        true,
-		"load_error":    true,
-		"created_at_ms": true,
-		"loaded_at_ms":  true,
-		"policy":        true,
-		"provenance":    true,
+		"version":      true,
+		"policy_hash":  true,
+		"status":       true,
+		"load_error":   true,
+		"created_time": true,
+		"loaded_time":  true,
+		"policy":       true,
+		"provenance":   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxPolicyRevision{}).ProtoReflect().Descriptor(), handled, nil)
@@ -299,6 +308,7 @@ func TestConverterCoversAllProtoFields_ProviderProfile(t *testing.T) {
 		"description":       true,
 		"category":          true,
 		"credentials":       true,
+		"files":             true,
 		"endpoints":         true,
 		"binaries":          true,
 		"inference_capable": true,
@@ -336,7 +346,7 @@ func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T
 		"audience":              true,
 		"jwt_svid_audience":     true,
 		"scopes":                true,
-		"cache_ttl_seconds":     true,
+		"cache_ttl":             true,
 		"audience_overrides":    true,
 		"client_assertion_type": true,
 		"grant_type":            true,

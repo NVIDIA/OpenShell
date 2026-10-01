@@ -11,12 +11,52 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct DockerOuterFenceEvidence<'a> {
+    container_id: &'a str,
+    network_mode: &'static str,
+    unexpected_networks: &'a [String],
+}
+
+impl DockerOuterFenceEvidence<'_> {
+    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
+        if self.container_id.is_empty() {
+            return Err(BackendError::Descriptor(
+                "Docker outer fence evidence is incomplete".to_string(),
+            ));
+        }
+        let mut established = Vec::new();
+        if self.network_mode == "none" {
+            // With no container network namespace attachment, workload egress
+            // remains denied both after revocation and if the supervisor exits.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.unexpected_networks.is_empty() {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            BackendError::Descriptor(format!("encode Docker outer fence evidence: {error}"))
+        })?;
+        let projection =
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
+        projection.validate(generation)?;
+        Ok(projection)
+    }
+}
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
 pub struct DockerBoundarySpec {
@@ -48,8 +88,7 @@ pub struct DockerBoundaryProvisioning {
 impl DockerBoundarySpec {
     /// Produce both sides of the common protocol from the same immutable
     /// Docker coordinates so attach cannot bind a different container.
-    #[must_use]
-    pub fn provision(self) -> DockerBoundaryProvisioning {
+    pub fn provision(self) -> Result<DockerBoundaryProvisioning, BackendError> {
         let mut resource_claims = BTreeMap::from([
             ("docker.container_id".to_string(), self.container_id),
             ("docker.image_identity".to_string(), self.image_identity),
@@ -57,12 +96,14 @@ impl DockerBoundarySpec {
         if self.gpu_requested {
             resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
         }
-        let driver_fence = DriverFenceEvidence::Docker {
-            container_id: resource_claims["docker.container_id"].clone(),
-            network_mode: "none".to_string(),
-            unexpected_networks: Vec::new(),
-        };
-        DockerBoundaryProvisioning {
+        let unexpected_networks = Vec::new();
+        let outer_fence = DockerOuterFenceEvidence {
+            container_id: &resource_claims["docker.container_id"],
+            network_mode: "none",
+            unexpected_networks: &unexpected_networks,
+        }
+        .project(&self.generation)?;
+        Ok(DockerBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
                 generation: self.generation.clone(),
@@ -78,7 +119,7 @@ impl DockerBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: self.workload_identity.clone(),
-                driver_fence: driver_fence.clone(),
+                outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -92,15 +133,39 @@ impl DockerBoundarySpec {
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
-                driver_fence,
+                outer_fence,
             },
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["bridge".to_string()];
+        for evidence in [
+            DockerOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
 
     #[test]
     fn provisioning_binds_container_and_image_claims() {
@@ -143,7 +208,8 @@ mod tests {
             .unwrap(),
             child_env: HashMap::new(),
         }
-        .provision();
+        .provision()
+        .unwrap();
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
@@ -158,14 +224,14 @@ mod tests {
             "true"
         );
         assert_eq!(
-            provisioned.boundary_config.driver_fence,
-            provisioned.runtime_descriptor.driver_fence
+            provisioned.boundary_config.outer_fence,
+            provisioned.runtime_descriptor.outer_fence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .driver_fence
-                .validate()
+                .outer_fence
+                .validate("generation-1")
                 .is_ok()
         );
     }

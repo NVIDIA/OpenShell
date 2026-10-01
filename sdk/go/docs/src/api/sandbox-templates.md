@@ -108,7 +108,7 @@ Deletes a template by name. Existing sandboxes created from the template are not
 deleted.
 
 ```go
-deleted, err := client.SandboxTemplates().Delete(ctx, "default", "gpu-kata")
+deletion, err := client.SandboxTemplates().Delete(ctx, "default", "gpu-kata")
 ```
 
 ## Fake Client

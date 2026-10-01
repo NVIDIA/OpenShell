@@ -132,14 +132,13 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[serde(default)]
+    pub enable_websocket_tunnel: Option<bool>,
 
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_key: Option<PathBuf>,
 
     // ── TLS toggle ───────────────────────────────────────────────────────
     /// When `true`, the gateway listens on plaintext HTTP and ignores any
@@ -164,6 +163,8 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
+    #[serde(default)]
+    pub ocsf_log: Option<OcsfLogConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -195,6 +196,83 @@ pub struct GatewayTlsFileConfig {
     pub external_server_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcsfLogRotation {
+    Never,
+    #[default]
+    Daily,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OcsfSchemaVersion {
+    #[serde(rename = "1.1")]
+    V1_1,
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+impl OcsfSchemaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1_1 => "1.1",
+            Self::V1_3 => "1.3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawOcsfLogConfig")]
+pub struct OcsfLogConfig {
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<OcsfSchemaVersion>,
+    pub rotation: OcsfLogRotation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<std::num::NonZeroUsize>,
+    pub queue_capacity: std::num::NonZeroUsize,
+    pub queue_max_bytes: std::num::NonZeroUsize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcsfLogConfig {
+    path: PathBuf,
+    schema_version: Option<OcsfSchemaVersion>,
+    #[serde(default)]
+    rotation: OcsfLogRotation,
+    max_files: Option<std::num::NonZeroUsize>,
+    queue_capacity: Option<std::num::NonZeroUsize>,
+    queue_max_bytes: Option<std::num::NonZeroUsize>,
+}
+
+impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawOcsfLogConfig) -> Result<Self, Self::Error> {
+        if raw.path.as_os_str().is_empty() {
+            return Err("ocsf_log.path must not be empty");
+        }
+        if raw.rotation == OcsfLogRotation::Never && raw.max_files.is_some() {
+            return Err("ocsf_log.max_files requires daily rotation");
+        }
+        Ok(Self {
+            path: raw.path,
+            schema_version: raw.schema_version,
+            rotation: raw.rotation,
+            max_files: (raw.rotation == OcsfLogRotation::Daily).then(|| {
+                raw.max_files
+                    .unwrap_or(std::num::NonZeroUsize::new(7).unwrap())
+            }),
+            queue_capacity: raw
+                .queue_capacity
+                .unwrap_or(std::num::NonZeroUsize::new(10_000).unwrap()),
+            queue_max_bytes: raw
+                .queue_max_bytes
+                .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
+        })
+    }
+}
 /// `[openshell.gateway.otlp]` section.
 ///
 /// Presence of this table enables OTLP export; there is no `enabled` flag.
@@ -272,7 +350,21 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
             max_payload_bytes: config.max_payload_bytes,
-            timeout: config.timeout.clone().unwrap_or_default(),
+            request_timeout: config
+                .timeout
+                .as_deref()
+                .map(openshell_core::middleware::parse_middleware_timeout)
+                .transpose()
+                .map_err(|_| ConfigFileError::InvalidValue {
+                    field: "openshell.supervisor_middleware.services.timeout",
+                    message: "must be a duration between 10ms and 30s",
+                })?
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|_| ConfigFileError::InvalidValue {
+                    field: "openshell.supervisor_middleware.services.timeout",
+                    message: "duration is outside the protobuf range",
+                })?,
             tls_ca_cert_pem,
             audience: config
                 .audience
@@ -382,8 +474,7 @@ pub enum ConfigFileError {
     },
 }
 
-const CONFIG_MIGRATION_URL: &str =
-    "https://docs.nvidia.com/openshell/latest/reference/gateway-config#migrate-to-schema-version-2";
+const CONFIG_MIGRATION_URL: &str = "https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2";
 
 /// Stable package-preflight failure with no configuration contents attached.
 #[derive(Debug, thiserror::Error)]
@@ -833,6 +924,60 @@ service_name = "openshell-gateway-dev"
     }
 
     #[test]
+    fn gateway_accepts_a_single_ocsf_log_destination() {
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\n");
+        let config = load(tmp.path())
+            .unwrap()
+            .openshell
+            .gateway
+            .ocsf_log
+            .unwrap();
+        assert_eq!(config.rotation, OcsfLogRotation::Daily);
+        assert_eq!(config.schema_version, None);
+        assert_eq!(config.max_files.unwrap().get(), 7);
+        assert_eq!(config.queue_capacity.get(), 10_000);
+        assert_eq!(config.queue_max_bytes.get(), 16 * 1024 * 1024);
+        assert!(ConfigFile::default().openshell.gateway.ocsf_log.is_none());
+
+        let tmp = write_tmp(
+            "[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\nschema_version = '1.3'\n",
+        );
+        assert_eq!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .ocsf_log
+                .unwrap()
+                .schema_version,
+            Some(OcsfSchemaVersion::V1_3)
+        );
+    }
+
+    #[test]
+    fn ocsf_log_rejects_invalid_and_unshipped_options() {
+        for settings in [
+            "",
+            "path = ''",
+            "path = 'log'\nqueue_capacity = 0",
+            "path = 'log'\nqueue_max_bytes = 0",
+            "path = 'log'\nmax_files = 0",
+            "path = 'log'\nrotation = 'hourly'",
+            "path = 'log'\nschema_version = ''",
+            "path = 'log'\nschema_version = '1.8'",
+            "path = 'log'\nkind = 'jsonl'",
+            "path = 'log'\nrotation = 'never'\nmax_files = 7",
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway.ocsf_log]\n{settings}\n"));
+            assert!(load(tmp.path()).is_err(), "accepted {settings}");
+        }
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'log'\nrotation = 'never'\n");
+        let config = load(tmp.path()).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(toml::from_str::<ConfigFile>(&encoded).is_ok());
+    }
+
+    #[test]
     fn otlp_config_requires_only_endpoint() {
         let toml = r#"
 [openshell.gateway.otlp]
@@ -934,7 +1079,7 @@ timeout = "2s"
         let registration =
             SupervisorMiddlewareService::try_from(&file.openshell.supervisor.middleware[0])
                 .expect("valid CA resolves");
-        assert_eq!(registration.timeout, "2s");
+        assert_eq!(registration.request_timeout.unwrap().seconds, 2);
         let registered_pem = String::from_utf8(registration.tls_ca_cert_pem)
             .expect("registered CA remains PEM text")
             .replace("\r\n", "\n");
@@ -1076,7 +1221,6 @@ max_body_bytes = 262144
         let toml = r#"
 [openshell.gateway]
 provider_profile_sources = [
-  { type = "builtin" },
   { type = "user" },
   { type = "interceptor", name = "provider-governance" },
 ]
@@ -1086,12 +1230,30 @@ provider_profile_sources = [
         assert_eq!(
             file.openshell.gateway.provider_profile_sources,
             Some(vec![
-                GatewayProviderProfileSourceConfig::Builtin,
                 GatewayProviderProfileSourceConfig::User,
                 GatewayProviderProfileSourceConfig::Interceptor {
                     name: "provider-governance".to_string(),
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn rejects_the_removed_builtin_provider_profile_source() {
+        let toml = r#"
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+]
+"#;
+        let tmp = write_tmp(toml);
+        let error = load(tmp.path()).expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
         );
     }
 

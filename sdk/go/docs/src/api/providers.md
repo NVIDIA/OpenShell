@@ -89,7 +89,7 @@ fmt.Println("Updated provider:", updated.Name)
 Remove a provider by name.
 
 ```go
-err := client.Providers().Delete(ctx, "default", "my-openai")
+deletion, err := client.Providers().Delete(ctx, "default", "my-openai")
 if err != nil {
     log.Fatal(err)
 }
@@ -152,5 +152,10 @@ The `Provider` type represents a registered compute provider.
 | `Credentials`          | map[string]string         | Authentication credentials (e.g., API keys)     |
 | `Config`               | map[string]string         | Provider-specific configuration values          |
 | `CredentialExpiresAt`  | map[string]time.Time      | Expiration timestamps for credentials           |
+
+The curated Go API uses a zero `time.Time` value to clear an expiration during
+an update. Consequently, it cannot represent the protobuf minimum timestamp
+(`0001-01-01T00:00:00Z`) in this map. Use the raw protobuf API if that exact
+timestamp is required. Other pointer-based timestamp fields preserve it.
 
 See also: [Profiles](profiles.md), [Refresh](refresh.md), [Error Handling](../error-handling.md), [Testing](../testing.md)

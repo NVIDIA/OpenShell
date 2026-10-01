@@ -134,20 +134,6 @@ macro_rules! impl_src_endpoint_addr_setter {
     };
 }
 
-/// Generate the `firewall_rule` setter shared by network and HTTP builders.
-macro_rules! impl_firewall_rule_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the firewall rule that matched this event.
-            #[must_use]
-            pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-                self.firewall_rule = Some($crate::objects::FirewallRule::new(name, rule_type));
-                self
-            }
-        }
-    };
-}
-
 mod api_activity;
 mod base;
 mod config;
@@ -175,6 +161,18 @@ use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 
+/// Which `OpenShell` component produced an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventOrigin {
+    /// The supervisor process enforcing sandbox policy.
+    Supervisor,
+    /// The gateway process, which has no sandbox or container of its own.
+    Gateway {
+        /// Operator-assigned gateway name (`[openshell.gateway] name`).
+        name: String,
+    },
+}
+
 /// Immutable context created once at sandbox startup.
 ///
 /// Passed to every event builder to populate shared OCSF fields
@@ -195,15 +193,21 @@ pub struct EventContext {
     pub proxy_ip: IpAddr,
     /// Proxy listen port.
     pub proxy_port: u16,
+    /// Which component is emitting.
+    pub origin: EventOrigin,
 }
 
 impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
+        let product = match self.origin {
+            EventOrigin::Supervisor => Product::openshell_sandbox(&self.product_version),
+            EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
+        };
         Metadata {
             version: OCSF_VERSION.to_string(),
-            product: Product::openshell_sandbox(&self.product_version),
+            product,
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
@@ -229,7 +233,10 @@ impl EventContext {
     /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::for_current_os(&self.hostname)
+        match &self.origin {
+            EventOrigin::Supervisor => Device::for_current_os(&self.hostname),
+            EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
+        }
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -269,6 +276,7 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
+        origin: EventOrigin::Supervisor,
     }
 }
 

@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import re
-import stat
 import subprocess
 import sys
 from pathlib import Path
 
 
-def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_default_driver(
+def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     tmp_path: Path,
 ) -> None:
     release_dir = tmp_path / "release"
@@ -29,6 +28,10 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "d" * 64 + "  openshell-gateway-aarch64-apple-darwin.tar.gz\n",
         encoding="utf-8",
     )
+    (release_dir / "openshell-prover-checksums-sha256.txt").write_text(
+        "e" * 64 + "  openshell-prover-aarch64-apple-darwin.tar.gz\n",
+        encoding="utf-8",
+    )
 
     repo_root = Path(__file__).resolve().parents[2]
     output = tmp_path / "openshell.rb"
@@ -38,7 +41,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
             str(repo_root / "tasks/scripts/release.py"),
             "generate-homebrew-formula",
             "--release-tag",
-            "v0.0.10",
+            "v0.1.0-pre.3",
             "--release-dir",
             str(release_dir),
             "--output",
@@ -50,9 +53,18 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     formula = output.read_text(encoding="utf-8")
     assert (
         "https://github.com/NVIDIA/OpenShell/releases/download/"
-        "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
+        "v0.1.0-pre.3/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
+    assert 'version "0.1.0-pre.3"' in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
+    assert (
+        "https://github.com/NVIDIA/OpenShell/releases/download/"
+        "v0.1.0-pre.3/openshell-prover-aarch64-apple-darwin.tar.gz"
+    ) in formula
+    assert 'sha256 "' + "e" * 64 + '"' in formula
+    assert 'resource("openshell-prover").stage' in formula
+    assert 'bin.install "openshell-prover"' in formula
+    assert "#{bin}/openshell-prover --version" in formula
     assert "OPENSHELL_COMPUTE_DRIVER: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
@@ -87,7 +99,8 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert 'bind_address = "[::1]:17670"' in legacy_ipv6_config.group("contents")
     assert "gateway_config.read == legacy_empty_gateway_config_contents ||" in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
-    assert "gateway_config.write gateway_config_contents" in formula
+    assert formula.count("gateway_config.write gateway_config_contents") == 1
+    assert "gateway_config.atomic_write gateway_config_contents" in formula
     assert '# compute_driver = "vm"' not in formula
     assert (
         "openshell gateway add https://localhost:17670 --local --name openshell"
@@ -142,23 +155,16 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
         'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"'
         in wrapper
     )
-    assert 'export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"' in wrapper
+    assert "OPENSHELL_DISABLE_TLS" not in wrapper
+    assert (
+        'export OPENSHELL_LOCAL_TLS_DIR="${OPENSHELL_LOCAL_TLS_DIR:-${SNAP_COMMON}/tls}"'
+        in wrapper
+    )
     assert (
         'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
         in wrapper
     )
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
-
-
-def test_snap_docker_connect_hook_restarts_gateway() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    hook = repo_root / "snap/hooks/connect-plug-docker"
-
-    assert hook.is_file()
-    assert hook.stat().st_mode & stat.S_IXUSR
-    assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:

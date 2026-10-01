@@ -29,3 +29,48 @@ tests:
             kind: ServiceAccount
             name: openshell
             namespace: my-namespace
+
+  - it: omits the ClusterRoleBinding when cluster-scoped RBAC is disabled
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the ClusterRoleBinding when all chart-managed RBAC is disabled
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: uses the configured ClusterRoleBinding and ClusterRole names
+    set:
+      rbac.clusterScoped.clusterRoleName: platform-openshell-node-reader
+      rbac.clusterScoped.clusterRoleBindingName: platform-openshell-node-reader-binding
+    asserts:
+      - equal:
+          path: metadata.name
+          value: platform-openshell-node-reader-binding
+      - equal:
+          path: roleRef.name
+          value: platform-openshell-node-reader
+
+  - it: binds the custom gateway service account created by the namespaced release
+    set:
+      serviceAccount.create: false
+      serviceAccount.name: my-existing-sa
+    asserts:
+      - contains:
+          path: subjects
+          content:
+            kind: ServiceAccount
+            name: my-existing-sa
+            namespace: my-namespace
+
+  - it: creates the ClusterRoleBinding when legacy values omit the rbac block
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 1

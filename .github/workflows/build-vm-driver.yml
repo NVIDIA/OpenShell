@@ -9,7 +9,7 @@ on:
       cargo-version:
         required: true
         type: string
-      image-tag:
+      supervisor-image-tag:
         required: false
         type: string
         default: ""
@@ -25,48 +25,8 @@ permissions:
   contents: read
 
 jobs:
-  host-supervisor-macos:
-    name: native host supervisor (aarch64-apple-darwin)
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-supervisor
-      binary: openshell-supervisor
-      triple: aarch64-apple-darwin
-      runner: macos-15-xlarge
-      cargo-version: ${{ inputs.cargo-version }}
-      image-tag: ${{ inputs.image-tag }}
-      checkout-ref: ${{ inputs.checkout-ref }}
-    secrets: inherit
-
-  guest-init:
-    name: guest init (${{ matrix.triple }})
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-          - arch: aarch64
-            triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-driver-vm
-      binary: openshell-vm-init
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
-      cargo-version: ${{ inputs.cargo-version }}
-      image-tag: ${{ inputs.image-tag }}
-      extra-cargo-flags: --no-default-features
-      interpreter: none
-      checkout-ref: ${{ inputs.checkout-ref }}
-    secrets: inherit
-
   build:
     name: openshell-driver-vm (${{ matrix.triple }})
-    needs: [guest-init, host-supervisor-macos]
     strategy:
       matrix:
         include:
@@ -87,6 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
       - uses: ./.github/actions/setup-nix
@@ -144,4 +105,4 @@ jobs:
           binary: openshell-driver-vm
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
-          image-tag: ${{ inputs['image-tag'] }}
+          supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}

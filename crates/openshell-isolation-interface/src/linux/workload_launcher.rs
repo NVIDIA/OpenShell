@@ -137,7 +137,27 @@ mod tests {
             })
             .expect("launcher result")
             .expect("spawn child");
-        let notification = listener.receive().expect("receive child socket");
+        let notification = loop {
+            let notification = listener.receive().expect("receive child syscall");
+            let syscall = i64::from(notification.syscall);
+            if syscall == libc::SYS_socket {
+                break notification;
+            }
+            if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+                listener
+                    .respond_continue(notification.id)
+                    .expect("continue ordinary file open");
+                continue;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if syscall == libc::SYS_open {
+                listener
+                    .respond_continue(notification.id)
+                    .expect("continue ordinary file open");
+                continue;
+            }
+            panic!("unexpected child syscall: {syscall}");
+        };
         assert_eq!(i64::from(notification.syscall), libc::SYS_socket);
         assert!(
             std::path::Path::new(&format!("/proc/{}/task/{}", child.id(), notification.tid))

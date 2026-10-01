@@ -188,7 +188,7 @@ impl VaultCredentialDriver {
             managed_secret_path(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
             )
@@ -197,7 +197,7 @@ impl VaultCredentialDriver {
         validate_managed_secret_path(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &logical_path,
@@ -231,7 +231,7 @@ impl VaultCredentialDriver {
         validate_managed_secret_path(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &logical_path,
@@ -257,7 +257,7 @@ impl VaultCredentialDriver {
             validate_managed_secret_path(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &logical_path,
@@ -284,7 +284,7 @@ impl VaultCredentialDriver {
                     Ok::<_, Status>(ResolvedCredential {
                         request_id,
                         value,
-                        expires_at_ms: 0,
+                        expiration_time: None,
                     })
                 }
             });
@@ -501,15 +501,29 @@ impl Clone for VaultCredentialDriver {
 impl CredentialDriver for CredentialDriverService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCredentialDriverCapabilitiesRequest>,
+        request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
-        Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
+        let capabilities = GetCredentialDriverCapabilitiesResponse {
             driver_name: VaultCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: VaultCredentialDriver::NAME.to_string(),
             supports_list: false,
             supports_expires_at: false,
-        }))
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Credentials,
+                "openshell/vault",
+                VERSION,
+                [],
+            )),
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Credentials,
+            VaultCredentialDriver::NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn store_credential(
@@ -1002,6 +1016,38 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), token).unwrap();
         file
+    }
+
+    #[tokio::test]
+    async fn capabilities_reject_missing_gateway_metadata() {
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:8200".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+        let service = CredentialDriverService::new(driver);
+
+        let error = CredentialDriver::get_capabilities(
+            &service,
+            Request::new(GetCredentialDriverCapabilitiesRequest::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("gateway did not provide protocol metadata")
+        );
     }
 
     fn test_ca() -> (rcgen::Certificate, KeyPair) {
@@ -1536,7 +1582,7 @@ mod tests {
 
         let stored = driver
             .store_credential(StoreCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "nvapi-test".to_string(),
                 existing_handle: None,
@@ -1551,7 +1597,7 @@ mod tests {
         let resolved = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(stored),
                 workspace: "default".to_string(),
@@ -1593,7 +1639,7 @@ mod tests {
 
         let stored = driver
             .store_credential(StoreCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "updated-secret".to_string(),
                 existing_handle: Some(handle(&format!("v1:{logical_path}"))),
@@ -1636,7 +1682,7 @@ mod tests {
 
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),
@@ -1694,7 +1740,7 @@ mod tests {
         let resolved = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "github-prod".to_string(),
+                provider: "github-prod".to_string(),
                 credential_key: "GITHUB_TOKEN".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "test-workspace".to_string(),
@@ -1739,7 +1785,7 @@ mod tests {
         let err = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),
@@ -1781,7 +1827,7 @@ mod tests {
         let err = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),

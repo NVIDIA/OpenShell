@@ -114,7 +114,7 @@
 //	    log.Fatal(err)
 //	}
 //	for _, ep := range endpoints {
-//	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.ServiceName, ep.TargetPort, ep.URL)
+//	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.Name, ep.TargetPort, ep.URL)
 //	}
 //
 // # Provider Profiles
@@ -217,11 +217,10 @@
 //
 // # SSH Session Management
 //
-// Create an SSH session for a sandbox and use the returned connection details.
-// Note: CreateSession accepts a sandbox ID, not a name. For name-based access
-// with automatic session cleanup, prefer SSH().Tunnel() instead.
+// Create an SSH session for a sandbox by its canonical name in a workspace and
+// use the returned connection details.
 //
-//	session, err := client.SSH().CreateSession(ctx, "default", sandbox.ID)
+//	session, err := client.SSH().CreateSession(ctx, "default", sandbox.Name)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -230,11 +229,11 @@
 //	fmt.Printf("Host key: %s\n", session.HostKeyFingerprint)
 //	// Use session.Token to authenticate the SSH connection.
 //
-//	revoked, err := client.SSH().RevokeSession(ctx, "default", session.Token)
+//	deletion, err := client.SSH().RevokeSession(ctx, "default", session.Token)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	fmt.Printf("Session revoked: %v\n", revoked)
+//	fmt.Printf("Revocation outcome: %v\n", deletion.Outcome)
 //
 // # TCP Port Forwarding
 //

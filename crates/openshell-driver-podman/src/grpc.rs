@@ -7,12 +7,11 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -67,34 +66,20 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.rpc_tracer
             .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
-                self.driver
-                    .capabilities()
-                    .map(Response::new)
-                    .map_err(Status::from)
+                let capabilities = self.driver.capabilities().map_err(Status::from)?;
+                openshell_core::extension_protocol::validate_gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    "podman",
+                    capabilities.extension.as_ref(),
+                    request.into_inner().gateway,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                Ok(Response::new(capabilities))
             })
-            .await
-    }
-
-    async fn get_gateway_listener_requirements(
-        &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        self.rpc_tracer
-            .trace(
-                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
-                async {
-                    Ok(Response::new(GetGatewayListenerRequirementsResponse {
-                        requirements: self
-                            .driver
-                            .gateway_listener_requirements()
-                            .map_err(Status::from)?,
-                    }))
-                },
-            )
             .await
     }
 
@@ -165,7 +150,7 @@ impl ComputeDriver for ComputeDriverService {
                 Box::pin(self.driver.create_sandbox(&sandbox))
                     .await
                     .map_err(Status::from)?;
-                Ok(Response::new(CreateSandboxResponse {}))
+                Ok(Response::new(CreateSandboxResponse::default()))
             })
             .await
     }
@@ -207,7 +192,7 @@ impl ComputeDriver for ComputeDriverService {
                     )
                     .await
                     .map_err(Status::from)?;
-                Ok(Response::new(StartSandboxResponse {}))
+                Ok(Response::new(StartSandboxResponse::default()))
             })
             .await
     }
@@ -378,7 +363,14 @@ mod tests {
 
         async {
             let gateway_span = tracing::info_span!(target: "openshell_server::compute", "driver", otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities", otel.kind = "client");
-            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
+            ComputeDriver::get_capabilities(
+                &service,
+                Request::new(GetCapabilitiesRequest {
+                    gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    )),
+                }),
+            )
                 .instrument(gateway_span)
                 .await
         }
@@ -441,7 +433,11 @@ mod tests {
         let (mut client, shutdown, server) = standalone_traced_client().await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }))
             .await
             .expect("capabilities should succeed");
         client
@@ -666,7 +662,7 @@ mod tests {
             &service,
             Request::new(DeleteSandboxRequest {
                 sandbox_id: String::new(),
-                sandbox_name: "demo".to_string(),
+                name: "demo".to_string(),
             }),
         )
         .await
@@ -697,7 +693,7 @@ mod tests {
             &service,
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
-                sandbox_name: "demo".to_string(),
+                name: "demo".to_string(),
             }),
         )
         .await

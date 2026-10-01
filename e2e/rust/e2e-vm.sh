@@ -51,7 +51,7 @@ DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -262,8 +262,6 @@ version = 2
 bind_address = "127.0.0.1:${HOST_PORT}"
 compute_driver = "vm"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
-guest_tls_cert = "${PKI_DIR}/client/tls.crt"
-guest_tls_key = "${PKI_DIR}/client/tls.key"
 
 [openshell.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"
@@ -301,8 +299,6 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
-    --guest-tls-cert "${PKI_DIR}/client/tls.crt" \
-    --guest-tls-key "${PKI_DIR}/client/tls.key" \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -388,6 +384,12 @@ export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
 
+# Seed the catalog once for the whole lane. The profiles live in the gateway
+# for as long as it runs, and the import is create-only: a second import of
+# the same directory fails with "custom provider profile '<id>' already
+# exists", so this cannot move inside the per-target helper below.
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
 run_e2e_test() {
   local test_target="$1"
   shift
@@ -405,6 +407,7 @@ run_e2e_test() {
 if [ -n "${E2E_TEST_OVERRIDE}" ]; then
   run_e2e_test "${E2E_TEST_OVERRIDE}"
 else
+  run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install cargo-nextest
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    nextest_version: 0.9.143
+    nextest_arches:
+      x86_64:
+        triple: x86_64-unknown-linux-musl
+        sha256: 6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389
+      aarch64:
+        triple: aarch64-unknown-linux-musl
+        sha256: 0560ce0ce017f368c54b5db86588370fc03b470985490fa81200e62a657dda05
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Gather guest architecture
+      ansible.builtin.setup:
+        filter:
+          - ansible_architecture
+
+    - name: Select cargo-nextest release for guest architecture
+      ansible.builtin.set_fact:
+        nextest_release: "{{ nextest_arches[ansible_facts.architecture] | default({}) }}"
+
+    - name: Validate guest architecture
+      ansible.builtin.assert:
+        that: nextest_release | length > 0
+        fail_msg: "cargo-nextest is unsupported on {{ ansible_facts.architecture }}"
+
+    - name: Download cargo-nextest
+      ansible.builtin.get_url:
+        url: "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{{ nextest_version }}/cargo-nextest-{{ nextest_version }}-{{ nextest_release.triple }}.tar.gz"
+        dest: /tmp/cargo-nextest.tar.gz
+        checksum: "sha256:{{ nextest_release.sha256 }}"
+        mode: "0600"
+
+    - name: Install cargo-nextest
+      ansible.builtin.unarchive:
+        src: /tmp/cargo-nextest.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/cargo-nextest
+
+    - name: Verify cargo-nextest
+      ansible.builtin.command: cargo-nextest --version
+      changed_when: false

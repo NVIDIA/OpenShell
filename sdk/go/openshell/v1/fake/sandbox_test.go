@@ -20,7 +20,7 @@ import (
 // helper to build a minimal fake sandbox client for testing.
 func newTestSandboxClient() *fakeSandboxClient {
 	store := newobjectStore(sandboxName, copySandbox)
-	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	templateStore := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
 	return newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return false })
 }
@@ -215,7 +215,7 @@ func TestSandbox_Delete(t *testing.T) {
 
 	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
 
-	err := sc.Delete(ctx, "default", "test-sb")
+	_, err := sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
 
 	_, err = sc.Get(ctx, "default", "test-sb")
@@ -227,8 +227,8 @@ func TestSandbox_Delete_Idempotent(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	// Delete non-existent sandbox should not error
-	err := sc.Delete(ctx, "default", "nonexistent")
+	// Explicitly allow a missing target.
+	_, err := sc.Delete(ctx, "default", "nonexistent", types.DeleteOptions{AllowMissing: true})
 	require.NoError(t, err)
 }
 
@@ -417,7 +417,7 @@ func TestSandbox_Watch_DeletedOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	err = sc.Delete(ctx, "default", "test-sb")
+	_, err = sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
 
 	select {
@@ -523,7 +523,7 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	_ = sc.Delete(ctx, "default", "test-sb")
+	_, _ = sc.Delete(ctx, "default", "test-sb")
 
 	select {
 	case ev := <-w.ResultChan():
@@ -569,7 +569,7 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 				_, _ = sc.Get(ctx, "default", name)
 				_, _ = sc.ListAll(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
-				_ = sc.Delete(ctx, "default", name)
+				_, _ = sc.Delete(ctx, "default", name)
 			}
 		}(i)
 	}
@@ -667,7 +667,7 @@ func TestSandbox_ListProviders(t *testing.T) {
 	require.NoError(t, err)
 
 	// No providers yet
-	providers, err := sc.ListProviders(ctx, "default", "test-sb")
+	providers, err := sc.ListAllProviders(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Empty(t, providers)
 
@@ -678,7 +678,14 @@ func TestSandbox_ListProviders(t *testing.T) {
 	_, err = sc.AttachProvider(ctx, "default", "test-sb", "anthropic", result.Sandbox.ResourceVersion)
 	require.NoError(t, err)
 
-	providers, err = sc.ListProviders(ctx, "default", "test-sb")
+	pager, err := sc.ListProviders("default", "test-sb", v1.ListOptions{PageSize: 1})
+	require.NoError(t, err)
+	firstPage, err := pager.NextPage(ctx)
+	require.NoError(t, err)
+	require.Len(t, firstPage.Items, 1)
+	require.NotEmpty(t, firstPage.NextPageToken)
+
+	providers, err = sc.ListAllProviders(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Len(t, providers, 2)
 
@@ -692,9 +699,8 @@ func TestSandbox_ListProviders(t *testing.T) {
 
 func TestSandbox_ListProviders_SandboxNotFound(t *testing.T) {
 	sc := newTestSandboxClient()
-	ctx := context.Background()
 
-	_, err := sc.ListProviders(ctx, "default", "nonexistent")
+	_, err := sc.ListProviders("default", "nonexistent")
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
 }
@@ -960,7 +966,7 @@ func TestSandbox_GetLogs_ReturnsUnimplemented(t *testing.T) {
 
 func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	store := newobjectStore(sandboxName, copySandbox)
-	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	templateStore := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
 	sc := newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return true })
 	_, err := sc.GetLogs(context.Background(), "default", "sb-1")

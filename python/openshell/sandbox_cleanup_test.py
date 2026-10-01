@@ -45,6 +45,11 @@ def cleanup_client():
         state.calls.append("DeleteSandbox")
         assert request.name == "cleanup-test"
         assert request.workspace_scope.workspace == "default"
+        assert request.allow_missing
+        if state.code == grpc.StatusCode.NOT_FOUND:
+            return openshell_pb2.DeleteSandboxResponse(
+                outcome=openshell_pb2.DELETION_OUTCOME_ALREADY_ABSENT
+            )
         fail(context)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
@@ -125,7 +130,9 @@ def test_wait_deleted_handles_intercepted_status(cleanup_client, code):
         grpc.StatusCode.UNAVAILABLE,
     ],
 )
-def test_context_cleanup_handles_intercepted_status(cleanup_client, monkeypatch, code):
+def test_context_cleanup_handles_absence_and_intercepted_errors(
+    cleanup_client, monkeypatch, code
+):
     client, state = cleanup_client
     state.code = code
     state.exists = True

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 
@@ -27,6 +27,10 @@ pub const fn podman_image_pull_policy(policy: ImagePullPolicy) -> &'static str {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Podman API Unix socket. When unset, use the socket selected by
     /// gateway auto-detection.
     pub socket_path: Option<PathBuf>,
@@ -36,8 +40,8 @@ pub struct PodmanComputeConfig {
     pub image_pull_policy: ImagePullPolicy,
     /// Gateway gRPC endpoint the sandbox connects back to.
     ///
-    /// When empty, the driver auto-detects the endpoint using
-    /// `gateway_port` and `host.containers.internal`.
+    /// When empty, the driver selects loopback on Linux or
+    /// `host.containers.internal` with Podman Machine, using `gateway_port`.
     pub grpc_endpoint: String,
     /// Port the gateway server is actually listening on.
     ///
@@ -48,15 +52,14 @@ pub struct PodmanComputeConfig {
     pub gateway_port: u16,
     /// Unix socket path the in-container supervisor bridges relay traffic to.
     pub ssh_socket_path: String,
-    /// Name of the Podman bridge network.
-    /// Created automatically if it does not exist.
+    /// Name of the Podman bridge network used for driver-managed resources.
     pub network_name: String,
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination for sandbox host-gateway aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver. macOS defaults to
-    /// gvproxy's host-loopback IP because stale Podman machines may fail to
-    /// resolve `host-gateway` while still serving `host.containers.internal`
-    /// through gvproxy.
+    /// Empty uses supervisor loopback on Linux and gvproxy's host-loopback IP
+    /// with Podman Machine. The resolved address is pinned into the protected
+    /// runtime descriptor; sandbox policy DNS never trusts workload resolver
+    /// state for `host.openshell.internal`.
     pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
@@ -66,16 +69,14 @@ pub struct PodmanComputeConfig {
     pub sandbox_runtime_image: String,
     /// OCI image containing the dynamically linked `openshell-supervisor` binary.
     pub supervisor_image: String,
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for sandbox-to-gateway TLS.
     ///
-    /// When all three TLS paths (`guest_tls_ca`, `guest_tls_cert`,
-    /// `guest_tls_key`) are set, the driver bind-mounts them into sandbox
-    /// containers and switches the auto-detected endpoint from `http://`
-    /// to `https://`.
+    /// When set, the driver mounts the CA into supervisor containers and
+    /// switches the auto-detected endpoint from `http://` to `https://`.
     pub guest_tls_ca: Option<PathBuf>,
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_cert: Option<PathBuf>,
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_key: Option<PathBuf>,
     /// Container cgroup PID limit for Podman-managed sandboxes.
     ///
@@ -225,6 +226,9 @@ pub fn parse_id_map_entry(
 impl PodmanComputeConfig {
     /// Validate and normalize startup configuration without connecting to Podman.
     pub fn validate_configuration(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        self.resource_admission
+            .validate()
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         self.validate_tls_config()?;
         self.validate_runtime_limits()?;
         self.validate_host_gateway_ip()?;
@@ -247,43 +251,33 @@ impl PodmanComputeConfig {
         self.validate_userns_mappings()
     }
 
-    /// Returns `true` when all three TLS paths are configured.
+    /// Returns `true` when the gateway CA is configured.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
-        self.guest_tls_ca.is_some() && self.guest_tls_cert.is_some() && self.guest_tls_key.is_some()
+        self.guest_tls_ca.is_some()
     }
 
     /// Validate TLS configuration consistency.
     ///
-    /// Returns `Ok(())` when either all three TLS paths are set (full mTLS)
-    /// or none are set (plaintext).  Returns an error naming the missing
-    /// fields when only a subset is provided — this prevents silent
-    /// fallback to plaintext when an operator partially configures mTLS.
+    /// Client certificates are rejected because sandbox identity is carried
+    /// by bearer tokens rather than the gateway user's mTLS identity.
     pub fn validate_tls_config(&self) -> Result<(), crate::client::PodmanApiError> {
-        let has_ca = self.guest_tls_ca.is_some();
         let has_cert = self.guest_tls_cert.is_some();
         let has_key = self.guest_tls_key.is_some();
 
-        // All set or none set — both are valid.
-        if (has_ca && has_cert && has_key) || (!has_ca && !has_cert && !has_key) {
+        if !has_cert && !has_key {
             return Ok(());
         }
-
-        let mut missing = Vec::new();
-        if !has_ca {
-            missing.push("--podman-tls-ca / OPENSHELL_PODMAN_TLS_CA");
-        }
-        if !has_cert {
-            missing.push("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT");
-        }
-        if !has_key {
-            missing.push("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY");
-        }
-
         Err(crate::client::PodmanApiError::InvalidInput(format!(
-            "Partial TLS configuration: all three TLS paths must be provided together. \
-             Missing: {}",
-            missing.join(", ")
+            "Sandbox client certificates are no longer supported; remove {}",
+            [
+                has_cert.then_some("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT"),
+                has_key.then_some("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ")
         )))
     }
 
@@ -433,16 +427,46 @@ impl PodmanComputeConfig {
     }
 
     pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
+        self.resolved_host_gateway_ip().map(|_| ())
+    }
+
+    /// Resolve the trusted supervisor-side destination for host-gateway aliases.
+    pub fn resolved_host_gateway_ip(&self) -> Result<IpAddr, crate::client::PodmanApiError> {
         let trimmed = self.host_gateway_ip.trim();
-        if trimmed.is_empty() {
-            return Ok(());
+        let address = if trimmed.is_empty() {
+            #[cfg(target_os = "macos")]
+            {
+                MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP
+                    .parse::<IpAddr>()
+                    .expect("Podman Machine host gateway constant must be an IP address")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            }
+        } else {
+            trimmed.parse::<IpAddr>().map_err(|err| {
+                crate::client::PodmanApiError::InvalidInput(format!(
+                    "invalid host_gateway_ip value '{trimmed}': {err}"
+                ))
+            })?
+        };
+
+        let normalized = match address {
+            IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(address, IpAddr::V4),
+            IpAddr::V4(_) => address,
+        };
+        if address.is_unspecified()
+            || address.is_multicast()
+            || normalized == IpAddr::V4(Ipv4Addr::BROADCAST)
+            || normalized == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        {
+            return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                "invalid host_gateway_ip value '{address}': address is not a safe concrete host destination"
+            )));
         }
 
-        trimmed.parse::<IpAddr>().map(|_| ()).map_err(|err| {
-            crate::client::PodmanApiError::InvalidInput(format!(
-                "invalid host_gateway_ip value '{trimmed}': {err}"
-            ))
-        })
+        Ok(address)
     }
 
     /// Resolve the default host gateway override for the current platform.
@@ -463,6 +487,9 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: None,
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
@@ -639,6 +666,12 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert_eq!(cfg.host_gateway_ip, MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP);
         assert!(cfg.validate_host_gateway_ip().is_ok());
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP
+                .parse::<IpAddr>()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -647,6 +680,10 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         assert!(cfg.host_gateway_ip.is_empty());
         assert!(cfg.validate_host_gateway_ip().is_ok());
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
     }
 
     #[test]
@@ -657,6 +694,33 @@ mod tests {
         };
         let err = cfg.validate_host_gateway_ip().unwrap_err();
         assert!(err.to_string().contains("host_gateway_ip"));
+    }
+
+    #[test]
+    fn host_gateway_ip_resolution_preserves_explicit_address() {
+        let cfg = PodmanComputeConfig {
+            host_gateway_ip: "192.168.127.254".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_host_gateway_ip().unwrap(),
+            "192.168.127.254".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn host_gateway_ip_validation_rejects_unsafe_destinations() {
+        for address in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "169.254.169.254"] {
+            let cfg = PodmanComputeConfig {
+                host_gateway_ip: address.to_string(),
+                ..PodmanComputeConfig::default()
+            };
+            let error = cfg.validate_host_gateway_ip().unwrap_err();
+            assert!(
+                error.to_string().contains("safe concrete host destination"),
+                "unexpected validation error for {address}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -954,107 +1018,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_config_all_set_is_ok() {
+    fn validate_tls_config_ca_only_is_ok() {
         let cfg = PodmanComputeConfig {
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.validate_tls_config().is_ok());
+        assert!(cfg.tls_enabled());
     }
 
     #[test]
-    fn validate_tls_config_only_ca_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only CA should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_cert_is_error() {
+    fn validate_tls_config_rejects_client_certificate() {
         let cfg = PodmanComputeConfig {
             guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("only cert should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_cert_missing_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_key_missing_cert_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing cert should be rejected");
+            .expect_err("sandbox client certificate should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]
-    fn validate_tls_config_cert_and_key_missing_ca_is_error() {
+    fn validate_tls_config_rejects_client_private_key() {
         let cfg = PodmanComputeConfig {
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("missing CA should be rejected");
+            .expect_err("sandbox client private key should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]

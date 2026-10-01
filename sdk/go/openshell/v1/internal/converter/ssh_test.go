@@ -20,7 +20,7 @@ func TestSSHSessionFromProto(t *testing.T) {
 		GatewayPort:        2222,
 		GatewayScheme:      "https",
 		HostKeyFingerprint: "SHA256:abc123",
-		ExpiresAtMs:        1700000000000,
+		ExpirationTime:     TimestampFromMillis(1700000000000),
 	}
 
 	session := SSHSessionFromProto(resp)
@@ -80,7 +80,7 @@ func TestSSHSessionToProto(t *testing.T) {
 	assert.Equal(t, uint32(2222), resp.GatewayPort)
 	assert.Equal(t, "https", resp.GatewayScheme)
 	assert.Equal(t, "SHA256:abc123", resp.HostKeyFingerprint)
-	assert.Equal(t, int64(1700000000000), resp.ExpiresAtMs)
+	assert.Equal(t, int64(1700000000000), MillisFromProto(resp.ExpirationTime))
 }
 
 func TestSSHSessionToProto_Nil(t *testing.T) {

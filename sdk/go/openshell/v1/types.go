@@ -23,6 +23,16 @@ const (
 	SandboxCompleted    = types.SandboxCompleted
 )
 
+// SandboxRestartPolicy controls replacement after the canonical main process exits.
+type SandboxRestartPolicy = types.SandboxRestartPolicy
+
+// Sandbox restart policy values.
+const (
+	SandboxRestartNever     = types.SandboxRestartNever
+	SandboxRestartOnFailure = types.SandboxRestartOnFailure
+	SandboxRestartAlways    = types.SandboxRestartAlways
+)
+
 // EventType classifies watch events.
 type EventType = types.EventType
 

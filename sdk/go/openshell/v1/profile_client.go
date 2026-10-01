@@ -30,7 +30,7 @@ func (p *profileClient) List(workspace string, opts ...ListOptions) (*Pager[*Pro
 		pageToken = opts[0].PageToken
 	}
 	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ProviderProfile], error) {
-		req := &pb.ListProviderProfilesRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
+		req := &pb.ListProviderProfilesRequest{WorkspaceScope: profileWorkspaceScope(workspace), PageSize: pageSize, PageToken: pageToken}
 		resp, err := p.client.ListProviderProfiles(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)
@@ -53,8 +53,8 @@ func (p *profileClient) ListAll(ctx context.Context, workspace string, opts ...L
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {
 	resp, err := p.client.GetProviderProfile(ctx, &pb.GetProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -74,8 +74,8 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 	}
 
 	resp, err := p.client.ImportProviderProfiles(ctx, &pb.ImportProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
+		Profiles:       pbItems,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -111,7 +111,7 @@ func (p *profileClient) Update(ctx context.Context, workspace, id string, expect
 		Id:                      id,
 		Profile:                 pbItem,
 		ExpectedResourceVersion: expectedResourceVersion,
-		Workspace:               workspace,
+		WorkspaceScope:          profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -169,7 +169,10 @@ func profilesRequireStablePlaceholders(items []*pb.ProviderProfileImportItem) bo
 // Lint acknowledges feature support before an opt-in is persisted. Legacy
 // gateways can otherwise silently discard unknown credential fields.
 func (p *profileClient) lint(ctx context.Context, workspace string, items []*pb.ProviderProfileImportItem) (*pb.LintProviderProfilesResponse, error) {
-	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{Profiles: items, Workspace: workspace})
+	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{
+		Profiles:       items,
+		WorkspaceScope: profileWorkspaceScope(workspace),
+	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
@@ -179,13 +182,14 @@ func (p *profileClient) lint(ctx context.Context, workspace string, items []*pb.
 	return resp, nil
 }
 
-func (p *profileClient) Delete(ctx context.Context, workspace, id string) (bool, error) {
+func (p *profileClient) Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := p.client.DeleteProviderProfile(ctx, &pb.DeleteProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		AllowMissing:   allowMissing(opts),
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

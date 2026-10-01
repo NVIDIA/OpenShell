@@ -143,7 +143,7 @@ func TestConfigGetSandbox(t *testing.T) {
 
 	// Verify request was forwarded with resolved ID (stubSandboxResolver returns "sb-<name>").
 	mock.mu.Lock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastSandboxReq.GetSandboxId())
+	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetName())
 	mock.mu.Unlock()
 
 	// Scalar fields.
@@ -222,7 +222,7 @@ func TestConfigGetSandbox_Error(t *testing.T) {
 
 // --- Name-to-ID resolution tests ---
 
-func TestConfigGetSandbox_ResolvesNameToID(t *testing.T) {
+func TestConfigGetSandbox_UsesName(t *testing.T) {
 	mock := newMockConfigServer()
 	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{Version: 1}
 
@@ -235,7 +235,7 @@ func TestConfigGetSandbox_ResolvesNameToID(t *testing.T) {
 
 	// stubSandboxResolver returns ID "sb-<name>" — verify the proto has the resolved ID, not the name.
 	mock.mu.Lock()
-	assert.Equal(t, "sb-my-sandbox", mock.lastSandboxReq.GetSandboxId(), "GetSandbox should send resolved sandbox ID, not the name")
+	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetName())
 	mock.mu.Unlock()
 }
 
@@ -361,7 +361,7 @@ func TestConfigUpdate_SandboxScope(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, req)
-	assert.Equal(t, "my-sandbox", req.GetName())
+	assert.Equal(t, "my-sandbox", req.GetSandbox())
 	assert.Equal(t, "max_tokens", req.GetSettingKey())
 	assert.False(t, req.GetGlobal())
 	assert.Equal(t, uint64(4), req.GetExpectedResourceVersion())
@@ -397,7 +397,7 @@ func TestConfigUpdate_GlobalScope(t *testing.T) {
 	mock.mu.Unlock()
 
 	assert.True(t, req.GetGlobal())
-	assert.Empty(t, req.GetName())
+	assert.Empty(t, req.GetSandbox())
 }
 
 func TestConfigUpdate_DeleteSetting(t *testing.T) {
@@ -545,6 +545,74 @@ func TestConfigUpdate_MergeOperationsAccepted(t *testing.T) {
 	mock.mu.Unlock()
 	require.NotNil(t, req)
 	assert.NotEmpty(t, req.GetMergeOperations(), "MergeOperations should be serialized to proto")
+}
+
+func TestConfigUpdate_L7TargetScopeSurvivesTransport(t *testing.T) {
+	mock := newMockConfigServer()
+	mock.updateResp = &pb.UpdateConfigResponse{Version: 3}
+	client, cleanup := setupConfigTest(t, mock)
+	defer cleanup()
+
+	path := ""
+	_, err := client.Update(context.Background(), "default", &ConfigUpdate{
+		Name: "my-sandbox",
+		MergeOperations: []PolicyMergeOperation{
+			{AddAllowRules: &AddAllowRules{
+				Target: &L7RuleTarget{
+					RuleName: "api", Host: "api.example.com",
+					Ports:    []uint32{443, 8443},
+					Path:     &path,
+					Binaries: []PolicyNetworkBinary{{Path: "/usr/bin/curl"}, {Path: "/usr/bin/wget"}},
+				},
+				Rules: []L7Rule{{Allow: &L7Allow{Method: "POST", Path: "/admin"}}},
+			}},
+			{AddDenyRules: &AddDenyRules{
+				Target: &L7RuleTarget{
+					RuleName: "public-api", Host: "public.example.com",
+					Ports:     []uint32{443},
+					AnyBinary: true,
+				},
+				DenyRules: []L7DenyRule{{Method: "DELETE", Path: "/admin"}},
+			}},
+		},
+	})
+	require.NoError(t, err)
+
+	mock.mu.Lock()
+	req := mock.lastUpdateReq
+	mock.mu.Unlock()
+	require.NotNil(t, req)
+	require.Len(t, req.GetMergeOperations(), 2)
+	allow := req.GetMergeOperations()[0].GetAddAllowRules()
+	require.NotNil(t, allow)
+	allowTarget := allow.GetTarget()
+	require.NotNil(t, allowTarget)
+	assert.Equal(t, "api", allowTarget.GetRuleName())
+	assert.Equal(t, "api.example.com", allowTarget.GetHost())
+	assert.Equal(t, []uint32{443, 8443}, allowTarget.GetPorts())
+	require.NotNil(t, allowTarget.Path, "empty endpoint path must survive protobuf encoding")
+	assert.Empty(t, *allowTarget.Path)
+	require.Len(t, allowTarget.GetBinaries(), 2)
+	assert.Equal(t, "/usr/bin/curl", allowTarget.GetBinaries()[0].GetPath())
+	assert.Equal(t, "/usr/bin/wget", allowTarget.GetBinaries()[1].GetPath())
+	assert.False(t, allowTarget.GetAnyBinary())
+	require.Len(t, allow.GetRules(), 1)
+	assert.Equal(t, "POST", allow.GetRules()[0].GetAllow().GetMethod())
+	assert.Equal(t, "/admin", allow.GetRules()[0].GetAllow().GetPath())
+
+	deny := req.GetMergeOperations()[1].GetAddDenyRules()
+	require.NotNil(t, deny)
+	denyTarget := deny.GetTarget()
+	require.NotNil(t, denyTarget)
+	assert.Equal(t, "public-api", denyTarget.GetRuleName())
+	assert.Equal(t, "public.example.com", denyTarget.GetHost())
+	assert.Equal(t, []uint32{443}, denyTarget.GetPorts())
+	assert.Nil(t, denyTarget.Path)
+	assert.Empty(t, denyTarget.GetBinaries())
+	assert.True(t, denyTarget.GetAnyBinary())
+	require.Len(t, deny.GetDenyRules(), 1)
+	assert.Equal(t, "DELETE", deny.GetDenyRules()[0].GetMethod())
+	assert.Equal(t, "/admin", deny.GetDenyRules()[0].GetPath())
 }
 
 func TestConfigUpdate_ErrorConflict(t *testing.T) {

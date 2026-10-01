@@ -36,7 +36,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
+| `crates/openshell-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
@@ -44,6 +44,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
+| `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -64,6 +65,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
@@ -78,8 +80,13 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
-| `architecture/` | Architecture docs | Design decisions and component documentation |
+| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
+
+## Public API Conventions
+
+Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
+the canonical source for entity-reference naming, workspace selectors, field
+design, and schema evolution.
 
 ## Vouch System
 
@@ -102,7 +109,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 ## Plans
 
-- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
+- Store plan documents in `plans/`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
 - When asked to write a plan, write it there without asking for the location.
 
 ## Sandbox Logging (OCSF)
@@ -256,24 +263,13 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Documentation
 
-- When making changes, update the relevant documentation in the `architecture/` directory.
+- Put crate-specific implementation details in the relevant crate `README.md`, design proposals in `rfc/`, and temporary plans in the ignored `plans/` directory.
 - When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
-- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
+- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
-
-### Architecture Docs
-
-- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
-- Update one of the existing top-level architecture docs before adding a new file.
-- Put useful crate-specific details in the relevant crate `README.md`.
-- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
-- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
-- Remove stale detail instead of preserving it by default.
-- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
-- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
 
 ## Security
 

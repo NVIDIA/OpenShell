@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // --- Mock server for SSH sessions ---
@@ -51,21 +52,22 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		return nil, s.createErr
 	}
 
-	token := "tok-" + req.GetSandboxId()
+	sandboxName := req.GetSandbox()
+	token := "tok-" + sandboxName
 	if s.nextToken != "" {
 		token = s.nextToken
 	}
 
 	resp := &pb.CreateSshSessionResponse{
-		SandboxId:          req.GetSandboxId(),
+		SandboxId:          "id-" + sandboxName,
 		Token:              token,
 		GatewayHost:        "gw.example.com",
 		GatewayPort:        2222,
 		GatewayScheme:      "https",
 		HostKeyFingerprint: "SHA256:abc123",
-		ExpiresAtMs:        1700000000000,
+		ExpirationTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 	}
-	s.sessions[req.GetSandboxId()] = resp
+	s.sessions[sandboxName] = resp
 	s.tokens[token] = true
 	return resp, nil
 }
@@ -80,13 +82,15 @@ func (s *mockSSHServer) RevokeSshSession(ctx context.Context, req *pb.RevokeSshS
 	}
 
 	token := req.GetToken()
-	active, exists := s.tokens[token]
-	if exists && active {
+	_, exists := s.tokens[token]
+	if exists {
 		s.tokens[token] = false
-		return &pb.RevokeSshSessionResponse{Revoked: true}, nil
+		return &pb.RevokeSshSessionResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 	}
-	// Already revoked or not found — not an error, just revoked=false.
-	return &pb.RevokeSshSessionResponse{Revoked: false}, nil
+	if !req.AllowMissing {
+		return nil, status.Error(codes.NotFound, "ssh session not found")
+	}
+	return &pb.RevokeSshSessionResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_ALREADY_ABSENT}, nil
 }
 
 func (s *mockSSHServer) ForwardTcp(stream grpc.BidiStreamingServer[pb.TcpForwardFrame, pb.TcpForwardFrame]) error { //nolint:revive // proto-generated method name
@@ -157,14 +161,19 @@ func (m *mockSandboxResolver) List(_ string, _ ...ListOptions) (*Pager[*Sandbox]
 func (m *mockSandboxResolver) ListAll(_ context.Context, _ string, _ ...ListOptions) ([]*Sandbox, error) {
 	return nil, nil
 }
-func (m *mockSandboxResolver) Delete(_ context.Context, _, _ string) error { return nil }
+func (m *mockSandboxResolver) Delete(_ context.Context, _, _ string, _ ...DeleteOptions) (*DeletionResult, error) {
+	return &DeletionResult{Outcome: DeletionCompleted}, nil
+}
 func (m *mockSandboxResolver) AttachProvider(_ context.Context, _, _, _ string, _ uint64) (*AttachProviderResult, error) {
 	return nil, nil
 }
 func (m *mockSandboxResolver) DetachProvider(_ context.Context, _, _, _ string, _ uint64) (*DetachProviderResult, error) {
 	return nil, nil
 }
-func (m *mockSandboxResolver) ListProviders(_ context.Context, _, _ string) ([]*Provider, error) {
+func (m *mockSandboxResolver) ListProviders(_, _ string, _ ...ListOptions) (*Pager[*Provider], error) {
+	return nil, nil
+}
+func (m *mockSandboxResolver) ListAllProviders(_ context.Context, _, _ string, _ ...ListOptions) ([]*Provider, error) {
 	return nil, nil
 }
 func (m *mockSandboxResolver) WaitReady(_ context.Context, _, _ string, _ ...WaitOptions) (*Sandbox, error) {
@@ -225,7 +234,7 @@ func TestSSHCreateSession(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, session)
-	assert.Equal(t, "my-sandbox", session.SandboxID)
+	assert.Equal(t, "id-my-sandbox", session.SandboxID)
 	assert.Equal(t, "tok-my-sandbox", session.Token)
 	assert.Equal(t, "gw.example.com", session.GatewayHost)
 	assert.Equal(t, uint32(2222), session.GatewayPort)
@@ -260,7 +269,7 @@ func TestSSHRevokeSession(t *testing.T) {
 	revoked, err := client.RevokeSession(context.Background(), "default", session.Token)
 
 	require.NoError(t, err)
-	assert.True(t, revoked)
+	assert.Equal(t, DeletionCompleted, revoked.Outcome)
 }
 
 func TestSSHRevokeSession_AlreadyRevoked(t *testing.T) {
@@ -274,11 +283,11 @@ func TestSSHRevokeSession_AlreadyRevoked(t *testing.T) {
 	_, err = client.RevokeSession(context.Background(), "default", session.Token)
 	require.NoError(t, err)
 
-	// Revoke again — should return false (already revoked).
+	// Revocation is already effective; the retained session is still completed.
 	revoked, err := client.RevokeSession(context.Background(), "default", session.Token)
 
 	require.NoError(t, err)
-	assert.False(t, revoked)
+	assert.Equal(t, DeletionCompleted, revoked.Outcome)
 }
 
 func TestSSHRevokeSession_Error(t *testing.T) {
@@ -289,7 +298,7 @@ func TestSSHRevokeSession_Error(t *testing.T) {
 
 	revoked, err := client.RevokeSession(context.Background(), "default", "some-token")
 
-	assert.False(t, revoked)
+	assert.Nil(t, revoked)
 	require.Error(t, err)
 	var se *StatusError
 	require.ErrorAs(t, err, &se)
@@ -332,7 +341,7 @@ func TestSSHTunnel_Success(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, init)
-	assert.Equal(t, "sb-123", init.GetSandboxId())
+	assert.Equal(t, "my-sandbox", init.GetSandbox())
 	assert.NotEmpty(t, init.GetAuthorizationToken())
 	assert.NotNil(t, init.GetSsh(), "target should be SshRelayTarget")
 }

@@ -17,6 +17,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -28,7 +29,8 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
-from .errors import GatewayError, _error_mapping_channel
+from .errors import _error_mapping_channel
+from .mutations import DeletionOutcome, DeletionResult
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -36,6 +38,8 @@ _ClientCallDetailsBase = namedtuple(
 )
 
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
+_PAGER_MAX_CONSUMED_TOKENS = 10_000
+_PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
 T = TypeVar("T")
 
 
@@ -48,20 +52,46 @@ class Page(Generic[T]):
 
 
 class Pager(Generic[T]):
-    """Lazy, single-pass iterator that fetches one RPC page per advance."""
+    """Lazy, single-pass iterator over the continuation-token contract.
+
+    The repeated-token guard has bounded memory and raises ``SandboxError`` if
+    the traversal exceeds that guard's token-count or byte budget.
+    """
 
     def __init__(self, fetch: Callable[[str], Page[T]], page_token: str = "") -> None:
         self._fetch = fetch
         self._page_token: str | None = page_token
+        self._consumed_page_tokens: set[str] = set()
+        self._consumed_page_token_bytes = 0
 
     def __iter__(self) -> Pager[T]:
         return self
 
+    def _validate_page_token_budget(self, page_token: str) -> int:
+        if not page_token:
+            return 0
+        token_bytes = len(page_token.encode("utf-8"))
+        if (
+            len(self._consumed_page_tokens) >= _PAGER_MAX_CONSUMED_TOKENS
+            or self._consumed_page_token_bytes + token_bytes
+            > _PAGER_MAX_CONSUMED_TOKEN_BYTES
+        ):
+            raise SandboxError("pager continuation token history limit exceeded")
+        return token_bytes
+
     def __next__(self) -> Page[T]:
         if self._page_token is None:
             raise StopIteration
-        page = self._fetch(self._page_token)
-        self._page_token = page.next_page_token or None
+        page_token = self._page_token
+        token_bytes = self._validate_page_token_budget(page_token)
+        page = self._fetch(page_token)
+        if page_token:
+            self._consumed_page_tokens.add(page_token)
+            self._consumed_page_token_bytes += token_bytes
+        next_page_token = page.next_page_token
+        if next_page_token and next_page_token in self._consumed_page_tokens:
+            raise SandboxError("pager received a repeated continuation token")
+        self._page_token = next_page_token or None
         return page
 
     def all(self) -> builtins.list[T]:
@@ -77,6 +107,24 @@ def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
 
 def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
     return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
+
+
+def _service_exposure_messages(
+    exposures: Sequence[ServiceExposure] | None,
+) -> list[openshell_pb2.SandboxServiceExposure]:
+    return [
+        openshell_pb2.SandboxServiceExposure(
+            service=exposure.service,
+            target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
+        )
+        for exposure in exposures or ()
+    ]
 
 
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
@@ -407,6 +455,25 @@ class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
+
+
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
+
+
+@dataclass(frozen=True)
+class ServiceExposure:
+    """A loopback HTTP service to expose during sandbox creation."""
+
+    target_port: int
+    service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -450,9 +517,14 @@ class SandboxRef:
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
     labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
     created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
+    # Populated by create operations. The empty key identifies the unnamed service.
+    service_urls: Mapping[str, str] = field(
+        default_factory=_ImmutableLabels, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
+        object.__setattr__(self, "service_urls", _ImmutableLabels(self.service_urls))
 
     @property
     def phase(self) -> int:
@@ -502,8 +574,9 @@ class SandboxSession:
         no_login_shell: bool = False,
     ) -> ExecResult:
         return self._client.exec(
-            self.sandbox.id,
+            self.sandbox.name,
             command,
+            workspace=self._workspace,
             stream_output=stream_output,
             workdir=workdir,
             env=env,
@@ -524,8 +597,9 @@ class SandboxSession:
         timeout_seconds: int | None = None,
     ) -> ExecResult:
         return self._client.exec_python(
-            self.sandbox.id,
+            self.sandbox.name,
             function,
+            workspace=self._workspace,
             args=args,
             kwargs=kwargs,
             stream_output=stream_output,
@@ -534,8 +608,10 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
         )
 
-    def delete(self) -> bool:
-        return self._client.delete(self.sandbox.name, workspace=self._workspace)
+    def delete(self, *, allow_missing: bool = False) -> DeletionResult:
+        return self._client.delete(
+            self.sandbox.name, workspace=self._workspace, allow_missing=allow_missing
+        )
 
     def stop(self) -> SandboxRef:
         self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
@@ -759,18 +835,20 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace_scope=_workspace_scope(workspace),
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -779,25 +857,27 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
-        if not template_name.strip():
-            raise SandboxError("template_name is required")
+        if not workload_template.strip():
+            raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace_scope=_workspace_scope(workspace),
-                workload_template_name=template_name,
+                workload_template=workload_template,
+                service_exposures=_service_exposure_messages(service_exposures),
             ),
             timeout=self._timeout,
         )
-        sandbox_ref = _sandbox_ref(response.sandbox)
+        sandbox_ref = _sandbox_ref(response.sandbox, response.service_urls)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
         return sandbox_ref
@@ -809,45 +889,56 @@ class SandboxClient:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
-            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+            self,
+            self.create(
+                workspace=workspace,
+                spec=spec,
+                name=name,
+                labels=labels,
+                service_exposures=service_exposures,
+            ),
         )
 
     def create_session_from_template(
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxSession:
         return SandboxSession(
             self,
             self.create_from_template(
                 workspace=workspace,
-                template_name=template_name,
+                workload_template=workload_template,
                 spec=spec,
                 name=name,
                 labels=labels,
+                service_exposures=service_exposures,
             ),
         )
 
     def sandbox_templates(self) -> SandboxTemplateClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
 
-    def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_name: str, *, workspace: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_name, workspace=workspace))
+    def get_session(self, name: str, *, workspace: str) -> SandboxSession:
+        return SandboxSession(self, self.get(name, workspace=workspace))
 
     def list(
         self,
@@ -956,56 +1047,70 @@ class SandboxClient:
             )
         ]
 
-    def delete(self, sandbox_name: str, *, workspace: str) -> bool:
+    def delete(
+        self, name: str, *, workspace: str, allow_missing: bool = False
+    ) -> DeletionResult:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+                allow_missing=allow_missing,
             ),
             timeout=self._timeout,
         )
-        return bool(response.deleted)
+        return DeletionResult(
+            DeletionOutcome(response.outcome), response.sandbox_id or None
+        )
 
-    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def stop(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def start(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
     def wait_deleted(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
+        self,
+        name: str,
+        *,
+        workspace: str,
+        timeout_seconds: float = 60.0,
+        expected_sandbox_id: str | None = None,
     ) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_name, workspace=workspace)
-            except grpc.RpcError as exc:
-                call = exc.raw_error if isinstance(exc, GatewayError) else exc
+                current = self.get(name, workspace=workspace)
                 if (
-                    isinstance(call, grpc.Call)
-                    and call.code() == grpc.StatusCode.NOT_FOUND
+                    expected_sandbox_id is not None
+                    and current.id != expected_sandbox_id
                 ):
+                    return
+            except grpc.RpcError as exc:
+                if getattr(exc, "code", lambda: None)() == grpc.StatusCode.NOT_FOUND:
                     return
                 raise
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
+        raise SandboxError(f"sandbox {name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         return self._wait_for_phase(
-            sandbox_name,
+            name,
             workspace=workspace,
             target_phase=openshell_pb2.SANDBOX_PHASE_READY,
             target_name="ready",
@@ -1013,10 +1118,10 @@ class SandboxClient:
         )
 
     def wait_stopped(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         return self._wait_for_phase(
-            sandbox_name,
+            name,
             workspace=workspace,
             target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
             target_name="stopped",
@@ -1025,7 +1130,7 @@ class SandboxClient:
 
     def _wait_for_phase(
         self,
-        sandbox_name: str,
+        name: str,
         *,
         workspace: str,
         target_phase: int,
@@ -1034,7 +1139,7 @@ class SandboxClient:
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_name, workspace=workspace)
+            sandbox = self.get(name, workspace=workspace)
             if sandbox.status.phase == target_phase:
                 return sandbox
             if (
@@ -1046,21 +1151,18 @@ class SandboxClient:
                 target_phase == openshell_pb2.SANDBOX_PHASE_READY
                 and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
             ):
-                raise SandboxError(
-                    f"sandbox {sandbox_name} stopped before becoming ready"
-                )
+                raise SandboxError(f"sandbox {name} stopped before becoming ready")
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
-                raise SandboxError(f"sandbox {sandbox_name} entered error phase")
+                raise SandboxError(f"sandbox {name} entered error phase")
             time.sleep(1)
-        raise SandboxError(
-            f"sandbox {sandbox_name} was not {target_name} within timeout"
-        )
+        raise SandboxError(f"sandbox {name} was not {target_name} within timeout")
 
     def exec_stream(
         self,
-        sandbox_id: str,
+        sandbox: str,
         command: Sequence[str],
         *,
+        workspace: str,
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
@@ -1071,14 +1173,16 @@ class SandboxClient:
             raise SandboxError("command must not be empty")
 
         request = openshell_pb2.ExecSandboxRequest(
-            sandbox_id=sandbox_id,
+            workspace_scope=_workspace_scope(workspace),
+            sandbox=sandbox,
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),
-            timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
             no_login_shell=no_login_shell,
         )
+        if timeout_seconds:
+            request.execution_timeout.seconds = timeout_seconds
         # Use whichever is larger: the default client timeout or the command
         # timeout plus headroom for SSH setup / teardown overhead.
         grpc_deadline = self._timeout
@@ -1114,9 +1218,10 @@ class SandboxClient:
 
     def exec(
         self,
-        sandbox_id: str,
+        sandbox: str,
         command: Sequence[str],
         *,
+        workspace: str,
         stream_output: bool = False,
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
@@ -1126,8 +1231,9 @@ class SandboxClient:
     ) -> ExecResult:
         result: ExecResult | None = None
         for item in self.exec_stream(
-            sandbox_id,
+            sandbox,
             command,
+            workspace=workspace,
             workdir=workdir,
             env=env,
             stdin=stdin,
@@ -1149,9 +1255,10 @@ class SandboxClient:
 
     def exec_python(
         self,
-        sandbox_id: str,
+        sandbox: str,
         function: Callable[..., object],
         *,
+        workspace: str,
         args: Sequence[object] = (),
         kwargs: Mapping[str, object] | None = None,
         stream_output: bool = False,
@@ -1166,8 +1273,9 @@ class SandboxClient:
             kwargs=kwargs,
         )
         return self.exec(
-            sandbox_id,
+            sandbox,
             [_SANDBOX_PYTHON_BIN, "-c", _PYTHON_CLOUDPICKLE_BOOTSTRAP],
+            workspace=workspace,
             stream_output=stream_output,
             workdir=workdir,
             env=exec_env,
@@ -1246,7 +1354,7 @@ class SandboxTemplateClient:
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         response = self._stub.GetSandboxTemplate(
             openshell_pb2.GetSandboxTemplateRequest(
-                name=name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace), name=name
             ),
             timeout=self._timeout,
         )
@@ -1329,14 +1437,18 @@ class SandboxTemplateClient:
             label_selector=label_selector,
         ).all()
 
-    def delete(self, name: str, *, workspace: str) -> bool:
+    def delete(
+        self, name: str, *, workspace: str, allow_missing: bool = False
+    ) -> DeletionResult:
         response = self._stub.DeleteSandboxTemplate(
             openshell_pb2.DeleteSandboxTemplateRequest(
-                name=name, workspace_scope=_workspace_scope(workspace)
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
+                allow_missing=allow_missing,
             ),
             timeout=self._timeout,
         )
-        return bool(response.deleted)
+        return DeletionResult(DeletionOutcome(response.outcome))
 
 
 @dataclass(frozen=True)
@@ -1424,12 +1536,14 @@ class WorkspaceClient:
             label_selector=label_selector,
         ).all()
 
-    def delete(self, name: str) -> bool:
+    def delete(self, name: str, *, allow_missing: bool = False) -> DeletionResult:
         response = self._stub.DeleteWorkspace(
-            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            openshell_pb2.DeleteWorkspaceRequest(
+                name=name, allow_missing=allow_missing
+            ),
             timeout=self._timeout,
         )
-        return response.deleted
+        return DeletionResult(DeletionOutcome(response.outcome))
 
 
 class Sandbox:
@@ -1445,7 +1559,7 @@ class Sandbox:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
-        template_name: str | None = None,
+        workload_template: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1471,7 +1585,7 @@ class Sandbox:
         self._name = name
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
-        self._template_name = template_name
+        self._workload_template = workload_template
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1499,10 +1613,10 @@ class Sandbox:
         if self._sandbox_input is not None and (
             self._name is not None
             or self._labels is not None
-            or self._template_name is not None
+            or self._workload_template is not None
         ):
             raise SandboxError(
-                "name, labels, and template_name cannot be set when attaching to an existing sandbox"
+                "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
             )
 
         client = SandboxClient.from_active_cluster(
@@ -1515,10 +1629,10 @@ class Sandbox:
         )
         self._client = client
 
-        if self._sandbox_input is None and self._template_name is not None:
+        if self._sandbox_input is None and self._workload_template is not None:
             self._session = client.create_session_from_template(
                 workspace=self._workspace,
-                template_name=self._template_name,
+                workload_template=self._workload_template,
                 spec=self._spec,
                 name=self._name,
                 labels=self._labels,
@@ -1555,20 +1669,20 @@ class Sandbox:
                 and self._session is not None
                 and self._client is not None
             ):
-                try:
-                    deleted = self._session.delete()
-                    if deleted:
-                        self._client.wait_deleted(
-                            self._session.sandbox.name,
-                            workspace=self._workspace,
-                        )
-                except grpc.RpcError as exc:
-                    call = exc.raw_error if isinstance(exc, GatewayError) else exc
-                    if (
-                        not isinstance(call, grpc.Call)
-                        or call.code() != grpc.StatusCode.NOT_FOUND
-                    ):
-                        raise
+                result = self._session.delete(allow_missing=True)
+                if result.outcome == DeletionOutcome.ACCEPTED:
+                    self._client.wait_deleted(
+                        self._session.sandbox.name,
+                        workspace=self._workspace,
+                        expected_sandbox_id=result.sandbox_id,
+                    )
+                elif result.outcome not in (
+                    DeletionOutcome.COMPLETED,
+                    DeletionOutcome.ALREADY_ABSENT,
+                ):
+                    raise SandboxError(
+                        f"unsupported deletion outcome: {result.outcome}"
+                    )
         finally:
             if self._client is not None:
                 self._client.close()
@@ -1648,7 +1762,10 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
-def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
+def _sandbox_ref(
+    sandbox: openshell_pb2.Sandbox,
+    service_urls: Mapping[str, str] | None = None,
+) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
     provenance = (
         SandboxWorkloadTemplateProvenanceRef(
@@ -1668,9 +1785,17 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
             else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
+            else None,
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
+            else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
+        service_urls=service_urls or {},
     )
 
 

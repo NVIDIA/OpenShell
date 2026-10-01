@@ -53,20 +53,29 @@ Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
 contents write on the repository. The test auto-resolves the token from
 `DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.
 
-## Mechanistic smoke
+## Conformance coverage
 
-Lightweight regression for the L4 CONNECT deny → mechanistic chunk pipeline.
-No GitHub token or LLM required.
-
-```bash
-mise run e2e:mechanistic-smoke
-```
-
-Or manually against a running gateway with `agent_policy_proposals_enabled=true`:
+The `mechanistic-proposal` and `new-hostname-proposal` conformance scenarios
+check draft generation for a denied IP address and for a hostname absent from
+policy. The `policy-local` scenario uses `policy.local` to inspect policy, submit
+a narrow permission request, and read the resulting proposal. Run them against a configured gateway
+with `--openshell-bin` pointing to the CLI under test:
 
 ```bash
-OPENSHELL_BIN=target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh
+openshell-conformance run mechanistic-proposal new-hostname-proposal policy-local --openshell-bin target/debug/openshell
 ```
+
+Run `openshell-conformance list` to see all scenario names. A manual
+`Integration Tests` workflow run can select the `policy-advisor` testsuite to
+run only these three scenarios against an installed candidate. Set
+`artifact-run-id` to the candidate build's workflow run ID and `test-matrix` to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```
+
+The GitHub write test above and the regressions below still exercise distinct
+proposal review, approval, and hot-reload behavior.
 
 The #2821 regression additionally verifies that a denial on an existing
 inspected endpoint becomes a binary expansion, auto-approves, hot-reloads, and

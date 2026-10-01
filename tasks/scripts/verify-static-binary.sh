@@ -6,11 +6,12 @@ set -euo pipefail
 
 # Verify a binary is a genuine, complete, fully static executable.
 #
-# The supervisor is executed from inside arbitrary sandbox images (Docker
-# extraction, Podman image volumes, the Kubernetes copy-self path), so any
-# dynamic linkage breaks it on musl-based images and on images whose glibc is
-# older than the build host's. Both supported supervisor libc variants (musl
-# and glibc-static) must therefore produce a static binary.
+# Callers pass binaries that must run without a dynamic loader, such as the
+# musl sandbox runtime (openshell-sandbox). It is executed from inside
+# arbitrary workload images (Docker extraction, Podman image volumes, the
+# Kubernetes copy-self path), so any dynamic linkage breaks it on musl-based
+# images and on images whose glibc is older than the build host's. Other
+# callers include the release prover and e2e fixtures.
 #
 # This check exists because the failure is silent: `zig cc` accepts `-static`
 # for `*-linux-gnu` targets and emits a dynamically linked binary anyway, so a
@@ -57,7 +58,7 @@ if [[ -z $READELF ]]; then
   host_os=""
   command -v uname >/dev/null 2>&1 && host_os=$(uname -s 2>/dev/null || true)
   # Skip only on a host positively identified as non-Linux — e.g. a macOS dev
-  # cross-building the Linux supervisor via cargo-zigbuild, where mise installs
+  # cross-building a Linux musl binary via cargo-zigbuild, where mise installs
   # no binutils. Linux (including CI), or any host whose OS cannot be determined,
   # fails closed so a missing inspector never silently passes. Static linkage is
   # still enforced in CI, which runs on Linux.

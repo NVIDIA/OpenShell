@@ -18,6 +18,9 @@ type Sandbox struct {
 	CreatedFromWorkloadTemplate *SandboxWorkloadTemplateProvenance
 	Spec                        SandboxSpec
 	Status                      SandboxStatus
+	// ServiceURLs is populated by create operations and keyed by service name.
+	// The empty key identifies the unnamed service.
+	ServiceURLs map[string]string
 }
 
 // SandboxSpec holds the desired state of a sandbox.
@@ -31,9 +34,10 @@ type SandboxSpec struct {
 	GPU      bool
 	GPUCount *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy  *SandboxPolicy
-	Command []string
-	TTY     bool
+	Policy        *SandboxPolicy
+	Command       []string
+	TTY           bool
+	RestartPolicy SandboxRestartPolicy
 }
 
 // SandboxTemplate defines the container template for a sandbox.
@@ -109,7 +113,6 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName          string
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string
@@ -119,7 +122,33 @@ type SandboxStatus struct {
 	ExitCode             *int32
 	// EndpointStatuses describes configured external tool endpoints and their
 	// last accepted network results, independently of sandbox readiness.
-	EndpointStatuses []EndpointStatus
+	EndpointStatuses       []EndpointStatus
+	ConfigurationAdmission *SandboxConfigurationAdmission
+	RestartCount           uint32
+	NextRestartAtMs        int64
+	MainProcessStartedAtMs int64
+}
+
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState string
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  ConfigurationAdmissionState = "unknown"
+	ConfigurationAdmissionPending  ConfigurationAdmissionState = "pending"
+	ConfigurationAdmissionAccepted ConfigurationAdmissionState = "accepted"
+	ConfigurationAdmissionRejected ConfigurationAdmissionState = "rejected"
+)
+
+// SandboxConfigurationAdmission identifies a validated or rejected configuration.
+// Supervisor instance fencing remains available through the raw protobuf API.
+type SandboxConfigurationAdmission struct {
+	State               ConfigurationAdmissionState
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	Error               string
 }
 
 // EndpointStatus holds a configured tool endpoint and its last accepted network result.
@@ -132,7 +161,7 @@ type EndpointStatus struct {
 	Ports      []uint32
 	Path       string
 	LastResult EndpointResult
-	// LastReportedAt is the RFC 3339 UTC time when the gateway accepted the
+	// LastReportedAt is the RFC 3339 UTC rendering of the time when the gateway accepted the
 	// observation, not the request time. Retained evidence can be accepted after
 	// a reset. NoObservedExchange has no report timestamp.
 	LastReportedAt string

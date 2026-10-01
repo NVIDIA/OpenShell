@@ -17,8 +17,13 @@
 # Sandbox image overrides:
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
+#   SANDBOX_IMAGE=... (trusted sandbox runtime override)
+# Supervisor image overrides:
+#   SUPERVISOR_IMAGE=... (common test-wrapper override)
+#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   OPENSHELL_DOCKER_SUPERVISOR_IMAGE=... (Docker-specific override)
 #
-# The default community sandbox image uses :latest. This wrapper refreshes it
+# The default sandbox image uses a mutable tag. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to
 # if_not_present so local Dockerfile-built images remain usable.
 #
@@ -323,6 +328,16 @@ resolve_docker_supervisor_image() {
     return 0
   fi
 
+  if [ -n "${SUPERVISOR_IMAGE:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -z "${IMAGE_TAG:-}" ] \
+       && ! e2e_image_reference_is_complete "${SUPERVISOR_IMAGE}"; then
+      echo "ERROR: IMAGE_TAG must be set in CI when SUPERVISOR_IMAGE is repository-only." >&2
+      exit 2
+    fi
+    printf '%s\n' "$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
   if [ -n "${CI:-}" ]; then
     if [ -z "${IMAGE_TAG:-}" ]; then
       echo "ERROR: IMAGE_TAG must be set in CI when no Docker supervisor image override is provided." >&2
@@ -345,6 +360,10 @@ resolve_docker_sandbox_runtime_image() {
 
   if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
     printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+  if [ -n "${SANDBOX_IMAGE:-}" ]; then
+    printf '%s\n' "$(e2e_resolve_image_reference "${SANDBOX_IMAGE}" "${IMAGE_TAG:-dev}")"
     return 0
   fi
 
@@ -443,7 +462,7 @@ ensure_docker_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -516,7 +535,7 @@ build_local_docker_sandbox_runtime_image_if_required "${SANDBOX_RUNTIME_IMAGE}"
 ensure_docker_sandbox_runtime_image "${SANDBOX_RUNTIME_IMAGE}"
 echo "Using Docker sandbox runtime image: ${SANDBOX_RUNTIME_IMAGE}"
 
-DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}}"
 if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
@@ -524,20 +543,17 @@ if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
   exit 2
 fi
 
-PKI_DIR="${WORKDIR}/pki"
-e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
-export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
-
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
 
-GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
 DOCKER_NETWORK_NAME="${E2E_NAMESPACE}"
 GATEWAY_HOST_ALIAS_IP=""
+GATEWAY_BIND_IP="127.0.0.1"
+SUPERVISOR_GATEWAY_HOST="127.0.0.1"
 
 ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
@@ -546,9 +562,26 @@ export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
+  # Container jobs use the host Docker daemon. The host-networked supervisor
+  # therefore cannot reach the gateway through the job container's loopback;
+  # it reaches the gateway through the job container's address on this bridge.
+  GATEWAY_BIND_IP="0.0.0.0"
+  SUPERVISOR_GATEWAY_HOST="${GATEWAY_HOST_ALIAS_IP}"
 else
   GATEWAY_HOST_ALIAS_IP=""
 fi
+
+PKI_DIR="${WORKDIR}/pki"
+if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+  e2e_generate_pki \
+    "${GATEWAY_BIN}" \
+    "${PKI_DIR}" \
+    "${SUPERVISOR_GATEWAY_HOST}"
+else
+  e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
+fi
+export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
+GATEWAY_ENDPOINT="https://${SUPERVISOR_GATEWAY_HOST}:${HOST_PORT}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
@@ -572,8 +605,6 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 2\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n'
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n\n'      "$(toml_string "${PKI_DIR}/client/tls.key")"
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
     e2e_write_gateway_mtls_auth_config
@@ -585,41 +616,34 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
+    printf 'allow_driver_config = true\n'
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'enable_bind_mounts = true\n'
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
-    fi
+    printf '\n[openshell.drivers.docker.resource_admission]\n'
+    printf 'enabled = false\n'
   fi
 } > "${GATEWAY_CONFIG}"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-    printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
-    printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
     printf 'enable_bind_mounts = true\n'
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
-    fi
   } >"${DRIVER_CONFIG}"
   "${DRIVER_BIN}" \
     --bind-socket "${DRIVER_SOCKET}" \
     --config "${DRIVER_CONFIG}" \
-    --gateway-bind "127.0.0.1:${HOST_PORT}" \
+    --gateway-bind "${GATEWAY_BIND_IP}:${HOST_PORT}" \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -628,11 +652,14 @@ fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
+  --bind-address "${GATEWAY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --compute-driver docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
+  # edge_tunnel_e2e exercises the opt-in WebSocket tunnel.
+  --enable-websocket-tunnel true
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
 
@@ -705,6 +732,24 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
   exit 1
 fi
+
+# Seed the example profiles the provider tests rely on. The mTLS lanes already
+# have a registered gateway identity; the OIDC lanes deliberately skip
+# registration and have no token yet, so establish an administrator session
+# first rather than importing unauthenticated.
+if [ "${OIDC_MODE}" = "1" ]; then
+  e2e_register_oidc_admin_session \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${OIDC_ISSUER}" \
+    "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
+    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${PKI_DIR}" \
+    "${CLI_BIN}" || exit 1
+fi
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
 
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"

@@ -37,6 +37,7 @@ pub mod edge_tunnel;
 pub mod error;
 pub mod oidc;
 pub mod pagination;
+pub mod provider_readiness;
 pub mod raw;
 pub mod refresh;
 pub mod transport;
@@ -49,8 +50,10 @@ pub use error::SdkError;
 pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxResources,
+    DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions, ExecResult, Health, ListOptions,
+    LogLine, PlatformEvent, SandboxPhase, SandboxRef, SandboxResources, SandboxRestartPolicy,
     SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
     SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceStatus, WorkspaceRef,
+    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+    ServiceExposure, ServiceStatus, WatchEvent, WatchOptions, WorkspaceRef,
 };

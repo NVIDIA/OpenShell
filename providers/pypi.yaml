@@ -1,6 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/pypi.yaml
+#   openshell provider profile import -f providers/pypi.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   python, python3 (which also run pip), uv.
+# Reference layout:  the paths below assume a particular image layout — a
+#                    virtualenv at /sandbox/.venv or /app/.venv, uv at
+#                    /usr/local/bin/uv, uv-managed interpreters under
+#                    /sandbox/.uv/python. Almost every other image differs
+#                    (/usr/bin/python3, /usr/local/bin/python3, a venv
+#                    elsewhere). Edit `binaries` before importing or the
+#                    profile is inert.
+#                    OpenShell identifies a process by its executable, not its
+#                    command line, so pip and other Python scripts match the
+#                    interpreter that runs them. List that interpreter, never
+#                    a script path such as .venv/bin/pip. Exact paths resolve
+#                    symlinks; globs must match the interpreter's real path.
+# Credential scope:  none. PyPI access here is anonymous.
+# Endpoint access:   pypi.org and files.pythonhosted.org for packages;
+#                    downloads.python.org for interpreters; github.com,
+#                    api.github.com and objects.githubusercontent.com for
+#                    sdists that build from a Git source.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      python -m pip download --no-deps -d /tmp/wheels requests
+
 id: pypi
 display_name: PyPI
 description: Python package installation from PyPI and related package sources
@@ -21,9 +50,7 @@ endpoints:
 binaries:
   - /sandbox/.venv/bin/python
   - /sandbox/.venv/bin/python3
-  - /sandbox/.venv/bin/pip
   - /app/.venv/bin/python
   - /app/.venv/bin/python3
-  - /app/.venv/bin/pip
   - /usr/local/bin/uv
   - /sandbox/.uv/python/**

@@ -22,7 +22,7 @@ fn run_forward_list(config_dir: &Path, args: &[&str]) -> Output {
 }
 
 fn write_dead_forward(config_dir: &Path) {
-    let forward_dir = config_dir.join("openshell/forwards");
+    let forward_dir = config_dir.join("openshell/forwards/default");
     fs::create_dir_all(&forward_dir).expect("create forward directory");
     fs::write(
         forward_dir.join("my-sandbox-8443.pid"),
@@ -60,6 +60,7 @@ fn forward_list_json_emits_machine_readable_records() {
     assert_eq!(
         value,
         serde_json::json!([{
+            "workspace": "default",
             "sandbox": "my-sandbox",
             "bind_address": "0.0.0.0",
             "port": 8443,
@@ -90,6 +91,7 @@ fn forward_list_yaml_emits_equivalent_records() {
     assert_eq!(
         value,
         serde_json::json!([{
+            "workspace": "default",
             "sandbox": "my-sandbox",
             "bind_address": "0.0.0.0",
             "port": 8443,
@@ -118,7 +120,7 @@ fn forward_list_structured_output_emits_empty_collections() {
 }
 
 #[test]
-fn forward_list_table_output_keeps_existing_columns() {
+fn forward_list_table_output_includes_workspace_scope() {
     let config_dir = tempfile::tempdir().expect("create config directory");
     write_dead_forward(config_dir.path());
 
@@ -132,12 +134,15 @@ fn forward_list_table_output_keeps_existing_columns() {
         .map(|line| line.split_whitespace().collect())
         .collect();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec!["SANDBOX", "BIND", "PORT", "PID", "STATUS"]);
     assert_eq!(
-        &rows[1][..4],
-        ["my-sandbox", "0.0.0.0", "8443", "4294967295"]
+        rows[0],
+        vec!["WORKSPACE", "SANDBOX", "BIND", "PORT", "PID", "STATUS"]
     );
-    assert!(rows[1][4].contains("dead"));
+    assert_eq!(
+        &rows[1][..5],
+        ["default", "my-sandbox", "0.0.0.0", "8443", "4294967295"]
+    );
+    assert!(rows[1][5].contains("dead"));
 }
 
 #[test]

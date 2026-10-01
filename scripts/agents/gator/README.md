@@ -4,7 +4,7 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 
 ## Prerequisites
 
-- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
+- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
 - A local gateway and either Docker or Podman are available to build the

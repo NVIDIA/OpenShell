@@ -5,27 +5,27 @@
 
 use crate::color::Colorize;
 use crate::tls::{TlsOptions, grpc_client};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::driver_mounts;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
-    CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    tcp_forward_init,
+    CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
+    TcpForwardInit, tcp_forward_init,
 };
-use openshell_core::{ObjectId, driver_mounts};
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
@@ -44,6 +44,22 @@ const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// command has already reported its terminal result.
 const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
+/// An SSH client that remained alive for this long was attached successfully,
+/// rather than failing during initial authentication or setup.
+const CONNECT_ESTABLISHED_DURATION: Duration = Duration::from_secs(2);
+/// Briefly wait for the gateway lifecycle projection to catch up with an SSH
+/// exit status before treating status 255 as a transport failure.
+const CONNECT_TERMINAL_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECT_TERMINAL_STATUS_INTERVAL: Duration = Duration::from_millis(50);
+/// Time allowed to restore an established canonical-main attachment after its
+/// transport is lost.
+const CONNECT_RECOVERY_TIMEOUT: Duration = Duration::from_mins(1);
+const CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
+const SYNC_RETRY_ATTEMPTS: usize = 4;
+const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -74,6 +90,7 @@ impl Editor {
 struct SshSessionConfig {
     proxy_command: String,
     sandbox_id: String,
+    sandbox_name: String,
     gateway_url: String,
     token: String,
     main_terminal: bool,
@@ -88,11 +105,13 @@ async fn ssh_session_config(
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
-    // Resolve sandbox name to id.
+    // Resolve the sandbox and retain its ID for local lifecycle tracking.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (workspace).to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -105,7 +124,10 @@ async fn ssh_session_config(
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
             })
             .await
         {
@@ -150,7 +172,8 @@ async fn ssh_session_config(
     let proxy_command = build_proxy_command(
         &exe_command,
         &gateway_url,
-        &session.sandbox_id,
+        name,
+        workspace,
         &session.token,
         gateway_name,
     );
@@ -158,6 +181,7 @@ async fn ssh_session_config(
     Ok(SshSessionConfig {
         proxy_command,
         sandbox_id: session.sandbox_id.clone(),
+        sandbox_name: name.to_string(),
         gateway_url,
         token: session.token,
         main_terminal: sandbox.spec.as_ref().is_none_or(|spec| spec.tty),
@@ -271,6 +295,377 @@ fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn main_attach_command(session: &SshSessionConfig) -> Command {
+    let mut command = ssh_base_command(&session.proxy_command);
+    if session.main_terminal {
+        command.arg("-tt").arg("-o").arg("RequestTTY=force");
+    } else {
+        command.arg("-T");
+    }
+    command
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("-s")
+        .arg("sandbox")
+        .arg("openshell-main")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+}
+
+async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
+    let command = main_attach_command(session);
+    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
+        .await
+        .into_diagnostic()?
+}
+
+fn process_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+#[cfg(unix)]
+struct TerminationSignals {
+    interrupt: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).into_diagnostic()?,
+            quit: signal(SignalKind::quit()).into_diagnostic()?,
+            terminate: signal(SignalKind::terminate()).into_diagnostic()?,
+        })
+    }
+
+    async fn recv(&mut self) -> Signal {
+        tokio::select! {
+            _ = self.interrupt.recv() => Signal::SIGINT,
+            _ = self.quit.recv() => Signal::SIGQUIT,
+            _ = self.terminate.recv() => Signal::SIGTERM,
+        }
+    }
+}
+
+struct ConnectCancellation {
+    #[cfg(unix)]
+    signals: TerminationSignals,
+}
+
+impl ConnectCancellation {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            signals: TerminationSignals::new()?,
+        })
+    }
+
+    async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
+    where
+        F: Future<Output = T>,
+    {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                biased;
+                result = future => Ok(result),
+                signal = self.signals.recv() => Err(128 + signal as i32),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(future.await)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_signal_to_child(child: &Child, signal: Signal) -> Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    let pid = i32::try_from(pid).into_diagnostic()?;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i32> {
+    forward_signal_to_child(child, signal)?;
+    if let Ok(status) = tokio::time::timeout(CONNECT_CHILD_TERMINATION_TIMEOUT, child.wait()).await
+    {
+        status.into_diagnostic()?;
+    } else {
+        child.kill().await.into_diagnostic()?;
+        child.wait().await.into_diagnostic()?;
+    }
+    Ok(128 + signal as i32)
+}
+
+async fn run_main_attach_supervised(
+    session: &SshSessionConfig,
+    cancellation: &mut ConnectCancellation,
+) -> Result<i32> {
+    #[cfg(not(unix))]
+    let _ = cancellation;
+
+    let mut command = TokioCommand::from(main_attach_command(session));
+    command.kill_on_drop(true);
+
+    let mut child = command.spawn().into_diagnostic()?;
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            biased;
+            status = child.wait() => Ok(process_exit_code(status.into_diagnostic()?)),
+            signal = cancellation.signals.recv() => terminate_and_reap_child(&mut child, signal).await,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(process_exit_code(child.wait().await.into_diagnostic()?))
+    }
+}
+
+async fn await_before_recovery_deadline<F, T>(
+    deadline: Option<Instant>,
+    future: F,
+) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
+        .await
+        .map_err(|_| ())
+}
+
+fn print_connect_recovery_timeout() {
+    eprintln!(
+        "Unable to restore the sandbox connection within {} seconds.",
+        CONNECT_RECOVERY_TIMEOUT.as_secs()
+    );
+}
+
+fn should_recover_connect(
+    exit_code: i32,
+    attached_for: Duration,
+    recovery_active: bool,
+    main_has_terminal_result: bool,
+) -> bool {
+    !main_has_terminal_result
+        && exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
+        && (recovery_active || attached_for >= CONNECT_ESTABLISHED_DURATION)
+}
+
+async fn canonical_main_has_terminal_result(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> bool {
+    let probe = async {
+        let Ok(mut client) = grpc_client(server, tls).await else {
+            return false;
+        };
+        loop {
+            let Ok(response) = client
+                .get_sandbox(GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        workspace.to_string(),
+                    )),
+                })
+                .await
+            else {
+                return false;
+            };
+            let Some(sandbox) = response.into_inner().sandbox else {
+                return false;
+            };
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.exit_code.is_some())
+                || matches!(
+                    phase,
+                    SandboxPhase::Completed
+                        | SandboxPhase::Error
+                        | SandboxPhase::Stopping
+                        | SandboxPhase::Stopped
+                        | SandboxPhase::Deleting
+                )
+            {
+                return true;
+            }
+            tokio::time::sleep(CONNECT_TERMINAL_STATUS_INTERVAL).await;
+        }
+    };
+
+    tokio::time::timeout(CONNECT_TERMINAL_STATUS_TIMEOUT, probe)
+        .await
+        .unwrap_or(false)
+}
+
+fn should_start_connect_recovery_window(attached_for: Duration, recovery_active: bool) -> bool {
+    !recovery_active || attached_for >= CONNECT_RECOVERY_TIMEOUT
+}
+
+fn next_connect_retry_delay(delay: Duration) -> Duration {
+    std::cmp::min(delay.saturating_mul(2), CONNECT_RETRY_MAX_DELAY)
+}
+
+fn connect_error_is_retryable(error: &Report) -> bool {
+    let message = format!("{error:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "deadline exceeded",
+        "h2 protocol",
+        "http2",
+        "reset before headers",
+        "service is currently unavailable",
+        "timed out",
+        "timeout",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "upstream connect error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn sandbox_connect_supervised(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<i32> {
+    let mut recovery_deadline = None;
+    let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+    let mut cancellation = ConnectCancellation::new()?;
+
+    loop {
+        if recovery_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            print_connect_recovery_timeout();
+            return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+        }
+
+        let session_attempt = match Box::pin(cancellation.wait(await_before_recovery_deadline(
+            recovery_deadline,
+            ssh_session_config(server, name, tls, workspace, None),
+        )))
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(exit_code) => return Ok(exit_code),
+        };
+        let session = match session_attempt {
+            Err(()) => {
+                print_connect_recovery_timeout();
+                return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+            }
+            Ok(Ok(session)) => session,
+            Ok(Err(error))
+                if recovery_deadline.is_some_and(|deadline| Instant::now() < deadline)
+                    && connect_error_is_retryable(&error) =>
+            {
+                tracing::warn!(
+                    sandbox = name,
+                    error = %error,
+                    "failed to create replacement SSH session; retrying"
+                );
+                let now = Instant::now();
+                let delay = recovery_deadline
+                    .map_or(retry_delay, |deadline| retry_delay.min(deadline - now));
+                if let Err(exit_code) = cancellation.wait(tokio::time::sleep(delay)).await {
+                    return Ok(exit_code);
+                }
+                retry_delay = next_connect_retry_delay(retry_delay);
+                continue;
+            }
+            Ok(Err(error)) => return Err(error),
+        };
+
+        let attach_started = Instant::now();
+        let exit_code = run_main_attach_supervised(&session, &mut cancellation).await?;
+        let attached_for = attach_started.elapsed();
+        let recovery_active = recovery_deadline.is_some();
+        let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
+            match cancellation
+                .wait(canonical_main_has_terminal_result(
+                    server, name, tls, workspace,
+                ))
+                .await
+            {
+                Ok(has_result) => has_result,
+                Err(exit_code) => return Ok(exit_code),
+            }
+        } else {
+            false
+        };
+
+        if !should_recover_connect(
+            exit_code,
+            attached_for,
+            recovery_active,
+            main_has_terminal_result,
+        ) {
+            return Ok(exit_code);
+        }
+
+        // Once a replacement attachment survives the full recovery interval,
+        // treat a later failure as a new interruption. Keeping the existing
+        // deadline for shorter attempts prevents SSH connect timeouts from
+        // extending recovery forever.
+        if should_start_connect_recovery_window(attached_for, recovery_active) {
+            recovery_deadline = Some(Instant::now() + CONNECT_RECOVERY_TIMEOUT);
+            retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+            eprintln!(
+                "Connection to sandbox lost; reconnecting. To disconnect, press Ctrl-D or Ctrl-P then Ctrl-Q after reattachment; press Ctrl-C while retrying to cancel."
+            );
+        }
+
+        let Some(deadline) = recovery_deadline else {
+            return Ok(exit_code);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            print_connect_recovery_timeout();
+            return Ok(exit_code);
+        }
+
+        if let Err(exit_code) = cancellation
+            .wait(tokio::time::sleep(std::cmp::min(
+                retry_delay,
+                deadline - now,
+            )))
+            .await
+        {
+            return Ok(exit_code);
+        }
+        retry_delay = next_connect_retry_delay(retry_delay);
+    }
+}
+
 async fn sandbox_connect_with_mode(
     server: &str,
     name: &str,
@@ -288,27 +683,7 @@ async fn sandbox_connect_with_mode(
     )
     .await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
-    if session.main_terminal {
-        command.arg("-tt").arg("-o").arg("RequestTTY=force");
-    } else {
-        command.arg("-T");
-    }
-    command
-        .arg("-o")
-        .arg("SetEnv=TERM=xterm-256color")
-        .arg("-s")
-        .arg("sandbox")
-        .arg("openshell-main")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let exit_code = tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
-        .await
-        .into_diagnostic()??;
-
-    Ok(exit_code)
+    run_main_attach(&session, replace_process).await
 }
 
 /// Connect to a sandbox via SSH.
@@ -318,7 +693,7 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, true, workspace, None).await
+    sandbox_connect_supervised(server, name, tls, workspace).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -386,15 +761,11 @@ pub async fn sandbox_forward(
 
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
 
-    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
-    command
-        .arg("-N")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-L")
-        .arg(spec.ssh_forward_arg());
-
-    command.arg("sandbox");
+    let mut command = TokioCommand::from(ssh_forward_command(
+        &session.proxy_command,
+        &session.sandbox_id,
+        spec,
+    ));
 
     if background {
         command
@@ -413,33 +784,43 @@ pub async fn sandbox_forward(
 
     if background {
         let mut child = command.spawn().into_diagnostic()?;
-        let pid = child.id().ok_or_else(|| {
-            miette::miette!("ssh process did not expose a PID for background tracking")
-        })?;
+        let Some(pid) = child.id() else {
+            terminate_owned_forward_child(&mut child).await;
+            return Err(miette::miette!(
+                "ssh process did not expose a PID for background tracking"
+            ));
+        };
 
         if let Err(err) = wait_for_forward_start(&mut child, spec)
             .await
             .wrap_err("ssh process started but local forward listener was not reachable")
         {
-            terminate_owned_forward_child(&mut child);
+            terminate_owned_forward_child(&mut child).await;
             return Err(err);
         }
 
-        track_background_forward_or_cleanup(
+        let tracked = track_background_forward_or_cleanup(
+            workspace,
             name,
             port,
             pid,
             &session.sandbox_id,
             &spec.bind_addr,
-            || terminate_owned_forward_child(&mut child),
-        )?;
+            || {
+                let _ = child.start_kill();
+            },
+        );
+        if tracked.is_err() {
+            let _ = child.wait().await;
+        }
+        tracked?;
         return Ok(());
     }
 
     let status = {
         let mut child = command.spawn().into_diagnostic()?;
         if let Err(err) = wait_for_forward_start(&mut child, spec).await {
-            let _ = child.kill().await;
+            terminate_owned_forward_child(&mut child).await;
             return Err(err);
         }
         eprintln!("{}", foreground_forward_started_message(name, spec));
@@ -451,6 +832,30 @@ pub async fn sandbox_forward(
     }
 
     Ok(())
+}
+
+/// A forward must stay owned by the process we spawn so it can be reaped or
+/// tracked by PID. User SSH config may otherwise move it into a persistent mux.
+fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
+    let mut command = ssh_base_command(proxy_command);
+    command
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPath=none")
+        .arg("-o")
+        .arg("ControlPersist=no")
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
+        .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg(format!("SetEnv=OPENSHELL_FORWARD_SANDBOX_ID={sandbox_id}"))
+        .arg("-L")
+        .arg(spec.ssh_forward_arg())
+        .arg("sandbox");
+    command
 }
 
 /// Wait for the local listener, racing the probe against the `ssh` child
@@ -478,7 +883,16 @@ async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result
                 ))
             }
         }
+    }?;
+
+    if let Some(status) = child.try_wait().into_diagnostic()? {
+        return Err(miette::miette!(
+            "ssh exited with status {status} after local forward listener opened on {}:{}",
+            forward_probe_host(spec),
+            spec.port,
+        ));
     }
+    Ok(())
 }
 
 /// Poll the local endpoint until a connect succeeds or `wait_for` elapses. The
@@ -554,13 +968,15 @@ fn forward_probe_host(spec: &ForwardSpec) -> &str {
     }
 }
 
-/// Best-effort cleanup for the SSH child this process spawned.
-fn terminate_owned_forward_child(child: &mut Child) {
-    let _ = child.start_kill();
+/// Best-effort cleanup for the SSH child this process spawned. `kill` waits for
+/// the child to exit, so failed startup cannot leave an unreaped process.
+async fn terminate_owned_forward_child(child: &mut Child) {
+    let _ = child.kill().await;
 }
 
 /// Track a verified background forward, cleaning it up if PID-file persistence fails.
 fn track_background_forward_or_cleanup(
+    workspace: &str,
     name: &str,
     port: u16,
     pid: u32,
@@ -568,7 +984,7 @@ fn track_background_forward_or_cleanup(
     bind_addr: &str,
     cleanup: impl FnOnce(),
 ) -> Result<()> {
-    if let Err(err) = write_forward_pid(name, port, pid, sandbox_id, bind_addr) {
+    if let Err(err) = write_forward_pid(workspace, name, port, pid, sandbox_id, bind_addr) {
         cleanup();
         return Err(err)
             .wrap_err("local forward listener was reachable but tracking the SSH process failed");
@@ -644,6 +1060,7 @@ pub async fn sandbox_exec(
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
+#[derive(Clone)]
 enum UploadSource {
     /// A single local file or directory.  `tar_name` controls the entry name
     /// inside the archive (e.g. the target basename for file-to-file uploads).
@@ -1021,18 +1438,15 @@ pub async fn sandbox_sync_up_files(
     if files.is_empty() {
         return Ok(());
     }
-    ssh_tar_upload(
-        server,
-        name,
-        dest,
-        UploadSource::FileList {
-            base_dir: base_dir.to_path_buf(),
-            files: files.to_vec(),
-            archive_prefix: file_list_archive_prefix(local_path),
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::FileList {
+        base_dir: base_dir.to_path_buf(),
+        files: files.to_vec(),
+        archive_prefix: file_list_archive_prefix(local_path),
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1067,17 +1481,16 @@ pub async fn sandbox_sync_up(
     {
         let (parent, target_name) = split_sandbox_path(path);
         if parent != "/" {
-            return ssh_tar_upload(
-                server,
-                name,
-                Some(parent),
-                UploadSource::SinglePath {
-                    local_path: local_path.to_path_buf(),
-                    tar_name: target_name.into(),
-                },
-                tls,
-                workspace,
-            )
+            let source = UploadSource::SinglePath {
+                local_path: local_path.to_path_buf(),
+                tar_name: target_name.into(),
+            };
+            return retry_sandbox_sync("upload", || {
+                let source = source.clone();
+                async move {
+                    ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await
+                }
+            })
             .await;
         }
     }
@@ -1095,17 +1508,14 @@ pub async fn sandbox_sync_up(
         directory_upload_prefix(local_path)
     };
 
-    ssh_tar_upload(
-        server,
-        name,
-        sandbox_path,
-        UploadSource::SinglePath {
-            local_path: local_path.to_path_buf(),
-            tar_name,
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::SinglePath {
+        local_path: local_path.to_path_buf(),
+        tar_name,
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1245,6 +1655,20 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
+    retry_sandbox_sync("download", || async {
+        sandbox_sync_down_once(server, name, sandbox_path, dest, tls, workspace).await
+    })
+    .await
+}
+
+async fn sandbox_sync_down_once(
+    server: &str,
+    name: &str,
+    sandbox_path: &str,
+    dest: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
@@ -1255,6 +1679,54 @@ pub async fn sandbox_sync_down(
             sandbox_sync_down_directory(&session, &sandbox_path, dest).await
         }
     }
+}
+
+async fn retry_sandbox_sync<F, Fut>(operation: &str, mut run: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match run().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < SYNC_RETRY_ATTEMPTS && sync_error_is_retryable(&error) => {
+                tracing::warn!(
+                    operation,
+                    attempt,
+                    max_attempts = SYNC_RETRY_ATTEMPTS,
+                    error = %error,
+                    "sandbox sync operation failed; retrying"
+                );
+                tokio::time::sleep(SYNC_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_error_is_retryable(error: &Report) -> bool {
+    let message = format!("{error:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection",
+        "early eof",
+        "http2",
+        "h2 protocol",
+        "reset before headers",
+        "service is currently unavailable",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "upstream connect error",
+        "ssh probe exited with status exit status: 255",
+        "ssh tar create exited",
+        "ssh tar extract exited",
+        "failed to extract tar archive from sandbox",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Stream a tar archive from the sandbox and extract it into a fresh
@@ -1425,7 +1897,8 @@ async fn sandbox_sync_down_directory(
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: &str,
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1436,8 +1909,9 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_id: sandbox_id.to_string(),
-                service_id: format!("ssh-proxy:{sandbox_id}"),
+                sandbox: sandbox_name.to_string(),
+                workspace: (workspace).to_string(),
+                service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
             },
@@ -1452,20 +1926,37 @@ pub async fn sandbox_ssh_proxy(
         .into_diagnostic()?
         .into_inner();
 
-    let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let to_remote = tokio::spawn(async move {
-        let mut stdin = stdin;
-        let mut buf = vec![0u8; 64 * 1024];
-        while let Ok(n) = stdin.read(&mut buf).await {
-            if n == 0 {
-                break;
+    // Tokio stdin uses an uncancellable read on the runtime's blocking pool.
+    // If the relay closes while SSH still holds the pipe open, runtime shutdown
+    // would wait forever for that read. A dedicated thread can be left behind
+    // when this ProxyCommand process exits without holding the runtime alive.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(8);
+    std::thread::Builder::new()
+        .name("ssh-proxy-stdin".into())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
             }
+        })
+        .into_diagnostic()?;
+    let to_remote = tokio::spawn(async move {
+        while let Some(data) = stdin_rx.recv().await {
             if tx
                 .send(TcpForwardFrame {
                     payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        buf[..n].to_vec(),
+                        data,
                     )),
                 })
                 .await
@@ -1478,8 +1969,10 @@ pub async fn sandbox_ssh_proxy(
     let from_remote = tokio::spawn(async move {
         let mut stdout = stdout;
         loop {
-            let Ok(Some(frame)) = response.message().await else {
-                break;
+            let frame = match response.message().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok::<_, Report>(()),
+                Err(error) => return Err(error).into_diagnostic(),
             };
             let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
             else {
@@ -1488,16 +1981,14 @@ pub async fn sandbox_ssh_proxy(
             if data.is_empty() {
                 continue;
             }
-            if stdout.write_all(&data).await.is_err() {
-                break;
-            }
-            let _ = stdout.flush().await;
+            stdout.write_all(&data).await.into_diagnostic()?;
+            stdout.flush().await.into_diagnostic()?;
         }
     });
-    let _ = from_remote.await;
+    let result = from_remote.await;
     to_remote.abort();
 
-    Ok(())
+    result.into_diagnostic()?
 }
 
 fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {
@@ -1530,7 +2021,8 @@ pub async fn sandbox_ssh_proxy_by_name(
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
-        &session.sandbox_id,
+        &session.sandbox_name,
+        workspace,
         &session.token,
         tls,
     )
@@ -1771,6 +2263,113 @@ mod tests {
     }
 
     #[test]
+    fn sync_error_retry_filter_accepts_transport_failures() {
+        let error = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transient_ssh_probe_failures() {
+        let error = Err::<(), _>(miette::miette!(
+            "ssh probe exited with status exit status: 255"
+        ))
+        .wrap_err("failed to resolve sandbox source path '/sandbox/ha-sync/ha-sync-upload'")
+        .unwrap_err();
+        assert!(sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_rejects_validation_failures() {
+        let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
+        assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn connect_recovery_starts_only_for_established_transport_failures() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            0,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn connect_recovery_continues_after_fast_replacement_failure() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            Duration::ZERO,
+            true,
+            false
+        ));
+        assert!(!should_start_connect_recovery_window(
+            CONNECT_ESTABLISHED_DURATION,
+            true
+        ));
+        assert!(should_start_connect_recovery_window(
+            CONNECT_RECOVERY_TIMEOUT,
+            true
+        ));
+    }
+
+    #[test]
+    fn connect_retry_delay_is_capped() {
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_INITIAL_DELAY),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_MAX_DELAY),
+            CONNECT_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn connect_retry_filter_rejects_authentication_failures() {
+        let transient = miette::miette!("transport error: connection reset by peer");
+        assert!(connect_error_is_retryable(&transient));
+
+        let authentication = miette::miette!("status: Unauthenticated");
+        assert!(!connect_error_is_retryable(&authentication));
+
+        let lifecycle = miette::miette!("sandbox is not ready");
+        assert!(!connect_error_is_retryable(&lifecycle));
+    }
+
+    #[tokio::test]
+    async fn connect_recovery_deadline_bounds_stalled_session_creation() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = await_before_recovery_deadline(
+            Some(deadline),
+            std::future::pending::<std::result::Result<(), Report>>(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
     #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
         let _guard = TEST_ENV_LOCK
@@ -1886,6 +2485,55 @@ mod tests {
         assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ssh_config");
+        fs::write(
+            &config,
+            format!(
+                "Host sandbox\n  ControlMaster auto\n  ControlPath {}/mux-%C\n  ControlPersist yes\n  ForkAfterAuthentication yes\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let forward = ssh_forward_command(
+            "openshell ssh-proxy --sandbox demo",
+            "sandbox-id",
+            &ForwardSpec::new(18080),
+        );
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&config)
+            .arg("-G")
+            .args(forward.get_args())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).unwrap();
+        assert!(effective.lines().any(|line| line == "controlmaster false"));
+        assert!(effective.lines().any(|line| line == "controlpersist no"));
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "forkafterauthentication no")
+        );
+        assert!(
+            !effective
+                .lines()
+                .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
+        );
+    }
+
     #[tokio::test]
     async fn wait_for_forward_listener_accepts_ready_listener() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1933,10 +2581,17 @@ mod tests {
         }
 
         let mut cleaned_up = false;
-        let result =
-            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+        let result = track_background_forward_or_cleanup(
+            "default",
+            "demo",
+            8080,
+            4242,
+            "sbx-1",
+            "127.0.0.1",
+            || {
                 cleaned_up = true;
-            });
+            },
+        );
 
         unsafe {
             match old_xdg {
@@ -1969,12 +2624,19 @@ mod tests {
         }
 
         let mut cleaned_up = false;
-        let result =
-            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+        let result = track_background_forward_or_cleanup(
+            "default",
+            "demo",
+            8080,
+            4242,
+            "sbx-1",
+            "127.0.0.1",
+            || {
                 cleaned_up = true;
-            });
-        let pid_file_exists =
-            openshell_core::forward::forward_pid_path("demo", 8080).is_ok_and(|path| path.exists());
+            },
+        );
+        let pid_file_exists = openshell_core::forward::forward_pid_path("default", "demo", 8080)
+            .is_ok_and(|path| path.exists());
 
         unsafe {
             match old_xdg {

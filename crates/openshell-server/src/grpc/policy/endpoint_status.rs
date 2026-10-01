@@ -10,11 +10,11 @@ use super::{
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
 };
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectName, ObjectWorkspace};
+use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::EndpointReportCursor;
-use chrono::{SecondsFormat, Utc};
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
@@ -62,6 +62,37 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let req = request.into_inner();
+    if let Some(owner) =
+        crate::supervisor_session::remote_supervisor_owner(state, &sandbox_id).await?
+    {
+        let response =
+            crate::supervisor_session::forward_endpoint_status_to_owner(state, &owner, req).await?;
+        return Ok(Response::new(response));
+    }
+    handle_report_endpoint_status_inner(state, req).await
+}
+
+pub(in crate::grpc) async fn handle_peer_report_endpoint_status(
+    state: &Arc<ServerState>,
+    request: Request<ReportEndpointStatusRequest>,
+) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+    if !matches!(
+        request
+            .extensions()
+            .get::<crate::auth::principal::Principal>(),
+        Some(crate::auth::principal::Principal::Peer(_))
+    ) {
+        return Err(Status::permission_denied(
+            "gateway peer principal is required",
+        ));
+    }
+    handle_report_endpoint_status_inner(state, request.into_inner()).await
+}
+
+async fn handle_report_endpoint_status_inner(
+    state: &Arc<ServerState>,
+    req: ReportEndpointStatusRequest,
+) -> Result<Response<ReportEndpointStatusResponse>, Status> {
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
@@ -80,7 +111,9 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
     // Session validation, configuration derivation, and persistence share the
     // sandbox mutation boundary. A newly registered supervisor can therefore
     // invalidate its predecessor before any stale report reaches the CAS.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
@@ -139,7 +172,8 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
         &context.endpoints,
     )?;
     validate_endpoint_observation_markers(&sandbox, &reports, &observed_endpoint_ids)?;
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint report timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -328,7 +362,9 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     sandbox_id: &str,
     supervisor_session_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if !state
         .supervisor_sessions
         .is_current_session(sandbox_id, supervisor_session_id)
@@ -345,7 +381,8 @@ pub async fn reset_endpoint_status_for_supervisor_session(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
     let reports = unknown_endpoint_reports(&context.endpoints);
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -372,12 +409,17 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
+    })?;
     if state
         .supervisor_sessions
         .current_session_id(sandbox_id)
         .is_some()
     {
+        return Ok(());
+    }
+    if has_fresh_shared_owner(state, sandbox_id).await? {
         return Ok(());
     }
     let sandbox = state
@@ -388,7 +430,8 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
     let reports = unknown_endpoint_reports(&context.endpoints);
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
@@ -439,9 +482,15 @@ pub async fn retry_endpoint_status_after_supervisor_disconnect(
 /// Invalidate endpoint results left by sessions from an earlier gateway process.
 ///
 /// Supervisor sessions are intentionally process-local. This reconciliation
-/// runs before gateway listeners are bound, so persisted success can never be
-/// served without a session in the current process that owns the observation.
+/// runs before gateway listeners are bound. A fresh shared owner preserves its
+/// evidence; records without one are reset so stale success is never served.
 pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> Result<(), Status> {
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::super::persistence_error_to_status(
+            error,
+            "acquire endpoint status startup reconciliation lock",
+        )
+    })?;
     let mut offset = 0;
     loop {
         let sandboxes = state
@@ -466,6 +515,9 @@ pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> 
                 continue;
             }
             let sandbox_id = sandbox.object_id();
+            if has_fresh_shared_owner(state, sandbox_id).await? {
+                continue;
+            }
             let expected_resource_version = sandbox.get_resource_version();
             let updated = state
                 .store
@@ -496,6 +548,17 @@ pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> 
     }
 }
 
+async fn has_fresh_shared_owner(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<bool, Status> {
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .read(sandbox_id)
+        .await
+        .map(|owner| owner.is_some_and(|owner| owner.is_fresh(OWNER_TTL)))
+        .map_err(|error| Status::unavailable(format!("resolve supervisor owner failed: {error}")))
+}
+
 fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
     let Some(status) = sandbox.status.as_mut() else {
         return;
@@ -504,7 +567,7 @@ fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
     // remains available so callers can still identify the configured endpoint.
     for endpoint in &mut status.endpoint_statuses {
         endpoint.last_result = EndpointResult::NoObservedExchange as i32;
-        endpoint.last_reported_at.clear();
+        endpoint.last_reported_time = None;
     }
 }
 
@@ -703,18 +766,11 @@ pub(super) fn reconcile_endpoint_statuses(
     sandbox: &mut Sandbox,
     reports: &BTreeMap<String, EndpointStatus>,
     observed_endpoint_ids: &HashSet<String>,
-    now: &str,
+    now: &prost_types::Timestamp,
 ) {
     let phase = sandbox.phase();
     let current_policy_version = sandbox.current_policy_version();
-    let sandbox_name = if sandbox.object_name().is_empty() {
-        sandbox.object_id()
-    } else {
-        sandbox.object_name()
-    }
-    .to_string();
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
-        sandbox_name,
         phase,
         current_policy_version,
         ..Default::default()
@@ -722,12 +778,7 @@ pub(super) fn reconcile_endpoint_statuses(
     let previous = status
         .endpoint_statuses
         .iter()
-        .map(|endpoint| {
-            (
-                endpoint.endpoint_id.as_str(),
-                endpoint.last_reported_at.as_str(),
-            )
-        })
+        .map(|endpoint| (endpoint.endpoint_id.as_str(), endpoint.last_reported_time))
         .collect::<HashMap<_, _>>();
     // Replace the complete inventory to remove retired endpoints atomically.
     // Only newly accepted evidence advances the gateway acceptance timestamp;
@@ -736,17 +787,16 @@ pub(super) fn reconcile_endpoint_statuses(
         .iter()
         .map(|(endpoint_id, report)| {
             let mut endpoint = report.clone();
-            endpoint.last_reported_at =
+            endpoint.last_reported_time =
                 if endpoint.last_result == EndpointResult::NoObservedExchange as i32 {
-                    String::new()
+                    None
                 } else if observed_endpoint_ids.contains(endpoint_id) {
-                    now.to_string()
+                    Some(*now)
                 } else {
                     previous
                         .get(endpoint_id.as_str())
                         .copied()
                         .unwrap_or_default()
-                        .to_string()
                 };
             endpoint
         })

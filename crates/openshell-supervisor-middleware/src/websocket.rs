@@ -957,7 +957,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         context: Some(RequestContext {
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
-            sandbox_name: input.sandbox_name,
+            sandbox: input.sandbox_name,
             workspace: input.workspace,
             originating_process: None,
         }),

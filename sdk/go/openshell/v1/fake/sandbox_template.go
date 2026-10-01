@@ -13,7 +13,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-func sandboxWorkloadTemplateName(template *types.SandboxWorkloadTemplate) string {
+func sandboxWorkloadTemplate(template *types.SandboxWorkloadTemplate) string {
 	return template.Name
 }
 
@@ -138,12 +138,12 @@ func (c *fakeSandboxTemplateClient) ListAll(ctx context.Context, workspace strin
 	return pager.All(ctx)
 }
 
-func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string) (bool, error) {
+func (c *fakeSandboxTemplateClient) Delete(_ context.Context, workspace, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return false, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	_, existed := c.store.DeleteAndGet(workspace, name)
-	return existed, nil
+	return deletionResult(existed, "", opts)
 }
 
 func validateSandboxWorkloadTemplate(template *types.SandboxWorkloadTemplate) error {

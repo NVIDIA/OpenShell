@@ -45,6 +45,7 @@
           overlays = [ (import rust-overlay) ];
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
+        tmachineRuntimePkgs = if pkgs.stdenv.hostPlatform.isDarwin then testGuestPkgs else pkgs;
         commonDevShellPackages = with pkgs; [
           actionlint
           cargo-auditable
@@ -59,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
@@ -67,6 +75,10 @@
           zizmor
           zstd
         ];
+        commonDevShell = {
+          packages = [ rustToolchain ] ++ commonDevShellPackages;
+          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+        };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -114,17 +126,86 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
+        testMachines = import ./tests/config.nix {
+          inherit pkgs toolchains;
+          qemuPkgs = tmachineRuntimePkgs;
+          firmwarePkgs = tmachineRuntimePkgs;
+        };
+        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
-        apps.test-guest = testGuest.app;
-        apps.test-guest-cache = testGuest.cacheApp;
+        apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
+          build-artifacts = {
+            type = "app";
+            program = "${artifacts.all}/bin/build-artifacts";
+          };
+          build-artifacts-binaries = {
+            type = "app";
+            program = "${artifacts.binaries}/bin/build-artifacts-binaries";
+          };
+          build-artifacts-test-archives = {
+            type = "app";
+            program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
+          };
+          build-artifacts-test-images = {
+            type = "app";
+            program = "${artifacts.testImages}/bin/build-artifacts-test-images";
+          };
+          generate-podman-e2e-ci-tests = {
+            type = "app";
+            program = "${artifacts.podmanE2eCiTests}/bin/generate-podman-e2e-ci-tests";
+          };
+          build-artifacts-helm = {
+            type = "app";
+            program = "${artifacts.helm}/bin/build-artifacts-helm";
+          };
+          build-artifacts-images = {
+            type = "app";
+            program = "${artifacts.images}/bin/build-artifacts-images";
+          };
+          test-guest = testGuest.app;
+          test-guest-cache = testGuest.cacheApp;
+        };
 
-        packages.vm-runtime = vmRuntime;
+        packages = {
+          vm-runtime = vmRuntime;
+          tmachine = testMachines.package;
+          tmachine-config = testMachines.config;
+          tmachine-unwrapped = testMachines.unwrapped;
+        };
 
-        devShells.default = pkgs.mkShellNoCC {
-          packages = [ rustToolchain ] ++ commonDevShellPackages;
+        devShells = {
+          default = pkgs.mkShellNoCC commonDevShell;
 
-          env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+          testing = pkgs.mkShellNoCC (
+            commonDevShell
+            // {
+              packages = commonDevShell.packages ++ [
+                pkgs.ansible
+                pkgs.skopeo
+                pkgs.sshpass
+                testMachines.package
+              ];
+
+              shellHook = ''
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+              '';
+            }
+          );
         };
 
         formatter = treefmtEval.config.build.wrapper;

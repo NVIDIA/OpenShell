@@ -130,7 +130,7 @@ func TestTCPForward_InitFrame(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, init)
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId())
+	assert.Equal(t, "my-sandbox", init.GetSandbox())
 	assert.Empty(t, init.GetServiceId(), "service_id should be empty per FR-007a")
 	assert.Empty(t, init.GetAuthorizationToken())
 
@@ -336,7 +336,7 @@ func TestTCPForward_WithServiceID(t *testing.T) {
 
 	require.NotNil(t, init)
 	assert.Equal(t, "audit-svc", init.GetServiceId())
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId())
+	assert.Equal(t, "my-sandbox", init.GetSandbox())
 }
 
 func TestTCPForward_WithoutOptions_BackwardCompat(t *testing.T) {
@@ -393,7 +393,7 @@ func TestTCPForward_ServerError(t *testing.T) {
 
 // --- Name-to-ID resolution tests ---
 
-func TestTCPForward_ResolvesNameToID(t *testing.T) {
+func TestTCPForward_UsesName(t *testing.T) {
 	mock := newMockTCPServer()
 	client, cleanup := setupTCPTest(t, mock)
 	defer cleanup()
@@ -416,7 +416,7 @@ func TestTCPForward_ResolvesNameToID(t *testing.T) {
 
 	require.NotNil(t, init)
 	// stubSandboxResolver returns ID "sb-<name>" — verify the proto has the resolved ID, not the name
-	assert.Equal(t, "sb-my-sandbox", init.GetSandboxId(), "Forward should send resolved sandbox ID, not the name")
+	assert.Equal(t, "my-sandbox", init.GetSandbox())
 }
 
 func TestTCPForward_ResolutionError(t *testing.T) {
@@ -784,8 +784,8 @@ func (m *mockSSHClient) CreateSession(_ context.Context, _, _ string) (*SSHSessi
 	return nil, fmt.Errorf("not implemented in mock")
 }
 
-func (m *mockSSHClient) RevokeSession(_ context.Context, _, _ string) (bool, error) {
-	return false, fmt.Errorf("not implemented in mock")
+func (m *mockSSHClient) RevokeSession(_ context.Context, _, _ string, _ ...DeleteOptions) (*DeletionResult, error) {
+	return nil, fmt.Errorf("not implemented in mock")
 }
 
 // Tunnel returns a pipe that echoes data back, and increments the call counter.
@@ -1002,7 +1002,7 @@ func (r *flippableResolver) List(string, ...ListOptions) (*Pager[*Sandbox], erro
 func (r *flippableResolver) ListAll(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
 	panic("not implemented")
 }
-func (r *flippableResolver) Delete(context.Context, string, string) error {
+func (r *flippableResolver) Delete(context.Context, string, string, ...DeleteOptions) (*DeletionResult, error) {
 	panic("not implemented")
 }
 func (r *flippableResolver) AttachProvider(context.Context, string, string, string, uint64) (*AttachProviderResult, error) {
@@ -1011,7 +1011,10 @@ func (r *flippableResolver) AttachProvider(context.Context, string, string, stri
 func (r *flippableResolver) DetachProvider(context.Context, string, string, string, uint64) (*DetachProviderResult, error) {
 	panic("not implemented")
 }
-func (r *flippableResolver) ListProviders(context.Context, string, string) ([]*Provider, error) {
+func (r *flippableResolver) ListProviders(string, string, ...ListOptions) (*Pager[*Provider], error) {
+	panic("not implemented")
+}
+func (r *flippableResolver) ListAllProviders(context.Context, string, string, ...ListOptions) ([]*Provider, error) {
 	panic("not implemented")
 }
 func (r *flippableResolver) WaitReady(context.Context, string, string, ...WaitOptions) (*Sandbox, error) {

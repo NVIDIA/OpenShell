@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -19,7 +20,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func testTimestamp(milliseconds int64) *timestamppb.Timestamp {
+	return timestamppb.New(time.UnixMilli(milliseconds))
+}
 
 // --- Mock server for Policy RPCs ---
 
@@ -206,7 +212,7 @@ func TestPolicyGetDraft(t *testing.T) {
 				Rationale:        "DNS access needed",
 				Confidence:       0.95,
 				DenialSummaryIds: []string{"ds-1", "ds-2"},
-				CreatedAtMs:      1700000000000,
+				CreatedTime:      testTimestamp(1700000000000),
 				Stage:            "initial",
 				HitCount:         3,
 				Binary:           "/usr/bin/curl",
@@ -222,7 +228,7 @@ func TestPolicyGetDraft(t *testing.T) {
 		},
 		RollingSummary:   "Two rules proposed",
 		DraftVersion:     5,
-		LastAnalyzedAtMs: 1700000001000,
+		LastAnalyzedTime: testTimestamp(1700000001000),
 	}
 
 	client, cleanup := setupPolicyTest(t, mock)
@@ -235,7 +241,7 @@ func TestPolicyGetDraft(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastGetDraftReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastGetDraftReq.GetSandbox())
 	assert.Empty(t, mock.lastGetDraftReq.GetStatusFilter())
 	mock.mu.Unlock()
 
@@ -321,7 +327,7 @@ func TestPolicyApproveDraftChunk(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastApproveReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastApproveReq.GetSandbox())
 	assert.Equal(t, "chunk-1", mock.lastApproveReq.GetChunkId())
 	assert.Equal(t, "token-1", mock.lastApproveReq.GetReviewToken())
 	mock.mu.Unlock()
@@ -358,7 +364,7 @@ func TestPolicyRejectDraftChunk(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastRejectReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastRejectReq.GetSandbox())
 	assert.Equal(t, "chunk-2", mock.lastRejectReq.GetChunkId())
 	assert.Equal(t, "too broad", mock.lastRejectReq.GetReason())
 	mock.mu.Unlock()
@@ -400,7 +406,7 @@ func TestPolicyApproveAllDraftChunks(t *testing.T) {
 
 	// Verify default: security-flagged NOT included.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastApproveAllReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastApproveAllReq.GetSandbox())
 	assert.False(t, mock.lastApproveAllReq.GetIncludeSecurityFlagged())
 	mock.mu.Unlock()
 
@@ -466,7 +472,7 @@ func TestPolicyClearDraftChunks(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastClearReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastClearReq.GetSandbox())
 	mock.mu.Unlock()
 
 	assert.Equal(t, uint32(4), result.ChunksCleared)
@@ -493,13 +499,13 @@ func TestPolicyGetDraftHistory(t *testing.T) {
 	mock.historyResp = &pb.GetDraftHistoryResponse{
 		Entries: []*pb.DraftHistoryEntry{
 			{
-				TimestampMs: 1700000000000,
+				EventTime:   testTimestamp(1700000000000),
 				EventType:   "approved",
 				Description: "Chunk chunk-1 approved",
 				ChunkId:     "chunk-1",
 			},
 			{
-				TimestampMs: 1700000001000,
+				EventTime:   testTimestamp(1700000001000),
 				EventType:   "rejected",
 				Description: "Chunk chunk-2 rejected: too broad",
 				ChunkId:     "chunk-2",
@@ -517,7 +523,7 @@ func TestPolicyGetDraftHistory(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastHistoryReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastHistoryReq.GetSandbox())
 	mock.mu.Unlock()
 
 	assert.Equal(t, "approved", entries[0].EventType)
@@ -567,8 +573,8 @@ func TestPolicyGetStatus(t *testing.T) {
 			Version:     3,
 			PolicyHash:  "sha256:rev3",
 			Status:      pb.PolicyStatus_POLICY_STATUS_LOADED,
-			CreatedAtMs: 1700000000000,
-			LoadedAtMs:  1700000001000,
+			CreatedTime: testTimestamp(1700000000000),
+			LoadedTime:  testTimestamp(1700000001000),
 		},
 		ActiveVersion: 3,
 	}
@@ -583,7 +589,7 @@ func TestPolicyGetStatus(t *testing.T) {
 
 	// Verify request was forwarded (no version = latest).
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetSandbox())
 	assert.Equal(t, uint32(0), mock.lastStatusReq.GetVersion())
 	mock.mu.Unlock()
 
@@ -649,8 +655,7 @@ func TestPolicyGetStatus_WithGlobal(t *testing.T) {
 	// Verify global flag was forwarded in the proto request.
 	mock.mu.Lock()
 	assert.True(t, mock.lastStatusReq.GetGlobal())
-	assert.Empty(t, mock.lastStatusReq.GetName())
-	assert.Nil(t, mock.lastStatusReq.GetWorkspaceScope())
+	assert.Empty(t, mock.lastStatusReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -675,8 +680,7 @@ func TestPolicyGetStatus_WithGlobalIgnoresNonEmptyName(t *testing.T) {
 
 	mock.mu.Lock()
 	assert.True(t, mock.lastStatusReq.GetGlobal())
-	assert.Equal(t, "some-sandbox", mock.lastStatusReq.GetName())
-	assert.Nil(t, mock.lastStatusReq.GetWorkspaceScope())
+	assert.Empty(t, mock.lastStatusReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -732,7 +736,7 @@ func TestPolicyGetStatus_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	mock.mu.Lock()
 	assert.False(t, mock.lastStatusReq.GetGlobal())
 	assert.Equal(t, "default", mock.lastStatusReq.GetWorkspaceScope().GetWorkspace())
-	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -758,14 +762,14 @@ func TestPolicyList(t *testing.T) {
 				Version:     1,
 				PolicyHash:  "sha256:v1",
 				Status:      pb.PolicyStatus_POLICY_STATUS_SUPERSEDED,
-				CreatedAtMs: 1700000000000,
+				CreatedTime: testTimestamp(1700000000000),
 			},
 			{
 				Version:     2,
 				PolicyHash:  "sha256:v2",
 				Status:      pb.PolicyStatus_POLICY_STATUS_LOADED,
-				CreatedAtMs: 1700000001000,
-				LoadedAtMs:  1700000002000,
+				CreatedTime: testTimestamp(1700000001000),
+				LoadedTime:  testTimestamp(1700000002000),
 			},
 		},
 	}
@@ -773,15 +777,15 @@ func TestPolicyList(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
+	revisions, err := client.ListAll(context.Background(), "default", "my-sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 2)
 
 	// Verify request was forwarded (no pagination options).
 	mock.mu.Lock()
+	assert.Equal(t, "my-sandbox", mock.lastListReq.GetSandbox())
 	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
-	assert.Equal(t, "sandbox", mock.lastListReq.GetName())
 	assert.Equal(t, int32(0), mock.lastListReq.GetPageSize())
 	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
@@ -806,7 +810,7 @@ func TestPolicyList_WithPageSize(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.ListAll(context.Background(), "default", "sandbox",
+	revisions, err := client.ListAll(context.Background(), "default", "my-sandbox",
 		types.WithPageSize(10),
 	)
 
@@ -827,7 +831,7 @@ func TestPolicyList_Empty(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
+	revisions, err := client.ListAll(context.Background(), "default", "my-sandbox")
 
 	require.NoError(t, err)
 	assert.NotNil(t, revisions)
@@ -856,7 +860,7 @@ func TestPolicyList_WithGlobal(t *testing.T) {
 	// Verify global flag was forwarded in the proto request.
 	mock.mu.Lock()
 	assert.True(t, mock.lastListReq.GetGlobal())
-	assert.Nil(t, mock.lastListReq.GetWorkspaceScope())
+	assert.Empty(t, mock.lastListReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -878,7 +882,7 @@ func TestPolicyList_WithGlobalIgnoresWorkspace(t *testing.T) {
 
 	mock.mu.Lock()
 	assert.True(t, mock.lastListReq.GetGlobal())
-	assert.Nil(t, mock.lastListReq.GetWorkspaceScope())
+	assert.Empty(t, mock.lastListReq.GetSandbox())
 	mock.mu.Unlock()
 }
 
@@ -920,7 +924,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
+	revisions, err := client.ListAll(context.Background(), "default", "my-sandbox")
 
 	require.NoError(t, err)
 	require.Len(t, revisions, 1)
@@ -928,6 +932,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	// Verify global flag is false by default.
 	mock.mu.Lock()
 	assert.False(t, mock.lastListReq.GetGlobal())
+	assert.Equal(t, "my-sandbox", mock.lastListReq.GetSandbox())
 	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
 	mock.mu.Unlock()
 }
@@ -939,7 +944,7 @@ func TestPolicyList_Error(t *testing.T) {
 	client, cleanup := setupPolicyTest(t, mock)
 	defer cleanup()
 
-	revisions, err := client.ListAll(context.Background(), "default", "sandbox")
+	revisions, err := client.ListAll(context.Background(), "default", "my-sandbox")
 
 	assert.Nil(t, revisions)
 	require.Error(t, err)
@@ -966,7 +971,7 @@ func TestPolicyEditDraftChunk(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastEditReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastEditReq.GetSandbox())
 	assert.Equal(t, "chunk-1", mock.lastEditReq.GetChunkId())
 	require.NotNil(t, mock.lastEditReq.GetProposedRule())
 	assert.Equal(t, "allow-https", mock.lastEditReq.GetProposedRule().GetName())
@@ -1005,7 +1010,7 @@ func TestPolicyUndoDraftChunk(t *testing.T) {
 
 	// Verify request was forwarded.
 	mock.mu.Lock()
-	assert.Equal(t, "my-sandbox", mock.lastUndoReq.GetName())
+	assert.Equal(t, "my-sandbox", mock.lastUndoReq.GetSandbox())
 	assert.Equal(t, "chunk-3", mock.lastUndoReq.GetChunkId())
 	mock.mu.Unlock()
 

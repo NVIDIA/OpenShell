@@ -66,10 +66,9 @@ On first start, the gateway automatically generates:
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 
 > **Note:** The primary gateway listener uses the loopback default,
-> `127.0.0.1:17670`. The Podman driver requests a separate callback listener
-> scoped to the interface its sandboxes can reach. Mutual TLS (mTLS) is
-> enabled automatically on first start, requiring a valid client certificate
-> for every connection. See CONFIGURATION.md for details.
+> `127.0.0.1:17670`. Host-networked Podman supervisors use this same listener.
+> mTLS user authentication is enabled automatically on first start.
+> Supervisor connections use the gateway CA and sandbox-scoped bearer tokens. See CONFIGURATION.md for details.
 
 Verify the service is running:
 

@@ -6,15 +6,16 @@
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
+use crate::layer_applier::apply_layer_dir_to_rootfs;
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
-    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
-    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
+    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
+    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
     validate_host_supervisor, write_rootfs_image_file,
 };
@@ -49,8 +50,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
@@ -77,6 +77,8 @@ use std::future::Future;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -155,10 +157,6 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 #[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 #[allow(dead_code)]
-const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
-#[allow(dead_code)]
-const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
-#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
@@ -198,19 +196,21 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v4";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v5";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
+const IMAGE_PREP_CONSOLE_LOG: &str = "image-prep-console.log";
+/// Directory the guest image-prep init writes at the root of the prepared disk
+/// once preparation succeeds (`image_root` in `openshell-vm-sandbox-init.sh`).
+const PREPARED_IMAGE_ROOTFS_DIR: &str = "/image-rootfs";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +243,12 @@ enum GuestImagePayloadSource {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmDriverConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    #[serde(default)]
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    #[serde(default)]
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
@@ -360,6 +366,9 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
             default_image: String::new(),
@@ -419,6 +428,16 @@ impl VmDriverConfig {
         Ok(())
     }
 
+    pub fn validate_bootstrap_image_config(&self) -> Result<(), String> {
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(
+                "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_rootfs_tar_config(&self) -> Result<(), String> {
         if self
             .rootfs_tar_staging_dir
@@ -472,15 +491,16 @@ impl VmDriverConfig {
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
-        let provided = [
-            self.guest_tls_ca.as_ref(),
-            self.guest_tls_cert.as_ref(),
-            self.guest_tls_key.as_ref(),
-        ];
-        if provided.iter().all(Option::is_none) {
+        if self.guest_tls_cert.is_some() || self.guest_tls_key.is_some() {
+            return Err(
+                "sandbox client certificates are no longer supported; remove OPENSHELL_VM_TLS_CERT and OPENSHELL_VM_TLS_KEY"
+                    .to_string(),
+            );
+        }
+        if self.guest_tls_ca.is_none() {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA so the host supervisor can authenticate the gateway"
                         .to_string(),
                 )
             } else {
@@ -493,18 +513,7 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.guest_tls_cert.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
-            );
-        };
-        let Some(key) = self.guest_tls_key.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
-            );
-        };
-
-        for path in [&ca, &cert, &key] {
+        for path in [&ca] {
             if !path.is_file() {
                 return Err(format!(
                     "TLS material '{}' does not exist or is not a file",
@@ -513,7 +522,7 @@ impl VmDriverConfig {
             }
         }
 
-        Ok(Some(VmDriverTlsPaths { ca, cert, key }))
+        Ok(Some(VmDriverTlsPaths { ca }))
     }
 }
 
@@ -573,6 +582,35 @@ struct SandboxRecord {
     deleting: bool,
 }
 
+/// Resolve a lifecycle request to a registry key.
+///
+/// A non-empty `sandbox_id` is authoritative: resolution uses that id alone and
+/// never falls back to the name, so a request for an already-removed sandbox
+/// reports absence instead of matching a same-named sandbox in another
+/// workspace. Only a caller that supplies no id resolves by name, and because
+/// sandbox names are unique per workspace rather than globally, a name matching
+/// more than one record is rejected instead of decided by iteration order.
+fn resolve_record_id(
+    registry: &HashMap<String, SandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(registry.get_key_value(sandbox_id).map(|(id, _)| id.clone()));
+    }
+
+    let mut matches = registry
+        .iter()
+        .filter(|(_, record)| record.snapshot.name == sandbox_name);
+    let first = matches.next().map(|(id, _)| id.clone());
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(format!(
+            "sandbox_name {sandbox_name} matched more than one sandbox; supply sandbox_id"
+        )));
+    }
+    Ok(first)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayPreparation {
     Fresh,
@@ -622,6 +660,8 @@ fn provisioning_span(
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
+    socket_root: PathBuf,
+    socket_root_fd: Arc<OwnedFd>,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     image_cache_lock: Arc<Mutex<()>>,
@@ -639,11 +679,13 @@ impl VmDriver {
         mut config: VmDriverConfig,
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
+        config.resource_admission.validate()?;
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
@@ -665,7 +707,7 @@ impl VmDriver {
             )
         })?;
         let image_cache_root = image_cache_root_dir(&config.state_dir);
-        tokio::fs::create_dir_all(&image_cache_root)
+        create_private_dir_all(&image_cache_root)
             .await
             .map_err(|err| {
                 format!(
@@ -700,9 +742,14 @@ impl VmDriver {
             None
         };
 
+        let (socket_root, socket_root_fd) = allocate_socket_root()
+            .map_err(|err| format!("failed to allocate socket root in /tmp: {err}"))?;
+
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let driver = Self {
             config,
+            socket_root,
+            socket_root_fd: Arc::new(socket_root_fd),
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -889,7 +936,7 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                state_dir.join("ssh.sock"),
+                sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
             )
             .env(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -920,10 +967,7 @@ impl VmDriver {
         }
         configure_main_exit_marker(&mut command, state_dir);
         if let Some(tls) = tls_paths {
-            command
-                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
-                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
-                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+            command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
         #[cfg(unix)]
         let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
@@ -978,6 +1022,11 @@ impl VmDriver {
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
+            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: self.config.allow_driver_config,
+                resource_admission: self.config.resource_admission.clone(),
+            }
+            .acknowledgement(),
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
@@ -1002,6 +1051,12 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+                "openshell/vm",
+                openshell_core::VERSION,
+                [],
+            )),
         }
     }
 
@@ -1009,6 +1064,10 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )?;
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
         let has_rootfs_tar =
             VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
@@ -1024,6 +1083,7 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
+        self.validate_sandbox(sandbox)?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1087,10 +1147,20 @@ impl VmDriver {
             return Err(Status::internal(format!("create state dir failed: {err}")));
         }
 
+        if let Err(err) =
+            create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+        {
+            let mut registry = self.registry.lock().await;
+            registry.remove(&sandbox.id);
+            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            return Err(Status::internal(format!("create socket dir failed: {err}")));
+        }
+
         if let Err(err) = self.ensure_extension_state_dirs(&state_dir).await {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
             return Err(err);
         }
 
@@ -1098,6 +1168,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
             return Err(Status::internal(format!(
                 "write sandbox start metadata failed: {err}"
             )));
@@ -1146,7 +1217,7 @@ impl VmDriver {
             task.abort();
         }
 
-        Ok(CreateSandboxResponse {})
+        Ok(CreateSandboxResponse::default())
     }
 
     async fn provision_sandbox(
@@ -1173,6 +1244,7 @@ impl VmDriver {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 }
+                remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox_id);
                 return;
             }
 
@@ -1237,7 +1309,7 @@ impl VmDriver {
                         "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
                     ))
                 })?;
-            let bootstrap_image_ref = self.bootstrap_image_ref(&image_ref);
+            let bootstrap_image_ref = self.bootstrap_image_ref()?;
             let bootstrap_image_identity = self
                 .ensure_cached_bootstrap_rootfs_image(&sandbox.id, &bootstrap_image_ref)
                 .await?;
@@ -1444,7 +1516,10 @@ impl VmDriver {
         }
 
         let console_output = state_dir.join("rootfs-console.log");
-        let control_socket = state_dir.join(VM_CONTROL_SOCKET);
+        create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+            .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?;
+        let control_socket =
+            sandbox_socket_dir(&self.socket_root, &sandbox.id).join(VM_CONTROL_SOCKET);
         let session_id = launch_authentication.supervisor.session_id;
         let channel_tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1499,6 +1574,7 @@ impl VmDriver {
             agent_uid: sandbox_owner_state.uid,
             agent_gid: sandbox_owner_state.gid,
             child_env: merged_environment(&sandbox),
+            gpu_requested: is_gpu,
         }
         .provision()
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -1698,14 +1774,7 @@ impl VmDriver {
         }
         let record_id = {
             let registry = self.registry.lock().await;
-            if registry.contains_key(sandbox_id) {
-                Some(sandbox_id.to_string())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_record_id(&registry, sandbox_id, sandbox_name)?
         }
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -1790,16 +1859,13 @@ impl VmDriver {
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let (record_id, state_dir, already_running) = {
             let registry = self.registry.lock().await;
-            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
-                entry
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?
-            };
+            let id = resolve_record_id(&registry, sandbox_id, sandbox_name)?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let record = registry
+                .get(&id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
             (
-                id.clone(),
+                id,
                 record.state_dir.clone(),
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
@@ -1822,6 +1888,14 @@ impl VmDriver {
             if launch_authentication.is_empty() {
                 return Ok(());
             }
+        }
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+            })?;
+        self.validate_sandbox(&sandbox)?;
+        if already_running {
             // The gateway keeps launch sessions in memory. A non-empty bundle
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
@@ -1842,11 +1916,6 @@ impl VmDriver {
         )
         .await
         .map_err(|error| Status::internal(format!("persist VM start generation: {error}")))?;
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
-            .map_err(|err| {
-                Status::internal(format!("read sandbox start metadata failed: {err}"))
-            })?;
         let authentication = serde_json::from_slice::<
             openshell_core::jwt::SandboxLaunchAuthentication,
         >(&launch_authentication)
@@ -1912,14 +1981,7 @@ impl VmDriver {
 
         let record_id = {
             let registry = self.registry.lock().await;
-            if let Some((id, _record)) = registry.get_key_value(sandbox_id) {
-                Some(id.clone())
-            } else {
-                registry
-                    .iter()
-                    .find(|(_, record)| record.snapshot.name == sandbox_name)
-                    .map(|(id, _)| id.clone())
-            }
+            resolve_record_id(&registry, sandbox_id, sandbox_name)?
         };
 
         let Some(record_id) = record_id else {
@@ -1969,6 +2031,7 @@ impl VmDriver {
         }
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
+        remove_sandbox_socket_dir(&self.socket_root_fd, &record_id);
 
         {
             let mut registry = self.registry.lock().await;
@@ -2156,6 +2219,10 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
+        if let Err(error) = self.validate_sandbox(&sandbox) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
+            return false;
+        }
         let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
             .is_ok_and(|c| c.rootfs_tar_path.is_some());
 
@@ -2229,21 +2296,15 @@ impl VmDriver {
             );
         }
 
-        if clear_stop_marker {
-            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    self.registry.lock().await.remove(&sandbox.id);
-                    warn!(
-                        sandbox_id = %sandbox.id,
-                        state_dir = %state_dir.display(),
-                        error = %err,
-                        "vm driver: cannot clear stop marker for persisted sandbox restore"
-                    );
-                    return false;
-                }
-            }
+        if clear_stop_marker && let Err(err) = clear_explicit_start_markers(&state_dir).await {
+            self.registry.lock().await.remove(&sandbox.id);
+            warn!(
+                sandbox_id = %sandbox.id,
+                state_dir = %state_dir.display(),
+                error = %err,
+                "vm driver: cannot clear lifecycle markers for persisted sandbox restore"
+            );
+            return false;
         }
 
         self.publish_platform_event(
@@ -2296,6 +2357,12 @@ impl VmDriver {
             task.abort();
         }
         true
+    }
+
+    /// Best-effort removal of the per-driver socket root. VM children are
+    /// `kill_on_drop`, so no socket is live once the server has stopped.
+    pub fn remove_socket_root(&self) {
+        let _ = fs::remove_dir_all(&self.socket_root);
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -2590,6 +2657,7 @@ impl VmDriver {
 
         if remove_state {
             let _ = tokio::fs::remove_dir_all(state_dir).await;
+            remove_sandbox_socket_dir(&self.socket_root_fd, sandbox_id);
         }
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -2622,7 +2690,7 @@ impl VmDriver {
         rootfs_tar_path: Option<&Path>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
             .await?;
@@ -2660,9 +2728,13 @@ impl VmDriver {
         }))
     }
 
-    fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+    fn bootstrap_image_ref(&self) -> Result<String, Status> {
         self.bootstrap_image_ref_default()
-            .unwrap_or_else(|| sandbox_image_ref.to_string())
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image",
+                )
+            })
     }
 
     fn bootstrap_image_ref_default(&self) -> Option<String> {
@@ -3581,6 +3653,33 @@ impl VmDriver {
             return Err(err);
         }
 
+        // The prep VM exits successfully even when guest init fails, so check
+        // the disk itself. Caching a disk without the rootfs would break every
+        // later sandbox that uses this image.
+        let prepared_image_for_check = prepared_image.clone();
+        let has_rootfs = tokio::task::spawn_blocking(move || {
+            ext4_image_has_directory(&prepared_image_for_check, PREPARED_IMAGE_ROOTFS_DIR)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("prepared image validation panicked: {err}")))?;
+        if !matches!(has_rootfs, Ok(true)) {
+            let mut message = format!(
+                "image-prep for \"{image_ref}\" did not produce {PREPARED_IMAGE_ROOTFS_DIR}"
+            );
+            if let Err(err) = &has_rootfs {
+                write!(message, ": {err}").expect("writing to String cannot fail");
+            }
+            if let Some(console) = read_vm_console_tail(
+                &staging_dir.join(IMAGE_PREP_CONSOLE_LOG),
+                VM_CONSOLE_DIAGNOSTIC_BYTES,
+            ) {
+                write!(message, "; guest console tail:\n{console}")
+                    .expect("writing to String cannot fail");
+            }
+            let _ = tokio::fs::remove_dir_all(staging_dir).await;
+            return Err(Status::failed_precondition(message));
+        }
+
         if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(staging_dir).await;
             return Ok(());
@@ -3599,7 +3698,7 @@ impl VmDriver {
         prep_disk: &Path,
         run_dir: &Path,
     ) -> Result<(), Status> {
-        let console_output = run_dir.join("image-prep-console.log");
+        let console_output = run_dir.join(IMAGE_PREP_CONSOLE_LOG);
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
@@ -4237,18 +4336,17 @@ impl ComputeDriver for VmDriver {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        Ok(Response::new(self.capabilities()))
-    }
-
-    async fn get_gateway_listener_requirements(
-        &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements: Vec::new(),
-        }))
+        let capabilities = self.capabilities();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            DRIVER_NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn validate_sandbox_create(
@@ -4280,14 +4378,14 @@ impl ComputeDriver for VmDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_id.is_empty() && request.sandbox_name.is_empty() {
+        if request.sandbox_id.is_empty() && request.name.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox_id or sandbox_name is required",
             ));
         }
 
         let sandbox = self
-            .get_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .get_sandbox(&request.sandbox_id, &request.name)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -4316,7 +4414,7 @@ impl ComputeDriver for VmDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+        self.stop_sandbox(&request.sandbox_id, &request.name)
             .await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
@@ -4328,12 +4426,12 @@ impl ComputeDriver for VmDriver {
         let request = request.into_inner();
         self.start_sandbox(
             &request.sandbox_id,
-            &request.sandbox_name,
+            &request.name,
             &request.generation_id,
             request.launch_authentication,
         )
         .await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(
@@ -4342,7 +4440,7 @@ impl ComputeDriver for VmDriver {
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
         let response = self
-            .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .delete_sandbox(&request.sandbox_id, &request.name)
             .await?;
         Ok(Response::new(response))
     }
@@ -5385,142 +5483,6 @@ fn layer_compression_from_media_type(media_type: &str) -> Result<LayerCompressio
     Err(format!("unsupported layer media type '{media_type}'"))
 }
 
-fn apply_layer_dir_to_rootfs(layer_root: &Path, rootfs: &Path) -> Result<(), String> {
-    merge_layer_directory(layer_root, rootfs)
-}
-
-fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(target_dir)
-        .map_err(|err| format!("create {}: {err}", target_dir.display()))?;
-
-    let mut entries = fs::read_dir(source_dir)
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-
-    if entries
-        .iter()
-        .any(|entry| entry.file_name().to_string_lossy() == ".wh..wh..opq")
-    {
-        clear_directory_contents(target_dir)?;
-    }
-
-    for entry in entries {
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if name == ".wh..wh..opq" {
-            continue;
-        }
-        if let Some(hidden_name) = name.strip_prefix(".wh.") {
-            remove_path_if_exists(&target_dir.join(hidden_name))?;
-            continue;
-        }
-
-        let source_path = entry.path();
-        let dest_path = target_dir.join(&file_name);
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            if let Ok(dest_metadata) = fs::symlink_metadata(&dest_path)
-                && !dest_metadata.file_type().is_dir()
-                && !path_is_dir_or_symlink_to_dir(&dest_path)?
-            {
-                remove_path_if_exists(&dest_path)?;
-            }
-            fs::create_dir_all(&dest_path)
-                .map_err(|err| format!("create {}: {err}", dest_path.display()))?;
-            merge_layer_directory(&source_path, &dest_path)?;
-            if fs::symlink_metadata(&dest_path)
-                .map_err(|err| format!("stat {}: {err}", dest_path.display()))?
-                .file_type()
-                .is_dir()
-            {
-                fs::set_permissions(&dest_path, metadata.permissions())
-                    .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-            }
-        } else if file_type.is_file() {
-            remove_path_if_exists(&dest_path)?;
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("create {}: {err}", parent.display()))?;
-            }
-            fs::copy(&source_path, &dest_path).map_err(|err| {
-                format!(
-                    "copy {} to {}: {err}",
-                    source_path.display(),
-                    dest_path.display()
-                )
-            })?;
-            fs::set_permissions(&dest_path, metadata.permissions())
-                .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source_path, &dest_path)?;
-        } else {
-            return Err(format!(
-                "unsupported layer entry type at {}",
-                source_path.display()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn path_is_dir_or_symlink_to_dir(path: &Path) -> Result<bool, String> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("stat {}: {err}", path.display())),
-    }
-}
-
-fn clear_directory_contents(dir: &Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir).map_err(|err| format!("read {}: {err}", dir.display()))? {
-        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
-        remove_path_if_exists(&entry.path())?;
-    }
-    Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    } else {
-        fs::remove_file(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    }
-}
-
-#[cfg(unix)]
-fn copy_symlink(source_path: &Path, dest_path: &Path) -> Result<(), String> {
-    let target = fs::read_link(source_path)
-        .map_err(|err| format!("readlink {}: {err}", source_path.display()))?;
-    remove_path_if_exists(dest_path)?;
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
-    }
-    std::os::unix::fs::symlink(&target, dest_path).map_err(|err| {
-        format!(
-            "symlink {} to {}: {err}",
-            target.display(),
-            dest_path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn copy_symlink(_source_path: &Path, _dest_path: &Path) -> Result<(), String> {
-    Err("symlink layers are only supported on Unix hosts".to_string())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayerCompression {
     None,
@@ -5609,6 +5571,88 @@ async fn restrict_owner_only_dir(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(not(unix))]
 async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
+/// macOS `sun_path` is 104 bytes including the NUL terminator.
+const MAX_SUN_PATH_LEN: usize = 103;
+
+fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
+    socket_root.join(sandbox_id)
+}
+
+fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
+    let uid = rustix::process::geteuid().as_raw();
+    allocate_socket_root_with(Path::new("/tmp"), || {
+        let random: u128 = rand::random();
+        format!("os-{uid}-{random:032x}")
+    })
+}
+
+fn allocate_socket_root_with(
+    base: &Path,
+    mut gen_name: impl FnMut() -> String,
+) -> Result<(PathBuf, OwnedFd), std::io::Error> {
+    for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
+        let root = base.join(gen_name());
+        match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
+            Ok(()) => {
+                let fd = rustix::fs::open(
+                    &root,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                return Ok((root, fd));
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate socket root under {} after {SOCKET_ROOT_ALLOC_RETRIES} attempts",
+            base.display()
+        ),
+    ))
+}
+
+fn create_sandbox_socket_dir(
+    root_fd: &OwnedFd,
+    socket_root: &Path,
+    sandbox_id: &str,
+) -> Result<PathBuf, std::io::Error> {
+    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
+    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
+                longest.display()
+            ),
+        ));
+    }
+    match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(socket_root.join(sandbox_id))
+}
+
+fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
+    if let Ok(leaf_fd) = rustix::fs::openat(
+        root_fd,
+        sandbox_id,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        let _ = rustix::fs::unlinkat(&leaf_fd, VM_CONTROL_SOCKET, rustix::fs::AtFlags::empty());
+        let _ = rustix::fs::unlinkat(&leaf_fd, "ssh.sock", rustix::fs::AtFlags::empty());
+    }
+    let _ = rustix::fs::unlinkat(root_fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
 }
 
 #[allow(clippy::result_large_err)]
@@ -6145,6 +6189,19 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
+async fn clear_explicit_start_markers(state_dir: &Path) -> Result<(), std::io::Error> {
+    // Remove the terminal marker first. If clearing the durable stop marker
+    // fails, the sandbox remains stopped and a later start can safely retry.
+    for marker in [MAIN_PROCESS_EXITED_FILE, SANDBOX_STOPPED_FILE] {
+        match tokio::fs::remove_file(state_dir.join(marker)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn restrict_owner_read_write(path: &Path) -> Result<(), std::io::Error> {
     tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await
@@ -6618,9 +6675,12 @@ fn prepared_image_disk_size_bytes(
             .map_err(|err| format!("stat {}: {err}", rootfs_archive.display()))?
             .len(),
     };
+    // The payload and the unpacked rootfs coexist until the guest deletes the
+    // payload, and compressed layers commonly expand 2.5-3x. The disk file is
+    // sparse, so extra headroom costs no host disk space.
     let requested = payload_size
-        .saturating_mul(3)
-        .saturating_add(512 * 1024 * 1024);
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024 * 1024);
     Ok(minimum_size_bytes.max(requested))
 }
 
@@ -6724,7 +6784,7 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
         namespace: sandbox.namespace.clone(),
         workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
-            sandbox_name: sandbox.name.clone(),
+            name: sandbox.name.clone(),
             instance_id: String::new(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -6742,7 +6802,7 @@ fn status_with_condition(
     deleting: bool,
 ) -> SandboxStatus {
     SandboxStatus {
-        sandbox_name: snapshot.name.clone(),
+        name: snapshot.name.clone(),
         instance_id: String::new(),
         agent_fd: String::new(),
         sandbox_fd: String::new(),
@@ -6758,7 +6818,7 @@ fn provisioning_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Starting".to_string(),
         message: "VM is starting".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -6768,7 +6828,7 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -6778,7 +6838,7 @@ fn stopped_condition() -> SandboxCondition {
         status: "True".to_string(),
         reason: "ComputeStopped".to_string(),
         message: "VM compute is stopped and persistent state is retained".to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -6788,13 +6848,14 @@ fn error_condition(reason: &str, message: &str) -> SandboxCondition {
         status: "False".to_string(),
         reason: reason.to_string(),
         message: message.to_string(),
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
 fn platform_event(source: &str, event_type: &str, reason: &str, message: String) -> PlatformEvent {
     let mut event = PlatformEvent {
-        timestamp_ms: openshell_core::time::now_ms(),
+        event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+            .ok(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),
@@ -6908,6 +6969,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
+
+    fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
+        let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).expect("create test socket root");
+        std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("set test socket root permissions");
+        let fd = rustix::fs::open(
+            &dir,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open test socket root");
+        (dir, Arc::new(fd))
+    }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -7140,7 +7217,11 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }))
             .await
             .unwrap();
         client.shutdown().await;
@@ -7172,7 +7253,11 @@ mod tests {
         let mut client = traced_driver_client(driver).await;
 
         client
-            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }))
             .await
             .unwrap();
         assert!(
@@ -7195,7 +7280,7 @@ mod tests {
             client
                 .get_sandbox(request_with_traceparent(GetSandboxRequest {
                     sandbox_id: String::new(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .is_err()
@@ -7208,7 +7293,7 @@ mod tests {
             client
                 .stop_sandbox(request_with_traceparent(StopSandboxRequest {
                     sandbox_id: String::new(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .is_err()
@@ -7216,7 +7301,7 @@ mod tests {
         client
             .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
                 sandbox_id: String::new(),
-                sandbox_name: String::new(),
+                name: String::new(),
             }))
             .await
             .unwrap();
@@ -7280,6 +7365,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
         let sandbox = Sandbox {
             id: "sb-spawned-trace".to_string(),
             name: "spawned-trace".to_string(),
@@ -8440,6 +8526,105 @@ mod tests {
     }
 
     #[test]
+    fn create_sandbox_socket_dir_rejects_over_long_ids() {
+        let (root, fd) = test_socket_root();
+        let err = create_sandbox_socket_dir(&fd, &root, &"x".repeat(128)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!root.join("x".repeat(128)).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandbox_socket_dir_fits_macos_sun_path() {
+        let sandbox_id = "3eb2ad45-bead-4c2e-bd10-1a4a7f3a2721";
+        let worst_root = "/tmp/os-4294967295-00000000000000000000000000000000";
+        let control = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join(VM_CONTROL_SOCKET);
+        let ssh = sandbox_socket_dir(Path::new(worst_root), sandbox_id).join("ssh.sock");
+        assert!(
+            control.as_os_str().len() < 104,
+            "control socket path exceeds macOS sun_path: {}",
+            control.display()
+        );
+        assert!(
+            ssh.as_os_str().len() < 104,
+            "ssh socket path exceeds macOS sun_path: {}",
+            ssh.display()
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_returns_distinct_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut counter = 0u64;
+        let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
+            counter += 1;
+            format!("root-{counter}")
+        })
+        .unwrap();
+        let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
+            counter += 1;
+            format!("root-{counter}")
+        })
+        .unwrap();
+        assert_ne!(
+            root_a, root_b,
+            "two allocations must produce distinct roots"
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_retries_on_occupied_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let original_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+
+        // attempt-0: symlink to victim directory
+        std::os::unix::fs::symlink(&victim, tmp.path().join("attempt-0")).unwrap();
+        // attempt-1: existing directory (simulates foreign-owned pre-creation)
+        std::fs::create_dir(tmp.path().join("attempt-1")).unwrap();
+
+        let call_count = AtomicUsize::new(0);
+        let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
+            let n = call_count.fetch_add(1, Ordering::SeqCst);
+            format!("attempt-{n}")
+        })
+        .expect("should succeed after retries");
+
+        assert_eq!(root, tmp.path().join("attempt-2"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert!(
+            tmp.path()
+                .join("attempt-0")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "pre-created symlink must not be removed"
+        );
+        assert!(
+            tmp.path().join("attempt-1").exists(),
+            "pre-created directory must not be removed"
+        );
+        let after_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            original_mode, after_mode,
+            "victim directory permissions must not change"
+        );
+    }
+
+    #[test]
+    fn allocate_socket_root_exhaustion_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+
+        let err = allocate_socket_root_with(tmp.path(), || "blocked".to_string())
+            .expect_err("should fail when all names are occupied");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn sandbox_state_dir_rejects_path_unsafe_ids() {
         let err = sandbox_state_dir(Path::new("/tmp/openshell-vm"), "../escape")
             .expect_err("path traversal should be rejected");
@@ -8522,11 +8707,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        let (old_authentication, old_session) = test_launch_authentication("old");
         let sandbox = Sandbox {
             id: "sandbox-stopped".to_string(),
             name: "stopped".to_string(),
             spec: Some(SandboxSpec {
-                launch_authentication: test_launch_authentication("old").0,
+                launch_authentication: old_authentication,
                 ..Default::default()
             }),
             ..Default::default()
@@ -8535,6 +8721,9 @@ mod tests {
         create_private_dir_all(&state_dir).await.unwrap();
         write_sandbox_request(&state_dir, &sandbox).await.unwrap();
         tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
             .await
             .unwrap();
         let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
@@ -8550,7 +8739,7 @@ mod tests {
             },
         );
 
-        let (fresh_authentication, fresh_session) = test_launch_authentication("fresh");
+        let (fresh_authentication, _) = test_launch_authentication("fresh");
         let err = driver
             .start_sandbox(
                 &sandbox.id,
@@ -8561,12 +8750,18 @@ mod tests {
             .await
             .expect_err("start without an image should fail");
 
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
             tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok(),
             "failed start must retain its durable stop marker"
+        );
+        assert!(
+            tokio::fs::metadata(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its terminal marker"
         );
         let restored = driver
             .get_sandbox(&sandbox.id, &sandbox.name)
@@ -8591,10 +8786,54 @@ mod tests {
                     .launch_authentication,
             )
             .expect("persisted launch authentication");
-        assert_eq!(
-            persisted_authentication.supervisor.session_id,
-            fresh_session
+        assert_eq!(persisted_authentication.supervisor.session_id, old_session);
+    }
+
+    #[tokio::test]
+    async fn already_running_start_noop_does_not_require_admission_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-running".to_string(),
+            name: "running".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            b"g0000000000000001\n",
+        )
+        .await
+        .unwrap();
+        let provisioning_task = tokio::spawn(std::future::pending());
+        let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir,
+                process: None,
+                provisioning_task: Some(provisioning_task),
+                gpu_bdf: None,
+                deleting: false,
+            },
         );
+
+        driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
+            .await
+            .expect("matching already-running start must remain an idempotent no-op");
+
+        let task = driver
+            .registry
+            .lock()
+            .await
+            .remove(&sandbox.id)
+            .and_then(|record| record.provisioning_task)
+            .unwrap();
+        task.abort();
     }
 
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
@@ -8628,6 +8867,32 @@ mod tests {
             serde_json::to_vec(&authentication).expect("encode launch authentication"),
             session_id,
         )
+    }
+
+    #[tokio::test]
+    async fn explicit_start_clears_stop_and_terminal_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("sandbox");
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(MAIN_PROCESS_EXITED_FILE), b"terminal\n")
+            .await
+            .unwrap();
+
+        clear_explicit_start_markers(&state_dir).await.unwrap();
+
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -8683,11 +8948,14 @@ mod tests {
 
     #[test]
     fn capabilities_report_configured_default_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:dev".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8719,11 +8987,14 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_prefers_template_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8750,11 +9021,14 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_falls_back_to_driver_default() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8778,8 +9052,11 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_returns_none_without_template_or_default() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8800,12 +9077,15 @@ mod tests {
 
     #[test]
     fn bootstrap_image_ref_prefers_explicit_bootstrap_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8815,18 +9095,21 @@ mod tests {
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox-bootstrap:latest"
         );
     }
 
     #[test]
     fn bootstrap_image_ref_falls_back_to_default_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8836,15 +9119,18 @@ mod tests {
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox:default"
         );
     }
 
     #[test]
-    fn bootstrap_image_ref_falls_back_to_requested_image() {
+    fn bootstrap_image_ref_rejects_missing_trusted_image() {
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8853,10 +9139,41 @@ mod tests {
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
-        assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
-            "ghcr.io/example/app:latest"
-        );
+        let error = driver
+            .bootstrap_image_ref()
+            .expect_err("sandbox images must not become VM bootstrap images");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox image cannot be used"));
+    }
+
+    #[tokio::test]
+    async fn vm_driver_startup_rejects_missing_trusted_bootstrap_image() {
+        let Err(error) = VmDriver::new(VmDriverConfig::default()).await else {
+            panic!("driver startup must reject an empty bootstrap configuration");
+        };
+        assert!(error.contains("sandbox image cannot be used"));
+    }
+
+    #[test]
+    fn bootstrap_image_config_requires_a_trusted_image() {
+        let error = VmDriverConfig::default()
+            .validate_bootstrap_image_config()
+            .expect_err("an empty bootstrap configuration must fail closed");
+        assert!(error.contains("sandbox image cannot be used"));
+
+        VmDriverConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmDriverConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("an explicit bootstrap image is valid");
     }
 
     #[test]
@@ -9191,6 +9508,214 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+
+        let sentinel = fs::read_to_string(outside.join("sentinel")).unwrap();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(sentinel, "unchanged");
+        assert!(
+            !payload_escaped,
+            "upper-layer payload escaped the rootfs through a lower-layer symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_whiteout_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let outside_entry = base.join("outside-entry");
+        let outside_opaque = base.join("outside-opaque");
+        fs::create_dir_all(&outside_entry).unwrap();
+        fs::create_dir_all(&outside_opaque).unwrap();
+        fs::write(outside_entry.join("victim"), "entry").unwrap();
+        fs::write(outside_opaque.join("victim"), "opaque").unwrap();
+
+        let entry_rootfs = base.join("entry-rootfs");
+        let entry_layer = base.join("entry-layer");
+        fs::create_dir_all(&entry_rootfs).unwrap();
+        fs::create_dir_all(entry_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_entry, entry_rootfs.join("escape")).unwrap();
+        fs::write(entry_layer.join("escape/.wh.victim"), "").unwrap();
+        let entry_error = apply_layer_dir_to_rootfs(&entry_layer, &entry_rootfs).err();
+
+        let opaque_rootfs = base.join("opaque-rootfs");
+        let opaque_layer = base.join("opaque-layer");
+        fs::create_dir_all(&opaque_rootfs).unwrap();
+        fs::create_dir_all(opaque_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_opaque, opaque_rootfs.join("escape")).unwrap();
+        fs::write(opaque_layer.join("escape/.wh..wh..opq"), "").unwrap();
+        let opaque_error = apply_layer_dir_to_rootfs(&opaque_layer, &opaque_rootfs).err();
+
+        let entry_remained = outside_entry.join("victim").exists();
+        let opaque_remained = outside_opaque.join("victim").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let entry_error =
+            entry_error.expect("escaping symlink should reject an individual whiteout layer");
+        let opaque_error =
+            opaque_error.expect("escaping symlink should reject an opaque whiteout layer");
+        assert!(
+            entry_error.contains("absolute symlink"),
+            "unexpected error: {entry_error}"
+        );
+        assert!(
+            opaque_error.contains("absolute symlink"),
+            "unexpected error: {opaque_error}"
+        );
+        assert!(entry_remained, "individual whiteout escaped the rootfs");
+        assert!(opaque_remained, "opaque whiteout escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_relative_symlink_escape() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink("../outside", rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("escapes rootfs"),
+            "unexpected error: {error}"
+        );
+        assert!(!payload_escaped, "relative symlink escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_directory_symlink_cycles() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("a")).unwrap();
+        fs::write(layer.join("a/payload"), "payload").unwrap();
+        std::os::unix::fs::symlink("b", rootfs.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", rootfs.join("b")).unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs)
+            .expect_err("directory symlink cycle must reject the layer");
+
+        assert!(
+            error.contains("too many symlinks"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layers_do_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        // GNU tar's legacy symlink field is limited to 100 bytes, while the
+        // macOS temporary directory path is already close to that limit.
+        let outside = Path::new("/tmp").join(format!(
+            "openshell-vm-layer-test-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_symlink(&mut lower_tar, "escape", &outside);
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        let upper_tar = tar_bytes_with_file("escape/payload", b"escaped");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        let error = apply_layer_dir_to_rootfs(&upper, &rootfs)
+            .expect_err("upper layer must not traverse the lower absolute symlink");
+
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.join("payload").exists());
+
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layer_implicit_parent_preserves_lower_directory_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut lower_tar, "usr/bin/bash", b"bash");
+        append_test_tar_symlink(&mut lower_tar, "bin", Path::new("usr/bin"));
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        // The tar contains no explicit `bin/` entry. Extraction necessarily
+        // materializes it as an implicit parent for `bin/tool`.
+        let upper_tar = tar_bytes_with_file("bin/tool", b"tool");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        apply_layer_dir_to_rootfs(&upper, &rootfs).unwrap();
+
+        assert!(
+            fs::symlink_metadata(rootfs.join("bin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "implicit upper parent must not replace the lower /bin symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("usr/bin/tool")).unwrap(),
+            "tool"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn layer_compression_from_media_type_supports_common_formats() {
         assert_eq!(
@@ -9214,8 +9739,6 @@ mod tests {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -9246,11 +9769,14 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9308,11 +9834,14 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9358,12 +9887,15 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 default_image: "ghcr.io/example/sandbox:latest".to_string(),
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9578,7 +10110,7 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v4:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-",
             openshell_core::VERSION
         )));
         assert!(identity.ends_with(":sha256:bootstrap-image"));
@@ -9757,12 +10289,15 @@ mod tests {
     /// Driver whose rootfs tar staging root is an isolated temp directory.
     fn rootfs_tar_test_driver(staging_root: &Path, max_bytes: Option<u64>) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 rootfs_tar_staging_dir: Some(staging_root.to_path_buf()),
                 rootfs_tar_max_bytes: max_bytes,
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9969,6 +10504,11 @@ mod tests {
     /// Build an uncompressed tar holding a single file.
     fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut builder, name, contents);
+        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_file(builder: &mut tar::Builder<Vec<u8>>, name: &str, contents: &[u8]) {
         let mut header = tar::Header::new_gnu();
         header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
         header.set_mode(0o644);
@@ -9976,7 +10516,18 @@ mod tests {
         builder
             .append_data(&mut header, name, contents)
             .expect("append tar entry");
-        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_symlink(builder: &mut tar::Builder<Vec<u8>>, name: &str, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(target).expect("set symlink target");
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .expect("append symlink entry");
     }
 
     fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -10078,6 +10629,7 @@ mod tests {
 
     fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let (socket_root, socket_root_fd) = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 grpc_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -10087,6 +10639,8 @@ mod tests {
                 gpu_mem_mib: 16384,
                 ..Default::default()
             },
+            socket_root,
+            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -10670,5 +11224,199 @@ mod tests {
             .unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    /// Register a stopped, process-free record whose id, name, and workspace are
+    /// set independently.
+    ///
+    /// The other test helpers reuse one string for both id and name, so a test
+    /// built on them cannot express the cross-workspace name collision that
+    /// lifecycle resolution has to tolerate.
+    async fn insert_named_record(
+        driver: &VmDriver,
+        id: &str,
+        name: &str,
+        workspace: &str,
+    ) -> PathBuf {
+        let state_dir = sandbox_state_dir(&driver.config.state_dir, id).unwrap();
+        create_private_dir_all(&state_dir).await.unwrap();
+        driver.registry.lock().await.insert(
+            id.to_string(),
+            SandboxRecord {
+                snapshot: Sandbox {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    workspace: workspace.to_string(),
+                    ..Default::default()
+                },
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        state_dir
+    }
+
+    fn resolution_test_driver(state_dir: &Path) -> VmDriver {
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver
+    }
+
+    #[tokio::test]
+    async fn stop_targets_the_requested_id_when_two_workspaces_share_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        driver
+            .stop_sandbox("vm-beta", "demo")
+            .await
+            .expect("stop by id should be accepted");
+
+        assert!(
+            beta.join(SANDBOX_STOPPED_FILE).exists(),
+            "the requested sandbox should have been stopped"
+        );
+        assert!(
+            !alpha.join(SANDBOX_STOPPED_FILE).exists(),
+            "the same-named sandbox in another workspace must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_targets_the_requested_id_when_two_workspaces_share_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        let response = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("delete by id should be accepted");
+
+        assert!(response.deleted);
+        let registry = driver.registry.lock().await;
+        assert!(!registry.contains_key("vm-beta"));
+        assert!(
+            registry.contains_key("vm-alpha"),
+            "the same-named sandbox in another workspace must survive"
+        );
+        assert!(alpha.exists(), "the surviving sandbox must keep its state");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_delete_does_not_fall_back_to_a_same_named_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        let first = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("the first delete should be accepted");
+        assert!(first.deleted);
+
+        // Delete is idempotent, so a retry carrying the same id and name is
+        // ordinary caller behavior. The id is gone from the registry by now, and
+        // resolving it by name instead would destroy the sandbox in `alpha`.
+        let second = driver
+            .delete_sandbox("vm-beta", "demo")
+            .await
+            .expect("a repeated delete should be accepted");
+
+        assert!(
+            !second.deleted,
+            "a repeated delete must report that nothing was removed"
+        );
+        assert!(
+            driver.registry.lock().await.contains_key("vm-alpha"),
+            "a repeated delete must not remove a same-named sandbox in another workspace"
+        );
+        assert!(alpha.exists(), "the surviving sandbox must keep its state");
+    }
+
+    #[tokio::test]
+    async fn stop_and_start_reject_an_absent_id_that_shares_a_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+
+        let stop_error = driver
+            .stop_sandbox("vm-absent", "demo")
+            .await
+            .expect_err("a supplied id that is not registered must not resolve by name");
+        assert_eq!(stop_error.code(), Code::NotFound);
+
+        let (start_authentication, _) = test_launch_authentication("absent");
+        let start_error = driver
+            .start_sandbox(
+                "vm-absent",
+                "demo",
+                "g0000000000000001",
+                start_authentication,
+            )
+            .await
+            .expect_err("a supplied id that is not registered must not resolve by name");
+        assert_eq!(start_error.code(), Code::NotFound);
+
+        assert!(
+            !alpha.join(SANDBOX_STOPPED_FILE).exists(),
+            "the same-named sandbox must not have been touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_only_request_matching_two_sandboxes_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
+
+        // Without an id the driver has nothing to disambiguate with: the request
+        // carries no workspace, and picking by iteration order would stop or
+        // delete an arbitrary one of the two.
+        for error in [
+            driver.stop_sandbox("", "demo").await.unwrap_err(),
+            driver
+                .start_sandbox(
+                    "",
+                    "demo",
+                    "g0000000000000001",
+                    test_launch_authentication("ambiguous").0,
+                )
+                .await
+                .unwrap_err(),
+            driver.delete_sandbox("", "demo").await.unwrap_err(),
+        ] {
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains("matched more than one sandbox"));
+        }
+
+        let registry = driver.registry.lock().await;
+        assert!(registry.contains_key("vm-alpha"));
+        assert!(registry.contains_key("vm-beta"));
+        assert!(!alpha.join(SANDBOX_STOPPED_FILE).exists());
+        assert!(!beta.join(SANDBOX_STOPPED_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_name_only_request_still_resolves_a_unique_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let driver = resolution_test_driver(temp.path());
+        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
+        insert_named_record(&driver, "vm-beta", "other", "beta").await;
+
+        driver
+            .stop_sandbox("", "demo")
+            .await
+            .expect("an unambiguous name-only stop should still resolve");
+
+        assert!(alpha.join(SANDBOX_STOPPED_FILE).exists());
     }
 }

@@ -420,6 +420,26 @@ fn apply_discovered_provider(form: &mut CreateProviderForm, discovered: Discover
 // Provider detail view (Get)
 // ---------------------------------------------------------------------------
 
+/// Availability of strictly serialized provider profile YAML in the detail view.
+pub enum ProviderProfileYaml {
+    /// The provider has no associated profile.
+    Absent,
+    /// The profile serialized successfully.
+    Valid(String),
+    /// A profile exists, but its YAML serialization failed.
+    Invalid,
+}
+
+impl ProviderProfileYaml {
+    /// Return YAML only when strict profile serialization succeeded.
+    pub fn yaml(&self) -> Option<&str> {
+        match self {
+            Self::Valid(yaml) => Some(yaml),
+            Self::Absent | Self::Invalid => None,
+        }
+    }
+}
+
 pub struct ProviderDetailView {
     pub name: String,
     pub provider_id: String,
@@ -430,7 +450,7 @@ pub struct ProviderDetailView {
     pub show_raw_provider: bool,
     pub raw_profile_scroll: usize,
     pub raw_provider_scroll: usize,
-    pub raw_profile_yaml: Option<String>,
+    pub raw_profile_yaml: ProviderProfileYaml,
     pub raw_provider_yaml: String,
     pub profile_name: Option<String>,
     pub profile_category: Option<String>,
@@ -656,7 +676,12 @@ pub struct App {
     pub sandbox_ages: Vec<String>,
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
+    pub sandbox_restart_policies: Vec<String>,
+    pub sandbox_restart_counts: Vec<u32>,
+    pub sandbox_exit_codes: Vec<Option<i32>>,
+    pub sandbox_next_restart_at: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    pub sandbox_detail_notes: Vec<String>,
     /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
     pub sandbox_labels: Vec<String>,
     /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
@@ -900,9 +925,12 @@ fn provider_to_redacted_yaml(provider: &openshell_core::proto::Provider) -> Stri
         }
     }
 
-    if !provider.credential_expires_at_ms.is_empty() {
-        out.push_str("credential_expires_at_ms:\n");
-        let mut entries = provider.credential_expires_at_ms.iter().collect::<Vec<_>>();
+    if !provider.credential_expiration_times.is_empty() {
+        out.push_str("credential_expiration_times:\n");
+        let mut entries = provider
+            .credential_expiration_times
+            .iter()
+            .collect::<Vec<_>>();
         entries.sort_by_key(|(key, _)| *key);
         for (key, value) in entries {
             out.push_str("  ");
@@ -1015,7 +1043,12 @@ impl App {
             sandbox_ages: Vec::new(),
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
+            sandbox_restart_policies: Vec::new(),
+            sandbox_restart_counts: Vec::new(),
+            sandbox_exit_codes: Vec::new(),
+            sandbox_next_restart_at: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_detail_notes: Vec::new(),
             sandbox_labels: Vec::new(),
             sandbox_annotations: Vec::new(),
             sandbox_workspaces: Vec::new(),
@@ -2920,7 +2953,7 @@ impl App {
             KeyCode::Esc | KeyCode::Enter => {
                 self.provider_detail = None;
             }
-            KeyCode::Char('y') if detail.raw_profile_yaml.is_some() => {
+            KeyCode::Char('y') if detail.raw_profile_yaml.yaml().is_some() => {
                 detail.show_raw_profile = !detail.show_raw_profile;
                 detail.show_raw_provider = false;
                 detail.raw_profile_scroll = 0;
@@ -2933,7 +2966,7 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down if detail.show_raw_profile => {
                 let max_scroll = detail
                     .raw_profile_yaml
-                    .as_ref()
+                    .yaml()
                     .map_or(0, |raw| raw.lines().count().saturating_sub(1));
                 detail.raw_profile_scroll = (detail.raw_profile_scroll + 1).min(max_scroll);
             }
@@ -3225,13 +3258,6 @@ impl App {
     // Helpers
     // ------------------------------------------------------------------
 
-    /// Get the ID of the currently selected sandbox.
-    pub fn selected_sandbox_id(&self) -> Option<&str> {
-        self.sandbox_ids
-            .get(self.sandbox_selected)
-            .map(String::as_str)
-    }
-
     /// Get the name of the currently selected sandbox.
     pub fn selected_sandbox_name(&self) -> Option<&str> {
         self.sandbox_names
@@ -3290,10 +3316,9 @@ impl App {
                             .get(key)
                             .map_or_else(|| "-".to_string(), |value| mask_secret(value));
                         let expiry = provider
-                            .credential_expires_at_ms
+                            .credential_expiration_times
                             .get(key)
-                            .copied()
-                            .filter(|value| *value > 0)
+                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
                             .map_or_else(String::new, |value| format!(" expires={value}"));
                         format!("{key}: {masked}{expiry}")
                     })
@@ -3320,9 +3345,8 @@ impl App {
                             credential.env_vars.join(", ")
                         };
                         let expiry = present_key
-                            .and_then(|key| provider.credential_expires_at_ms.get(key))
-                            .copied()
-                            .filter(|value| *value > 0)
+                            .and_then(|key| provider.credential_expiration_times.get(key))
+                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
                             .map_or_else(String::new, |value| format!(" expires={value}"));
                         format!(
                             "{} ({required}) env=[{env_vars}] {status}{expiry}",
@@ -3356,14 +3380,15 @@ impl App {
                         } else {
                             endpoint.protocol.as_str()
                         };
-                        let access = if endpoint.access.is_empty() {
+                        let access = if endpoint.access == 0 {
                             if endpoint.rules.is_empty() {
                                 "custom"
                             } else {
                                 "rules"
                             }
                         } else {
-                            endpoint.access.as_str()
+                            openshell_policy::network_access_preset_to_str(endpoint.access)
+                                .unwrap_or("unknown")
                         };
                         let path = if endpoint.path.is_empty() {
                             String::new()
@@ -3436,9 +3461,12 @@ impl App {
             },
         );
 
-        let raw_profile_yaml = profile.and_then(|profile| {
+        let raw_profile_yaml = profile.map_or(ProviderProfileYaml::Absent, |profile| {
             let dto = ProviderTypeProfile::from_proto(profile);
-            openshell_providers::profile_to_yaml(&dto).ok()
+            // Serializer errors may echo authored values. Keep the failure
+            // distinct from absence without retaining potentially secret text.
+            openshell_providers::profile_to_yaml(&dto)
+                .map_or(ProviderProfileYaml::Invalid, ProviderProfileYaml::Valid)
         });
 
         ProviderDetailView {
@@ -3526,7 +3554,12 @@ impl App {
         self.sandbox_ages.clear();
         self.sandbox_created.clear();
         self.sandbox_images.clear();
+        self.sandbox_restart_policies.clear();
+        self.sandbox_restart_counts.clear();
+        self.sandbox_exit_codes.clear();
+        self.sandbox_next_restart_at.clear();
         self.sandbox_notes.clear();
+        self.sandbox_detail_notes.clear();
         self.sandbox_labels.clear();
         self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
@@ -3648,6 +3681,201 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn detail_mcp_profile(versions: &[&str]) -> openshell_core::proto::ProviderProfile {
+        openshell_core::proto::ProviderProfile {
+            id: "mcp-example".to_string(),
+            display_name: "MCP Example".to_string(),
+            endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                protocol: "mcp".to_string(),
+                mcp: Some(openshell_core::proto::McpOptions {
+                    versions: versions.iter().map(ToString::to_string).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn detail_app(profile: Option<openshell_core::proto::ProviderProfile>) -> App {
+        let mut app = test_app();
+        let provider = openshell_core::proto::Provider {
+            metadata: Some(openshell_core::proto::ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "example-provider".to_string(),
+                ..Default::default()
+            }),
+            r#type: "mcp-example".to_string(),
+            credentials: HashMap::from([("API_KEY".to_string(), "test-only-secret".to_string())]),
+            ..Default::default()
+        };
+        app.provider_entries.push(ProviderListEntry {
+            provider: provider.clone(),
+            profile,
+        });
+        app.provider_detail = Some(app.provider_detail_from_provider(&provider));
+        app
+    }
+
+    fn render_provider_detail(app: &App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 36))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| crate::ui::create_provider::draw_detail(frame, app, frame.size()))
+            .expect("provider detail renders");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn provider_detail_absent_profile_keeps_object_yaml_available() {
+        let mut app = detail_app(None);
+        let detail = app.provider_detail.as_ref().expect("detail view");
+        assert!(matches!(
+            detail.raw_profile_yaml,
+            ProviderProfileYaml::Absent
+        ));
+        let text = render_provider_detail(&app);
+        assert!(text.contains("Profile: <none> (legacy/unprofiled provider)"));
+        assert!(!text.contains("Profile YAML unavailable"));
+        assert!(!text.contains("[y]"));
+
+        app.handle_provider_detail_key(key(KeyCode::Char('y')));
+        assert!(
+            !app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .show_raw_profile
+        );
+        app.handle_provider_detail_key(key(KeyCode::Char('o')));
+        let text = render_provider_detail(&app);
+        assert!(text.contains("Provider Object YAML"));
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("test-only-secret"));
+    }
+
+    #[tokio::test]
+    async fn provider_detail_valid_profile_preserves_yaml_navigation() {
+        let profile = detail_mcp_profile(&["2025-11-25"]);
+        let expected_yaml =
+            openshell_providers::profile_to_yaml(&ProviderTypeProfile::from_proto(&profile))
+                .expect("valid profile YAML");
+        let mut app = detail_app(Some(profile));
+        assert_eq!(
+            app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .raw_profile_yaml
+                .yaml(),
+            Some(expected_yaml.as_str())
+        );
+        assert!(render_provider_detail(&app).contains("[y] Profile YAML"));
+        app.handle_provider_detail_key(key(KeyCode::Char('y')));
+        let text = render_provider_detail(&app);
+        assert!(text.contains("Provider Profile YAML"));
+        assert!(text.contains("mcp-example"));
+        assert!(!text.contains("test-only-secret"));
+        app.handle_provider_detail_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .raw_profile_scroll,
+            1
+        );
+        app.handle_provider_detail_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .raw_profile_scroll,
+            0
+        );
+        app.handle_provider_detail_key(key(KeyCode::Char('o')));
+        assert!(
+            app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .show_raw_provider
+        );
+        app.handle_provider_detail_key(key(KeyCode::Char('y')));
+        let detail = app.provider_detail.as_ref().expect("detail view");
+        assert!(detail.show_raw_profile);
+        assert!(!detail.show_raw_provider);
+        app.handle_provider_detail_key(key(KeyCode::Esc));
+        assert!(
+            !app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .show_raw_profile
+        );
+        app.handle_provider_detail_key(key(KeyCode::Esc));
+        assert!(app.provider_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_detail_invalid_profile_remains_visible_without_yaml_action() {
+        for versions in [vec!["2025-11-25", "2025-11-25"], vec!["latest"]] {
+            let mut app = detail_app(Some(detail_mcp_profile(&versions)));
+            let detail = app.provider_detail.as_ref().expect("detail view");
+            assert!(matches!(
+                detail.raw_profile_yaml,
+                ProviderProfileYaml::Invalid
+            ));
+            assert_eq!(detail.profile_name.as_deref(), Some("MCP Example"));
+            let text = render_provider_detail(&app);
+            assert!(text.contains("example-provider"));
+            assert!(text.contains("Profile YAML unavailable: serialization failed."));
+            assert!(text.contains("Correct the profile at its source, then reopen this view."));
+            assert!(!text.contains("legacy/unprofiled"));
+            assert!(!text.contains("[y]"));
+            app.handle_provider_detail_key(key(KeyCode::Char('y')));
+            assert!(
+                !app.provider_detail
+                    .as_ref()
+                    .expect("detail view")
+                    .show_raw_profile
+            );
+            app.handle_provider_detail_key(key(KeyCode::Char('o')));
+            let text = render_provider_detail(&app);
+            assert!(text.contains("Provider Object YAML"));
+            assert!(text.contains("<redacted>"));
+            assert!(!text.contains("test-only-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_detail_multibyte_profile_error_is_bounded_and_redacted() {
+        let malformed = "秘密é🚧\nprivate-profile-value".repeat(2048);
+        let profile = detail_mcp_profile(&[malformed.as_str()]);
+        let error =
+            openshell_providers::profile_to_yaml(&ProviderTypeProfile::from_proto(&profile))
+                .expect_err("malformed revision must fail strict serialization");
+        assert!(error.to_string().contains("秘密"));
+        let app = detail_app(Some(profile));
+        assert!(matches!(
+            app.provider_detail
+                .as_ref()
+                .expect("detail view")
+                .raw_profile_yaml,
+            ProviderProfileYaml::Invalid
+        ));
+        let text = render_provider_detail(&app);
+        assert!(text.contains("Profile YAML unavailable: serialization failed."));
+        assert!(!text.contains("秘密"));
+        assert!(!text.contains("private-profile-value"));
+        assert!(!text.contains("test-only-secret"));
+        let ordinary_failure = detail_app(Some(detail_mcp_profile(&["latest"])));
+        assert_eq!(text, render_provider_detail(&ordinary_failure));
     }
 
     #[tokio::test]

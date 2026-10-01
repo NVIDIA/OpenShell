@@ -250,6 +250,8 @@ The pre-1.0 SDK intentionally includes source-incompatible API corrections:
   types preserve that scope.
 - Several public struct field orders changed. Use keyed struct literals.
 - Initialisms use Go spelling, including `JSONRPCMaxBodyBytes`.
+- Provider profile durations use the exact `RefreshBefore`, `MaxLifetime`, and
+  `CacheTTL` fields. The legacy whole-second fields were removed.
 
 These changes are intentional while the module remains below v1. Update callers
 as one migration rather than relying on the v0.0.101 API shape.
@@ -275,6 +277,18 @@ an internal converter layer. The public API surface uses type aliases so
 consumers import a single package. See the [Architecture](https://ro14nd.de/openshell-sdk-go/architecture.html) overview for details.
 
 ## Features
+
+Use `CloseInteractiveInput(session)` to close stdin and resize input while keeping
+output readable. SDK sessions implement the optional `InteractiveSessionControl`
+interface (`CloseWrite()` and `Cancel()`); the original `InteractiveSession`
+interface remains unchanged for existing mocks and wrappers. Input closure returns
+`ErrorUnimplemented` for sessions without that capability and leaves them open.
+`CancelInteractive(session)` uses `Cancel()` when available and otherwise calls
+`Close()`. SDK close/cancel operations are idempotent; writes and resizes after
+input closure return `io.ErrClosedPipe`. Drain `Read` concurrently with waiting for `ExitCode()`.
+`ExitCode()` waits for final gRPC status and returns any observed process exit code
+alongside a later stream error. An exit event alone does not establish successful
+stream completion.
 
 | Feature | Interface | Docs |
 |---------|-----------|------|

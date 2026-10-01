@@ -18,13 +18,15 @@ const (
 )
 
 // ProviderProfile defines a provider type template with credentials schema,
-// endpoints, binaries, and discovery configuration.
+// files, endpoints, binaries, and discovery configuration.
 type ProviderProfile struct {
-	ID               string
-	DisplayName      string
-	Description      string
-	Category         ProfileCategory
-	Credentials      []ProfileCredential
+	ID          string
+	DisplayName string
+	Description string
+	Category    ProfileCategory
+	Credentials []ProfileCredential
+	// Files is EXPERIMENTAL. This API and its behavior may change or be removed.
+	Files            []ProfileFile
 	Endpoints        []NetworkEndpoint
 	Binaries         []NetworkBinary
 	InferenceCapable bool
@@ -33,6 +35,14 @@ type ProviderProfile struct {
 	Annotations      map[string]string
 	Source           string
 	Scope            string
+}
+
+// ProfileFile declares non-secret content served at a virtual sandbox path.
+// EXPERIMENTAL: This API and its behavior may change or be removed.
+type ProfileFile struct {
+	Path    string
+	Content string
+	EnvVar  string
 }
 
 // ProfileCredential defines a single credential required by a provider profile.
@@ -56,13 +66,15 @@ type ProfileCredential struct {
 
 // ProfileCredentialRefresh declares how a profile credential is refreshed.
 type ProfileCredentialRefresh struct {
-	Strategy             RefreshStrategy
-	TokenURL             string
-	Scopes               []string
-	RefreshBeforeSeconds int64
-	MaxLifetimeSeconds   int64
-	Material             []ProfileCredentialRefreshMaterial
-	AdditionalOutputs    []ProfileCredentialRefreshOutput
+	Strategy RefreshStrategy
+	TokenURL string
+	Scopes   []string
+	// RefreshBefore retains the exact protobuf duration, including presence and nanoseconds.
+	RefreshBefore *ProfileDuration
+	// MaxLifetime retains the exact protobuf duration, including presence and nanoseconds.
+	MaxLifetime       *ProfileDuration
+	Material          []ProfileCredentialRefreshMaterial
+	AdditionalOutputs []ProfileCredentialRefreshOutput
 }
 
 // ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.
@@ -90,16 +102,25 @@ const (
 
 // CredentialTokenGrant configures dynamic credential acquisition via OAuth2 grant.
 type CredentialTokenGrant struct {
-	TokenEndpoint       string
-	Audience            string
-	JWTSVIDAudience     string
-	Scopes              []string
-	CacheTTLSeconds     int64
+	TokenEndpoint   string
+	Audience        string
+	JWTSVIDAudience string
+	Scopes          []string
+	// CacheTTL retains the exact protobuf duration, including presence and nanoseconds.
+	CacheTTL            *ProfileDuration
 	AudienceOverrides   []TokenGrantAudienceOverride
 	ClientAssertionType string
 	GrantType           CredentialTokenGrantType
 	SubjectToken        *TokenGrantSubjectToken
 	RequestedTokenType  string
+}
+
+// ProfileDuration represents a protobuf duration without importing generated
+// protobuf packages into the curated SDK types. A nil pointer means absent; a
+// non-nil zero value means an explicitly present zero duration.
+type ProfileDuration struct {
+	Seconds int64
+	Nanos   int32
 }
 
 // TokenGrantSubjectToken configures the subject token for token exchange grants.

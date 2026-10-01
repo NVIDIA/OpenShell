@@ -56,7 +56,7 @@
       gateway_id = "openshell-test-guest"
 
       [openshell.drivers.podman]
-      default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+      default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
       supervisor_image = "{{ openshell_supervisor_image }}"
       image_pull_policy = "always"
       network_name = "openshell-test-guest"

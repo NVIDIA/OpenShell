@@ -8,7 +8,7 @@ inputs:
   mise-version:
     description: mise release to install
     required: false
-    default: v2026.4.25
+    default: v2026.9.9
   podman-major:
     description: Expected Podman major version
     required: true
@@ -122,5 +122,5 @@ runs:
         podman run --rm \
           --cap-add=SETPCAP \
           --volume "$probe:/openshell-capbset-probe:ro" \
-          docker.io/library/alpine:3.22 \
+          nvcr.io/nvidia/base/ubuntu:24.04 \
           /openshell-capbset-probe

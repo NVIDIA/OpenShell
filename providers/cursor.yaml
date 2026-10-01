@@ -1,6 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/cursor.yaml
+#   openshell provider profile import -f providers/cursor.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl, wget, and the Cursor remote server.
+# Reference layout:  the server path below (/sandbox/.cursor-server/**) is where
+#                    Cursor may unpack itself when it connects over SSH. A
+#                    different HOME or user means a
+#                    different path — check where the server actually lands.
+# Credential scope:  none. This profile only opens the bootstrap and update
+#                    endpoints; Cursor authenticates the user separately.
+# Endpoint access:   the Cursor download, update and API hosts, L4 passthrough.
+# Smoke test:        connect Cursor to the sandbox over SSH and confirm the
+#                    remote server downloads and attaches.
+
 id: cursor
 display_name: Cursor
 description: Cursor editor server bootstrap and update endpoints

@@ -92,6 +92,7 @@ mod tests {
 
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
+            files: Vec::new(),
             id: "custom".to_string(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),

@@ -1,43 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Build Binary
+name: Build Binaries
 
 on:
   workflow_call:
     inputs:
-      package:
-        required: true
-        type: string
-      binary:
-        required: true
-        type: string
-      triple:
-        required: true
-        type: string
-      runner:
-        required: true
-        type: string
       cargo-version:
         required: true
         type: string
-      image-tag:
+      supervisor-image-tag:
         required: false
         type: string
         default: ""
-      artifact-name:
-        required: false
-        type: string
-        default: ""
-      extra-cargo-flags:
-        required: false
-        type: string
-        default: ""
-      interpreter:
-        description: Expected ELF program interpreter, "none" for static, or "skip"
-        required: false
-        type: string
-        default: skip
       checkout-ref:
         required: false
         type: string
@@ -49,27 +24,140 @@ on:
 permissions:
   contents: read
 
+env:
+  EXTRA_CARGO_FLAGS: ""
+
 jobs:
-  build:
-    name: ${{ inputs.binary }} (${{ inputs.triple }})
-    runs-on: ${{ inputs.runner }}
+  cli:
+    name: openshell (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-cli
+      BINARY: openshell
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    steps:
+    steps: &build_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs['checkout-ref'] || github.sha }}
-
+          persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
       - uses: ./.github/actions/build-rust-binary
         with:
-          package: ${{ inputs.package }}
-          binary: ${{ inputs.binary }}
-          triple: ${{ inputs.triple }}
-          cargo-version: ${{ inputs['cargo-version'] }}
-          image-tag: ${{ inputs['image-tag'] }}
-          artifact-name: ${{ inputs['artifact-name'] }}
-          extra-cargo-flags: ${{ inputs['extra-cargo-flags'] }}
-          interpreter: ${{ inputs.interpreter }}
+          package: ${{ env.PACKAGE }}
+          binary: ${{ env.BINARY }}
+          triple: ${{ matrix.triple }}
+          cargo-version: ${{ inputs.cargo-version }}
+          supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
+          extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
+
+  conformance:
+    name: openshell-conformance (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-conformance-cli
+      BINARY: openshell-conformance
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  prover:
+    name: openshell-prover (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-prover-cli
+      BINARY: openshell-prover
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  gateway:
+    name: openshell-gateway (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-gateway
+      BINARY: openshell-gateway
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+          - triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  runtimes:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
+    env:
+      PACKAGE: ${{ matrix.package }}
+      BINARY: ${{ matrix.binary }}
+    strategy:
+      matrix:
+        include:
+          - package: openshell-sandbox
+            binary: openshell-sandbox
+            triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - package: openshell-sandbox
+            binary: openshell-sandbox
+            triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+          - package: openshell-supervisor
+            binary: openshell-supervisor
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+          - package: openshell-supervisor
+            binary: openshell-supervisor
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+          - package: openshell-supervisor
+            binary: openshell-supervisor
+            triple: aarch64-apple-darwin
+            runner: macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps
+
+  vm-init:
+    name: openshell-vm-init (${{ matrix.triple }})
+    env:
+      PACKAGE: openshell-driver-vm
+      BINARY: openshell-vm-init
+      EXTRA_CARGO_FLAGS: --no-default-features
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps: *build_steps

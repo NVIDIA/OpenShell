@@ -3,7 +3,7 @@
 
 //! Configuration management for `OpenShell` components.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -194,6 +194,10 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Allow the WebSocket tunnel used by authenticated edge proxies.
+    /// Disabled for local gateways by default.
+    pub enable_websocket_tunnel: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -374,13 +378,13 @@ pub struct OidcConfig {
     pub scopes_claim: String,
 }
 
-/// mTLS user authentication for local, single-user gateways.
+/// mTLS user authentication for gateway users.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
     /// When true, the gateway maps a verified TLS client certificate into a
-    /// user principal. Keep disabled for Kubernetes deployments because
-    /// Kubernetes sandbox pods and external users must not share user auth.
+    /// user principal. Sandbox and supervisor clients use bearer identity, so
+    /// this setting is independent of the selected compute driver.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -473,15 +477,44 @@ pub enum GatewayInterceptorBindingPolicy {
 }
 
 /// One configured source in the gateway's effective provider-profile catalog.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Deserialization is hand-written so that the removed `builtin` source is
+/// recognized and rejected with the migration step, rather than reported as an
+/// unknown variant.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayProviderProfileSourceConfig {
-    /// Profiles bundled with the `OpenShell` build.
-    Builtin,
     /// Profiles managed through the provider profile mutation APIs.
     User,
     /// Profiles vended by a configured gateway interceptor instance.
     Interceptor { name: String },
+}
+
+pub(crate) const BUILTIN_PROFILE_SOURCE_REMOVED: &str = "provider profile source type \"builtin\" was removed: provider profiles are import-only. \
+     Remove the entry and import the profiles this gateway needs with \
+     'openshell provider profile import --from providers --global'";
+
+impl<'de> Deserialize<'de> for GatewayProviderProfileSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// Mirrors the public shape, plus the retired `builtin` tag so it can be
+        /// named in the error instead of surfacing as an unknown variant.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Shadow {
+            Builtin,
+            User,
+            Interceptor { name: String },
+        }
+
+        match Shadow::deserialize(deserializer)? {
+            Shadow::Builtin => Err(de::Error::custom(BUILTIN_PROFILE_SOURCE_REMOVED)),
+            Shadow::User => Ok(Self::User),
+            Shadow::Interceptor { name } => Ok(Self::Interceptor { name }),
+        }
+    }
 }
 
 /// Failure behavior when an interceptor evaluation cannot produce a valid
@@ -678,10 +711,10 @@ impl Serialize for AppArmorProfile {
 impl<'de> Deserialize<'de> for AppArmorProfile {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).map_err(serde::de::Error::custom)
+        Self::from_str(&value).map_err(de::Error::custom)
     }
 }
 
@@ -771,14 +804,22 @@ pub struct GatewayJwtConfig {
     /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Omit the field for a non-expiring token.
+    /// Token lifetime in seconds. Omission selects non-expiring sandbox
+    /// session credentials and the default lifetime for extension tokens.
     /// Explicit zero is invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<NonZeroU64>,
 }
 
 impl GatewayJwtConfig {
-    /// Effective token lifetime. `None` represents a non-expiring token.
+    /// Effective typed extension-token lifetime.
+    pub fn token_ttl(&self) -> Duration {
+        self.ttl_secs.map_or(Duration::from_mins(15), |ttl| {
+            Duration::from_secs(ttl.get())
+        })
+    }
+
+    /// Effective sandbox session-token lifetime. `None` is non-expiring.
     pub fn sandbox_token_ttl(&self) -> Option<Duration> {
         self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
     }
@@ -813,11 +854,9 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
-            provider_profile_sources: vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ],
+            provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -988,6 +1027,13 @@ impl Config {
         self.service_routing.enable_loopback_service_http = enabled;
         self
     }
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[must_use]
+    pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
+        self.enable_websocket_tunnel = enabled;
+        self
+    }
 }
 
 impl Default for ServiceRoutingConfig {
@@ -1124,14 +1170,42 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+    fn config_defaults_to_the_user_provider_profile_source() {
         let cfg = Config::new(None);
         assert_eq!(
             cfg.provider_profile_sources,
-            vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ]
+            vec![GatewayProviderProfileSourceConfig::User]
+        );
+    }
+
+    #[test]
+    fn builtin_provider_profile_source_is_rejected_with_the_import_step() {
+        let error =
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"builtin"}"#)
+                .expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn user_and_interceptor_provider_profile_sources_still_parse() {
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"user"}"#)
+                .unwrap(),
+            GatewayProviderProfileSourceConfig::User
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(
+                r#"{"type":"interceptor","name":"governance"}"#
+            )
+            .unwrap(),
+            GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string()
+            }
         );
     }
 
@@ -1159,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+    fn gateway_jwt_omitted_ttl_defaults_extension_and_nonexpiring_session_tokens() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
             "public_key_path": "/tmp/public.pem",
@@ -1168,6 +1242,7 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, None);
+        assert_eq!(cfg.token_ttl(), Duration::from_mins(15));
         assert_eq!(cfg.sandbox_token_ttl(), None);
 
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
@@ -1184,6 +1259,7 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with positive ttl");
 
+        assert_eq!(cfg.token_ttl(), Duration::from_hours(1));
         assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert_eq!(serialized["ttl_secs"], 3600);

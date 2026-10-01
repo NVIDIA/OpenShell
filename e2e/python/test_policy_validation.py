@@ -182,7 +182,10 @@ def test_create_sandbox_materializes_default_mcp_version(
         assert list(stored_endpoint.mcp.versions) == ["2025-11-25"]
 
         config = sandbox_client._stub.GetSandboxConfig(
-            sandbox_pb2.GetSandboxConfigRequest(sandbox_id=created.id)
+            sandbox_pb2.GetSandboxConfigRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=created.name,
+            )
         )
         endpoint = config.policy.network_policies["mcp_default"].endpoints[0]
 
@@ -231,7 +234,7 @@ def test_update_policy_rejects_immutable_fields(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
-                    name=sandbox_name,
+                    sandbox=sandbox_name,
                     policy=unsafe_policy,
                 )
             )

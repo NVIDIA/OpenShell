@@ -29,7 +29,7 @@ if err != nil {
     log.Fatal(err)
 }
 for _, svc := range services {
-    fmt.Printf("  %s -> port %d (%s)\n", svc.ServiceName, svc.TargetPort, svc.URL)
+    fmt.Printf("  %s -> port %d (%s)\n", svc.Name, svc.TargetPort, svc.URL)
 }
 
 // Platform Admin only: list services across all workspaces
@@ -44,7 +44,7 @@ Remove an exposed service. The underlying sandbox port remains accessible
 internally but is no longer reachable through the service endpoint.
 
 ```go
-err := client.Services().Delete(ctx, "default", "my-sandbox", "web")
+deletion, err := client.Services().Delete(ctx, "default", "my-sandbox", "web")
 if err != nil {
     log.Fatal(err)
 }

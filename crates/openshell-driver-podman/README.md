@@ -13,6 +13,13 @@ identity, DNS, TCP, and loopback-forwarding semantics.
 
 ## Runtime posture
 
+Caller driver config is disabled by default. Existing volumes require
+administrator-controlled approval labels; bind and supplemental image mounts
+are denied under enforcement. Private-volume names alone do not prove
+ownership. GPU devices are temporarily exempt. Admission runs before launch,
+restart, and periodically for running workloads.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 | Property | Workload | Supervisor |
 |---|---|---|
 | UID/GID | Pinned non-root workload identity | Same mapped identity |
@@ -60,11 +67,11 @@ The channel contains the sandbox bootstrap and sandbox-side TLS identity only.
 Supervisor private keys and the runtime descriptor stay in the supervisor's private filesystem.
 Landlock denies agent access to the top-level `/.openshell` control hierarchy.
 The driver verifies Podman's reported `network=none` fence before launch and
-restart. `host.containers.internal` and callback networking apply to the
-supervisor, not the agent.
+restart. Host networking applies to the supervisor, not the agent.
 
-Gateway callbacks use the existing sandbox JWT and optional configured mTLS
-bundle. The sandbox/supervisor channel always uses its separate, per-sandbox
+Gateway sessions use the sandbox JWT and optional server-authenticated TLS.
+Only the gateway CA is delivered to the supervisor; user client certificates
+and private keys are not mounted into either container. The sandbox/supervisor channel always uses its separate, per-sandbox
 mutual TLS material. These are distinct authentication relationships.
 
 ## Identity and trusted binaries
@@ -108,11 +115,13 @@ requires the authenticated supervisor session before publishing Ready.
 
 User `bind`, `volume`, `tmpfs`, and `image` mounts and CDI GPU selection remain
 native Podman features and apply only to the workload. Bind mounts require the
-operator's `enable_bind_mounts` opt-in. Reserved control paths and the workspace
+operator's `enable_bind_mounts` opt-in and disabled label admission. Supplemental
+image mounts also require disabled admission. Driver JSON requires
+`allow_driver_config = true`. Reserved control paths and the workspace
 root cannot be replaced. User-owned volumes are never created or deleted.
 
-See [gateway configuration](../../docs/reference/gateway-config.mdx) for
-operator settings and [NETWORKING.md](NETWORKING.md) for callback networking.
+See [gateway configuration](../../docs/how-it-works/gateways/configuration.mdx) for
+operator settings and [NETWORKING.md](NETWORKING.md) for supervisor networking.
 The supervisor uses Podman's host network and owns the upstream proxy settings.
 Omit `health_check_interval_secs` to disable Podman's periodic health command.
 Explicit zero is invalid. OpenShell still gates readiness on the supervisor's

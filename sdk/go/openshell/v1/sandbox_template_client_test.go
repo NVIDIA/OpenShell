@@ -99,7 +99,7 @@ func (s *mockSandboxTemplateServer) DeleteSandboxTemplate(_ context.Context, req
 		return nil, s.deleteErr
 	}
 	delete(s.templates, req.GetName())
-	return &pb.DeleteSandboxTemplateResponse{Deleted: true}, nil
+	return &pb.DeleteSandboxTemplateResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 func setupSandboxTemplateTest(t *testing.T, mock *mockSandboxTemplateServer) (*sandboxTemplateClient, func()) {
@@ -230,7 +230,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "gpu-kata")
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()

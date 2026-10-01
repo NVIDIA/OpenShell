@@ -6,6 +6,8 @@ syntax = "proto3";
 package openshell.sandbox.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
+import "datamodel.proto";
 
 // Sandbox-supervisor configuration and policy messages.
 //
@@ -100,6 +102,40 @@ message NetworkCredentialBinding {
   string provider = 1;
 }
 
+// TLS handling for a network endpoint.
+enum NetworkTlsMode {
+  // Auto-detect TLS and terminate it when inspection is configured.
+  NETWORK_TLS_MODE_UNSPECIFIED = 0;
+  // Disable TLS detection and relay the connection without inspection.
+  NETWORK_TLS_MODE_SKIP = 1;
+  // Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
+  NETWORK_TLS_MODE_TERMINATE = 2 [deprecated = true];
+  // Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
+  NETWORK_TLS_MODE_PASSTHROUGH = 3 [deprecated = true];
+}
+
+// Enforcement behavior for inspected network traffic.
+enum NetworkEnforcementMode {
+  // Preserve the existing default: log violations and allow traffic.
+  NETWORK_ENFORCEMENT_MODE_UNSPECIFIED = 0;
+  // Deny traffic that does not satisfy the endpoint policy.
+  NETWORK_ENFORCEMENT_MODE_ENFORCE = 1;
+  // Log policy violations and allow the traffic.
+  NETWORK_ENFORCEMENT_MODE_AUDIT = 2;
+}
+
+// Shorthand access policy for an inspected network endpoint.
+enum NetworkAccessPreset {
+  // No access preset; explicit rules may define allowed traffic.
+  NETWORK_ACCESS_PRESET_UNSPECIFIED = 0;
+  // Allow read-only operations for the selected protocol.
+  NETWORK_ACCESS_PRESET_READ_ONLY = 1;
+  // Allow read and write operations for the selected protocol.
+  NETWORK_ACCESS_PRESET_READ_WRITE = 2;
+  // Allow every operation supported by the selected protocol.
+  NETWORK_ACCESS_PRESET_FULL = 3;
+}
+
 // A network endpoint (host + port) with optional L7 inspection config.
 message NetworkEndpoint {
   // Hostname or host glob pattern. Exact match is case-insensitive.
@@ -112,13 +148,13 @@ message NetworkEndpoint {
   // Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
   // "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
   string protocol = 3;
-  // TLS handling: "terminate" or "passthrough" (default).
-  string tls = 4;
-  // Enforcement mode: "enforce" or "audit" (default).
-  string enforcement = 5;
-  // Access preset shorthand: "read-only", "read-write", "full".
+  // TLS handling. Unspecified enables automatic detection and termination.
+  NetworkTlsMode tls = 4;
+  // Enforcement mode. Unspecified preserves the audit default.
+  NetworkEnforcementMode enforcement = 5;
+  // Access preset shorthand. Unspecified means no preset.
   // Mutually exclusive with rules.
-  string access = 6;
+  NetworkAccessPreset access = 6;
   // Explicit L7 rules (mutually exclusive with access).
   repeated L7Rule rules = 7;
   // Allowed resolved IP addresses or CIDR ranges for this endpoint.
@@ -315,10 +351,11 @@ message NetworkBinary {
   reserved "harness";
 }
 
-// Request to get sandbox settings by sandbox ID.
+// Request to get sandbox settings by sandbox name.
 message GetSandboxConfigRequest {
-  // The sandbox ID.
-  string sandbox_id = 1;
+  // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  string name = 1;
 }
 
 // Request to get gateway-global settings.
@@ -398,11 +435,23 @@ message GetSandboxConfigResponse {
   // False also covers older gateways that do not advertise this capability;
   // supervisors preserve their legacy unauthenticated connection behavior.
   bool extension_authentication_enabled = 12;
+  // Gateway-owned attachment identity captured with this desired configuration.
+  // Compare for equality; reattachment invalidates previous installation evidence.
+  string provider_attachment_epoch = 14;
+  // True only after validating this complete policy/provider composition.
+  // Missing (older gateway) is deliberately not admission.
+  bool configuration_admitted = 13;
+  // Bounded, credential-free admission diagnostic. Empty for admitted policy.
+  string configuration_error = 16;
+  // Registration fence for a new supervisor; capture once and retain on retry.
+  string configuration_instance_id = 15;
 }
 
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {
+  reserved 4;
+  reserved "timeout";
   // Operator-owned registration name used by policy attachments and diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
@@ -410,10 +459,9 @@ message SupervisorMiddlewareService {
   // Operator-owned logical payload limit applied to every binding exposed by
   // the service. This caps HTTP bodies and complete WebSocket messages.
   uint64 max_payload_bytes = 3;
-  // Default RPC timeout for this service. Empty uses the platform default of
-  // 500ms. Values use an integer with an `ms` or `s` suffix and must be
-  // between 10ms and 30s.
-  string timeout = 4;
+  // Default RPC timeout for this service. Absence uses the platform default of
+  // 500ms. Values must be between 10ms and 30s.
+  google.protobuf.Duration request_timeout = 104;
   // PEM-encoded trust roots loaded by the gateway from the operator-configured
   // tls_ca_cert_path. Empty uses the platform trust store.
   bytes tls_ca_cert_pem = 5;

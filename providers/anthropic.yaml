@@ -1,6 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/anthropic.yaml
+#   openshell provider profile import -f providers/anthropic.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl.
+# Reference layout:  curl at /usr/bin/curl or /usr/local/bin/curl. Add the SDK
+#                    interpreter (for example /usr/bin/python3) if the workload
+#                    calls the API through a library instead of curl.
+# Credential scope:  ANTHROPIC_API_KEY, sent as the x-api-key header to
+#                    api.anthropic.com and nowhere else. Pointing a client at a
+#                    different base URL does not carry the credential with it.
+# Endpoint access:   api.anthropic.com, read-write, L7 enforced.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS https://api.anthropic.com/v1/models
+
 id: anthropic
 display_name: Anthropic
 description: Anthropic inference API

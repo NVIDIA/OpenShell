@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Validate ```mermaid fenced blocks in Markdown/MDX files using the official
 // mermaid parser. Line numbers in error output are offset back to the source
 // file so editors can jump to them.

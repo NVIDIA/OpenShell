@@ -75,13 +75,13 @@ func TestPolicyChunkFromProto(t *testing.T) {
 		SecurityNotes:     "No concerns",
 		Confidence:        0.95,
 		DenialSummaryIds:  []string{"d1", "d2"},
-		CreatedAtMs:       1700000000000,
-		DecidedAtMs:       1700000001000,
+		CreatedTime:       TimestampFromMillis(1700000000000),
+		DecidedTime:       TimestampFromMillis(1700000001000),
 		Stage:             "initial",
 		SupersedesChunkId: "chunk-0",
 		HitCount:          5,
-		FirstSeenMs:       1699999999000,
-		LastSeenMs:        1700000000500,
+		FirstSeenTime:     TimestampFromMillis(1699999999000),
+		LastSeenTime:      TimestampFromMillis(1700000000500),
 		Binary:            "/usr/bin/curl",
 		ValidationResult:  "valid",
 		RejectionReason:   "",
@@ -146,7 +146,7 @@ func TestDraftPolicyFromProto(t *testing.T) {
 		},
 		RollingSummary:   "Analysis summary",
 		DraftVersion:     42,
-		LastAnalyzedAtMs: 1700000000000,
+		LastAnalyzedTime: TimestampFromMillis(1700000000000),
 	}
 
 	draft := DraftPolicyFromProto(proto)
@@ -442,8 +442,8 @@ func TestSandboxPolicyRevisionFromProto(t *testing.T) {
 		PolicyHash:  "sha256:abc123",
 		Status:      pb.PolicyStatus_POLICY_STATUS_LOADED,
 		LoadError:   "",
-		CreatedAtMs: 1700000000000,
-		LoadedAtMs:  1700000001000,
+		CreatedTime: TimestampFromMillis(1700000000000),
+		LoadedTime:  TimestampFromMillis(1700000001000),
 		Provenance:  map[string]string{"source": "api", "user": "admin"},
 	}
 
@@ -594,7 +594,7 @@ func TestClearResultFromProto_Nil(t *testing.T) {
 
 func TestDraftHistoryEntryFromProto(t *testing.T) {
 	proto := &pb.DraftHistoryEntry{
-		TimestampMs: 1700000000000,
+		EventTime:   TimestampFromMillis(1700000000000),
 		EventType:   "approved",
 		Description: "Chunk c1 approved",
 		ChunkId:     "c1",

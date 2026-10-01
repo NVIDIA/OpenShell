@@ -25,7 +25,7 @@
 //! - `client_assertion_type` — `OAuth2` client assertion type (optional)
 //! - `audience` — Resource audience to request from the token service
 //! - `scopes` — `OAuth2` scopes to request (optional)
-//! - `cache_ttl_seconds` — Cache override (0 = use `expires_in` from response)
+//! - `cache_ttl` — Optional exact cache override; zero disables caching
 //!
 //! ## Environment
 //!
@@ -124,7 +124,7 @@ impl TokenCache {
 /// * `client_assertion_type` — Optional `OAuth2` client assertion type
 /// * `audience` — Resource audience to request in the token request
 /// * `scopes` — `OAuth2` scopes to request (may be empty)
-/// * `cache_ttl_override` — Cache TTL in seconds (0 = use `expires_in` from response)
+/// * `cache_ttl_override` — Exact cache TTL; absence uses `expires_in` and zero disables caching
 ///
 /// # Errors
 ///
@@ -141,7 +141,7 @@ pub struct ObtainProviderTokenRequest<'a> {
     pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
-    pub cache_ttl_override: i64,
+    pub cache_ttl_override: Option<Duration>,
     pub grant_type: i32,
     pub requested_token_type: &'a str,
 }
@@ -239,7 +239,7 @@ struct ObtainProviderTokenInput<'a> {
     client_assertion_type: &'a str,
     audience: &'a str,
     scopes: &'a [String],
-    cache_ttl_override: i64,
+    cache_ttl_override: Option<Duration>,
     grant_type: ProviderCredentialTokenGrantType,
     requested_token_type: &'a str,
 }
@@ -264,21 +264,24 @@ where
         requested_token_type: effective_token_type(input.requested_token_type),
     });
 
-    if let Some(cached) = input.cache.get(&cache_key) {
+    if input.cache_ttl_override != Some(Duration::ZERO)
+        && let Some(cached) = input.cache.get(&cache_key)
+    {
         return Ok(cached);
     }
 
     let token_response = grant(jwt_audience).await?;
 
-    let cache_ttl_seconds =
-        token_cache_ttl_seconds(input.cache_ttl_override, token_response.expires_in);
-    let expires_at_ms = current_time_ms().saturating_add(cache_ttl_seconds.saturating_mul(1000));
-
-    input.cache.set(
-        cache_key,
-        token_response.access_token.clone(),
-        expires_at_ms,
-    );
+    let cache_ttl = token_cache_ttl(input.cache_ttl_override, token_response.expires_in);
+    if !cache_ttl.is_zero() {
+        let ttl_ms = i64::try_from(cache_ttl.as_millis()).unwrap_or(i64::MAX);
+        let expires_at_ms = current_time_ms().saturating_add(ttl_ms);
+        input.cache.set(
+            cache_key,
+            token_response.access_token.clone(),
+            expires_at_ms,
+        );
+    }
 
     Ok(token_response.access_token)
 }
@@ -352,8 +355,8 @@ async fn perform_token_exchange(
 
 pub use oauth::validate_access_token;
 
-fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
-    if cache_ttl_override > 0 {
+fn token_cache_ttl(cache_ttl_override: Option<Duration>, expires_in: i64) -> Duration {
+    if let Some(cache_ttl_override) = cache_ttl_override {
         return cache_ttl_override;
     }
 
@@ -363,7 +366,10 @@ fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
         DEFAULT_TOKEN_CACHE_TTL_SECONDS
     };
 
-    ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1)
+    Duration::from_secs(
+        u64::try_from(ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1))
+            .unwrap_or(u64::MAX),
+    )
 }
 
 /// Derive the issuer/realm URL from a token endpoint URL.
@@ -659,7 +665,7 @@ mod tests {
         jwt_svid_audience: &'a str,
         audience: &'a str,
         scopes: &'a [String],
-        cache_ttl_override: i64,
+        cache_ttl_override: Option<Duration>,
         expires_in: i64,
         grant_calls: Arc<AtomicUsize>,
     }
@@ -700,7 +706,7 @@ mod tests {
         jwt_svid_audience: &str,
         audience: &str,
         scopes: &[String],
-        cache_ttl_override: i64,
+        cache_ttl_override: Option<Duration>,
     ) -> Result<String> {
         obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
@@ -851,25 +857,46 @@ mod tests {
 
     #[test]
     fn token_cache_ttl_uses_override_without_endpoint_skew() {
-        assert_eq!(token_cache_ttl_seconds(120, 10), 120);
-        assert_eq!(token_cache_ttl_seconds(120, i64::MAX), 120);
+        assert_eq!(
+            token_cache_ttl(Some(Duration::from_mins(2)), 10),
+            Duration::from_mins(2)
+        );
+        assert_eq!(
+            token_cache_ttl(Some(Duration::from_mins(2)), i64::MAX),
+            Duration::from_mins(2)
+        );
+    }
+
+    #[test]
+    fn token_cache_ttl_preserves_fractional_and_zero_overrides() {
+        assert_eq!(
+            token_cache_ttl(Some(Duration::from_millis(500)), 60),
+            Duration::from_millis(500)
+        );
+        assert_eq!(token_cache_ttl(Some(Duration::ZERO), 60), Duration::ZERO);
     }
 
     #[test]
     fn token_cache_ttl_skews_default_and_response_expires_in() {
         assert_eq!(
-            token_cache_ttl_seconds(0, 0),
-            DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
+            token_cache_ttl(None, 0),
+            Duration::from_secs(
+                u64::try_from(DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS)
+                    .unwrap()
+            )
         );
-        assert_eq!(token_cache_ttl_seconds(0, 60), 30);
-        assert_eq!(token_cache_ttl_seconds(0, 10), 1);
+        assert_eq!(token_cache_ttl(None, 60), Duration::from_secs(30));
+        assert_eq!(token_cache_ttl(None, 10), Duration::from_secs(1));
     }
 
     #[test]
     fn token_cache_ttl_clamps_large_response_expires_in() {
         assert_eq!(
-            token_cache_ttl_seconds(0, i64::MAX),
-            MAX_TOKEN_EXPIRES_IN_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
+            token_cache_ttl(None, i64::MAX),
+            Duration::from_secs(
+                u64::try_from(MAX_TOKEN_EXPIRES_IN_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS)
+                    .unwrap()
+            )
         );
     }
 
@@ -886,7 +913,7 @@ mod tests {
             jwt_svid_audience: "https://auth.example.com",
             audience: "api://resource",
             scopes: &scopes,
-            cache_ttl_override: 0,
+            cache_ttl_override: None,
             expires_in: 60,
             grant_calls: grant_calls.clone(),
         })
@@ -899,7 +926,7 @@ mod tests {
             "https://auth.example.com",
             "api://resource",
             &scopes,
-            0,
+            None,
         )
         .await
         .expect("second call should use cache");
@@ -923,7 +950,7 @@ mod tests {
             jwt_svid_audience: "https://auth.example.com",
             audience: "api://resource-one",
             scopes: &read_scope,
-            cache_ttl_override: 0,
+            cache_ttl_override: None,
             expires_in: 60,
             grant_calls: grant_calls.clone(),
         })
@@ -936,7 +963,7 @@ mod tests {
             jwt_svid_audience: "https://auth.example.com",
             audience: "api://resource-two",
             scopes: &read_scope,
-            cache_ttl_override: 0,
+            cache_ttl_override: None,
             expires_in: 60,
             grant_calls: grant_calls.clone(),
         })
@@ -949,7 +976,7 @@ mod tests {
             jwt_svid_audience: "https://auth.example.com",
             audience: "api://resource-one",
             scopes: &write_scope,
-            cache_ttl_override: 0,
+            cache_ttl_override: None,
             expires_in: 60,
             grant_calls: grant_calls.clone(),
         })
@@ -995,7 +1022,7 @@ mod tests {
             jwt_svid_audience,
             audience,
             scopes: &scopes,
-            cache_ttl_override: 0,
+            cache_ttl_override: None,
             expires_in: 60,
             grant_calls: grant_calls.clone(),
         })
@@ -1019,7 +1046,7 @@ mod tests {
             jwt_svid_audience: "https://auth.example.com",
             audience: "api://resource",
             scopes: &scopes,
-            cache_ttl_override: 60,
+            cache_ttl_override: Some(Duration::from_mins(1)),
             expires_in: 0,
             grant_calls: grant_calls.clone(),
         })
@@ -1032,7 +1059,7 @@ mod tests {
             "https://auth.example.com",
             "api://resource",
             &scopes,
-            60,
+            Some(Duration::from_mins(1)),
         )
         .await
         .expect("override should keep token cached");
@@ -1040,6 +1067,28 @@ mod tests {
         assert_eq!(first, "token-1");
         assert_eq!(second, "token-1");
         assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn obtain_provider_token_zero_cache_ttl_does_not_cache() {
+        let cache = TokenCache::new();
+        let grant_calls = Arc::new(AtomicUsize::new(0));
+        let scopes = vec!["read".to_string()];
+        let input = || CountedTokenGrantInput {
+            cache: &cache,
+            provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: Some(Duration::ZERO),
+            expires_in: 60,
+            grant_calls: grant_calls.clone(),
+        };
+
+        assert_eq!(obtain_counted_test_token(input()).await.unwrap(), "token-1");
+        assert_eq!(obtain_counted_test_token(input()).await.unwrap(), "token-2");
+        assert_eq!(grant_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install OpenShell CLI
+      become: true
+      ansible.builtin.copy:
+        src: "{{ openshell_cli_binary }}"
+        dest: /usr/local/bin/openshell
+        mode: "0755"
+
+    - name: Install OpenShell gateway
+      become: true
+      ansible.builtin.copy:
+        src: "{{ openshell_gateway_binary }}"
+        dest: /usr/local/bin/openshell-gateway
+        mode: "0755"

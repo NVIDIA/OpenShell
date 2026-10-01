@@ -172,9 +172,7 @@ pub struct Networking {
 /// the workload child (entered via `setns()` in `pre_exec`).
 ///
 /// `denial_tx` and `denial_rx` are owned by the caller. The proxy uses the
-/// sender; the aggregator owns the receiver. The caller is also responsible
-/// for cloning `denial_tx` for the bypass monitor (which lives in
-/// `openshell-supervisor-process`).
+/// sender; the aggregator owns the receiver.
 ///
 /// # Errors
 ///
@@ -274,7 +272,7 @@ pub async fn run_networking(
                             "Container filesystem accessible, resolving policy binary symlinks"
                         );
                         match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                            Ok(()) => {
+                            Ok(_) => {
                                 info!(
                                     pid = pid,
                                     "Policy binary symlink resolution complete \

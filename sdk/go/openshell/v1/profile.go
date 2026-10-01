@@ -61,5 +61,5 @@ type ProfileInterface interface {
 	Import(ctx context.Context, workspace string, items []ProfileImportItem) (*ImportResult, error)
 	Update(ctx context.Context, workspace, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error)
 	Lint(ctx context.Context, workspace string, items []ProfileImportItem) (*LintResult, error)
-	Delete(ctx context.Context, workspace, id string) (bool, error)
+	Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error)
 }

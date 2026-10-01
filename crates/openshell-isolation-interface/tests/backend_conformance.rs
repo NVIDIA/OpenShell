@@ -97,9 +97,10 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
         Ok(PendingTcpOpen {
             stream: Box::new(near),
             binary_identity: Ok(BinaryIdentity {
-                binary_path: PathBuf::from("/usr/bin/agent"),
-                binary_digest: K::HAS_DIGEST
-                    .then(|| "00".repeat(32).parse().expect("valid digest")),
+                executable: ExecutableIdentity {
+                    path: PathBuf::from("/usr/bin/agent"),
+                    digest: K::HAS_DIGEST.then(|| "00".repeat(32).parse().expect("valid digest")),
+                },
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
@@ -192,6 +193,7 @@ impl BoundaryExec for MockExec {
             stdout: Box::new(out_r),
             stderr: (!spec.pty).then_some(stderr),
             terminal: spec.pty.then_some(terminal),
+            output_status: None,
         })
     }
 }
@@ -239,7 +241,7 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         ConfirmedBoundary::try_new(
             Box::new(MockReady::<K> { _k: PhantomData }),
-            confirmation_evidence(),
+            confirmation(),
             &workload_identity(),
         )
     }
@@ -368,80 +370,73 @@ fn workload_identity() -> ResolvedWorkloadIdentity {
     .unwrap()
 }
 
-fn confirmation_evidence() -> SandboxConfirmEvidence {
-    SandboxConfirmEvidence {
+fn complete_outer_fence(generation: &str, evidence: &[u8]) -> OuterFenceGuarantees {
+    OuterFenceGuarantees::from_enforcement_evidence(
+        generation,
+        [
+            OuterFenceGuarantee::DefaultDenyEgress,
+            OuterFenceGuarantee::NoUnmanagedEgressPath,
+            OuterFenceGuarantee::RevocationVerified,
+            OuterFenceGuarantee::ControllerLossFailsClosed,
+        ],
+        evidence,
+    )
+    .unwrap()
+}
+
+fn confirmation() -> BoundaryConfirmation {
+    BoundaryConfirmation {
         generation: "generation-1".to_string(),
         identity: workload_identity(),
-        capabilities: CapabilityEvidence {
-            inheritable: 0,
-            permitted: 0,
-            effective: 0,
-            bounding: 0,
-            ambient: 0,
+        properties: BoundaryProperties {
+            filesystem_confinement: EnforcedProperty::new(true, "mock-filesystem"),
+            egress_interception: EnforcedProperty::new(true, "mock-egress"),
+            request_attribution: EnforcedProperty::new(true, "mock-attribution"),
+            privilege_floor: EnforcedProperty::new(true, "mock-privilege-floor"),
         },
-        no_new_privileges: true,
-        sandbox_dumpable: false,
-        child_dumpable: true,
-        core_limit_zero: true,
-        native_architecture: std::env::consts::ARCH.to_string(),
-        kernel_release: "test".to_string(),
-        seccomp: SeccompEvidence {
-            new_listener: true,
-            notification_round_trip: true,
-            id_validation: true,
-            addfd_send: true,
-            retained_socket_operation: true,
-            proc_fd_identity: true,
-            task_memory_read: true,
-            task_memory_write: true,
-            cancellation: true,
-        },
-        landlock_abi: 3,
-        landlock_allow_deny: true,
-        udp_dns_round_trip: true,
-        tcp_dns_round_trip: true,
-        tcp_allow_round_trip: true,
-        tcp_deny_round_trip: true,
         authenticated_supervisor: true,
         session_id: SandboxSessionId::new(),
-        driver_fence: DriverFenceEvidence::Vm {
-            generation: "generation-1".to_string(),
-            network_device_count: 0,
-        },
+        outer_fence: complete_outer_fence("generation-1", b"mock-fence-evidence"),
         runtime_exit_terminates_workload: true,
         resource_claims: BTreeMap::new(),
+        backend_audit: serde_json::json!({"backend": "mock"}),
     }
 }
 
 #[test]
-fn driver_fence_evidence_is_backend_specific_and_fail_closed() {
-    let docker = DriverFenceEvidence::Docker {
-        container_id: "sha256:container".to_string(),
-        network_mode: "none".to_string(),
-        unexpected_networks: Vec::new(),
-    };
-    let kubernetes = DriverFenceEvidence::Kubernetes {
-        network_policy_uid: "policy-uid".to_string(),
-        network_policy_resource_version: "42".to_string(),
-        ingress_isolated: true,
-        egress_isolated: true,
-        egress_rule_count: 0,
-    };
-    let vm = DriverFenceEvidence::Vm {
-        generation: "generation-1".to_string(),
-        network_device_count: 0,
-    };
+fn outer_fence_guarantees_are_backend_neutral_and_fail_closed() {
+    let fence = complete_outer_fence("generation-1", b"native-driver-evidence");
+    assert!(fence.validate("generation-1").is_ok());
+    assert_ne!(
+        fence.evidence_digest,
+        complete_outer_fence("generation-2", b"native-driver-evidence").evidence_digest
+    );
 
-    assert!(docker.validate().is_ok());
-    assert!(kubernetes.validate().is_ok());
-    assert!(vm.validate().is_ok());
+    let mut wrong_generation = fence.clone();
+    wrong_generation.generation = "generation-2".to_string();
+    assert!(wrong_generation.validate("generation-1").is_err());
 
-    let drifted = DriverFenceEvidence::Docker {
-        container_id: "sha256:container".to_string(),
-        network_mode: "bridge".to_string(),
-        unexpected_networks: vec!["bridge".to_string()],
-    };
-    assert!(drifted.validate().is_err());
+    for guarantee in [
+        OuterFenceGuarantee::DefaultDenyEgress,
+        OuterFenceGuarantee::NoUnmanagedEgressPath,
+        OuterFenceGuarantee::RevocationVerified,
+        OuterFenceGuarantee::ControllerLossFailsClosed,
+    ] {
+        let mut incomplete = fence.clone();
+        incomplete.established.remove(&guarantee);
+        assert!(incomplete.validate("generation-1").is_err());
+    }
+
+    assert!(OuterFenceGuarantees::from_enforcement_evidence("", [], b"evidence").is_err());
+    assert!(OuterFenceGuarantees::from_enforcement_evidence("generation-1", [], b"").is_err());
+
+    let unproven = OuterFenceGuarantees::from_enforcement_evidence(
+        "generation-1",
+        [OuterFenceGuarantee::DefaultDenyEgress],
+        b"native-driver-evidence",
+    )
+    .unwrap();
+    assert!(unproven.validate("generation-1").is_err());
 }
 
 /// The backend-independent supervisor sequence. Identical for every backend:
@@ -458,7 +453,7 @@ async fn drive(
     let _ingress = bound.network_mediation_source();
     assert_eq!(bound.host_gateway_ip(), None);
     let confirmed = bound.confirm().await?;
-    confirmed.evidence().validate(&sandbox_ctx().identity)?;
+    confirmed.confirmation().validate(&sandbox_ctx().identity)?;
     confirmed.into_boundary().start_agent().await
 }
 
@@ -536,12 +531,12 @@ async fn one_driver_runs_both_backends() {
 }
 
 #[test]
-fn confirmation_constructor_rejects_incomplete_evidence() {
-    let mut evidence = confirmation_evidence();
-    evidence.seccomp.cancellation = false;
+fn confirmation_constructor_rejects_unenforced_property() {
+    let mut confirmation = confirmation();
+    confirmation.properties.egress_interception.enforced = false;
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
-        evidence,
+        confirmation,
         &workload_identity(),
     );
     assert!(matches!(result, Err(BackendError::Confirm(_))));
@@ -559,7 +554,7 @@ fn confirmation_constructor_rejects_another_workload_identity() {
     .unwrap();
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
-        confirmation_evidence(),
+        confirmation(),
         &expected,
     );
     assert!(matches!(result, Err(BackendError::Confirm(_))));
@@ -626,7 +621,7 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
 
     let conn = source.accept_tcp().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
+    assert_eq!(identity.executable.path, PathBuf::from("/usr/bin/agent"));
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +704,8 @@ async fn exec_session_owns_its_process_and_streams() {
         .exec(ExecSpec {
             program: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "true".to_string()],
+            shell: None,
+            runtime_helper: None,
             env: vec![],
             workdir: None,
             pty: false,
@@ -730,6 +727,8 @@ async fn pty_exec_merges_output_and_supports_resize() {
         .exec(ExecSpec {
             program: "/bin/sh".to_string(),
             args: vec![],
+            shell: None,
+            runtime_helper: None,
             env: vec![],
             workdir: None,
             pty: true,
@@ -789,10 +788,10 @@ async fn pending_network_open_carries_socket_bound_identity() {
         .await
         .expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
+    assert_eq!(identity.executable.path, PathBuf::from("/usr/bin/agent"));
     // A missing digest is `None`, never an empty value.
     assert_eq!(
-        identity.binary_digest.expect("digest").to_string(),
+        identity.executable.digest.expect("digest").to_string(),
         "00".repeat(32)
     );
     assert_eq!(conn.destination, "203.0.113.10:443".parse().unwrap());
@@ -806,7 +805,7 @@ async fn missing_digest_is_none_never_empty() {
     let source = MockSource::<Secondary>(PhantomData);
     let conn = source.accept_tcp().await.expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert!(identity.binary_digest.is_none());
+    assert!(identity.executable.digest.is_none());
 }
 
 #[test]
@@ -842,16 +841,16 @@ fn workload_identity_rejects_root_and_normalizes_groups() {
 }
 
 #[test]
-fn confirmation_evidence_rejects_identity_or_posture_drift() {
+fn confirmation_rejects_identity_or_property_drift() {
     let expected = workload_identity();
-    let evidence = confirmation_evidence();
-    evidence.validate(&expected).unwrap();
+    let baseline = confirmation();
+    baseline.validate(&expected).unwrap();
 
-    let mut drifted = confirmation_evidence();
-    drifted.capabilities.effective = 1;
+    let mut drifted = confirmation();
+    drifted.properties.privilege_floor.enforced = false;
     assert!(drifted.validate(&expected).is_err());
 
-    let mut unmanaged = confirmation_evidence();
+    let mut unmanaged = confirmation();
     unmanaged.runtime_exit_terminates_workload = false;
     assert!(unmanaged.validate(&expected).is_err());
 
@@ -863,7 +862,7 @@ fn confirmation_evidence_rejects_identity_or_posture_drift() {
         "sha256:test".into(),
     )
     .unwrap();
-    assert!(evidence.validate(&different).is_err());
+    assert!(baseline.validate(&different).is_err());
 }
 
 // ---------------------------------------------------------------------------

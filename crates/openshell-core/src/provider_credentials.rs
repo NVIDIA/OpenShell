@@ -17,14 +17,33 @@ const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentialSnapshot {
+    /// Identifies this local installation, including repairs at the same revision.
+    pub installation_id: String,
     pub revision: u64,
     pub child_env: HashMap<String, String>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
 }
 
+/// One atomic workload-facing snapshot and its local installation identity.
+///
+/// Only the prepared environment crosses an isolation boundary; resolver
+/// material remains in the supervisor. The identity distinguishes an empty
+/// fail-closed snapshot from a later repair with the same provider revision.
+pub struct ChildEnvironmentSnapshot {
+    /// Opaque identity of the installed supervisor snapshot.
+    pub installation_id: String,
+    /// Opaque provider content fingerprint, never an ordered counter.
+    pub revision: u64,
+    /// Prepared environment used by future workload processes.
+    pub environment: HashMap<String, String>,
+    /// Complete desired set of non-secret files for this installation.
+    pub files: HashMap<String, String>,
+}
+
 #[derive(Debug)]
 struct ProviderCredentialStateInner {
     current: Arc<ProviderCredentialSnapshot>,
+    files: HashMap<String, String>,
     generations: VecDeque<Arc<SecretResolver>>,
     current_resolver: Option<Arc<SecretResolver>>,
     combined_resolver: Option<Arc<SecretResolver>>,
@@ -92,6 +111,7 @@ impl ProviderCredentialState {
                 revision,
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -103,6 +123,7 @@ impl ProviderCredentialState {
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations,
                 current_resolver,
                 combined_resolver,
@@ -167,6 +188,7 @@ impl ProviderCredentialState {
                 &stable_handles,
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -185,6 +207,7 @@ impl ProviderCredentialState {
         Ok(Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations,
                 current_resolver,
                 combined_resolver,
@@ -210,6 +233,7 @@ impl ProviderCredentialState {
     /// or holding the gateway-side resolver material.
     pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -218,6 +242,7 @@ impl ProviderCredentialState {
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations: VecDeque::new(),
                 current_resolver: None,
                 combined_resolver: None,
@@ -254,6 +279,7 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -429,25 +455,23 @@ impl ProviderCredentialState {
         inner.suppressed_keys.insert(key.to_string());
         let mut env = (*inner.current).clone();
         env.child_env.remove(key);
+        env.installation_id = uuid::Uuid::new_v4().to_string();
         inner.current = Arc::new(env);
     }
 
-    /// Return `child_env` with GCP static config vars resolved to real values.
+    /// Return `child_env` with explicitly non-secret config vars resolved.
     ///
-    /// The credential pipeline placeholderizes ALL env values, but GCP SDKs
-    /// and coding agents read certain vars (project ID, region, metadata host)
-    /// at process startup before any HTTP request flows through the proxy.
-    /// This method overrides those vars with resolved real values while
-    /// keeping secret credentials (like `GCP_ACCESS_TOKEN`) as placeholders.
+    /// The credential pipeline placeholderizes all env values. Workloads need
+    /// non-secret configuration, including provider file paths, at process
+    /// startup before any HTTP request flows through the proxy. Credential
+    /// values remain placeholders.
     ///
     /// Three layers of env var injection:
     /// 1. **Synthetic vars** (`GCE_METADATA_IP`, `METADATA_SERVER_DETECTION`)
     ///    — sandbox-internal config not from user
     ///    input, inserted directly here with real values.
-    /// 2. **`google_cloud::STATIC_CONFIG_KEYS`** — user-provided non-secret config
-    ///    (project ID, region, SA email) that was placeholderized by
-    ///    `ProviderPlugin::inject_env` → `SecretResolver`; un-placeholderized
-    ///    here so SDKs can read them at startup.
+    /// 2. **Classified non-secret keys** — user-provided config and provider
+    ///    file paths un-placeholderized so workloads can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
         let inner = self
@@ -474,6 +498,29 @@ impl ProviderCredentialState {
         Ok(Self::resolve_child_env_snapshot(&inner))
     }
 
+    /// Capture installation identity and prepared environment under one lock.
+    pub fn child_environment_snapshot(&self) -> std::io::Result<ChildEnvironmentSnapshot> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        let (revision, environment) = Self::resolve_child_env_snapshot(&inner);
+        Ok(ChildEnvironmentSnapshot {
+            installation_id: inner.current.installation_id.clone(),
+            revision,
+            environment,
+            files: inner.files.clone(),
+        })
+    }
+
+    /// Attach the complete file set to a prepared provider snapshot.
+    pub fn set_managed_files(&self, files: HashMap<String, String>) {
+        self.inner
+            .write()
+            .expect("provider credential state poisoned")
+            .files = files;
+    }
+
     fn resolve_child_env_snapshot(
         inner: &ProviderCredentialStateInner,
     ) -> (u64, HashMap<String, String>) {
@@ -485,11 +532,7 @@ impl ProviderCredentialState {
             && inner
                 .non_secret_environment_keys
                 .contains("GCE_METADATA_HOST");
-        let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
-            .iter()
-            .any(|key| env.contains_key(*key) && inner.non_secret_environment_keys.contains(*key));
-
-        if !has_gcp_metadata && !has_gcp_config {
+        if !has_gcp_metadata && inner.non_secret_environment_keys.is_empty() {
             return (inner.current.revision, env);
         }
 
@@ -514,16 +557,15 @@ impl ProviderCredentialState {
             );
         }
 
-        // Un-placeholderize non-secret config vars so SDKs can read them
-        // at process startup before any HTTP flows through the proxy.
+        // Only explicitly classified non-secret values may be unwrapped.
         if let Some(ref resolver) = inner.combined_resolver {
-            for key in google_cloud::STATIC_CONFIG_KEYS
-                .iter()
-                .filter(|key| inner.non_secret_environment_keys.contains(**key))
-            {
+            for key in &inner.non_secret_environment_keys {
+                if !env.contains_key(key) || (has_gcp_metadata && key == "GCE_METADATA_HOST") {
+                    continue;
+                }
                 let placeholder = crate::secrets::placeholder_for_env_key(key);
                 if let Some(value) = resolver.resolve_placeholder(&placeholder) {
-                    env.insert(key.to_string(), value.to_string());
+                    env.insert(key.clone(), value.to_string());
                 }
             }
         }
@@ -534,8 +576,9 @@ impl ProviderCredentialState {
     /// Compare and install a workload-facing environment snapshot.
     ///
     /// Provider environment revisions are opaque content identities, not
-    /// ordered counters. The expected revision makes retries idempotent while
-    /// rejecting updates based on a stale view of the boundary state.
+    /// ordered counters. The expected revision rejects a different current
+    /// fingerprint. Callers must also fence publication order when a failed
+    /// refresh and its repair can share that fingerprint.
     pub fn compare_and_install_child_env_snapshot(
         &self,
         expected_revision: u64,
@@ -546,14 +589,19 @@ impl ProviderCredentialState {
             .inner
             .write()
             .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
-        if revision == inner.current.revision || expected_revision != inner.current.revision {
+        if expected_revision != inner.current.revision {
             return Ok(inner.current.revision);
         }
+
+        // A failed refresh can clear the map without changing its provider
+        // fingerprint. A matching expectation must therefore install even an
+        // equal revision. Boundary publication ordering fences delayed retries.
 
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -630,6 +678,7 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -723,6 +772,7 @@ impl ProviderCredentialState {
             child_env.remove(key);
         }
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -758,6 +808,81 @@ impl ProviderCredentialState {
         Ok(inner.current.child_env.len())
     }
 
+    /// Install a validated candidate without repeating fallible compilation.
+    ///
+    /// Existing clones keep observing this live state. Preserve suppressed
+    /// environment keys and identity history so refresh cannot restore removed
+    /// keys or authorize old placeholders for a different provider. Callers
+    /// must serialize installs and revocations, as for bound-environment installs.
+    pub fn install_prepared(&self, prepared: &Self) -> usize {
+        // Release the candidate lock before taking the live lock, including
+        // when a caller passes another handle to the same state.
+        let (
+            snapshot,
+            generations,
+            current_resolver,
+            bindings,
+            non_secret_keys,
+            files,
+            requires_stable_placeholders,
+        ) = {
+            let candidate = prepared
+                .inner
+                .read()
+                .expect("provider credential state poisoned");
+            (
+                (*candidate.current).clone(),
+                candidate.generations.clone(),
+                candidate.current_resolver.clone(),
+                candidate.static_credential_bindings.clone(),
+                candidate.non_secret_environment_keys.clone(),
+                candidate.files.clone(),
+                candidate.requires_stable_placeholders,
+            )
+        };
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        let mut snapshot = snapshot;
+        for key in &inner.suppressed_keys {
+            snapshot.child_env.remove(key);
+        }
+        if static_credential_identities(&inner.static_credential_bindings)
+            != static_credential_identities(&bindings)
+        {
+            inner.generations.clear();
+        }
+        inner.generations.extend(generations);
+        while inner.generations.len() > MAX_RETAINED_CREDENTIAL_GENERATIONS {
+            inner.generations.pop_front();
+        }
+        inner.current_resolver = current_resolver;
+        inner.combined_resolver =
+            merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
+        inner
+            .known_static_credential_keys
+            .extend(bindings.keys().cloned());
+        update_static_credential_identity_epochs(
+            &mut inner.static_credential_identity_epochs,
+            snapshot.revision,
+            &bindings,
+        );
+        inner.static_credential_bindings = bindings;
+        inner.non_secret_environment_keys = non_secret_keys;
+        inner.files = files;
+        // Prepared installation is the refresh commit point. Carry its
+        // acknowledged delivery requirement into later fetches, including
+        // failures that revoke credentials without removing the requirement.
+        inner.requires_stable_placeholders = requires_stable_placeholders;
+        inner.body_inventory_available = true;
+        inner
+            .known_body_keys
+            .extend(snapshot.child_env.keys().cloned());
+        inner.current = Arc::new(snapshot);
+        inner.current.child_env.len()
+    }
+
     /// Atomically remove static provider material after a failed refresh.
     ///
     /// Dynamic token grants retain their independently endpoint-bound state
@@ -783,6 +908,7 @@ impl ProviderCredentialState {
         let dynamic_credentials =
             dynamic_credentials.unwrap_or_else(|| inner.current.dynamic_credentials.clone());
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env: HashMap::new(),
             dynamic_credentials,
@@ -2486,6 +2612,33 @@ mod tests {
     }
 
     #[test]
+    fn child_env_resolves_provider_file_path_but_keeps_credentials_placeholderized() {
+        let path = "/run/openshell/providers/acme/client.toml";
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([
+                ("ACME_CONFIG_FILE".to_string(), path.to_string()),
+                ("ACME_TOKEN".to_string(), "secret-token".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "ACME_TOKEN".to_string(),
+                binding("api.acme.example", 443, "/**"),
+            )]),
+            vec!["ACME_CONFIG_FILE".to_string()],
+        )
+        .expect("classified provider environment");
+
+        let env = state.child_env_with_gcp_resolved();
+        assert_eq!(env.get("ACME_CONFIG_FILE").map(String::as_str), Some(path));
+        assert_eq!(
+            env.get("ACME_TOKEN").map(String::as_str),
+            Some("openshell:resolve:env:v1_ACME_TOKEN")
+        );
+    }
+
+    #[test]
     fn child_env_with_gcp_resolved_overrides_gcp_static_vars() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
@@ -2777,6 +2930,95 @@ mod tests {
     }
 
     #[test]
+    fn prepared_install_retains_placeholders_for_same_provider_identity() {
+        let make_state = |revision, secret: &str| {
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    binding("api.example.com", 443, "/**"),
+                )]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first-secret");
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.install_prepared(&make_state(2, "second-secret"));
+        let resolver = live
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert_eq!(
+            resolver.resolve_placeholder(&old_placeholder),
+            Some("first-secret")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            Some("second-secret"),
+        );
+    }
+
+    #[test]
+    fn prepared_install_restores_body_inventory_after_revocation() {
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        live.revoke_static_provider_environment(2);
+        assert!(!live.inner.read().unwrap().body_inventory_available);
+        let candidate = ProviderCredentialState::from_bound_environment(
+            3,
+            HashMap::from([("NEW_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "NEW_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        live.install_prepared(&candidate);
+        let inner = live.inner.read().unwrap();
+        assert!(inner.body_inventory_available);
+        assert!(inner.known_body_keys.contains("NEW_KEY"));
+    }
+
+    #[test]
+    fn prepared_install_preserves_suppression_and_rejects_replaced_identity() {
+        let make_state = |revision, identity: &str, secret: &str| {
+            let mut binding = binding("api.example.com", 443, "/**");
+            binding.credential_identity = identity.to_string();
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), binding)]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first:API_KEY", "first-secret");
+        let observer = live.clone();
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.remove_env_key("API_KEY");
+        let candidate = make_state(2, "second:API_KEY", "second-secret");
+        live.install_prepared(&candidate);
+        assert_eq!(observer.snapshot().revision, 2);
+        assert!(!observer.snapshot().child_env.contains_key("API_KEY"));
+        let resolver = observer
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
+    }
+
+    #[test]
     fn suppressed_keys_survive_install_environment() {
         let state = ProviderCredentialState::from_environment(
             1,
@@ -2876,6 +3118,26 @@ mod tests {
         let (revision, env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
         assert_eq!(revision, 2);
         assert!(env.is_empty(), "an empty snapshot must revoke the old env");
+    }
+
+    #[test]
+    fn child_environment_repair_replaces_an_empty_map_at_the_same_revision() {
+        let state = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
+        let failed = state.child_environment_snapshot().unwrap();
+        state
+            .compare_and_install_child_env_snapshot(
+                6,
+                6,
+                HashMap::from([("TOKEN".to_string(), "reference".to_string())]),
+            )
+            .unwrap();
+        let repaired = state.child_environment_snapshot().unwrap();
+        assert_ne!(failed.installation_id, repaired.installation_id);
+        assert_eq!(repaired.revision, 6);
+        assert_eq!(
+            repaired.environment.get("TOKEN").map(String::as_str),
+            Some("reference")
+        );
     }
 
     #[test]

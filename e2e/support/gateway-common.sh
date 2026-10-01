@@ -9,6 +9,88 @@
 # Keep an explicit override so telemetry-specific tests can opt back in.
 export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
 
+# Resolve a test image override. Repository-only values inherit the caller's
+# tag, while tagged and digest-pinned references are already complete.
+e2e_image_reference_is_complete() {
+  local image=$1
+  local last_component="${image##*/}"
+
+  [[ "${image}" == *@* || "${last_component}" == *:* ]]
+}
+
+e2e_image_reference_has_digest() {
+  [[ "$1" == *@* ]]
+}
+
+e2e_resolve_image_reference() {
+  local image=$1
+  local tag=$2
+
+  if e2e_image_reference_is_complete "${image}"; then
+    printf '%s\n' "${image}"
+  else
+    printf '%s:%s\n' "${image%/}" "${tag}"
+  fi
+}
+
+e2e_image_reference_repository() {
+  local image=$1
+  local repository="${image%%@*}"
+  local last_component="${repository##*/}"
+
+  if [[ "${last_component}" == *:* ]]; then
+    repository="${repository%:*}"
+  fi
+  printf '%s\n' "${repository}"
+}
+
+# Return the registry portion of an image repository. Docker treats the first
+# path component as a registry when it contains a dot or colon, or is
+# `localhost`; otherwise the image uses the configured/default registry.
+e2e_image_reference_registry() {
+  local repository
+  local first_component
+
+  repository="$(e2e_image_reference_repository "$1")"
+  first_component="${repository%%/*}"
+  if [[ "${repository}" == */* ]] \
+    && { [[ "${first_component}" == *.* ]] || [[ "${first_component}" == *:* ]] || [[ "${first_component}" == "localhost" ]]; }; then
+    printf '%s\n' "${first_component}"
+  fi
+}
+
+# Return the repository path without its registry, suitable for Helm's
+# <component>.image.repository values.
+e2e_image_reference_repository_path() {
+  local repository
+  local registry
+
+  repository="$(e2e_image_reference_repository "$1")"
+  registry="$(e2e_image_reference_registry "$1")"
+  if [ -n "${registry}" ]; then
+    printf '%s\n' "${repository#"${registry}"/}"
+  else
+    printf '%s\n' "${repository}"
+  fi
+}
+
+e2e_image_reference_tag() {
+  local image=$1
+  local repository="${image%%@*}"
+  local last_component="${repository##*/}"
+
+  if [[ "${image}" == *@* || "${last_component}" != *:* ]]; then
+    return 0
+  fi
+  printf '%s\n' "${last_component##*:}"
+}
+
+e2e_image_reference_digest() {
+  if [[ "$1" == *@* ]]; then
+    printf '%s\n' "${1#*@}"
+  fi
+}
+
 e2e_cargo_target_dir() {
   local root=$1
   shift
@@ -144,6 +226,111 @@ e2e_register_mtls_gateway() {
 }
 EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+}
+
+# Import the example provider profiles at platform scope.
+#
+# OpenShell compiles no provider profile into a binary, so a freshly started
+# gateway serves an empty catalog. The e2e suites exercise providers built from
+# github, openai, nvidia and the rest, which means the lane has to import them
+# first — the same step the upgrade notes give operators.
+e2e_import_example_provider_profiles() {
+  local cli_bin=$1
+  local root=$2
+
+  echo "Importing example provider profiles from ${root}/providers..."
+  if ! "${cli_bin}" provider profile import --from "${root}/providers" --global; then
+    echo "ERROR: failed to import example provider profiles" >&2
+    return 1
+  fi
+}
+
+# Register an administrator OIDC session for a gateway, non-interactively.
+#
+# The browser PKCE flow the CLI normally uses cannot run unattended, so mint an
+# admin access token with Keycloak's password grant and write the same token
+# bundle `openshell gateway login` would have stored. Used only to establish a
+# setup identity; the tests themselves still authenticate however they choose.
+e2e_register_oidc_admin_session() {
+  local config_home=$1
+  local name=$2
+  local endpoint=$3
+  local port=$4
+  local issuer=$5
+  local username=$6
+  local password=$7
+  local pki_dir=$8
+  local cli_bin=$9
+  local client_id="${10:-openshell-cli}"
+  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+
+  # The OpenShell scopes are optional client scopes on openshell-cli, so
+  # Keycloak mints them only when they are asked for. Without an explicit
+  # scope the token carries the realm defaults alone and every authorized RPC
+  # fails with "scope '<name>' required".
+  local token
+  token=$(curl -sf -X POST "${issuer}/protocol/openid-connect/token" \
+    -d "grant_type=password" \
+    -d "client_id=${client_id}" \
+    -d "username=${username}" \
+    -d "password=${password}" \
+    --data-urlencode "scope=openid openshell:all" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
+
+  if [ -z "${token}" ]; then
+    echo "ERROR: could not obtain an admin OIDC token from ${issuer}" >&2
+    return 1
+  fi
+
+  mkdir -p "${gateway_config_dir}"
+
+  # Trust the gateway's self-signed serving certificate. Only the CA is
+  # installed: these lanes start the gateway without --tls-client-ca, and with
+  # no client cert/key on disk the CLI falls back to CA-only server
+  # verification and authenticates with the bearer token instead of an mTLS
+  # identity.
+  mkdir -p "${gateway_config_dir}/mtls"
+  cp "${pki_dir}/ca.crt" "${gateway_config_dir}/mtls/ca.crt"
+
+  # auth_mode must be "oidc": the CLI dispatches on this field alone when
+  # deciding to load a stored bearer token, so omitting it leaves
+  # oidc_token.json on disk and unread, and the request goes unauthenticated.
+  cat >"${gateway_config_dir}/metadata.json" <<EOF
+{
+  "name": "${name}",
+  "gateway_endpoint": "${endpoint}",
+  "is_remote": false,
+  "gateway_port": ${port},
+  "auth_mode": "oidc",
+  "oidc_issuer": "${issuer}",
+  "oidc_client_id": "${client_id}",
+  "oidc_scopes": "openid openshell:all"
+}
+EOF
+  cat >"${gateway_config_dir}/oidc_token.json" <<EOF
+{
+  "access_token": "${token}",
+  "issuer": "${issuer}",
+  "client_id": "${client_id}"
+}
+EOF
+  chmod 600 "${gateway_config_dir}/oidc_token.json"
+  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+
+  # Assert the CLI reaches the gateway as an authenticated administrator before
+  # anything depends on it. ListProviderProfiles is annotated
+  # auth_mode: "bearer", so it cannot succeed unless the stored token was
+  # loaded and accepted -- this fails here, with the cause named, rather than
+  # surfacing later as an opaque profile import error.
+  if ! "${cli_bin}" provider list-profiles --global --output json >/dev/null 2>&1; then
+    echo "ERROR: the CLI could not make an authenticated call as the OIDC administrator" >&2
+    echo "       gateway config: ${gateway_config_dir}" >&2
+    echo "       CLI output follows:" >&2
+    "${cli_bin}" provider list-profiles --global --output json >&2 || true
+    return 1
+  fi
+
+  echo "Established an authenticated OIDC administrator session for '${name}'."
 }
 
 e2e_toml_string() {

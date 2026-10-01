@@ -3,13 +3,15 @@
 
 #![cfg(feature = "e2e-docker")]
 
-//! External credential rotation through a real sandbox HTTPS request path.
+//! External caller assertion rotation through a real sandbox HTTPS request path.
 //!
-//! The workload keeps one supervisor-issued reference in one Python process.
+//! The workload sends a synthetic `tools/call` request using one retained
+//! supervisor-issued reference in one Python process. The fixture exercises
+//! credential substitution, not a complete MCP session or an agent runtime.
 //! Only the isolated backend and privileged provider CLI receive synthetic keys;
 //! workload files, responses, and diagnostics contain status information only.
 
-use std::collections::HashSet;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -17,7 +19,8 @@ use std::time::Duration;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::{ContainerEngine, e2e_network_name};
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -32,7 +35,8 @@ const CONTROL: &str = "/sandbox/stable-placeholder-probe";
 const RESULT: &str = "/sandbox/stable-placeholder-result";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
-const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(90);
+const READINESS_TIMEOUT_SECONDS: &str = "90";
+const READINESS_COMMAND_TIMEOUT: Duration = Duration::from_secs(105);
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Keys arrive on a private stdin pipe after process creation. Neither the
@@ -44,7 +48,8 @@ sys.excepthook = lambda *_: None
 config = json.loads(sys.stdin.readline())
 keys = config.pop('keys')
 lock = threading.Lock()
-state = {'phase': 0, 'total': 0, 'accepted': [0, 0], 'rejected': 0}
+state = {'phase': 0, 'total': 0, 'accepted': [0, 0], 'rejected': 0,
+         'received': [0, 0], 'missing': 0, 'unknown': 0, 'invalid_tool_calls': 0}
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -55,15 +60,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
     def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
+        tool_call = (request.get('jsonrpc') == '2.0' and request.get('method') == 'tools/call'
+                     and request.get('params') == {'name': 'local_hello',
+                                                   'arguments': {'name': 'rotation-proof'}})
         with lock:
             phase = state['phase']
-            valid = self.headers.get('Authorization') == 'Bearer ' + keys[phase]
+            assertion = self.headers.get('x-openshell-sandbox-assertion')
+            generation = 'missing' if assertion is None else 'unknown'
+            for index, key in enumerate(keys):
+                if assertion == key:
+                    generation = 'A' if index == 0 else 'B'
+                    state['received'][index] += 1
+            if generation in ('missing', 'unknown'):
+                state[generation] += 1
+            if not tool_call:
+                state['invalid_tool_calls'] += 1
+            valid = assertion == keys[phase] and tool_call
             state['total'] += 1
             if valid:
                 state['accepted'][phase] += 1
             else:
                 state['rejected'] += 1
-        body = json.dumps({'authorized': valid, 'phase': phase}).encode()
+        response = {'jsonrpc': '2.0', 'id': request.get('id'),
+                    'fixture': {'authorized': valid, 'phase': phase,
+                                'credential_generation': generation, 'tool_call': tool_call}}
+        if valid:
+            response['result'] = {'content': [{'type': 'text', 'text': 'Hello rotation-proof'}]}
+        else:
+            response['error'] = {'code': -32001, 'message': 'Unauthorized'}
+        body = json.dumps(response).encode()
         self.send_response(200 if valid else 401)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
@@ -101,15 +127,16 @@ import json, os, pathlib, re, ssl, sys, time, urllib.error, urllib.request
 config = json.loads(sys.argv[1])
 key = 'STABLE_EXTERNAL_E2E_TOKEN'
 token = os.environ.get(key, '')
-if not re.fullmatch(r'openshell:resolve:env:s[0-9a-f]{64}_' + key, token):
-    print('client did not receive an identity-bound reference', flush=True)
+pattern = r's[0-9a-f]{64}' if config['stable'] else r'v[1-9][0-9]*'
+if not re.fullmatch(r'openshell:resolve:env:' + pattern + '_' + key, token):
+    print('client did not receive the expected issued reference', flush=True)
     sys.exit(64)
 pid = os.getpid()
 control = pathlib.Path('/sandbox/stable-placeholder-probe')
 result = pathlib.Path('/sandbox/stable-placeholder-result')
 
 def probe(phase):
-    host, port, path = config['host'], config['port'], '/v1/chat/completions'
+    host, port, path = config['host'], config['port'], '/mcp/local-hello'
     authorization = token
     target = phase[:-8] if phase.endswith('_control') else phase
     if target == 'wrong_host':
@@ -122,7 +149,8 @@ def probe(phase):
         authorization = 'openshell:resolve:env:' + key
     url = 'https://%s:%s%s' % (host, port, path)
     response = {'phase': phase, 'pid': pid, 'same_reference': os.environ.get(key) == token,
-                'ok': False, 'status': 0, 'backend_phase': -1}
+                'ok': False, 'status': 0, 'backend_phase': -1,
+                'credential_generation': 'unobserved', 'tool_call': False}
     try:
         context = ssl.create_default_context()
         if phase == 'untrusted_ca':
@@ -130,8 +158,10 @@ def probe(phase):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         headers = {'Content-Type': 'application/json'}
         if not phase.endswith('_control'):
-            headers['Authorization'] = 'Bearer ' + authorization
-        request = urllib.request.Request(url, data=b'{}', headers=headers)
+            headers['x-openshell-sandbox-assertion'] = authorization
+        payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                   'params': {'name': 'local_hello', 'arguments': {'name': 'rotation-proof'}}}
+        request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
         try:
             reply = urllib.request.urlopen(request, context=context, timeout=5)
         except urllib.error.HTTPError as error:
@@ -140,15 +170,24 @@ def probe(phase):
             reply = error
         with reply:
             body = json.loads(reply.read(1024))
-            response['ok'] = body.get('authorized') is True
+            attestation = body.get('fixture', {})
+            response['ok'] = (attestation.get('authorized') is True
+                              and body.get('result', {}).get('content') ==
+                              [{'type': 'text', 'text': 'Hello rotation-proof'}])
             response['status'] = reply.status
-            response['backend_phase'] = body.get('phase', -1)
+            response['backend_phase'] = attestation.get('phase', -1)
+            response['credential_generation'] = attestation.get('credential_generation', 'unobserved')
+            response['tool_call'] = attestation.get('tool_call') is True
     except Exception as error:
         # HTTP/TLS exception text can embed headers. Type names expose the
         # failure layer without retaining messages, headers, or credentials.
         response['error_kind'] = type(error).__name__
         response['reason_kind'] = type(getattr(error, 'reason', None)).__name__
     return response
+
+if len(sys.argv) > 2 and sys.argv[2] == '--once':
+    print(json.dumps(probe('fresh')), flush=True)
+    sys.exit(0)
 
 print('stable-placeholder-client-ready', flush=True)
 deadline = time.monotonic() + 600
@@ -206,9 +245,8 @@ impl FixtureImage {
     }
 }
 
-// This fixture owns the only test in its binary. The wrapper's gateway is
-// private to this run, so replacing its supervisor image cannot affect another
-// test while the public fixture CA is installed in the supervisor trust store.
+// These tests run serially against a wrapper-owned gateway. The public fixture
+// CA must be removed and the original supervisor restored before the next case.
 struct GatewayTrustConfig {
     path: PathBuf,
     original: String,
@@ -382,7 +420,6 @@ struct Backend {
     name: String,
     network: String,
     namespace: String,
-    hosts: [String; 2],
     child: Option<Child>,
     input: Option<ChildStdin>,
     output: Option<Lines<BufReader<ChildStdout>>>,
@@ -390,14 +427,13 @@ struct Backend {
 }
 
 impl Backend {
-    fn new(name: String, hosts: [String; 2]) -> Result<Self, String> {
+    fn new(name: String) -> Result<Self, String> {
         Ok(Self {
             engine: ContainerEngine::from_env()?,
             name,
             network: e2e_network_name().ok_or("fixture requires the managed Docker network")?,
             namespace: std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
                 .map_err(|_| "fixture requires the managed Docker namespace")?,
-            hosts,
             child: None,
             input: None,
             output: None,
@@ -405,12 +441,7 @@ impl Backend {
         })
     }
 
-    async fn start(
-        &mut self,
-        base: &str,
-        tls_directory: &Path,
-        config: &Value,
-    ) -> Result<(), String> {
+    async fn spawn(&mut self, base: &str, tls_directory: &Path) -> Result<String, String> {
         let tls_directory = tls_directory
             .to_str()
             .filter(|path| !path.contains([',', '\n', '\r']))
@@ -428,10 +459,6 @@ impl Backend {
                 &self.name,
                 "--network",
                 &self.network,
-                "--network-alias",
-                &self.hosts[0],
-                "--network-alias",
-                &self.hosts[1],
                 "--label",
                 "openshell.ai/managed-by=openshell",
                 "--label",
@@ -474,6 +501,63 @@ impl Backend {
             .take()
             .ok_or("backend stdout was not available")?;
         self.output = Some(BufReader::new(output).lines());
+        // The host-networked supervisor cannot resolve Docker bridge aliases.
+        // Python waits for configuration on stdin while we inspect its bridge
+        // address and generate a certificate for that exact IP.
+        self.address().await
+    }
+
+    async fn address(&mut self) -> Result<String, String> {
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("backend bridge address did not become available".to_string());
+            }
+            let mut inspect = Command::from(self.engine.command());
+            inspect.args([
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                &self.name,
+            ]);
+            if let Ok(output) = checked_command_with_timeout(
+                &mut inspect,
+                "inspect backend bridge address",
+                remaining.min(Duration::from_secs(2)),
+            )
+            .await
+            {
+                let networks: Value = serde_json::from_str(&output)
+                    .map_err(|_| "backend network metadata was invalid")?;
+                if let Some(address) = networks[&self.network]["IPAddress"]
+                    .as_str()
+                    .filter(|address| !address.is_empty())
+                {
+                    let address = address
+                        .parse::<Ipv4Addr>()
+                        .map_err(|_| "backend network address was not IPv4")?;
+                    if !address.is_private() {
+                        return Err("fixture backend requires a private bridge address".to_string());
+                    }
+                    return Ok(address.to_string());
+                }
+            }
+            if self
+                .child
+                .as_mut()
+                .ok_or("backend child was absent")?
+                .try_wait()
+                .map_err(|_| "could not inspect backend client status")?
+                .is_some()
+            {
+                return Err("backend exited before its bridge address was available".to_string());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn initialize(&mut self, config: &Value) -> Result<(), String> {
         if self.exchange(config).await?["ready"] != true {
             return Err("synthetic HTTPS backend did not become ready".to_string());
         }
@@ -501,10 +585,6 @@ impl Backend {
         .await
         .map_err(|_| "backend control operation timed out".to_string())?
         .map_err(str::to_string)
-    }
-
-    async fn counts(&mut self) -> Result<Value, String> {
-        self.exchange(&json!({"command": "snapshot"})).await
     }
 
     async fn stop(&mut self) -> Result<(), String> {
@@ -542,6 +622,108 @@ impl Backend {
             }
         }
         reap_result
+    }
+}
+
+// Counters attest generations without retaining headers or credential values.
+#[derive(Deserialize, Serialize)]
+struct BackendCounts {
+    phase: u8,
+    total: u64,
+    accepted: [u64; 2],
+    rejected: u64,
+    received: [u64; 2],
+    missing: u64,
+    unknown: u64,
+    invalid_tool_calls: u64,
+}
+
+// Distinct bridge addresses provide independent authorized and wrong-host
+// endpoints. Summed counters prove denied traffic reaches neither container.
+struct BackendPair {
+    backends: [Backend; 2],
+}
+
+impl BackendPair {
+    fn new(name: &str) -> Result<Self, String> {
+        Ok(Self {
+            backends: [
+                Backend::new(format!("{name}-backend"))?,
+                Backend::new(format!("{name}-other-backend"))?,
+            ],
+        })
+    }
+
+    async fn spawn(&mut self, base: &str, tls_directory: &Path) -> Result<[String; 2], String> {
+        let host = self.backends[0].spawn(base, tls_directory).await?;
+        let other_host = self.backends[1].spawn(base, tls_directory).await?;
+        if host == other_host {
+            return Err("wrong-host control requires a distinct backend address".to_string());
+        }
+        Ok([host, other_host])
+    }
+
+    async fn initialize(&mut self, config: &Value) -> Result<(), String> {
+        for backend in &mut self.backends {
+            backend.initialize(config).await?;
+        }
+        Ok(())
+    }
+
+    async fn rotate(&mut self) -> Result<(), String> {
+        for backend in &mut self.backends {
+            if backend.exchange(&json!({"command": "rotate"})).await?["phase"] != 1 {
+                return Err("backend did not switch to the replacement assertion".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn counts(&mut self) -> Result<Value, String> {
+        let mut combined: Option<BackendCounts> = None;
+        for backend in &mut self.backends {
+            let response = backend.exchange(&json!({"command": "snapshot"})).await?;
+            let counters: BackendCounts =
+                serde_json::from_value(response).map_err(|_| "backend counters were invalid")?;
+            if let Some(total) = combined.as_mut() {
+                if total.phase != counters.phase {
+                    return Err("fixture backends disagree on the active assertion".to_string());
+                }
+                let add = |left: u64, right: u64| {
+                    left.checked_add(right).ok_or("backend counters overflowed")
+                };
+                total.total = add(total.total, counters.total)?;
+                total.rejected = add(total.rejected, counters.rejected)?;
+                total.missing = add(total.missing, counters.missing)?;
+                total.unknown = add(total.unknown, counters.unknown)?;
+                total.invalid_tool_calls =
+                    add(total.invalid_tool_calls, counters.invalid_tool_calls)?;
+                for (left, right) in total.accepted.iter_mut().zip(counters.accepted) {
+                    *left = add(*left, right)?;
+                }
+                for (left, right) in total.received.iter_mut().zip(counters.received) {
+                    *left = add(*left, right)?;
+                }
+            } else {
+                combined = Some(counters);
+            }
+        }
+        serde_json::to_value(combined.ok_or("backend counters were absent")?)
+            .map_err(|_| "backend counters could not be encoded".to_string())
+    }
+
+    async fn stop(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for backend in &mut self.backends {
+            if let Err(error) = backend.stop().await {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 }
 
@@ -593,7 +775,7 @@ async fn generate_certificates(
     std::fs::write(
         &extensions,
         format!(
-            "basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:{host},DNS:{other_host}\nextendedKeyUsage=serverAuth\n"
+            "basicConstraints=critical,CA:FALSE\nsubjectAltName=IP:{host},IP:{other_host}\nextendedKeyUsage=serverAuth\n"
         ),
     )
     .map_err(|_| "could not write public TLS certificate extensions")?;
@@ -680,12 +862,19 @@ fn write_profile(
     host: &str,
     port: u16,
     python: &str,
+    stable: bool,
 ) -> Result<(), String> {
+    // Omitting the opt-in reproduces the behavior of an existing static
+    // credential profile on both the upstream gateway and the candidate.
+    let mut credential = json!({"name": "synthetic_assertion", "env_vars": [TOKEN_ENV],
+        "required": true, "auth_style": "header", "header_name": "x-openshell-sandbox-assertion"});
+    if stable {
+        credential["stable_placeholder"] = json!(true);
+    }
     let document = json!({
-        "id": name, "display_name": "Stable external placeholder E2E", "category": "other",
-        "credentials": [{"name": "synthetic", "env_vars": [TOKEN_ENV], "required": true,
-            "auth_style": "bearer", "header_name": "authorization", "stable_placeholder": true}],
-        "endpoints": [{"host": host, "port": port, "path": "/v1/**", "protocol": "rest",
+        "id": name, "display_name": "External caller assertion E2E", "category": "other",
+        "credentials": [credential],
+        "endpoints": [{"host": host, "port": port, "path": "/mcp/**", "protocol": "rest",
             "access": "full", "enforcement": "enforce",
             "allowed_ips": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]}],
         "binaries": [python],
@@ -727,50 +916,80 @@ fn write_policy(
         .map_err(|_| "could not write synthetic policy".to_string())
 }
 
-async fn receipts(sandbox: &SandboxGuard) -> Result<HashSet<String>, String> {
-    let logs = cli(
-        "read supervisor activation receipts",
-        &[
-            "logs",
-            &sandbox.name,
-            "-n",
-            "500",
-            "--since",
-            "10m",
-            "--source",
-            "sandbox",
-        ],
-        None,
+async fn acknowledged_mutation(
+    args: &[&str],
+    credential: Option<&str>,
+    sandbox: &SandboxGuard,
+    provider: &str,
+    kind: &str,
+    keys: &[String; 2],
+) -> Result<(), String> {
+    let mut command = openshell_cmd();
+    command.args(args).args([
+        "--wait",
+        "--timeout",
+        READINESS_TIMEOUT_SECONDS,
+        "-o",
+        "json",
+    ]);
+    if let Some(credential) = credential {
+        command.env(TOKEN_ENV, credential);
+    }
+    let output = checked_command_with_timeout(
+        &mut command,
+        "apply and acknowledge provider mutation",
+        READINESS_COMMAND_TIMEOUT,
     )
     .await?;
-    Ok(logs
-        .lines()
-        .filter_map(|line| {
-            let (_, suffix) = line.split_once("Provider environment refreshed [revision:")?;
-            let revision: String = suffix.chars().take_while(char::is_ascii_digit).collect();
-            (!revision.is_empty()).then_some(revision)
-        })
-        .collect())
-}
-
-async fn wait_for_activation(
-    sandbox: &SandboxGuard,
-    previous: &HashSet<String>,
-) -> Result<(), String> {
-    let deadline = Instant::now() + ACTIVATION_TIMEOUT;
-    loop {
-        if receipts(sandbox)
-            .await?
-            .iter()
-            .any(|revision| !previous.contains(revision))
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("supervisor did not acknowledge a new provider environment".to_string());
-        }
-        sleep(Duration::from_millis(250)).await;
+    if keys.iter().any(|key| output.contains(key)) || output.contains("openshell:resolve:") {
+        return Err("provider readiness output contained credential material".to_string());
     }
+    let body: Value =
+        serde_json::from_str(&output).map_err(|_| "provider readiness output was invalid JSON")?;
+    let targets = body["targets"]
+        .as_array()
+        .ok_or("provider readiness targets were absent")?;
+    let [status] = targets.as_slice() else {
+        return Err("provider mutation did not acknowledge exactly one sandbox".to_string());
+    };
+    let receipt = &status["receipt"];
+    let desired = &receipt["desired"];
+    let observed = &status["observed"];
+    let expected = if kind == "detach" { "revoked" } else { "ready" };
+    if body["mutation_id"].as_str().is_none_or(str::is_empty)
+        || receipt["mutation_id"] != body["mutation_id"]
+        || receipt["provider"] != provider
+        || receipt["kind"] != kind
+        || desired["sandbox"] != sandbox.name
+        || status["state"] != expected
+        || status["wait_outcome"] != "complete"
+        || status["reason"] != "unspecified"
+        || observed["reason"] != "unspecified"
+    {
+        return Err("provider mutation was not acknowledged for the intended sandbox".to_string());
+    }
+    for field in [
+        "attachment_epoch",
+        "provider_env_revision",
+        "config_revision",
+        "policy_hash",
+    ] {
+        if desired[field].as_str().is_none_or(str::is_empty) || observed[field] != desired[field] {
+            return Err(format!(
+                "provider acknowledgment did not match desired {field}"
+            ));
+        }
+    }
+    for field in [
+        "credentials_installed",
+        "policy_active",
+        "launch_environment_installed",
+    ] {
+        if observed[field] != true {
+            return Err(format!("provider acknowledgment omitted {field}"));
+        }
+    }
+    Ok(())
 }
 
 async fn probe(sandbox: &SandboxGuard, phase: &str) -> Result<Value, String> {
@@ -816,15 +1035,16 @@ async fn probe_disallowed_binary(
     let script = r#"
 test -n "$STABLE_EXTERNAL_E2E_TOKEN" || exit 64
 "$1" --version >/dev/null 2>&1 || exit 65
-if printf 'Authorization: Bearer %s\n' "$STABLE_EXTERNAL_E2E_TOKEN" | \
-    "$1" --silent --fail --max-time 5 --output /dev/null --header @- --data '{}' "$2" 2>/dev/null
+if printf 'x-openshell-sandbox-assertion: %s\n' "$STABLE_EXTERNAL_E2E_TOKEN" | \
+    "$1" --silent --fail --max-time 5 --output /dev/null --header @- \
+    --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"local_hello","arguments":{"name":"rotation-proof"}}}' "$2" 2>/dev/null
 then
     printf 'unexpected-success'
 else
     printf 'denied'
 fi
 "#;
-    let url = format!("https://{host}:{port}/v1/chat/completions");
+    let url = format!("https://{host}:{port}/mcp/local-hello");
     let output = timeout(
         COMMAND_TIMEOUT,
         sandbox.exec(&["sh", "-c", script, "binary-probe", curl, &url]),
@@ -857,7 +1077,10 @@ fn check(
         ));
     }
     if let Some(phase) = backend_phase
-        && (response["backend_phase"].as_u64() != Some(phase) || response["status"] != 200)
+        && (response["backend_phase"].as_u64() != Some(phase)
+            || response["status"] != 200
+            || response["credential_generation"] != if phase == 0 { "A" } else { "B" }
+            || response["tool_call"] != true)
     {
         return Err("backend did not attest the expected credential generation".to_string());
     }
@@ -865,23 +1088,24 @@ fn check(
 }
 
 #[tokio::test]
-// Keep the lifecycle in one test so no phase can replace the retained client.
-#[allow(clippy::too_many_lines)]
+#[serial_test::serial]
 async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(), String> {
+    external_caller_assertion_rotation(true).await
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn ordinary_external_placeholder_keeps_revoked_assertion_after_rotation() -> Result<(), String>
+{
+    external_caller_assertion_rotation(false).await
+}
+
+// Keep each lifecycle together so no phase can replace the retained client.
+#[allow(clippy::too_many_lines)]
+async fn external_caller_assertion_rotation(stable: bool) -> Result<(), String> {
     let mut gateway_config = GatewayTrustConfig::load()?;
-    let name = format!(
-        "e2e-stable-{}-{:016x}",
-        std::process::id(),
-        rand::random::<u64>()
-    );
-    // Ordinary bridge DNS aliases exercise the policy DNS path without relying
-    // on a host-gateway address outside the supervisor's container network.
-    let host = format!("{name}.test");
-    let other_host = format!("{name}-other.test");
-    let mut backend = Backend::new(
-        format!("{name}-backend"),
-        [host.clone(), other_host.clone()],
-    )?;
+    let name = format!("e2e{:016x}", rand::random::<u64>());
+    let mut backend = BackendPair::new(&name)?;
     // The wrapper's directory is shared with the host Docker daemon in CI;
     // a job-container-local temporary path cannot back the TLS bind mount.
     let fixture_parent = gateway_config
@@ -892,32 +1116,12 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
         TempDir::new_in(fixture_parent).map_err(|_| "could not allocate fixture directory")?;
     let context = directory.path().join("image");
     std::fs::create_dir(&context).map_err(|_| "could not allocate public image context")?;
-    let (certificate, private_key) =
-        generate_certificates(directory.path(), &host, &other_host).await?;
     let backend_tls = directory.path().join("backend-tls");
     std::fs::create_dir(&backend_tls).map_err(|_| "could not allocate backend TLS directory")?;
-    std::fs::copy(&certificate, backend_tls.join("backend.crt"))
-        .map_err(|_| "could not stage backend certificate")?;
-    let backend_tls_key = backend_tls.join("backend.key.fixture");
-    std::fs::copy(&private_key, &backend_tls_key).map_err(|_| "could not stage backend TLS key")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // The backend inherits the image's unprivileged user. Only its mounted
-        // leaf key is readable there; the parent TempDir stays private and the
-        // CA signing key never enters a container or either image build context.
-        std::fs::set_permissions(&backend_tls_key, std::fs::Permissions::from_mode(0o444))
-            .map_err(|_| "could not set backend TLS key permissions")?;
-    }
-    std::fs::copy(
-        directory.path().join("ca.crt"),
-        context.join("fixture-ca.crt"),
-    )
-    .map_err(|_| "could not copy public fixture CA")?;
     std::fs::write(context.join("client.py"), CLIENT)
         .map_err(|_| "could not write client source")?;
     let base = std::env::var("OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string());
+        .unwrap_or_else(|_| E2E_WORKLOAD_IMAGE.to_string());
     if base.chars().any(char::is_whitespace) {
         return Err("fixture image reference contains whitespace".to_string());
     }
@@ -926,16 +1130,18 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
         .as_str()
         .ok_or("Python executable was absent")?;
     let dockerfile = context.join("Dockerfile");
-    std::fs::write(&dockerfile, format!(
-        "FROM {base}\nUSER root\nCOPY client.py /opt/stable-placeholder-client.py\nUSER sandbox\n"
-    )).map_err(|_| "could not write fixture Dockerfile")?;
+    std::fs::write(
+        &dockerfile,
+        format!("FROM {base}\nCOPY client.py /opt/stable-placeholder-client.py\nUSER 1000:1000\n"),
+    )
+    .map_err(|_| "could not write fixture Dockerfile")?;
     let supervisor_dockerfile = context.join("Dockerfile.supervisor");
-    // Outbound TLS belongs to the separate supervisor. Its combined public
-    // trust bundle is delivered to the workload through the sandbox protocol.
-    // Preserve the base image's user setting: Docker's archive upload applies
-    // an explicit image user to the supervisor's private bootstrap files.
+    // Build the combined trust bundle in the workload image: the supervisor is
+    // distroless and has no shell. The final stage preserves the supervisor's
+    // default user and its original public trust roots.
     std::fs::write(&supervisor_dockerfile, format!(
-        "FROM {}\nCOPY fixture-ca.crt /tmp/stable-fixture-ca.crt\nRUN cat /tmp/stable-fixture-ca.crt >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/stable-fixture-ca.crt\n",
+        "FROM {} AS supervisor\nFROM {base} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/stable-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/stable-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
+        gateway_config.supervisor_image,
         gateway_config.supervisor_image
     )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
     let image = FixtureImage::new()?;
@@ -950,28 +1156,46 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
     ];
     let profile = directory.path().join("profile.json");
     let policy = directory.path().join("policy.json");
-    write_profile(&profile, &name, &host, port, python)?;
-    write_policy(&policy, &host, &other_host, port, other_port, python)?;
     let profile_path = profile.to_str().ok_or("profile path was not UTF-8")?;
     let policy_path = policy.to_str().ok_or("policy path was not UTF-8")?;
     let curl = binaries["curl"]
         .as_str()
         .ok_or("curl executable was absent")?;
-    let configuration = json!({"host": host, "other_host": other_host, "port": port,
-        "other_port": other_port})
-    .to_string();
     let mut sandbox = None;
     let result = async {
-        // Begin image mutation only inside this result scope so enrollment or
-        // build failures still flow through the explicit bounded teardown.
+        // Begin container mutation inside this scope so address, certificate,
+        // image and enrollment failures all reach explicit bounded teardown.
         image.build(&dockerfile, &context).await?;
+        let [host, other_host] = backend.spawn(&base, &backend_tls).await?;
+        let (certificate, private_key) =
+            generate_certificates(directory.path(), &host, &other_host).await?;
+        std::fs::copy(&certificate, backend_tls.join("backend.crt"))
+            .map_err(|_| "could not stage backend certificate")?;
+        let backend_tls_key = backend_tls.join("backend.key.fixture");
+        std::fs::copy(&private_key, &backend_tls_key)
+            .map_err(|_| "could not stage backend TLS key")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // The backends inherit the image's unprivileged user. Only their
+            // mounted leaf key is readable; the private CA key stays outside
+            // the shared mount and both image build contexts.
+            std::fs::set_permissions(&backend_tls_key, std::fs::Permissions::from_mode(0o444))
+                .map_err(|_| "could not set backend TLS key permissions")?;
+        }
+        backend.initialize(&json!({"keys": keys, "ports": [port, other_port],
+            "certificate": "/fixture-tls/backend.crt", "private_key": "/fixture-tls/backend.key.fixture"}))
+            .await?;
+        std::fs::copy(directory.path().join("ca.crt"), context.join("fixture-ca.crt"))
+            .map_err(|_| "could not copy public fixture CA")?;
         supervisor_image
             .build(&supervisor_dockerfile, &context)
             .await?;
         gateway_config.apply(supervisor_image.tag()).await?;
-        backend.start(&base, &backend_tls, &json!({"keys": keys, "ports": [port, other_port],
-            "certificate": "/fixture-tls/backend.crt", "private_key": "/fixture-tls/backend.key.fixture"}))
-            .await?;
+        write_profile(&profile, &name, &host, port, python, stable)?;
+        write_policy(&policy, &host, &other_host, port, other_port, python)?;
+        let configuration = json!({"host": host, "other_host": other_host, "port": port,
+            "other_port": other_port, "stable": stable}).to_string();
         cli(
             "import synthetic provider profile",
             &["provider", "profile", "import", "--file", profile_path],
@@ -1059,32 +1283,65 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
             return Err("disallowed binary reached the backend".to_string());
         }
 
-        let previous = receipts(running).await?;
-        backend.exchange(&json!({"command": "rotate"})).await?;
-        cli(
-            "update synthetic provider once",
+        backend.rotate().await?;
+        // This is the only provider update. --wait acknowledges the exact
+        // saved revision before either client sends its next tool request.
+        acknowledged_mutation(
             &["provider", "update", &name, "--credential", TOKEN_ENV],
             Some(&keys[1]),
+            running, &name, "update", &keys,
         )
         .await?;
         // No workload requests occur while waiting. The first next request
-        // therefore proves activation, rather than eventually succeeding by retry.
-        wait_for_activation(running, &previous).await?;
-        check(&probe(running, "rotated").await?, pid, true, Some(1))?;
+        // must use B with the opt-in; the ordinary profile still resolves A.
+        let retained = probe(running, "rotated").await?;
+        check(&retained, pid, stable, stable.then_some(1))?;
+        if !stable && (retained["status"] != 401 || retained["backend_phase"] != 1
+            || retained["credential_generation"] != "A" || retained["tool_call"] != true)
+        {
+            return Err("ordinary retained reference did not send the revoked assertion A".to_string());
+        }
         let rotated = backend.counts().await?;
-        if rotated["total"] != 5 || rotated["accepted"] != json!([1, 1]) || rotated["rejected"] != 3
+        let accepted_after_rotation = if stable { json!([1, 1]) } else { json!([1, 0]) };
+        let received_after_rotation = if stable { json!([1, 1]) } else { json!([2, 0]) };
+        let rejected_after_rotation = if stable { 3 } else { 4 };
+        if rotated["total"] != 5 || rotated["accepted"] != accepted_after_rotation
+            || rotated["received"] != received_after_rotation
+            || rotated["rejected"] != rejected_after_rotation
+            || rotated["missing"] != 3 || rotated["unknown"] != 0 || rotated["invalid_tool_calls"] != 0
         {
             return Err("single-update backend assertions failed".to_string());
         }
 
-        let previous = receipts(running).await?;
-        cli(
-            "detach synthetic provider",
+        // A fresh process proves the installed provider revision can use B in
+        // both modes. It does not replace or modify the original client.
+        let fresh_output = timeout(COMMAND_TIMEOUT, running.exec(&[
+            "/usr/bin/python3", "-u", "/opt/stable-placeholder-client.py", &configuration, "--once",
+        ])).await.map_err(|_| "fresh client timed out")?
+            .map_err(|_| "fresh client failed")?;
+        let fresh: Value = serde_json::from_str(fresh_output.trim())
+            .map_err(|_| "fresh client returned invalid status")?;
+        let fresh_pid = fresh["pid"].as_u64().ok_or("fresh client PID was absent")?;
+        if fresh_pid == pid || fresh["same_reference"] != true {
+            return Err("fresh process control did not retain its own issued reference".to_string());
+        }
+        check(&fresh, fresh_pid, true, Some(1))?;
+        let refreshed = backend.counts().await?;
+        let final_accepted = if stable { json!([1, 2]) } else { json!([1, 1]) };
+        let final_received = if stable { json!([1, 2]) } else { json!([2, 1]) };
+        if refreshed["total"] != 6 || refreshed["accepted"] != final_accepted
+            || refreshed["received"] != final_received || refreshed["rejected"] != rejected_after_rotation
+            || refreshed["missing"] != 3 || refreshed["unknown"] != 0 || refreshed["invalid_tool_calls"] != 0
+        {
+            return Err("fresh process did not prove installed assertion B".to_string());
+        }
+
+        acknowledged_mutation(
             &["sandbox", "provider", "detach", &running.name, &name],
             None,
+            running, &name, "detach", &keys,
         )
         .await?;
-        wait_for_activation(running, &previous).await?;
         // Detach must revoke the reference while leaving the independently
         // authorized route usable; a network outage cannot satisfy this proof.
         let control = probe(running, "detached_control").await?;
@@ -1093,9 +1350,11 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
             return Err("detached endpoint was not reachable without a credential".to_string());
         }
         let detached = backend.counts().await?;
-        if detached["total"] != 6
-            || detached["accepted"] != json!([1, 1])
-            || detached["rejected"] != 4
+        if detached["total"] != 7
+            || detached["accepted"] != final_accepted
+            || detached["received"] != final_received
+            || detached["rejected"] != rejected_after_rotation + 1
+            || detached["missing"] != 4 || detached["unknown"] != 0 || detached["invalid_tool_calls"] != 0
             || detached["phase"] != 1
         {
             return Err("detached endpoint control assertions failed".to_string());
@@ -1107,7 +1366,10 @@ async fn persistent_external_placeholder_rotation_and_revocation() -> Result<(),
         println!(
             "{}",
             json!({"phase": "complete", "pid": pid, "same_reference": true,
-            "rotated": true, "endpoint_denials": true, "binary_denial": true,
+            "stable_placeholder": stable, "provider_updates": 1,
+            "retained_assertion": if stable { "B" } else { "A" },
+            "retained_request_accepted": stable, "fresh_process_assertion": "B",
+            "tool": "local_hello", "endpoint_denials": true, "binary_denial": true,
             "canonical_alias_denial": true, "tls_verified": true, "detached": true})
         );
         Ok(())

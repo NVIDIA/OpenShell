@@ -54,7 +54,7 @@ class TestRbac:
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
             ),
         )
@@ -84,7 +84,7 @@ class TestRbac:
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
             ),
         )
@@ -102,7 +102,9 @@ class TestRbac:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=user_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
@@ -119,7 +121,10 @@ class TestRbac:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=user_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=user_sub,
                     ),
                     metadata=admin_md,
                 )
@@ -251,7 +256,9 @@ class TestClientCredentials:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=ci_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
@@ -264,7 +271,10 @@ class TestClientCredentials:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=ci_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=ci_sub,
                     ),
                     metadata=admin_md,
                 )

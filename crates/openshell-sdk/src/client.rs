@@ -14,12 +14,13 @@ use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
 use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
-use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
+    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadTemplate, WorkspaceRef,
 };
-use futures::StreamExt;
+use crate::{WatchEvent, WatchOptions, transport};
+use futures::{Stream, StreamExt};
 use openshell_core::proto;
 use std::collections::HashMap;
 use std::future::Future;
@@ -143,7 +144,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a workspace-scoped workload template name.
@@ -158,7 +159,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -169,6 +170,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::CreateSandboxTemplateRequest {
+                    request_id: String::new(),
                     template: Some(template.clone()),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -273,17 +275,26 @@ impl OpenShellClient {
     }
 
     /// Delete a reusable sandbox template by name from the default workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name.
@@ -339,21 +350,24 @@ impl OpenShellClient {
 
     /// Delete a sandbox by name.
     ///
-    /// Returns `true` when the gateway acknowledges the deletion, `false`
-    /// when it was already absent. The sandbox may still be in
-    /// [`SandboxPhase::Deleting`] when this returns — pair with
-    /// [`OpenShellClient::wait_deleted`] when you need a terminal guarantee.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    /// An accepted outcome is not completion. The result identifies the original
+    /// sandbox; a same-name replacement is not part of this operation.
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name.
@@ -361,6 +375,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -375,6 +390,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -406,16 +422,26 @@ impl OpenShellClient {
         .await
     }
 
-    /// Poll until the sandbox is gone (gRPC `NotFound`) or the `timeout`
-    /// elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    /// Poll until the sandbox is gone (gRPC `NotFound`) or the timeout elapses.
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
-                Ok(snapshot) if snapshot.phase == SandboxPhase::Deleting => {}
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -488,6 +514,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::CreateWorkspaceRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     labels: labels.clone(),
                 };
@@ -553,16 +580,25 @@ impl OpenShellClient {
     }
 
     /// Delete a workspace by name.
-    pub async fn delete_workspace(&self, name: &str) -> Result<bool> {
+    pub async fn delete_workspace(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteWorkspaceRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                 };
                 async move { grpc.delete_workspace(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr to the end.
@@ -570,15 +606,18 @@ impl OpenShellClient {
     /// For streaming output, drop down to [`OpenShellClient::raw_grpc`] and
     /// call `exec_sandbox` directly.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector("default")),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -622,6 +661,124 @@ impl OpenShellClient {
             stdout,
             stderr,
         })
+    }
+
+    /// Watch a sandbox's logs and platform events with loss-aware resume.
+    ///
+    /// Reconnects transparently on transient stream errors, resuming from the
+    /// highest cursor already delivered. A recoverable server lag surfaces as
+    /// [`WatchEvent::Warning`] and the stream continues.
+    ///
+    /// [`SdkError::OutOfRange`] is terminal and deliberately not retried: it
+    /// means the resume point is gone (trimmed from the buffer, or issued by a
+    /// cursor space the gateway no longer has), so events between it and now
+    /// are unrecoverable. Auto-restarting from scratch would hide that loss,
+    /// which is exactly what this API exists to surface. Callers who accept the
+    /// gap can start a new watch with an empty
+    /// [`WatchOptions::resume_after_cursor`]; retrying the same cursor fails
+    /// identically.
+    pub fn watch_logs(
+        &self,
+        name: &str,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        let name = name.to_string();
+        async_stream::try_stream!(
+            let sandbox = self.get_sandbox(&name).await?;
+            for await event in self.watch_logs_by_name(sandbox.name, "default".to_string(), opts) {
+                yield event?;
+            }
+        )
+    }
+
+    /// Shared watch loop over an already-resolved canonical sandbox name.
+    ///
+    /// Both [`OpenShellClient::watch_logs`] and
+    /// [`WorkspaceScopedClient::watch_logs`] resolve and re-confirm a name under
+    /// their own workspace, then delegate here so the reconnect/resume logic
+    /// lives in one place.
+    fn watch_logs_by_name(
+        &self,
+        sandbox_name: String,
+        workspace: String,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        async_stream::try_stream!(
+            let mut cursor = opts.resume_after_cursor;
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                let request = proto::WatchSandboxRequest {
+                    sandbox: sandbox_name.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&workspace)),
+                    follow_status: false,
+                    follow_logs: opts.follow_logs,
+                    follow_events: opts.follow_events,
+                    log_tail_lines: opts.log_tail_lines,
+                    event_tail: opts.event_tail,
+                    log_sources: opts.log_sources.clone(),
+                    log_min_level: opts.log_min_level.clone().unwrap_or_default(),
+                    resume_after_cursor: cursor.clone(),
+                    ..Default::default()
+                };
+                // Apply the same reconnect policy to the initial dial: `unary`
+                // only retries `Unauthenticated`, so a pre-stream transient
+                // (e.g. `Unavailable`) would otherwise exit without resuming.
+                let mut stream = match self
+                    .unary(|mut grpc| {
+                        let req = request.clone();
+                        async move { grpc.watch_sandbox(req).await }
+                    })
+                    .await
+                {
+                    Ok(stream) => stream,
+                    // Transient — back off and redial from `cursor`.
+                    Err(err) if is_retryable_stream(&err) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(2));
+                        continue;
+                    }
+                    // Trimmed cursor or any other error — terminal.
+                    Err(err) => Err(err)?,
+                };
+                let mut clean_eof = true;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(event) => {
+                            // A delivered event means the connection is healthy
+                            // again; reset the reconnect backoff so a later drop
+                            // retries promptly instead of at the capped delay.
+                            backoff = Duration::from_millis(100);
+                            if let Some(ev) = convert_event(event, &mut cursor) {
+                                yield ev;
+                            }
+                        }
+                        Err(status) => {
+                            clean_eof = false;
+                            let err = map_status(status);
+                            match err {
+                                // Terminal gap — never silently restart.
+                                SdkError::OutOfRange { .. } => {
+                                    Err(err)?;
+                                }
+                                // Transient — back off and redial from `cursor`.
+                                _ if is_retryable_stream(&err) => {
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                                }
+                                // Anything else is terminal.
+                                _ => {
+                                    Err(err)?;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if clean_eof {
+                    break;
+                }
+            }
+        )
     }
 
     /// Run a unary RPC with OIDC-aware auth: refresh proactively before the
@@ -736,7 +893,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a template in this workspace.
@@ -753,7 +910,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in this workspace.
@@ -765,6 +922,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::CreateSandboxTemplateRequest {
+                    request_id: String::new(),
                     template: Some(template.clone()),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
@@ -831,18 +989,27 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a reusable sandbox template by name in this workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name in this workspace.
@@ -900,18 +1067,23 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a sandbox by name in this workspace.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name in this workspace.
@@ -920,6 +1092,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
@@ -935,6 +1108,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
@@ -978,13 +1152,25 @@ impl WorkspaceScopedClient {
     }
 
     /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -999,15 +1185,18 @@ impl WorkspaceScopedClient {
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -1048,6 +1237,34 @@ impl WorkspaceScopedClient {
             stdout,
             stderr,
         })
+    }
+
+    /// Watch a sandbox's logs and platform events with loss-aware resume.
+    ///
+    /// Reconnects transparently on transient stream errors, resuming from the
+    /// highest cursor already delivered. A recoverable server lag surfaces as
+    /// [`WatchEvent::Warning`] and the stream continues.
+    ///
+    /// [`SdkError::OutOfRange`] is terminal and deliberately not retried: it
+    /// means the resume point is gone (trimmed from the buffer, or issued by a
+    /// cursor space the gateway no longer has), so events between it and now
+    /// are unrecoverable. Auto-restarting from scratch would hide that loss,
+    /// which is exactly what this API exists to surface. Callers who accept the
+    /// gap can start a new watch with an empty
+    /// [`WatchOptions::resume_after_cursor`]; retrying the same cursor fails
+    /// identically.
+    pub fn watch_logs(
+        &self,
+        name: &str,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        let name = name.to_string();
+        async_stream::try_stream!(
+            let sandbox = self.get_sandbox(&name).await?;
+            for await event in self.client.watch_logs_by_name(sandbox.name, self.workspace.clone(), opts) {
+                yield event?;
+            }
+        )
     }
 }
 
@@ -1109,6 +1326,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu,
         command,
         tty,
+        service_exposures,
+        restart_policy,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -1118,6 +1337,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             environment,
             template,
@@ -1125,6 +1345,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             resource_requirements,
             command,
             tty,
+            restart_policy: proto::SandboxRestartPolicy::from(restart_policy) as i32,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1132,7 +1353,17 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         annotations: HashMap::new(),
         workspace_scope: Some(proto::workspace_selector("default")),
         await_main_process_attachment: false,
-        workload_template_name: String::new(),
+        workload_template: String::new(),
+        service_exposures: service_exposures
+            .into_iter()
+            .map(|exposure| proto::SandboxServiceExposure {
+                service: exposure.service,
+                target_port: u32::from(exposure.target_port),
+                authorization_mode: proto::ServiceAuthorizationMode::from(
+                    exposure.authorization_mode,
+                ) as i32,
+            })
+            .collect(),
     }
 }
 
@@ -1147,8 +1378,10 @@ fn create_sandbox_from_template_request(
         command,
         tty,
         policy,
+        service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             providers,
             command,
@@ -1160,8 +1393,18 @@ fn create_sandbox_from_template_request(
         labels,
         annotations: HashMap::new(),
         workspace_scope: Some(proto::workspace_selector("default")),
-        workload_template_name: template_name,
+        workload_template: template_name,
         await_main_process_attachment: false,
+        service_exposures: service_exposures
+            .into_iter()
+            .map(|exposure| proto::SandboxServiceExposure {
+                service: exposure.service,
+                target_port: u32::from(exposure.target_port),
+                authorization_mode: proto::ServiceAuthorizationMode::from(
+                    exposure.authorization_mode,
+                ) as i32,
+            })
+            .collect(),
     }
 }
 
@@ -1169,6 +1412,12 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
     sandbox
         .map(SandboxRef::from_proto)
         .ok_or_else(|| SdkError::invalid_config("sandbox missing from gateway response"))
+}
+
+fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
+    let mut sandbox = sandbox_from_response(response.sandbox)?;
+    sandbox.service_urls = response.service_urls;
+    Ok(sandbox)
 }
 
 fn sandbox_template_from_response(
@@ -1180,6 +1429,61 @@ fn sandbox_template_from_response(
 
 fn map_status(status: tonic::Status) -> SdkError {
     SdkError::from_status(status)
+}
+
+/// Convert a wire watch event into the curated [`WatchEvent`], advancing
+/// `cursor` for resumable payloads.
+///
+/// Log and platform events carry the shared per-sandbox cursor and update it.
+/// Warnings are recoverable loss notices with no cursor, so they never advance
+/// it. Status snapshots and draft-policy updates are not part of the log/event
+/// stream and are dropped (`None`).
+///
+/// `cursor` is a high-water mark, not the last cursor seen. The gateway reads
+/// the log and platform sources independently during live delivery, so arrival
+/// order can differ from cursor order. Taking the max keeps the resume point
+/// monotonic; assigning directly would let a later lower-cursor event rewind it
+/// and replay already-delivered events after a reconnect.
+///
+/// The comparison is a plain byte-wise string compare on an opaque token. That
+/// is the one operation the gateway permits on a cursor, and it is well defined
+/// here because both cursors come from the same stream: the encoding is fixed
+/// width within a cursor space, and a stream never spans two spaces (a reset
+/// ends it). Never parse the token — its layout is not part of the contract.
+fn convert_event(event: proto::SandboxStreamEvent, cursor: &mut String) -> Option<WatchEvent> {
+    match event.payload? {
+        proto::sandbox_stream_event::Payload::Log(line) => {
+            if event.cursor > *cursor {
+                cursor.clone_from(&event.cursor);
+            }
+            Some(WatchEvent::Log {
+                line: line.into(),
+                cursor: event.cursor,
+            })
+        }
+        proto::sandbox_stream_event::Payload::Event(platform) => {
+            if event.cursor > *cursor {
+                cursor.clone_from(&event.cursor);
+            }
+            Some(WatchEvent::Event {
+                event: platform.into(),
+                cursor: event.cursor,
+            })
+        }
+        proto::sandbox_stream_event::Payload::Warning(warning) => Some(WatchEvent::Warning {
+            message: warning.message,
+        }),
+        proto::sandbox_stream_event::Payload::Sandbox(_)
+        | proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_) => None,
+    }
+}
+
+/// Whether a mid-stream error is a transient condition worth reconnecting on.
+///
+/// Only `Unavailable` (connection drop, gateway restart) is retryable; every
+/// other status is terminal so the caller surfaces it instead of looping.
+fn is_retryable_stream(err: &SdkError) -> bool {
+    matches!(err, SdkError::Rpc { code, .. } if *code == tonic::Code::Unavailable as i32)
 }
 
 #[cfg(test)]
@@ -1338,11 +1642,16 @@ mod tests {
         let request = create_sandbox_request(SandboxSpec {
             command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
             tty: false,
+            restart_policy: crate::types::SandboxRestartPolicy::OnFailure,
             ..SandboxSpec::default()
         });
 
         let spec = request.spec.expect("sandbox spec should be present");
         assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
         assert!(!spec.tty);
+        assert_eq!(
+            spec.restart_policy(),
+            proto::SandboxRestartPolicy::OnFailure
+        );
     }
 }

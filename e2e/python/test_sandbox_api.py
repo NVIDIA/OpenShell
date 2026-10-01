@@ -3,15 +3,84 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import uuid
 from typing import TYPE_CHECKING
 
-from openshell._proto import openshell_pb2
+from google.protobuf import duration_pb2
+
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from openshell import Sandbox, SandboxClient, WorkspaceClient
+
+
+def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
+    sandbox_client: SandboxClient,
+) -> None:
+    name = f"replay-{uuid.uuid4().hex[:8]}"
+    scope = "default"
+    stub = sandbox_client._stub
+    create = openshell_pb2.CreateSandboxRequest(
+        name=name,
+        spec=openshell_pb2.SandboxSpec(),
+        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
+        request_id=str(uuid.uuid4()),
+    )
+
+    def replay(method, request):
+        result, call = method.with_call(request, timeout=60)
+        assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+        return result
+
+    try:
+        original = stub.CreateSandbox(create, timeout=60).sandbox.metadata.id
+        sandbox_client.wait_ready(name, workspace="default", timeout_seconds=300)
+        assert replay(stub.CreateSandbox, create).sandbox.metadata.id == original
+        stop = openshell_pb2.StopSandboxRequest(
+            name=name,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
+            request_id=str(uuid.uuid4()),
+        )
+        stub.StopSandbox(stop, timeout=60)
+        sandbox_client.wait_stopped(name, workspace="default", timeout_seconds=120)
+        assert replay(stub.StopSandbox, stop).sandbox.metadata.id == original
+        start = openshell_pb2.StartSandboxRequest(
+            name=name,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
+            request_id=str(uuid.uuid4()),
+        )
+        stub.StartSandbox(start, timeout=60)
+        sandbox_client.wait_ready(name, workspace="default", timeout_seconds=300)
+        assert replay(stub.StartSandbox, start).sandbox.metadata.id == original
+        update = openshell_pb2.UpdateConfigRequest(
+            sandbox=name,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
+            setting_key="ocsf_json_enabled",
+            setting_value=sandbox_pb2.SettingValue(bool_value=True),
+            request_id=str(uuid.uuid4()),
+        )
+        updated = stub.UpdateConfig(update, timeout=30)
+        assert replay(stub.UpdateConfig, update) == updated
+        delete = openshell_pb2.DeleteSandboxRequest(
+            name=name,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
+            request_id=str(uuid.uuid4()),
+        )
+        deleted = stub.DeleteSandbox(delete, timeout=60)
+        assert deleted.sandbox_id == original
+        sandbox_client.wait_deleted(name, workspace="default", timeout_seconds=120)
+        replacement = sandbox_client.create(workspace="default", name=name)
+        assert replacement.id != original
+        assert replay(stub.DeleteSandbox, delete) == deleted
+        assert sandbox_client.get(name, workspace="default").id == replacement.id
+    finally:
+        with contextlib.suppress(Exception):
+            sandbox_client.delete(name, workspace="default", allow_missing=True)
+            sandbox_client.wait_deleted(name, workspace="default", timeout_seconds=120)
 
 
 def test_sandbox_api_crud_and_exec(
@@ -71,10 +140,11 @@ def test_sandbox_interactive_exec_honors_tty(
     stdout_sentinel = b"stdout-sentinel"
     stderr_sentinel = b"stderr-sentinel"
 
-    def exec_interactive(sandbox_id: str, *, tty: bool) -> tuple[bytes, bytes]:
+    def exec_interactive(sandbox_name: str, *, tty: bool) -> tuple[bytes, bytes]:
         request = openshell_pb2.ExecSandboxInput(
             start=openshell_pb2.ExecSandboxRequest(
-                sandbox_id=sandbox_id,
+                sandbox=sandbox_name,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 command=[
                     "/bin/sh",
                     "-c",
@@ -87,7 +157,7 @@ def test_sandbox_interactive_exec_honors_tty(
                     "printf 'stderr-sentinel\\n' >&2",
                 ],
                 tty=tty,
-                timeout_seconds=20,
+                execution_timeout=duration_pb2.Duration(seconds=20),
             )
         )
 
@@ -118,7 +188,7 @@ def test_sandbox_interactive_exec_honors_tty(
         return b"".join(stdout), b"".join(stderr)
 
     with sandbox(delete_on_exit=True) as sb:
-        stdout, stderr = exec_interactive(sb.id, tty=False)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=False)
         assert b"NNN" in stdout
         assert b"stdin:" + stdin_sentinel in stdout
         assert stdout_sentinel in stdout
@@ -126,13 +196,57 @@ def test_sandbox_interactive_exec_honors_tty(
         assert stderr_sentinel in stderr
         assert stderr_sentinel not in stdout
 
-        stdout, stderr = exec_interactive(sb.id, tty=True)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=True)
         assert b"TTT" in stdout + stderr
+
+
+def test_interactive_exec_drains_output_after_request_eof(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    with sandbox(delete_on_exit=True) as sb:
+
+        def requests():
+            yield openshell_pb2.ExecSandboxInput(
+                start=openshell_pb2.ExecSandboxRequest(
+                    sandbox=sb.sandbox.name,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                    command=[
+                        "/bin/sh",
+                        "-c",
+                        "input=$(cat); sleep 0.2; "
+                        "printf '%s' \"$input\"; printf 'drained-stderr' >&2; exit 7",
+                    ],
+                    tty=False,
+                    execution_timeout=duration_pb2.Duration(seconds=20),
+                )
+            )
+            yield openshell_pb2.ExecSandboxInput(stdin=b"drained-stdout")
+            # End requests before the command emits output. The receive
+            # direction must survive long enough to drain both output streams.
+
+        stdout = bytearray()
+        stderr = bytearray()
+        exit_codes: list[int] = []
+        for event in sandbox_client._stub.ExecSandboxInteractive(
+            requests(), timeout=30
+        ):
+            assert not exit_codes, "received another event after terminal exit"
+            payload = event.WhichOneof("payload")
+            if payload == "stdout":
+                stdout.extend(event.stdout.data)
+            elif payload == "stderr":
+                stderr.extend(event.stderr.data)
+            elif payload == "exit":
+                exit_codes.append(event.exit.exit_code)
+        assert stdout == b"drained-stdout"
+        assert stderr == b"drained-stderr"
+        assert exit_codes == [7]
 
 
 def test_list_scoped_and_for_all_workspaces(
     sandbox_client: SandboxClient,
-    workspace_client: "WorkspaceClient",
+    workspace_client: WorkspaceClient,
 ) -> None:
     import contextlib
     import uuid
@@ -150,9 +264,7 @@ def test_list_scoped_and_for_all_workspaces(
         )
         created_default.append(ref_default.name)
 
-        ref_other = sandbox_client.create(
-            workspace=other_ws, name=f"ls-oth-{suffix}"
-        )
+        ref_other = sandbox_client.create(workspace=other_ws, name=f"ls-oth-{suffix}")
         created_other.append(ref_other.name)
 
         default_ids = set(sandbox_client.list_ids(workspace="default"))
@@ -206,15 +318,29 @@ def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
 
         # Labels round-trip through create and get.
         assert ref_a.labels["role"] == "primary"
-        assert dict(sandbox_client.get(job_a, workspace="default").labels)["role"] == "primary"
-        assert dict(sandbox_client.get(job_b, workspace="default").labels)["role"] == "secondary"
+        assert (
+            dict(sandbox_client.get(job_a, workspace="default").labels)["role"]
+            == "primary"
+        )
+        assert (
+            dict(sandbox_client.get(job_b, workspace="default").labels)["role"]
+            == "secondary"
+        )
 
         # A specific selector filters to exactly the primary sandbox.
         assert {
-            s.name for s in sandbox_client.list_all(workspace="default", label_selector=primary_selector)
+            s.name
+            for s in sandbox_client.list_all(
+                workspace="default", label_selector=primary_selector
+            )
         } == {job_a}
         # The shared group label returns both.
-        assert {s.name for s in sandbox_client.list_all(workspace="default", label_selector=group_selector)} == {
+        assert {
+            s.name
+            for s in sandbox_client.list_all(
+                workspace="default", label_selector=group_selector
+            )
+        } == {
             job_a,
             job_b,
         }
@@ -223,15 +349,20 @@ def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
         assert sandbox_client.delete(job_a, workspace="default")
         sandbox_client.wait_deleted(job_a, workspace="default")
         created.remove(job_a)
-        assert {s.name for s in sandbox_client.list_all(workspace="default", label_selector=group_selector)} == {
-            job_b
-        }
+        assert {
+            s.name
+            for s in sandbox_client.list_all(
+                workspace="default", label_selector=group_selector
+            )
+        } == {job_b}
 
         # Final deletion leaves no matching sandboxes.
         assert sandbox_client.delete(job_b, workspace="default")
         sandbox_client.wait_deleted(job_b, workspace="default")
         created.remove(job_b)
-        assert not sandbox_client.list_all(workspace="default", label_selector=group_selector)
+        assert not sandbox_client.list_all(
+            workspace="default", label_selector=group_selector
+        )
     finally:
         for name in created:
             with contextlib.suppress(Exception):

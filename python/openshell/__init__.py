@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
+from .mutations import DeletionOutcome, DeletionResult
 from .sandbox import (
     ClientCredentialsAuth,
     ExecChunk,
@@ -20,6 +21,8 @@ from .sandbox import (
     SandboxStatusRef,
     SandboxTemplateClient,
     SandboxWorkloadTemplateProvenanceRef,
+    ServiceAuthorizationMode,
+    ServiceExposure,
     TlsConfig,
     WorkspaceClient,
     WorkspaceRef,
@@ -34,6 +37,8 @@ except Exception:
 
 __all__ = [
     "ClientCredentialsAuth",
+    "DeletionOutcome",
+    "DeletionResult",
     "ErrorInfo",
     "ExecChunk",
     "ExecResult",
@@ -49,6 +54,8 @@ __all__ = [
     "SandboxStatusRef",
     "SandboxTemplateClient",
     "SandboxWorkloadTemplateProvenanceRef",
+    "ServiceAuthorizationMode",
+    "ServiceExposure",
     "TlsConfig",
     "WorkspaceClient",
     "WorkspaceRef",

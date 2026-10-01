@@ -13,6 +13,46 @@ type NetworkPolicyRule struct {
 	Binaries []PolicyNetworkBinary
 }
 
+// NetworkTLSMode controls TLS handling for a policy endpoint.
+type NetworkTLSMode int32
+
+const (
+	// NetworkTLSModeUnspecified uses automatic TLS handling.
+	NetworkTLSModeUnspecified NetworkTLSMode = 0
+	// NetworkTLSModeSkip disables TLS inspection.
+	NetworkTLSModeSkip NetworkTLSMode = 1
+	// NetworkTLSModeTerminate is rejected by policy validation.
+	NetworkTLSModeTerminate NetworkTLSMode = 2
+	// NetworkTLSModePassthrough is rejected by policy validation.
+	NetworkTLSModePassthrough NetworkTLSMode = 3
+)
+
+// NetworkEnforcementMode controls whether an endpoint audits or enforces L7 rules.
+type NetworkEnforcementMode int32
+
+const (
+	// NetworkEnforcementModeUnspecified uses the documented audit default.
+	NetworkEnforcementModeUnspecified NetworkEnforcementMode = 0
+	// NetworkEnforcementModeEnforce blocks policy violations.
+	NetworkEnforcementModeEnforce NetworkEnforcementMode = 1
+	// NetworkEnforcementModeAudit logs policy violations without blocking them.
+	NetworkEnforcementModeAudit NetworkEnforcementMode = 2
+)
+
+// NetworkAccessPreset selects a predefined endpoint access policy.
+type NetworkAccessPreset int32
+
+const (
+	// NetworkAccessPresetUnspecified selects no access preset.
+	NetworkAccessPresetUnspecified NetworkAccessPreset = 0
+	// NetworkAccessPresetReadOnly permits read operations.
+	NetworkAccessPresetReadOnly NetworkAccessPreset = 1
+	// NetworkAccessPresetReadWrite permits read and write operations.
+	NetworkAccessPresetReadWrite NetworkAccessPreset = 2
+	// NetworkAccessPresetFull permits every operation supported by the protocol.
+	NetworkAccessPresetFull NetworkAccessPreset = 3
+)
+
 // PolicyNetworkEndpoint describes a full network endpoint with its access controls
 // as used in sandbox network policy rules. This is distinct from [NetworkEndpoint]
 // which is the simplified profile-level endpoint (Host, Port, Protocol only).
@@ -21,9 +61,9 @@ type PolicyNetworkEndpoint struct {
 	Port                         uint32
 	Ports                        []uint32
 	Protocol                     string
-	TLS                          string
-	Enforcement                  string
-	Access                       string
+	TLS                          NetworkTLSMode
+	Enforcement                  NetworkEnforcementMode
+	Access                       NetworkAccessPreset
 	Rules                        []L7Rule
 	AllowedIPs                   []string
 	DenyRules                    []L7DenyRule
@@ -159,22 +199,38 @@ type RemoveNetworkRule struct {
 	RuleName string
 }
 
+// L7RuleTarget identifies an endpoint and declares its complete affected scope.
+// The gateway requires the ports and binary scope to match the stored endpoint
+// and rule before appending any layer-7 rules.
+type L7RuleTarget struct {
+	// RuleName names the base-policy rule containing the endpoint.
+	RuleName string
+	// Host is the endpoint host, matched case-insensitively.
+	Host string
+	// Ports lists every port affected by the append, not only a lookup port.
+	Ports []uint32
+	// Path selects the endpoint path, distinct from an appended request path.
+	// Nil requires a unique endpoint; a pointer to "" selects an unscoped endpoint.
+	Path *string
+	// Binaries lists every binary governed by the containing rule.
+	// Exactly one of a nonempty Binaries list or AnyBinary=true is required.
+	Binaries []PolicyNetworkBinary
+	// AnyBinary explicitly acknowledges a rule with unrestricted binary scope.
+	AnyBinary bool
+}
+
 // AddDenyRules appends layer-7 deny rules to a specific endpoint.
 type AddDenyRules struct {
-	// Host identifies the target endpoint host.
-	Host string
-	// Port identifies the target endpoint port.
-	Port uint32
+	// Target is required and declares the full scope affected by the append.
+	Target *L7RuleTarget
 	// DenyRules are the deny rules to append.
 	DenyRules []L7DenyRule
 }
 
 // AddAllowRules appends layer-7 allow rules to a specific endpoint.
 type AddAllowRules struct {
-	// Host identifies the target endpoint host.
-	Host string
-	// Port identifies the target endpoint port.
-	Port uint32
+	// Target is required and declares the full scope affected by the append.
+	Target *L7RuleTarget
 	// Rules are the allow rules to append.
 	Rules []L7Rule
 }

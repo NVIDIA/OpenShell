@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+network_policies:
+  unicode-binary:
+    endpoints:
+      - host: api.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/é*

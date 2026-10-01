@@ -5,7 +5,9 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use openshell_ocsf::{ActivityId, EventContext, NetworkActivityBuilder, OcsfEvent, SeverityId};
+use openshell_ocsf::{
+    ActivityId, Endpoint, EventContext, EventOrigin, NetworkActivityBuilder, OcsfEvent, SeverityId,
+};
 
 fn sandbox_ctx(container_image: &str) -> EventContext {
     EventContext {
@@ -16,6 +18,7 @@ fn sandbox_ctx(container_image: &str) -> EventContext {
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 8888,
+        origin: EventOrigin::Supervisor,
     }
 }
 
@@ -23,6 +26,7 @@ fn event(ctx: &EventContext) -> OcsfEvent {
     NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Open)
         .severity(SeverityId::Medium)
+        .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
         .message("CONNECT api.example.com:443")
         .build()
 }

@@ -91,13 +91,14 @@ func (s *sandboxTemplateClient) ListAll(ctx context.Context, workspace string, o
 	return pager.All(ctx)
 }
 
-func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string) (bool, error) {
+func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := s.client.DeleteSandboxTemplate(ctx, &pb.DeleteSandboxTemplateRequest{
+		AllowMissing:   allowMissing(opts),
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

@@ -28,9 +28,7 @@ target_triple() {
   local suffix
   case "$libc" in
     musl) suffix=musl ;;
-    # gnu-static builds the GNU target with +crt-static, so it shares the
-    # gnu triple.
-    gnu|gnu-static) suffix=gnu ;;
+    gnu) suffix=gnu ;;
     *)
       echo "unsupported libc: $libc" >&2
       exit 1
@@ -169,8 +167,8 @@ build_component_for_arch() {
   target="$(target_triple "$arch" "$target_libc")"
   stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-}"
-  if [[ "$component" == "gateway" && " ${features} " != *" bundled-z3 "* ]]; then
-    features="${features} bundled-z3"
+  if [[ "$component" == "gateway" ]]; then
+    features="${features} vendored-z3"
   fi
   current_host_os="$(host_os)"
   current_host_arch="$(host_arch)"

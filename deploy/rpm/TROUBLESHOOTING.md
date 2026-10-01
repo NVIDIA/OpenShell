@@ -176,7 +176,7 @@ sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 **Image pull failure.** Verify ghcr.io is reachable:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 ### Images not updating
@@ -185,7 +185,7 @@ The default image pull policy is `if_not_present` -- images are pulled once
 and cached. To update:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 ```
 
@@ -231,7 +231,7 @@ the schema-v2 upgrade, the user service replaces only an exact copy of the v1
 file previously seeded by the RPM. If you edited that file, migrate it manually
 before restarting the service; direct `dnf` or `rpm` upgrades do not use the
 breaking-upgrade guard in `install.sh`. See the
-[Gateway Configuration File](https://docs.nvidia.com/openshell/latest/reference/gateway-config#migrate-to-schema-version-2)
+[Gateway Configuration File](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2)
 for the field-by-field migration steps. New gateway process options are listed
 in CONFIGURATION.md and `openshell-gateway --help`.
 
@@ -239,19 +239,19 @@ To pick up new container images after an upgrade:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 ### Migrating a TLS-enabled local driver to schema version 2
 
-Docker, Podman, and VM sandboxes connect back to the gateway with a guest TLS
-bundle. Package-managed installs use the complete bundle generated under
-`~/.local/state/openshell/tls`, so the RPM default requires no additional TOML.
-If you override the listener with custom `--tls-cert` and `--tls-key` inputs and
-do not use that managed bundle, configure all three `guest_tls_ca`,
-`guest_tls_cert`, and `guest_tls_key` paths under `[openshell.gateway]`. The
-gateway now fails at startup instead of allowing sandboxes to fail later. Omit
-all three fields when TLS is disabled.
+Docker, Podman, and VM supervisors authenticate the gateway with its CA and
+authenticate RPCs with sandbox bearer tokens. Package-managed installs use the
+CA generated under `~/.local/state/openshell/tls`, so the RPM default requires
+no additional TOML. If you override the listener with custom `--tls-cert` and
+`--tls-key` inputs and do not use that managed CA, configure `guest_tls_ca` under
+`[openshell.gateway]`. Remove the retired `guest_tls_cert` and `guest_tls_key`
+fields. The gateway fails at startup if the required CA is missing. Omit
+`guest_tls_ca` when TLS is disabled.
 
 ### Migrating from gateway.env
 

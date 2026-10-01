@@ -7,6 +7,7 @@ use std::io::Write;
 use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::container::is_e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
@@ -174,7 +175,7 @@ endpoints:
     protocol: rest
     access: full
     enforcement: enforce
-binaries: [/usr/bin/curl]
+binaries: [/usr/bin/bash]
 "#
     );
     file.write_all(profile.as_bytes())
@@ -191,7 +192,7 @@ fn write_binding_policy(port: u16) -> Result<NamedTempFile, String> {
 
 filesystem_policy:
   include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
   read_write: [/sandbox, /tmp, /dev/null]
 
 landlock:
@@ -218,7 +219,7 @@ network_policies:
         access: full
         enforcement: enforce
     binaries:
-      - path: /usr/bin/curl
+      - path: /usr/bin/bash
 "#
     );
     file.write_all(policy.as_bytes())
@@ -246,8 +247,7 @@ async fn delete_provider(name: &str) {
 
 async fn delete_provider_profile(id: &str) {
     let mut cmd = openshell_cmd();
-    cmd.arg("provider")
-        .arg("profile")
+    cmd.arg("profile")
         .arg("delete")
         .arg(id)
         .stdout(Stdio::null())
@@ -264,6 +264,7 @@ filesystem_policy:
   include_workdir: true
   read_only:
     - /usr
+    - /bin
     - /lib
     - /proc
     - /dev/urandom
@@ -294,7 +295,7 @@ network_policies:
           - "192.168.0.0/16"
           - "fc00::/7"
     binaries:
-      - path: /usr/bin/curl
+      - path: /usr/bin/bash
 "#
     );
     file.write_all(policy.as_bytes())
@@ -316,16 +317,17 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         .expect("temp policy path should be utf-8")
         .to_string();
 
+    let command = format!(
+        r#"exec 3<>/dev/tcp/host.openshell.internal/{0}; printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{0}\r\nConnection: close\r\n\r\n' >&3; while IFS= read -r line <&3 || [[ -n $line ]]; do printf '%s\n' "$line"; done"#,
+        server.port
+    );
     let guard = SandboxGuard::create(&[
         "--policy",
         &policy_path,
         "--",
-        "curl",
-        "--silent",
-        "--show-error",
-        "--max-time",
-        "15",
-        &format!("http://host.openshell.internal:{}/", server.port),
+        "/usr/bin/bash",
+        "-c",
+        &command,
     ])
     .await
     .expect("sandbox create with host.openshell.internal echo request");
@@ -337,6 +339,78 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         "expected sandbox to receive host echo response:\n{}",
         guard.create_output
     );
+}
+
+#[tokio::test]
+async fn sandbox_receives_eof_after_closing_http_response() {
+    for response in [
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
+    ] {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = HostServer {
+            port,
+            task: tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).expect("disable Nagle on fixture");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }),
+        };
+        let policy = write_policy(server.port).unwrap();
+        let command = format!(
+            r#"set -eu
+exec 3<>/dev/tcp/host.openshell.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\n\r\n' >&3
+while true; do
+  line=
+  if IFS= read -r -t 5 line <&3; then
+    printf '%s\n' "$line"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || {{ echo EOF_TIMEOUT; exit 1; }}
+    [ -z "$line" ] || printf '%s\n' "$line"
+    break
+  fi
+done
+printf 'RESPONSE_EOF\n'
+"#,
+        );
+        let mut sandbox = SandboxGuard::create(&[
+            "--policy",
+            policy.path().to_str().unwrap(),
+            "--no-auto-providers",
+            "--",
+            "/usr/bin/bash",
+            "-c",
+            &command,
+        ])
+        .await
+        .expect("closing response must finish without a client timeout");
+        assert!(
+            sandbox.create_output.lines().any(|line| line == "OK"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            sandbox.create_output.contains("RESPONSE_EOF"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            !sandbox.create_output.contains("EOF_TIMEOUT"),
+            "{}",
+            sandbox.create_output
+        );
+        sandbox.cleanup().await;
+    }
 }
 
 #[tokio::test]
@@ -369,10 +443,10 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     delete_provider(BINDING_PROVIDER_B_NAME).await;
     delete_provider_profile(BINDING_PROFILE_A_ID).await;
     delete_provider_profile(BINDING_PROFILE_B_ID).await;
-    run_cli(&["provider", "profile", "import", "--file", &profile_a_path])
+    run_cli(&["profile", "import", "--file", &profile_a_path])
         .await
         .expect("import provider A endpoint-binding profile");
-    run_cli(&["provider", "profile", "import", "--file", &profile_b_path])
+    run_cli(&["profile", "import", "--file", &profile_b_path])
         .await
         .expect("import provider B endpoint-binding profile");
     run_cli(&[
@@ -401,8 +475,32 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     .expect("create endpoint-bound provider B");
 
     let command = format!(
-        r#"allowed=$(curl --silent --show-error --max-time 15 -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/allowed/check); host_denied=$(curl --silent --show-error --max-time 15 -o /tmp/host-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.docker.internal:{}/allowed/check); path_denied=$(curl --silent --show-error --max-time 15 -o /tmp/path-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/other/check); printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied""#,
-        server.port, server.port, server.port
+        r#"
+http_request() {{
+  local host="$1" path="$2" status_line line
+  HTTP_STATUS= HTTP_BODY=
+  if ! exec 3<>"/dev/tcp/$host/{port}"; then
+    HTTP_STATUS=connect-denied
+    return 1
+  fi
+  printf 'GET %s HTTP/1.1\r\nHost: %s:{port}\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$path" "$host" "$BOUND_TOKEN_A" >&3
+  IFS= read -r status_line <&3 || return 1
+  status_line="${{status_line%$'\r'}}"
+  HTTP_STATUS="${{status_line#* }}"
+  HTTP_STATUS="${{HTTP_STATUS%% *}}"
+  while IFS= read -r line <&3; do
+    line="${{line%$'\r'}}"
+    [[ -z "$line" ]] && break
+  done
+  while IFS= read -r line <&3 || [[ -n "$line" ]]; do HTTP_BODY+="$line"; done
+  exec 3>&- 3<&-
+}}
+http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
+http_request host.docker.internal /allowed/check || true; host_denied="$HTTP_STATUS"
+http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
+printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
+"#,
+        port = server.port,
     );
     let mut guard = SandboxGuard::create(&[
         "--policy",
@@ -413,7 +511,7 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         BINDING_PROVIDER_B_NAME,
         "--no-auto-providers",
         "--",
-        "sh",
+        "/usr/bin/bash",
         "-c",
         &command,
     ])
@@ -433,8 +531,13 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
         guard.create_output,
     );
+    let expected_host_denial = if is_e2e_driver("podman") {
+        "HOST_DENIED=connect-denied"
+    } else {
+        "HOST_DENIED=403"
+    };
     assert!(
-        guard.create_output.contains("HOST_DENIED=403"),
+        guard.create_output.contains(expected_host_denial),
         "same placeholder must be denied at an unbound host:\n{}",
         guard.create_output
     );

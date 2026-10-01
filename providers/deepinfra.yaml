@@ -1,6 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/deepinfra.yaml
+#   openshell provider profile import -f providers/deepinfra.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl.
+# Reference layout:  curl at /usr/bin/curl or /usr/local/bin/curl. Add the SDK
+#                    interpreter if the workload calls the API through a library.
+# Credential scope:  DEEPINFRA_API_KEY, sent as a bearer authorization header to
+#                    api.deepinfra.com and nowhere else.
+# Endpoint access:   api.deepinfra.com, read-write, L7 enforced.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS https://api.deepinfra.com/v1/openai/models
+
 id: deepinfra
 display_name: DeepInfra
 description: DeepInfra inference endpoints

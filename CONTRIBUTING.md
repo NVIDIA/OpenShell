@@ -16,7 +16,7 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
 - **Do** interrogate your agent until you understand every edge case and interaction in your changes.
 - **Don't** submit code you can't explain without your agent open.
-- **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
+- **Don't** use agents as a substitute for understanding the system. Read the RFCs, crate READMEs, and published docs.
 
 ## First-Time Contributors
 
@@ -80,7 +80,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | --- | --- |
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
-| `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from `inference.local` |
+| `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
@@ -309,16 +309,17 @@ Project requirements:
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
-- CMake 3.16+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
-The `openshell-prover` crate links directly against Z3. The `openshell-server`
-crate depends on the prover, and the `openshell-gateway` binary crate depends
-on `openshell-server` in turn; both forward a `bundled-z3` feature down to
-`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on
-Z3. On macOS and Linux, install the system Z3 development package; `z3-sys`
-discovers it through `pkg-config`.
+The `openshell-prover` crate and standalone `openshell-prover-cli` binary link
+directly against Z3. The `openshell-server` crate depends on the prover, and
+the `openshell-gateway` binary crate depends on `openshell-server` in turn.
+The `openshell-cli` crate does not depend on Z3. The Nix development shell
+supplies Z3. For builds outside that shell on macOS and Linux, install the
+system Z3 development package; `z3-sys` discovers it through `pkg-config`.
+The linker uses the installed static or shared library. The Nix development
+shell provides a static Z3 library.
 
 ```bash
 # macOS
@@ -331,17 +332,21 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
-compiles Z3 from source during the Rust build and requires CMake 3.16+:
+To build Z3 from source instead, enable `vendored-z3` (requires CMake and a C++
+compiler):
 
 ```bash
-cargo build -p openshell-prover --features bundled-z3
+cargo build -p openshell-prover --features vendored-z3
+cargo build -p openshell-prover-cli --features vendored-z3
 ```
+
+Local gateway image and E2E builds enable `vendored-z3` so their
+copied gateway binaries do not need a shared Z3 library in the runtime image.
 
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
-  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  pinned Z3 5.1.0 GitHub release for the target architecture on the first
   build. Cargo reuses the extracted archive from its target directory. Windows
   CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
   preserves the archive in the architecture-specific Cargo target cache. For
@@ -351,14 +356,12 @@ For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
   target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
   The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
   is set.
-- Bundled Z3: for direct Cargo builds, pass `--features bundled-z3` so `z3-sys`
-  builds Z3 from source.
 
 `openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
 just this crate does not require `LIBCLANG_PATH`:
 
 ```powershell
-cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
 ```
 
 ### Windows full build
@@ -379,8 +382,8 @@ To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
-$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
-$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-5.1.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-5.1.0-x64-win\include\z3.h'
 mise run --skip-tools windows:build:x64
 ```
 
@@ -458,15 +461,17 @@ These are the primary `mise` tasks for day-to-day development:
 | Path            | Purpose                                       |
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
+| `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
-| `proto/`        | Protocol buffer definitions                   |
+| `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
-| `architecture/` | Architecture docs and plans                   |
+| `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
 | `.agents/`      | Contributor skills and persona definitions    |
@@ -475,9 +480,15 @@ These are the primary `mise` tasks for day-to-day development:
 
 New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines.
 
+## Public API conventions
+
+Follow [the protobuf API conventions](proto/README.md) when adding or changing
+gRPC contracts. The guide defines entity-reference naming, workspace selectors,
+field design, and schema-evolution rules.
+
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides. Keep every page URL equal to its file path under `docs/`; `mise run docs` checks this with `docs:nav`.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs-from-commits` skill.
 It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.
@@ -547,7 +558,46 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
+
+The project uses version 1.1 of the [Developer Certificate of Origin](https://developercertificate.org/):
+
+```text
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+
+Developer's Certificate of Origin 1.1
+
+By making a contribution to this project, I certify that:
+
+(a) The contribution was created in whole or in part by me and I
+    have the right to submit it under the open source license
+    indicated in the file; or
+
+(b) The contribution is based upon previous work that, to the best
+    of my knowledge, is covered under an appropriate open source
+    license and I have the right under that license to submit that
+    work with modifications, whether created in whole or in part
+    by me, under the same open source license (unless I am
+    permitted to submit under a different license), as indicated
+    in the file; or
+
+(c) The contribution was provided directly to me by some other
+    person who certified (a), (b) or (c) and I have not modified
+    it.
+
+(d) I understand and agree that this project and the contribution
+    are public and that a record of the contribution (including all
+    personal information I submit with it, including my sign-off) is
+    maintained indefinitely and may be redistributed consistent with
+    this project or the open source license(s) involved.
+```
 
 ```bash
 git commit -s -m "feat(sandbox): add new capability"

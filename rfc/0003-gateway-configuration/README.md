@@ -93,10 +93,8 @@ enable_loopback_service_http = true
 # plaintext listener; guest TLS fields must then be omitted.
 disable_tls           = false
 
-# Gateway-owned TLS bundle injected into the selected local driver.
+# Gateway-owned CA injected into the selected local driver for supervisor TLS.
 guest_tls_ca          = "/etc/openshell/certs/ca.pem"
-guest_tls_cert        = "/etc/openshell/certs/client.pem"
-guest_tls_key         = "/etc/openshell/certs/client-key.pem"
 
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -122,7 +120,7 @@ scopes_claim  = ""                     # empty disables scope enforcement
 
 [openshell.drivers.kubernetes]
 namespace                    = "openshell"
-default_image                = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image                = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy            = "if_not_present"
 supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:latest"
 supervisor_image_pull_policy = "if_not_present"
@@ -132,7 +130,7 @@ host_gateway_ip              = "10.0.0.1"
 ssh_socket_path              = "/run/openshell/ssh.sock"
 
 [openshell.drivers.docker]
-default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present"
 sandbox_label     = "docker-dev"
 grpc_endpoint     = "https://host.openshell.internal:8080"
@@ -142,7 +140,7 @@ supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"      # used to 
 
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
-default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image     = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present" # always | if_not_present | never | newer
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
@@ -162,7 +160,7 @@ krun_log_level  = 1
 Each `[openshell.drivers.<name>]` table is extracted from the parsed file and handed to the driver's initialization function as a raw TOML value. The driver is then responsible for:
 
 1. **Parsing** — deserializing the table into its own typed config struct (e.g. `KubernetesComputeConfig`, `DockerComputeConfig`, `PodmanComputeConfig`, `VmComputeConfig`).
-2. **Validation** — applying cross-field checks specific to that driver. Gateway-owned guest TLS paths are validated as one bundle and injected only into the selected local driver before this step.
+2. **Validation** — applying cross-field checks specific to that driver. The gateway-owned CA path is validated and injected only into the selected local driver before this step; supervisor identity uses sandbox bearer tokens.
 3. **Consumption** — using the resulting struct to initialize internal state.
 
 Driver authors define and own their config schema. Adding a new driver does not require changes to the gateway's core `Config` struct or to this RFC.
@@ -225,7 +223,7 @@ disable_tls = true
 
 [openshell.drivers.kubernetes]
 namespace        = "agents"
-default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:0.9.0"
 grpc_endpoint    = "https://openshell-gateway.agents.svc:8080"
 ```
@@ -245,7 +243,7 @@ gateway:
     drivers:
       kubernetes:
         namespace: agents
-        default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+        default_image: nvcr.io/nvidia/base/ubuntu:24.04
         supervisor_image: ghcr.io/nvidia/openshell/supervisor:0.9.0
 ```
 

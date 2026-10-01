@@ -33,7 +33,8 @@
 use base64::Engine as _;
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate};
 use openshell_core::proto::{
-    FilesystemPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+    FilesystemPolicy, NetworkAccessPreset, NetworkBinary, NetworkEndpoint, NetworkEnforcementMode,
+    NetworkPolicyRule, NetworkTlsMode, SandboxPolicy,
 };
 use openshell_driver_mxc::{MxcComputeBackend, MxcComputeConfig};
 use std::path::PathBuf;
@@ -732,9 +733,9 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     host: "example.com".to_string(),
                     ports: vec![443],
                     protocol: "rest".to_string(),
-                    tls: "terminate".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-only".to_string(),
+                    tls: NetworkTlsMode::Unspecified as i32,
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
+                    access: NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary { path: cmd_string }],
@@ -766,7 +767,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };
-    let backend = MxcComputeBackend::new(config);
+    let backend = MxcComputeBackend::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
     backend
         .create_sandbox(&sandbox)
         .await

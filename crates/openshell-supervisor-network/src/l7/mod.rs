@@ -28,7 +28,8 @@ use openshell_core::endpoint_status::{
 use openshell_core::mcp::McpProtocolVersion;
 pub use openshell_policy::L7Protocol;
 use openshell_policy::{
-    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+    L7EndpointFields, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
 };
 use std::sync::{Arc, Mutex};
 
@@ -297,38 +298,23 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
 
-    let tls = match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        Some("terminate") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        Some("passthrough") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        _ => TlsMode::Auto,
+    let tls_value = get_object_str(val, "tls").unwrap_or_default();
+    let enforcement_value = get_object_str(val, "enforcement").unwrap_or_default();
+    let access_value = get_object_str(val, "access").unwrap_or_default();
+    if !validate_endpoint_modes(&tls_value, &enforcement_value, &access_value).is_empty() {
+        return None;
+    }
+
+    let tls = match tls_value.as_str() {
+        "skip" => TlsMode::Skip,
+        "" => TlsMode::Auto,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
-    let enforcement = match get_object_str(val, "enforcement").as_deref() {
-        Some("enforce") => EnforcementMode::Enforce,
-        _ => EnforcementMode::Audit,
+    let enforcement = match enforcement_value.as_str() {
+        "enforce" => EnforcementMode::Enforce,
+        "" | "audit" => EnforcementMode::Audit,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
@@ -364,9 +350,10 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         Some("sigv4:body") => CredentialSigning::SigV4Body,
         Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
         Some(other) if !other.is_empty() => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::High)
+                .status(openshell_ocsf::StatusId::Failure)
+                .state(openshell_ocsf::StateId::Disabled, "invalid")
                 .message(format!(
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
@@ -381,9 +368,10 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let signing_region = get_object_str(val, "signing_region").unwrap_or_default();
 
     if credential_signing.is_sigv4() && signing_service.is_empty() {
-        let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(openshell_ocsf::ActivityId::Other)
+        let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::High)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Disabled, "invalid")
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();
         openshell_ocsf::ocsf_emit!(event);
@@ -460,7 +448,6 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
     }
 }
@@ -1019,9 +1006,11 @@ fn validate_mcp_params_field(
     has_tool: bool,
     mcp_strict_tool_names: bool,
 ) {
-    let Some(params) = rule.get("params").filter(|v| !v.is_null()) else {
+    let Some(params) = rule.get("params") else {
         return;
     };
+    // Explicit params must be a map: tool alias lowering inserts params.name
+    // into it, so accepting null would discard the tool selector.
     let Some(params_obj) = params.as_object() else {
         errors.push(format!("{loc}.params: expected map of matchers"));
         return;
@@ -1261,6 +1250,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             );
             let loc = format!("{name}.endpoints[{i}]");
 
+            errors.extend(
+                validate_endpoint_modes(tls, enforcement, access)
+                    .into_iter()
+                    .map(|reason| format!("{loc}: {reason}")),
+            );
+
             if protocol == "mcp" {
                 if host.trim().is_empty() {
                     errors.push(format!(
@@ -1477,13 +1472,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            // Deprecated tls values: warn but don't error
-            if tls == "terminate" || tls == "passthrough" {
-                warnings.push(format!(
-                    "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
-                ));
-            }
-
             // tls: skip with L7 on port 443 won't work
             if tls == "skip" && !protocol.is_empty() && ports.contains(&443) {
                 warnings.push(format!(
@@ -1497,10 +1485,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: SQL enforcement requires full SQL parsing (not available in v1). Use `enforcement: audit`."
                 ));
             }
-
-            // port 443 + rest + tls: skip — L7 won't work (already handled above)
-            // The old warning about missing `tls: terminate` is no longer needed
-            // because TLS termination is now automatic.
 
             // Per-rule deny_rules validation (semantic checks handled by
             // shared validator above).
@@ -1941,12 +1925,11 @@ mod tests {
     #[test]
     fn parse_l7_config_rest_enforce() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "tls": "terminate", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
+            r#"{"protocol": "rest", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        // "terminate" is deprecated and treated as Auto.
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Enforce);
     }
@@ -2226,6 +2209,16 @@ mod tests {
         .expect("parse REST config JSON");
         let config = parse_l7_config(&value).expect("parse REST config");
         assert!(EndpointObserver::begin(Some(&sender), &config).is_none());
+    }
+
+    #[test]
+    fn parse_l7_config_rejects_unknown_enforcement() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "enforcement": "enforc", "access": "read-only", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&val).is_none());
     }
 
     #[test]
@@ -3399,30 +3392,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_terminate_deprecated_warning() {
-        let data = serde_json::json!({
-            "network_policies": {
-                "test": {
-                    "endpoints": [{
-                        "host": "api.example.com",
-                        "port": 443,
-                        "tls": "terminate",
-                        "protocol": "rest",
-                        "access": "full"
-                    }],
-                    "binaries": []
+    fn validate_rejects_unknown_endpoint_modes_without_warning() {
+        for (field, value) in [
+            ("tls", "terminate"),
+            ("tls", "passthrough"),
+            ("enforcement", "enforcee"),
+            ("access", "read_only"),
+        ] {
+            let mut endpoint = serde_json::json!({
+                "host": "api.example.com",
+                "port": 443,
+                "protocol": "rest",
+                "access": "full"
+            });
+            endpoint[field] = value.into();
+            let data = serde_json::json!({
+                "network_policies": {
+                    "test": { "endpoints": [endpoint], "binaries": [] }
                 }
-            }
-        });
-        let (errors, warnings) = validate_l7_policies(&data);
-        assert!(
-            errors.is_empty(),
-            "deprecated tls should not error: {errors:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("deprecated")),
-            "should warn about deprecated tls: {warnings:?}"
-        );
+            });
+
+            let (errors, warnings) = validate_l7_policies(&data);
+            assert!(
+                errors.iter().any(|e| e.contains("test.endpoints[0]")
+                    && e.contains(&format!("unknown {field} value '{value}'"))),
+                "{field}: {value} should be rejected: {errors:?}"
+            );
+            assert!(
+                !warnings.iter().any(|w| w.contains("deprecated")),
+                "{field}: {value} should not warn: {warnings:?}"
+            );
+        }
     }
 
     #[test]
