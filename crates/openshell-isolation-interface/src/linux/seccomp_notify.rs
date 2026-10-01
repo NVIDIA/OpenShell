@@ -456,6 +456,28 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
     install_listener(&syscalls)
 }
 
+/// Join the launcher thread on handover failure and propagate its error.
+///
+/// When `recv()` fails the launcher thread already exited — either because
+/// `install_listener` failed (preserving a real `io::Error` and `ErrorKind`) or
+/// because the thread panicked. This function joins the thread, extracts the
+/// result, and converts a panic into a generic I/O error while preserving the
+/// original error kind for genuine failures.
+///
+/// The `join_handle` closure is only called on the failure path, so it can
+/// safely move `launcher` into the closure without consuming it on the
+/// success path. The closure returns the launcher's `io::Result<U>`, allowing
+/// direct extraction of the `io::Error` without generic type parameters.
+fn launcher_failure<F, E>(join_handle: F) -> io::Error
+where
+    F: FnOnce() -> io::Result<E>,
+{
+    match join_handle() {
+        Err(error) => error,
+        Ok(_) => io::Error::other("notification launcher exited before handover"),
+    }
+}
+
 /// Run a no-capability conformance probe.
 ///
 /// This uses the production launcher-thread shape: the listener is created on
@@ -485,9 +507,13 @@ fn probe_scalar_round_trip() -> io::Result<bool> {
         Ok(unsafe { libc::syscall(libc::SYS_getppid) })
     });
 
-    let (listener, wait_killable) = receiver
-        .recv()
-        .map_err(|_| io::Error::other("notification launcher disappeared"))?;
+    let Ok((listener, wait_killable)) = receiver.recv() else {
+        return Err(launcher_failure(|| match launcher.join() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::other("notification launcher panicked")),
+        }));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -556,9 +582,13 @@ fn probe_addfd_send() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("ADDFD launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(|| match launcher.join() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::other("notification launcher panicked")),
+        }));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -687,9 +717,13 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("sendto launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(|| match launcher.join() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::other("notification launcher panicked")),
+        }));
+    };
     let destination = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -1131,5 +1165,66 @@ mod tests {
             .expect("install killable listener");
         assert_eq!(listener.mode(), ListenerMode::Killable);
         assert!(!listener.writes_disabled());
+    }
+
+    #[test]
+    fn notification_probe_reports_rejected_listener_install() {
+        const CHILD_ENV: &str = "OPENSHELL_SECCOMP_BLOCKED_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+            #[cfg(target_arch = "x86_64")]
+            const SYS_SECCOMP: u32 = 317;
+
+            let mut instructions = [
+                stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+                jump(BPF_JMP_JEQ_K, native_audit_arch(), 1, 0),
+                stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+                stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+                #[cfg(target_arch = "x86_64")]
+                jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
+                #[cfg(target_arch = "x86_64")]
+                stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+                jump(BPF_JMP_JEQ_K, SYS_SECCOMP, 0, 1),
+                stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs()),
+                stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+            ];
+            let length = u16::try_from(instructions.len()).expect("test seccomp filter fits u16");
+            let mut program = libc::sock_fprog {
+                len: length,
+                filter: instructions.as_mut_ptr(),
+            };
+            set_no_new_privileges().expect("no_new_privs for test seccomp filter");
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    SECCOMP_SET_MODE_FILTER,
+                    0,
+                    std::ptr::addr_of_mut!(program),
+                )
+            };
+            assert!(
+                result >= 0,
+                "test must install seccomp filter to block SYS_seccomp"
+            );
+            // SYS_seccomp is blocked by the filter: VERIFY must fail with
+            // EPERM rather than any kernel ABI mismatch, and the probe must
+            // surface that errno through the launcher thread instead of
+            // reporting a generic "notification launcher disappeared" message.
+            let error =
+                probe_scalar_round_trip().expect_err("probe must fail when SYS_seccomp is blocked");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::seccomp_notify::tests::notification_probe_reports_rejected_listener_install")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("run disposable test subprocess");
+        assert!(status.success(), "blocked-listener child failed: {status}");
     }
 }
