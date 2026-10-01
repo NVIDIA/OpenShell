@@ -333,6 +333,40 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: OTLP environment mutation is serialized with test_lock().
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: OTLP environment mutation is serialized with test_lock().
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: OTLP environment mutation is serialized with test_lock().
+            match self.original.as_deref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn error_status_guard_marks_only_unfinished_results() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -492,6 +526,42 @@ mod tests {
                 .map(|value| value.to_string()),
             Some("vm-dev".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn gzip_compression_env_builds_exporter() {
+        let _env_lock = test_lock();
+        let _trace_compression = EnvVarGuard::remove("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION");
+        let _compression = EnvVarGuard::set("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip");
+
+        let (provider, error) = provider_for(Some(OtlpTraceConfig {
+            endpoint: "http://127.0.0.1:4317",
+            service_name: ServiceName::Fixed("test-service"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        }));
+
+        assert!(error.is_none(), "gzip exporter setup failed: {error:?}");
+        let provider = provider.expect("gzip exporter should build");
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn https_endpoint_builds_exporter_with_native_roots() {
+        let _env_lock = test_lock();
+        let _trace_compression = EnvVarGuard::remove("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION");
+        let _compression = EnvVarGuard::remove("OTEL_EXPORTER_OTLP_COMPRESSION");
+
+        let (provider, error) = provider_for(Some(OtlpTraceConfig {
+            endpoint: "https://localhost:4317",
+            service_name: ServiceName::Fixed("test-service"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        }));
+
+        assert!(error.is_none(), "HTTPS exporter setup failed: {error:?}");
+        let provider = provider.expect("HTTPS exporter should build");
+        provider.shutdown().unwrap();
     }
 
     #[tokio::test]
