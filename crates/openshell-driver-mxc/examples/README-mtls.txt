@@ -1,38 +1,61 @@
 OpenShell CLI <-> gateway mTLS test (T2)
-========================================
+=========================================
 
 WHAT THIS PROVES
-  T2 is the CONTROL CHANNEL, not inference. It verifies that the gateway's
-  management API (sandbox create/list/etc.) is served over mutual TLS and that a
-  client presenting NO certificate is rejected at the TLS handshake. It does not
-  touch the MXC sandbox or any inference endpoint, and needs no API key.
+  T2 covers the control channel, not inference. It verifies that:
 
-  PASS requires all of:
-    - gateway logs: TLS enabled + client cert verification + mTLS user auth
-    - CLI `gateway add` and `sandbox list` succeed over https (real mTLS RPCs)
-    - a no-cert curl client is refused (curl exit 56 + gateway logs the rejection)
+    - the gateway enables TLS, client-certificate verification, and mTLS auth;
+    - the CLI can register the gateway and complete a real `sandbox list` RPC;
+    - a client that presents no certificate is rejected during the handshake.
+
+  The gateway starts with OpenShell's in-process MXC mock only to satisfy the
+  compute-driver startup contract. The test never creates a sandbox and does
+  not claim MXC or AppContainer isolation coverage.
 
 PREREQUISITES
-  - Drop run-mtls-test.ps1 into the SAME folder that already has:
-      openshell-gateway.exe
-      openshell.exe
-    (the existing openshell-inference-test folder works as-is)
-  - No API key, no wxc-exec, no network egress required. Pure loopback.
+  Put this script in a folder containing:
+
+    openshell-gateway.exe
+    openshell.exe
+
+  No API key, wxc-exec binary, MXC backend, or network egress is required.
+  The gateway uses an in-memory database and the test runs on loopback.
 
 RUN
   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-mtls-test.ps1
 
-  Optional:
-    -TlsDir C:\work\openshell-mtls   (where throwaway certs are generated)
-    -Port 17670                      (gateway bind port)
-    -KeepRunning                     (leave the gateway up for inspection)
+  Optional parameters:
+
+    -TlsDir C:\work\openshell-mtls
+        Directory for throwaway certificates. Private keys remain here and are
+        never copied into the result bundle.
+
+    -Port 17670
+        Explicit gateway port. The default, 0, chooses an available loopback
+        port. If an explicit port is busy, the test fails without stopping the
+        process that owns it.
+
+    -GatewayPath C:\path\to\openshell-gateway.exe
+    -CliPath C:\path\to\openshell.exe
+        Override the packaged binary paths for local development.
+
+    -OutputDir D:\results\openshell-mtls
+        Write the result directory and zip to another location. The default is
+        the script folder.
+
+    -KeepRunning
+        Leave only the gateway process started by this invocation running.
+        The script prints the PID and preserves its isolated CLI state path.
+
+STATE SAFETY
+  The script redirects XDG_CONFIG_HOME, XDG_STATE_HOME, and the system gateway
+  overlay to a unique test-owned directory beneath TlsDir before generating
+  certificates or invoking the CLI. Existing gateway registrations, active
+  selection, certificates, and CLI state are never read, overwritten, or
+  removed. The original environment is restored before the script exits.
 
 OUTPUT
-  results-mtls-<timestamp>.zip in the same folder. Hand that back.
-  The bundle contains: gateway.log, transcript.txt, summary.txt, and the PUBLIC
-  server cert. Throwaway PRIVATE keys are intentionally NOT included.
-
-NOTE
-  A gateway named "openshell" may already be registered from a prior run; the
-  script removes/re-adds it automatically. The decisive proof is the
-  `sandbox list` RPC succeeding over mTLS plus the no-cert client being refused.
+  results-mtls-<timestamp>-<pid>.zip in OutputDir (the script folder by
+  default). The bundle contains gateway logs, transcript.txt, summary.txt, the
+  exact non-secret gateway configuration, and the public server certificate.
+  It contains no private keys.
