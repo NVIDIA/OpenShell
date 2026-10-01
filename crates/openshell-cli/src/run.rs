@@ -6784,7 +6784,7 @@ mod tests {
         tokio::pin!(stream);
         drop(sender);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
+            tokio::time::timeout(Duration::from_millis(10), stream.next())
                 .await
                 .is_err()
         );
