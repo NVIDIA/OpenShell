@@ -18,9 +18,15 @@
 //! Per-request L7 enforcement is covered by
 //! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_l7`] via
 //! [`CedarL7TunnelEngine`], this engine's [`crate::opa::L7PolicyEngine`]
-//! handle. `EgressAuthorization::{endpoint_configs,matched_endpoints}` are
-//! always empty from this engine — those feed L7 config lookup and the
-//! not-yet-landed policy-DNS adapter, both out of scope here.
+//! handle. [`l7_endpoint_configs_for`] populates
+//! `EgressAuthorization::endpoint_configs` from `HttpRequest` permits (via
+//! [`openshell_policy_cedar::extract_l7_endpoints`]) so the proxy actually
+//! routes an allowed CONNECT into L7 inspection instead of unconditional
+//! passthrough. `EgressAuthorization::matched_endpoints` stays always
+//! empty — that feeds the not-yet-landed transparent-TCP policy-DNS
+//! adapter (dead code for every current driver), out of scope here. DNS
+//! eligibility is a separate concern, covered independently by
+//! [`crate::opa::NetworkPolicyEngine::policy_dns_eligibility_snapshot`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -146,6 +152,33 @@ impl CedarOnlyEngine {
     }
 }
 
+/// Builds the `endpoint_configs` the proxy's `query_l7_route_snapshot`
+/// needs to select L7 inspection over passthrough for `(host, port)`.
+///
+/// Without this, a Cedar-sourced sandbox's `HttpRequest` policies are never
+/// consulted: `query_l7_route_snapshot` only inspects when
+/// `EgressAuthorization::endpoint_configs` is non-empty, and every allowed
+/// CONNECT would otherwise fall through to unconditional passthrough.
+fn l7_endpoint_configs_for(
+    guard: &CedarNetworkEngine,
+    host: &str,
+    port: u16,
+) -> Vec<regorus::Value> {
+    let normalized_host = openshell_policy_cedar::normalize_host(host);
+    guard
+        .extract_l7_endpoints()
+        .into_iter()
+        .filter(|endpoint| endpoint.host == normalized_host && endpoint.port == port)
+        .filter_map(|endpoint| {
+            let json = serde_json::json!({
+                "protocol": endpoint.protocol,
+                "enforcement": "enforce",
+            });
+            serde_json::from_value::<regorus::Value>(json).ok()
+        })
+        .collect()
+}
+
 impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
     fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         let request = network_request_from_input(input);
@@ -173,11 +206,20 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
             NetworkDecision::Unsupported { reason } => NetworkAction::Deny { reason },
         };
 
+        let endpoint_configs = if matches!(action, NetworkAction::Allow { .. }) {
+            l7_endpoint_configs_for(&guard, &request.host, request.port)
+        } else {
+            Vec::new()
+        };
+
         Ok(EgressAuthorization {
             action,
-            // L7 config lookup and the policy-DNS adapter are out of scope
-            // for Cedar-sourced sandboxes in this phase (see module docs).
-            endpoint_configs: Vec::new(),
+            endpoint_configs,
+            // The policy-DNS adapter (transparent TCP's host:port-to-policy
+            // correlation) is out of scope for Cedar-sourced sandboxes in
+            // this phase — see module docs. It's unrelated to L7 config
+            // lookup above, which `policy_dns_eligibility_snapshot` (a
+            // separate NetworkPolicyEngine method) now covers independently.
             matched_endpoints: Vec::<MatchedEndpoint>::new(),
             exact_declared_endpoint_host: false,
             generation,
@@ -357,6 +399,61 @@ when {
             graphql: None,
             jsonrpc: None,
         }
+    }
+
+    #[test]
+    fn authorize_egress_populates_endpoint_configs_for_an_l7_endpoint() {
+        // Without this, query_l7_route_snapshot (proxy.rs) always sees an
+        // empty endpoint_configs and routes every allowed CONNECT to
+        // unconditional passthrough — the HttpRequest permit above would
+        // then never actually be consulted for a real connection.
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let input = NetworkInput {
+            host: "api.example.com".to_string(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: "deadbeef".to_string(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let authorization = engine.authorize_egress(&input).expect("request evaluates");
+        assert!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            "{:?}",
+            authorization.action
+        );
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        let config = crate::l7::parse_l7_config(&authorization.endpoint_configs[0])
+            .expect("config must parse");
+        assert_eq!(config.protocol, openshell_policy::L7Protocol::Rest);
+    }
+
+    #[test]
+    fn authorize_egress_omits_endpoint_configs_for_a_connect_only_endpoint() {
+        const CONNECT_ONLY_POLICY: &str = r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+"#;
+        let engine = CedarOnlyEngine::from_policy_str(CONNECT_ONLY_POLICY).expect("policy parses");
+        let input = NetworkInput {
+            host: "pypi.org".to_string(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: "deadbeef".to_string(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let authorization = engine.authorize_egress(&input).expect("request evaluates");
+        assert!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            "{:?}",
+            authorization.action
+        );
+        assert!(authorization.endpoint_configs.is_empty());
     }
 
     #[test]

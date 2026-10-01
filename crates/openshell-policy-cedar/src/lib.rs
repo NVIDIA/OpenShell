@@ -198,6 +198,13 @@ impl CedarNetworkEngine {
         extract_authorized_network_endpoints(&self.policies)
     }
 
+    /// Extracts the `NetworkEndpoint`s this engine's policy set designates
+    /// for L7 inspection. See [`extract_l7_endpoints`].
+    #[must_use]
+    pub fn extract_l7_endpoints(&self) -> Vec<AuthorizedL7Endpoint> {
+        extract_l7_endpoints(&self.policies)
+    }
+
     /// Evaluates one network-connect request against the loaded policy set.
     ///
     /// # Errors
@@ -579,8 +586,84 @@ pub fn extract_authorized_network_endpoints(
 /// (see `NormalizedName::parse`); authored Cedar policy host literals never
 /// have one. Without this, every CONNECT/L7 request whose host came from a
 /// DNS resolution would fail to match an otherwise-identical policy host.
-fn normalize_host(host: &str) -> String {
+#[must_use]
+pub fn normalize_host(host: &str) -> String {
     host.strip_suffix('.').unwrap_or(host).to_lowercase()
+}
+
+/// One network endpoint an authored Cedar policy set designates for L7
+/// (per-request) inspection, and the protocol to parse it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedL7Endpoint {
+    /// Destination host, lowercased.
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// L7 protocol label (`"rest"`, `"sql"`, `"json-rpc"`), determining
+    /// which wire parser the relay uses. Defaults to `"rest"` when the
+    /// granting policy carries no `@protocol(...)` annotation.
+    pub protocol: String,
+}
+
+/// Extracts the exact `NetworkEndpoint` literals an authored Cedar policy
+/// set designates for L7 inspection, by the presence of an `HttpRequest`
+/// permit targeting them.
+///
+/// Unlike CONNECT-time authorization (a yes/no decision), per-request L7
+/// inspection needs to know *which wire parser* to use before any request
+/// has been read — information Cedar's schema has no entity-literal
+/// equivalent for (it isn't part of the allow/deny decision at all, any
+/// more than OPA's YAML `protocol:` field is). Author a `@protocol("sql")`
+/// (or `"json-rpc"`) annotation on the granting `HttpRequest` permit to
+/// declare it; absent an annotation, `"rest"` is assumed — the common case,
+/// and the only protocol `compile_l7` targets without one.
+///
+/// A host reachable only through a `like` glob condition is **not**
+/// included, same limitation and rationale as
+/// [`extract_authorized_network_endpoints`]. `forbid` policies are ignored.
+#[must_use]
+pub fn extract_l7_endpoints(policies: &PolicySet) -> Vec<AuthorizedL7Endpoint> {
+    let mut by_endpoint: BTreeMap<(String, u16), String> = BTreeMap::new();
+
+    for policy in policies.policies() {
+        if policy.effect() != Effect::Permit {
+            continue;
+        }
+        let literals = policy.entity_literals();
+        let targets_http_request = literals.iter().any(|uid| {
+            uid.type_name().to_string() == actions::ACTION_TYPE
+                && uid.id().unescaped() == actions::HTTP_REQUEST
+        });
+        if !targets_http_request {
+            continue;
+        }
+        let protocol = policy
+            .annotation("protocol")
+            .map_or_else(|| "rest".to_string(), ToString::to_string);
+
+        for uid in &literals {
+            if uid.type_name().to_string() != entity_types::NETWORK_ENDPOINT {
+                continue;
+            }
+            let id = uid.id().unescaped();
+            let Some((host, port_str)) = id.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            by_endpoint.insert((host.to_ascii_lowercase(), port), protocol.clone());
+        }
+    }
+
+    by_endpoint
+        .into_iter()
+        .map(|((host, port), protocol)| AuthorizedL7Endpoint {
+            host,
+            port,
+            protocol,
+        })
+        .collect()
 }
 
 /// Builds an [`EntityUid`] from a Cedar entity type name and id.
