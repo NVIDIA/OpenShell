@@ -644,6 +644,7 @@ pub struct ComputeRuntime {
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
+    image_preparation_timeout_seconds: u32,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -745,6 +746,7 @@ impl ComputeRuntime {
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
             default_image,
+            image_preparation_timeout_seconds: 1800,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -824,6 +826,16 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    /// Validate the budget once at startup. Persisted attempts keep their
+    /// original deadline even if the operator changes this value on restart.
+    pub(crate) fn with_image_preparation_timeout(mut self, seconds: u32) -> Result<Self, String> {
+        if !(1..=86_400).contains(&seconds) {
+            return Err("image_preparation_timeout_seconds must be between 1 and 86400".into());
+        }
+        self.image_preparation_timeout_seconds = seconds;
+        Ok(self)
     }
 
     #[must_use]
@@ -1618,6 +1630,7 @@ impl ComputeRuntime {
                             SandboxPhase::Starting,
                             "Starting",
                             "Sandbox start requested",
+                            self.image_preparation_timeout_seconds,
                         );
                     },
                 )
@@ -1699,7 +1712,7 @@ impl ComputeRuntime {
                         .await.map_err(|error| Status::internal(error.to_string()))?
                         .ok_or_else(|| Status::not_found("sandbox removed during startup"))?;
                     if provisioning_deadline::timed_out(&current) {
-                        return Err(Status::deadline_exceeded("provisioning repair window expired"));
+                        return Err(Status::deadline_exceeded("provisioning deadline expired"));
                     }
                 }
             }
@@ -2104,7 +2117,13 @@ impl ComputeRuntime {
                 &sandbox_id,
                 expected_resource_version,
                 move |sandbox| {
-                    apply_lifecycle_phase(sandbox, phase, &reason, &message);
+                    apply_lifecycle_phase(
+                        sandbox,
+                        phase,
+                        &reason,
+                        &message,
+                        self.image_preparation_timeout_seconds,
+                    );
                 },
             )
             .await
@@ -3312,22 +3331,27 @@ impl ComputeRuntime {
                         }
                     };
                     let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
+                    // Recovery retains the original attempt and deadline. A
+                    // stalled driver must release this lifecycle gate after
+                    // expiry so the deadline worker can reclaim its compute.
                     if let Err(err) = self
-                        .driver
-                        .call(
-                            openshell_otel::rpc::START_SANDBOX,
-                            Some(&sandbox_id),
-                            |driver| async move {
-                                driver
-                                    .start_sandbox(Request::new(StartSandboxRequest {
-                                        sandbox_id: driver_sandbox_id,
-                                        name: sandbox_name,
-                                        launch_authentication: Vec::new(),
-                                        generation_id,
-                                        expected_runtime_identity,
-                                    }))
-                                    .await
-                            },
+                        .await_provisioning_operation(
+                            &sandbox,
+                            self.driver.call(
+                                openshell_otel::rpc::START_SANDBOX,
+                                Some(&sandbox_id),
+                                |driver| async move {
+                                    driver
+                                        .start_sandbox(Request::new(StartSandboxRequest {
+                                            sandbox_id: driver_sandbox_id,
+                                            name: sandbox_name,
+                                            launch_authentication: Vec::new(),
+                                            generation_id,
+                                            expected_runtime_identity,
+                                        }))
+                                        .await
+                                },
+                            ),
                         )
                         .await
                     {
@@ -6553,7 +6577,13 @@ fn is_recoverable_error_reason(sandbox: &Sandbox) -> bool {
         .is_some_and(|c| c.reason == CONDITION_RUNTIME_RESTART || c.reason == CONDITION_STOPPED)
 }
 
-fn apply_lifecycle_phase(sandbox: &mut Sandbox, phase: SandboxPhase, reason: &str, message: &str) {
+fn apply_lifecycle_phase(
+    sandbox: &mut Sandbox,
+    phase: SandboxPhase,
+    reason: &str,
+    message: &str,
+    image_preparation_timeout_seconds: u32,
+) {
     sandbox.set_phase(phase as i32);
     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
         let status = sandbox.status.get_or_insert_with(Default::default);
@@ -6564,8 +6594,9 @@ fn apply_lifecycle_phase(sandbox: &mut Sandbox, phase: SandboxPhase, reason: &st
         set_next_restart_at_ms(status, 0);
         set_main_process_started_at_ms(status, 0);
         if phase == SandboxPhase::Starting {
-            status.provisioning = Some(provisioning_deadline::new_record(
+            status.provisioning = Some(provisioning_deadline::new_preparation_record(
                 openshell_core::time::now_ms(),
+                image_preparation_timeout_seconds,
             ));
             status.configuration_admission =
                 Some(openshell_core::proto::SandboxConfigurationAdmission {
@@ -6940,6 +6971,7 @@ pub fn new_test_runtime_with_driver(
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
+        image_preparation_timeout_seconds: 1800,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -7989,6 +8021,7 @@ mod tests {
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
+            image_preparation_timeout_seconds: 1800,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -10612,18 +10645,19 @@ mod tests {
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &blocked
         ));
-        // Simulate the supervisor's successful exact-generation admission report.
+        // The supervisor report records the preparation-to-admission transition
+        // together with acceptance of the exact configuration generation.
         runtime
             .store
             .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
-                sandbox
-                    .status
-                    .as_mut()
-                    .unwrap()
-                    .configuration_admission
-                    .as_mut()
-                    .unwrap()
-                    .state = openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+                let status = sandbox.status.as_mut().unwrap();
+                provisioning_deadline::record_admission_start(
+                    status.provisioning.as_mut().unwrap(),
+                    openshell_core::time::now_ms(),
+                )
+                .unwrap();
+                status.configuration_admission.as_mut().unwrap().state =
+                    openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
             })
             .await
             .unwrap();
@@ -15367,6 +15401,162 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preparation_expiry_releases_stalled_start_recovery_for_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let runtime = test_runtime(driver.clone()).await;
+        let now = openshell_core::time::now_ms();
+        let preparation = provisioning_deadline::new_preparation_record(now, 1800);
+        let mut sandbox = sandbox_record("sb-recovery-ttl", "recovery-ttl", SandboxPhase::Starting);
+        sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let recovered_runtime = runtime.clone();
+        let mut recovery = tokio::spawn(async move {
+            recovered_runtime
+                .recover_persisted_lifecycle_transitions()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .unwrap();
+        runtime
+            .reconcile_provisioning_deadlines(now + 1_800_000)
+            .await
+            .unwrap();
+        let expired = runtime
+            .store
+            .get_message::<Sandbox>("sb-recovery-ttl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        let status = expired.status.as_ref().unwrap();
+        let record = status.provisioning.as_ref().unwrap();
+        assert_eq!(record.attempt_id, preparation.attempt_id);
+        assert_eq!(
+            record.preparation_deadline,
+            preparation.preparation_deadline
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ImagePreparationTimedOut")
+        );
+        // The recovery RPC never receives its semaphore permit. The persisted
+        // expiry must cancel its waiter and release the lifecycle gate itself.
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut recovery).await {
+            result.unwrap().unwrap();
+        } else {
+            recovery.abort();
+            let _ = recovery.await;
+            panic!("expired recovery kept the lifecycle gate while the driver was blocked");
+        }
+        runtime
+            .reconcile_provisioning_deadlines(now + 1_800_001)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sandbox = runtime
+                    .store
+                    .get_message::<Sandbox>("sb-recovery-ttl")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let record = sandbox
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap();
+                if record.cleanup_completed_time.is_some() {
+                    assert_eq!(record.attempt_id, preparation.attempt_id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_retains_reason_and_uses_existing_cleanup() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-prepare", "prepare", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(0, 1800));
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let sandbox = runtime
+            .store
+            .get_message::<Sandbox>("sb-prepare")
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = runtime.lifecycle_gates.lock_for("sb-prepare").await;
+        let global = runtime.lock_global_for_lifecycle(&gate).await;
+        assert!(
+            runtime
+                .claim_provisioning_timeout(&sandbox, 600_000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let expired = runtime
+            .claim_provisioning_timeout(&sandbox, 1_800_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        assert!(
+            expired
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| { condition.reason == "ImagePreparationTimedOut" })
+        );
+        let record = expired
+            .status
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .as_ref()
+            .unwrap();
+        assert!(record.admission_start_time.is_none());
+        assert!(record.preparation_deadline.is_some());
+        assert!(record.cleanup_completed_time.is_none());
+        drop(global);
+        runtime
+            .reclaim_provisioning_timeout(&expired, &gate)
+            .await
+            .unwrap();
+        let reclaimed = runtime
+            .store
+            .get_message::<Sandbox>("sb-prepare")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            reclaimed
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .cleanup_completed_time
+                .is_some()
+        );
+        assert_eq!(driver.stop_calls(), 1);
     }
 
     #[tokio::test]

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Gateway-owned provisioning repair-window transitions.
+//! Gateway-owned image preparation and admission repair deadlines.
 //!
 //! Callers must persist each transition under the sandbox lifecycle fence. Times
 //! are gateway-assigned Unix milliseconds, never supervisor-supplied values.
-//! The timer remains armed after admission acceptance until compute becomes Ready.
+//! Preparation has an absolute ceiling. The first authenticated supervisor
+//! configuration report starts admission repair, which remains armed until Ready.
 
 use openshell_core::proto::SandboxProvisioning;
 use openshell_core::time::{timestamp_from_millis, timestamp_to_millis};
@@ -26,6 +27,8 @@ pub(super) struct ProvisioningDeadline {
     attempt_id: String,
     change: ConfigurationChange,
     first_rejection_at_ms: Option<i64>,
+    preparation_deadline_at_ms: Option<i64>,
+    admission_start_at_ms: Option<i64>,
     state: DeadlineState,
 }
 
@@ -50,6 +53,21 @@ impl ProvisioningDeadline {
         if record.deadline.is_some() && record.timeout_time.is_some() {
             return Err("provisioning cannot be armed and expired".into());
         }
+        let preparation_deadline_at_ms = record
+            .preparation_deadline
+            .as_ref()
+            .map(|value| millis(Some(value), "preparation deadline"))
+            .transpose()?;
+        let admission_start_at_ms = record
+            .admission_start_time
+            .as_ref()
+            .map(|value| millis(Some(value), "admission start time"))
+            .transpose()?;
+        if admission_start_at_ms.is_some_and(|started| {
+            preparation_deadline_at_ms.is_none_or(|ceiling| started >= ceiling)
+        }) {
+            return Err("admission must start before its preparation deadline".into());
+        }
         let state = if record.timeout_time.is_some() {
             DeadlineState::Expired {
                 expired_at_ms: millis(record.timeout_time.as_ref(), "timeout time")?,
@@ -61,6 +79,13 @@ impl ProvisioningDeadline {
         } else {
             DeadlineState::Ready
         };
+        if let Some(ceiling) = preparation_deadline_at_ms
+            && admission_start_at_ms.is_none()
+            && !matches!(state, DeadlineState::Expired { .. })
+            && !matches!(state, DeadlineState::Armed { deadline_at_ms } if deadline_at_ms == ceiling)
+        {
+            return Err("preparation must retain its absolute deadline until admission".into());
+        }
         Ok(Self {
             attempt_id: record.attempt_id.clone(),
             change: ConfigurationChange {
@@ -72,6 +97,8 @@ impl ProvisioningDeadline {
                 .as_ref()
                 .map(|value| millis(Some(value), "rejection time"))
                 .transpose()?,
+            preparation_deadline_at_ms,
+            admission_start_at_ms,
             state,
         })
     }
@@ -83,6 +110,12 @@ impl ProvisioningDeadline {
         record.configuration_change_time = timestamp_from_millis(self.change.committed_at_ms).ok();
         record.first_rejection_time = self
             .first_rejection_at_ms
+            .and_then(|value| timestamp_from_millis(value).ok());
+        record.preparation_deadline = self
+            .preparation_deadline_at_ms
+            .and_then(|value| timestamp_from_millis(value).ok());
+        record.admission_start_time = self
+            .admission_start_at_ms
             .and_then(|value| timestamp_from_millis(value).ok());
         record.deadline = self
             .deadline_at_ms()
@@ -98,10 +131,36 @@ impl ProvisioningDeadline {
             attempt_id,
             change,
             first_rejection_at_ms: None,
+            preparation_deadline_at_ms: None,
+            admission_start_at_ms: None,
             state: DeadlineState::Armed {
                 deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
             },
         }
+    }
+
+    fn is_preparing(&self) -> bool {
+        self.preparation_deadline_at_ms.is_some() && self.admission_start_at_ms.is_none()
+    }
+
+    /// Only an authenticated report for the current supervisor may call this.
+    /// Persist it with the report: duplicate delivery or restart must not grant
+    /// another admission window, and a late registration cannot revive compute.
+    fn start_admission(&mut self, attempt_id: &str, now_ms: i64) -> bool {
+        if attempt_id != self.attempt_id
+            || !self.is_preparing()
+            || now_ms < self.change.committed_at_ms
+            || self
+                .deadline_at_ms()
+                .is_none_or(|deadline| now_ms >= deadline)
+        {
+            return false;
+        }
+        self.admission_start_at_ms = Some(now_ms);
+        self.state = DeadlineState::Armed {
+            deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
+        };
+        true
     }
 
     pub fn deadline_at_ms(&self) -> Option<i64> {
@@ -124,10 +183,12 @@ impl ProvisioningDeadline {
         {
             return false;
         }
-        self.state = DeadlineState::Armed {
-            deadline_at_ms: deadline_at_ms
-                .max(change.committed_at_ms.saturating_add(REPAIR_WINDOW_MS)),
-        };
+        if !self.is_preparing() {
+            self.state = DeadlineState::Armed {
+                deadline_at_ms: deadline_at_ms
+                    .max(change.committed_at_ms.saturating_add(REPAIR_WINDOW_MS)),
+            };
+        }
         self.change = change;
         self.first_rejection_at_ms = None;
         true
@@ -140,6 +201,7 @@ impl ProvisioningDeadline {
             return false;
         };
         if !self.matches(attempt_id, change_id)
+            || self.is_preparing()
             || self.first_rejection_at_ms.is_some()
             || now_ms < self.change.committed_at_ms
             || now_ms >= deadline_at_ms
@@ -173,6 +235,7 @@ impl ProvisioningDeadline {
     /// must not call this method. Late readiness requires an explicit retry.
     pub fn ready(&mut self, attempt_id: &str, change_id: &str, now_ms: i64) -> bool {
         if !self.matches(attempt_id, change_id)
+            || self.is_preparing()
             || self
                 .deadline_at_ms()
                 .is_none_or(|deadline| now_ms >= deadline)
@@ -197,7 +260,8 @@ pub fn timed_out(sandbox: &openshell_core::proto::Sandbox) -> bool {
         .is_some_and(|record| record.timeout_time.is_some())
 }
 
-/// Create an independent attempt. Supervisor reconnects must never call this.
+/// Adopt an existing untimed attempt without granting it a new preparation phase.
+/// New create/start operations use `new_preparation_record` instead.
 pub fn new_record(now_ms: i64) -> SandboxProvisioning {
     let mut record = SandboxProvisioning::default();
     ProvisioningDeadline::new(
@@ -210,6 +274,26 @@ pub fn new_record(now_ms: i64) -> SandboxProvisioning {
     )
     .write_record(&mut record);
     record
+}
+
+/// Create an independent attempt with a fixed preparation budget. The gateway
+/// validates the configured seconds before constructing the runtime. Reconnects
+/// and driver progress must never call this function.
+pub fn new_preparation_record(now_ms: i64, timeout_seconds: u32) -> SandboxProvisioning {
+    let mut record = new_record(now_ms);
+    let ceiling = now_ms.saturating_add(i64::from(timeout_seconds) * 1_000);
+    record.preparation_deadline = timestamp_from_millis(ceiling).ok();
+    record.deadline.clone_from(&record.preparation_deadline);
+    record
+}
+
+/// The caller has checked the report's authentication, instance fence and
+/// configuration generation. Persist this transition in the same CAS as admission.
+pub fn record_admission_start(record: &mut SandboxProvisioning, now_ms: i64) -> Result<(), String> {
+    let mut deadline = ProvisioningDeadline::from_record(record)?;
+    deadline.start_admission(&record.attempt_id, now_ms);
+    deadline.write_record(record);
+    Ok(())
 }
 
 /// Apply the first accepted rejection under the same CAS as admission evidence.
@@ -250,6 +334,10 @@ pub(super) fn reconcile_readiness(sandbox: &mut openshell_core::proto::Sandbox, 
     if deadline.ready(&record.attempt_id, &record.configuration_change_id, now_ms) {
         deadline.write_record(record);
     } else {
+        let awaiting_registration = deadline.is_preparing()
+            && deadline
+                .deadline_at_ms()
+                .is_some_and(|value| now_ms < value);
         status.phase = SandboxPhase::Provisioning.into();
         status
             .conditions
@@ -257,8 +345,18 @@ pub(super) fn reconcile_readiness(sandbox: &mut openshell_core::proto::Sandbox, 
         status.conditions.push(SandboxCondition {
             r#type: "Ready".into(),
             status: "False".into(),
-            reason: "ProvisioningDeadlineElapsed".into(),
-            message: "Provisioning deadline elapsed; awaiting compute reclamation".into(),
+            reason: if awaiting_registration {
+                "ConfigurationPending"
+            } else {
+                "ProvisioningDeadlineElapsed"
+            }
+            .into(),
+            message: if awaiting_registration {
+                "Waiting for an authenticated supervisor configuration report"
+            } else {
+                "Provisioning deadline elapsed; awaiting compute reclamation"
+            }
+            .into(),
             ..Default::default()
         });
     }
@@ -442,6 +540,7 @@ impl super::ComputeRuntime {
             return Ok(None);
         };
         let mut deadline = ProvisioningDeadline::from_record(record)?;
+        let preparation_expired = deadline.is_preparing();
         if !deadline.expire(&record.attempt_id, &record.configuration_change_id, now_ms) {
             return Ok(None);
         }
@@ -463,7 +562,9 @@ impl super::ComputeRuntime {
                         .configuration_admission
                         .as_ref()
                         .map_or("", |admission| admission.error.as_str());
-                    let message = if diagnostic.is_empty() {
+                    let message = if preparation_expired {
+                        "Image preparation or initial supervisor startup exceeded its absolute deadline".to_string()
+                    } else if diagnostic.is_empty() {
                         "Provisioning repair window expired after 300 seconds".to_string()
                     } else {
                         format!(
@@ -476,7 +577,11 @@ impl super::ComputeRuntime {
                     status.conditions.push(SandboxCondition {
                         r#type: "Ready".into(),
                         status: "False".into(),
-                        reason: "ProvisioningTimedOut".into(),
+                        reason: if preparation_expired {
+                            "ImagePreparationTimedOut"
+                        } else {
+                            "ProvisioningTimedOut"
+                        }.into(),
                         message,
                         transition_time: timestamp_from_millis(now_ms).ok(),
                     });
@@ -488,7 +593,8 @@ impl super::ComputeRuntime {
         self.sandbox_watch_bus.notify(current.object_id());
         tracing::warn!(
             sandbox_id = current.object_id(),
-            "Sandbox provisioning repair window expired"
+            preparation_expired,
+            "Sandbox provisioning deadline expired"
         );
         Ok(Some(updated))
     }
@@ -653,6 +759,87 @@ impl super::ComputeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_wire_record_does_not_gain_preparation_time() {
+        use prost::Message;
+        // Encoded before preparation timestamps existed: attempt a, change c,
+        // configuration at epoch 0, and an admission deadline at 300 seconds.
+        let bytes = [0x0a, 1, b'a', 0x12, 1, b'c', 0x1a, 0, 0x2a, 3, 8, 0xac, 2];
+        let mut record = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
+        let before = record.clone();
+        record_admission_start(&mut record, 299_999).unwrap();
+        assert_eq!(record, before);
+        assert!(record.preparation_deadline.is_none());
+        assert!(!allows_admission(&record, 300_000));
+    }
+
+    #[test]
+    fn preparation_over_five_minutes_gets_a_full_admission_repair_window() {
+        let record = new_preparation_record(0, 1800);
+        let mut timer = ProvisioningDeadline::from_record(&record).unwrap();
+        let attempt = record.attempt_id;
+        let change_id = record.configuration_change_id;
+        assert!(!timer.expire(&attempt, &change_id, 600_000));
+        assert!(!timer.ready(&attempt, &change_id, 600_000));
+        assert!(timer.start_admission(&attempt, 600_000));
+        assert_eq!(timer.deadline_at_ms(), Some(900_000));
+        assert!(timer.rejected(&attempt, &change_id, 601_000));
+        assert_eq!(timer.deadline_at_ms(), Some(901_000));
+        assert!(!timer.start_admission(&attempt, 800_000));
+        assert!(timer.configuration_changed(&attempt, change("updated", 800_000)));
+        assert_eq!(timer.deadline_at_ms(), Some(1_100_000));
+        assert_eq!(timer.admission_start_at_ms, Some(600_000));
+        assert_eq!(timer.preparation_deadline_at_ms, Some(1_800_000));
+    }
+
+    #[test]
+    fn preparation_config_changes_and_restart_preserve_the_absolute_ceiling() {
+        use prost::Message;
+        let mut record = new_preparation_record(0, 1800);
+        let mut timer = ProvisioningDeadline::from_record(&record).unwrap();
+        let attempt = record.attempt_id.clone();
+        assert!(timer.configuration_changed(&attempt, change("first", 600_000)));
+        assert!(timer.configuration_changed(&attempt, change("last", 1_799_000)));
+        assert!(!timer.configuration_changed(&attempt, change("last", 1_799_500)));
+        assert!(!timer.rejected(&attempt, "last", 1_799_500));
+        timer.write_record(&mut record);
+        let bytes = record.encode_to_vec();
+        let restored = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
+        let mut timer = ProvisioningDeadline::from_record(&restored).unwrap();
+        assert_eq!(timer.deadline_at_ms(), Some(1_800_000));
+        assert!(!timer.start_admission("previous-attempt", 1_799_999));
+        assert!(!timer.start_admission(&attempt, 1_800_000));
+        assert!(timer.expire(&attempt, "last", 1_800_000));
+        assert!(!timer.start_admission(&attempt, 1_799_999));
+        assert!(!timer.ready(&attempt, "last", 1_799_999));
+        assert!(!timer.configuration_changed(&attempt, change("late", 1_799_999)));
+    }
+
+    #[test]
+    fn admission_registration_roundtrip_does_not_restart_repair() {
+        use prost::Message;
+        let mut record = new_preparation_record(0, 1800);
+        record_admission_start(&mut record, 600_000).unwrap();
+        let before = record.clone();
+        let bytes = record.encode_to_vec();
+        let mut restored = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
+        record_admission_start(&mut restored, 899_999).unwrap();
+        assert_eq!(restored, before);
+        assert!(!allows_admission(&restored, 900_000));
+    }
+
+    #[test]
+    fn malformed_preparation_timing_cannot_grant_admission() {
+        let mut record = new_preparation_record(0, 1800);
+        record.deadline = timestamp_from_millis(1_800_001).ok();
+        assert!(ProvisioningDeadline::from_record(&record).is_err());
+        record.deadline = None;
+        assert!(ProvisioningDeadline::from_record(&record).is_err());
+        record.deadline = record.preparation_deadline;
+        record.admission_start_time = timestamp_from_millis(1_800_000).ok();
+        assert!(ProvisioningDeadline::from_record(&record).is_err());
+    }
 
     #[test]
     fn protobuf_roundtrip_retains_deadline_and_cleanup_progress() {
