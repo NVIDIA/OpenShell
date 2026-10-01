@@ -4859,6 +4859,7 @@ dependencies = [
  "hickory-proto",
  "miette",
  "openshell-core",
+ "openshell-policy-cedar",
  "openshell-policy-schema",
  "prost-types",
  "serde",

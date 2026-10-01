@@ -1733,6 +1733,13 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         PolicyViolation::McpOptionsOnNonMcpEndpoint { .. } => "MCP options require MCP protocol",
         PolicyViolation::UnsupportedMcpVersion { .. } => "unsupported MCP protocol version",
         PolicyViolation::DuplicateMcpVersion { .. } => "duplicate MCP protocol version",
+        PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies => {
+            "cedar_policy_source combined with network_policies"
+        }
+        PolicyViolation::InvalidCedarPolicy { .. } => "invalid Cedar policy",
+        PolicyViolation::CedarForbidsFilesystemPath { .. } => {
+            "Cedar policy forbids a filesystem path"
+        }
     }
 }
 

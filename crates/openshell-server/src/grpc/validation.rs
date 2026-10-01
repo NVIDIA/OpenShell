@@ -1039,6 +1039,18 @@ pub(super) fn validate_static_fields_unchanged(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
     }
+    // The supervisor picks its authoritative policy engine (OPA or Cedar)
+    // once at startup from whether cedar_policy_source was set; a live
+    // reload only ever re-evaluates within that same engine. Flipping
+    // formats via update would leave the originally-chosen engine stale
+    // (silently evaluating against the old policy) while the other engine's
+    // reload is simply never consulted.
+    if baseline.cedar_policy_source.is_empty() != new.cedar_policy_source.is_empty() {
+        return Err(Status::invalid_argument(
+            "cannot switch a live sandbox between YAML and Cedar policy formats; \
+             recreate the sandbox instead",
+        ));
+    }
     Ok(())
 }
 
@@ -2236,6 +2248,41 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_switching_from_yaml_to_cedar() {
+        let baseline = ProtoSandboxPolicy::default();
+        let new = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &new);
+        assert!(result.is_err(), "format flip must be rejected");
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_switching_from_cedar_to_yaml() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy::default();
+        let result = validate_static_fields_unchanged(&baseline, &new);
+        assert!(result.is_err(), "format flip must be rejected");
+    }
+
+    #[test]
+    fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy {
+            cedar_policy_source: "forbid(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
     }
 
     #[test]

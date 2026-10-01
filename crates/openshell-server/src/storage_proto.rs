@@ -118,9 +118,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "418130a28d1a5398d3d7f73f11b7f025d027c70f215be320dfe8e58371769f83";
+        "8d4493baab82425c71c9d9a881b5cf3c6e2f9dc5e8e6b0d63a484b410767d2d9";
     const DURABLE_SCHEMA_SHA256: &str =
-        "557ca283c55fd46b213d5573b950ba8604cc3f4b31bad3e433eb9c5f9975138d";
+        "2a358304365e2c1ac02a87a825643fab5dfb712c918774312f38309bedd5551c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "f541c25bb3e1e5806865bc61470c66d10c16cca7399bf5909c77dc384d469171";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
