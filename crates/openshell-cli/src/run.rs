@@ -6711,7 +6711,7 @@ mod tests {
     fn policy_check_accepts_valid_file_without_gateway() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "version: 1\\n").expect("write policy");
+        std::fs::write(&path, "version: 1\n").expect("write policy");
 
         super::policy_check(&path).expect("valid policy should pass");
     }
