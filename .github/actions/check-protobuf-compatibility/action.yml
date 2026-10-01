@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check Protobuf Compatibility
+description: Check protobuf compatibility against the target or latest stable release using the release train policy. Requires a checkout with full history and tags.
+
+inputs:
+  ref:
+    description: PR or merge-group target branch/commit, or release tag to qualify.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-nix
+
+    - name: Check protobuf compatibility
+      shell: bash
+      env:
+        CHECK_REF: ${{ inputs.ref }}
+      run: |
+        nix run .#check-protobuf-compatibility --no-write-lock-file -- "$CHECK_REF"

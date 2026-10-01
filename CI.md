@@ -17,6 +17,55 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Protobuf API compatibility
+
+`Protobuf Compatibility` runs in Branch Checks and Release Tag through the shared
+`check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
+and Git from the flake lockfile.
+It uses Buf's `FILE` policy for the `proto/`
+module, covering SDK descriptors and extension contracts. Storage-only protobufs
+remain subject to their separate durability checks.
+
+Branch Checks compares the prospective merge tree with the PR target commit,
+so additions on the target do not look like deletions in an outdated PR. Merge
+queues use their base commit. Both paths resolve the train from tags reachable
+from that target, preventing a PR from selecting its own train. The checkout
+must contain full history and tags; the checker leaves HEAD and working files
+unchanged.
+
+The current train's version is compared with the latest stable release. During
+`0.x`, a minor increment permits breaking changes: for example, `0.2.0-pre.N`
+after stable `0.1.2`. A patch increment such as `0.1.3-pre.N` rejects them.
+Commit messages do not affect this decision. No active train also rejects
+breaking changes. Allowed findings remain visible as warnings; schema errors,
+missing baselines, merge conflicts, and tool failures always fail the check.
+
+Release Tag compares the tagged candidate cumulatively against the previous
+stable release, using the same minor-versus-patch policy. Its result is part
+of the qualification profile: failure blocks stable publication, while a
+pre-release can still publish with failed qualification recorded. This checks
+protobuf compatibility; SDK/configuration compatibility and migration review
+remain separate qualification work.
+
+Fetch the target and tags to check committed branch changes locally, replacing
+`origin/main` for another target:
+
+```shell
+git fetch origin main --tags
+nix run .#check-protobuf-compatibility -- origin/main
+```
+
+The same command accepts a release tag to qualify it against the previous stable
+release. Branch names and commit SHAs select the branch comparison instead:
+
+```shell
+nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
+```
+
+For an intentional minor-train incompatibility, record the Buf finding,
+linked issue, consumer impact, and migration plan in the PR. Keep the finding
+visible; do not disable the job or add a broad Buf ignore rule.
+
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
@@ -182,7 +231,7 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-The tagged release workflow records security and integration outcomes in a
+The tagged release workflow records protobuf, security, and integration outcomes in a
 qualification job after publishing its commit-addressed OCI images. A failed
 check remains visible in the workflow, but pre-release artifact assembly and
 publication continue. Stable publication currently requires the implemented
@@ -441,7 +490,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Protobuf, security, and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

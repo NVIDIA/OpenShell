@@ -223,11 +223,28 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    needs: compute-versions
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
   qualification-result:
     name: Release Qualification
     if: always()
     needs:
       - compute-versions
+      - protobuf-compatibility
       - security
       - conformance-integration
       - feature-specific-integration
@@ -253,6 +270,7 @@ jobs:
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
           VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
@@ -277,6 +295,7 @@ jobs:
             echo
             echo "| Suite | Result |"
             echo "| --- | --- |"
+            echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
             echo "| Security | ${SECURITY_RESULT} |"
             echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
             echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
