@@ -629,15 +629,10 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
-    state
-        .compute
-        .validate_sandbox_create(&sandbox)
-        .await
-        .map_err(|status| {
-            warn!(error = %status, "Rejecting sandbox create request");
-            status
-        })?;
-
+    // Build the exact launch material that create would use before asking the
+    // selected driver to validate. Drivers that do not use the Sandbox Protocol
+    // can ignore this opaque field; drivers that require it can fail before the
+    // gateway persists the sandbox or starts provisioning.
     let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
@@ -661,6 +656,15 @@ async fn handle_create_sandbox_inner(
                 .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
         })
         .transpose()?;
+
+    state
+        .compute
+        .validate_sandbox_create_authenticated(&sandbox, launch_authentication.as_deref())
+        .await
+        .map_err(|status| {
+            warn!(error = %status, "Rejecting sandbox create request");
+            status
+        })?;
 
     let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
         sandbox,
