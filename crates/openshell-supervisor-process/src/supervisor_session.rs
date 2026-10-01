@@ -531,12 +531,13 @@ pub(crate) async fn test_bridge_ssh_relay(
     inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
     out_tx: mpsc::Sender<RelayFrame>,
 ) {
-    let _ = bridge_relay(
-        Box::new(target),
+    let (read, write) = tokio::io::split(target);
+    let _ = stream_lifecycle::client_relay(
         tokio_stream::wrappers::ReceiverStream::new(inbound),
+        read,
+        write,
         out_tx,
-        "half-open-test".into(),
-        Arc::new(AtomicBool::new(false)),
+        false,
     )
     .await;
 }
