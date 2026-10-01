@@ -1036,7 +1036,10 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: cmd_string }],
+                // The proxy authorizes the socket owner, not its cmd.exe parent.
+                binaries: vec![NetworkBinary {
+                    path: curl.to_string_lossy().into_owned(),
+                }],
             },
         )]),
         ..Default::default()
