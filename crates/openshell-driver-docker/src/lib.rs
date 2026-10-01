@@ -153,6 +153,17 @@ fn provisioning_span(
     span
 }
 
+/// Operator-owned networking mode for the trusted supervisor companion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerSupervisorNetworkMode {
+    /// Use bridge for Sysbox/ECI workloads, otherwise use host networking.
+    #[default]
+    Auto,
+    Host,
+    Bridge,
+}
+
 /// Gateway-local configuration for the Docker compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -177,6 +188,9 @@ pub struct DockerComputeConfig {
 
     /// Gateway gRPC endpoint the sandbox connects back to.
     pub grpc_endpoint: String,
+
+    /// Networking mode for the supervisor only. Workloads always use network=none.
+    pub supervisor_network_mode: DockerSupervisorNetworkMode,
 
     /// Image containing the trusted `openshell-sandbox` binary.
     pub sandbox_runtime_image: Option<String>,
@@ -276,6 +290,7 @@ impl Default for DockerComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             sandbox_label: "default".to_string(),
             grpc_endpoint: String::new(),
+            supervisor_network_mode: DockerSupervisorNetworkMode::Auto,
             sandbox_runtime_image: None,
             supervisor_bin: None,
             supervisor_image: None,
@@ -310,6 +325,9 @@ struct DockerDriverRuntimeConfig {
     sandbox_binary: Arc<Vec<u8>>,
     supervisor_image_id: String,
     supervisor_grpc_endpoint: String,
+    supervisor_network_mode: DockerSupervisorNetworkMode,
+    supervisor_endpoint_explicit: bool,
+    bridge_default_endpoint: Option<String>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
     gpu: DockerGpuRuntimeCapabilities,
@@ -882,6 +900,14 @@ impl DockerComputeDriver {
         };
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
+        let supervisor_endpoint_explicit = !docker_config.grpc_endpoint.trim().is_empty();
+        let bridge_default_endpoint = default_docker_bridge_endpoint(
+            gateway_bind_address,
+            docker_guest_tls_configured(docker_config),
+            info.operating_system
+                .as_deref()
+                .is_some_and(|os| os.to_ascii_lowercase().contains("docker desktop")),
+        );
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             docker_config.grpc_endpoint = default_docker_supervisor_grpc_endpoint(
@@ -939,6 +965,9 @@ impl DockerComputeDriver {
                 sandbox_binary,
                 supervisor_image_id,
                 supervisor_grpc_endpoint,
+                supervisor_network_mode: docker_config.supervisor_network_mode,
+                supervisor_endpoint_explicit,
+                bridge_default_endpoint,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
                 gpu,
@@ -4563,10 +4592,9 @@ async fn prepare_docker_boundary_files(
             server_name: tls.server_name.clone(),
             trust_anchor_pem: tls.trust_anchor_pem.clone(),
         },
-        // Pin the reserved host alias to the same address used by the
-        // host-networked supervisor. This is normally loopback, but container
-        // CI reaches the gateway and host fixtures through the job
-        // container's bridge address.
+        // Host mode pins the alias to the gateway address, normally loopback.
+        // In bridge mode the companion replaces this value from its own
+        // Docker-injected hosts file before attaching the descriptor.
         host_gateway_ip: docker_supervisor_host_address(&config.supervisor_grpc_endpoint),
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
@@ -4973,14 +5001,34 @@ fn docker_auxiliary_container_labels(
     ])
 }
 
-fn docker_supervisor_host_config(mounts: Vec<Mount>, grpc_endpoint: &str) -> HostConfig {
+fn docker_supervisor_host_config(
+    mounts: Vec<Mount>,
+    grpc_endpoint: &str,
+    network_mode: DockerSupervisorNetworkMode,
+) -> HostConfig {
     HostConfig {
         // The supervisor is trusted infrastructure and originates every
         // approved upstream connection. Host networking lets it reach the
         // configured gateway and host-side services directly; the workload
         // remains fenced by network=none.
-        network_mode: Some("host".to_string()),
-        extra_hosts: docker_supervisor_host_aliases(grpc_endpoint),
+        network_mode: Some(
+            if network_mode == DockerSupervisorNetworkMode::Bridge {
+                "bridge"
+            } else {
+                "host"
+            }
+            .to_string(),
+        ),
+        extra_hosts: if network_mode == DockerSupervisorNetworkMode::Bridge {
+            // Docker resolves host-gateway on the daemon, including Desktop's VM.
+            // The gateway endpoint may be remote and must not define host aliases.
+            Some(vec![
+                format!("{HOST_OPEN_SHELL_INTERNAL}:host-gateway"),
+                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
+            ])
+        } else {
+            docker_supervisor_host_aliases(grpc_endpoint)
+        },
         mounts: Some(mounts),
         cap_drop: Some(vec!["ALL".to_string()]),
         cap_add: None,
@@ -5036,6 +5084,18 @@ async fn spawn_docker_control_process(
     config: &DockerDriverRuntimeConfig,
     failure_context: DockerRuntimeFailureContext,
 ) -> Result<DockerControlProcess, Status> {
+    // Inspect the existing workload on every supervisor launch, including restart.
+    // This adds no diagnostic container and observes the actual selected runtime.
+    let (network_mode, supervisor_endpoint) = Box::pin(async {
+        let workload = docker
+            .inspect_container(&failure_context.container_id, None)
+            .await
+            .map_err(|error| internal_status("inspect Docker workload runtime", error))?;
+        docker_supervisor_networking(config, &workload)
+    })
+    .await?;
+    info!(sandbox_id = %sandbox.id, ?network_mode, endpoint = %supervisor_endpoint,
+        "Selected Docker supervisor networking");
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let main_process_spec = tokio::fs::read_to_string(directory.join(MAIN_PROCESS_SPEC_FILE))
         .await
@@ -5064,7 +5124,7 @@ async fn spawn_docker_control_process(
         format!(
             "{}={}",
             openshell_core::sandbox_env::ENDPOINT,
-            config.supervisor_grpc_endpoint
+            supervisor_endpoint
         ),
         format!("{}={}", openshell_core::sandbox_env::SANDBOX_ID, sandbox.id),
         format!("{}={}", openshell_core::sandbox_env::SANDBOX, sandbox.name),
@@ -5131,6 +5191,9 @@ async fn spawn_docker_control_process(
         workspace_root,
         format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
     ];
+    if network_mode == DockerSupervisorNetworkMode::Bridge {
+        command.push("--host-gateway-from-hosts".to_string());
+    }
     command.extend(docker_upstream_proxy_cli_args(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
@@ -5194,7 +5257,8 @@ async fn spawn_docker_control_process(
         }),
         host_config: Some(docker_supervisor_host_config(
             supervisor_mounts,
-            &config.supervisor_grpc_endpoint,
+            &supervisor_endpoint,
+            network_mode,
         )),
         ..Default::default()
     };
@@ -6531,6 +6595,63 @@ fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
 fn default_docker_supervisor_grpc_endpoint(gateway_port: u16, tls: bool) -> String {
     let scheme = if tls { "https" } else { "http" };
     format!("{scheme}://127.0.0.1:{gateway_port}")
+}
+
+fn default_docker_bridge_endpoint(
+    gateway_bind_address: SocketAddr,
+    tls: bool,
+    desktop: bool,
+) -> Option<String> {
+    let scheme = if tls { "https" } else { "http" };
+    if desktop || gateway_bind_address.ip().is_unspecified() {
+        Some(format!(
+            "{scheme}://{HOST_DOCKER_INTERNAL}:{}",
+            gateway_bind_address.port()
+        ))
+    } else if !gateway_bind_address.ip().is_loopback() {
+        Some(format!("{scheme}://{gateway_bind_address}"))
+    } else {
+        None
+    }
+}
+
+fn docker_supervisor_networking(
+    config: &DockerDriverRuntimeConfig,
+    workload: &bollard::models::ContainerInspectResponse,
+) -> Result<(DockerSupervisorNetworkMode, String), Status> {
+    let sysbox = workload
+        .host_config
+        .as_ref()
+        .and_then(|host| host.runtime.as_deref())
+        .is_some_and(|runtime| runtime == "sysbox-runc");
+    let mode = match config.supervisor_network_mode {
+        DockerSupervisorNetworkMode::Auto if sysbox => DockerSupervisorNetworkMode::Bridge,
+        DockerSupervisorNetworkMode::Auto => DockerSupervisorNetworkMode::Host,
+        mode => mode,
+    };
+    let endpoint = if mode == DockerSupervisorNetworkMode::Bridge
+        && !config.supervisor_endpoint_explicit
+    {
+        config.bridge_default_endpoint.clone().ok_or_else(|| Status::failed_precondition(
+            "Docker bridge supervisor cannot reach a Linux gateway bound only to loopback; configure a bridge-reachable gateway bind_address and grpc_endpoint, or use supervisor_network_mode = 'host' when the runtime permits host networking",
+        ))?
+    } else {
+        config.supervisor_grpc_endpoint.clone()
+    };
+    if mode == DockerSupervisorNetworkMode::Bridge {
+        let url = Url::parse(&endpoint).map_err(|error| {
+            Status::failed_precondition(format!("invalid Docker supervisor endpoint: {error}"))
+        })?;
+        if matches!(url.host(), Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost"))
+            || matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback() || ip.is_unspecified())
+            || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback() || ip.is_unspecified())
+        {
+            return Err(Status::failed_precondition(
+                "Docker bridge supervisor grpc_endpoint must be reachable outside the gateway's loopback namespace; use host.docker.internal or a reachable gateway address",
+            ));
+        }
+    }
+    Ok((mode, endpoint))
 }
 
 pub(crate) fn docker_guest_tls_paths(

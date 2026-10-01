@@ -113,6 +113,10 @@ struct Args {
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
+    /// Resolve the Docker host alias from this supervisor's driver-owned hosts file.
+    #[arg(long)]
+    host_gateway_from_hosts: bool,
+
     /// Protected gateway-issued credentials for this exact sandbox launch.
     #[arg(long)]
     auth_bundle_file: Option<PathBuf>,
@@ -180,12 +184,66 @@ fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
-    let payload = std::fs::read(path)
+    let mut payload = std::fs::read(path)
         .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
+    if args.host_gateway_from_hosts {
+        let hosts = std::fs::read_to_string("/etc/hosts")
+            .map_err(|error| miette::miette!("read supervisor Docker host aliases: {error}"))?;
+        let ip = docker_host_gateway_from_hosts(&hosts)?;
+        let mut descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+            serde_json::from_slice(&payload).into_diagnostic()?;
+        // Resolve before any workload is admitted, from the supervisor's mount
+        // namespace. Workload /etc/hosts and DNS never supply this trusted IP.
+        descriptor.host_gateway_ip = Some(ip);
+        payload = serde_json::to_vec(&descriptor).into_diagnostic()?;
+    }
     Ok(BackendDescriptor {
         backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
         payload,
     })
+}
+
+fn docker_host_gateway_from_hosts(hosts: &str) -> Result<std::net::IpAddr> {
+    let mut ips = std::collections::BTreeSet::new();
+    for line in hosts.lines() {
+        let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
+        let Some(ip) = fields
+            .next()
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        else {
+            continue;
+        };
+        if fields.any(|host| host.eq_ignore_ascii_case("host.openshell.internal")) {
+            ips.insert(ip);
+        }
+    }
+    // Docker may expand host-gateway to both families. Prefer IPv4 consistently.
+    let ipv4 = ips
+        .iter()
+        .copied()
+        .filter(std::net::IpAddr::is_ipv4)
+        .collect::<Vec<_>>();
+    let candidates = if ipv4.is_empty() {
+        ips.into_iter().collect()
+    } else {
+        ipv4
+    };
+    let [ip] = candidates.as_slice() else {
+        return Err(miette::miette!(
+            "expected one Docker host-gateway address per family in supervisor /etc/hosts"
+        ));
+    };
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || matches!(ip, std::net::IpAddr::V4(ip) if ip.is_link_local() || ip.is_broadcast())
+        || matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4_mapped().is_some())
+    {
+        return Err(miette::miette!(
+            "unsafe Docker host-gateway address in supervisor /etc/hosts"
+        ));
+    }
+    Ok(*ip)
 }
 
 fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle> {
@@ -232,6 +290,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
         }
         SupervisorRole::NetworkProxy => {
             if args.backend_descriptor_file.is_some()
+                || args.host_gateway_from_hosts
                 || args.auth_bundle_file.is_some()
                 || args.sandbox_id.is_some()
                 || args.sandbox.is_some()
@@ -481,6 +540,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_host_gateway_uses_supervisor_alias_and_prefers_ipv4() {
+        let hosts = "127.0.0.1 localhost\n192.168.65.254 host.openshell.internal host.docker.internal\nfd00::1 host.openshell.internal\n192.168.65.254 host.openshell.internal # duplicate\n";
+        assert_eq!(
+            docker_host_gateway_from_hosts(hosts).unwrap(),
+            "192.168.65.254".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            docker_host_gateway_from_hosts("fd00::1 host.openshell.internal").unwrap(),
+            "fd00::1".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn docker_host_gateway_rejects_missing_ambiguous_and_unsafe_aliases() {
+        for hosts in [
+            "192.168.65.254 host.docker.internal",
+            "192.168.65.254 host.openshell.internal\n172.17.0.1 host.openshell.internal",
+            "127.0.0.1 host.openshell.internal",
+            "0.0.0.0 host.openshell.internal",
+            "169.254.169.254 host.openshell.internal",
+            "::ffff:127.0.0.1 host.openshell.internal",
+        ] {
+            assert!(docker_host_gateway_from_hosts(hosts).is_err(), "{hosts}");
+        }
+    }
 
     #[test]
     fn isolation_backend_is_the_default_role() {

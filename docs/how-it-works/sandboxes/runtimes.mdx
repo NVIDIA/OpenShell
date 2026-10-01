@@ -89,7 +89,7 @@ To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_id
 
 ## Docker Driver
 
-[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the gateway host. Docker is also required to build sandbox images from local directories or Dockerfiles.
+[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the Docker daemon host. The gateway accesses the daemon through its configured Unix socket. Docker is also required to build sandbox images from local directories or Dockerfiles.
 
 ```toml
 [openshell.gateway]
@@ -99,9 +99,13 @@ compute_driver = "docker"
 socket_path = "/var/run/docker.sock"
 ```
 
-Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
+Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `supervisor_network_mode`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
-Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+`supervisor_network_mode` defaults to `auto`: the driver uses bridge networking for workloads whose inspected runtime is `sysbox-runc` (Docker Desktop Enhanced Container Isolation), and host networking otherwise. Set `host` or `bridge` to override the heuristic. The workload always retains `network=none`.
+
+Host mode on Docker Desktop requires host networking enabled and Enhanced Container Isolation disabled. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
+
+Bridge selection does not establish full Enhanced Container Isolation compatibility; the sandbox must still pass its Landlock and seccomp qualification. A gateway running in an ECI container requires an administrator-approved Docker socket exception. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
 ### Docker Corporate Proxy Egress
 

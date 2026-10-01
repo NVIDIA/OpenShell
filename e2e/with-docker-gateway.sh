@@ -22,6 +22,8 @@
 #   SUPERVISOR_IMAGE=... (common test-wrapper override)
 #   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
 #   OPENSHELL_DOCKER_SUPERVISOR_IMAGE=... (Docker-specific override)
+#   OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE=auto|host|bridge
+#   OPENSHELL_E2E_DOCKER_AUTOMATIC_ENDPOINT=1 omits the callback override.
 #
 # The default sandbox image uses a mutable tag. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to
@@ -569,6 +571,11 @@ if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   SUPERVISOR_GATEWAY_HOST="${GATEWAY_HOST_ALIAS_IP}"
 else
   GATEWAY_HOST_ALIAS_IP=""
+  if [ "${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-auto}" = "bridge" ]; then
+    # This ephemeral test gateway deliberately admits bridge-side connections.
+    GATEWAY_BIND_IP="0.0.0.0"
+    SUPERVISOR_GATEWAY_HOST="host.docker.internal"
+  fi
 fi
 
 PKI_DIR="${WORKDIR}/pki"
@@ -618,7 +625,10 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   else
     printf 'allow_driver_config = true\n'
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    if [ "${OPENSHELL_E2E_DOCKER_AUTOMATIC_ENDPOINT:-0}" != "1" ]; then
+      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+    fi
+    printf 'supervisor_network_mode = %s\n' "$(toml_string "${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-auto}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'enable_bind_mounts = true\n'
@@ -632,7 +642,10 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    if [ "${OPENSHELL_E2E_DOCKER_AUTOMATIC_ENDPOINT:-0}" != "1" ]; then
+      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+    fi
+    printf 'supervisor_network_mode = %s\n' "$(toml_string "${OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE:-auto}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"

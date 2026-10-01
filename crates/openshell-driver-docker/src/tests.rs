@@ -210,6 +210,9 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        supervisor_network_mode: DockerSupervisorNetworkMode::Auto,
+        supervisor_endpoint_explicit: true,
+        bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -2911,7 +2914,11 @@ fn build_container_create_body_disables_docker_networking() {
 
 #[test]
 fn docker_supervisor_uses_host_network() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://127.0.0.1:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://127.0.0.1:17670",
+        DockerSupervisorNetworkMode::Host,
+    );
 
     assert_eq!(host.network_mode.as_deref(), Some("host"));
     assert_eq!(
@@ -2927,7 +2934,11 @@ fn docker_supervisor_uses_host_network() {
 
 #[test]
 fn docker_supervisor_maps_host_aliases_to_the_gateway_address() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://172.20.0.4:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://172.20.0.4:17670",
+        DockerSupervisorNetworkMode::Host,
+    );
 
     assert_eq!(
         host.extra_hosts,
@@ -2944,7 +2955,11 @@ fn docker_supervisor_maps_host_aliases_to_the_gateway_address() {
 
 #[test]
 fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
-    let host = docker_supervisor_host_config(Vec::new(), "https://gateway.example.com:17670");
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:17670",
+        DockerSupervisorNetworkMode::Host,
+    );
 
     assert_eq!(host.extra_hosts, None);
     assert_eq!(
@@ -2962,6 +2977,186 @@ fn docker_supervisor_defaults_to_the_primary_loopback_endpoint() {
     assert_eq!(
         default_docker_supervisor_grpc_endpoint(17_670, true),
         "https://127.0.0.1:17670"
+    );
+}
+
+#[test]
+fn docker_supervisor_selects_bridge_for_sysbox_and_honors_operator_mode() {
+    for (runtime, requested, expected) in [
+        (
+            Some("sysbox-runc"),
+            DockerSupervisorNetworkMode::Auto,
+            DockerSupervisorNetworkMode::Bridge,
+        ),
+        (
+            Some("runc"),
+            DockerSupervisorNetworkMode::Auto,
+            DockerSupervisorNetworkMode::Host,
+        ),
+        (
+            None,
+            DockerSupervisorNetworkMode::Auto,
+            DockerSupervisorNetworkMode::Host,
+        ),
+        (
+            Some("sysbox-runc"),
+            DockerSupervisorNetworkMode::Host,
+            DockerSupervisorNetworkMode::Host,
+        ),
+        (
+            Some("runc"),
+            DockerSupervisorNetworkMode::Bridge,
+            DockerSupervisorNetworkMode::Bridge,
+        ),
+    ] {
+        let mut config = runtime_config();
+        config.supervisor_network_mode = requested;
+        config.supervisor_endpoint_explicit = false;
+        config.supervisor_grpc_endpoint = "https://127.0.0.1:8443".into();
+        let inspected = bollard::models::ContainerInspectResponse {
+            host_config: Some(HostConfig {
+                runtime: runtime.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (mode, endpoint) = docker_supervisor_networking(&config, &inspected).unwrap();
+        assert_eq!(mode, expected);
+        assert_eq!(
+            endpoint,
+            if mode == DockerSupervisorNetworkMode::Bridge {
+                "https://host.docker.internal:8443"
+            } else {
+                "https://127.0.0.1:8443"
+            }
+        );
+    }
+}
+
+#[test]
+fn docker_bridge_preserves_explicit_endpoints_and_rejects_loopback() {
+    let mut config = runtime_config();
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
+    for endpoint in [
+        "https://gateway.example.com:9443",
+        "http://172.20.0.4:8080",
+        "https://[fd00::2]:9443",
+    ] {
+        config.supervisor_grpc_endpoint = endpoint.into();
+        let (_, selected) = docker_supervisor_networking(
+            &config,
+            &bollard::models::ContainerInspectResponse::default(),
+        )
+        .unwrap();
+        assert_eq!(selected, endpoint);
+    }
+    for endpoint in [
+        "https://127.0.0.1:8443",
+        "http://localhost:8080",
+        "https://[::1]:8443",
+        "http://0.0.0.0:8080",
+        "http://[::]:8080",
+    ] {
+        config.supervisor_grpc_endpoint = endpoint.into();
+        let error = docker_supervisor_networking(
+            &config,
+            &bollard::models::ContainerInspectResponse::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("grpc_endpoint"));
+    }
+}
+
+#[test]
+fn docker_bridge_defaults_respect_desktop_and_linux_listener_reachability() {
+    assert_eq!(
+        default_docker_bridge_endpoint("127.0.0.1:17670".parse().unwrap(), true, true).as_deref(),
+        Some("https://host.docker.internal:17670")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("0.0.0.0:8080".parse().unwrap(), false, false).as_deref(),
+        Some("http://host.docker.internal:8080")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("192.168.1.2:8080".parse().unwrap(), true, false).as_deref(),
+        Some("https://192.168.1.2:8080")
+    );
+    assert_eq!(
+        default_docker_bridge_endpoint("[fd00::2]:8080".parse().unwrap(), true, false).as_deref(),
+        Some("https://[fd00::2]:8080")
+    );
+    assert!(
+        default_docker_bridge_endpoint("127.0.0.1:17670".parse().unwrap(), true, false).is_none()
+    );
+    let mut config = runtime_config();
+    config.supervisor_network_mode = DockerSupervisorNetworkMode::Bridge;
+    config.supervisor_endpoint_explicit = false;
+    config.bridge_default_endpoint = None;
+    let error = docker_supervisor_networking(
+        &config,
+        &bollard::models::ContainerInspectResponse::default(),
+    )
+    .unwrap_err();
+    assert!(error.message().contains("bind_address"));
+}
+
+#[test]
+fn docker_bridge_host_aliases_are_independent_of_gateway_endpoint() {
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:9443",
+        DockerSupervisorNetworkMode::Bridge,
+    );
+    assert_eq!(host.network_mode.as_deref(), Some("bridge"));
+    assert_eq!(
+        host.extra_hosts,
+        Some(vec![
+            "host.openshell.internal:host-gateway".into(),
+            "host.docker.internal:host-gateway".into()
+        ])
+    );
+    assert_eq!(host.cap_drop, Some(vec!["ALL".into()]));
+    assert_eq!(host.cap_add, None);
+    assert_eq!(
+        host.security_opt,
+        Some(vec!["no-new-privileges:true".into()])
+    );
+    assert_eq!(
+        build_container_create_body(&test_sandbox(), &runtime_config())
+            .unwrap()
+            .host_config
+            .unwrap()
+            .network_mode
+            .as_deref(),
+        Some("none")
+    );
+}
+
+#[test]
+fn docker_supervisor_network_mode_is_an_operator_config_enum() {
+    assert_eq!(
+        toml::from_str::<DockerComputeConfig>("")
+            .unwrap()
+            .supervisor_network_mode,
+        DockerSupervisorNetworkMode::Auto
+    );
+    for (value, expected) in [
+        ("auto", DockerSupervisorNetworkMode::Auto),
+        ("host", DockerSupervisorNetworkMode::Host),
+        ("bridge", DockerSupervisorNetworkMode::Bridge),
+    ] {
+        let config: DockerComputeConfig =
+            toml::from_str(&format!("supervisor_network_mode = '{value}'")).unwrap();
+        assert_eq!(config.supervisor_network_mode, expected);
+    }
+    assert!(toml::from_str::<DockerComputeConfig>("supervisor_network_mode = 'none'").is_err());
+    assert!(
+        serde_json::from_value::<DockerSandboxDriverConfig>(serde_json::json!({
+            "supervisor_network_mode": "host"
+        }))
+        .is_err(),
+        "workloads cannot select supervisor networking"
     );
 }
 
