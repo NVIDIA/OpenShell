@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Enable lingering for tmachine
+- name: Enable lingering for gateway user
   become: true
   ansible.builtin.command:
     argv:
       - loginctl
       - enable-linger
-      - tmachine
+      - "{{ tmachine_user_manager_user | default('tmachine') }}"
   changed_when: false
 
-- name: Start tmachine user manager
+- name: Start gateway user manager
   become: true
   ansible.builtin.systemd_service:
-    name: user@1000.service
+    name: "user@{{ tmachine_user_manager_uid | default('1000') }}.service"
     state: started

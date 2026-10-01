@@ -32,6 +32,13 @@ before installing a snap. The Debian and Kubernetes CLI lanes remove snapd so
 they continue to exercise the dev Debian package. Kubernetes pins the matching
 `0.0.0-dev` chart and `:dev` images.
 
+RPM package installation also has tmachine conformance coverage in
+`Branch E2E Checks` (with `test:e2e`), `Release Dev`, and `Release Tag`. Those
+lanes use the `rpm` installer on `fedora-podman-rootful` and
+`fedora-podman-rootless` with candidate CLI and
+gateway RPMs and matching runtime images. Branch RPM package builds run on
+every approved branch run, independently of optional E2E labels.
+
 The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
 the release-tooling and package lifecycle tests before relying on the canary.
