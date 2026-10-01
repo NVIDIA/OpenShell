@@ -136,6 +136,7 @@ def test_sandbox_interactive_exec_honors_tty(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
+    ready_marker = b"tty-ready\n"
     stdin_sentinel = b"streamed-stdin-sentinel"
     stdout_sentinel = b"stdout-sentinel"
     stderr_sentinel = b"stderr-sentinel"
@@ -150,7 +151,7 @@ def test_sandbox_interactive_exec_honors_tty(
                     "-c",
                     "[ -t 0 ] && printf T || printf N; "
                     "[ -t 1 ] && printf T || printf N; "
-                    "[ -t 2 ] && printf T || printf N; printf '\\n'; "
+                    "[ -t 2 ] && printf T || printf N; printf '\\ntty-ready\\n'; "
                     "IFS= read -r stdin_value; "
                     "printf 'stdin:%s\\n' \"$stdin_value\"; "
                     "printf 'stdout-sentinel\\n'; "
@@ -161,35 +162,45 @@ def test_sandbox_interactive_exec_honors_tty(
             )
         )
 
+        ready = threading.Event()
         done = threading.Event()
 
         def requests():
             yield request
+            # PTY input echo can split the separate TTY flag writes. Wait for
+            # the complete marker, including its newline, before sending input.
+            if not ready.wait(timeout=20) or done.is_set():
+                return
             yield openshell_pb2.ExecSandboxInput(stdin=stdin_sentinel + b"\n")
             done.wait(timeout=30)
 
-        stdout: list[bytes] = []
-        stderr: list[bytes] = []
+        stdout = bytearray()
+        stderr = bytearray()
         exit_code: int | None = None
         try:
             events = sandbox_client._stub.ExecSandboxInteractive(requests(), timeout=30)
             for event in events:
                 payload = event.WhichOneof("payload")
                 if payload == "stdout":
-                    stdout.append(bytes(event.stdout.data))
+                    stdout.extend(event.stdout.data)
+                    if ready_marker in stdout.replace(b"\r\n", b"\n"):
+                        ready.set()
                 elif payload == "stderr":
-                    stderr.append(bytes(event.stderr.data))
+                    stderr.extend(event.stderr.data)
                 elif payload == "exit":
                     exit_code = int(event.exit.exit_code)
         finally:
             done.set()
+            # Unblock a request iterator waiting for readiness on early exit
+            # or RPC failure without sending input after the call has ended.
+            ready.set()
 
         assert exit_code == 0
-        return b"".join(stdout), b"".join(stderr)
+        return bytes(stdout), bytes(stderr)
 
     with sandbox(delete_on_exit=True) as sb:
         stdout, stderr = exec_interactive(sb.sandbox.name, tty=False)
-        assert b"NNN" in stdout
+        assert b"NNN" in stdout.splitlines()
         assert b"stdin:" + stdin_sentinel in stdout
         assert stdout_sentinel in stdout
         assert stdout_sentinel not in stderr
@@ -197,7 +208,11 @@ def test_sandbox_interactive_exec_honors_tty(
         assert stderr_sentinel not in stdout
 
         stdout, stderr = exec_interactive(sb.sandbox.name, tty=True)
-        assert b"TTT" in stdout + stderr
+        terminal_output = stdout + stderr
+        assert b"TTT" in terminal_output.splitlines()
+        assert b"stdin:" + stdin_sentinel in terminal_output
+        assert stdout_sentinel in terminal_output
+        assert stderr_sentinel in terminal_output
 
 
 def test_interactive_exec_drains_output_after_request_eof(
