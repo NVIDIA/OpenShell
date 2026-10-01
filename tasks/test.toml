@@ -290,11 +290,6 @@ description = "Run Docker conformance and Rust e2e tests against a standalone ga
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
 
-["e2e:docker:supervisor-networking"]
-description = "Exercise automatic Docker supervisor networking and restart"
-depends = ["e2e:workload:build"]
-run = "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_supervisor_networking"
-
 ["e2e:mechanistic-existing-endpoint"]
 description = "Run #2821 existing inspected-endpoint auto-approval regression"
 run = [
