@@ -48,14 +48,9 @@ jobs:
             push)
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-<<<<<<< HEAD
+              run_integration_upgrades="$(jq -r 'index("test:upgrade") != null' <<< "$LABELS_JSON")"
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-=======
-              run_integration_upgrades="$(jq -r 'index("test:upgrade") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
->>>>>>> bedd141c0 (test(ci): add label-gated upgrade qualification)
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -260,20 +255,6 @@ jobs:
     with:
       deb-version: ${{ needs.version.outputs.deb }}
       checkout-ref: ${{ github.sha }}
-
-  build-rpm:
-    name: Build RPM packages
-    needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/rpm-package.yml
-    with:
-      checkout-ref: ${{ github.sha }}
-      rpm-version: ${{ needs.version.outputs.rpm_version }}
-      rpm-release: ${{ needs.version.outputs.rpm_release }}
-      cargo-version: ${{ needs.version.outputs.cargo }}
 
   prepare-integration-upgrades:
     name: Prepare upgrade qualification inputs
