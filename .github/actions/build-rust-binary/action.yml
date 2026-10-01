@@ -59,12 +59,12 @@ runs:
       run: cargo auditable build --release --target "${INPUTS_TRIPLE}" --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
 
     - name: Sign ${{ inputs.binary }} for macOS
-      if: inputs.macos-entitlements != ''
+      if: inputs['macos-entitlements'] != ''
       shell: bash -euo pipefail {0}
       env:
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
-        INPUTS_MACOS_ENTITLEMENTS: ${{ inputs.macos-entitlements }}
+        INPUTS_MACOS_ENTITLEMENTS: ${{ inputs['macos-entitlements'] }}
       run: |
         binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
         signed_entitlements="${RUNNER_TEMP}/${INPUTS_BINARY}.entitlements.plist"
