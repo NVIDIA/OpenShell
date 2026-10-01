@@ -151,7 +151,8 @@ def test_sandbox_interactive_exec_honors_tty(
                     "-c",
                     "[ -t 0 ] && printf T || printf N; "
                     "[ -t 1 ] && printf T || printf N; "
-                    "[ -t 2 ] && printf T || printf N; printf '\\ntty-ready\\n'; "
+                    "[ -t 2 ] && printf T || printf N; "
+                    f"printf '\\n%s' '{ready_marker.decode()}'; "
                     "IFS= read -r stdin_value; "
                     "printf 'stdin:%s\\n' \"$stdin_value\"; "
                     "printf 'stdout-sentinel\\n'; "
