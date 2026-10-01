@@ -956,6 +956,14 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_sandbox_create_authenticated(sandbox, None).await
+    }
+
+    pub async fn validate_sandbox_create_authenticated(
+        &self,
+        sandbox: &Sandbox,
+        launch_authentication: Option<&[u8]>,
+    ) -> Result<(), Status> {
         self.validate_caller_driver_config(
             sandbox
                 .spec
@@ -969,6 +977,9 @@ impl ComputeRuntime {
         if let Some(token) = take_staging_token(&mut driver_sandbox) {
             let staged = self.rootfs_tar_staging.peek(&token)?;
             set_rootfs_tar_path(&mut driver_sandbox, &staged);
+        }
+        if let Some(spec) = driver_sandbox.spec.as_mut() {
+            spec.launch_authentication = launch_authentication.unwrap_or_default().to_vec();
         }
         self.driver
             .call(
