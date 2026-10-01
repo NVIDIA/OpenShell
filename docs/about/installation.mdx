@@ -132,7 +132,7 @@ The snap installs the standalone policy prover as `openshell.prover`. The
 The prover reads local policy files through the `home` interface and does not
 connect to the gateway.
 
-The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists and stores its database and TLS material under `~/snap/openshell/common`. Register it from the same user account:
+The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
 
 ```shell
 snap services openshell.user-gateway

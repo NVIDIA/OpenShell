@@ -137,12 +137,11 @@ assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
 assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
-assert_contains "$snap_wrapper" "if [ -n \"\${OPENSHELL_GATEWAY_CONFIG:-}\" ]; then"
-assert_contains \
-  "$snap_wrapper" \
-  "elif [ -e \"\$CANONICAL_CONFIG_FILE\" ] || [ -L \"\$CANONICAL_CONFIG_FILE\" ]; then"
-assert_contains "$snap_wrapper" "config preflight -- --config \"\$CANONICAL_CONFIG_FILE\" \"\$@\""
-assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
+assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]'
+assert_contains "$snap_wrapper" '[ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]'
+assert_contains "$snap_wrapper" 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"'
+assert_contains "$snap_wrapper" 'config preflight -- "$@"'
+assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 
 # Store installs autoconnect all required interfaces and require snapd 2.76 for
@@ -182,9 +181,13 @@ if grep -Eq '^  gateway:$' "$snapcraft"; then
 fi
 assert_contains "$snapcraft" '  system-gateway:'
 assert_contains "$snapcraft" '  user-gateway:'
-assert_contains "$snapcraft" 'OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_USER_COMMON/.config/openshell/gateway.toml"'
-assert_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON/gateway.db?mode=rwc"'
-assert_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON/.local/state/openshell/tls"'
+assert_contains "$snapcraft" 'OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_COMMON/gateway.toml"'
+assert_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"'
+assert_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_COMMON/tls"'
+assert_not_contains "$snapcraft" 'XDG_RUNTIME_DIR:'
+assert_not_contains "$snapcraft" 'OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_USER_COMMON'
+assert_not_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON'
+assert_not_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON'
 assert_contains "$snapcraft" 'refresh-mode: endure'
 if [[ ! -x "$snap_post_refresh_hook" ]]; then
   echo "FAIL: Snap post-refresh hook must be executable" >&2
