@@ -287,8 +287,9 @@ pub fn new_preparation_record(now_ms: i64, timeout_seconds: u32) -> SandboxProvi
     record
 }
 
-/// The caller has checked the report's authentication, instance fence and
-/// configuration generation. Persist this transition in the same CAS as admission.
+/// The caller has authenticated the supervisor and checked its instance fence.
+/// A Pending registration may start timing before configuration validation.
+/// Persist this transition in the same CAS as the supervisor report.
 pub fn record_admission_start(record: &mut SandboxProvisioning, now_ms: i64) -> Result<(), String> {
     let mut deadline = ProvisioningDeadline::from_record(record)?;
     deadline.start_admission(&record.attempt_id, now_ms);
