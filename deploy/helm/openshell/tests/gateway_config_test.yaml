@@ -1418,3 +1418,85 @@ tests:
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 3
+
+  - it: renders no extension registrations by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor\.middleware|gateway\.interceptors|provider_profile_sources'
+
+  - it: registers supervisor middleware with a private CA
+    template: templates/gateway-config.yaml
+    set:
+      server.middleware:
+        - name: content-guard
+          grpcEndpoint: https://content-guard.ext.svc:50051
+          tlsCaCertPath: /etc/ext-ca/ca.crt
+          timeout: 500ms
+          maxPayloadBytes: 262144
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.supervisor\.middleware\]\]\s*name\s*=\s*"content-guard"\s*grpc_endpoint\s*=\s*"https://content-guard\.ext\.svc:50051"\s*tls_ca_cert_path\s*=\s*"/etc/ext-ca/ca\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^max_payload_bytes = 262144$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^timeout = "500ms"$'
+
+  - it: registers an allowlisted gateway interceptor and selects it as a profile source
+    template: templates/gateway-config.yaml
+    set:
+      server.interceptors:
+        - name: governance
+          grpcEndpoint: https://governance.ext.svc:50052
+          order: 0
+          failurePolicy: fail_closed
+          bindingPolicy: allowlist
+          bindings:
+            - rpc: openshell.v1.OpenShell/CreateSandbox
+              phases: [modify_operation, validate]
+      server.providerProfileSources:
+        - type: user
+        - type: interceptor
+          name: governance
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.gateway\.interceptors\]\]\s*name\s*=\s*"governance".*?order = 0\s*failure_policy = "fail_closed"\s*binding_policy = "allowlist"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.gateway\.interceptors\.bindings\]\]\s*rpc = "openshell\.v1\.OpenShell/CreateSandbox"\s*phases = \["modify_operation", "validate"\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)provider_profile_sources = \[\s*\{ type = "user" \},\s*\{ type = "interceptor", name = "governance" \},\s*\]'
+
+  - it: requires a name for interceptor provider profile sources
+    template: templates/statefulset.yaml
+    set:
+      server.providerProfileSources:
+        - type: interceptor
+    asserts:
+      - failedTemplate:
+          errorMessage: server.providerProfileSources[] of type interceptor requires name
+
+  - it: requires an endpoint for middleware registrations
+    template: templates/statefulset.yaml
+    set:
+      server.middleware:
+        - name: content-guard
+    asserts:
+      - failedTemplate:
+          errorMessage: server.middleware[].grpcEndpoint is required
+
+  - it: requires a payload limit for middleware registrations
+    template: templates/statefulset.yaml
+    set:
+      server.middleware:
+        - name: content-guard
+          grpcEndpoint: https://content-guard.ext.svc:50051
+    asserts:
+      - failedTemplate:
+          errorMessage: server.middleware[].maxPayloadBytes is required

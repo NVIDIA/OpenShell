@@ -79,6 +79,19 @@ data:
     {{- else if or (gt $rlRequests 0) (gt $rlWindowSeconds 0) }}
     {{- fail "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it" }}
     {{- end }}
+    {{- if .Values.server.providerProfileSources }}
+    provider_profile_sources = [
+      {{- range $i, $source := .Values.server.providerProfileSources }}
+      {{- if not (has $source.type (list "user" "interceptor")) }}
+      {{- fail "server.providerProfileSources[].type must be user or interceptor" }}
+      {{- end }}
+      {{- if and (eq $source.type "interceptor") (not $source.name) }}
+      {{- fail "server.providerProfileSources[] of type interceptor requires name" }}
+      {{- end }}
+      { type = {{ $source.type | quote }}{{ if eq $source.type "interceptor" }}, name = {{ $source.name | quote }}{{ end }} },
+      {{- end }}
+    ]
+    {{- end }}
 
     {{- if $otlp.endpoint }}
 
@@ -174,8 +187,81 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- range .Values.server.middleware }}
+
+    [[openshell.supervisor.middleware]]
+    name          = {{ required "server.middleware[].name is required" .name | quote }}
+    grpc_endpoint = {{ required "server.middleware[].grpcEndpoint is required" .grpcEndpoint | quote }}
+    {{- if .tlsCaCertPath }}
+    tls_ca_cert_path = {{ .tlsCaCertPath | quote }}
+    {{- end }}
+    {{- if .audience }}
+    audience = {{ .audience | quote }}
+    {{- end }}
+    max_payload_bytes = {{ int (required "server.middleware[].maxPayloadBytes is required" .maxPayloadBytes) }}
+    {{- if .timeout }}
+    timeout = {{ .timeout | quote }}
+    {{- end }}
+    {{- if .allowInsecureTransport }}
+    allow_insecure_transport = true
+    {{- end }}
+    {{- end }}
+
+    {{- range .Values.server.interceptors }}
+
+    [[openshell.gateway.interceptors]]
+    name          = {{ required "server.interceptors[].name is required" .name | quote }}
+    grpc_endpoint = {{ required "server.interceptors[].grpcEndpoint is required" .grpcEndpoint | quote }}
+    {{- if .tlsCaCertPath }}
+    tls_ca_cert_path = {{ .tlsCaCertPath | quote }}
+    {{- end }}
+    {{- if .audience }}
+    audience = {{ .audience | quote }}
+    {{- end }}
+    {{- if .allowInsecureTransport }}
+    allow_insecure_transport = true
+    {{- end }}
+    {{- if not (kindIs "invalid" .order) }}
+    order = {{ int .order }}
+    {{- end }}
+    {{- if .failurePolicy }}
+    failure_policy = {{ .failurePolicy | quote }}
+    {{- end }}
+    {{- if .bindingPolicy }}
+    binding_policy = {{ .bindingPolicy | quote }}
+    {{- end }}
+    {{- if .timeout }}
+    timeout = {{ .timeout | quote }}
+    {{- end }}
+    {{- if .maxResponseBytes }}
+    max_response_bytes = {{ int .maxResponseBytes }}
+    {{- end }}
+    {{- if .maxPatches }}
+    max_patches = {{ int .maxPatches }}
+    {{- end }}
+    {{- range .bindings }}
+
+    [[openshell.gateway.interceptors.bindings]]
+    {{- if .rpc }}
+    rpc = {{ .rpc | quote }}
+    {{- end }}
+    {{- if .service }}
+    service = {{ .service | quote }}
+    {{- end }}
+    {{- if .method }}
+    method = {{ .method | quote }}
+    {{- end }}
+    {{- if .phases }}
+    phases = [{{- range $i, $phase := .phases }}{{ if $i }}, {{ end }}{{ $phase | quote }}{{- end }}]
+    {{- end }}
+    {{- if .failurePolicy }}
+    failure_policy = {{ .failurePolicy | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
     [openshell.drivers.kubernetes]
-    allow_driver_config          = {{ .Values.server.drivers.kubernetes.allowDriverConfig }}
+    allow_driver_config         = {{ .Values.server.drivers.kubernetes.allowDriverConfig }}
     namespace                    = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image                = {{ include "openshell.sandboxImage" . | quote }}
     {{- if include "openshell.sandboxRuntimeImageOverrideEnabled" . }}

@@ -410,9 +410,13 @@ When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credenti
 
 See [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) for attachment, failure, and operational guidance.
 
+On Kubernetes, the Helm chart renders these entries from `server.middleware`. Mount a private CA bundle with `server.extraVolumes` and `server.extraVolumeMounts` and reference it from `tlsCaCertPath`.
+
 ## Gateway Interceptors
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+On Kubernetes, the Helm chart renders `[[openshell.gateway.interceptors]]` from `server.interceptors` and `provider_profile_sources` from `server.providerProfileSources`.
 
 Each interceptor must also complete [extension protocol negotiation](/extensibility/overview#protocol-negotiation) during `Describe`. Upgrade legacy gateways and interceptors together during a coordinated outage; neither mixed legacy/current pairing is supported. The interceptor rejects missing or incompatible gateway metadata, and the gateway rejects missing metadata, incompatible protocol majors, and unmet requirements before serving requests.
 
