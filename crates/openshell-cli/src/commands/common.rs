@@ -140,22 +140,6 @@ pub fn format_timestamp(d: Duration) -> String {
     format!("[{secs:.1}s]")
 }
 
-/// Format a millisecond timestamp into a readable string.
-pub fn format_timestamp_ms(ms: i64) -> String {
-    if ms <= 0 {
-        return "-".to_string();
-    }
-    let secs = ms / 1000;
-    let mins = (secs / 60) % 60;
-    let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days}d {hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
-    }
-}
-
 pub fn truncate_status_field(value: &str, max_chars: usize) -> String {
     if value.is_empty() {
         return "-".to_string();
@@ -1071,6 +1055,20 @@ pub fn scrub_git_env(command: &mut Command) -> &mut Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_epoch_ms_renders_absolute_date_not_day_count() {
+        // Rule-history entries carry an absolute `google.protobuf.Timestamp`
+        // (epoch ms), so the rendered string must be a readable wall-clock
+        // date, never a days-since-epoch count. 1_700_000_000_000 ms is
+        // 2023-11-14T22:13:20Z.
+        assert_eq!(
+            format_optional_epoch_ms(1_700_000_000_000),
+            "2023-11-14 22:13:20"
+        );
+        // A missing timestamp (proto default -> 0 ms) renders as a placeholder.
+        assert_eq!(format_optional_epoch_ms(0), "-");
+    }
 
     #[test]
     fn parse_duration_to_ms_parses_supported_units() {
