@@ -2098,6 +2098,14 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Validate a policy file locally without contacting a gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Check {
+        /// Path to the policy YAML file.
+        #[arg(value_hint = ValueHint::FilePath)]
+        policy: PathBuf,
+    },
+
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -2621,6 +2629,16 @@ async fn run_async() -> Result<()> {
         unsafe {
             std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
         }
+    }
+
+    // Local policy validation is intentionally handled before the main
+    // command dispatch. It must not resolve a gateway or load credentials.
+    if let Some(Commands::Policy {
+        command: Some(PolicyCommands::Check { policy }),
+    }) = &cli.command
+    {
+        run::policy_check(policy)?;
+        return Ok(());
     }
 
     match cli.command {
