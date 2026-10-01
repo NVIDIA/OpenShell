@@ -25,6 +25,31 @@ assert_glibc_preflight_passes() {
   fi
 }
 
+assert_target_config_home() {
+  local name=$1
+  local xdg_config_home=$2
+  local expected=$3
+  local actual
+
+  actual="$(
+    TARGET_HOME="${tmpdir}/home"
+    XDG_CONFIG_HOME="$xdg_config_home"
+    if [ "$xdg_config_home" = "__UNSET__" ]; then
+      unset XDG_CONFIG_HOME
+    fi
+    target_config_home
+  )"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_target_config_home "unset XDG_CONFIG_HOME" __UNSET__ "${tmpdir}/home/.config"
+assert_target_config_home "empty XDG_CONFIG_HOME" "" "${tmpdir}/home/.config"
+assert_target_config_home "set XDG_CONFIG_HOME" "${tmpdir}/custom-config" "${tmpdir}/custom-config"
+assert_target_config_home "set XDG_CONFIG_HOME with spaces" "${tmpdir}/custom config" "${tmpdir}/custom config"
+
 assert_glibc_preflight_fails() {
   local name=$1
   local expected=$2
