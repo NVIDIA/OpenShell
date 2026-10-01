@@ -278,7 +278,7 @@ For unattended agents, `state:needs-info` blocks work until the requested eviden
 
 #### Stale Issues
 
-Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity. Automated closing is currently disabled. Comment on the item or remove `state:stale` to keep it active. Issues awaiting triage or human disposition, accepted issues, active agent workflows, and roadmap issues are exempt. `state:needs-info` may become stale when no new evidence arrives.
+Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity. Issues close as not planned after 14 additional days without activity; pull requests are only marked stale. Comment on the item or remove `state:stale` to keep it active. Issues awaiting triage or human disposition, accepted issues, active agent workflows, and roadmap issues are exempt. `state:needs-info` may become stale when no new evidence arrives.
 
 ## Prerequisites
 
