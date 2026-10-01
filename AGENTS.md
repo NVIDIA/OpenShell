@@ -227,6 +227,7 @@ ocsf_emit!(event);
 - `mise run test` — Unit test suite. Run after code changes.
 - `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
+- For public CLI or gateway behavior that should be portable across drivers and installation methods, use the [CLI conformance suite guide](tests/suites/conformance/README.md) to decide whether to add conformance coverage and which test layer owns it.
 
 ## Go SDK (`sdk/go/`)
 

@@ -207,8 +207,11 @@ gh issue create \
 
 ## Test Considerations
 
+- For public CLI or gateway behavior that may need portable installed-artifact
+  coverage, use `tests/suites/conformance/README.md` to determine whether the
+  contract belongs in conformance, a driver suite, a feature suite, or E2E.
 - <what testing strategy makes sense for this change>
-- <which test levels are needed: unit, integration, e2e>
+- <which test levels are needed: unit, integration, conformance, e2e>
 - <any test infrastructure that may need to be added>
 - <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 

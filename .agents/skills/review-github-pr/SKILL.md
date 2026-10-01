@@ -137,6 +137,13 @@ Read through the full diff (and the PR description if available). Produce a summ
   - Do not fabricate concerns or claim a behavioral regression without evidence
     for both the prior and proposed behavior.
 - **Agent infrastructure**: When the PR changes behavior, commands, or development workflows, use the `sync-agent-infra` maintenance map to check that related skills were updated. When it adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references, apply the full consistency checklist. Report missing companion updates or drift under **Potential Concerns**.
+- **Conformance coverage**: When the PR changes public CLI or gateway behavior,
+  or touches `crates/openshell-conformance/` or
+  `tests/suites/conformance/`, apply the placement and verification criteria in
+  `tests/suites/conformance/README.md`. Report a missing portable scenario,
+  misplaced driver-specific assertion, duplicated scenario implementation, or
+  omitted focused verification under **Potential Concerns** when it creates a
+  concrete coverage risk.
 
 ## Step 5: Output
 

@@ -24,6 +24,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 | `.agents/skills/create-github-pr/SKILL.md` | Pre-PR agent infrastructure check |
 | `.agents/skills/review-github-pr/SKILL.md` | Review-time agent infrastructure check |
 | `.agents/skills/build-from-issue/SKILL.md` | Label awareness and pre-commit agent infrastructure check |
+| `tests/suites/conformance/README.md` | Canonical conformance test placement and verification guidance |
 | `.claude/agents/principal-engineer-reviewer.md` | Shared review-time agent infrastructure check |
 
 ## When to Run
@@ -32,6 +33,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 - After adding, removing, or renaming a crate in `crates/`
 - After changing workflow chain relationships between skills
 - After changing which product or development areas a skill covers
+- After changing conformance test placement or verification guidance
 - After modifying issue or PR templates
 - Before opening a PR that touches any of the above
 
@@ -56,6 +58,7 @@ Use this map when product behavior, commands, or development workflows change. I
 | Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
 | RFC template, numbering, or lifecycle | `create-rfc` |
 | Documentation structure, navigation, or doc-update workflow | `update-docs-from-commits` |
+| Portable public CLI behavior, installed-artifact validation, or conformance test layout | `build-from-issue`, `create-spike`, `review-github-pr` |
 | Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
 
 ## Prerequisites
@@ -142,6 +145,10 @@ For each file in the table above, check for the following inconsistencies:
 4. **`create-spike`** — Reference to `build-from-issue` as next step must be accurate.
 5. **`review-security-issue`** / **`fix-security-issue`** — Cross-references between the two must be accurate.
 6. **PR creation and review checks** — The `create-github-pr`, `review-github-pr`, `build-from-issue`, and `principal-engineer-reviewer` references to `sync-agent-infra` must exist and use trigger conditions aligned with this skill.
+7. **Conformance test routing** — `AGENTS.md`, `build-from-issue`,
+   `create-spike`, and `review-github-pr` must route portable public CLI and
+   gateway behavior to `tests/suites/conformance/README.md` without copying its
+   detailed placement rules.
 
 ### Skill Layout, Metadata, and Portability
 

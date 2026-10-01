@@ -171,7 +171,7 @@ In the prompt, instruct the reviewer to:
 3. Determine the **issue type** — one of: `feat` (new feature), `fix` (bug fix), `refactor`, `chore`, `perf`, `docs`.
 4. Propose the minimal set of changes that satisfies the requirements.
 5. Sequence the work so each step is independently testable.
-6. Identify what tests are needed (unit, integration, e2e) and where they should live.
+6. Identify what tests are needed (unit, integration, conformance, e2e) and where they should live. For public CLI or gateway behavior that may need portable installed-artifact coverage, apply the routing criteria in `tests/suites/conformance/README.md` instead of assuming an existing driver or E2E test is sufficient.
 7. Assess **complexity** on a scale:
    - **Low**: Isolated change, < 3 files, clear path forward
    - **Medium**: Multiple files/components, some design decisions, but well-scoped
@@ -212,6 +212,7 @@ gh issue comment <id> --body "$(cat <<'EOF'
 ### Test Plan
 - **Unit tests:** <what will be tested and where the tests live>
 - **Integration tests:** <what will be tested, or "N/A" with rationale>
+- **Conformance tests:** <portable installed-artifact behavior to cover, or "N/A" with rationale>
 - **E2E tests:** <what will be tested, or "N/A" with rationale>
 
 ### Risks & Open Questions
@@ -429,17 +430,31 @@ mise run pre-commit
 
 Do not proceed to Phase 2 or PR creation if Phase 1 is not green.
 
-#### Phase 2: E2E Tests (Conditional)
+#### Phase 2: Conformance and E2E Tests (Conditional)
 
-**Trigger**: Run this phase if any files under `e2e/` were added or modified in this build. Check with:
+**Trigger**: Run this phase when the plan calls for conformance or E2E coverage,
+when the implementation changes behavior covered by those suites, or when
+executable test code or configuration changes under any of these paths:
 
 ```bash
-git diff --name-only main -- e2e/
+git diff --name-only main -- \
+  e2e/ \
+  crates/openshell-conformance/ \
+  crates/openshell-conformance-cli/ \
+  tests/suites/conformance/
 ```
 
-If there are no changes under `e2e/`, skip this phase entirely.
+Treat this path check as a minimum signal, not the sole test-selection rule. A
+public CLI or gateway behavior change can require portable conformance coverage
+even when none of these paths changed. Use `tests/suites/conformance/README.md`
+to decide whether conformance applies and which focused build and live checks to
+run.
 
-If E2E files were modified, run the relevant E2E lane for the driver touched by the change:
+For changes to the conformance library, runner, or installed-artifact workspace,
+run the focused checks documented in that README. When scenario behavior or its
+E2E integration changes, also run the narrowest live lane that exercises it.
+
+For driver- or environment-specific E2E changes, run the relevant lane:
 
 ```bash
 # Docker-backed gateway smoke E2E
@@ -448,23 +463,23 @@ mise run e2e:docker
 
 Use `mise run e2e:podman`, `mise run e2e:vm`, or a Helm-backed Kubernetes E2E lane when the change targets those drivers.
 
-**E2E retry loop** (up to 3 attempts):
+**Conformance/E2E retry loop** (up to 3 attempts):
 
-1. Run the selected E2E lane.
+1. Run the selected focused conformance check or E2E lane.
 2. If tests fail:
-   - Read the pytest output carefully — identify which tests failed and why.
+   - Read the test output carefully — identify which tests failed and why.
    - Distinguish between **test bugs** (the test itself is wrong) and **implementation bugs** (the code under test is wrong).
    - Fix the failing code or tests.
    - Decrement the retry counter and try again.
 3. If tests pass, Phase 2 is green.
 
-**If all 3 E2E attempts fail**, stop and report to the user:
-- Which E2E tests are failing
-- The pytest output from the last attempt
+**If all 3 attempts fail**, stop and report to the user:
+- Which conformance or E2E tests are failing
+- The test output from the last attempt
 - Whether the failures appear to be test issues or implementation issues
 - That manual intervention is needed
 
-Do not proceed to PR creation if E2E verification is not green.
+Do not proceed to PR creation if required conformance or E2E verification is not green.
 
 ### Step 11: Update Documentation
 
@@ -529,6 +544,7 @@ Closes #<issue-id>
 ## Testing
 - [x] `mise run pre-commit` passes
 - [x] Unit tests added/updated
+- [x] Conformance tests added/updated (if applicable)
 - [x] E2E tests added/updated (if applicable)
 
 **Tests added:**
@@ -727,7 +743,7 @@ User says: "Build issue #42"
 6. Implement pagination for both endpoints per the plan
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise run pre-commit` passes on first attempt
-9. E2E tests skipped (no changes under `e2e/`)
+9. Conformance and E2E tests skipped because the plan and changed behavior do not require them
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
 12. No agent-workflow label transition is needed
