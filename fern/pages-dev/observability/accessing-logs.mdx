@@ -33,6 +33,20 @@ Gateway-originated policy mutations also appear in this stream. When the gateway
 
 The TUI dashboard displays sandbox logs in real time. Logs appear in the log panel with the same format as the CLI.
 
+## Main Process Output
+
+The sandbox's main process writes its stdout and stderr to the sandbox container's stdout and stderr, alongside warnings from the sandbox runtime. Read it with the container tooling for the compute driver:
+
+```shell
+kubectl -n <namespace> logs <sandbox-pod> -c agent
+docker logs <sandbox-container>
+podman logs <sandbox-container>
+```
+
+A main process started with a TTY writes only to its attachment; use `openshell sandbox connect` to view that output. Output from `sandbox exec` and SSH sessions does not reach the container log, and `openshell logs` does not include main process output.
+
+When the container runtime falls behind reading the log, the main process blocks on writes, as with any container.
+
 ## Gateway Log Storage
 
 The sandbox pushes logs to the gateway over gRPC in real time. The gateway stores a bounded buffer of recent log lines per sandbox. This buffer is not persisted to disk and is lost when the gateway restarts.
