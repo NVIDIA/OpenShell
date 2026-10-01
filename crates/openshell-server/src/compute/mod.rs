@@ -659,6 +659,7 @@ pub struct ComputeRuntime {
     restart_authority:
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
+    ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
 }
 
 pub struct SandboxSyncGuard {
@@ -756,7 +757,71 @@ impl ComputeRuntime {
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
+            ssh_identities: Arc::new(OnceLock::new()),
         })
+    }
+
+    pub(crate) fn configure_ssh_identities(
+        &self,
+        credentials: crate::credentials::CredentialRuntime,
+    ) {
+        let _ = self
+            .ssh_identities
+            .set(crate::ssh_identity::SshIdentityStore::new(
+                self.store.clone(),
+                credentials,
+            ));
+    }
+
+    pub(crate) async fn prepare_ssh_identity(
+        &self,
+        sandbox: &mut Sandbox,
+        authentication: &mut openshell_core::jwt::SandboxLaunchAuthentication,
+    ) -> Result<(), Status> {
+        if let Some(identities) = self.ssh_identities.get() {
+            identities.prepare(sandbox, authentication).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cleanup_ssh_identity(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        if let Some(identities) = self.ssh_identities.get() {
+            identities.delete(sandbox).await?;
+        }
+        Ok(())
+    }
+
+    async fn encode_launch_authentication(
+        &self,
+        sandbox: &Sandbox,
+        mut authentication: openshell_core::jwt::SandboxLaunchAuthentication,
+    ) -> Result<Vec<u8>, Status> {
+        let mut with_identity = sandbox.clone();
+        self.prepare_ssh_identity(&mut with_identity, &mut authentication)
+            .await?;
+        serialize_launch_authentication(authentication)
+    }
+
+    async fn encode_persisted_launch_authentication(
+        &self,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+        sandbox: &Sandbox,
+    ) -> Result<Vec<u8>, Status> {
+        let Some(authority) = authority else {
+            return Ok(Vec::new());
+        };
+        let metadata = sandbox
+            .metadata
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+        let identity =
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        self.encode_launch_authentication(
+            sandbox,
+            authority.mint_persisted_launch(sandbox.object_id(), &identity)?,
+        )
+        .await
     }
 
     /// Serializes sandbox/provider-profile invariant checks and object writes
@@ -1098,6 +1163,25 @@ impl ComputeRuntime {
         if let Some(metadata) = sandbox.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
+        // The parent now owns any staged key, including if this request is
+        // cancelled. Keep the creation guard until its public identity and
+        // protected launch bundle have been committed.
+        let launch_authentication = if let Some(encoded) = launch_authentication {
+            let authentication = serde_json::from_slice(&encoded)
+                .map_err(|_| Status::internal("invalid sandbox launch authentication"))?;
+            let encoded = self
+                .encode_launch_authentication(&sandbox, authentication)
+                .await?;
+            sandbox = self
+                .store
+                .get_message::<Sandbox>(&sandbox_id)
+                .await
+                .map_err(|_| Status::unavailable("reload sandbox SSH identity failed"))?
+                .ok_or_else(|| Status::aborted("sandbox was removed during creation"))?;
+            Some(encoded)
+        } else {
+            None
+        };
         drop(global_guard);
 
         if let Some(token) = sandbox_token
@@ -1178,6 +1262,7 @@ impl ComputeRuntime {
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
+                self.cleanup_ssh_identity(&sandbox).await?;
                 let _ = self
                     .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
@@ -1186,6 +1271,7 @@ impl ComputeRuntime {
                 Err(Status::already_exists("sandbox already exists"))
             }
             Err(status) if status.code() == Code::FailedPrecondition => {
+                self.cleanup_ssh_identity(&sandbox).await?;
                 let _ = self
                     .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
@@ -1194,6 +1280,7 @@ impl ComputeRuntime {
                 Err(Status::failed_precondition(status.message().to_string()))
             }
             Err(err) => {
+                self.cleanup_ssh_identity(&sandbox).await?;
                 let _ = self
                     .store
                     .delete(Sandbox::object_type(), sandbox.object_id())
@@ -1579,9 +1666,16 @@ impl ComputeRuntime {
                 // Acquiring the lifecycle gate proves that no local worker still
                 // owns this transition. Retry the idempotent driver operation
                 // with the identity committed by the original transition.
-                let authentication =
-                    serialize_persisted_launch_authentication(authority, &current)?;
-                break (current.clone(), current, authentication);
+                let authentication = self
+                    .encode_persisted_launch_authentication(authority, &current)
+                    .await?;
+                let refreshed = self
+                    .store
+                    .get_message::<Sandbox>(&sandbox_id)
+                    .await
+                    .map_err(|_| Status::unavailable("reload sandbox SSH identity failed"))?
+                    .ok_or_else(|| Status::not_found("sandbox was deleted"))?;
+                break (refreshed.clone(), refreshed, authentication);
             }
 
             let previous = current.clone();
@@ -1594,11 +1688,14 @@ impl ComputeRuntime {
             };
             let launch_authentication =
                 if let (Some(authority), Some(identity)) = (authority, next_identity.as_ref()) {
-                    serialize_launch_authentication(
+                    self.encode_launch_authentication(
+                        &current,
                         authority.mint_persisted_launch(current.object_id(), identity)?,
-                    )?
+                    )
+                    .await?
                 } else {
-                    serialize_persisted_launch_authentication(authority, &current)?
+                    self.encode_persisted_launch_authentication(authority, &current)
+                        .await?
                 };
             let expected_resource_version = sandbox_resource_version(&current);
             let next_identity_for_update = next_identity.clone();
@@ -3774,7 +3871,9 @@ impl ComputeRuntime {
             return Ok(());
         };
 
-        let launch_authentication = serialize_persisted_launch_authentication(authority, &armed)
+        let launch_authentication = self
+            .encode_persisted_launch_authentication(authority, &armed)
+            .await
             .map_err(|status| status.to_string())?;
         let generation_id = sandbox_runtime_generation(&armed)?.into_string();
         let expected_runtime_identity = sandbox_compute_runtime_identity(&current);
@@ -4811,7 +4910,20 @@ impl ComputeRuntime {
             // call itself, only on the (instant, non-blocking) decision to
             // make it.
             self.spawn_driver_sandbox_cleanup(sandbox.object_id(), sandbox.object_name());
-            self.cleanup_sandbox_owned_records(sandbox).await?;
+            // Fence a delayed identity preparer before reclaiming its key.
+            // A watch deletion has no request-side Deleting transition.
+            let deleting = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox.object_id(),
+                    sandbox_resource_version(sandbox),
+                    |sandbox| {
+                        sandbox.set_phase(SandboxPhase::Deleting.into());
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            self.cleanup_sandbox_owned_records(&deleting).await?;
         }
 
         let _ = self
@@ -4835,6 +4947,9 @@ impl ComputeRuntime {
     }
 
     async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.cleanup_ssh_identity(sandbox)
+            .await
+            .map_err(|error| error.to_string())?;
         self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
             .await?;
         self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
@@ -6596,25 +6711,6 @@ fn next_runtime_identity(
     })
 }
 
-fn serialize_persisted_launch_authentication(
-    authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
-    sandbox: &Sandbox,
-) -> Result<Vec<u8>, Status> {
-    let Some(authority) = authority else {
-        return Ok(Vec::new());
-    };
-    let metadata = sandbox
-        .metadata
-        .as_ref()
-        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
-    let identity =
-        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    serialize_launch_authentication(
-        authority.mint_persisted_launch(sandbox.object_id(), &identity)?,
-    )
-}
-
 fn serialize_launch_authentication(
     authentication: openshell_core::jwt::SandboxLaunchAuthentication,
 ) -> Result<Vec<u8>, Status> {
@@ -6935,6 +7031,7 @@ pub fn new_test_runtime_with_driver(
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
+        ssh_identities: Arc::new(OnceLock::new()),
     }
 }
 
@@ -7984,6 +8081,7 @@ mod tests {
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
+            ssh_identities: Arc::new(OnceLock::new()),
         }
     }
 

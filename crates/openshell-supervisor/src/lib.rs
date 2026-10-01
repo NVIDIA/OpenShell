@@ -683,6 +683,13 @@ pub async fn run_sandbox(
         ));
     }
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    let ssh_host_key = if ssh_socket_path.is_some() {
+        Some(openshell_supervisor_process::ssh::parse_host_key(
+            auth_bundle.ssh_host_private_key.as_ref(),
+        )?)
+    } else {
+        None
+    };
     let (image_yaml, invalid_image) =
         openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
             runtime_descriptor.clone(),
@@ -1168,6 +1175,7 @@ pub async fn run_sandbox(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            ssh_host_key,
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");

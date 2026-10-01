@@ -106,6 +106,7 @@ glob = { workspace = true }
 hex = "0.4"
 russh = "0.62"
 rand = { workspace = true }
+rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"
 ipnet = "2"
 tempfile = "3"

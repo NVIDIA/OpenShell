@@ -799,6 +799,29 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 ## SSH Config
 
+Each sandbox has its own SSH host key. The key stays the same when the
+supervisor or container restarts, a pod is rescheduled, or the sandbox is
+stopped and started. Deleting the sandbox removes its key. Creating another
+sandbox with the same name creates a different key.
+
+The gateway returns the public fingerprint in `Sandbox.host_key_fingerprint`
+from sandbox creation, lookup, and listing, and in
+`CreateSshSessionResponse.host_key_fingerprint`. The value uses OpenSSH's
+`SHA256:<base64>` format. Read it over an authenticated gateway connection,
+pin it to the sandbox ID, and reject SSH connections that present a different
+fingerprint. This also applies to clients that connect directly to the
+supervisor's SSH socket.
+
+The gateway keeps the private key in its credential store and delivers it
+only to the supervisor. The sandbox workload cannot read the key. Drivers,
+gateway, and supervisor must use the matching OpenShell release. Older
+runtimes can return an empty fingerprint; an empty value cannot verify an
+SSH server's identity.
+
+The CLI and TUI continue to use their existing SSH connection settings.
+Exposing the fingerprint does not enable automatic host-key verification in
+those clients.
+
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
 ```shell
