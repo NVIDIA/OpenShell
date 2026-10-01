@@ -485,9 +485,9 @@ fn probe_scalar_round_trip() -> io::Result<bool> {
         Ok(unsafe { libc::syscall(libc::SYS_getppid) })
     });
 
-    let (listener, wait_killable) = receiver
-        .recv()
-        .map_err(|_| io::Error::other("notification launcher disappeared"))?;
+    let Ok((listener, wait_killable)) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "notification"));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -556,9 +556,9 @@ fn probe_addfd_send() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("ADDFD launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "ADDFD"));
+    };
     let notification = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -687,9 +687,9 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         Ok(())
     });
 
-    let listener = receiver
-        .recv()
-        .map_err(|_| io::Error::other("sendto launcher disappeared"))?;
+    let Ok(listener) = receiver.recv() else {
+        return Err(launcher_failure(launcher, "sendto"));
+    };
     let destination = match receive_probe_notification(&listener) {
         Ok(notification) => notification,
         Err(error) => {
@@ -729,6 +729,25 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         .join()
         .map_err(|_| io::Error::other("sendto launcher panicked"))??;
     Ok(())
+}
+
+/// Recover the real error from a probe launcher that exited before handing its
+/// listener to the broker.
+///
+/// The launcher owns the only `install_listener` result, so a failed install
+/// just closes the handover channel. Join the thread to report the kernel's
+/// refusal — the errno distinguishes a pre-5.19 `WAIT_KILLABLE_RECV` rejection
+/// from a restrictive host that the fallback cannot retry. Return that error
+/// unchanged rather than reformatting it, so `raw_os_error` still reports the
+/// kernel's errno to callers that branch on it.
+fn launcher_failure<T>(launcher: thread::JoinHandle<io::Result<T>>, role: &str) -> io::Error {
+    match launcher.join() {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => io::Error::other(format!(
+            "{role} launcher exited before sending its listener"
+        )),
+        Err(_) => io::Error::other(format!("{role} launcher panicked")),
+    }
 }
 
 fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Notification> {
@@ -968,6 +987,7 @@ mod tests {
     use super::*;
 
     const NONDUMPABLE_PROBE_CHILD: &str = "OPENSHELL_NONDUMPABLE_PROBE_CHILD";
+    const REJECTED_INSTALL_PROBE_CHILD: &str = "OPENSHELL_REJECTED_INSTALL_PROBE_CHILD";
 
     #[test]
     fn filter_rejects_empty_syscall_set() {
@@ -1018,6 +1038,77 @@ mod tests {
             .status()
             .expect("run disposable nondumpable probe process");
         assert!(status.success(), "nondumpable probe child failed: {status}");
+    }
+
+    #[test]
+    fn notification_probe_reports_rejected_listener_install() {
+        if std::env::var_os(REJECTED_INSTALL_PROBE_CHILD).is_some() {
+            // Model a host that refuses the listener install with an errno the
+            // `WAIT_KILLABLE_RECV` fallback cannot retry. The install happens on
+            // the launcher thread, so the probe must join that thread to report
+            // the kernel's refusal instead of only observing a closed channel.
+            install_set_mode_filter_eperm_filter().expect("install SET_MODE_FILTER EPERM filter");
+            let error = probe_notification_api().expect_err("rejected install must fail the probe");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            assert!(
+                error.to_string().contains("os error 1"),
+                "probe error must carry the install errno, got: {error}"
+            );
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::seccomp_notify::tests::notification_probe_reports_rejected_listener_install")
+            .arg("--nocapture")
+            .env(REJECTED_INSTALL_PROBE_CHILD, "1")
+            .status()
+            .expect("run disposable rejected-install probe process");
+        assert!(
+            status.success(),
+            "rejected-install probe child failed: {status}"
+        );
+    }
+
+    /// Refuse `seccomp(SECCOMP_SET_MODE_FILTER, ...)` with `EPERM` while the
+    /// notification size query keeps working, so `install_listener` fails the
+    /// way a restrictive host does rather than the way a pre-5.19 kernel does.
+    fn install_set_mode_filter_eperm_filter() -> io::Result<()> {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let seccomp_number = u32::try_from(libc::SYS_seccomp)
+            .map_err(|_| io::Error::other("syscall number does not fit u32"))?;
+        let mut instructions = [
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+            jump(BPF_JMP_JEQ_K, seccomp_number, 0, 3),
+            stmt(BPF_LD_W_ABS, argument_word_offset(0, 0)),
+            jump(BPF_JMP_JEQ_K, SECCOMP_SET_MODE_FILTER, 0, 1),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM.unsigned_abs()),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        ];
+        let length = u16::try_from(instructions.len())
+            .map_err(|_| io::Error::other("test seccomp filter is too large"))?;
+        let mut program = libc::sock_fprog {
+            len: length,
+            filter: instructions.as_mut_ptr(),
+        };
+        set_no_new_privileges()?;
+        // SAFETY: program references the complete live test filter. No flags
+        // are required because the disposable process has one calling thread.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::addr_of_mut!(program),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn install_process_vm_enosys_filter() -> io::Result<()> {
