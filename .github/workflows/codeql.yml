@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+﻿# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 name: CodeQL
@@ -20,7 +20,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ inputs.candidate_ref || github.ref }}
@@ -30,6 +29,9 @@ jobs:
   analyze:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     timeout-minutes: 90
     env:
       # Keep Rust test fixtures out of production-focused security results.
@@ -166,3 +168,4 @@ jobs:
             exit 1
           fi
           echo "All CodeQL analyzers completed and the configured finding threshold passed."
+
