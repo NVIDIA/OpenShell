@@ -24,9 +24,10 @@ Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
 Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification installs the
-CLI and gateway RPMs on Fedora with rootful and rootless Podman and runs conformance using
-the matching runtime images. Release Dev and Release Tag run the same RPM lane.
+runs without optional E2E labels. Core integration qualification builds and installs
+the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
+rootful and rootless Podman. These lanes run conformance using the matching runtime
+images. Release Dev and Release Tag use the same package installers.
 
 Three opt-in labels enable the long-running E2E suites:
 
