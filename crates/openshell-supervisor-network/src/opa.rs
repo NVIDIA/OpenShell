@@ -147,6 +147,24 @@ pub trait NetworkPolicyEngine: Send + Sync {
     fn l7_engine_for_tunnel(&self, _captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
         None
     }
+
+    /// Endpoints eligible for policy-gated DNS resolution under the active
+    /// policy generation.
+    ///
+    /// Consulted by `policy_dns` before any CONNECT decision: a DNS query
+    /// for a host not covered here is refused outright. `OpaEngine` reads
+    /// `network_policies` directly; `CedarOnlyEngine` extracts exact
+    /// `NetworkEndpoint` literals from `NetworkConnect` permits (see
+    /// [`openshell_policy_cedar::extract_authorized_network_endpoints`]) —
+    /// glob-only hosts are a documented, narrow gap there, not a security
+    /// issue (fails closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for an evaluator-internal failure (e.g. a
+    /// poisoned lock) — an empty-but-`Ok` snapshot is the correct result
+    /// when no host is currently eligible.
+    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot>;
 }
 
 /// Input for a network access policy evaluation.
@@ -1315,6 +1333,10 @@ impl NetworkPolicyEngine for OpaEngine {
 
     fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
         Self::websocket_assembly_budget(self)
+    }
+
+    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        Self::policy_dns_eligibility_snapshot(self)
     }
 }
 

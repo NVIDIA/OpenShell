@@ -2806,7 +2806,8 @@ async fn handle_mediated_connection(
             port = port,
             "tls: skip — bypassing TLS auto-detection, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, network_engine.as_ref(), &decision)
         else {
             return Ok(());
         };
@@ -3031,7 +3032,8 @@ async fn handle_mediated_connection(
             port = port,
             "Non-TLS non-HTTP traffic detected, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, network_engine.as_ref(), &decision)
         else {
             return Ok(());
         };

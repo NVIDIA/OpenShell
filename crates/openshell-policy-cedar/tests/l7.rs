@@ -64,3 +64,13 @@ fn denies_an_endpoint_with_no_http_request_policy() {
         .expect("request must be representable in the schema");
     assert!(!allowed);
 }
+
+#[test]
+fn allows_a_dns_resolved_host_with_a_trailing_dot() {
+    let mut req = request("POST", "/v1/chat/completions");
+    req.host = "integrate.api.nvidia.com.".to_string();
+    let (allowed, _) = engine()
+        .evaluate_l7(&req)
+        .expect("request must be representable in the schema");
+    assert!(allowed);
+}

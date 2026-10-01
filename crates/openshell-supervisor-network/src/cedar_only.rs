@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use crate::cedar_shadow::{PLACEHOLDER_IDENTITY, network_request_from_input};
 use crate::opa::{
     EgressAuthorization, L7PolicyEngine, MatchedEndpoint, NetworkAction, NetworkInput,
+    PolicyDnsEligibilitySnapshot,
 };
 use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 
@@ -46,6 +47,13 @@ pub struct CedarOnlyEngine {
     /// without needing the enclosing `Arc<CedarOnlyEngine>` — trait objects
     /// reached through `&dyn NetworkPolicyEngine` only ever see `&self`.
     engine: Arc<RwLock<CedarNetworkEngine>>,
+    /// The currently-loaded policy source, so [`Self::reload_from_policy_str`]
+    /// can no-op on an unchanged reload instead of unconditionally advancing
+    /// the generation. An unconditional bump here would invalidate every
+    /// in-flight L7 tunnel on every policy-poll reconciliation pass — even
+    /// one triggered by something unrelated to this sandbox's Cedar policy
+    /// (e.g. middleware registry reconciliation) — not just a real change.
+    source: RwLock<String>,
     generation: Arc<AtomicU64>,
     generation_tx: watch::Sender<u64>,
 }
@@ -63,6 +71,7 @@ impl CedarOnlyEngine {
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
+            source: RwLock::new(policy_src.to_string()),
             generation: Arc::new(AtomicU64::new(0)),
             generation_tx,
         })
@@ -82,12 +91,24 @@ impl CedarOnlyEngine {
     /// generation counter. Call this directly alongside wherever
     /// `OpaEngine::reload*` would be called for a YAML-sourced sandbox.
     ///
+    /// A no-op (generation unchanged) when `policy_src` is byte-identical
+    /// to what's already loaded — see the `source` field doc.
+    ///
     /// # Errors
     ///
     /// Returns an error if `policy_src` fails to parse. On error, the
     /// previous policy and generation stay active (last-known-good,
     /// matching `OpaEngine`'s reload failure behavior).
     pub fn reload_from_policy_str(&self, policy_src: &str) -> Result<()> {
+        {
+            let current_source = self
+                .source
+                .read()
+                .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
+            if current_source.as_str() == policy_src {
+                return Ok(());
+            }
+        }
         let engine =
             CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
         let mut guard = self
@@ -95,6 +116,10 @@ impl CedarOnlyEngine {
             .write()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
         *guard = engine;
+        *self
+            .source
+            .write()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))? = policy_src.to_string();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         Ok(())
@@ -182,6 +207,37 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
 
     fn l7_engine_for_tunnel(&self, captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
         Some(self.l7_handle(captured_generation))
+    }
+
+    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        let generation = self.current_generation();
+        let guard = self
+            .engine
+            .read()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
+        let authorized = guard.extract_authorized_network_endpoints();
+
+        let endpoints = authorized
+            .into_iter()
+            .enumerate()
+            .filter_map(|(endpoint_index, authorized)| {
+                let value = serde_json::json!({
+                    "host": authorized.host,
+                    "ports": authorized.ports,
+                });
+                let endpoint = serde_json::from_value::<regorus::Value>(value).ok()?;
+                Some(MatchedEndpoint {
+                    policy_name: "cedar".to_string(),
+                    endpoint_index,
+                    endpoint,
+                })
+            })
+            .collect();
+
+        Ok(PolicyDnsEligibilitySnapshot {
+            endpoints,
+            generation,
+        })
     }
 }
 
@@ -337,14 +393,35 @@ when {
         let handle = engine
             .l7_engine_for_tunnel(captured_generation)
             .expect("Cedar engine provides an L7 handle");
+        // A reload with genuinely different policy text must still advance
+        // the generation — only a byte-identical reload is a no-op.
+        let changed_policy = format!("{POLICY}\n// a trailing comment to change the source\n");
         engine
-            .reload_from_policy_str(POLICY)
-            .expect("reload with identical policy still advances the generation");
+            .reload_from_policy_str(&changed_policy)
+            .expect("reload with changed policy advances the generation");
 
         let result = handle.evaluate_request(&ctx(), &request("GET", "/v1/status"));
         assert!(
             result.is_err(),
             "stale tunnel must fail closed, not silently re-evaluate"
+        );
+    }
+
+    #[test]
+    fn reload_with_identical_policy_source_is_a_no_op() {
+        // An unconditional generation bump here would invalidate every
+        // in-flight L7 tunnel whenever a policy poll reconciliation pass
+        // fires for a reason unrelated to this sandbox's Cedar policy (e.g.
+        // middleware registry reconciliation) — not just a real change.
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        let generation_before = engine.current_generation();
+        engine
+            .reload_from_policy_str(POLICY)
+            .expect("reload succeeds");
+        assert_eq!(
+            engine.current_generation(),
+            generation_before,
+            "reloading byte-identical policy text must not advance the generation"
         );
     }
 

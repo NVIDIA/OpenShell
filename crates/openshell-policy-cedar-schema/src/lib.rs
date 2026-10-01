@@ -61,11 +61,13 @@ pub mod context_fields {
     pub const BINARY_PATH: &str = "binary_path";
     /// `Set<String>` of the calling process's ancestor binary paths.
     pub const ANCESTORS: &str = "ancestors";
-    /// HTTP method for REST requests.
+    /// HTTP method for REST requests. On `NetworkConnect` this is always
+    /// `""` — see the schema's `NetworkConnect` doc comment.
     pub const METHOD: &str = "method";
-    /// REST request path.
+    /// REST request path. Always `""` on `NetworkConnect` — see `METHOD`.
     pub const PATH: &str = "path";
-    /// SQL command verb for SQL requests.
+    /// SQL command verb for SQL requests. Always `""` on `NetworkConnect` —
+    /// see `METHOD`.
     pub const COMMAND: &str = "command";
     /// JSON-RPC method name for JSON-RPC requests. `HttpRequest`-only.
     pub const JSONRPC_METHOD: &str = "jsonrpc_method";

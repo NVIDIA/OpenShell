@@ -89,3 +89,17 @@ fn denies_connect_to_an_endpoint_with_no_matching_policy() {
         "{decision:?}"
     );
 }
+
+#[test]
+fn allows_a_dns_resolved_host_with_a_trailing_dot() {
+    // DNS-resolved hostnames (as published by policy_dns and read back via
+    // ResolvedEndpointStore::lookup) are absolute FQDNs with a trailing
+    // dot; the authored policy host literal never has one.
+    let decision = engine()
+        .evaluate_network(&sandbox_request("pypi.org.", 443, "GET"))
+        .expect("request must be representable in the schema");
+    assert!(
+        matches!(decision, NetworkDecision::Allow { .. }),
+        "{decision:?}"
+    );
+}

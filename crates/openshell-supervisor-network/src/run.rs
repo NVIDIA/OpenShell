@@ -461,9 +461,9 @@ pub async fn run_networking(
     };
 
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
-        let engine = opa_engine
-            .cloned()
-            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        let engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Mediated DNS requires a network policy engine (OPA or Cedar)")
+        })?;
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,

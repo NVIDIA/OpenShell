@@ -3149,7 +3149,16 @@ where
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
-            if generation != generation_guard.captured_generation() {
+            // Compare against the middleware engine's own live generation,
+            // not generation_guard: for a Cedar-sourced sandbox,
+            // generation_guard tracks Cedar's generation while `engine`
+            // here is always the (middleware-only) dummy OpaEngine — a
+            // different counter that need not, and often permanently
+            // doesn't, match Cedar's. The real staleness protection for
+            // this tunnel is the close_if_stale(generation_guard, ..) calls
+            // elsewhere in this loop; this check only guards against the
+            // middleware chain changing out from under this one query.
+            if generation != engine.current_generation() {
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;

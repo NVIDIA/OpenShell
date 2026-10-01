@@ -125,7 +125,19 @@ pub(super) fn pin_l7_evaluator(
     network_engine: &dyn NetworkPolicyEngine,
     expected_generation: u64,
 ) -> Result<TunnelPolicyEngine> {
-    let tunnel = opa_engine.clone_engine_for_tunnel(expected_generation)?;
+    // Validate staleness against the authoritative engine (OPA or Cedar),
+    // not opa_engine's own generation: for a Cedar-sourced sandbox,
+    // opa_engine is a structural stand-in whose counter is independent of
+    // Cedar's (e.g. it advances once from builtin middleware registry
+    // installation at startup, permanently offsetting it from Cedar's,
+    // which never reflects that event). `expected_generation` here is the
+    // CONNECT decision's generation, always reported by whichever engine
+    // was actually authoritative for that decision.
+    network_engine.generation_guard(expected_generation)?;
+    // Clone against opa_engine's own live generation: the real staleness
+    // check already happened above, so this is structural only (it always
+    // succeeds short of a concurrent OPA reload landing in this instant).
+    let tunnel = opa_engine.clone_engine_for_tunnel(opa_engine.current_generation())?;
     let l7_override = network_engine.l7_engine_for_tunnel(expected_generation);
     Ok(tunnel.with_l7_override(l7_override))
 }
@@ -191,17 +203,18 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
-                return None;
-            }
-        };
+        let generation_guard =
+            match pin_policy_generation(network_engine, decision.policy_generation) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_l7_tunnel_close_after_policy_change(
+                        &decision.intent.destination.host,
+                        decision.intent.destination.port,
+                        error,
+                    );
+                    return None;
+                }
+            };
         PreparedHttpPolicy::Passthrough { generation_guard }
     };
 
@@ -217,7 +230,7 @@ pub(super) fn prepare_http_relay<'a>(
 /// a stale decision.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &OpaEngine,
+    network_engine: &dyn NetworkPolicyEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
@@ -229,7 +242,7 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.policy_generation) {
+    match pin_policy_generation(network_engine, decision.policy_generation) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(

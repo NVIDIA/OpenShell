@@ -36,11 +36,11 @@ pub use compile::CompiledCedarPolicy;
 pub use compile_l7::CompiledL7Policy;
 pub use error::CedarEngineError;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
+    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
     PolicySet, Request, RestrictedExpression, Schema,
 };
 use openshell_policy_cedar_schema::{actions, context_fields, endpoint_fields, entity_types};
@@ -190,6 +190,14 @@ impl CedarNetworkEngine {
         filesystem::extract_authorized_paths(&self.policies)
     }
 
+    /// Extracts the exact `NetworkEndpoint` literals this engine's policy
+    /// set permits for `NetworkConnect`. See
+    /// [`extract_authorized_network_endpoints`].
+    #[must_use]
+    pub fn extract_authorized_network_endpoints(&self) -> Vec<AuthorizedNetworkEndpoint> {
+        extract_authorized_network_endpoints(&self.policies)
+    }
+
     /// Evaluates one network-connect request against the loaded policy set.
     ///
     /// # Errors
@@ -217,7 +225,7 @@ impl CedarNetworkEngine {
             });
         }
 
-        let host_lower = request.host.to_lowercase();
+        let host_lower = normalize_host(&request.host);
         let host_port = format!("{host_lower}:{}", request.port);
 
         let user_uid = entity_uid(entity_types::USER, &request.user)?;
@@ -344,7 +352,7 @@ impl CedarNetworkEngine {
         &self,
         request: &L7Request,
     ) -> Result<(bool, Vec<String>), CedarEngineError> {
-        let host_lower = request.host.to_lowercase();
+        let host_lower = normalize_host(&request.host);
         let host_port = format!("{host_lower}:{}", request.port);
 
         let user_uid = entity_uid(entity_types::USER, &request.user)?;
@@ -485,6 +493,94 @@ pub struct L7Request {
     pub command: String,
     /// JSON-RPC method name, when known; empty string when not applicable.
     pub jsonrpc_method: String,
+}
+
+/// One network endpoint an authored Cedar policy set permits a
+/// `NetworkConnect`, grouped by host.
+///
+/// For DNS eligibility purposes, not CONNECT-time matching: only exact
+/// `NetworkEndpoint` literals (`resource == NetworkEndpoint::"host:port"` or
+/// `resource in [...]`) are extracted. A host expressed only through a
+/// `resource.host like "pattern"` condition has no entity literal and is not
+/// covered — see [`extract_authorized_network_endpoints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedNetworkEndpoint {
+    /// Destination host, lowercased.
+    pub host: String,
+    /// Ports this host is permitted on.
+    pub ports: Vec<u16>,
+}
+
+/// Extracts the exact `NetworkEndpoint` literals an authored Cedar policy
+/// set permits for `NetworkConnect`, grouped by host.
+///
+/// Feeds DNS eligibility checks for a Cedar-sourced sandbox: a DNS query for
+/// a host not covered here is refused before the CONNECT-time decision ever
+/// runs, matching the YAML/OPA path's `policy_dns_eligible_endpoint_records`
+/// semantics as closely as Cedar's literal-only extraction allows.
+///
+/// A host reachable only through a `like` glob condition (not a literal
+/// equality/`in` comparison) is **not** included — DNS resolution for such a
+/// host fails even though the CONNECT-time Cedar decision would correctly
+/// evaluate the glob. This is a known, documented gap (not a security
+/// issue: it only makes some policies that should work fail closed), kept
+/// narrow deliberately rather than guessed. `forbid` policies never grant
+/// eligibility and are ignored here.
+#[must_use]
+pub fn extract_authorized_network_endpoints(
+    policies: &PolicySet,
+) -> Vec<AuthorizedNetworkEndpoint> {
+    let mut by_host: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+
+    for policy in policies.policies() {
+        if policy.effect() != Effect::Permit {
+            continue;
+        }
+        let literals = policy.entity_literals();
+        let targets_network_connect = literals.iter().any(|uid| {
+            uid.type_name().to_string() == actions::ACTION_TYPE
+                && uid.id().unescaped() == actions::NETWORK_CONNECT
+        });
+        if !targets_network_connect {
+            continue;
+        }
+
+        for uid in &literals {
+            if uid.type_name().to_string() != entity_types::NETWORK_ENDPOINT {
+                continue;
+            }
+            let id = uid.id().unescaped();
+            let Some((host, port_str)) = id.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            by_host
+                .entry(host.to_ascii_lowercase())
+                .or_default()
+                .insert(port);
+        }
+    }
+
+    by_host
+        .into_iter()
+        .map(|(host, ports)| AuthorizedNetworkEndpoint {
+            host,
+            ports: ports.into_iter().collect(),
+        })
+        .collect()
+}
+
+/// Lowercases `host` and strips one trailing `.`.
+///
+/// DNS-resolved hostnames (as published by `policy_dns` and read back via
+/// `ResolvedEndpointStore::lookup`) are absolute FQDNs with a trailing dot
+/// (see `NormalizedName::parse`); authored Cedar policy host literals never
+/// have one. Without this, every CONNECT/L7 request whose host came from a
+/// DNS resolution would fail to match an otherwise-identical policy host.
+fn normalize_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_lowercase()
 }
 
 /// Builds an [`EntityUid`] from a Cedar entity type name and id.

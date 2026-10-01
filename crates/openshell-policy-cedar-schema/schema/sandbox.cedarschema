@@ -47,9 +47,14 @@ namespace Sandbox {
   //              Set.contains()/like, not hierarchy traversal)
   // ancestors:   absolute paths of the calling process's ancestors, from
   //              /proc/<pid>/exe walks; excludes cmdline/argv0 (spoofable)
-  // method:      HTTP verb for REST endpoints ("GET", "POST", …); "" when not applicable
-  // path:        REST request path; "" when not applicable
-  // command:     SQL command verb ("SELECT", "INSERT", …); "" when not applicable
+  // method, path, command: ALWAYS "" for this action. CONNECT happens
+  //              before any HTTP request/SQL statement is seen, so there is
+  //              nothing to report yet — these three fields exist only for
+  //              schema symmetry with HttpRequest's context. A `permit`
+  //              that conditions on one of them (e.g. `context.method ==
+  //              "GET"`) can never match and silently denies every
+  //              connection; gate per-request method/path on the
+  //              HttpRequest action instead.
   action "NetworkConnect"
     appliesTo {
       principal: [Process],
