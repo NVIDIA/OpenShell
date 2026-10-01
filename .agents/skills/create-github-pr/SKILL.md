@@ -50,7 +50,7 @@ Before creating a PR, verify:
 2. **Branch follows naming convention** - Follow Branch Names in `CONTRIBUTING.md`, including the exceptions for generated branches and private security work.
 
    ```bash
-   # Example: feat/1234-add-pagination/johntmyers
+   # Example: feat/1234-add-pagination/octocat
    git branch --show-current
    ```
 
