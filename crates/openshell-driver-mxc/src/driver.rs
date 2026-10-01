@@ -523,18 +523,22 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
     environment
 }
 
-/// Values that must never appear verbatim in the gateway log: the
+/// Values to redact from gateway diagnostics: the
 /// caller-injected per-sandbox environment (`--env`/`--env-from`/template
 /// environment) and the generated egress-proxy password. Both reach the
 /// sandboxed process's own environment for its own legitimate use, but the
 /// whole point of injecting them as environment variables rather than baking
 /// them into a logged command line is that they must never surface in
-/// gateway/trace/audit output either. `cmd.exe` (and any other shell) echoes
-/// its own expanded command line to stdout by default, so a workload that
+/// gateway output either. `cmd.exe` batch files without `@echo off` echo
+/// their expanded command lines to stdout, so a workload that
 /// merely references an injected variable (e.g. `echo %SECRET%`) leaks it
 /// straight into the `wxc-exec stdout:` log line -- twice, once in the
 /// echoed command and once in the command's own output -- unless the value
 /// is redacted before logging. See nvbugs 6843156.
+///
+/// Matching is literal and case-sensitive. Values shorter than four UTF-8
+/// bytes are excluded to preserve useful diagnostics for common flag values.
+/// This is best-effort log hygiene, not protection against transformed output.
 ///
 /// Provider credentials are deliberately excluded here: per
 /// `append_provider_child_env`'s doc comment, those values are
@@ -544,9 +548,7 @@ fn secret_redaction_values(
     injected_environment: &[String],
     proxy_auth: Option<&SandboxProxyAuth>,
 ) -> Vec<String> {
-    // Below this length a "secret" is common enough (e.g. "1", "true", a
-    // short flag value) that redacting it would mangle unrelated log lines
-    // without protecting anything meaningful.
+    // Short flag values are too common to suppress in every diagnostic.
     const MIN_SECRET_LEN: usize = 4;
     let mut values: Vec<String> = injected_environment
         .iter()
@@ -561,27 +563,46 @@ fn secret_redaction_values(
     values
 }
 
-/// Replaces every occurrence of a redaction value in `line` with
-/// `[REDACTED]`. Longest values first, so a value that happens to be a
-/// substring of another redaction value doesn't get partially replaced,
-/// leaving a fragment of the longer secret behind.
+/// Redact the union of all matching ranges in the original text. Include
+/// overlapping occurrences, even of the same value, and never scan replacement
+/// markers. The deduplicated values are prepared once per sandbox; a line with
+/// no matches needs neither an allocation nor a sort.
 fn redact_secrets<'a>(line: &'a str, secrets: &[String]) -> std::borrow::Cow<'a, str> {
-    if secrets.is_empty() {
-        return std::borrow::Cow::Borrowed(line);
-    }
-    let mut ordered: Vec<&String> = secrets.iter().collect();
-    ordered.sort_unstable_by_key(|s| std::cmp::Reverse(s.len()));
-    let mut result: Option<String> = None;
-    for secret in ordered {
-        let haystack = result.as_deref().unwrap_or(line);
-        if haystack.contains(secret.as_str()) {
-            result = Some(haystack.replace(secret.as_str(), "[REDACTED]"));
+    let mut ranges = Vec::new();
+    for secret in secrets {
+        let Some(first) = secret.chars().next() else {
+            continue;
+        };
+        let mut offset = 0;
+        while let Some(relative_start) = line[offset..].find(secret.as_str()) {
+            let start = offset + relative_start;
+            ranges.push((start, start + secret.len()));
+            // Advance one character, not the full match, to retain self-overlap.
+            offset = start + first.len_utf8();
         }
     }
-    match result {
-        Some(redacted) => std::borrow::Cow::Owned(redacted),
-        None => std::borrow::Cow::Borrowed(line),
+    if ranges.is_empty() {
+        return std::borrow::Cow::Borrowed(line);
     }
+
+    ranges.sort_unstable();
+    let mut result = String::new();
+    let (mut start, mut end) = ranges[0];
+    let mut copied_until = 0;
+    for &(next_start, next_end) in &ranges[1..] {
+        if next_start <= end {
+            end = end.max(next_end);
+        } else {
+            result.push_str(&line[copied_until..start]);
+            result.push_str("[REDACTED]");
+            copied_until = end;
+            (start, end) = (next_start, next_end);
+        }
+    }
+    result.push_str(&line[copied_until..start]);
+    result.push_str("[REDACTED]");
+    result.push_str(&line[end..]);
+    std::borrow::Cow::Owned(result)
 }
 
 /// Merge provider-owned child environment values into MXC `process.env`.
@@ -2347,8 +2368,15 @@ async fn run_lifecycle(
             }
         };
         if let Some(err) = launch_err {
-            warn!(sandbox = %sandbox_name, "control-channel launch failed: {err}");
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &err).await;
+            set_launch_failed(
+                &registry,
+                &watch_tx,
+                &sandbox,
+                &sandbox_id,
+                &err,
+                &secret_values,
+            )
+            .await;
             // `child` was already moved into the registry (and possibly
             // already claimed by monitor_exec, spawned above) once a
             // cancellable handle was published. ProcessContainer has
@@ -2589,6 +2617,23 @@ async fn monitor_exec(
         }
     }
 }
+
+/// Control-channel diagnostics can contain the relay's captured workload
+/// stderr. Scrub the decoded text at the diagnostic boundary, leaving protocol
+/// envelopes and successful control-channel payloads untouched.
+async fn set_launch_failed(
+    registry: &Arc<Mutex<HashMap<String, SandboxEntry>>>,
+    watch_tx: &Arc<broadcast::Sender<WatchSandboxesEvent>>,
+    sandbox: &DriverSandbox,
+    sandbox_id: &str,
+    message: &str,
+    secrets: &[String],
+) {
+    let message = redact_secrets(message, secrets);
+    warn!(sandbox = %sandbox.name, "control-channel launch failed: {message}");
+    set_failed(registry, watch_tx, sandbox, sandbox_id, &message).await;
+}
+
 async fn set_failed(
     registry: &Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: &Arc<broadcast::Sender<WatchSandboxesEvent>>,
@@ -3499,11 +3544,8 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn redact_secrets_prefers_the_longest_match_so_no_fragment_survives() {
-        // A short secret that happens to be a substring of a longer one must
-        // not get replaced first and leave a `[REDACTED]`-tail fragment of
-        // the longer secret behind.
-        let secrets = vec!["abc".to_owned(), "abcdef".to_owned()];
+    fn redact_secrets_covers_contained_values() {
+        let secrets = vec!["abcd".to_owned(), "abcdef".to_owned()];
         let line = "value=abcdef".to_owned();
         assert_eq!(redact_secrets(&line, &secrets), "value=[REDACTED]");
     }
@@ -3523,6 +3565,139 @@ mod lifecycle_tests {
         assert!(values.contains(&"SuperSecretValue12345".to_owned()));
         assert!(values.contains(&"sandbox-secret".to_owned()));
         assert!(!values.iter().any(|v| v == "abc"));
+    }
+
+    #[test]
+    fn redact_secrets_merges_overlapping_and_adjacent_matches() {
+        for values in [["abcdef", "defghi"], ["defghi", "abcdef"]] {
+            let secrets = values.map(str::to_owned);
+            assert_eq!(
+                redact_secrets("value=abcdefghi!", &secrets),
+                "value=[REDACTED]!"
+            );
+            assert_eq!(redact_secrets("abcdefdefghi", &secrets), "[REDACTED]");
+            assert_eq!(
+                redact_secrets("abcdef / defghi", &secrets),
+                "[REDACTED] / [REDACTED]"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_handles_self_overlap_and_unicode_boundaries() {
+        let secrets = ["éé".to_owned()];
+        assert_eq!(redact_secrets("前ééé後", &secrets), "前[REDACTED]後");
+        let secrets = ["abab".to_owned()];
+        assert_eq!(redact_secrets("ababab", &secrets), "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_secrets_does_not_rescan_replacement_markers() {
+        let secrets = ["example-value".to_owned(), "REDACTED".to_owned()];
+        assert_eq!(redact_secrets("example-value", &secrets), "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_secrets_borrows_when_no_nonempty_pattern_matches() {
+        for secrets in [vec![], vec![String::new()], vec!["absent".to_owned()]] {
+            assert!(matches!(
+                redact_secrets("ordinary output", &secrets),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    async fn assert_launch_failure_is_redacted(message: &str, secret: &str) {
+        use tracing::instrument::WithSubscriber;
+
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sandbox = driver_sandbox("redacted-failure");
+        backend.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxEntry {
+                sandbox: sandbox.clone(),
+                iso_sandbox_id: None,
+                isolation_stopped: false,
+                phase_state: PhaseState::Starting,
+                lifecycle_gate: Arc::new(Mutex::new(())),
+                exec_child: None,
+                shutdown_tx: None,
+                terminated_rx: None,
+                signal_file: None,
+                trimmed_policy: None,
+                proxy_addr: None,
+                host_proxy: None,
+                control_channel: None,
+            },
+        );
+        let mut events = backend.watch_tx.subscribe();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let secrets = secret_redaction_values(&[format!("TOKEN={secret}")], None);
+        set_launch_failed(
+            &backend.registry,
+            &backend.watch_tx,
+            &sandbox,
+            &sandbox.id,
+            message,
+            &secrets,
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        let expected = "target failed; stderr: [REDACTED]";
+        let registry = backend.registry.lock().await;
+        let entry = registry.get(&sandbox.id).unwrap();
+        assert_eq!(entry.phase_state, PhaseState::Failed(expected.to_owned()));
+        assert_eq!(ready_condition(&entry.sandbox).unwrap().message, expected);
+        let event = events.try_recv().expect("failure watch event");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected sandbox status");
+        };
+        assert_eq!(
+            ready_condition(&event.sandbox.unwrap()).unwrap().message,
+            expected
+        );
+        let captured = std::fs::read_to_string(log.path()).unwrap();
+        assert!(captured.contains("control-channel launch failed"));
+        assert!(captured.contains("MXC lifecycle failed"));
+        assert!(!captured.contains(secret));
+        assert_eq!(captured.matches("[REDACTED]").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn routed_target_failure_redacts_logs_status_and_watch_event() {
+        let secret = r#"test-credential"with\escapes"#;
+        let message = format!("target failed; stderr: {secret}");
+        let line = serde_json::json!({"event": "target_failed", "error": message}).to_string();
+        let (tx, rx) = oneshot::channel();
+        let slot = Mutex::new(Some(tx));
+        assert!(ControlChannel::try_route_target_status(&slot, &line).await);
+        let decoded = rx.await.unwrap().unwrap_err();
+        assert_eq!(decoded, message, "routing preserves decoded protocol data");
+        assert_launch_failure_is_redacted(&decoded, secret).await;
+    }
+
+    #[tokio::test]
+    async fn routed_response_redacts_failure_without_rewriting_success_payload() {
+        let secret = "test-response-credential";
+        for ok in [false, true] {
+            let message = format!("target failed; stderr: {secret}");
+            let response = serde_json::json!({"id": 1, "ok": ok, "error": message, "data": secret});
+            let (tx, rx) = oneshot::channel();
+            let pending = Mutex::new(HashMap::from([(1, tx)]));
+            assert!(ControlChannel::try_route_response(&pending, &response.to_string()).await);
+            let decoded = rx.await.unwrap();
+            assert_eq!(decoded, response, "protocol payload must remain unchanged");
+            if !ok {
+                assert_launch_failure_is_redacted(decoded["error"].as_str().unwrap(), secret).await;
+            }
+        }
     }
 
     #[test]

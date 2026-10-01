@@ -40,6 +40,19 @@ an exited canonical process remains a terminal sandbox result. Exit code zero
 produces `Completed`; a nonzero or signal-normalized exit produces `Error`
 with the exact exit code. Driver and supervisor failures remain `Error`.
 
+## Windows MXC Diagnostics
+
+The MXC driver redacts literal, case-sensitive matches of injected environment
+values and its per-sandbox proxy password in captured stdout/stderr and relay
+launch-failure diagnostics. Gateway logs and sandbox failure status use the
+scrubbed diagnostics. Overlapping matches are redacted together.
+
+Only values of at least four UTF-8 bytes are included, and non-secret injected
+settings can also be redacted. Shorter values and transformed or encoded values
+are outside this protection. Avoid printing credentials in workloads.
+Provider credentials remain in the host proxy and reach the child as
+placeholders.
+
 ## Build with Selected Compute Drivers
 
 Source builds of `openshell-gateway` can include any subset of the Docker,

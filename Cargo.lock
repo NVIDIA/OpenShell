@@ -4191,6 +4191,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windows",
 ]

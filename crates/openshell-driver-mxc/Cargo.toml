@@ -43,6 +43,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
