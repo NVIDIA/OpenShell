@@ -206,6 +206,14 @@ does not provide restart durability.
 
 ## Audit Boundary
 
+The driver redacts literal, case-sensitive matches of injected environment
+values and the per-sandbox proxy password in captured stdout/stderr and decoded
+relay launch-failure diagnostics before logging or publishing failure status.
+Overlapping matches are redacted together. Values shorter than four UTF-8 bytes
+are excluded to preserve diagnostic usefulness. This is best-effort log hygiene;
+transformed values are outside its scope. Control-channel protocol payloads are
+unchanged, and provider secrets remain in the host proxy.
+
 When enabled, `crates/openshell-driver-mxc/src/etw_consumer.rs` starts a
 gateway-owned real-time session for the Windows Sandboxing ETW provider. The
 consumer attributes events to a sandbox using the driver-owned `wxc-exec` PID

@@ -159,6 +159,20 @@ Each sandbox receives a distinct proxy listener and a random per-sandbox credent
 
 The MXC credential handoff is also fixed at sandbox creation. The gateway rejects expiring static provider credentials because the in-process MXC driver has no live credential-refresh channel. Dynamic token grants remain request-time operations in the host proxy. Recreate the sandbox after rotating or revoking a non-expiring static credential.
 
+### Captured output and failure diagnostics
+
+Before writing captured stdout/stderr or relay launch-failure diagnostics to
+gateway logs, the driver replaces literal, case-sensitive matches of injected
+environment values and the per-sandbox proxy password with `[REDACTED]`.
+Failure status uses the same scrubbed diagnostic. Overlapping occurrences are
+redacted together; successful control-channel payloads are unchanged.
+
+The redaction set includes all injected values of at least four UTF-8 bytes,
+including non-secret settings. Shorter values and transformed or encoded
+representations are outside its scope. This is best-effort log hygiene;
+workloads should avoid printing credentials. Provider secrets remain in the
+host proxy and reach the child only as placeholders.
+
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553
