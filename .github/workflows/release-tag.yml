@@ -214,8 +214,8 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
-  proto-breaking:
-    name: Protobuf API compatibility
+  protobuf-compatibility:
+    name: Protobuf Compatibility
     needs: compute-versions
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
@@ -226,18 +226,16 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-      - uses: ./.github/actions/setup-nix
-
-      - name: Check release protobuf API compatibility
-        shell: nix develop .#proto --no-write-lock-file -c bash -euo pipefail {0}
-        run: uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py --release "$RELEASE_TAG"
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          release-tag: ${{ env.RELEASE_TAG }}
 
   qualification-result:
     name: Release Qualification
     if: always()
     needs:
       - compute-versions
-      - proto-breaking
+      - protobuf-compatibility
       - security
       - conformance-integration
       - feature-specific-integration
@@ -263,7 +261,7 @@ jobs:
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
-          PROTO_COMPATIBILITY_RESULT: ${{ needs.proto-breaking.result }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
           VM_E2E_RESULT: ${{ needs.vm-e2e.result }}

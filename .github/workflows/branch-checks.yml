@@ -37,32 +37,25 @@ jobs:
       - id: gate
         uses: ./.github/actions/pr-gate
 
-  proto-breaking:
-    name: Protobuf API compatibility
+  protobuf-compatibility:
+    name: Protobuf Compatibility
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
-    defaults:
-      run:
-        shell: nix develop .#proto --no-write-lock-file -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-nix
-
-      - name: Check protobuf API compatibility
-        env:
-          TARGET_REF: ${{ github.event.merge_group.base_sha || needs.pr_metadata.outputs.base_sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            TARGET_REF="refs/remotes/origin/$DEFAULT_BRANCH"
-          fi
-          uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py --target "$TARGET_REF"
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          target-ref: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
+                || github.event.merge_group.base_sha
+                || needs.pr_metadata.outputs.base_sha }}
 
   mise-lockfile:
     name: mise Lockfile

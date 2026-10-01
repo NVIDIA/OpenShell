@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check Protobuf Compatibility
+description: Check protobuf compatibility against the target or latest stable release using the release train policy. Requires a checkout with full history and tags.
+
+inputs:
+  target-ref:
+    description: PR or merge-group target commit/ref. Supply either target-ref or release-tag.
+    required: false
+    default: ""
+  release-tag:
+    description: Prerelease or stable tag to qualify. Supply either target-ref or release-tag.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-nix
+
+    - name: Check protobuf compatibility
+      shell: nix develop .#proto --no-write-lock-file -c bash -euo pipefail {0}
+      env:
+        TARGET_REF: ${{ inputs.target-ref }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      run: |
+        args=()
+        if [[ -n "$TARGET_REF" ]]; then
+          args+=(--target "$TARGET_REF")
+        fi
+        if [[ -n "$RELEASE_TAG" ]]; then
+          args+=(--release "$RELEASE_TAG")
+        fi
+        uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py "${args[@]}"

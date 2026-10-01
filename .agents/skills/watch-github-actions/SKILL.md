@@ -132,10 +132,11 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
-For `Protobuf API compatibility`, check the logged train and comparison baseline.
+For `Protobuf Compatibility`, check the logged train and comparison baseline.
 Branch Checks compares the prospective merge tree with its target; Release Tag
 compares the tagged candidate with the previous stable release. Both use
-`nix develop .#proto`. During `0.x`, a minor train permits compatibility findings
+the shared `check-protobuf-compatibility` action with `nix develop .#proto`.
+During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in

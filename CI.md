@@ -19,8 +19,9 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 ### Protobuf API compatibility
 
-`Protobuf API compatibility` runs in Branch Checks and Release Tag through the
-lockfile-pinned `proto` Nix shell. It uses Buf's `FILE` policy for the `proto/`
+`Protobuf Compatibility` runs in Branch Checks and Release Tag through the shared
+`check-protobuf-compatibility` action and lockfile-pinned `proto` Nix shell.
+It uses Buf's `FILE` policy for the `proto/`
 module, covering SDK descriptors and extension contracts. Storage-only protobufs
 remain subject to their separate durability checks.
 
