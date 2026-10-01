@@ -283,14 +283,33 @@ assert_snap_install_flow() {
       case "${1:-}:${2:-}" in
         list:docker) return 1 ;;
         list:openshell) [ "$openshell_present" = "1" ] ;;
+        get:openshell) printf '%s\n' system ;;
         *) command snap "$@" ;;
       esac
     }
-    as_root() { printf 'root:%s\n' "$*"; }
+    as_root() {
+      if [ "${1:-}:${2:-}" = snap:get ]; then
+        shift
+        snap "$@"
+      else
+        printf 'root:%s\n' "$*"
+      fi
+    }
+    as_target_user() { printf 'target:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
     wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
-    register_snap_gateway() { printf '%s\n' "register:gateway"; }
-    wait_for_snap_gateway_listener() { printf '%s\n' "wait:gateway-listener"; }
+    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    snap_gateway_mode() {
+      if [ "$openshell_present" = 1 ]; then
+        printf '%s\n' system
+      else
+        printf '%s\n' user
+      fi
+    }
+    register_system_snap_gateway() { printf '%s\n' "register:system-gateway"; }
+    register_user_snap_gateway() { printf '%s\n' "register:user-gateway"; }
+    wait_for_system_snap_gateway_listener() { printf '%s\n' "wait:system-gateway-listener"; }
+    wait_for_user_snap_gateway_listener() { printf '%s\n' "wait:user-gateway-listener"; }
     wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
     info() { :; }
     export TARGET_USER=test-user
@@ -308,24 +327,75 @@ assert_snap_install_flow() {
   fi
 }
 
+assert_snap_user_refresh_flow() {
+  local calls
+  (
+    has_cmd() {
+      case "$1" in
+        snap | docker) return 0 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    snap() {
+      case "${1:-}:${2:-}" in
+        list:docker) return 1 ;;
+        list:openshell) return 0 ;;
+        get:openshell) printf '%s\n' user ;;
+        *) command snap "$@" ;;
+      esac
+    }
+    as_root() {
+      if [ "${1:-}:${2:-}" = snap:get ]; then
+        shift
+        snap "$@"
+      else
+        printf 'root:%s\n' "$*"
+      fi
+    }
+    as_target_user() { printf 'target:%s\n' "$*"; }
+    set_linux_target_runtime_dir() { :; }
+    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    snap_gateway_mode() { printf '%s\n' user; }
+    wait_for_user_snap_gateway_listener() { printf '%s\n' "wait:user-gateway-listener"; }
+    register_user_snap_gateway() { printf '%s\n' "register:user-gateway"; }
+    wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
+    info() { :; }
+    export TARGET_USER=test-user
+    install_linux_snap
+  ) >"$out"
+  calls="$(cat "$out")"
+  expected="wait:user-docker
+root:snap refresh openshell --channel=latest/stable
+root:snap restart openshell.user-gateway
+wait:user-gateway-listener
+register:user-gateway
+wait:gateway-status"
+  if [ "$calls" != "$expected" ]; then
+    echo "FAIL: existing user-mode Snap refresh used the wrong service" >&2
+    printf 'Expected:\n%s\nActual:\n%s\n' "$expected" "$calls" >&2
+    exit 1
+  fi
+}
+
 assert_snap_install_flow \
   "existing Docker is reused" \
   1 0 "" \
-  "wait:docker
+  "wait:user-docker
 root:snap install openshell --channel=latest/stable
-root:snap restart openshell.gateway
-wait:gateway-listener
-register:gateway
+wait:user-gateway-listener
+register:user-gateway
 wait:gateway-status"
+
+assert_snap_user_refresh_flow
 
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
   1 1 "" \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
-root:snap restart openshell.gateway
-wait:gateway-listener
-register:gateway
+root:snap restart openshell.system-gateway
+wait:system-gateway-listener
+register:system-gateway
 wait:gateway-status"
 
 assert_snap_install_rejected() {
@@ -445,7 +515,7 @@ if ! (
   info() { :; }
   TARGET_USER=test-user
   snap_gateway_uses_mtls() { return 0; }
-  register_snap_gateway
+  register_system_snap_gateway
 ) >"$out" 2>"$err"; then
   echo "FAIL: Snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
@@ -465,7 +535,7 @@ if ! (
   copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
   print_gateway_add_output() { :; }
   snap_gateway_uses_mtls() { return 1; }
-  register_snap_gateway
+  register_system_snap_gateway
 ) >"$out" 2>"$err"; then
   echo "FAIL: legacy plaintext Snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
@@ -494,7 +564,7 @@ assert_snap_listener_probe() {
     snap_gateway_uses_mtls() { [ "$uses_mtls" = "1" ]; }
     info() { :; }
     OPENSHELL_SNAP_TLS_DIR=/tls
-    wait_for_snap_gateway_listener >/dev/null
+    wait_for_system_snap_gateway_listener >/dev/null
     printf '%s\n' "$_last_output"
   )"
   if [ "$actual" != "$expected" ]; then
@@ -627,6 +697,22 @@ fi
 
 if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
   echo "FAIL: the listener wait must ignore the service state without a check" >&2
+  exit 1
+fi
+
+: >"$registration_calls_file"
+if ! (
+  as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  print_gateway_add_output() { :; }
+  register_user_snap_gateway
+) >"$out" 2>"$err"; then
+  echo "FAIL: user Snap gateway registration should succeed" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [[ $(cat "$registration_calls_file") != "target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]]; then
+  echo "FAIL: user Snap gateway registration must use its own local TLS bundle" >&2
+  cat "$registration_calls_file" >&2
   exit 1
 fi
 

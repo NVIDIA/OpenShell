@@ -142,7 +142,9 @@ The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
 Snap wrapper replays its effective daemon arguments through preflight. It first
 uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
-SNAP_COMMON/gateway.toml path whenever it exists or is a symlink. A broken symlink
+service-specific gateway.toml path whenever it exists or is a symlink. The legacy
+system service uses SNAP_COMMON/gateway.toml; the user service uses
+SNAP_USER_COMMON/.config/openshell/gateway.toml. A broken symlink
 fails preflight before the gateway is started. Correct or manually migrate an
 operator-owned v1 file, then run preflight again before restarting the service.
 

@@ -152,6 +152,10 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
 
     assert "init-gateway-config.sh" not in wrapper
     assert (
+        'CANONICAL_CONFIG_FILE="${OPENSHELL_SNAP_CONFIG_FILE:-${SNAP_COMMON}/gateway.toml}"'
+        in wrapper
+    )
+    assert (
         'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"'
         in wrapper
     )

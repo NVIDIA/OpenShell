@@ -65,7 +65,7 @@ Package-managed gateways use either built-in defaults or a package-seeded TOML f
 | Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml`; the systemd user service seeds this file from the packaged template on first start. |
-| Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
+| Snap | New installations use `$SNAP_USER_COMMON/.config/openshell/gateway.toml`, usually `~/snap/openshell/common/.config/openshell/gateway.toml`. Upgraded legacy installations retain `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. Host-networked Podman supervisors use that same loopback endpoint, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
@@ -1325,8 +1325,10 @@ Debian and Ubuntu run preflight from the systemd user unit before local certific
 generation. The unit still loads the `gateway.env` environment file and starts the
 gateway with no configuration arguments. Snap replays the exact effective daemon
 arguments through preflight. It gives a nonempty `OPENSHELL_GATEWAY_CONFIG`
-precedence; otherwise it validates and passes its canonical
-`SNAP_COMMON/gateway.toml` only when that path exists in the filesystem. A broken
+precedence; otherwise it validates and passes its canonical service-specific
+path only when that path exists in the filesystem. The legacy system service
+uses `$SNAP_COMMON/gateway.toml`; the user service uses
+`$SNAP_USER_COMMON/.config/openshell/gateway.toml`. A broken
 symlink is therefore rejected instead of being treated as absent.
 
 Package startup does not modify an operator-owned v1 file. Back it up, follow
