@@ -61,6 +61,11 @@
       loop: [ca.crt, tls.crt, tls.key]
       no_log: true
 
+    - name: Remove previous guest gateway registration
+      become: false
+      ansible.builtin.command:
+        argv: [/usr/local/bin/openshell, gateway, remove, tmachine]
+
     - name: Register guest gateway
       ansible.builtin.include_role:
         name: openshell_client

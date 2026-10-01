@@ -6,8 +6,6 @@
   hosts: all
   become: true
   gather_facts: false
-  vars:
-    k3s_ha: "{{ openshell_k3s_ha | default(false) | bool }}"
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -66,11 +64,6 @@
           global:
             image:
               registry: ""
-          {% if k3s_ha %}
-          replicaCount: 3
-          workload:
-            kind: deployment
-          {% endif %}
           gateway:
             image:
               repository: openshell/gateway
@@ -90,34 +83,9 @@
             enabled: true
           server:
             auth:
-              allowUnauthenticatedUsers: {{ (not k3s_ha) | to_json }}
-            disableTls: {{ (not k3s_ha) | to_json }}
+              allowUnauthenticatedUsers: true
+            disableTls: true
             telemetryEnabled: false
-          {% if k3s_ha %}
-            externalDbSecret: openshell-e2e-postgres-credentials
-          {% endif %}
-
-    - name: Install PostgreSQL fixture
-      when: k3s_ha
-      block:
-        - name: Create OpenShell namespace
-          ansible.builtin.command:
-            argv: [/usr/local/bin/k3s, kubectl, create, namespace, openshell]
-
-        - name: Copy PostgreSQL fixture
-          ansible.builtin.copy:
-            src: "{{ openshell_postgres_fixture }}"
-            dest: /var/lib/openshell/artifacts/postgres.yaml
-            mode: "0600"
-
-        - name: Apply PostgreSQL fixture
-          ansible.builtin.command:
-            argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, apply, --filename, /var/lib/openshell/artifacts/postgres.yaml]
-
-        - name: Wait for PostgreSQL
-          ansible.builtin.command:
-            argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, rollout, status, deployment/openshell-e2e-postgres, --timeout=300s]
-          changed_when: false
 
     - name: Install Agent Sandbox
       ansible.builtin.command:
@@ -204,8 +172,4 @@
   hosts: all
   gather_facts: false
   roles:
-    - role: openshell_client
-      when: not (openshell_k3s_ha | default(false) | bool)
-
-- import_playbook: openshell-k3s-ha-tls-ready.yaml
-  when: openshell_k3s_ha | default(false) | bool
+    - openshell_client

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- import_playbook: openshell-k3s.yaml
+
+- name: Add PostgreSQL and TLS to the K3s test installation
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Copy PostgreSQL fixture
+      ansible.builtin.copy:
+        src: "{{ openshell_postgres_fixture }}"
+        dest: /var/lib/openshell/artifacts/postgres.yaml
+        mode: "0600"
+
+    - name: Apply PostgreSQL fixture
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, apply, --filename, /var/lib/openshell/artifacts/postgres.yaml]
+
+    - name: Wait for PostgreSQL
+      ansible.builtin.command:
+        argv: [/usr/local/bin/k3s, kubectl, --namespace, openshell, rollout, status, deployment/openshell-e2e-postgres, --timeout=300s]
+      changed_when: false
+
+    - name: Write PostgreSQL and TLS values overlay
+      ansible.builtin.copy:
+        dest: /var/lib/openshell/artifacts/values-ha-tls.yaml
+        mode: "0600"
+        content: |
+          replicaCount: 3
+          workload:
+            kind: deployment
+          server:
+            externalDbSecret: openshell-e2e-postgres-credentials
+            disableTls: false
+            auth:
+              allowUnauthenticatedUsers: false
+
+    - name: Apply PostgreSQL and TLS overlay to OpenShell
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/helm
+          - upgrade
+          - openshell
+          - /var/lib/openshell/artifacts/helm-chart.tgz
+          - --namespace
+          - openshell
+          - --values
+          - /var/lib/openshell/artifacts/values.yaml
+          - --values
+          - /var/lib/openshell/artifacts/values-ha-tls.yaml
+          - --wait
+          - --timeout=5m
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+
+- import_playbook: openshell-k3s-ha-tls-ready.yaml
