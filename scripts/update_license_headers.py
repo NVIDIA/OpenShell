@@ -38,6 +38,8 @@ LICENSE_ID = "Apache-2.0"
 COMMENT_STYLES: dict[str, str] = {
     ".rs": "//",
     ".proto": "//",
+    ".c": "//",
+    ".h": "//",
     ".py": "#",
     ".sh": "#",
     ".toml": "#",

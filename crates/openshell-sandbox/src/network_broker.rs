@@ -1265,6 +1265,12 @@ fn accept_and_inject(
         nonblocking: flags & libc::SOCK_NONBLOCK != 0,
         creator_generation: u64::from(notification.tid),
     };
+    // Hold this guard across both `add_fd_and_send` and `commit_with_state`
+    // below. `add_fd_and_send` resumes the workload, which may immediately call
+    // `getpeername` on the descriptor it just received -- the sequence the
+    // legacy-mode preload issues on every accept. That handler resolves against
+    // this same registry, so releasing the lock before the commit would let it
+    // observe the socket as unregistered.
     let mut registry = lock(registry);
     let notifying_fd = raw_fd(notification.args[0])?;
     if registry

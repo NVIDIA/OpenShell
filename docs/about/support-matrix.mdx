@@ -184,22 +184,49 @@ kernels — notably RHEL 9.x and RHCOS, which ship a 5.14 kernel — the sandbox
 cannot install a kill-only listener, so it falls back to a plain listener and
 runs in a **legacy read-only** cancellation mode. The sandbox starts and
 enforces the full isolation boundary (Landlock, the outer NetworkPolicy fence,
-DNS and TCP authorization); the only difference is that the broker refuses the
-mediated operations that write results back into workload memory, failing them
-closed with `EOPNOTSUPP`:
+DNS and TCP authorization); the difference is that the broker cannot write
+mediated results back into workload memory.
 
-- `getpeername`;
-- `accept` / `accept4` **when a non-null peer-address argument is supplied**
-  (a null address argument still works);
-- `sendmmsg` paths that write per-message lengths back to the caller.
+The sandbox compensates for the two operations that server workloads depend on.
+`getpeername` is answered by the kernel itself on sockets that are genuinely
+connected to the peer the broker recorded, so it returns the true peer address
+in this mode. For `accept` and `accept4` with a non-null peer-address argument,
+the sandbox preloads a small compatibility library into the workload that
+rewrites the call into a null-address `accept4` followed by `getpeername`, and
+fills the caller's buffer in the workload's own address space.
+
+`sendmmsg` paths that write per-message lengths back to the caller still fail
+closed with `EOPNOTSUPP`.
 
 Socket creation, `connect`, `bind`, `listen`, `sendto`, and `sendmsg` are
-unaffected. Outbound-oriented workloads generally run unchanged; server
-workloads whose accept wrappers request the peer address will see `EOPNOTSUPP`
-until the node runs a kernel that provides `WAIT_KILLABLE_RECV` (Linux 5.19+, or
-a distribution backport). The selected mode is reported in the sandbox
-qualification output as `seccomp_listener_mode` (`killable` or
-`legacy_read_only`).
+unaffected. The selected mode is reported in the sandbox qualification output
+as `seccomp_listener_mode` (`killable` or `legacy_read_only`).
+
+#### What the compatibility library covers
+
+The library is injected with `LD_PRELOAD`, so it interposes library symbols
+rather than system calls. It reaches runtimes that reach `accept` through libc
+and does not reach runtimes that issue the system call directly.
+
+| Runtime | Address-bearing `accept` | `getpeername` |
+| --- | --- | --- |
+| Node.js | Not needed — libuv passes a null address | Supported |
+| Bun | Supported | Supported |
+| CPython | Supported | Supported |
+| Go | Not supported — `net` issues the system call directly | Supported |
+| Statically linked binaries | Not supported — no dynamic loader | Supported |
+
+`getpeername` is supported everywhere because the kernel answers it, with no
+dependence on the preload.
+
+A workload that sets its own `LD_PRELOAD` keeps it; the sandbox composes its
+entry with the existing value rather than replacing it. The library is a
+compatibility aid, not a security control: a workload that removes it gains no
+access it did not already have, because the broker's authorization decisions use
+the kernel's own view of each socket and never the library's output.
+
+Run a Linux 5.19 or newer kernel — or a distribution backport that provides
+`WAIT_KILLABLE_RECV` — to avoid this mode and its remaining gaps entirely.
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 

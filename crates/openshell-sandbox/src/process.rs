@@ -72,9 +72,24 @@ pub(crate) fn prepare_child_sandbox(
     workdir: Option<&str>,
     runtime_read_only: &[PathBuf],
 ) -> Result<Option<sandbox::linux::PreparedSandbox>> {
-    let effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
+    let runtime_read_only =
+        effective_runtime_read_only(runtime_read_only, child_env::preload_shim());
+    let effective_policy = policy_with_runtime_read_only(policy, &runtime_read_only);
     let prepared = sandbox::linux::prepare_capability_free(&effective_policy, workdir)?;
     Ok(Some(prepared))
+}
+
+/// Combine a launch path's own runtime paths with the preloaded shim's.
+///
+/// Both the sandbox entrypoint and `sandbox exec` set `LD_PRELOAD`, and each
+/// supplies a different set of runtime paths. Admitting the shim here rather
+/// than at each call site means a launch path cannot set `LD_PRELOAD` without
+/// also letting the loader open what it points at.
+#[cfg(target_os = "linux")]
+fn effective_runtime_read_only(runtime_read_only: &[PathBuf], shim: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = runtime_read_only.to_vec();
+    paths.extend(shim_runtime_read_only_paths(shim));
+    paths
 }
 
 #[cfg(target_os = "linux")]
@@ -102,6 +117,27 @@ pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) 
     }
     paths.push(certificate.clone());
     paths.push(bundle.clone());
+    paths
+}
+
+/// Paths the dynamic loader must reach to honor the preloaded shim.
+///
+/// `LD_PRELOAD` is resolved by the loader inside the workload, after Landlock
+/// is enforced. The object is installed world-readable, but Landlock gates
+/// `open` independently of the file mode, so without an explicit admission the
+/// loader reports `cannot open shared object file` and silently drops the
+/// shim. The directory is admitted alongside the object because the loader
+/// resolves the path through it.
+#[cfg(target_os = "linux")]
+pub(crate) fn shim_runtime_read_only_paths(shim: Option<&Path>) -> Vec<PathBuf> {
+    let Some(object) = shim else {
+        return Vec::new();
+    };
+    let mut paths = Vec::with_capacity(2);
+    if let Some(directory) = object.parent() {
+        paths.push(directory.to_path_buf());
+    }
+    paths.push(object.to_path_buf());
     paths
 }
 
@@ -505,6 +541,12 @@ impl ProcessHandle {
             }
         }
 
+        if let Some(shim) = child_env::preload_shim() {
+            let inherited = child_env::inherited_preload(&configured_user_environment());
+            let (key, value) = child_env::preload_env_var(shim, inherited.as_deref());
+            cmd.env(key, value);
+        }
+
         // Probe Landlock availability and emit OCSF logs from the parent
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
@@ -668,6 +710,12 @@ impl ProcessHandle {
             for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
                 cmd.env(key, value);
             }
+        }
+
+        if let Some(shim) = child_env::preload_shim() {
+            let inherited = child_env::inherited_preload(&configured_user_environment());
+            let (key, value) = child_env::preload_env_var(shim, inherited.as_deref());
+            cmd.env(key, value);
         }
 
         // Create a dedicated session for PTY children and a dedicated process
@@ -1509,6 +1557,115 @@ mod tests {
                 waitpid(child, None).expect("waitpid should succeed"),
                 WaitStatus::Exited(child, 0),
                 "Landlock must preserve non-root access only to admitted public CA material"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shim_runtime_paths_admit_the_object_and_its_directory() {
+        assert!(
+            shim_runtime_read_only_paths(None).is_empty(),
+            "no shim installed means nothing extra to admit"
+        );
+
+        let object = PathBuf::from(format!(
+            "{}/{}",
+            openshell_accept_shim::RUNTIME_DIR,
+            openshell_accept_shim::FILE_NAME
+        ));
+        assert_eq!(
+            shim_runtime_read_only_paths(Some(&object)),
+            vec![
+                PathBuf::from(openshell_accept_shim::RUNTIME_DIR),
+                object.clone()
+            ],
+            "the loader resolves the object through its directory, so both must be admitted"
+        );
+    }
+
+    /// Workload children are launched from more than one place: the sandbox
+    /// entrypoint, and `sandbox exec` through the boundary. Every one of them
+    /// sets `LD_PRELOAD`, so every one of them needs the loader to be able to
+    /// open the shim. Composing the admission with the caller's own runtime
+    /// paths keeps a launch path from silently omitting it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_read_only_composition_admits_caller_paths_and_the_shim() {
+        let certificate = PathBuf::from("/run/openshell-ca/ca.pem");
+        let object = PathBuf::from(format!(
+            "{}/{}",
+            openshell_accept_shim::RUNTIME_DIR,
+            openshell_accept_shim::FILE_NAME
+        ));
+
+        assert_eq!(
+            effective_runtime_read_only(&[certificate.clone()], None),
+            vec![certificate.clone()],
+            "without a shim the caller's paths pass through unchanged"
+        );
+
+        assert_eq!(
+            effective_runtime_read_only(&[certificate.clone()], Some(&object)),
+            vec![
+                certificate,
+                PathBuf::from(openshell_accept_shim::RUNTIME_DIR),
+                object,
+            ],
+            "the shim must be admitted alongside whatever the launch path supplied"
+        );
+    }
+
+    /// The dynamic loader opens the shim as the workload user, after Landlock
+    /// is enforced. A world-readable mode is not sufficient on its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn preloaded_shim_remains_readable_after_landlock_for_non_root_workload() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim_directory = root.path().join("openshell-compat");
+        std::fs::create_dir(&shim_directory).unwrap();
+        let object = shim_directory.join(openshell_accept_shim::FILE_NAME);
+        std::fs::write(&object, openshell_accept_shim::SHIM_OBJECT).unwrap();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Tighten the directory only after the object exists, matching how the
+        // installer leaves it and keeping the test runnable as a normal user.
+        std::fs::set_permissions(&shim_directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let denied = root.path().join("not-authorized");
+        std::fs::write(&denied, b"unrelated").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.landlock = LandlockPolicy {
+            compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
+        };
+        let runtime_paths = shim_runtime_read_only_paths(Some(&object));
+        let Ok(Some(prepared)) = prepare_child_sandbox(&policy, None, &runtime_paths) else {
+            return;
+        };
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                let dropped = if nix::unistd::geteuid().is_root() {
+                    unsafe {
+                        libc::setgroups(0, std::ptr::null()) == 0
+                            && libc::setgid(42_235) == 0
+                            && libc::setuid(42_234) == 0
+                    }
+                } else {
+                    true
+                };
+                let valid = dropped
+                    && sandbox::linux::enforce(prepared).is_ok()
+                    && std::fs::read(&object).is_ok()
+                    && std::fs::read(&denied).is_err();
+                unsafe { libc::_exit(i32::from(!valid)) };
+            }
+            ForkResult::Parent { child } => assert_eq!(
+                waitpid(child, None).expect("waitpid should succeed"),
+                WaitStatus::Exited(child, 0),
+                "Landlock must admit the preloaded shim so the loader can open it"
             ),
         }
     }

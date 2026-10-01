@@ -188,6 +188,23 @@ impl LocalBoundaryExec {
                 command.env(key, value);
             }
         }
+        // Last, so the shim composes with whichever LD_PRELOAD the workload
+        // would otherwise have received rather than being overwritten by it.
+        if let Some(shim) = crate::child_env::preload_shim() {
+            let inherited = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == openshell_accept_shim::PRELOAD_ENV)
+                .map(|(_, value)| value.as_str())
+                .or_else(|| {
+                    self.user_environment
+                        .get(openshell_accept_shim::PRELOAD_ENV)
+                        .map(String::as_str)
+                });
+            let (key, value) = crate::child_env::preload_env_var(shim, inherited);
+            command.env(key, value);
+        }
         if let Some(workdir) = spec.workdir.as_deref().or(self.base_workdir.as_deref()) {
             command.current_dir(workdir);
         }

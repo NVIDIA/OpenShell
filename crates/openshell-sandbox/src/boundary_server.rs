@@ -228,6 +228,7 @@ mod linux {
         }
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
+        crate::child_env::set_preload_shim(install_peer_address_shim(&listener));
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
             BoundaryListenerConfig::Unix { .. } | BoundaryListenerConfig::Vsock { .. } => None,
@@ -246,6 +247,51 @@ mod linux {
             qualification,
         )?);
         serve(&config.listener, runtime)
+    }
+
+    /// Materialize the peer-address shim when the kernel's seccomp listener
+    /// leaves broker output writes disabled.
+    ///
+    /// Without `WAIT_KILLABLE_RECV` the broker cannot write into workload
+    /// memory, so `accept`/`accept4` with an address buffer fails closed. The
+    /// shim rewrites those calls into an `accept4(NULL)` plus `getpeername`
+    /// pair that the broker can serve. It is a compatibility aid, not a
+    /// security control, so a failure to install it is not fatal: the sandbox
+    /// still runs with the broker's existing fail-closed behavior.
+    fn install_peer_address_shim(
+        listener: &openshell_isolation_interface::linux::seccomp_notify::NotificationListener,
+    ) -> Option<std::path::PathBuf> {
+        if !listener.writes_disabled() {
+            return None;
+        }
+        match openshell_accept_shim::install_shim() {
+            Ok(path) => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "legacy_read_only")
+                        .message(format!(
+                            "Installed peer-address shim for legacy seccomp listener [path:{}]",
+                            path.display()
+                        ))
+                        .build()
+                );
+                Some(path)
+            }
+            Err(error) => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Medium)
+                        .status(openshell_ocsf::StatusId::Failure)
+                        .message(format!(
+                            "Peer-address shim unavailable; accept with an address buffer stays unsupported [error:{error}]"
+                        ))
+                        .build()
+                );
+                None
+            }
+        }
     }
 
     fn make_boundary_nondumpable() -> Result<(), String> {

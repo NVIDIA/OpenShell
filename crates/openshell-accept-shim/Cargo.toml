@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-accept-shim"
+description = "Preloadable peer-address shim for seccomp listeners without WAIT_KILLABLE_RECV"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# Resolves the target C compiler through the standard cross-compilation
+# conventions, including the per-target wrappers cargo-zigbuild installs.
+cc = "1"
+
+[lints]
+workspace = true
