@@ -6598,6 +6598,32 @@ pub async fn sandbox_draft_history(
     Ok(())
 }
 
+/// Validate an authored sandbox policy without contacting a gateway.
+///
+/// This intentionally performs only file-local checks. Validation that depends on
+/// gateway state, registered middleware, attached providers, the image, or the
+/// selected compute driver remains part of sandbox creation.
+pub fn policy_check(path: &Path) -> Result<()> {
+    let policy_path = Path::new(path);
+    let policy = openshell_policy::parse_sandbox_policy_file(policy_path)
+        .wrap_err_with(|| format!("failed to parse policy file '{}'", policy_path.display()))?;
+
+    match openshell_policy::validate_sandbox_policy(&policy) {
+        Ok(()) => {
+            println!("{} Policy is valid: {}", "OK".green().bold(), policy_path.display());
+            Ok(())
+        }
+        Err(violations) => {
+            let details = violations
+                .iter()
+                .map(|violation| format!("  - {violation}"))
+                .collect::<Vec<_>>()
+                .join("\\n");
+            Err(miette!("policy validation failed:\\n{details}"))
+        }
+    }
+}
+
 /// Format a `NetworkPolicyRule`'s endpoints as a compact string.
 fn format_endpoints(rule: &openshell_core::proto::NetworkPolicyRule) -> String {
     rule.endpoints
