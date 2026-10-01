@@ -141,7 +141,8 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     assert "OPENSHELL_DRIVER_DIR:" not in formula
     assert "OPENSHELL_DOCKER_SUPERVISOR_IMAGE:" not in formula
     assert 'OPENSHELL_DOCKER_TLS_CA: "#{var}/openshell/tls/ca.crt"' not in formula
-    assert "entitlements.atomic_write" in formula
+    assert "openshell-driver-vm.entitlements.plist" not in formula
+    assert 'system "/usr/bin/codesign"' not in formula
     assert "brew services restart openshell" in formula
 
 
