@@ -150,6 +150,7 @@ Agents investigate issues, collect evidence, and report technical findings. Huma
 | Accept or decline the work with `state:accepted`, roadmap placement, or closure | Maintainer |
 | Place the issue on the roadmap or move it | Maintainer |
 | Directly request an agent plan | User |
+
 | Queue an agent plan with `agent:plan-requested` | Maintainer |
 | Produce a plan, implement it, and open a pull request | Agent |
 | Directly request agent implementation | User |
