@@ -85,7 +85,24 @@ let
         name = "k3s";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ready.yaml" ];
         inputs = {
+          agent_sandbox_version = "0.5.0";
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        };
+      }
+      {
+        name = "k3s-ha-tls";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ready.yaml" ];
+        inputs = {
+          openshell_k3s_ha = "true";
+          openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
           agent_sandbox_version = "0.5.0";
           openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
           openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";

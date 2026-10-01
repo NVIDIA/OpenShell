@@ -85,6 +85,17 @@
         var: conformance_result
       when: conformance_result.rc != 0
 
+    - name: Detect K3s for conformance diagnostics
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: conformance_k3s
+      when: conformance_result.rc != 0
+
+    - name: Collect Kubernetes conformance diagnostics
+      ansible.builtin.include_role:
+        name: openshell_k3s_diagnostics
+      when: conformance_result.rc != 0 and conformance_k3s.stat.exists
+
     - name: Read OpenShell gateway logs
       become: true
       ansible.builtin.command:
@@ -98,12 +109,12 @@
       register: openshell_gateway_logs
       changed_when: false
       failed_when: false
-      when: conformance_result.rc != 0
+      when: conformance_result.rc != 0 and not conformance_k3s.stat.exists
 
     - name: Show OpenShell gateway logs
       ansible.builtin.debug:
         var: openshell_gateway_logs.stdout_lines
-      when: conformance_result.rc != 0
+      when: conformance_result.rc != 0 and not conformance_k3s.stat.exists
 
     - name: Require OpenShell conformance success
       ansible.builtin.assert:

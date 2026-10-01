@@ -296,6 +296,22 @@ KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
 
 Use the IP that pods in that cluster use to reach listeners on the test host.
 
+### tmachine PostgreSQL/mTLS conformance
+
+For a disposable VM using staged candidate artifacts, run:
+
+```shell
+nix run .#tmachine -- test ubuntu-k3s k3s-ha-tls conformance
+```
+
+This installer uses three gateway replicas on one K3s node, the pinned e2e
+PostgreSQL fixture and chart-generated mTLS. It registers the guest CLI at
+`https://localhost:17670` and checks an authenticated API after every boot.
+The existing `k3s` installer remains the SQLite/plaintext baseline. See
+`tests/README.md` for artifact prerequisites and interactive guest access.
+This lane runs ordinary conformance; scale/owner-loss/rollout scenarios and
+node-level HA qualification require separate coverage.
+
 ### BackendTLSPolicy (end-to-end TLS)
 
 To enable end-to-end TLS between the Gateway proxy and the gateway pod, add

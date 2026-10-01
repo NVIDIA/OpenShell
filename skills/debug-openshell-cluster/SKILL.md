@@ -447,6 +447,15 @@ stores encrypted credential envelopes in the OpenShell database. For
 mentioning `server.credentialDrivers` means the values selected multiple
 external credential backends.
 
+For a disposable single-node PostgreSQL/mTLS test deployment, check that the
+CLI registration uses an HTTPS endpoint and that the named gateway's mTLS
+directory contains the chart client certificate and CA. An open port-forward
+or successful `gateway add` alone does not establish API readiness: require a
+successful `openshell sandbox list --output json` as well. After the cluster
+reboots, wait for PostgreSQL, the controller and all gateway replicas before
+diagnosing sandbox operations. Collect Kubernetes gateway logs rather than a
+host `openshell-gateway.service` journal for a Helm deployment.
+
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
 deployed in-cluster:
