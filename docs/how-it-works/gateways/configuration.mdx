@@ -951,33 +951,21 @@ Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
 
 `supervisor_network_mode` accepts `auto` (the default), `host`, or `bridge`.
-On each supervisor launch, including restart, `auto` inspects the existing
-workload container's runtime. `sysbox-runc`, used by Docker Desktop Enhanced
-Container Isolation (ECI), selects bridge networking; other runtimes select
-host networking. This heuristic creates no diagnostic container. An explicit
-mode overrides it. The workload always uses `network=none`.
+`auto` selects bridge for Docker Desktop Enhanced Container Isolation (ECI)
+workloads using `sysbox-runc`, otherwise host, on every launch and restart.
+The workload always uses `network=none`.
 
-When `grpc_endpoint` is omitted, host mode uses the gateway's primary loopback
-endpoint. Bridge mode uses `host.docker.internal` and the gateway's bind port
-on Docker Desktop or for a wildcard listener. On native Linux, a concrete
-non-loopback listener uses its bind address. A Linux gateway bound only to
-loopback requires a bridge-reachable listener and endpoint; OpenShell does not
-automatically widen the listener. A gateway container with a remapped published
-port requires an explicit endpoint using that host port. Explicit endpoints
-retain their scheme, host, port, and TLS verification; bridge mode rejects
-loopback and unspecified endpoint addresses. HTTPS certificates must cover
-the selected endpoint hostname or IP.
+Omit `grpc_endpoint` for automatic selection: host mode uses loopback; bridge
+uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
+the Linux listener's non-loopback address. Both use the gateway's bind port.
+Bridge requires a reachable listener; OpenShell does not widen it. Set an
+explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint.
 
-In bridge mode, Docker resolves `host-gateway` for the supervisor's
-`host.openshell.internal` and `host.docker.internal` aliases independently of
-the gateway endpoint. The supervisor pins that driver-owned address before
-admitting the workload. On native Linux, host services listening only on
-loopback are unreachable through the bridge; expose them on a bridge-reachable
-interface or use host mode when permitted. Host mode on Docker Desktop requires
-host networking enabled and ECI disabled. Bridge selection removes that
-networking conflict but does not establish full ECI compatibility: the runtime
-must still pass OpenShell's Landlock and seccomp qualification. A containerized
-gateway under ECI also requires an administrator-approved Docker socket exception.
+Bridge resolves both host aliases through Docker's `host-gateway`; native Linux
+services bound only to loopback remain unreachable. Desktop host mode requires
+host networking enabled and ECI disabled. ECI still requires Landlock and seccomp
+qualification, plus an administrator-approved Docker socket exception for
+containerized gateways.
 
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
