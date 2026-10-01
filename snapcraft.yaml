@@ -127,7 +127,9 @@ apps:
     # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
-      XDG_RUNTIME_DIR: "$SNAP_COMMON"
+      OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_COMMON/gateway.toml"
+      OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
+      OPENSHELL_LOCAL_TLS_DIR: "$SNAP_COMMON/tls"
     plugs:
       - docker
       - log-observe
@@ -140,15 +142,12 @@ apps:
     daemon-scope: user
     install-mode: disable
     refresh-mode: endure
-    # The shared wrapper uses these user-owned paths instead of its legacy
-    # $SNAP_COMMON defaults. The CLI uses the same XDG config and state roots.
+    # Use persistent user-owned XDG roots shared with the Snap CLI and TUI.
+    # Snapd provides the ephemeral XDG_RUNTIME_DIR automatically.
     environment:
       XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"
       XDG_DATA_HOME: "$SNAP_USER_COMMON/.local/share"
       XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"
-      OPENSHELL_SNAP_CONFIG_FILE: "$SNAP_USER_COMMON/.config/openshell/gateway.toml"
-      OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON/gateway.db?mode=rwc"
-      OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON/.local/state/openshell/tls"
     plugs:
       - docker
       - log-observe
