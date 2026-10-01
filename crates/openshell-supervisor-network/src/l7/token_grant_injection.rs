@@ -115,41 +115,38 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
             .as_ref()
             .ok_or_else(|| miette!("selected credential has no token grant"))?;
         let request = token_grant_request(provider_key, token_grant)?;
-        match resolver.obtain(request).await {
-            Ok(access_token) => {
-                crate::token_grant::validate_access_token(&access_token)?;
-                headers.push(token_grant_header(cred, &access_token)?);
-            }
-            Err(_) => {
-                // An issuer may echo credentials in its error description. Only the
-                // binding identity is safe to include in diagnostics or relay errors.
-                let provider_key = ocsf_message_field(provider_key);
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    provider = %provider_key,
-                    "Token grant failed"
-                );
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant failed for {} to {}:{}",
-                            provider_key, ctx.host, ctx.port
-                        ))
-                        .build()
-                );
-                return Err(miette!("Token grant failed"));
-            }
+        if let Ok(access_token) = resolver.obtain(request).await {
+            crate::token_grant::validate_access_token(&access_token)?;
+            headers.push(token_grant_header(cred, &access_token)?);
+        } else {
+            // An issuer may echo credentials in its error description. Only the
+            // binding identity is safe to include in diagnostics or relay errors.
+            let provider_key = ocsf_message_field(provider_key);
+            warn!(
+                host = %ctx.host,
+                port = ctx.port,
+                provider = %provider_key,
+                "Token grant failed"
+            );
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Token grant failed for {} to {}:{}",
+                        provider_key, ctx.host, ctx.port
+                    ))
+                    .build()
+            );
+            return Err(miette!("Token grant failed"));
         }
     }
 

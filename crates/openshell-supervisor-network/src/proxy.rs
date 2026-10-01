@@ -12818,8 +12818,7 @@ network_policies:
             .await
             .expect_err("forward token exchange failure should stop request rewriting");
 
-        assert!(err.to_string().contains("Token grant failed"));
-        assert!(err.to_string().contains("oauth unavailable"));
+        assert_eq!(err.to_string(), "Token grant failed");
         fixture.assert_one_token_exchange_request(
             "api.example.test\t8080\t/v1/**\tprovider:access_token",
         );

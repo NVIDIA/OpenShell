@@ -4,6 +4,7 @@
 use super::test_support::TokenGrantTestFixture;
 use super::*;
 use crate::l7::provider::BodyLength;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::layer::SubscriberExt;
@@ -15,7 +16,7 @@ fn request() -> L7Request {
     L7Request {
         action: "POST".into(),
         target: "/v1/projects?view=full".into(),
-        query_params: Default::default(),
+        query_params: HashMap::default(),
         raw_header: b"POST /v1/projects?view=full HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer agent-token\r\nauthorization : duplicate\r\nX-Workload-Jwt: agent-identity\r\nx-workload-jwt: duplicate\r\nX-Static: openshell:placeholder\r\nContent-Length: 4\r\n\r\nbody".to_vec(),
         body_length: BodyLength::ContentLength(4),
     }
