@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
+use openshell_core::policy_identity::canonical_provider_profile_bytes;
 use openshell_core::proto::ProviderProfile;
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
@@ -17,7 +18,6 @@ use openshell_gateway_interceptors::{
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id, validate_profile_set,
 };
-use prost::Message as _;
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use tracing::debug;
@@ -102,7 +102,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
             if let Some(profile) = stored.profile {
                 let mut profile = profile_response_payload(profile, resource_version);
                 normalize_provider_profile_mcp_fields(&mut profile);
-                hasher.update(profile.encode_to_vec());
+                hasher.update(canonical_provider_profile_bytes(&profile));
                 profiles.push(ScopedSnapshotProfile {
                     scope: ProfileScope::Platform,
                     profile,
@@ -123,7 +123,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
                 if let Some(profile) = stored.profile {
                     let mut profile = profile_response_payload(profile, resource_version);
                     normalize_provider_profile_mcp_fields(&mut profile);
-                    hasher.update(profile.encode_to_vec());
+                    hasher.update(canonical_provider_profile_bytes(&profile));
                     profiles.push(ScopedSnapshotProfile {
                         scope: ProfileScope::Workspace,
                         profile,
@@ -495,7 +495,7 @@ fn hash_scoped_profile_revision(entry: &ScopedProfileEntry, hasher: &mut Sha256)
         b"source-managed"
     };
     hasher.update(ownership_tag);
-    hasher.update(entry.response.encode_to_vec());
+    hasher.update(canonical_provider_profile_bytes(&entry.response));
 }
 
 fn scope_to_string(scope: ProfileScope) -> &'static str {
@@ -709,7 +709,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-profile-snapshot-v1");
     for profile in profiles {
-        hasher.update(profile.encode_to_vec());
+        hasher.update(canonical_provider_profile_bytes(&profile));
     }
     format!("sha256:{:x}", hasher.finalize())
 }
@@ -1007,6 +1007,41 @@ mod tests {
             canonical.get_profile("versioned-profile"),
             reordered.get_profile("versioned-profile")
         );
+    }
+
+    #[test]
+    fn profile_revision_is_stable_across_decodes_with_several_annotations() {
+        use prost::Message as _;
+
+        let mut annotated = profile("annotated-profile");
+        for i in 0..8 {
+            annotated
+                .annotations
+                .insert(format!("example.com/{i}"), i.to_string());
+        }
+        let wire = annotated.encode_to_vec();
+        let fingerprint = || {
+            let decoded = ProviderProfile::decode(wire.as_slice()).unwrap();
+            let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "external/test".to_string(),
+                revision: "same-revision".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: decoded,
+                }],
+                user_managed: false,
+                allow_empty: false,
+            }])
+            .expect("valid source profile");
+            let mut hash = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("annotated-profile", "", &mut hash);
+            hash.finalize()
+        };
+
+        let expected = fingerprint();
+        for _ in 0..32 {
+            assert_eq!(fingerprint(), expected);
+        }
     }
 
     #[test]
