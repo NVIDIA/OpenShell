@@ -452,19 +452,6 @@ class Openshell < Formula
       end
     end
 
-    entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
-    entitlements.atomic_write <<~XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-      <plist version="1.0">
-      <dict>
-          <key>com.apple.security.hypervisor</key>
-          <true/>
-      </dict>
-      </plist>
-    XML
-
-    system "/usr/bin/codesign", "--entitlements", entitlements, "--force", "-s", "-", libexec/"openshell-driver-vm"
   end
 
   service do
