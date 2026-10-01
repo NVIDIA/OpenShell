@@ -2960,6 +2960,7 @@ impl DockerComputeDriver {
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
+        let image_ref = normalize_docker_image_reference(image);
         self.publish_docker_progress(
             sandbox_id,
             "Pulling",
@@ -2968,7 +2969,7 @@ impl DockerComputeDriver {
         );
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
+                from_image: Some(image_ref),
                 ..Default::default()
             }),
             None,
@@ -2996,6 +2997,19 @@ impl DockerComputeDriver {
             HashMap::from([("image_ref".to_string(), image.to_string())]),
         );
         Ok(())
+    }
+}
+
+fn normalize_docker_image_reference(image: &str) -> String {
+    if image.contains('@') {
+        return image.to_string();
+    }
+
+    let last_slash = image.rfind('/').map_or(0, |index| index + 1);
+    if image[last_slash..].contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
     }
 }
 

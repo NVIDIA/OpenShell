@@ -24,6 +24,33 @@ use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[test]
+fn docker_image_reference_defaults_bare_images_to_latest() {
+    assert_eq!(
+        normalize_docker_image_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    assert_eq!(
+        normalize_docker_image_reference("ubuntu"),
+        "ubuntu:latest"
+    );
+}
+
+#[test]
+fn docker_image_reference_preserves_tags_digests_and_registry_ports() {
+    assert_eq!(
+        normalize_docker_image_reference("localhost:5000/nicolaka/netshoot"),
+        "localhost:5000/nicolaka/netshoot:latest"
+    );
+    for image in [
+        "nicolaka/netshoot:v0.16",
+        "nicolaka/netshoot@sha256:abc",
+        "localhost:5000/nicolaka/netshoot:v0.16",
+    ] {
+        assert_eq!(normalize_docker_image_reference(image), image);
+    }
+}
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
