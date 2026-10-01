@@ -43,51 +43,26 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
-    container:
-      image: ghcr.io/nvidia/openshell/ci:b77f5ddfc15869821bd18aef79263ed42dd41adf
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix develop .#proto --no-write-lock-file -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Mark workspace as safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Resolve and fetch target branch baseline
-        id: baseline
-        env:
-          PR_BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
-          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
-            base_sha="$MERGE_GROUP_BASE_SHA"
-          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            base_sha="$PR_BASE_SHA"
-          else
-            git fetch --no-tags --depth=1 origin "refs/heads/$DEFAULT_BRANCH"
-            base_sha="$(git rev-parse FETCH_HEAD)"
-          fi
-
-          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::No valid target branch baseline SHA was available."
-            exit 1
-          fi
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            git fetch --no-tags --depth=1 origin "$base_sha"
-          fi
-          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
-          echo "Comparing protobuf API with $base_sha"
-
-      - name: Install tools
-        run: mise install --locked
+      - uses: ./.github/actions/setup-nix
 
       - name: Check protobuf API compatibility
         env:
-          PROTO_BREAKING_BASE_REF: ${{ steps.baseline.outputs.sha }}
-        run: mise run proto:breaking
+          TARGET_REF: ${{ github.event.merge_group.base_sha || needs.pr_metadata.outputs.base_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            TARGET_REF="refs/remotes/origin/$DEFAULT_BRANCH"
+          fi
+          uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py --target "$TARGET_REF"
 
   mise-lockfile:
     name: mise Lockfile

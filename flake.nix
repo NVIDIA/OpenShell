@@ -170,6 +170,21 @@
         devShells = {
           default = pkgs.mkShellNoCC commonDevShell;
 
+          proto = pkgs.mkShellNoCC {
+            env.UV_PYTHON_PREFERENCE = "only-system";
+            env.UV_PYTHON_DOWNLOADS = "never";
+            packages = with pkgs; [
+              actionlint
+              buf
+              git
+              jq
+              python3
+              ruff
+              shellcheck
+              uv
+            ];
+          };
+
           testing = pkgs.mkShellNoCC (
             commonDevShell
             // {
