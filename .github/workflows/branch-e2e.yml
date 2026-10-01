@@ -283,11 +283,13 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
         ]
 
   # Run driver-specific integration tests:
+  # These suites require the binary installer's CLI path, local HTTP gateway,
+  # and system service configuration for their Podman user-namespace fixtures.
   driver-specific-integration:
     needs: prepare-integration
     permissions:
