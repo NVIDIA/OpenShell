@@ -12,31 +12,34 @@ links:
 ## Summary
 
 Define a common testing strategy for OpenShell that separates the behavioral
-contract being tested from the environment, installation, execution mechanism,
-and CI policy used to validate it. Contributors should be able to place a test,
-run it locally, and understand what its result establishes without consulting
-several competing descriptions of conformance.
+contract being tested from the environment, installation, client interface,
+and CI policy used to validate it. Reuse tests of public behavior across
+configured targets, while keeping implementation-specific checks and performance
+measurements distinct. A passing test establishes the same contract regardless
+of how its target was prepared.
 
 Use Nix for reproducible build inputs and test artifacts, and tmachine for
-integration and Linux installation environments it can represent. Keep general
-conformance focused on public behavior exercised through the OpenShell CLI.
-Feature, driver, disruption, load/scale, and SDK coverage retain explicit
-boundaries. This is a proposal for incremental implementation, not a description
-of gates already enforced by CI.
+integration and Linux installation environments it can represent. Keep test
+contracts independent of those tools. Initially exercise general conformance
+through the OpenShell CLI; using an SDK does not create a different test category.
+This is a proposal for incremental implementation, not a description of gates
+already enforced by CI.
 
 ## Motivation
 
-OpenShell tests have accumulated across crate-local tests, E2E binaries,
-driver wrappers, installed-artifact suites, and CI workflows. A single source
-binary can mix a portable behavioral contract, native runtime inspection, an
-external service integration, and performance measurements. This makes both
-ownership and coverage difficult to assess.
+How do we establish that OpenShell behaves as promised across supported
+configurations without duplicating behavioral tests for every driver and
+environment? Tests tied to particular environments make it difficult to
+distinguish product requirements from implementation details, reuse coverage,
+or determine what a passing suite establishes.
 
-Documentation has the same problem. TESTING.md is being asked to describe local
-commands, a future execution model, conformance admission rules, migration work,
-and release gates. Suite READMEs and implementation PRs independently define
-parts of that strategy. Contributors cannot tell which document owns a decision
-or whether a statement describes current behavior or a target state.
+OpenShell tests have accumulated across crate-local tests, E2E binaries,
+driver wrappers, installed-artifact suites, and CI workflows. A single binary
+can mix public behavior, native runtime inspection, an external integration,
+and performance measurements. Without a shared model, contributors must either
+duplicate this coverage for new targets or carry assumptions that do not apply
+to them. Reviewers cannot reliably distinguish missing product support from
+missing test infrastructure.
 
 The migration tracked by #3712 makes this concrete: the tmachine e2e-podman
 suite supplies interim coverage, but the intended outcome is to move the source
@@ -49,30 +52,41 @@ the definition of OpenShell conformance.
 - Implement the proposed framework, capability API, or CI matrices in this PR.
 - Finalize the destination of every existing E2E assertion; migration issues
   retain that analysis and their task lists.
-- Introduce named conformance profiles, hierarchical capability inference, or
-  generic capability parameters before concrete tests require them.
-- Create a dedicated workload fixture image or dependency-declaration system
-  for scenarios initially.
 - Establish a certification program, review board, or reporting service.
 - Replace the SDK compatibility proposal in #3238 or standardize language SDK
   APIs through the CLI runner.
 
 ## Proposal
 
-### 1. Separate behavioral ownership from execution dimensions
+### 1. Define contracts and organise tests by purpose
 
-Each assertion has an intended contract and an appropriate owner. A binary can
-be split when its assertions belong to different families.
+A behavioral contract specifies the expected observable result of an operation
+under stated conditions. A test case exercises that behavior; an assertion
+checks an observation against an expectation. A suite groups related test cases.
+For example, a contract may require that a deleted sandbox is absent from the
+sandbox list; the assertion checks that its identifier is absent. Assertions
+that verify test setup do not each define a separate product contract.
 
-| Family | Contract and admission boundary |
+Group tests by the contracts they exercise, not by their current binary or
+runner. Split binaries when they mix unrelated contracts or prerequisites.
+
+| Family | Purpose |
 | --- | --- |
 | Unit and component integration | Internal logic, configuration selection, translation, and implementation mechanics; use the lowest effective layer. |
-| General conformance | Public behavior demonstrated on at least two different drivers, with effective API capabilities for non-universal support. |
+| General conformance | Public behavioral contracts that hold across drivers and environments, independent of implementation details. |
 | Feature-specific | Public feature behavior requiring configured external integration, or currently implemented on only one driver; one representative driver suffices. |
 | Driver-specific | Driver configuration, runtime and host integration, and implementation contracts; exercise applicable environments for that driver. |
 | Disruption conformance | Portable continuity or recovery assertions using environment-specific disruption actuators; one working actuator suffices initially. |
 | Load/scale | Throughput, latency, concurrency, saturation, and scaling measurements, reported separately from behavioral correctness. |
-| SDK conformance | Behavior and compatibility of SDK implementations through their native interfaces, specified separately in #3238. |
+
+The placement of portable, capability-dependent tests in general conformance
+or feature-specific suites remains open until a concrete migration example
+requires that decision. Capability dependence alone does not determine a family.
+
+The client interface is separate from the test family. A public contract tested
+through an SDK can belong to general conformance just as it can through the CLI.
+SDK-specific behavior, such as language-specific conversion and cancellation,
+needs focused coverage; #3238 retains its SDK compatibility design scope.
 
 Security portability is a workstream spanning these families. Define a separate
 security family only if multiple tests need common specialized infrastructure.
@@ -80,27 +94,12 @@ For example, bypass prevention is an intended universal guarantee, but the
 existing seccomp-oriented probe needs separate analysis before its portable
 migration. Core-dump protection similarly needs a portable contract and probe.
 
-The execution matrix has independent axes:
-
-| Axis | Examples |
-| --- | --- |
-| Platform | Host and workload OS and architecture |
-| Driver | Docker, Podman, Kubernetes, VM, MXC |
-| Environment | Rootful/rootless Podman, local runtime, Kubernetes cluster |
-| Configuration | Gateway settings, in-process/external driver wiring |
-| Installation | Candidate binaries/images, RPM, DEB, Snap, Helm, Homebrew |
-| Suite | General conformance, a feature suite, a driver suite, disruption |
-
-Rootful and rootless Podman are environments of one driver. They do not satisfy
-the two-driver admission rule. Driver tests should preserve their behavioral
-contract across those environments. Matrix entries should target meaningful
-risks without requiring the full cross-product of every axis.
-
 ### 2. Define general conformance through observable contracts
 
 Conformance tests exercise a behavioral contract against an already configured
-OpenShell gateway. They remain CLI-based until direct API access is strictly
-required. Assertions should use observable outcomes and structured output;
+OpenShell gateway. The initial suite remains CLI-based until direct API access
+is strictly required; this is an execution choice, not a classification rule.
+Assertions should use observable outcomes and structured output;
 incidental presentation text is not a conformance contract. Native runtime
 inspection may provide best-effort failure diagnostics, but must not determine
 whether general conformance passed.
@@ -160,9 +159,9 @@ when support for that capability is optional.
 
 Non-universal behavior supported by at least two drivers is a signal to extend
 the public capability API. Prefer adding the capability and its concrete test
-in the same PR. If an API extension is infeasible, use feature-specific or
-driver-specific coverage. Both drivers used for general-conformance admission
-must advertise the capability and pass its assertions.
+in the same PR. The eventual suite classification of optional portable contracts
+is deferred, but their result semantics are not: absent optional support is
+unsupported, and advertised behavior that violates its contract fails.
 
 | Outcome | Meaning |
 | --- | --- |
@@ -179,6 +178,48 @@ example, needs to identify the mock target and cannot qualify the production
 driver. A focused or incomplete invocation must not imply complete coverage.
 
 ### 4. Keep execution reusable and select CI gates explicitly
+
+A test run exercises selected test cases against a configured target and records
+their results. Target preparation supplies the environment, installs artifacts,
+and configures the gateway. Behavioral tests consume that target through a
+client interface. CI policy selects runs and decides which results gate a merge
+or release; it does not redefine the tested contracts.
+
+```mermaid
+flowchart LR
+    subgraph preparation[Target preparation]
+        machine[Machine / base image] --> setup[Environment setup]
+        setup --> install[Install and configure OpenShell]
+    end
+    artifacts[Build artifacts] --> install
+    install --> target[Configured OpenShell target]
+    external[External provisioning] --> target
+    suite[Test suite] --> client[CLI or SDK]
+    client -->|exercises| target
+```
+
+In the current tmachine configuration, a `Machine` identifies a base image.
+An `Environment` references a machine and supplies setup playbooks. A separate
+`Installer` supplies installation playbooks and artifact inputs, and a
+`Testsuite` supplies test playbooks and inputs. Selecting an environment,
+installer, and suite composes a run without making test ownership depend on
+target preparation.
+
+Runs vary along several dimensions; not every combination is meaningful:
+
+| Dimension | Examples |
+| --- | --- |
+| Platform | Host and workload OS and architecture |
+| Driver | Docker, Podman, Kubernetes, VM, MXC |
+| Environment | Local runtime, Kubernetes cluster, rootful/rootless Podman |
+| Configuration | Gateway settings, in-process/external driver wiring |
+| Installation | Candidate binaries/images, RPM, DEB, Snap, Helm, Homebrew |
+| Client interface | CLI, language SDK |
+| Suite | General conformance, feature-specific, driver-specific, disruption |
+
+For example, rootful and rootless Podman change the environment, not the driver
+or expected contract. They do not supply two-driver admission evidence. Select
+combinations for meaningful coverage rather than requiring a full cross-product.
 
 Nix pins source-check dependencies and builds candidate artifacts and test
 archives. Tmachine provisions supported environments, applies installation and
@@ -228,7 +269,43 @@ the effective configuration. Other provisioners supply equivalent target
 identification. This is a placeholder, not a complete report schema; richer
 capability, scenario, and artifact reporting can follow a concrete need.
 
-### 5. Give each document one responsibility
+## Implementation plan
+
+### Build on the existing suite layout
+
+Retain the existing suite locations and extend them as contracts are migrated:
+
+```text
+tests/
+├── config.nix                            # Existing tmachine definitions
+├── artifacts.nix                         # Existing artifact construction
+├── ansible/                              # Existing provisioning and execution
+├── CONFORMANCE.md                        # Proposed agreed conformance policy
+└── suites/
+    ├── conformance/
+    │   ├── cli/                          # Existing CLI test entry points
+    │   └── README.md                     # Proposed suite contributor guidance
+    ├── drivers/
+    │   └── podman/                       # Existing driver-specific tests
+    └── features/
+        └── provider-refresh/
+            └── keycloak/                 # Existing external-integration tests
+```
+
+Move the shared `crates/openshell-conformance` library under
+`tests/suites/conformance` alongside its existing CLI entry points; choose its
+precise internal layout in that relocation. Extend `drivers/` and `features/`
+with focused suites rather than new catch-all binaries. Unit and component
+integration tests remain alongside their components, and SDK-native tests may
+remain in their SDK trees. Folder placement does not define the behavioral
+contract. Disruption and load/scale locations remain open pending their concrete
+infrastructure needs.
+
+### Publish the agreed model
+
+Documentation records the testing model and its implementation; reorganising
+documentation is not a substitute for implementing reusable suites and target
+preparation. Publish agreed policy as implementation lands:
 
 | Document | Responsibility |
 | --- | --- |
@@ -247,7 +324,7 @@ proposal while sharing terminology and provisioning boundaries. Accepted policy
 is published in the living guides as implementation lands; current references
 must not describe proposed gates as already enforced.
 
-## Implementation plan
+### Adopt incrementally
 
 1. Discuss this RFC through existing PR #3460 and track follow-ups in #3954.
    Resolve policy questions independently from per-test migration details.
@@ -296,12 +373,19 @@ must not describe proposed gates as already enforced.
 
 ## Alternatives
 
-### Continue expanding TESTING.md and suite READMEs independently
+### Maintain independent driver-specific E2E suites
 
-This is the smallest immediate documentation change, but leaves strategy,
-commands, and future gates interleaved. A single RFC and focused living
-references give reviewers a place to resolve disagreements before publishing
-authoritative guidance.
+Each driver could retain a complete E2E suite tailored to its runtime. This
+minimises initial migration, but duplicates public behavioral checks and allows
+expectations to diverge. Reuse portable contracts across targets and reserve
+driver-specific coverage for implementation and integration requirements.
+
+### Couple behavioral tests to target provisioning
+
+Each suite could provision and configure its own gateway. This simplifies local
+setup for that suite, but makes it harder to validate installed artifacts or an
+externally prepared gateway with the same tests. Separate target preparation
+from behavioral testing while allowing a harness to orchestrate both.
 
 ### Introduce separate API and CLI conformance frameworks immediately
 
@@ -310,18 +394,13 @@ runner and overlapping scenarios before a CLI limitation requires them. Keep
 general conformance CLI-based initially; SDK interface testing remains a
 separate justified consumer under #3238.
 
-### Require every scenario on every configuration
+### Require every tested behavior on every configuration
 
 This gives a uniform baseline but excludes useful portable behavior that some
 drivers do not implement. Mandatory scenarios plus precise optional capabilities
-allow useful coverage while requiring advertised behavior to pass.
-
-### Establish profiles and a full certification process first
-
-Profiles, a versioned certification program, and formal promotion gates could
-clarify compatibility guarantees, but would add policy and infrastructure before
-the existing tests have been classified. Keep these decisions open and evolve
-them from concrete contracts and consumers.
+allow useful coverage while requiring advertised behavior to pass. Whether
+optional portable contracts belong in general conformance or feature-specific
+suites is deferred; this alternative concerns support requirements, not naming.
 
 ## Prior art
 
@@ -341,6 +420,9 @@ them from concrete contracts and consumers.
 
 ## Open questions
 
+- Should portable, capability-dependent tests belong in general conformance or
+  feature-specific suites? Resolve this using the first concrete migration
+  example that requires the distinction, without adding a category in advance.
 - What constitutes a complete conformance claim, and how are suite versions
   matched to gateway/CLI releases? Which version-skew guarantees are required?
 - What maturity and reliability evidence is required beyond two-driver success?
