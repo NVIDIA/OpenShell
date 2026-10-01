@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ""
+      source-sha:
+        description: Candidate source revision; defaults to the artifact run head SHA
+        required: false
+        type: string
+        default: ""
       deb-artifact-name:
         description: Debian package artifact to include in the tmachine inputs
         required: false
@@ -43,9 +48,12 @@ jobs:
         env:
           ARTIFACT_RUN_ID: ${{ inputs['artifact-run-id'] || github.run_id }}
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs['source-sha'] }}
         run: |
-          head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq .head_sha)
-          echo "source_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          if [ -z "${SOURCE_SHA}" ]; then
+            SOURCE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq .head_sha)
+          fi
+          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

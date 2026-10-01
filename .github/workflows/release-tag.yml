@@ -159,6 +159,7 @@ jobs:
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
+      source-sha: ${{ needs.compute-versions.outputs.source_sha }}
       deb-artifact-name: deb-linux-amd64
 
   conformance-integration:

@@ -49,8 +49,11 @@ its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an
-`artifact-run-id` from a build of the same commit. Set `category` to
-`policy-advisor` and `test-matrix` to:
+`artifact-run-id` from a build of the same commit. When a `Release Tag` run was
+dispatched from a different commit, also set `source-sha` to the release tag's
+resolved commit so runtime images and test inputs match the candidate binaries.
+Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
+to `policy-advisor` and `test-matrix` to:
 
 ```json
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]

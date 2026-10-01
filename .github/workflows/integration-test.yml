@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ""
+      source-sha:
+        description: Candidate source revision; defaults to the artifact run head SHA
+        required: false
+        type: string
+        default: ""
       category:
         description: Integration-test category, used for the job name and concurrency key
         required: true
@@ -38,6 +43,7 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       artifact-run-id: ${{ inputs['artifact-run-id'] }}
+      source-sha: ${{ inputs['source-sha'] }}
 
   integration:
     needs: prepare
