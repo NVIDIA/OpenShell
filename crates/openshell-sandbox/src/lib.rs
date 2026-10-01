@@ -11,8 +11,6 @@ mod boundary_server;
 pub mod child_env;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
-#[cfg(unix)]
-pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod main_session;
 pub mod managed_children;
@@ -22,6 +20,8 @@ mod network_broker;
 pub mod perf;
 #[cfg(unix)]
 pub mod process;
+#[cfg(target_os = "linux")]
+mod provider_files;
 mod pty;
 pub mod sandbox;
 #[cfg(target_os = "linux")]

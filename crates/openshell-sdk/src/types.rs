@@ -296,6 +296,27 @@ pub struct ServiceExposure {
     pub service: String,
     /// Loopback TCP port inside the sandbox.
     pub target_port: u16,
+    /// Whether the gateway strips or forwards an application bearer credential.
+    pub authorization_mode: ServiceAuthorizationMode,
+}
+
+/// Handling for an incoming application `Authorization` header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServiceAuthorizationMode {
+    /// Remove the header before proxying to the sandbox service.
+    #[default]
+    Strip,
+    /// Forward one syntactically valid bearer credential unchanged.
+    BearerPassthrough,
+}
+
+impl From<ServiceAuthorizationMode> for proto::ServiceAuthorizationMode {
+    fn from(value: ServiceAuthorizationMode) -> Self {
+        match value {
+            ServiceAuthorizationMode::Strip => Self::Strip,
+            ServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
 }
 
 /// Caller intent for creating a sandbox from a named workload template.

@@ -624,7 +624,7 @@ impl KubernetesComputeConfig {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
     }
 
-    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// Where supervisor Pods read the gateway CA. Outside
     /// shared mode it is staged into each generation's bootstrap Secret.
     #[must_use]
     pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {

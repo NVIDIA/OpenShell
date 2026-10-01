@@ -157,7 +157,10 @@ UID. Restart requires exactly one matching Sandbox resource and preserves its
 namespace and UID while rotating the supervisor Pod UID. The gateway requires
 the authenticated identity to match the durable binding before returning the
 generation-bound session JWT used by the supervisor. The sandbox Pod receives
-neither token.
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.

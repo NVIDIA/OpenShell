@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -166,17 +165,6 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
         in wrapper
     )
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
-
-
-def test_snap_docker_connect_hook_restarts_gateway() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    hook = repo_root / "snap/hooks/connect-plug-docker"
-
-    assert hook.is_file()
-    assert hook.stat().st_mode & stat.S_IXUSR
-    assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:

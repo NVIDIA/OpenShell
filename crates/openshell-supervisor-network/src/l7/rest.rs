@@ -86,6 +86,7 @@ pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
     "HTTP/2 cleartext upgrade (h2c) is not supported for L7-inspected endpoints";
 pub(crate) const UNSUPPORTED_JSONRPC_UPGRADE_DETAIL: &str =
     "HTTP upgrade is not supported for JSON-RPC or MCP endpoints";
+pub(crate) const UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL: &str = "HTTP upgrade is not supported for GraphQL endpoints; serve GraphQL over WebSocket from a separate protocol: websocket endpoint on another path or port";
 const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
 
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
@@ -2436,9 +2437,8 @@ pub(crate) fn request_is_h2c_upgrade(raw_header: &[u8]) -> bool {
 /// Returns why an L7 endpoint using `protocol` must refuse this request's
 /// upgrade, or `None` when the request may continue.
 ///
-/// Every inspected protocol refuses h2c. JSON-RPC and MCP policy applies to
-/// individual HTTP requests, so after any protocol switch no rule would see
-/// the messages; those endpoints refuse every request that carries an
+/// Every inspected protocol refuses h2c. Protocols named by
+/// `upgrade_refusal_for_protocol` refuse every request that carries an
 /// `Upgrade` header. Callers apply this before the L7 policy decision and
 /// regardless of enforcement mode, because an upgrade would end inspection
 /// rather than break a rule that audit mode could log.
@@ -2449,10 +2449,30 @@ pub(crate) fn unsupported_upgrade_detail(
     if request_is_h2c_upgrade(raw_header) {
         return Some(UNSUPPORTED_H2C_UPGRADE_DETAIL);
     }
-    if protocol.is_jsonrpc_family() && request_has_upgrade_header(raw_header) {
-        return Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL);
+    let refusal = upgrade_refusal_for_protocol(protocol)?;
+    request_has_upgrade_header(raw_header).then_some(refusal)
+}
+
+/// Returns the refusal detail for a protocol whose policy applies only to
+/// individual HTTP requests, or `None` for a protocol that may relay an
+/// allowed upgrade.
+///
+/// JSON-RPC, MCP and GraphQL rules inspect each HTTP request body or query.
+/// After an upgrade the relay would copy frames that no rule of these
+/// protocols evaluates, so they never upgrade; GraphQL over WebSocket is
+/// served by separate `protocol: websocket` endpoints with GraphQL operation
+/// rules. REST and WebSocket endpoints relay allowed upgrades, and SQL
+/// endpoints keep their existing upgrade behavior. The match is exhaustive so
+/// a new protocol must choose.
+pub(crate) fn upgrade_refusal_for_protocol(
+    protocol: crate::l7::L7Protocol,
+) -> Option<&'static str> {
+    use crate::l7::L7Protocol;
+    match protocol {
+        L7Protocol::JsonRpc | L7Protocol::Mcp => Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+        L7Protocol::Graphql => Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => None,
     }
-    None
 }
 
 /// Returns true when a request carries an `Upgrade` header, whatever its
@@ -9129,14 +9149,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_upgrade_detail_allows_ordinary_and_non_jsonrpc_requests() {
+    fn unsupported_upgrade_detail_allows_ordinary_requests_and_relaying_protocols() {
         let websocket = format!(
             "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
         for protocol in [
             crate::l7::L7Protocol::Rest,
             crate::l7::L7Protocol::Websocket,
-            crate::l7::L7Protocol::Graphql,
         ] {
             assert_eq!(
                 unsupported_upgrade_detail(websocket.as_bytes(), protocol),
@@ -9155,7 +9174,11 @@ mod tests {
             b"GET /mcp HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\n\r\n",
         ];
         for raw in ordinary {
-            for protocol in [crate::l7::L7Protocol::JsonRpc, crate::l7::L7Protocol::Mcp] {
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
                 assert_eq!(
                     unsupported_upgrade_detail(raw, protocol),
                     None,
@@ -9163,6 +9186,47 @@ mod tests {
                     String::from_utf8_lossy(raw)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unsupported_upgrade_detail_refuses_upgrades_on_graphql() {
+        let requests = [
+            format!(
+                "GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ),
+            format!(
+                "GET /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n"
+            ),
+            "POST /graphql HTTP/1.1\r\nHost: example.com\r\nUpgrade: custom\r\nConnection: upgrade\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+        ];
+        for raw in &requests {
+            assert_eq!(
+                unsupported_upgrade_detail(raw.as_bytes(), crate::l7::L7Protocol::Graphql),
+                Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_refusal_for_protocol_names_every_per_request_protocol() {
+        use crate::l7::L7Protocol;
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::JsonRpc),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Mcp),
+            Some(UNSUPPORTED_JSONRPC_UPGRADE_DETAIL)
+        );
+        assert_eq!(
+            upgrade_refusal_for_protocol(L7Protocol::Graphql),
+            Some(UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL)
+        );
+        for protocol in [L7Protocol::Rest, L7Protocol::Websocket, L7Protocol::Sql] {
+            assert_eq!(upgrade_refusal_for_protocol(protocol), None, "{protocol:?}");
         }
     }
 
@@ -9198,7 +9262,11 @@ mod tests {
                 client_requested_upgrade(raw) || request_is_websocket_upgrade(raw.as_bytes()),
                 "fixture must be an upgrade to the relay: {raw}"
             );
-            for protocol in [crate::l7::L7Protocol::JsonRpc, crate::l7::L7Protocol::Mcp] {
+            for protocol in [
+                crate::l7::L7Protocol::JsonRpc,
+                crate::l7::L7Protocol::Mcp,
+                crate::l7::L7Protocol::Graphql,
+            ] {
                 assert!(
                     unsupported_upgrade_detail(raw.as_bytes(), protocol).is_some(),
                     "{protocol:?} must refuse: {raw}"

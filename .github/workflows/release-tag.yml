@@ -152,14 +152,16 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
-    needs: [compute-versions, build-binaries, build-deb, build-images]
+    needs: [compute-versions, build-binaries, build-deb, build-images, build-rpm]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
+      source-sha: ${{ needs.compute-versions.outputs.source_sha }}
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
 
   conformance-integration:
     needs: prepare-integration
@@ -172,6 +174,13 @@ jobs:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
 
   feature-specific-integration:
     needs: prepare-integration
@@ -186,8 +195,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
         ]
 
   docker-e2e:
@@ -214,11 +223,28 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    needs: compute-versions
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
   qualification-result:
     name: Release Qualification
     if: always()
     needs:
       - compute-versions
+      - protobuf-compatibility
       - security
       - conformance-integration
       - feature-specific-integration
@@ -244,6 +270,7 @@ jobs:
           DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
           FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
           VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
@@ -268,6 +295,7 @@ jobs:
             echo
             echo "| Suite | Result |"
             echo "| --- | --- |"
+            echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
             echo "| Security | ${SECURITY_RESULT} |"
             echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
             echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"

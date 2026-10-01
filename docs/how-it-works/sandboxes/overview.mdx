@@ -278,6 +278,10 @@ process. It retries transient transport failures for up to 60 seconds. Initial
 authentication failures, sandbox lifecycle changes, and clean SSH exits are
 not retried.
 
+The supervisor sends SSH keepalive probes after 15 seconds without inbound traffic and closes a connection after 60 seconds without receiving peer bytes, including when relay writes are stalled. Healthy idle clients answer these probes and stay attached. The timeout starts when the supervisor last reads peer bytes; relay buffering and scheduling can delay detection after physical network loss. The canonical process keeps running when its dead attachment closes.
+
+If recovery reaches the sandbox before the old connection releases stdin, the replacement reports `attached read-only`. After the old connection times out, type again: the replacement acquires stdin if it is available, reports `input enabled`, and forwards that new input. Keystrokes sent while another attachment owned stdin are discarded. An explicitly read-only attachment stays read-only, and recovery never displaces a healthy input owner.
+
 `Ctrl-C` retains its normal terminal behavior and interrupts the foreground
 process. For read-only attachments, `Ctrl-C` or `Ctrl-D` exits only the current
 viewer.
@@ -305,6 +309,8 @@ and receive the exit event and final gRPC status. Input EOF does not immediately
 close the SSH output channel and is distinct from cancelling the RPC. With a PTY,
 input closure is not equivalent to sending a terminal Ctrl-D keystroke.
 
+The supervisor limits pending stdin to 4 MiB per exec channel. If input arrives faster than the command consumes it and this buffer fills, further input fails the exec with exit code 74. The supervisor logs `process stdin buffer is full`. This also applies to SSH file transfers that use exec channels. The limit counts input waiting to be written, so clients that support larger transfers can continue as the command consumes data. Input EOF drains bytes already accepted; cancelling the exec discards pending input.
+
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
 ```shell
@@ -317,7 +323,7 @@ Pipe stdin into the command:
 echo "hello" | openshell sandbox exec -n my-sandbox -- cat
 ```
 
-By default, the CLI reads piped input to EOF before starting the command. It sends small input in one request and larger input in bounded frames. Piped input is limited to 4 MiB; the CLI rejects larger input before launch. Use `sandbox upload` for larger files.
+The CLI waits up to 200 ms for piped input to reach EOF. If EOF arrives within that period, it sends small input in one request and larger input in bounded frames. If the pipe stays open, the command starts after the grace period and the remaining input streams as it arrives. Input above 4 MiB is rejected before launch when detected during the grace period; after launch, exceeding the same total limit cancels execution. Use `sandbox upload` for larger files, or redirect stdin from `/dev/null` when a command needs no input.
 
 For commands that must respond while stdin remains open, add `--stream-stdin`:
 
@@ -325,7 +331,7 @@ For commands that must respond while stdin remains open, add `--stream-stdin`:
 openshell sandbox exec -n my-sandbox --stream-stdin -- cat
 ```
 
-This mode starts the command before stdin reaches EOF and forwards input as it arrives. It disables TTY allocation and keeps stdout and stderr separate. You cannot combine it with `--tty`; `--no-tty` is allowed. Closing stdin ends the command's input while the CLI continues reading output until completion.
+This mode skips the grace period and starts the command before stdin reaches EOF and forwards input as it arrives. It disables TTY allocation and keeps stdout and stderr separate. You cannot combine it with `--tty`; `--no-tty` is allowed. Closing stdin ends the command's input while the CLI continues reading output until completion.
 
 The 4 MiB limit applies to total stdin bytes for the command, including with `--stream-stdin`. Exceeding the limit cancels the execution and returns an error. The command may already have processed earlier input, and cancellation does not undo that work.
 
@@ -475,13 +481,16 @@ name selects the unnamed endpoint. The returned sandbox includes a service URL
 map keyed by those names; use the empty key for the unnamed endpoint:
 
 ```python
-from openshell import SandboxClient, ServiceExposure
+from openshell import SandboxClient, ServiceAuthorizationMode, ServiceExposure
 
 with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(
         workspace="default",
         name="app-server",
-        service_exposures=[ServiceExposure(target_port=4500)],
+        service_exposures=[ServiceExposure(
+            target_port=4500,
+            authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+        )],
     )
     print(sandbox.service_urls[""])
 ```
@@ -490,7 +499,10 @@ with SandboxClient.from_active_cluster() as client:
 const sandbox = await client.sandbox.create({
   name: 'app-server',
   image: 'base',
-  serviceExposures: [{ targetPort: 4500 }],
+  serviceExposures: [{
+    targetPort: 4500,
+    authorizationMode: ServiceAuthorizationMode.BearerPassthrough,
+  }],
 })
 console.log(sandbox.serviceUrls[''])
 ```
@@ -499,7 +511,10 @@ console.log(sandbox.serviceUrls[''])
 sandbox, err := client.Sandboxes().Create(
     ctx, "default", "app-server", spec, nil,
     v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
-        {TargetPort: 4500},
+        {
+            TargetPort: 4500,
+            AuthorizationMode: v1.ServiceAuthorizationModeBearerPassthrough,
+        },
     }},
 )
 fmt.Println(sandbox.ServiceURLs[""])
@@ -511,6 +526,7 @@ let sandbox = client.create_sandbox(openshell_sdk::SandboxSpec {
     service_exposures: vec![openshell_sdk::ServiceExposure {
         service: String::new(),
         target_port: 4500,
+        authorization_mode: openshell_sdk::ServiceAuthorizationMode::BearerPassthrough,
     }],
     ..Default::default()
 }).await?;
@@ -528,6 +544,63 @@ Pass an optional service name to create a named service URL:
 ```shell
 openshell service expose my-sandbox 8080 web
 ```
+
+OpenShell strips the incoming `Authorization` header by default. Opt a service
+into forwarding one valid bearer credential unchanged when the application
+performs its own authentication:
+
+```shell
+openshell service expose my-sandbox 4500 \
+  --authorization-mode bearer-passthrough
+```
+
+For a create-time exposure, use both flags:
+
+```shell
+openshell sandbox create \
+  --expose 4500 \
+  --expose-authorization-mode bearer-passthrough \
+  --detach \
+  -- ./authenticated-server
+```
+
+In `bearer-passthrough` mode, OpenShell accepts zero or one application
+`Authorization` header. When present, it must contain a nonempty Bearer
+credential. Missing credentials reach the application so it can return its own
+authentication response. Duplicate, Basic, and malformed credentials fail with
+`400 Bad Request`. Gateway and edge identity headers, proxy authorization, and
+edge authentication cookies remain stripped.
+
+<Warning>
+Bearer passthrough delivers the caller's credential to the sandbox service.
+Enable it only when that service is trusted to receive the credential. Exposed
+services still use the gateway listener and its TLS configuration in this
+release.
+</Warning>
+
+For example, Codex App Server can keep the raw capability outside the sandbox
+and receive only its SHA-256 verifier:
+
+```shell
+APP_SERVER_TOKEN="$(openssl rand -hex 32)"
+APP_SERVER_TOKEN_SHA256="$(printf %s "$APP_SERVER_TOKEN" | openssl dgst -sha256 -hex | awk '{print $2}')"
+
+openshell sandbox create \
+  --name codex-server \
+  --env "APP_SERVER_TOKEN_SHA256=$APP_SERVER_TOKEN_SHA256" \
+  --expose 4500 \
+  --expose-authorization-mode bearer-passthrough \
+  --detach \
+  -- codex app-server \
+    --listen ws://127.0.0.1:4500 \
+    --ws-auth capability-token \
+    --ws-token-sha256 "$APP_SERVER_TOKEN_SHA256"
+```
+
+Clients send `Authorization: Bearer $APP_SERVER_TOKEN` in the WebSocket
+handshake. Codex's WebSocket transport is experimental and unsupported for
+production workloads. It authenticates the handshake before the app-server
+`initialize` request.
 
 List exposed endpoints:
 
@@ -549,7 +622,8 @@ openshell service list my-sandbox --output yaml
 ```
 
 Structured list output contains `services` and `next_page_token` fields. Each
-record contains `workspace`, `sandbox`, `service`, `target_port`, and `url`.
+record contains `workspace`, `sandbox`, `service`, `target_port`,
+`authorization_mode`, and `url`.
 The unnamed service uses an empty `service` string. Pass the returned token to
 `--page-token` to continue. An empty result has an empty `services` collection.
 
@@ -568,7 +642,14 @@ openshell service delete my-sandbox
 ```
 
 <Note>
-Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/how-it-works/gateways/overview#configure-service-forwarding).
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways
+return HTTPS URLs on the gateway listener. Service routes bypass control-plane
+RPC authorization and do not use OIDC or CLI login. Because they share the
+listener in this release, its TLS configuration—including any required client
+certificate—still applies. The application is responsible for authentication
+enabled on its endpoint, and an upstream edge proxy may still apply its own
+access policy. For gateway service-domain configuration, refer to
+[Manage Gateways](/how-it-works/gateways/overview#configure-service-forwarding).
 </Note>
 
 ## Monitor and Debug

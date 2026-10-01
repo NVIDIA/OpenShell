@@ -36,6 +36,13 @@ When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 
+For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
+`[openshell.gateway]` or use the package-managed local CA. Remove the retired
+`guest_tls_cert` and `guest_tls_key` fields. Supervisors receive only the
+CA and authenticate gateway RPCs with sandbox bearer tokens. Kubernetes
+projects or stages only the gateway CA from its configured TLS Secret; user
+client certificates and private keys stay outside the sandbox boundary.
+
 ### Extension Drivers
 
 Any name other than a built-in driver selects an extension driver. Point the gateway at the Unix socket where the driver listens:
@@ -221,7 +228,7 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `image_pull_policy` | `sandbox.image.pullPolicy` | `always`, `if_not_present`, or `never`. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Image-pull Secrets for sandbox pods. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Gateway endpoint reachable from sandbox pods. |
-| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Secret with sandbox client TLS material. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Project or stage only `ca.crt` into supervisor Pods to authenticate the gateway. |
 | `sandbox_runtime_image` | `sandboxRuntime.image.*` | Override the sandbox runtime image. |
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |

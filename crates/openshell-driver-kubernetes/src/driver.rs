@@ -1251,8 +1251,8 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    /// Read the gateway client TLS material staged into supervisor bootstrap
-    /// Secrets outside the sandbox namespace.
+    /// Read only the gateway CA staged into supervisor bootstrap Secrets
+    /// outside the sandbox namespace.
     async fn read_client_tls_material(
         &self,
     ) -> Result<Option<ClientTlsMaterial>, KubernetesDriverError> {
@@ -1272,8 +1272,6 @@ impl KubernetesComputeDriver {
         };
         Ok(Some(ClientTlsMaterial {
             ca_certificate: take("ca.crt")?,
-            certificate: take("tls.crt")?,
-            private_key: take("tls.key")?,
         }))
     }
 
@@ -11244,7 +11242,7 @@ mod tests {
                         "kind": "Secret",
                         "metadata": {"name": "openshell-client-tls", "namespace": "openshell"},
                         "type": "kubernetes.io/tls",
-                        "data": {"ca.crt": "Y2E=", "tls.crt": "Y2VydA==", "tls.key": "a2V5"}
+                        "data": {"ca.crt": "Y2E="}
                     }),
                 ),
             )],
@@ -11255,8 +11253,6 @@ mod tests {
             .expect("read client TLS")
             .expect("client TLS is staged in managed mode");
         assert_eq!(material.ca_certificate, b"ca");
-        assert_eq!(material.certificate, b"cert");
-        assert_eq!(material.private_key, b"key");
         assert!(steps.lock().unwrap().is_empty());
 
         let (shared, _, _) = scripted_driver(

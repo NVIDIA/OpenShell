@@ -137,9 +137,16 @@ openshell rule reject <sandbox-name> \
   --reason "Scope this to docs/ paths only."
 ```
 
-If the sandbox's policy or providers change after a proposal is submitted,
-OpenShell rechecks the proposal and asks you to review it again before you can
-approve it. While a global policy is active, OpenShell cannot approve proposals,
+When you approve, remove, or undo a rule, OpenShell rechecks the other pending
+proposals against the updated policy before it responds, so `rule get` shows
+the risk check results your next approval uses and you can approve proposals one
+after another. Other policy updates recheck pending proposals in the
+background. Each change rechecks up to 32 of the newest pending proposals.
+
+If a proposal's inputs changed after you listed it, for example because the
+sandbox's providers changed, `rule approve` rechecks it and stops. Review the
+updated proposal with `openshell rule get <sandbox-name> --status pending`,
+then approve it again. While a global policy is active, OpenShell cannot approve proposals,
 including automatically. You can also review proposals in the terminal UI with
 `openshell term`, but it rejects proposals without a reason.
 

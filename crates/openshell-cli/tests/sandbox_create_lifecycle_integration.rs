@@ -2784,6 +2784,8 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
             name: Some("sandbox"),
             keep: false,
             expose: Some(4500),
+            expose_authorization_mode:
+                openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
             detach: true,
             ..test_config()
         },
@@ -2799,7 +2801,36 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
     assert_eq!(create_requests[0].service_exposures.len(), 1);
     assert_eq!(create_requests[0].service_exposures[0].service, "");
     assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+    assert_eq!(
+        create_requests[0].service_exposures[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
     assert!(expose_service_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn service_expose_forwards_bearer_passthrough_mode() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::service_expose(
+        &server.endpoint,
+        "sandbox",
+        "codex",
+        4500,
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        "default",
+        &tls,
+    )
+    .await
+    .expect("service expose should succeed");
+
+    let requests = expose_service_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -115,6 +116,12 @@ def _service_exposure_messages(
         openshell_pb2.SandboxServiceExposure(
             service=exposure.service,
             target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
         )
         for exposure in exposures or ()
     ]
@@ -453,12 +460,20 @@ class SandboxStatusRef:
     main_process_started_at_ms: int | None = None
 
 
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
+
+
 @dataclass(frozen=True)
 class ServiceExposure:
     """A loopback HTTP service to expose during sandbox creation."""
 
     target_port: int
     service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):

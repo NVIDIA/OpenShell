@@ -126,13 +126,15 @@ openshell status
 
 Keep the client key private.
 
-To install a locally built snap, connect its interfaces manually:
+To install a locally built snap, connect its interfaces manually. The gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart the gateway after connecting the interfaces:
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
+sudo systemctl reset-failed snap.openshell.gateway.service
+sudo snap restart openshell.gateway
 ```
 
 ## Kubernetes

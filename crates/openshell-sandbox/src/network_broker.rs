@@ -190,6 +190,7 @@ fn register_dns_socket(
 
 #[derive(Clone)]
 struct NotificationQueues {
+    provider_files: crate::provider_files::ProviderFiles,
     protected_control_port: Option<u16>,
     accept_registrar: crate::accept_interrupt::AcceptRegistrar,
     identity_resolver: ProcfsIdentityResolver,
@@ -204,6 +205,7 @@ struct NotificationQueues {
 /// Live broker handle retained by the sandbox boundary.
 #[derive(Clone)]
 pub struct NetworkBroker {
+    provider_files: crate::provider_files::ProviderFiles,
     _accept_monitor: Arc<crate::accept_interrupt::AcceptMonitor>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
@@ -260,7 +262,9 @@ impl NetworkBroker {
         let dns_address = dns_relay.address;
         let retained_socket_capacity = retained_socket_capacity()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
+        let provider_files = crate::provider_files::ProviderFiles::default();
         let queues = NotificationQueues {
+            provider_files: provider_files.clone(),
             protected_control_port,
             accept_registrar: accept_monitor.registrar(),
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
@@ -311,6 +315,7 @@ impl NetworkBroker {
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
+            provider_files,
             _accept_monitor: accept_monitor,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
@@ -351,6 +356,10 @@ impl NetworkBroker {
                 "network broker is not running",
             ))
         }
+    }
+
+    pub(crate) fn provider_files(&self) -> &crate::provider_files::ProviderFiles {
+        &self.provider_files
     }
 }
 
@@ -528,6 +537,13 @@ fn dispatch_notification(
     queues: NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
+    if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+        return queues.provider_files.handle_open(&listener, notification);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if syscall == libc::SYS_open {
+        return queues.provider_files.handle_open(&listener, notification);
+    }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
         return openshell_isolation_interface::linux::process_signal::mediate_process_signal(
             &listener,
@@ -1827,6 +1843,87 @@ fn error_to_errno(error: &io::Error) -> i32 {
 mod tests {
     use super::*;
     use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
+
+    #[test]
+    fn provider_files_are_opened_on_demand_and_replaced() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start broker");
+        let path = "/run/openshell/providers/acme/client.toml".to_string();
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path.clone(), "version = 1\n".into())]))
+            .unwrap();
+        let first = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::read_to_string(path)
+            })
+            .unwrap()
+            .expect("first open");
+        assert_eq!(first, "version = 1\n");
+        let mut old_descriptor = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::File::open(path)
+            })
+            .unwrap()
+            .expect("open old version");
+        let denied_write = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::OpenOptions::new().write(true).open(path)
+            })
+            .unwrap()
+            .expect_err("provider file is read only");
+        assert_eq!(denied_write.raw_os_error(), Some(libc::EACCES));
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path.clone(), "version = 2\n".into())]))
+            .unwrap();
+        let mut old_content = String::new();
+        io::Read::read_to_string(&mut old_descriptor, &mut old_content).unwrap();
+        assert_eq!(old_content, "version = 1\n");
+        let second = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::read_to_string(path)
+            })
+            .unwrap()
+            .expect("second open");
+        assert_eq!(second, "version = 2\n");
+        let via_openat2 = launcher
+            .execute({
+                let path = path.clone();
+                move || -> io::Result<String> {
+                    let path = std::ffi::CString::new(path).unwrap();
+                    let how = [libc::O_CLOEXEC as u64, 0, 0];
+                    let fd = unsafe {
+                        libc::syscall(
+                            libc::SYS_openat2,
+                            libc::AT_FDCWD,
+                            path.as_ptr(),
+                            how.as_ptr(),
+                            24_usize,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut file = unsafe {
+                        std::fs::File::from_raw_fd(i32::try_from(fd).expect("open fd fits"))
+                    };
+                    let mut content = String::new();
+                    io::Read::read_to_string(&mut file, &mut content)?;
+                    Ok(content)
+                }
+            })
+            .unwrap();
+        assert_eq!(via_openat2.unwrap(), "version = 2\n");
+        broker.provider_files().replace(HashMap::new()).unwrap();
+        let detached = launcher.execute(move || std::fs::read(path)).unwrap();
+        assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    }
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
 

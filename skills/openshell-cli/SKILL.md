@@ -377,6 +377,8 @@ attachments running. Configure VS Code Remote-SSH with:
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
+A writable attachment that finds another attachment holding stdin reports `attached read-only; retry input after the owner disconnects`. Automatic recovery can hit this when it reattaches before the supervisor closes the dead connection. The supervisor closes a connection 60 seconds after it last received bytes from it, which can be later than 60 seconds after the network failed if the relay buffered data. After the old owner disconnects or times out, send the input you meant to type next. If stdin is free, the attachment prints `input enabled` and forwards that input to the process, so do not probe with Enter or a prompt answer such as `y`. If nothing prints, the old connection still holds stdin. Input sent while the attachment was read-only never reaches the process, so send it again later. `Ctrl-C`, `Ctrl-D`, and `Ctrl-P` then `Ctrl-Q` still exit a read-only attachment instead of enabling input; enable input first if you need `Ctrl-C` to interrupt the process. Recovery never takes stdin from a healthy owner, and an explicitly read-only attachment stays read-only.
+
 If `connect` reports `canonical main process already finished`, inspect the
 result with `sandbox get`. A pending foreground attachment can still retrieve
 retained output in `Completed` or `Error`; phase alone does not determine
@@ -409,9 +411,13 @@ within it.
 ### Execute a non-interactive command
 
 ```bash
-openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
+openshell sandbox exec my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
+
+The sandbox is a positional name or `--name`, not both; omit it to use the
+last-used sandbox. `--` is required and everything after it is the remote
+command, so put options such as `--tty` before it.
 
 `sandbox exec` starts an independent sibling process and streams output. After
 stdout and stderr drain, it returns the remote command's exit code if delivery
@@ -423,7 +429,7 @@ Check whether the command ran before retrying work with side effects. Use
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
-When a client must read responses before closing stdin, check `openshell sandbox exec --help` for `--stream-stdin`. Use that mode to start the command immediately without a TTY and keep stdout and stderr separate. It conflicts with `--tty`. Total stdin remains limited to 4 MiB; exceeding the limit cancels the command after it may have processed earlier input. Without this flag, piped input is read to EOF and checked before launch. After a stream failure, inspect the command's effects before retrying it.
+When a client must read responses before closing stdin, check `openshell sandbox exec --help` for `--stream-stdin`. Use that mode to start the command immediately without a TTY and keep stdout and stderr separate. It conflicts with `--tty`. Total stdin remains limited to 4 MiB; exceeding the limit cancels the command after it may have processed earlier input. Without this flag, the CLI waits up to 200 ms for piped input to reach EOF, then streams any remaining input. Oversized input is rejected before launch only when detected during that grace period. After a stream failure, inspect the command's effects before retrying it.
 
 ### Change attached providers
 
@@ -882,11 +888,13 @@ openshell sandbox create \
   --name my-app \
   --from my-app:latest \
   --expose 8080 \
+  --expose-authorization-mode bearer-passthrough \
   --detach \
   -- ./start-server.sh
 
 # Expose and manage an HTTP service through the gateway.
-openshell service expose my-app 8080 web
+openshell service expose my-app 8080 web \
+  --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
@@ -900,6 +908,19 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+
+Exposed services strip `Authorization` by default. Select
+`bearer-passthrough` only when the application inside the sandbox authenticates
+its own clients. This mode accepts either no `Authorization` header or exactly
+one non-empty Bearer credential and forwards that value unchanged. It rejects
+duplicate, malformed, or non-Bearer authorization before contacting the
+application. The application remains responsible for validating the token, and
+the raw token reaches the sandbox process, so never log it. Service routes
+bypass control-plane RPC authorization, but they still use the gateway's
+existing listener, domain routing, and TLS configuration, including any client
+certificate requirement. See the published
+[sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for the complete security contract.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 

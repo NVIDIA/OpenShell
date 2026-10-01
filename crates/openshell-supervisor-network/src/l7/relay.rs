@@ -224,7 +224,10 @@ where
                     // even when the caller disconnects before receiving it.
                     observer.observe(EndpointResult::PolicyDenied);
                 }
-                let reason = error.to_string();
+                let reason = format!(
+                    "{error}; {}",
+                    crate::l7::mcp::selected_revision_context(request, version)
+                );
                 let summary = l7_protocol_log_summary(None, Some(&info));
                 ocsf_emit!(build_l7_request_event(
                     ctx,
@@ -305,7 +308,7 @@ where
         // Record the denial before client delivery can fail.
         observer.observe(EndpointResult::PolicyDenied);
     }
-    let reason = error.to_string();
+    let reason = error.rejection_detail(request);
     let summary = l7_protocol_log_summary(None, Some(info));
     ocsf_emit!(build_l7_request_event(
         ctx,
@@ -1384,18 +1387,19 @@ where
                     websocket_permessage_deflate,
                     websocket_subprotocol,
                 } => {
-                    // JSON-RPC and MCP rules apply to individual HTTP requests.
-                    // No current path forwards upgrade headers for these
-                    // protocols: the request-side refusal rejects them, and
-                    // request middleware cannot add upgrade or connection
-                    // headers. If a later change lets such a request reach an
-                    // upstream that answers `101`, close instead of relaying
-                    // frames that no rule would inspect.
-                    if config.protocol.is_jsonrpc_family() {
+                    // Protocols whose rules apply to individual HTTP requests
+                    // never upgrade (see `upgrade_refusal_for_protocol`). No
+                    // current path forwards upgrade headers for them: the
+                    // request-side refusal rejects them, and request
+                    // middleware cannot add upgrade or connection headers. If
+                    // a later change lets such a request reach an upstream
+                    // that answers `101`, close instead of relaying frames
+                    // that no rule would inspect.
+                    if crate::l7::rest::upgrade_refusal_for_protocol(config.protocol).is_some() {
                         warn!(
                             host = %ctx.host,
                             port = ctx.port,
-                            "closing JSON-RPC connection after unexpected protocol upgrade"
+                            "closing per-request L7 connection after unexpected protocol upgrade"
                         );
                         if let Some(session) = middleware_session.take() {
                             session
@@ -2590,22 +2594,22 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: config.allow_encoded_slash,
+            ..Default::default()
+        });
+
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
-        let parsed = match crate::l7::graphql::parse_graphql_http_request(
-            client,
-            config.graphql_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
-                allow_encoded_slash: config.allow_encoded_slash,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(Some(parsed)) => parsed,
+        // Validate the head, including body framing, before deciding whether
+        // this endpoint can inspect the requested protocol. Upgrade refusal
+        // must not wait for a body or depend on its inspection size limit.
+        let mut req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
             Err(e) => {
                 if is_benign_connection_error(&e) {
@@ -2624,13 +2628,44 @@ where
             }
         };
 
-        let req = parsed.request;
-        let graphql_info = parsed.info;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
+            return Ok(());
+        }
+
+        let graphql_info = match crate::l7::graphql::inspect_graphql_request(
+            client,
+            &mut req,
+            config.graphql_max_body_bytes,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "GraphQL L7 connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7-graphql");
+                }
+                return Ok(());
+            }
+        };
+
+        // Inspection appends the body to raw_header. An HTTP/1.0 request
+        // without Host must still be denied if that body contains reserved
+        // credential markers, so repeat the authority check on the full request.
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
 
@@ -2807,25 +2842,20 @@ where
                     );
                     return Ok(());
                 }
-                RelayOutcome::Upgraded {
-                    overflow,
-                    websocket_permessage_deflate,
-                    ..
-                } => {
-                    let options = UpgradeRelayOptions {
-                        assembly_budget: Some(
-                            crate::l7::websocket::WebSocketAssemblyBudget::default(),
-                        ),
-                        websocket: WebSocketUpgradeBehavior {
-                            permessage_deflate: websocket_permessage_deflate,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    return handle_upgrade(
-                        client, upstream, overflow, &ctx.host, ctx.port, options,
-                    )
-                    .await;
+                RelayOutcome::Upgraded { .. } => {
+                    // GraphQL rules apply to individual HTTP requests. No
+                    // current path forwards upgrade headers here: the
+                    // request-side refusal rejects them, and request
+                    // middleware cannot add upgrade or connection headers. If
+                    // a later change lets such a request reach an upstream
+                    // that answers `101`, close instead of relaying frames
+                    // that no GraphQL rule would inspect.
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "closing GraphQL connection after unexpected protocol upgrade"
+                    );
+                    return Ok(());
                 }
             }
         } else {
@@ -9277,9 +9307,56 @@ network_policies:
       - {{ path: /usr/bin/python3 }}
 "#
         );
-        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        two_endpoint_route_configs(&data, "mcp.example.test", "shared_api")
+    }
+
+    /// Builds per-request route selection for a GraphQL endpoint at
+    /// `/graphql` that allows only `query { viewer }`, and a REST endpoint at
+    /// `/api/**`, on the same host and port.
+    fn graphql_and_rest_route_configs(
+        enforcement: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_policies:
+  shared_graphql:
+    name: shared_graphql
+    endpoints:
+      - host: graphql.example.test
+        port: 8000
+        path: "/graphql"
+        protocol: graphql
+        enforcement: {enforcement}
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer]
+      - host: graphql.example.test
+        port: 8000
+        path: "/api/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        two_endpoint_route_configs(&data, "graphql.example.test", "shared_graphql")
+    }
+
+    /// Loads `data` and returns the two L7 configs that share `host:8000`
+    /// for `/usr/bin/python3`, with a matching tunnel engine and context.
+    fn two_endpoint_route_configs(
+        data: &str,
+        host: &str,
+        policy_name: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
-            host: "mcp.example.test".into(),
+            host: host.into(),
             port: 8000,
             binary_path: PathBuf::from("/usr/bin/python3"),
             binary_sha256: "unused".into(),
@@ -9296,10 +9373,10 @@ network_policies:
         assert_eq!(configs.len(), 2, "both endpoints must share the route");
         let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
         let ctx = L7EvalContext {
-            host: "mcp.example.test".into(),
+            host: host.into(),
             port: 8000,
             request_default_port: Some(8000),
-            policy_name: "shared_api".into(),
+            policy_name: policy_name.into(),
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -9399,12 +9476,23 @@ network_policies:
     }
 
     fn assert_upgrade_denied_before_forwarding(scenario: &UpgradeScenario) {
+        assert_upgrade_refused_before_forwarding(
+            scenario,
+            UNALLOWED_TOOL_CALL,
+            crate::l7::rest::UNSUPPORTED_JSONRPC_UPGRADE_DETAIL,
+        );
+    }
+
+    /// Asserts that the relay answered the upgrade with the `detail` refusal
+    /// and that neither the request nor `frame` reached the upstream.
+    fn assert_upgrade_refused_before_forwarding(
+        scenario: &UpgradeScenario,
+        frame: &[u8],
+        detail: &str,
+    ) {
         assert!(
-            !contains_bytes(
-                &scenario.upstream_seen,
-                &masked_text_frame(UNALLOWED_TOOL_CALL)
-            ),
-            "an uninspected tools/call frame reached the upstream"
+            !contains_bytes(&scenario.upstream_seen, &masked_text_frame(frame)),
+            "an uninspected frame reached the upstream"
         );
         assert!(
             scenario.upstream_seen.is_empty(),
@@ -9417,10 +9505,7 @@ network_policies:
             scenario.response
         );
         assert!(
-            scenario.body.contains("\"unsupported_l7_protocol\"")
-                && scenario
-                    .body
-                    .contains(crate::l7::rest::UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+            scenario.body.contains("\"unsupported_l7_protocol\"") && scenario.body.contains(detail),
             "expected the upgrade refusal, got: {}",
             scenario.body
         );
@@ -9546,8 +9631,8 @@ network_policies:
 
     #[tokio::test]
     async fn route_selected_rest_websocket_upgrade_still_relays_beside_mcp() {
-        // The refusal is scoped to JSON-RPC-family endpoints: a REST upgrade
-        // on the same host and port keeps its documented raw relay.
+        // The refusal follows the selected endpoint's protocol: a REST
+        // upgrade on the same host and port keeps its documented raw relay.
         let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
         let frame = br#"{"type":"ping"}"#;
         let scenario = run_upgrade_scenario(
@@ -9607,6 +9692,295 @@ network_policies:
         .expect("receive-stream GET should reach the upstream");
         let forwarded = String::from_utf8_lossy(&forwarded);
         assert!(forwarded.starts_with("GET /mcp HTTP/1.1\r\n"));
+        assert!(!forwarded.to_ascii_lowercase().contains("upgrade"));
+        relay.abort();
+        let _ = relay.await;
+    }
+
+    /// A GraphQL-over-WebSocket message that no GraphQL fixture allows.
+    const UNALLOWED_GRAPHQL_MUTATION: &[u8] =
+        br#"{"id":"1","type":"subscribe","payload":{"query":"mutation { deleteRepository }"}}"#;
+
+    /// A GET whose query the GraphQL fixtures allow, plus WebSocket upgrade
+    /// headers.
+    const GRAPHQL_WEBSOCKET_UPGRADE_REQUEST: &[u8] = b"GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    fn assert_graphql_upgrade_refused_before_forwarding(scenario: &UpgradeScenario) {
+        assert_upgrade_refused_before_forwarding(
+            scenario,
+            UNALLOWED_GRAPHQL_MUTATION,
+            crate::l7::rest::UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL,
+        );
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_graphql_websocket_upgrade_is_denied_before_forwarding() {
+        let (config, tunnel_engine, ctx) = graphql_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            GRAPHQL_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_is_refused_before_body_read() {
+        // Send only the complete head. Neither an oversized declaration nor
+        // an incomplete allowed-size body may delay the upgrade refusal.
+        for content_length in [65537, 16] {
+            for enforcement in [EnforcementMode::Enforce, EnforcementMode::Audit] {
+                for upgrade in ["websocket", "custom"] {
+                    let (mut config, engine, ctx) = graphql_test_relay_context();
+                    config.enforcement = enforcement;
+                    assert_eq!(config.graphql_max_body_bytes, 65536);
+                    let request = format!(
+                        "POST /graphql HTTP/1.1\r\nHost: graphql.example.test:8000\r\nContent-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nContent-Length: {content_length}\r\n\r\n"
+                    );
+                    let started = tokio::time::Instant::now();
+                    let scenario = run_upgrade_scenario(
+                        request.as_bytes(),
+                        UNALLOWED_GRAPHQL_MUTATION,
+                        move |mut client, mut upstream| {
+                            tokio::spawn(async move {
+                                relay_with_inspection(
+                                    &config,
+                                    engine,
+                                    &mut client,
+                                    &mut upstream,
+                                    &ctx,
+                                )
+                                .await
+                            })
+                        },
+                    )
+                    .await;
+                    assert_graphql_upgrade_refused_before_forwarding(&scenario);
+                    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_preserves_head_validation() {
+        // Framing errors are rejected by the HTTP parser, and authority
+        // mismatches retain their specific denial before upgrade handling.
+        for (host, framing, expected) in [
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nTransfer-Encoding: chunked\r\n",
+                "",
+            ),
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nContent-Length: 17\r\n",
+                "",
+            ),
+            (
+                "other.example.test:8000",
+                "Content-Length: 16\r\n",
+                "request_authority_mismatch",
+            ),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let request = format!(
+                "POST /graphql HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: custom\r\n{framing}\r\n"
+            );
+            let scenario = run_upgrade_scenario(
+                request.as_bytes(),
+                UNALLOWED_GRAPHQL_MUTATION,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                            .await
+                    })
+                },
+            )
+            .await;
+            assert!(scenario.upstream_seen.is_empty());
+            if expected.is_empty() {
+                assert!(scenario.response.is_empty());
+            } else {
+                assert!(scenario.response.starts_with("HTTP/1.1 403"));
+                assert!(scenario.body.contains(expected));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_post_still_inspects_body() {
+        for (field, host, token) in [
+            ("viewer", "graphql.example.test:8000", ""),
+            ("admin", "graphql.example.test:8000", ""),
+            ("viewer", "", ""),
+            ("viewer", "", "openshell:resolve:env:v1_API_TOKEN"),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_inspection(&config, engine, &mut client, &mut relay_upstream, &ctx).await
+            });
+            let body = format!(r#"{{"query":"{{{field}}}","variables":{{"token":"{token}"}}}}"#);
+            let (version, authority) = if host.is_empty() {
+                ("HTTP/1.0", String::new())
+            } else {
+                ("HTTP/1.1", format!("Host: {host}\r\n"))
+            };
+            let request = format!(
+                "POST /graphql {version}\r\n{authority}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut forwarded = Vec::new();
+            if field == "viewer" && token.is_empty() {
+                let headers = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    read_http_headers(&mut upstream),
+                )
+                .await
+                .expect("allowed POST head must reach upstream");
+                assert!(headers.starts_with(format!("POST /graphql {version}\r\n").as_bytes()));
+                let mut bytes = vec![0; body.len()];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    upstream.read_exact(&mut bytes),
+                )
+                .await
+                .expect("allowed POST must reach upstream")
+                .unwrap();
+                assert_eq!(bytes, body.as_bytes());
+            } else {
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    app.read_to_end(&mut response),
+                )
+                .await
+                .expect("unlisted field or credential marker without Host must be denied")
+                .unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 403"));
+                if !token.is_empty() {
+                    assert!(
+                        String::from_utf8_lossy(&response).contains("request_authority_mismatch")
+                    );
+                }
+                upstream.read_to_end(&mut forwarded).await.unwrap();
+                assert!(forwarded.is_empty());
+            }
+            relay.abort();
+            let _ = relay.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_websocket_upgrade_is_denied_before_forwarding() {
+        // Audit mode forwards requests that policy would deny, so the upgrade
+        // refusal must not depend on the policy decision.
+        for enforcement in ["enforce", "audit"] {
+            let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs(enforcement);
+            let scenario = run_upgrade_scenario(
+                GRAPHQL_WEBSOCKET_UPGRADE_REQUEST,
+                UNALLOWED_GRAPHQL_MUTATION,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        relay_with_route_selection(
+                            &configs,
+                            tunnel_engine,
+                            &mut client,
+                            &mut upstream,
+                            &ctx,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await;
+            assert_graphql_upgrade_refused_before_forwarding(&scenario);
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_audit_graphql_upgrade_with_denied_query_is_refused() {
+        // Audit mode forwards a query the policy denies. The refusal must
+        // still fire, because it runs before the policy decision.
+        let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs("audit");
+        let scenario = run_upgrade_scenario(
+            b"GET /graphql?query=%7Badmin%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_graphql_subscription_handshake_gets_upgrade_refusal() {
+        // A standard GraphQL-over-WebSocket handshake carries no query. It
+        // must receive the refusal that names the supported alternative, not
+        // a policy denial that suggests adding a rule.
+        let (config, tunnel_engine, ctx) = graphql_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            b"GET /graphql HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n",
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_query_without_upgrade_is_still_forwarded() {
+        let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs("enforce");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let forwarded = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_headers(&mut upstream),
+        )
+        .await
+        .expect("allowed GraphQL GET should reach the upstream");
+        let forwarded = String::from_utf8_lossy(&forwarded);
+        assert!(forwarded.starts_with("GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\n"));
         assert!(!forwarded.to_ascii_lowercase().contains("upgrade"));
         relay.abort();
         let _ = relay.await;
@@ -10992,23 +11366,31 @@ network_policies:
 
     #[tokio::test]
     async fn mcp_relay_rejects_invalid_disallowed_and_missing_versions_without_forwarding() {
-        for (headers, status, code) in [
+        for (headers, status, code, remedy) in [
             (
                 "MCP-Protocol-Version: 2026-07-29\r\n",
                 "400 Bad Request",
                 "unsupported_mcp_protocol_version",
+                "use a supported client/server revision permitted by mcp.versions",
             ),
             (
                 "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
                 "400 Bad Request",
                 "invalid_mcp_protocol_version_header",
+                "send exactly one revision",
             ),
             (
                 "MCP-Protocol-Version: 2025-06-18\r\n",
                 "403 Forbidden",
                 "mcp_protocol_version_not_allowed",
+                "selected MCP revision 2025-06-18 from MCP-Protocol-Version",
             ),
-            ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
+            (
+                "",
+                "403 Forbidden",
+                "mcp_protocol_version_not_allowed",
+                "missing MCP-Protocol-Version header fallback; send the client/server revision explicitly",
+            ),
         ] {
             let (response, forwarded) = run_rejected_mcp_request(
                 false,
@@ -11021,6 +11403,7 @@ network_policies:
                 "{response}"
             );
             assert!(response.contains(code), "{response}");
+            assert!(response.contains(remedy), "{response}");
             assert!(forwarded.is_empty(), "rejected request reached upstream");
         }
     }
@@ -11506,10 +11889,38 @@ network_policies:
             response.contains("does not permit top-level JSON-RPC batches"),
             "{response}"
         );
+        assert!(response.contains("send each JSON-RPC message in a separate request"));
+        assert!(response.contains("selected MCP revision 2025-11-25 from MCP-Protocol-Version"));
         assert!(
             forwarded.is_empty(),
             "profile-invalid request reached upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_explains_unavailable_method_without_reflecting_params() {
+        // tasks/update is known to the parser but absent from the selected
+        // core revision. The diagnostic must not suggest adding an allow rule.
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tasks/update","params":{"taskId":"private-task-marker","inputResponses":{"secret":"private-argument-marker"}}}"#;
+        for route_selected in [false, true] {
+            let (response, forwarded) = run_rejected_mcp_request(
+                route_selected,
+                "MCP-Protocol-Version: 2025-11-25\r\n",
+                body,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("invalid_mcp_request"), "{response}");
+            assert!(response.contains("`tasks/update` is unavailable in revision 2025-11-25"));
+            assert!(response.contains("allow_all_known_mcp_methods cannot enable"));
+            assert!(response.contains("from MCP-Protocol-Version"));
+            assert!(!response.contains("private-task-marker"));
+            assert!(!response.contains("private-argument-marker"));
+            assert!(forwarded.is_empty(), "unavailable method reached upstream");
+        }
     }
 
     #[tokio::test]

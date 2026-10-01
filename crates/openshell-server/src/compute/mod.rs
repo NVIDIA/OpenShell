@@ -25,6 +25,8 @@ use hyper_util::rt::TokioIo;
 use openshell_core::extension_protocol::{
     ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
 };
+#[cfg(test)]
+use openshell_core::proto::ServiceAuthorizationMode;
 use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
@@ -2133,6 +2135,7 @@ impl ComputeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn delete_sandbox(
         &self,
         workspace: &str,
@@ -4723,6 +4726,39 @@ impl ComputeRuntime {
         Ok(())
     }
 
+    /// Start ephemeral cleanup only after the finalize RPC has recorded the
+    /// terminal result and marked its supervisor session finalized.
+    pub async fn cleanup_finalized_ephemeral_sandbox(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let Some(sandbox) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if phase != SandboxPhase::Completed && !is_failed_main_process_result(&sandbox) {
+            return Ok(());
+        }
+        let Some(status) = sandbox.status.as_ref() else {
+            return Ok(());
+        };
+        if status.exit_code.is_none()
+            || (!status.main_process_instance_id.is_empty()
+                && status.main_process_instance_id != instance_id)
+        {
+            return Ok(());
+        }
+        self.schedule_ephemeral_sandbox_delete(&sandbox);
+        Ok(())
+    }
+
     fn schedule_ephemeral_sandbox_delete(&self, sandbox: &Sandbox) {
         if provisioning_deadline::timed_out(sandbox) {
             return;
@@ -4738,10 +4774,10 @@ impl ComputeRuntime {
         }
 
         let runtime = self.clone();
-        let workspace = sandbox.object_workspace().to_string();
+        let sandbox_id = sandbox.object_id().to_string();
         let name = sandbox.object_name().to_string();
         tokio::spawn(async move {
-            if let Err(error) = runtime.delete_sandbox(&workspace, &name).await {
+            if let Err(error) = runtime.delete_sandbox_by_id(&sandbox_id, &name).await {
                 tracing::warn!(
                     sandbox_name = %name,
                     error = %error,
@@ -9298,7 +9334,7 @@ mod tests {
             .unwrap();
         assert_eq!(driver.delete_calls(), 0);
         runtime
-            .supervisor_session_disconnected("sb-1", true)
+            .cleanup_finalized_ephemeral_sandbox("sb-1", "instance-1")
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -9307,7 +9343,83 @@ mod tests {
             }
         })
         .await
-        .expect("terminal finalization should release ephemeral cleanup");
+        .expect("terminal finalization should delete before the supervisor disconnects");
+    }
+
+    #[tokio::test]
+    async fn finalized_ephemeral_cleanup_skips_retained_and_restarting_sandboxes() {
+        for (retention, restart_policy, exit_code) in [
+            (None, SandboxRestartPolicy::Never, 0),
+            (Some("ephemeral"), SandboxRestartPolicy::OnFailure, 9),
+        ] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+            if let Some(retention) = retention {
+                sandbox.metadata.as_mut().unwrap().annotations.insert(
+                    "openshell.nvidia.com/retention".to_string(),
+                    retention.to_string(),
+                );
+            }
+            sandbox.spec = Some(SandboxSpec {
+                restart_policy: restart_policy as i32,
+                ..Default::default()
+            });
+            runtime.store.put_message(&sandbox).await.unwrap();
+            runtime
+                .supervisor_session_connected("sb-1", "instance-1")
+                .await
+                .unwrap();
+            runtime
+                .report_main_process_exit("sb-1", "instance-1", exit_code)
+                .await
+                .unwrap();
+            runtime
+                .finalize_main_process_exit("sb-1", "instance-1")
+                .await
+                .unwrap();
+            runtime
+                .cleanup_finalized_ephemeral_sandbox("sb-1", "instance-1")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(driver.delete_calls(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_failed_ephemeral_sandbox_deletes_while_connected() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .report_main_process_exit("sb-1", "instance-1", 9)
+            .await
+            .unwrap();
+        runtime
+            .finalize_main_process_exit("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .cleanup_finalized_ephemeral_sandbox("sb-1", "instance-1")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed canonical main should delete its ephemeral sandbox");
     }
 
     #[tokio::test]
@@ -9509,6 +9621,7 @@ mod tests {
             name: "web".to_string(),
             target_port: 8080,
             domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
         }
     }
 

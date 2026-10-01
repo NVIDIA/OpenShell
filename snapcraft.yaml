@@ -88,9 +88,10 @@ apps:
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
-    # Refresh must activate the migrated mTLS config immediately. This
-    # interrupts active sandbox sessions.
-    refresh-mode: restart
+    # refresh-mode: endure prevents snapd from restarting the gateway daemon
+    # during snap refreshes, which would kill active sandbox sessions.
+    # Operators must manually restart the service after a refresh if needed.
+    refresh-mode: endure
     # Snapd runs this daemon as root. The wrapper serves TLS from the bundle
     # generated in $SNAP_COMMON/tls, and the default config requires client
     # certificates; the installer copies the client bundle to the target

@@ -143,6 +143,9 @@ impl MockGateway {
                         if matches!(self.scenario, Scenario::Echo)
                             && output.send(Ok(stdout(bytes))).await.is_err()
                         {
+                            // A failed send observes the same response drop as
+                            // output.closed(), including cancellation mid-echo.
+                            self.calls.lock().unwrap().response_cancelled = true;
                             return;
                         }
                     }
@@ -567,6 +570,76 @@ async fn streaming_remote_exit_does_not_wait_for_idle_open_stdin() {
 }
 
 #[tokio::test]
+async fn default_open_pipe_exchanges_input_after_grace_and_closes_cleanly() {
+    let gateway = TestGateway::start(Scenario::Echo).await;
+    let mut child = gateway.spawn(false);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    for request in ["before grace\n", "after grace\n"] {
+        stdin.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        timeout(DEADLINE, stdout.read_line(&mut response))
+            .await
+            .expect("default exec must respond before stdin EOF")
+            .unwrap();
+        assert_eq!(response, request);
+    }
+    drop(stdin);
+    let mut final_stdout = String::new();
+    timeout(DEADLINE, stdout.read_to_string(&mut final_stdout))
+        .await
+        .unwrap()
+        .unwrap();
+    let output = finish(child).await;
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(final_stdout, "after-eof\n");
+    assert_eq!(output.stderr, b"remote-stderr\n");
+    gateway.assert_one_stream();
+    assert!(gateway.calls.lock().unwrap().request_ended);
+}
+
+#[tokio::test]
+async fn default_open_pipe_overflow_cancels_after_forwarding_prefix() {
+    let gateway = TestGateway::start(Scenario::Echo).await;
+    let mut child = gateway.spawn(false);
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"prefix\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    timeout(DEADLINE, stdout.read_line(&mut response))
+        .await
+        .expect("prefix must reach the command before sending overflow")
+        .unwrap();
+    assert_eq!(response, "prefix\n");
+    // Drain echo output concurrently so stdout backpressure does not prevent
+    // the input writer from reaching the cap and cancelling the response.
+    let drain = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.unwrap();
+    });
+    send_input(&mut child, &vec![b'x'; STDIN_LIMIT]).await;
+    let output = finish(child).await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("streamed stdin exceeds the 4 MiB limit"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("partial input"), "{stderr}");
+    timeout(DEADLINE, drain).await.unwrap().unwrap();
+    gateway.wait_for_stream_end().await;
+    gateway.assert_one_stream();
+    let calls = gateway.calls.lock().unwrap();
+    assert!(calls.input_bytes <= STDIN_LIMIT);
+    assert!(calls.response_cancelled);
+}
+
+#[tokio::test]
 async fn streaming_trailer_error_after_exit_is_not_success() {
     let gateway = TestGateway::start(Scenario::ErrorAfterExit).await;
     let mut child = gateway.spawn(true);
@@ -773,17 +846,33 @@ async fn default_large_finite_pipe_retains_streaming_transport() {
 }
 
 #[tokio::test]
-async fn default_oversized_pipe_is_rejected_before_launch() {
-    let gateway = TestGateway::start(Scenario::Count).await;
+async fn default_oversized_pipe_is_rejected_or_cancels_after_grace() {
+    let gateway = TestGateway::start(Scenario::AwaitCancellation).await;
     let mut child = gateway.spawn(false);
     send_input(&mut child, &vec![b'x'; STDIN_LIMIT + 1]).await;
     let output = finish(child).await;
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("piped stdin exceeds the 4 MiB limit")
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let started = !gateway.calls.lock().unwrap().starts.is_empty();
+    // Scheduler speed determines whether the cap is reached during the grace
+    // period. Both rejection before launch and bounded cancellation are valid.
+    if started {
+        assert!(
+            stderr.contains("streamed stdin exceeds the 4 MiB limit"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("partial input"), "{stderr}");
+        gateway.wait_for_stream_end().await;
+        gateway.assert_one_stream();
+    } else {
+        assert!(
+            stderr.contains("piped stdin exceeds the 4 MiB limit"),
+            "{stderr}"
+        );
+    }
     let calls = gateway.calls.lock().unwrap();
     assert_eq!(calls.lookups, 1);
     assert!(calls.unary.is_empty());
-    assert!(calls.starts.is_empty());
+    assert!(calls.input_bytes <= STDIN_LIMIT);
+    assert!(!started || calls.response_cancelled);
 }

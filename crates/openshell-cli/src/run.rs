@@ -58,9 +58,9 @@ use openshell_core::proto::{
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
     SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
     SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SettingScope, StartSandboxRequest,
-    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -443,6 +443,7 @@ pub struct SandboxCreateConfig<'a> {
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
+    pub expose_authorization_mode: ServiceAuthorizationMode,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -472,6 +473,7 @@ impl Default for SandboxCreateConfig<'_> {
             policy: None,
             forward: None,
             expose: None,
+            expose_authorization_mode: ServiceAuthorizationMode::Strip,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -509,6 +511,7 @@ pub async fn sandbox_create(
         policy,
         forward,
         expose,
+        expose_authorization_mode,
         command,
         tty_override,
         auto_providers_override,
@@ -693,6 +696,7 @@ pub async fn sandbox_create(
             .map(|target_port| SandboxServiceExposure {
                 service: String::new(),
                 target_port: u32::from(target_port),
+                authorization_mode: expose_authorization_mode as i32,
             })
             .into_iter()
             .collect(),
@@ -1848,6 +1852,113 @@ fn local_terminal_size() -> Option<(u32, u32)> {
 const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
 
+/// How long `sandbox exec` waits for piped stdin to reach EOF before it starts
+/// the command and streams the rest of the input as it arrives.
+///
+/// Small pipes such as `echo x | openshell sandbox exec ...` close well within
+/// this window and keep using the single-request path that older gateways
+/// need. A pipe that stays open (a CI runner, a supervisor, a harness that
+/// never closes stdin) must not block the command: after the grace period the
+/// command starts and stdin is forwarded until EOF or until the command exits.
+const EXEC_STDIN_UNARY_GRACE: Duration = Duration::from_millis(200);
+
+/// Piped stdin as collected by [`collect_piped_stdin`].
+enum PipedStdin {
+    /// stdin reached EOF within the grace period; `prefix` holds all of it.
+    Complete(Vec<u8>),
+    /// stdin is still open. `prefix` is what arrived so far; `rest` delivers
+    /// the remaining chunks until EOF.
+    Open {
+        prefix: Vec<u8>,
+        rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    },
+}
+
+/// Read a pipe on a detached OS thread and hand its bytes over in chunks.
+///
+/// A plain `std::thread` rather than `spawn_blocking`, so runtime shutdown
+/// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
+/// read error, or when the receiver is dropped.
+fn spawn_piped_stdin_reader(
+    mut reader: impl Read + Send + 'static,
+) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    return;
+                }
+                Ok(n) => {
+                    if tx.blocking_send(Ok(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+// Adapt the grace-period reader's queued chunks to the bounded stdin writer.
+// Read this only on the detached forwarding thread: blocking_recv must never
+// run on a Tokio worker. Keep partial chunks so the writer can probe exactly
+// one byte beyond its allowance without losing any permitted input.
+struct PipedStdinReader {
+    rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    chunk: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for PipedStdinReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let size = self.chunk.read(buffer)?;
+            if size != 0 {
+                return Ok(size);
+            }
+            match self.rest.blocking_recv() {
+                Some(chunk) => self.chunk = std::io::Cursor::new(chunk?),
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+/// Collect piped stdin until EOF or until `grace` elapses, whichever comes
+/// first. Input beyond `limit` bytes is rejected with the upload hint.
+async fn collect_piped_stdin(
+    mut rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    grace: Duration,
+    limit: usize,
+) -> Result<PipedStdin> {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut prefix = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Ok(chunk))) => {
+                prefix.extend_from_slice(&chunk);
+                if prefix.len() > limit {
+                    return Err(piped_stdin_limit_error());
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error).into_diagnostic(),
+            Ok(None) => return Ok(PipedStdin::Complete(prefix)),
+            Err(_elapsed) => return Ok(PipedStdin::Open { prefix, rest: rx }),
+        }
+    }
+}
+
+fn piped_stdin_limit_error() -> miette::Report {
+    miette::miette!("piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input")
+}
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// With `stream_stdin`, starts before local EOF and sends up to 4 MiB without a
@@ -1900,27 +2011,22 @@ pub async fn sandbox_exec_grpc(
     let tty = !stream_stdin
         && tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
 
-    // Finite pipes retain atomic oversize rejection and unary exec for small
-    // input. Streaming starts immediately, enforcing the same total byte cap
-    // while reading because the supervisor's process stdin queue is unbounded.
-    let stdin_prefix = if stream_stdin || stdin_is_terminal {
-        Vec::new()
+    // Small pipes retain unary exec. An open pipe starts after the grace
+    // period; explicit streaming skips that wait and always disables the PTY.
+    // Both paths enforce the same cumulative input cap while forwarding.
+    let (stdin_prefix, stdin_rest) = if stream_stdin || stdin_is_terminal {
+        (Vec::new(), None)
     } else {
-        tokio::task::spawn_blocking(|| {
-            let mut prefix = Vec::new();
-            std::io::stdin()
-                .take((MAX_EXEC_STDIN_BYTES + 1) as u64)
-                .read_to_end(&mut prefix)
-                .into_diagnostic()?;
-            if prefix.len() > MAX_EXEC_STDIN_BYTES {
-                return Err(miette::miette!(
-                    "piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input"
-                ));
-            }
-            Ok::<_, miette::Report>(prefix)
-        })
-        .await
-        .into_diagnostic()??
+        match collect_piped_stdin(
+            spawn_piped_stdin_reader(std::io::stdin()),
+            EXEC_STDIN_UNARY_GRACE,
+            MAX_EXEC_STDIN_BYTES,
+        )
+        .await?
+        {
+            PipedStdin::Complete(prefix) => (prefix, None),
+            PipedStdin::Open { prefix, rest } => (prefix, Some(rest)),
+        }
     };
 
     let (cols, rows) = if tty {
@@ -1953,7 +2059,10 @@ pub async fn sandbox_exec_grpc(
             "exec command or environment exceeds the gateway's 1 MiB message limit"
         ));
     }
-    if stream_stdin || (tty && stdin_is_terminal) || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
+    if stream_stdin
+        || (tty && stdin_is_terminal)
+        || stdin_rest.is_some()
+        || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
     {
         return sandbox_exec_streaming_grpc(
             client,
@@ -1966,6 +2075,7 @@ pub async fn sandbox_exec_grpc(
             tty,
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
+            stdin_rest,
             (stream_stdin || !stdin_is_terminal).then_some(MAX_EXEC_STDIN_BYTES),
         )
         .await;
@@ -2438,6 +2548,7 @@ async fn sandbox_exec_streaming_grpc(
     tty: bool,
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
+    stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
     stdin_limit: Option<usize>,
 ) -> Result<i32> {
     #[cfg(unix)]
@@ -2495,12 +2606,27 @@ async fn sandbox_exec_streaming_grpc(
     let stdin_tx = input_tx.clone();
     let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let result = write_exec_stdin_frames(
-            std::io::stdin().lock(),
-            &stdin_prefix,
-            stdin_limit,
-            &stdin_tx,
-        );
+        // The grace-period reader already owns an open pipe. Reuse its queued
+        // chunks through the same bounded writer as explicit streaming so cap
+        // violations and read failures never become a successful stdin EOF.
+        let result = if let Some(rest) = stdin_rest {
+            write_exec_stdin_frames(
+                PipedStdinReader {
+                    rest,
+                    chunk: std::io::Cursor::new(Vec::new()),
+                },
+                &stdin_prefix,
+                stdin_limit,
+                &stdin_tx,
+            )
+        } else {
+            write_exec_stdin_frames(
+                std::io::stdin().lock(),
+                &stdin_prefix,
+                stdin_limit,
+                &stdin_tx,
+            )
+        };
         let _ = stdin_result_tx.send(result);
     });
 
@@ -3879,11 +4005,20 @@ pub async fn service_expose(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let response =
-        expose_service_endpoint(server, sandbox, service, target_port, workspace, tls).await?;
+    let response = expose_service_endpoint(
+        server,
+        sandbox,
+        service,
+        target_port,
+        authorization_mode,
+        workspace,
+        tls,
+    )
+    .await?;
 
     if service.is_empty() {
         println!(
@@ -3913,6 +4048,7 @@ async fn expose_service_endpoint(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<ServiceEndpointResponse> {
@@ -3924,6 +4060,7 @@ async fn expose_service_endpoint(
             name: service.to_string(),
             target_port: u32::from(target_port),
             domain: true,
+            authorization_mode: authorization_mode as i32,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -4096,6 +4233,7 @@ fn print_service_endpoint_table(
                 .map_or("", |m| m.workspace.as_str());
             let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
             let url = if response.url.is_empty() {
                 String::new()
             } else {
@@ -4106,6 +4244,7 @@ fn print_service_endpoint_table(
                 endpoint.sandbox.clone(),
                 service,
                 target,
+                authorization,
                 url,
             ))
         })
@@ -4117,7 +4256,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -4126,50 +4265,52 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _)| service.len())
+        .map(|(_, _, service, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _)| target.len())
+        .map(|(_, _, _, target, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, url) in rows {
+    for (workspace, sandbox, service, target, authorization, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         }
     }
@@ -4195,12 +4336,20 @@ fn service_endpoint_to_json(
         "sandbox": endpoint.sandbox,
         "service": endpoint.name,
         "target_port": endpoint.target_port,
+        "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
     }))
 }
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
+}
+
+fn service_authorization_mode_name(mode: i32) -> &'static str {
+    match ServiceAuthorizationMode::try_from(mode).unwrap_or(ServiceAuthorizationMode::Strip) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
 }
 
 /// Read gcloud Application Default Credentials from disk.
@@ -6305,7 +6454,7 @@ pub async fn sandbox_draft_approve(
             review_token,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6316,6 +6465,23 @@ pub async fn sandbox_draft_approve(
     );
 
     Ok(())
+}
+
+/// Explain an approval the gateway refused because the proposal's evaluation
+/// changed after it was fetched. The gateway has already stored the refreshed
+/// evaluation, so the reviewer needs to look at it before approving again.
+fn draft_approval_error(status: Status, name: &str) -> miette::Report {
+    if status.code() == Code::FailedPrecondition
+        && status.message().contains("refetch and review again")
+    {
+        return miette::miette!(
+            help = format!(
+                "review it with `openshell rule get {name} --status pending`, then approve again"
+            ),
+            "the sandbox policy or its inputs changed after this rule was fetched, so the gateway re-evaluated it"
+        );
+    }
+    miette::Report::from_err(status)
 }
 
 /// Reject a network rule.
@@ -6386,7 +6552,7 @@ pub async fn sandbox_draft_approve_all(
             approvals,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6695,6 +6861,74 @@ mod tests {
         );
     }
 
+    fn queued_stdin_reader(chunks: Vec<std::io::Result<Vec<u8>>>) -> super::PipedStdinReader {
+        let (sender, rest) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            sender.try_send(chunk).unwrap();
+        }
+        super::PipedStdinReader {
+            rest,
+            chunk: std::io::Cursor::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn piped_stdin_reader_preserves_partial_chunks_and_exact_limit_eof() {
+        let reader = queued_stdin_reader(vec![Ok(Vec::new()), Ok(b"b".to_vec())]);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+        super::write_exec_stdin_frames(reader, b"a", Some(2), &sender).unwrap();
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            let super::ExecInputMessage::Frame(frame) = receiver.try_recv().unwrap() else {
+                panic!("expected input before EOF");
+            };
+            let Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(chunk)) =
+                frame.payload
+            else {
+                panic!("expected stdin frame");
+            };
+            bytes.extend(chunk);
+        }
+        assert_eq!(bytes, b"ab");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(super::ExecInputMessage::Eof)
+        ));
+
+        // The writer reads only two permitted bytes from this three-byte chunk.
+        // Its next read must see the remaining byte, reject it, and omit EOF.
+        let reader = queued_stdin_reader(vec![Ok(b"abc".to_vec())]);
+        let error = assert_exec_stdin_writer_error(reader, &[]);
+        assert!(error.to_string().contains("partial input"));
+    }
+
+    #[test]
+    fn piped_stdin_reader_failure_after_prefix_does_not_queue_eof() {
+        let reader = queued_stdin_reader(vec![Err(std::io::Error::other("pipe failed"))]);
+        let error = assert_exec_stdin_writer_error(reader, b"ab");
+        assert_eq!(error.to_string(), "pipe failed");
+    }
+
+    #[test]
+    fn draft_approval_error_explains_refreshed_evaluation() {
+        use super::draft_approval_error;
+        use tonic::Status;
+
+        let refreshed = draft_approval_error(
+            Status::failed_precondition(
+                "proposal inputs changed; evaluation refreshed, refetch and review again",
+            ),
+            "my-agent",
+        );
+        assert!(refreshed.to_string().contains("re-evaluated"));
+        let help = refreshed.help().expect("help text").to_string();
+        assert!(help.contains("openshell rule get my-agent --status pending"));
+
+        let other = draft_approval_error(Status::not_found("chunk not found"), "my-agent");
+        assert!(other.to_string().contains("chunk not found"));
+        assert!(other.help().is_none());
+    }
+
     #[test]
     fn zero_exec_timeout_is_omitted() {
         assert!(proto_execution_timeout(0).unwrap().is_none());
@@ -6726,8 +6960,9 @@ mod tests {
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
         SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
         SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
-        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceEndpoint,
-        ServiceEndpointResponse, WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6844,6 +7079,7 @@ mod tests {
                 sandbox: "api".to_string(),
                 name: String::new(),
                 target_port: 8080,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                 ..Default::default()
             }),
             url: "https://api.openshell.localhost:3000/".to_string(),
@@ -6858,6 +7094,7 @@ mod tests {
                 "sandbox": "api",
                 "service": "",
                 "target_port": 8080,
+                "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
             })
         );
@@ -8380,5 +8617,83 @@ mod tests {
         let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
         let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
         assert!(format_log_line(&log).ends_with(message));
+    }
+
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    fn exec_stdin_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn piped_stdin_that_closes_quickly_goes_in_one_request() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"hi\n").unwrap();
+        drop(writer);
+        let collected = exec_stdin_runtime().block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_secs(5),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        match collected.expect("collect") {
+            super::PipedStdin::Complete(prefix) => assert_eq!(prefix, b"hi\n"),
+            super::PipedStdin::Open { .. } => panic!("closed pipe must complete"),
+        }
+    }
+
+    #[test]
+    fn piped_stdin_that_stays_open_does_not_block_the_command() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"early").unwrap();
+        let grace = Duration::from_millis(100);
+        let started = Instant::now();
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            grace,
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= grace, "must wait the grace period: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must not wait for EOF: {elapsed:?}"
+        );
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert_eq!(prefix, b"early");
+        // The remainder keeps flowing after the command has started.
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
+    #[test]
+    fn piped_stdin_over_the_limit_is_rejected_with_the_upload_hint() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(&[0u8; 8]).unwrap();
+        drop(writer);
+        let error = exec_stdin_runtime()
+            .block_on(super::collect_piped_stdin(
+                super::spawn_piped_stdin_reader(reader),
+                Duration::from_secs(5),
+                4,
+            ))
+            .err()
+            .expect("over the limit must fail");
+        assert!(error.to_string().contains("sandbox upload"), "{error}");
     }
 }

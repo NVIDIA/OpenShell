@@ -20,9 +20,16 @@ import {
   SandboxClient,
   SandboxTemplateClient,
   SCOPE_NAMES,
+  ServiceAuthorizationMode,
   STATUS_NAMES,
 } from './client.js';
-import { OpenShell, SandboxPhase, SandboxRestartPolicy, ServiceStatus } from './gen/openshell_pb.js';
+import {
+  OpenShell,
+  ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  SandboxPhase,
+  SandboxRestartPolicy,
+  ServiceStatus,
+} from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
@@ -276,7 +283,9 @@ describe('exec / execStream', () => {
 
 describe('create', () => {
   it('sends create-time service exposures', async () => {
-    let created: { serviceExposures?: Array<{ service?: string; targetPort?: number }> } = {};
+    let created: {
+      serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+    } = {};
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -292,12 +301,29 @@ describe('create', () => {
 
     const result = await sandbox.create({
       image: 'img',
-      serviceExposures: [{ targetPort: 4500 }, { service: 'metrics', targetPort: 9090 }],
+      serviceExposures: [
+        { targetPort: 4500 },
+        {
+          service: 'metrics',
+          targetPort: 9090,
+          authorizationMode: ServiceAuthorizationMode.BearerPassthrough,
+        },
+      ],
     });
 
-    expect(created.serviceExposures?.map(({ service, targetPort }) => ({ service, targetPort }))).toEqual([
-      { service: '', targetPort: 4500 },
-      { service: 'metrics', targetPort: 9090 },
+    expect(
+      created.serviceExposures?.map(({ service, targetPort, authorizationMode }) => ({
+        service,
+        targetPort,
+        authorizationMode,
+      })),
+    ).toEqual([
+      { service: '', targetPort: 4500, authorizationMode: ProtoServiceAuthorizationMode.STRIP },
+      {
+        service: 'metrics',
+        targetPort: 9090,
+        authorizationMode: ProtoServiceAuthorizationMode.BEARER_PASSTHROUGH,
+      },
     ]);
     expect(result.serviceUrls).toEqual({
       '': 'https://sb.example.test/',
