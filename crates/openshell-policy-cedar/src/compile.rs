@@ -171,11 +171,11 @@ pub fn compile_normalized_data(data: &Value) -> Result<CompiledCedarPolicy, Ceda
     })
 }
 
-fn is_exact(pattern: &str) -> bool {
+pub(crate) fn is_exact(pattern: &str) -> bool {
     matches!(classify_glob(pattern), GlobClass::Exact(_))
 }
 
-fn parse_endpoints(policy: &Value) -> Vec<EndpointPattern> {
+pub(crate) fn parse_endpoints(policy: &Value) -> Vec<EndpointPattern> {
     policy
         .get("endpoints")
         .and_then(Value::as_array)
@@ -198,7 +198,7 @@ fn parse_endpoints(policy: &Value) -> Vec<EndpointPattern> {
         .unwrap_or_default()
 }
 
-fn parse_binaries(policy: &Value) -> Vec<String> {
+pub(crate) fn parse_binaries(policy: &Value) -> Vec<String> {
     policy
         .get("binaries")
         .and_then(Value::as_array)
@@ -212,7 +212,7 @@ fn parse_binaries(policy: &Value) -> Vec<String> {
 }
 
 /// One endpoint condition ready to render into a Cedar `when` clause.
-enum EndpointCondition {
+pub(crate) enum EndpointCondition {
     /// Combined into one `Set.contains()` check for the whole policy.
     ExactHostPort(String),
     /// One `.like()` clause per safe glob pattern.
@@ -221,7 +221,7 @@ enum EndpointCondition {
 
 /// Classifies every endpoint in `endpoints`. Returns `None` if any endpoint
 /// has a segment-unsafe host glob.
-fn classify_endpoints(endpoints: &[EndpointPattern]) -> Option<Vec<EndpointCondition>> {
+pub(crate) fn classify_endpoints(endpoints: &[EndpointPattern]) -> Option<Vec<EndpointCondition>> {
     let mut conditions = Vec::new();
     for endpoint in endpoints {
         match classify_glob(&endpoint.host) {
@@ -246,14 +246,10 @@ fn classify_endpoints(endpoints: &[EndpointPattern]) -> Option<Vec<EndpointCondi
     Some(conditions)
 }
 
-/// Appends one generated `permit` policy for `name` to `cedar_src`.
-fn write_policy(
-    cedar_src: &mut String,
-    name: &str,
-    endpoint_conditions: &[EndpointCondition],
-    binaries: &[String],
-    require_binary_identity: bool,
-) {
+/// Renders `endpoint_conditions` into a Cedar `when`-clause fragment
+/// (`resource`-side host:port matching), shared by the CONNECT-time and L7
+/// compilers.
+pub(crate) fn render_endpoint_clause(endpoint_conditions: &[EndpointCondition]) -> String {
     let exact_host_ports: Vec<&str> = endpoint_conditions
         .iter()
         .filter_map(|c| match c {
@@ -284,28 +280,43 @@ fn write_policy(
             ));
         }
     }
+    format!("({})", endpoint_clauses.join(" || "))
+}
 
-    let binary_clause = if require_binary_identity {
-        if binaries.is_empty() {
-            // Rego requires at least one `policy.binaries[_]` entry to
-            // match; an empty list can never satisfy `binary_allowed`.
-            "false".to_string()
-        } else {
-            let set_literal = binaries
-                .iter()
-                .map(|b| cedar_string_literal(b))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "([{set_literal}].contains(context.{binary_field}) \
-                 || context.{ancestors_field}.containsAny([{set_literal}]))",
-                binary_field = context_fields::BINARY_PATH,
-                ancestors_field = context_fields::ANCESTORS,
-            )
-        }
-    } else {
-        "true".to_string()
-    };
+/// Renders `binaries` into a Cedar `when`-clause fragment (`context`-side
+/// binary/ancestor matching), shared by the CONNECT-time and L7 compilers.
+pub(crate) fn render_binary_clause(binaries: &[String], require_binary_identity: bool) -> String {
+    if !require_binary_identity {
+        return "true".to_string();
+    }
+    if binaries.is_empty() {
+        // Rego requires at least one `policy.binaries[_]` entry to match;
+        // an empty list can never satisfy `binary_allowed`.
+        return "false".to_string();
+    }
+    let set_literal = binaries
+        .iter()
+        .map(|b| cedar_string_literal(b))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "([{set_literal}].contains(context.{binary_field}) \
+         || context.{ancestors_field}.containsAny([{set_literal}]))",
+        binary_field = context_fields::BINARY_PATH,
+        ancestors_field = context_fields::ANCESTORS,
+    )
+}
+
+/// Appends one generated `permit` policy for `name` to `cedar_src`.
+fn write_policy(
+    cedar_src: &mut String,
+    name: &str,
+    endpoint_conditions: &[EndpointCondition],
+    binaries: &[String],
+    require_binary_identity: bool,
+) {
+    let endpoint_clause = render_endpoint_clause(endpoint_conditions);
+    let binary_clause = render_binary_clause(binaries, require_binary_identity);
 
     let _ = writeln!(
         cedar_src,
@@ -314,19 +325,18 @@ fn write_policy(
            principal is {process},\n  \
            action == {action_type}::{action_id},\n  \
            resource is {endpoint}\n\
-         )\nwhen {{\n  ({endpoint_clauses}) && {binary_clause}\n}};\n",
+         )\nwhen {{\n  {endpoint_clause} && {binary_clause}\n}};\n",
         comment_name = name.replace(['\n', '\r'], " "),
         process = entity_types::PROCESS,
         action_type = actions::ACTION_TYPE,
         action_id = cedar_string_literal(actions::NETWORK_CONNECT),
         endpoint = entity_types::NETWORK_ENDPOINT,
-        endpoint_clauses = endpoint_clauses.join(" || "),
     );
 }
 
 /// Renders `value` as an escaped Cedar string literal (`"..."`, with `\`
 /// and `"` escaped).
-fn cedar_string_literal(value: &str) -> String {
+pub(crate) fn cedar_string_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for c in value.chars() {

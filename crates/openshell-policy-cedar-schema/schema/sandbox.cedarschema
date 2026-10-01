@@ -62,4 +62,23 @@ namespace Sandbox {
         command:     String,
       }
     };
+
+  // Per-request L7 enforcement within an already-permitted NetworkConnect
+  // tunnel. binary_path/ancestors/method/path/command mirror NetworkConnect's
+  // fields (same "" for not-applicable convention; binary identity is
+  // re-checked per request, matching Rego's stateless per-call evaluation);
+  // jsonrpc_method is new, for JSON-RPC method allow-listing.
+  action "HttpRequest"
+    appliesTo {
+      principal: [Process],
+      resource:  [NetworkEndpoint],
+      context: {
+        binary_path:    String,
+        ancestors:      Set<String>,
+        method:         String,
+        path:           String,
+        command:        String,
+        jsonrpc_method: String,
+      }
+    };
 }

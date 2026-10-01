@@ -6,9 +6,12 @@
 //! Checks that filesystem policy verification catches the authoring
 //! mistakes it's meant to catch, and stays quiet on clean policies.
 
+use std::str::FromStr as _;
+
+use cedar_policy::PolicySet;
 use openshell_policy_cedar::filesystem::{
     FilesystemAccess, FilesystemFinding, FilesystemPolicyInput, compile_filesystem_entities,
-    verify_filesystem_policy,
+    extract_authorized_paths, verify_filesystem_policy,
 };
 
 #[test]
@@ -112,5 +115,98 @@ fn compiles_entities_for_a_clean_policy() {
             .ancestors(&bin_uid)
             .is_some_and(|mut ancestors| ancestors.any(|a| a == &usr_uid)),
         "/usr/bin must have /usr as a Cedar hierarchy ancestor"
+    );
+}
+
+#[test]
+fn extracts_read_only_and_read_write_from_authored_permits() {
+    let policies = PolicySet::from_str(
+        r#"
+        permit(
+            principal is Sandbox::Process,
+            action == Sandbox::Action::"ReadFile",
+            resource is Sandbox::FilesystemPath
+        )
+        when { resource in Sandbox::FilesystemPath::"/usr" };
+
+        permit(
+            principal is Sandbox::Process,
+            action in [Sandbox::Action::"ReadFile", Sandbox::Action::"WriteFile"],
+            resource is Sandbox::FilesystemPath
+        )
+        when { resource == Sandbox::FilesystemPath::"/sandbox" };
+        "#,
+    )
+    .expect("policy text must parse");
+
+    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
+    assert_eq!(extracted.read_only, vec!["/usr".to_string()]);
+    assert_eq!(extracted.read_write, vec!["/sandbox".to_string()]);
+}
+
+#[test]
+fn write_only_action_still_counts_as_read_write() {
+    let policies = PolicySet::from_str(
+        r#"
+        permit(
+            principal is Sandbox::Process,
+            action == Sandbox::Action::"WriteFile",
+            resource is Sandbox::FilesystemPath
+        )
+        when { resource == Sandbox::FilesystemPath::"/tmp" };
+        "#,
+    )
+    .expect("policy text must parse");
+
+    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
+    assert!(extracted.read_only.is_empty());
+    assert_eq!(extracted.read_write, vec!["/tmp".to_string()]);
+}
+
+#[test]
+fn ignores_policies_unrelated_to_filesystem_path() {
+    let policies = PolicySet::from_str(
+        r#"
+        permit(
+            principal is Sandbox::Process,
+            action == Sandbox::Action::"NetworkConnect",
+            resource is Sandbox::NetworkEndpoint
+        )
+        when { resource.host_port == "pypi.org:443" };
+        "#,
+    )
+    .expect("policy text must parse");
+
+    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
+    assert!(extracted.read_only.is_empty());
+    assert!(extracted.read_write.is_empty());
+}
+
+#[test]
+fn forbid_on_filesystem_path_is_rejected() {
+    let policies = PolicySet::from_str(
+        r#"
+        permit(
+            principal is Sandbox::Process,
+            action == Sandbox::Action::"ReadFile",
+            resource is Sandbox::FilesystemPath
+        )
+        when { resource in Sandbox::FilesystemPath::"/usr" };
+
+        forbid(
+            principal is Sandbox::Process,
+            action == Sandbox::Action::"ReadFile",
+            resource is Sandbox::FilesystemPath
+        )
+        when { resource == Sandbox::FilesystemPath::"/usr/secret" };
+        "#,
+    )
+    .expect("policy text must parse");
+
+    let error = extract_authorized_paths(&policies)
+        .expect_err("forbid targeting FilesystemPath must be rejected");
+    assert!(
+        error.to_string().contains("forbid"),
+        "error should mention the forbid policy: {error}"
     );
 }

@@ -601,6 +601,9 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         network_policies,
         network_middlewares,
+        // YAML-authored policies never set this; it's exclusive to
+        // Cedar-sourced policies (see `proto/sandbox.proto`).
+        cedar_policy_source: String::new(),
     })
 }
 
@@ -957,6 +960,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         process: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
+        cedar_policy_source: String::new(),
     }
 }
 
@@ -3570,6 +3574,7 @@ network_policies:
     #[test]
     fn validate_accepts_empty_process() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             process: None,
             filesystem: None,
@@ -4025,6 +4030,7 @@ network_policies:
     #[test]
     fn validate_accepts_numeric_uid_in_range() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: "1000".into(),
@@ -4041,6 +4047,7 @@ network_policies:
     #[test]
     fn validate_accepts_boundary_uids() {
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: MIN_SANDBOX_UID.to_string(),
@@ -4113,6 +4120,7 @@ network_policies:
     fn validate_accepts_mixed_sandbox_name_and_uid() {
         // run_as_user as "sandbox" name, run_as_group as numeric UID
         let policy = SandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             process: Some(ProcessPolicy {
                 run_as_user: "sandbox".into(),

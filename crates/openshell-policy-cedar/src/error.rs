@@ -49,4 +49,18 @@ pub enum CedarEngineError {
     #[error("Cedar request failed schema validation: {0}")]
     #[diagnostic(code(openshell::policy_cedar::request_build))]
     RequestBuild(#[source] Box<cedar_policy::RequestValidationError>),
+
+    /// A `forbid` policy targets `Sandbox::FilesystemPath`. Landlock's flat
+    /// allow-list cannot express forbid-over-permit carve-outs (e.g. "allow
+    /// /usr except /usr/secret"), so this is rejected rather than silently
+    /// dropped or guessed.
+    #[error(
+        "policy {policy_id:?} is a forbid targeting FilesystemPath, which cannot be \
+         represented in a Landlock allow-list; restructure the permit scope instead"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::filesystem_forbid_unsupported))]
+    FilesystemForbidUnsupported {
+        /// The id of the offending `forbid` policy.
+        policy_id: String,
+    },
 }

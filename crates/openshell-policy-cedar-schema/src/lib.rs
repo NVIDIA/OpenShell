@@ -48,6 +48,8 @@ pub mod actions {
     pub const WRITE_FILE: &str = "WriteFile";
     /// Open a connection to a [`super::entity_types::NETWORK_ENDPOINT`].
     pub const NETWORK_CONNECT: &str = "NetworkConnect";
+    /// A single L7 request within an already-permitted `NetworkConnect` tunnel.
+    pub const HTTP_REQUEST: &str = "HttpRequest";
 }
 
 /// `NetworkConnect`'s `context` record attribute names.
@@ -65,6 +67,8 @@ pub mod context_fields {
     pub const PATH: &str = "path";
     /// SQL command verb for SQL requests.
     pub const COMMAND: &str = "command";
+    /// JSON-RPC method name for JSON-RPC requests. `HttpRequest`-only.
+    pub const JSONRPC_METHOD: &str = "jsonrpc_method";
 }
 
 /// `NetworkEndpoint`'s entity attribute names, declared in

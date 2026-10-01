@@ -204,7 +204,20 @@ pub async fn run_networking(
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
     shadow_engine: Option<&Arc<crate::cedar_shadow::ShadowCedarEngine>>,
+    cedar_network_engine: Option<&Arc<crate::cedar_only::CedarOnlyEngine>>,
 ) -> Result<Networking> {
+    // The active network-decision engine: an explicit Cedar engine (a
+    // Cedar-sourced sandbox) takes priority; otherwise fall back to the
+    // OPA engine already required for YAML-sourced sandboxes. Exactly one
+    // of these is ever meaningfully present per sandbox — see
+    // `crate::opa::NetworkPolicyEngine`.
+    let network_engine: Option<Arc<dyn crate::opa::NetworkPolicyEngine>> =
+        match (cedar_network_engine, opa_engine) {
+            (Some(cedar), _) => Some(cedar.clone()),
+            (None, Some(opa)) => Some(opa.clone()),
+            (None, None) => None,
+        };
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -485,10 +498,15 @@ pub async fn run_networking(
             SocketAddr::new(ip, port)
         });
 
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires a network policy engine (OPA or Cedar)")
+        })?;
+
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
             engine,
+            active_network_engine,
             cache,
             entrypoint_pid.clone(),
             tls_state,
@@ -517,6 +535,9 @@ pub async fn run_networking(
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("transparent TCP requires an OPA policy engine"))?;
+        let active_network_engine = network_engine.clone().ok_or_else(|| {
+            miette::miette!("transparent TCP requires a network policy engine (OPA or Cedar)")
+        })?;
         let cache = identity_cache
             .clone()
             .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
@@ -533,6 +554,7 @@ pub async fn run_networking(
             runtime.listeners,
             dns.store.clone(),
             engine,
+            active_network_engine,
             cache,
             entrypoint_pid,
             agent_proposals,

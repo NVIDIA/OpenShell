@@ -90,3 +90,19 @@ when {
     && (context.method == "GET"
         || context.method == "POST")
 };
+
+// Network: NVIDIA API (L7 per-request enforcement)
+// Only the chat completions endpoint may be POSTed to; anything else on
+// this already-permitted tunnel is denied at the request level.
+
+@enforcement("enforce")
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"HttpRequest",
+    resource  == Sandbox::NetworkEndpoint::"integrate.api.nvidia.com:443"
+)
+when {
+    context.binary_path == "/sandbox/.venv/bin/python3"
+    && context.method == "POST"
+    && context.path == "/v1/chat/completions"
+};

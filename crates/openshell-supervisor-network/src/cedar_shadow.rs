@@ -129,22 +129,7 @@ impl ShadowCedarEngine {
     /// never a policy-content mismatch (that's
     /// [`NetworkDecision::Unsupported`]).
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<NetworkDecision> {
-        let request = NetworkRequest {
-            user: PLACEHOLDER_IDENTITY.to_string(),
-            group: PLACEHOLDER_IDENTITY.to_string(),
-            host: input.host.clone(),
-            port: input.port,
-            protocol: String::new(),
-            binary_path: input.binary_path.to_string_lossy().into_owned(),
-            ancestors: input
-                .ancestors
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            method: String::new(),
-            path: String::new(),
-            command: String::new(),
-        };
+        let request = network_request_from_input(input);
 
         let guard = self
             .engine
@@ -153,6 +138,32 @@ impl ShadowCedarEngine {
         guard
             .evaluate_network(&request)
             .map_err(|e| miette::miette!("{e}"))
+    }
+}
+
+/// Builds a [`NetworkRequest`] from a [`NetworkInput`], for any
+/// `CedarNetworkEngine`-backed evaluator (shadow or authoritative).
+///
+/// `user`/`group` are always [`PLACEHOLDER_IDENTITY`]: the CONNECT-time
+/// decision this covers (`network_policy_for_request` in
+/// `sandbox-policy.rego`) never compares process identity — these values
+/// exist only to satisfy the Cedar schema's `Process` entity shape.
+pub(crate) fn network_request_from_input(input: &NetworkInput) -> NetworkRequest {
+    NetworkRequest {
+        user: PLACEHOLDER_IDENTITY.to_string(),
+        group: PLACEHOLDER_IDENTITY.to_string(),
+        host: input.host.clone(),
+        port: input.port,
+        protocol: String::new(),
+        binary_path: input.binary_path.to_string_lossy().into_owned(),
+        ancestors: input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        method: String::new(),
+        path: String::new(),
+        command: String::new(),
     }
 }
 

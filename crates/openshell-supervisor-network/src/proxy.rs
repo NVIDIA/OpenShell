@@ -9,7 +9,7 @@ mod relay;
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+use crate::opa::{NetworkAction, NetworkPolicyEngine, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
@@ -208,6 +208,7 @@ impl ProxyHandle {
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
+        network_engine: Arc<dyn NetworkPolicyEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
@@ -380,14 +381,14 @@ impl ProxyHandle {
                                 Ok(connection) => {
                                     let tx = preauthorized_tx.clone();
                                     let dns_store = policy_dns_store.clone();
-                                    let opa = opa_engine.clone();
+                                    let network = network_engine.clone();
                                     let backend_gateway = *backend_host_gateway;
                                     let trusted_gateway = *trusted_host_gateway;
                                     tokio::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
                                             dns_store.as_ref(),
-                                            &opa,
+                                            network.as_ref(),
                                             backend_gateway,
                                             trusted_gateway,
                                         )
@@ -429,6 +430,7 @@ impl ProxyHandle {
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
                         let opa = opa_engine.clone();
+                        let network = network_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
@@ -459,6 +461,7 @@ impl ProxyHandle {
                                 transparent_destination,
                                 dns_store,
                                 opa,
+                                network,
                                 cache,
                                 spid,
                                 tls,
@@ -555,7 +558,7 @@ impl ProxyHandle {
 async fn preauthorize_transparent_open(
     connection: PendingTcpOpen,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
-    opa_engine: &OpaEngine,
+    network_engine: &dyn NetworkPolicyEngine,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
 ) -> Option<AcceptedProxyConnection> {
@@ -572,7 +575,7 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
-    let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
+    let host = match transparent_destination_host(destination, policy_dns_store, network_engine) {
         Ok(host) => host,
         Err(error) => {
             warn!(%destination, %error, "Denied staged transparent connection");
@@ -587,7 +590,7 @@ async fn preauthorize_transparent_open(
         }
     };
     let mut decision = authorize_supplied_identity(
-        opa_engine,
+        network_engine,
         EgressIntent::connect(host.clone(), destination.port()),
         &binary_identity,
     );
@@ -625,7 +628,7 @@ async fn preauthorize_transparent_open(
             .lookup(
                 destination.ip(),
                 destination.port(),
-                opa_engine.current_generation(),
+                network_engine.current_generation(),
                 std::time::Instant::now(),
             )
             .ok()
@@ -726,7 +729,7 @@ fn emit_staged_transparent_denial(
 fn transparent_destination_host(
     destination: SocketAddr,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
-    opa_engine: &OpaEngine,
+    network_engine: &dyn NetworkPolicyEngine,
 ) -> Result<String> {
     let Some(store) = policy_dns_store else {
         return Ok(destination.ip().to_string());
@@ -734,7 +737,7 @@ fn transparent_destination_host(
     match store.lookup(
         destination.ip(),
         destination.port(),
-        opa_engine.current_generation(),
+        network_engine.current_generation(),
         std::time::Instant::now(),
     ) {
         Ok(mapping) => Ok(mapping.record.normalized_name.as_str().to_string()),
@@ -764,6 +767,7 @@ impl TransparentTcpHandle {
         listeners: Vec<TcpListener>,
         store: Arc<ResolvedEndpointStore>,
         opa_engine: Arc<OpaEngine>,
+        network_engine: Arc<dyn NetworkPolicyEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
         agent_proposals: openshell_core::proposals::AgentProposals,
@@ -781,6 +785,7 @@ impl TransparentTcpHandle {
         for listener in listeners {
             let store = store.clone();
             let engine = opa_engine.clone();
+            let network = network_engine.clone();
             let cache = identity_cache.clone();
             let pid = entrypoint_pid.clone();
             let proposals = agent_proposals.clone();
@@ -808,6 +813,7 @@ impl TransparentTcpHandle {
                     set_tcp_nodelay_best_effort(&stream);
                     let store = store.clone();
                     let engine = engine.clone();
+                    let network = network.clone();
                     let cache = cache.clone();
                     let pid = pid.clone();
                     let proposals = proposals.clone();
@@ -820,6 +826,7 @@ impl TransparentTcpHandle {
                             stream,
                             store,
                             engine,
+                            network,
                             cache,
                             pid,
                             proposals,
@@ -862,6 +869,7 @@ async fn handle_transparent_tcp_connection(
     mut client: TcpStream,
     store: Arc<ResolvedEndpointStore>,
     opa_engine: Arc<OpaEngine>,
+    network_engine: Arc<dyn NetworkPolicyEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     agent_proposals: openshell_core::proposals::AgentProposals,
@@ -872,7 +880,7 @@ async fn handle_transparent_tcp_connection(
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
-    let current_generation = opa_engine.current_generation();
+    let current_generation = network_engine.current_generation();
     let mapping = match store.lookup(
         original.ip(),
         original.port(),
@@ -890,11 +898,11 @@ async fn handle_transparent_tcp_connection(
     let port = original.port();
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
     let intent = EgressIntent::transparent_tcp(host.clone(), port);
-    let engine = opa_engine.clone();
+    let engine = network_engine.clone();
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+        authorize_egress_intent(connection, engine.as_ref(), &cache, &pid, intent)
     })
     .await
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
@@ -955,7 +963,7 @@ async fn handle_transparent_tcp_connection(
     // connector. This prevents combining an old DNS answer with a newer
     // policy decision (or vice versa).
     let Ok(generation_guard) =
-        relay::pin_policy_generation(&opa_engine, decision.policy_generation)
+        relay::pin_policy_generation(network_engine.as_ref(), decision.policy_generation)
     else {
         emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
@@ -2153,6 +2161,7 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let socket_addrs = client.peer_addr().ok().zip(client.local_addr().ok());
     let stream: BoundaryDuplexStream = Box::new(client);
+    let network_engine: Arc<dyn NetworkPolicyEngine> = opa_engine.clone();
     Box::pin(handle_mediated_connection(
         tokio::io::BufReader::new(stream),
         None,
@@ -2160,6 +2169,7 @@ async fn handle_tcp_connection(
         None,
         None,
         opa_engine,
+        network_engine,
         identity_cache,
         entrypoint_pid,
         tls_state,
@@ -2225,6 +2235,7 @@ async fn handle_mediated_connection(
     transparent_open: Option<TransparentOpen>,
     policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
     opa_engine: Arc<OpaEngine>,
+    network_engine: Arc<dyn NetworkPolicyEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
@@ -2255,8 +2266,11 @@ async fn handle_mediated_connection(
         transparent_open
     {
         let destination = transparent.destination;
-        let host =
-            transparent_destination_host(destination, policy_dns_store.as_ref(), &opa_engine)?;
+        let host = transparent_destination_host(
+            destination,
+            policy_dns_store.as_ref(),
+            network_engine.as_ref(),
+        )?;
         let (decision, connector) = transparent
             .authorization
             .map_or((None, None), |(decision, connector)| {
@@ -2323,6 +2337,7 @@ async fn handle_mediated_connection(
             supplied_identity.as_ref(),
             socket_addrs,
             opa_engine,
+            network_engine,
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
@@ -2354,19 +2369,25 @@ async fn handle_mediated_connection(
     let mut decision = if let Some(decision) = preauthorized_decision.take() {
         decision
     } else if let Some(identity) = supplied_identity.as_ref() {
-        authorize_supplied_identity(&opa_engine, intent, identity)
-    } else if !opa_engine.binary_identity_required() {
-        evaluate_endpoint_only_opa(&opa_engine, intent)
+        authorize_supplied_identity(network_engine.as_ref(), intent, identity)
+    } else if !network_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(network_engine.as_ref(), intent)
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
         })?;
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
-        let opa_clone = opa_engine.clone();
+        let network_clone = network_engine.clone();
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
         tokio::task::spawn_blocking(move || {
-            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            authorize_egress_intent(
+                connection,
+                network_clone.as_ref(),
+                &cache_clone,
+                &pid_clone,
+                intent,
+            )
         })
         .await
         .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
@@ -2460,7 +2481,7 @@ async fn handle_mediated_connection(
     }
 
     let connect_generation_guard =
-        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
+        match relay::pin_policy_generation(network_engine.as_ref(), decision.policy_generation) {
             Ok(guard) => guard,
             Err(error) => {
                 reject_stale_connect_policy(
@@ -3229,7 +3250,7 @@ fn resolve_process_identity(
 #[cfg(target_os = "linux")]
 fn authorize_egress_intent(
     connection: crate::procfs::WorkloadProxyTcpConnection,
-    engine: &OpaEngine,
+    engine: &dyn NetworkPolicyEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
     intent: EgressIntent,
@@ -3337,7 +3358,10 @@ fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
     (entrypoint_pid != 0).then_some(entrypoint_pid)
 }
 
-fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
+fn evaluate_endpoint_only_opa(
+    engine: &dyn NetworkPolicyEngine,
+    intent: EgressIntent,
+) -> EgressDecision {
     let input = crate::opa::NetworkInput {
         host: intent.destination.host.clone(),
         port: intent.destination.port,
@@ -3383,7 +3407,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
 /// connection by an isolation backend. This is the RFC 0012 path; legacy
 /// listeners continue to resolve through procfs in `authorize_egress_intent`.
 fn authorize_supplied_identity(
-    engine: &OpaEngine,
+    engine: &dyn NetworkPolicyEngine,
     intent: EgressIntent,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
 ) -> EgressDecision {
@@ -3454,7 +3478,7 @@ fn authorize_supplied_identity(
 #[cfg(not(target_os = "linux"))]
 fn authorize_egress_intent(
     _connection: crate::procfs::WorkloadProxyTcpConnection,
-    engine: &OpaEngine,
+    engine: &dyn NetworkPolicyEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
     intent: EgressIntent,
@@ -4927,6 +4951,7 @@ async fn handle_forward_proxy(
     supplied_identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
     socket_addrs: Option<(SocketAddr, SocketAddr)>,
     opa_engine: Arc<OpaEngine>,
+    network_engine: Arc<dyn NetworkPolicyEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
@@ -5031,19 +5056,25 @@ async fn handle_forward_proxy(
     );
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = if let Some(identity) = supplied_identity {
-        authorize_supplied_identity(&opa_engine, intent, identity)
-    } else if !opa_engine.binary_identity_required() {
-        evaluate_endpoint_only_opa(&opa_engine, intent)
+        authorize_supplied_identity(network_engine.as_ref(), intent, identity)
+    } else if !network_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(network_engine.as_ref(), intent)
     } else {
         let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
             miette::miette!("legacy proxy connection is missing socket addresses")
         })?;
         let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
-        let opa_clone = opa_engine.clone();
+        let network_clone = network_engine.clone();
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
         tokio::task::spawn_blocking(move || {
-            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+            authorize_egress_intent(
+                connection,
+                network_clone.as_ref(),
+                &cache_clone,
+                &pid_clone,
+                intent,
+            )
         })
         .await
         .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
@@ -5131,13 +5162,13 @@ async fn handle_forward_proxy(
         binary_pid = %pid_str,
         matched_policy = %policy_str,
         policy_generation = decision.policy_generation,
-        current_generation = opa_engine.current_generation(),
+        current_generation = network_engine.current_generation(),
         action = ?decision.action,
         "Forward proxy L4 policy decision"
     );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match relay::pin_policy_generation(
-        &opa_engine,
+        network_engine.as_ref(),
         decision.policy_generation,
     ) {
         Ok(guard) => guard,
@@ -5146,7 +5177,7 @@ async fn handle_forward_proxy(
                 host = %host_lc,
                 port,
                 policy_generation = decision.policy_generation,
-                current_generation = opa_engine.current_generation(),
+                current_generation = network_engine.current_generation(),
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
             );
@@ -5266,7 +5297,7 @@ async fn handle_forward_proxy(
                 policy_generation = decision.policy_generation,
                 l4_guard_generation = forward_generation_guard.captured_generation(),
                 l7_policy_generation = route.l7_policy_generation,
-                current_generation = opa_engine.current_generation(),
+                current_generation = network_engine.current_generation(),
                 "Forward proxy rejected request because L7 route lookup used a different policy generation"
             );
             emit_l7_tunnel_close_after_policy_change(
@@ -5298,7 +5329,7 @@ async fn handle_forward_proxy(
                     host = %host_lc,
                     port,
                     l7_policy_generation = route.l7_policy_generation,
-                    current_generation = opa_engine.current_generation(),
+                    current_generation = network_engine.current_generation(),
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
                 );
@@ -7078,10 +7109,12 @@ network_policies: {}
             .expect("engine"),
         );
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let network_engine: Arc<dyn NetworkPolicyEngine> = engine.clone();
         let mut handle = ProxyHandle::start_with_bind_addr(
             &ProxyPolicy { http_addr: None },
             Some(([127, 0, 0, 1], 3128).into()),
             engine,
+            network_engine,
             Arc::new(BinaryIdentityCache::new()),
             Arc::new(AtomicU32::new(1)),
             None,
@@ -7182,6 +7215,7 @@ network_policies:
                 OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
                     .expect("load MCP policy"),
             );
+            let network_engine: Arc<dyn NetworkPolicyEngine> = engine.clone();
             let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
                 openshell_supervisor_middleware_builtins::services(),
                 Vec::new(),
@@ -7252,6 +7286,7 @@ network_policies:
                     None,
                     socket_addrs,
                     engine,
+                    network_engine.clone(),
                     Arc::new(BinaryIdentityCache::new()),
                     Arc::new(AtomicU32::new(std::process::id())),
                     None,
@@ -7326,6 +7361,7 @@ network_policies:
             OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
                 .expect("load policy"),
         );
+        let network_engine: Arc<dyn NetworkPolicyEngine> = engine.clone();
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             vec![openshell_supervisor_middleware::in_process_endpoint(
                 Arc::new(DenyWebSocketPreflight),
@@ -7376,6 +7412,7 @@ network_policies:
                 None,
                 socket_addrs,
                 engine,
+                network_engine.clone(),
                 Arc::new(BinaryIdentityCache::new()),
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,
@@ -7450,6 +7487,7 @@ network_policies:
             OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
                 .expect("load policy"),
         );
+        let network_engine: Arc<dyn NetworkPolicyEngine> = engine.clone();
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             openshell_supervisor_middleware_builtins::services(),
             Vec::new(),
@@ -7519,6 +7557,7 @@ network_policies:
                 None,
                 socket_addrs,
                 engine,
+                network_engine.clone(),
                 Arc::new(BinaryIdentityCache::new()),
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,

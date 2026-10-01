@@ -40,6 +40,7 @@ fn action_constants_are_declared_in_the_schema() {
         actions::READ_FILE,
         actions::WRITE_FILE,
         actions::NETWORK_CONNECT,
+        actions::HTTP_REQUEST,
     ] {
         let uid = format!("{}::\"{action}\"", actions::ACTION_TYPE);
         assert!(

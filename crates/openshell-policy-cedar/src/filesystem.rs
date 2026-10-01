@@ -3,23 +3,29 @@
 
 // Rust guideline compliant 2026-09-30
 
-//! Advisory Cedar representation of filesystem policy, for offline
-//! verification only.
+//! Cedar representation of filesystem policy, in both directions.
 //!
 //! Landlock rulesets, built once at sandbox startup, are the sole runtime
 //! enforcer of filesystem access — there is no request-time decision for
-//! Cedar (or any rule engine) to make here. This module exists to catch
-//! authoring mistakes that a flat YAML path list makes easy to miss:
-//! granting a path both read-only and read-write, or listing a path that's
-//! already covered by a broader grant already in the same list. Nothing in
-//! `openshell-sandbox` consults this module; a failure or skip here has no
-//! effect on enforcement.
+//! Cedar (or any rule engine) to make here. Two independent uses follow
+//! from that:
+//!
+//! - [`compile_filesystem_entities`]/[`verify_filesystem_policy`]: YAML's
+//!   `FilesystemPolicy` compiled into Cedar entities purely for offline
+//!   verification (conflicting/redundant grants). Advisory only — nothing
+//!   in `openshell-sandbox` consults this; a failure or skip here has no
+//!   effect on enforcement.
+//! - [`extract_authorized_paths`]: the reverse direction, for a Cedar policy
+//!   authored *as the actual policy source* (not derived from YAML). Pulls
+//!   the flat path lists Landlock needs directly out of the authored
+//!   `permit` statements, so Cedar can be fully authoritative for
+//!   filesystem access, not just advisory.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-use cedar_policy::{Entities, Entity, Schema};
-use openshell_policy_cedar_schema::entity_types;
+use cedar_policy::{Effect, Entities, Entity, PolicySet, Schema};
+use openshell_policy_cedar_schema::{actions, entity_types};
 
 use crate::{CedarEngineError, entity_uid};
 
@@ -178,4 +184,82 @@ fn paths_relate(a: &str, b: &str) -> bool {
 /// aware, so `/usr` is an ancestor of `/usr/bin` but not of `/usrbin`).
 fn is_strict_ancestor(candidate: &str, path: &str) -> bool {
     candidate != path && Path::new(path).starts_with(Path::new(candidate))
+}
+
+/// Extracts the filesystem paths an authored Cedar policy set permits,
+/// ready to feed directly to Landlock as a [`FilesystemPolicyInput`].
+///
+/// For each `permit` policy whose
+/// [`entity_literals`](cedar_policy::Policy::entity_literals) include the
+/// `ReadFile` and/or `WriteFile` action and at least one
+/// `Sandbox::FilesystemPath` literal: every `FilesystemPath` literal in that
+/// policy is added to `read_only` (action is `ReadFile` only) or
+/// `read_write` (action includes `WriteFile`). A path reachable via both an
+/// read-only-only and a write-granting policy ends up in both lists, which
+/// Landlock resolves as the union (read-write) — the same way granting a
+/// path through two different YAML policies would.
+///
+/// Policies that don't reference `FilesystemPath` at all are ignored (they
+/// may be network policies in the same policy set).
+///
+/// # Errors
+///
+/// Returns [`CedarEngineError::FilesystemForbidUnsupported`] if any
+/// `forbid` policy targets `FilesystemPath` — Landlock's flat allow-list
+/// cannot express forbid-over-permit carve-outs, so this is rejected rather
+/// than silently dropped or guessed.
+pub fn extract_authorized_paths(
+    policies: &PolicySet,
+) -> Result<FilesystemPolicyInput, CedarEngineError> {
+    let mut read_only = BTreeSet::new();
+    let mut read_write = BTreeSet::new();
+
+    for policy in policies.policies() {
+        let literals = policy.entity_literals();
+        let targets_filesystem_path = literals
+            .iter()
+            .any(|uid| uid.type_name().to_string() == entity_types::FILESYSTEM_PATH);
+        if !targets_filesystem_path {
+            continue;
+        }
+
+        if policy.effect() == Effect::Forbid {
+            return Err(CedarEngineError::FilesystemForbidUnsupported {
+                policy_id: policy.id().to_string(),
+            });
+        }
+
+        let reads = literals
+            .iter()
+            .any(|uid| is_action_literal(uid, actions::READ_FILE));
+        let writes = literals
+            .iter()
+            .any(|uid| is_action_literal(uid, actions::WRITE_FILE));
+        if !reads && !writes {
+            continue;
+        }
+
+        for uid in &literals {
+            if uid.type_name().to_string() != entity_types::FILESYSTEM_PATH {
+                continue;
+            }
+            let path = uid.id().unescaped().to_string();
+            if writes {
+                read_write.insert(path);
+            } else {
+                read_only.insert(path);
+            }
+        }
+    }
+
+    Ok(FilesystemPolicyInput {
+        read_only: read_only.into_iter().collect(),
+        read_write: read_write.into_iter().collect(),
+    })
+}
+
+/// True if `uid` is the `Sandbox::Action` literal named `action_id` (e.g.
+/// `"ReadFile"`).
+fn is_action_literal(uid: &cedar_policy::EntityUid, action_id: &str) -> bool {
+    uid.type_name().to_string() == actions::ACTION_TYPE && uid.id().unescaped() == action_id
 }

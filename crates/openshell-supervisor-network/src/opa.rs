@@ -85,6 +85,56 @@ pub struct EgressAuthorization {
     pub generation: u64,
 }
 
+/// The network CONNECT-time decision-maker, independent of which policy
+/// language authored the active policy.
+///
+/// Exactly one implementation is active per sandbox, chosen by which policy
+/// format the sandbox's `SandboxPolicy` was submitted in: [`OpaEngine`] for
+/// YAML (`network_policies`), [`crate::cedar_only::CedarOnlyEngine`] for a
+/// `cedar_policy_source`. There is no dual-run — see
+/// `architecture/plans/cedar-policy-engine-rfc-draft.md` for why Cedar's
+/// authoritative role here is scoped to this trait's surface (L7/middleware
+/// stay OPA-only; `endpoint_configs`/`matched_endpoints` on
+/// [`EgressAuthorization`] are always empty from a Cedar-sourced sandbox,
+/// since those feed L7 config lookup and the not-yet-landed policy-DNS
+/// adapter, neither of which Cedar covers in this phase).
+pub trait NetworkPolicyEngine: Send + Sync {
+    /// Authorize one egress request and return all connection metadata from
+    /// one decision evaluated against one policy generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for an evaluator-internal failure (e.g. a
+    /// poisoned lock) — never for a policy-content denial, which is
+    /// `Ok(EgressAuthorization { action: NetworkAction::Deny { .. }, .. })`.
+    fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization>;
+
+    /// Current policy generation. Successful reloads increment this value.
+    fn current_generation(&self) -> u64;
+
+    /// Pins the current generation for a long-lived operation (e.g. an L7
+    /// relay), returning a guard that can detect a subsequent reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `expected_generation` is already stale.
+    fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard>;
+
+    /// Whether network authorization requires a workload binary identity.
+    ///
+    /// `CedarOnlyEngine` always returns `true` — there is no "trusted
+    /// runtime" override for Cedar-sourced policies in this phase.
+    fn binary_identity_required(&self) -> bool;
+
+    /// Assembly budget for buffering WebSocket frames pending L7 inspection.
+    ///
+    /// `CedarOnlyEngine` returns the default budget — WebSocket L7
+    /// inspection is middleware-adjacent and out of scope for Cedar-sourced
+    /// policies in this phase; the budget value itself is just a resource
+    /// limit, harmless to report even when nothing uses it.
+    fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget;
+}
+
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -183,6 +233,29 @@ pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
     generation_rx: watch::Receiver<u64>,
+}
+
+/// Builds a [`PolicyGenerationGuard`] for any engine holding a plain
+/// `Arc<AtomicU64>` generation counter and matching `watch::Sender<u64>` —
+/// both `OpaEngine` and `CedarOnlyEngine` use this same shape, so the guard
+/// itself (and callers that only read it, e.g. DNS-staleness checks) don't
+/// need to know which engine produced it.
+pub(crate) fn generation_guard_for(
+    expected_generation: u64,
+    current_generation_value: u64,
+    current_generation: &Arc<AtomicU64>,
+    generation_tx: &watch::Sender<u64>,
+) -> Result<PolicyGenerationGuard> {
+    if current_generation_value != expected_generation {
+        return Err(miette::miette!(
+            "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{current_generation_value}]"
+        ));
+    }
+    Ok(PolicyGenerationGuard {
+        captured_generation: current_generation_value,
+        current_generation: Arc::clone(current_generation),
+        generation_rx: generation_tx.subscribe(),
+    })
 }
 
 impl PolicyGenerationGuard {
@@ -1112,6 +1185,28 @@ impl OpaEngine {
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
         })
+    }
+}
+
+impl NetworkPolicyEngine for OpaEngine {
+    fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+        Self::authorize_egress(self, input)
+    }
+
+    fn current_generation(&self) -> u64 {
+        Self::current_generation(self)
+    }
+
+    fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
+        Self::generation_guard(self, expected_generation)
+    }
+
+    fn binary_identity_required(&self) -> bool {
+        Self::binary_identity_required(self)
+    }
+
+    fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        Self::websocket_assembly_budget(self)
     }
 }
 
@@ -3276,6 +3371,7 @@ mod tests {
             },
         );
         ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -4980,6 +5076,7 @@ process:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5518,6 +5615,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5589,6 +5687,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5665,6 +5764,7 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7206,6 +7306,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7263,6 +7364,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7321,6 +7423,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7381,6 +7484,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7440,6 +7544,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8951,6 +9056,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -9021,6 +9127,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -9251,6 +9358,7 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10234,6 +10342,7 @@ network_policies:
             process: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
         };
 
         let pid = std::process::id(); // accessible root, leaf paths absent
@@ -10879,6 +10988,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -11042,6 +11152,7 @@ process:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
         };
 
         // Initial load at pid=0 — no symlink expansion

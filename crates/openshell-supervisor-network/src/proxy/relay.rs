@@ -5,7 +5,9 @@
 
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::opa::{
+    NetworkAction, NetworkPolicyEngine, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine,
+};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
@@ -105,10 +107,10 @@ pub(super) fn http_context(
 
 /// Pin a generation for a relay or the forward HTTP single-request path.
 pub(super) fn pin_policy_generation(
-    opa_engine: &OpaEngine,
+    network_engine: &dyn NetworkPolicyEngine,
     expected_generation: u64,
 ) -> Result<PolicyGenerationGuard> {
-    opa_engine.generation_guard(expected_generation)
+    network_engine.generation_guard(expected_generation)
 }
 
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
