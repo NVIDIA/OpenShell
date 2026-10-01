@@ -3,7 +3,8 @@
 
 //! Portable sandbox lifecycle conformance scenarios.
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -16,8 +17,15 @@ const TRANSITION_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 struct SandboxState {
+    id: String,
     name: String,
     phase: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SandboxListPage {
+    sandboxes: Vec<SandboxState>,
+    next_page_token: String,
 }
 
 /// Certify sandbox stop, start, and deletion lifecycle behavior.
@@ -118,9 +126,10 @@ async fn stopped_can_be_deleted(runner: &mut OpenShellRunner) -> Result<(), Stri
     .await?;
 
     run_lifecycle_command(runner, "stop", &sandbox_name, "stopped-delete/stop").await?;
-    wait_for_phase(runner, &sandbox_name, "Stopped", "stopped-delete/stopped").await?;
+    let sandbox =
+        wait_for_phase(runner, &sandbox_name, "Stopped", "stopped-delete/stopped").await?;
     run_lifecycle_command(runner, "delete", &sandbox_name, "stopped-delete/delete").await?;
-    wait_for_absence(runner, &sandbox_name, "stopped-delete/deleted").await?;
+    wait_for_absence(runner, &sandbox.id, &sandbox_name, "stopped-delete/deleted").await?;
     runner.forget_sandbox(&sandbox_name);
     Ok(())
 }
@@ -151,7 +160,9 @@ async fn create_running_sandbox(
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
-    wait_for_phase(runner, sandbox_name, "Ready", &format!("{step}/ready")).await
+    wait_for_phase(runner, sandbox_name, "Ready", &format!("{step}/ready"))
+        .await
+        .map(|_| ())
 }
 
 async fn run_lifecycle_command(
@@ -199,7 +210,7 @@ async fn wait_for_phase(
     sandbox_name: &str,
     expected_phase: &str,
     step: &str,
-) -> Result<(), String> {
+) -> Result<SandboxState, String> {
     let sandbox_name = sandbox_name.to_string();
     let expected_phase = expected_phase.to_string();
     let step = step.to_string();
@@ -229,7 +240,7 @@ async fn wait_for_phase(
                             "sandbox get returned {:?}; expected '{sandbox_name}'",
                             state.name
                         )),
-                        Ok(state) if state.phase == expected_phase => Poll::Ready(()),
+                        Ok(state) if state.phase == expected_phase => Poll::Ready(state),
                         Ok(state) => Poll::Pending(format!(
                             "sandbox '{sandbox_name}' phase is {:?}; expected {expected_phase:?}",
                             state.phase
@@ -246,9 +257,11 @@ async fn wait_for_phase(
 
 async fn wait_for_absence(
     runner: &mut OpenShellRunner,
+    sandbox_id: &str,
     sandbox_name: &str,
     step: &str,
 ) -> Result<(), String> {
+    let sandbox_id = sandbox_id.to_string();
     let sandbox_name = sandbox_name.to_string();
     let step = step.to_string();
     let poll_step = step.clone();
@@ -257,22 +270,79 @@ async fn wait_for_absence(
             &poll_step,
             TRANSITION_TIMEOUT,
             TRANSITION_INTERVAL,
-            async move |runner| {
-                let result = runner
-                    .step(format!("{step}/get"))
-                    .description(format!("sandbox '{sandbox_name}' is no longer retrievable"))
-                    .with_timeout(COMMAND_TIMEOUT)
-                    .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
-                    .await;
-                match result {
-                    Ok(result) if !result.success() => Poll::Ready(()),
-                    Ok(_) => {
-                        Poll::Pending(format!("sandbox '{sandbox_name}' is still retrievable"))
-                    }
-                    Err(error) => Poll::Pending(error.to_string()),
-                }
+            async move |runner| match sandbox_is_listed(runner, &sandbox_id, &sandbox_name, &step)
+                .await
+            {
+                Ok(false) => Poll::Ready(()),
+                Ok(true) => Poll::Pending(format!(
+                    "sandbox '{sandbox_name}' with ID '{sandbox_id}' is still listed"
+                )),
+                Err(error) => Poll::Pending(error),
             },
         )
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn sandbox_is_listed(
+    runner: &OpenShellRunner,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    step: &str,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let mut seen_page_tokens = HashSet::new();
+    let mut page_token = String::new();
+    let mut page = 0u32;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "sandbox list observation for '{sandbox_name}' exceeded its {COMMAND_TIMEOUT:?} deadline"
+            ));
+        }
+
+        let result = runner
+            .step(format!("{step}/list/{page}"))
+            .description(format!(
+                "sandbox list confirms whether '{sandbox_name}' with ID '{sandbox_id}' still exists"
+            ))
+            .with_timeout(remaining)
+            .run(&[
+                "sandbox",
+                "list",
+                "--page-size",
+                "1000",
+                "--page-token",
+                &page_token,
+                "--output",
+                "json",
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+        result.require_success()?;
+
+        let response = result
+            .json::<SandboxListPage>()
+            .map_err(|error| error.to_string())?;
+        if response
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.id == sandbox_id)
+        {
+            return Ok(true);
+        }
+        if response.next_page_token.is_empty() {
+            return Ok(false);
+        }
+        if !seen_page_tokens.insert(response.next_page_token.clone()) {
+            return Err(format!(
+                "sandbox list returned a repeated page token while looking for '{sandbox_name}'"
+            ));
+        }
+        page_token = response.next_page_token;
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
+    }
 }

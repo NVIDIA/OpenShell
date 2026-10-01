@@ -10,7 +10,7 @@ assert_contains() {
   local file=$1
   local expected=$2
 
-  if ! grep -Fq "$expected" "$file"; then
+  if ! grep -Fq -- "$expected" "$file"; then
     echo "FAIL: ${file} is missing expected text:" >&2
     echo "  ${expected}" >&2
     exit 1
@@ -21,7 +21,7 @@ assert_not_contains() {
   local file=$1
   local unexpected=$2
 
-  if grep -Fq "$unexpected" "$file"; then
+  if grep -Fq -- "$unexpected" "$file"; then
     echo "FAIL: ${file} contains stale text:" >&2
     echo "  ${unexpected}" >&2
     exit 1
@@ -79,8 +79,18 @@ assert_not_contains "$spec" '%%S/openshell/tls'
 
 # Schema-v2 package startup wiring.
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"
+snapcraft="${ROOT}/snapcraft.yaml"
+snap_install_docs="${ROOT}/docs/about/installation.mdx"
+snap_canary="${ROOT}/.github/workflows/release-canary.yml"
+snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
+snap_post_refresh_hook="${ROOT}/snap/hooks/post-refresh"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
+assert_file_exists "$snapcraft"
+assert_file_exists "$snap_install_docs"
+assert_file_exists "$snap_canary"
+assert_file_exists "$snap_repro"
+assert_file_exists "$snap_post_refresh_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
@@ -92,6 +102,54 @@ assert_contains \
 assert_contains "$snap_wrapper" "config preflight -- --config \"\$CANONICAL_CONFIG_FILE\" \"\$@\""
 assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
+
+# Store installs autoconnect all required interfaces and require snapd 2.76 for
+# the system Docker slot. Manual connection for locally-built snaps requires
+# snapd 2.77.
+assert_contains "$snapcraft" "assumes: [snapd2.76]"
+for snap_file in \
+  "$snapcraft" \
+  "$snap_install_docs" \
+  "$snap_canary" \
+  "$snap_repro" \
+  "$snap_post_refresh_hook"; do
+  assert_not_contains "$snap_file" "docker:docker-daemon"
+  assert_not_contains "$snap_file" "default-provider: docker"
+done
+if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
+  echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
+  exit 1
+fi
+if [[ -e "${ROOT}/snap/hooks/install" ]]; then
+  echo "FAIL: obsolete Snap install hook must not exist" >&2
+  exit 1
+fi
+assert_contains "$snapcraft" 'refresh-mode: endure'
+if [[ ! -x "$snap_post_refresh_hook" ]]; then
+  echo "FAIL: Snap post-refresh hook must be executable" >&2
+  exit 1
+fi
+assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
+bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_hook"
+assert_not_contains "$snap_install_docs" "snap connect openshell:home"
+assert_not_contains "$snap_install_docs" "snap connect openshell:network"
+assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
+assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
+assert_contains "$snap_install_docs" "systemctl reset-failed snap.openshell.gateway.service"
+assert_contains "$snap_install_docs" "snap restart openshell.gateway"
+assert_contains "$snap_install_docs" "Snap refreshes keep the running gateway process active"
+assert_contains "$snap_install_docs" "install script refreshes and restarts the gateway automatically"
+assert_contains "$snap_canary" "install.sh | sh"
+assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
+assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
+assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_repro" "system-docker"
+assert_contains "$snap_repro" "missing-docker"
+assert_contains "$snap_repro" "docker-snap"
+assert_not_contains "$snap_canary" "--dangerous"
+assert_not_contains "$snap_repro" "--dangerous"
+assert_not_contains "$snap_canary" "snap connect openshell:docker"
+assert_not_contains "$snap_repro" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1

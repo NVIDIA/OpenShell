@@ -56,14 +56,15 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceExposure, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
-    ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    exec_sandbox_event, tcp_forward_init,
+    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use prost::Message;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -442,6 +443,7 @@ pub struct SandboxCreateConfig<'a> {
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
+    pub expose_authorization_mode: ServiceAuthorizationMode,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -451,6 +453,7 @@ pub struct SandboxCreateConfig<'a> {
     pub output: &'a str,
     pub detach: bool,
     pub suppress_credential_warnings: bool,
+    pub restart_policy: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -470,6 +473,7 @@ impl Default for SandboxCreateConfig<'_> {
             policy: None,
             forward: None,
             expose: None,
+            expose_authorization_mode: ServiceAuthorizationMode::Strip,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -479,6 +483,7 @@ impl Default for SandboxCreateConfig<'_> {
             output: "table",
             detach: false,
             suppress_credential_warnings: false,
+            restart_policy: "never",
         }
     }
 }
@@ -506,6 +511,7 @@ pub async fn sandbox_create(
         policy,
         forward,
         expose,
+        expose_authorization_mode,
         command,
         tty_override,
         auto_providers_override,
@@ -515,6 +521,7 @@ pub async fn sandbox_create(
         output,
         detach,
         suppress_credential_warnings,
+        restart_policy,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -669,6 +676,12 @@ pub async fn sandbox_create(
             template: inline_template,
             command: main_command,
             tty: main_terminal,
+            restart_policy: match restart_policy {
+                "never" => SandboxRestartPolicy::Never as i32,
+                "on-failure" => SandboxRestartPolicy::OnFailure as i32,
+                "always" => SandboxRestartPolicy::Always as i32,
+                value => return Err(miette::miette!("invalid restart policy '{value}'")),
+            },
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -683,6 +696,7 @@ pub async fn sandbox_create(
             .map(|target_port| SandboxServiceExposure {
                 service: String::new(),
                 target_port: u32::from(target_port),
+                authorization_mode: expose_authorization_mode as i32,
             })
             .into_iter()
             .collect(),
@@ -809,6 +823,7 @@ pub async fn sandbox_create(
             since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -1695,6 +1710,41 @@ where
         "Resource version:".dimmed(),
         sandbox.metadata.as_ref().map_or(0, |m| m.resource_version)
     );
+    println!(
+        "  {} {}",
+        "Restart policy:".dimmed(),
+        sandbox
+            .spec
+            .as_ref()
+            .map_or("never", |spec| { restart_policy_name(spec.restart_policy) })
+    );
+    if let Some(status) = sandbox.status.as_ref() {
+        println!(
+            "  {} {}",
+            "Main process instance:".dimmed(),
+            if status.main_process_instance_id.is_empty() {
+                "-"
+            } else {
+                &status.main_process_instance_id
+            }
+        );
+        println!(
+            "  {} {}",
+            "Last exit code:".dimmed(),
+            status
+                .exit_code
+                .map_or_else(|| "-".to_string(), |code| code.to_string())
+        );
+        println!("  {} {}", "Restart count:".dimmed(), status.restart_count);
+        println!(
+            "  {} {}",
+            "Next restart:".dimmed(),
+            status.next_restart_time.as_ref().map_or_else(
+                || "-".to_string(),
+                |time| format_epoch_ms(proto_timestamp_ms(Some(time))),
+            )
+        );
+    }
 
     // Display labels if present
     if let Some(metadata) = &sandbox.metadata
@@ -1793,14 +1843,93 @@ where
     Ok(())
 }
 
-/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
-/// data into memory before the server rejects an oversized message.
-const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
-
 fn local_terminal_size() -> Option<(u32, u32)> {
     crossterm::terminal::size()
         .ok()
         .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
+}
+
+const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long `sandbox exec` waits for piped stdin to reach EOF before it starts
+/// the command and streams the rest of the input as it arrives.
+///
+/// Small pipes such as `echo x | openshell sandbox exec ...` close well within
+/// this window and keep using the single-request path that older gateways
+/// need. A pipe that stays open (a CI runner, a supervisor, a harness that
+/// never closes stdin) must not block the command: after the grace period the
+/// command starts and stdin is forwarded until EOF or until the command exits.
+const EXEC_STDIN_UNARY_GRACE: Duration = Duration::from_millis(200);
+
+/// Piped stdin as collected by [`collect_piped_stdin`].
+enum PipedStdin {
+    /// stdin reached EOF within the grace period; `prefix` holds all of it.
+    Complete(Vec<u8>),
+    /// stdin is still open. `prefix` is what arrived so far; `rest` delivers
+    /// the remaining chunks until EOF.
+    Open {
+        prefix: Vec<u8>,
+        rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    },
+}
+
+/// Read a pipe on a detached OS thread and hand its bytes over in chunks.
+///
+/// A plain `std::thread` rather than `spawn_blocking`, so runtime shutdown
+/// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
+/// read error, or when the receiver is dropped.
+fn spawn_piped_stdin_reader(
+    mut reader: impl Read + Send + 'static,
+) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    return;
+                }
+                Ok(n) => {
+                    if tx.blocking_send(Ok(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Collect piped stdin until EOF or until `grace` elapses, whichever comes
+/// first. Input beyond `limit` bytes is rejected with the upload hint.
+async fn collect_piped_stdin(
+    mut rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    grace: Duration,
+    limit: usize,
+) -> Result<PipedStdin> {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut prefix = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Ok(chunk))) => {
+                prefix.extend_from_slice(&chunk);
+                if prefix.len() > limit {
+                    return Err(piped_stdin_limit_error());
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error).into_diagnostic(),
+            Ok(None) => return Ok(PipedStdin::Complete(prefix)),
+            Err(_elapsed) => return Ok(PipedStdin::Open { prefix, rest: rx }),
+        }
+    }
+}
+
+fn piped_stdin_limit_error() -> miette::Report {
+    miette::miette!("piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input")
 }
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
@@ -1845,37 +1974,69 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
-    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
-    // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
-        Vec::new()
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
+    //
+    // Never block on stdin EOF before starting the command: a pipe that stays
+    // open (CI runners, harnesses) would otherwise hang the exec forever
+    // without the gateway ever seeing the request. After a short grace period
+    // the command starts and the remaining input streams until EOF.
+    let (stdin_prefix, stdin_rest) = if stdin_is_terminal {
+        (Vec::new(), None)
     } else {
-        tokio::task::spawn_blocking(|| {
-            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .take(limit)
-                .read_to_end(&mut buf)
-                .into_diagnostic()?;
-            if buf.len() > MAX_STDIN_PAYLOAD {
-                return Err(miette::miette!(
-                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
-                    MAX_STDIN_PAYLOAD
-                ));
-            }
-            Ok(buf)
-        })
-        .await
-        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
+        match collect_piped_stdin(
+            spawn_piped_stdin_reader(std::io::stdin()),
+            EXEC_STDIN_UNARY_GRACE,
+            MAX_EXEC_STDIN_BYTES,
+        )
+        .await?
+        {
+            PipedStdin::Complete(prefix) => (prefix, None),
+            PipedStdin::Open { prefix, rest } => (prefix, Some(rest)),
+        }
     };
 
-    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
+    let mut request = ExecSandboxRequest {
+        request_id: String::new(),
+        sandbox: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        command: command.to_vec(),
+        workdir: workdir.unwrap_or_default().to_string(),
+        environment: environment.clone(),
+        execution_timeout: proto_execution_timeout(timeout_seconds)?,
+        stdin: stdin_prefix,
+        tty,
+        cols,
+        rows,
+        no_login_shell,
+    };
 
-    if tty && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(
+    let stdin_for_size_check = std::mem::take(&mut request.stdin);
+    let start_request_bytes = request.encoded_len();
+    request.stdin = stdin_for_size_check;
+    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+    if (tty && stdin_is_terminal)
+        || stdin_rest.is_some()
+        || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
+    {
+        return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
             command,
@@ -1883,33 +2044,17 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             environment,
             no_login_shell,
+            tty,
+            stdin_is_terminal,
+            std::mem::take(&mut request.stdin),
+            stdin_rest,
         )
         .await;
     }
 
-    let (cols, rows) = if tty {
-        local_terminal_size().unwrap_or_default()
-    } else {
-        (0, 0)
-    };
-
     // Make the streaming gRPC call.
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            sandbox: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: stdin_payload,
-            tty,
-            cols,
-            rows,
-            no_login_shell,
-        })
+        .exec_sandbox(request)
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2277,7 +2422,8 @@ impl Drop for TaskGuard {
     }
 }
 
-async fn sandbox_exec_interactive_grpc(
+#[allow(clippy::too_many_arguments)]
+async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
@@ -2285,20 +2431,29 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
+    tty: bool,
+    stdin_is_terminal: bool,
+    stdin_prefix: Vec<u8>,
+    stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
 
     // Send the start message with exec metadata.
     input_tx
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                request_id: String::new(),
                 sandbox: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
@@ -2309,7 +2464,7 @@ async fn sandbox_exec_interactive_grpc(
                 no_login_shell,
                 execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
-                tty: true,
+                tty,
                 cols,
                 rows,
             })),
@@ -2323,40 +2478,108 @@ async fn sandbox_exec_interactive_grpc(
         .into_diagnostic()?
         .into_inner();
 
-    // Enable raw mode so keystrokes are forwarded immediately.
-    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
-    let raw_guard = RawModeGuard;
+    // Raw mode is only appropriate for an interactive terminal, not a pipe.
+    let raw_guard = if tty && stdin_is_terminal {
+        crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     // Stdin reader on a detached OS thread. Using std::thread (not
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
+    let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
+    if let Some(mut rest) = stdin_rest {
+        // Piped stdin that was still open when the command started: the
+        // reader thread from `spawn_piped_stdin_reader` already owns stdin,
+        // so forward its chunks here after the collected prefix. The 4 MiB
+        // cap covers the prefix and the streamed remainder together.
+        tokio::spawn(async move {
+            let mut forwarded = 0usize;
+            let result = async {
+                for chunk in stdin_prefix.chunks(4096) {
+                    forwarded += chunk.len();
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                while let Some(chunk) = rest.recv().await {
+                    let chunk = chunk?;
+                    forwarded += chunk.len();
+                    if forwarded > MAX_EXEC_STDIN_BYTES {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            piped_stdin_limit_error().to_string(),
+                        ));
+                    }
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk)),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = stdin_result_tx.send(result);
+        });
+    } else {
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            let result = (|| {
+                for chunk in stdin_prefix.chunks(buf.len()) {
                     if stdin_tx
                         .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
                         })
                         .is_err()
                     {
-                        break;
+                        return Ok(());
                     }
                 }
-            }
-        }
-    });
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                        Ok(n) => {
+                            if stdin_tx
+                                .blocking_send(ExecSandboxInput {
+                                    payload: Some(exec_sandbox_input::Payload::Stdin(
+                                        buf[..n].to_vec(),
+                                    )),
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            })();
+            let _ = stdin_result_tx.send(result);
+        });
+    }
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let resize_task = {
+    let resize_task = if tty && stdin_is_terminal {
         let resize_tx = input_tx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
@@ -2372,17 +2595,56 @@ async fn sandbox_exec_interactive_grpc(
                     }
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
     #[cfg(unix)]
-    let _resize_guard = TaskGuard(resize_task);
+    let _resize_guard = resize_task.map(TaskGuard);
+
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    while let Some(event) = stream.next().await {
+    let mut stdin_reader_done = false;
+    loop {
+        let event = tokio::select! {
+            result = &mut stdin_result_rx, if !stdin_reader_done => {
+                stdin_reader_done = true;
+                match result.into_diagnostic()? {
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
+                    Err(error) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
+                        drop(stream);
+                        return Err(error).into_diagnostic();
+                    }
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
         let event = event.into_diagnostic()?;
         match event.payload {
             Some(exec_sandbox_event::Payload::Stdout(out)) => {
@@ -2404,10 +2666,12 @@ async fn sandbox_exec_interactive_grpc(
         }
     }
 
-    drop(input_tx);
-
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    if !stdin_reader_done && let Ok(result) = stdin_result_rx.try_recv() {
+        result.into_diagnostic()?;
+    }
 
     // A stream that closes without an Exit event means we never observed the
     // command's outcome. Treat it as a relay failure rather than reporting a
@@ -2761,6 +3025,14 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     ]
 }
 
+fn restart_policy_name(policy: i32) -> &'static str {
+    match SandboxRestartPolicy::try_from(policy) {
+        Ok(SandboxRestartPolicy::OnFailure) => "on-failure",
+        Ok(SandboxRestartPolicy::Always) => "always",
+        Ok(SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never) | Err(_) => "never",
+    }
+}
+
 fn sandbox_detail_to_json(
     sandbox: &Sandbox,
     config: &GetSandboxConfigResponse,
@@ -2769,6 +3041,33 @@ fn sandbox_detail_to_json(
     let obj = value
         .as_object_mut()
         .expect("sandbox_to_json returns object");
+
+    let restart_policy = sandbox
+        .spec
+        .as_ref()
+        .map_or("never", |spec| restart_policy_name(spec.restart_policy));
+    obj.insert("restart_policy".into(), serde_json::json!(restart_policy));
+    if let Some(status) = sandbox.status.as_ref() {
+        obj.insert(
+            "main_process_instance_id".into(),
+            serde_json::json!(status.main_process_instance_id),
+        );
+        obj.insert("exit_code".into(), serde_json::json!(status.exit_code));
+        obj.insert(
+            "restart_count".into(),
+            serde_json::json!(status.restart_count),
+        );
+        obj.insert(
+            "next_restart_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(status.next_restart_time.as_ref())),
+        );
+        obj.insert(
+            "main_process_started_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(
+                status.main_process_started_time.as_ref()
+            )),
+        );
+    }
 
     let policy_source = if config.policy_source == PolicySource::Global as i32 {
         "global"
@@ -3613,6 +3912,7 @@ async fn wait_for_lifecycle_phase(
             since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -3658,11 +3958,20 @@ pub async fn service_expose(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let response =
-        expose_service_endpoint(server, sandbox, service, target_port, workspace, tls).await?;
+    let response = expose_service_endpoint(
+        server,
+        sandbox,
+        service,
+        target_port,
+        authorization_mode,
+        workspace,
+        tls,
+    )
+    .await?;
 
     if service.is_empty() {
         println!(
@@ -3692,6 +4001,7 @@ async fn expose_service_endpoint(
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<ServiceEndpointResponse> {
@@ -3703,6 +4013,7 @@ async fn expose_service_endpoint(
             name: service.to_string(),
             target_port: u32::from(target_port),
             domain: true,
+            authorization_mode: authorization_mode as i32,
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
@@ -3875,6 +4186,7 @@ fn print_service_endpoint_table(
                 .map_or("", |m| m.workspace.as_str());
             let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
             let url = if response.url.is_empty() {
                 String::new()
             } else {
@@ -3885,6 +4197,7 @@ fn print_service_endpoint_table(
                 endpoint.sandbox.clone(),
                 service,
                 target,
+                authorization,
                 url,
             ))
         })
@@ -3896,7 +4209,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -3905,50 +4218,52 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _)| service.len())
+        .map(|(_, _, service, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _)| target.len())
+        .map(|(_, _, _, target, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, url) in rows {
+    for (workspace, sandbox, service, target, authorization, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         }
     }
@@ -3974,12 +4289,20 @@ fn service_endpoint_to_json(
         "sandbox": endpoint.sandbox,
         "service": endpoint.name,
         "target_port": endpoint.target_port,
+        "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
         "url": url,
     }))
 }
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
+}
+
+fn service_authorization_mode_name(mode: i32) -> &'static str {
+    match ServiceAuthorizationMode::try_from(mode).unwrap_or(ServiceAuthorizationMode::Strip) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
 }
 
 /// Read gcloud Application Default Credentials from disk.
@@ -5775,7 +6098,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             &rev.policy_hash
         };
         let error_short = if rev.load_error.len() > 40 {
-            format!("{}...", &rev.load_error[..40])
+            truncate_status_field(&rev.load_error, 40)
         } else {
             rev.load_error.clone()
         };
@@ -5847,6 +6170,7 @@ pub async fn sandbox_logs(
                     .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: String::new(),
             })
             .await
             .into_diagnostic()?
@@ -6083,7 +6407,7 @@ pub async fn sandbox_draft_approve(
             review_token,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6094,6 +6418,23 @@ pub async fn sandbox_draft_approve(
     );
 
     Ok(())
+}
+
+/// Explain an approval the gateway refused because the proposal's evaluation
+/// changed after it was fetched. The gateway has already stored the refreshed
+/// evaluation, so the reviewer needs to look at it before approving again.
+fn draft_approval_error(status: Status, name: &str) -> miette::Report {
+    if status.code() == Code::FailedPrecondition
+        && status.message().contains("refetch and review again")
+    {
+        return miette::miette!(
+            help = format!(
+                "review it with `openshell rule get {name} --status pending`, then approve again"
+            ),
+            "the sandbox policy or its inputs changed after this rule was fetched, so the gateway re-evaluated it"
+        );
+    }
+    miette::Report::from_err(status)
 }
 
 /// Reject a network rule.
@@ -6164,7 +6505,7 @@ pub async fn sandbox_draft_approve_all(
             approvals,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -6325,6 +6666,26 @@ mod tests {
     };
 
     #[test]
+    fn draft_approval_error_explains_refreshed_evaluation() {
+        use super::draft_approval_error;
+        use tonic::Status;
+
+        let refreshed = draft_approval_error(
+            Status::failed_precondition(
+                "proposal inputs changed; evaluation refreshed, refetch and review again",
+            ),
+            "my-agent",
+        );
+        assert!(refreshed.to_string().contains("re-evaluated"));
+        let help = refreshed.help().expect("help text").to_string();
+        assert!(help.contains("openshell rule get my-agent --status pending"));
+
+        let other = draft_approval_error(Status::not_found("chunk not found"), "my-agent");
+        assert!(other.to_string().contains("chunk not found"));
+        assert!(other.help().is_none());
+    }
+
+    #[test]
     fn zero_exec_timeout_is_omitted() {
         assert!(proto_execution_timeout(0).unwrap().is_none());
         assert_eq!(
@@ -6353,10 +6714,11 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
-        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
-        WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
+        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6440,6 +6802,29 @@ mod tests {
     }
 
     #[test]
+    fn policy_revision_table_handles_unicode_load_errors() {
+        // Stored diagnostics can contain Unicode paths. Byte 40 splits the
+        // character in the 40-scalar case; longer errors must also remain safe.
+        let revisions = [
+            String::new(),
+            "a".repeat(40),
+            "a".repeat(41),
+            format!("{}é", "a".repeat(39)),
+            format!("{}éz", "a".repeat(39)),
+        ]
+        .into_iter()
+        .map(|load_error| SandboxPolicyRevision {
+            version: 1,
+            status: PolicyStatus::Failed as i32,
+            load_error,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+        super::print_policy_revision_table(&revisions);
+    }
+
+    #[test]
     fn service_endpoint_json_has_raw_fields_and_normalized_url() {
         let response = ServiceEndpointResponse {
             endpoint: Some(ServiceEndpoint {
@@ -6450,6 +6835,7 @@ mod tests {
                 sandbox: "api".to_string(),
                 name: String::new(),
                 target_port: 8080,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                 ..Default::default()
             }),
             url: "https://api.openshell.localhost:3000/".to_string(),
@@ -6464,6 +6850,7 @@ mod tests {
                 "sandbox": "api",
                 "service": "",
                 "target_port": 8080,
+                "authorization_mode": "bearer_passthrough",
                 "url": "https://api.openshell.localhost:17670/",
             })
         );
@@ -7630,6 +8017,22 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(2);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            main_process_instance_id: "main-2".to_string(),
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            main_process_started_time: openshell_core::time::timestamp_from_millis(
+                1_699_999_000_000,
+            )
+            .ok(),
+            ..Default::default()
+        });
 
         let config = GetSandboxConfigResponse {
             policy_source: PolicySource::Global as i32,
@@ -7641,7 +8044,13 @@ mod tests {
 
         assert_eq!(json["id"], "sb-123");
         assert_eq!(json["name"], "test-sb");
-        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["phase"], "Starting");
+        assert_eq!(json["restart_policy"], "on-failure");
+        assert_eq!(json["main_process_instance_id"], "main-2");
+        assert_eq!(json["exit_code"], 9);
+        assert_eq!(json["restart_count"], 2);
+        assert_eq!(json["next_restart_at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(json["main_process_started_at_ms"], 1_699_999_000_000_i64);
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());
@@ -7964,5 +8373,83 @@ mod tests {
         let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
         let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
         assert!(format_log_line(&log).ends_with(message));
+    }
+
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    fn exec_stdin_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn piped_stdin_that_closes_quickly_goes_in_one_request() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"hi\n").unwrap();
+        drop(writer);
+        let collected = exec_stdin_runtime().block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_secs(5),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        match collected.expect("collect") {
+            super::PipedStdin::Complete(prefix) => assert_eq!(prefix, b"hi\n"),
+            super::PipedStdin::Open { .. } => panic!("closed pipe must complete"),
+        }
+    }
+
+    #[test]
+    fn piped_stdin_that_stays_open_does_not_block_the_command() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"early").unwrap();
+        let grace = Duration::from_millis(100);
+        let started = Instant::now();
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            grace,
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= grace, "must wait the grace period: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must not wait for EOF: {elapsed:?}"
+        );
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert_eq!(prefix, b"early");
+        // The remainder keeps flowing after the command has started.
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
+    #[test]
+    fn piped_stdin_over_the_limit_is_rejected_with_the_upload_hint() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(&[0u8; 8]).unwrap();
+        drop(writer);
+        let error = exec_stdin_runtime()
+            .block_on(super::collect_piped_stdin(
+                super::spawn_piped_stdin_reader(reader),
+                Duration::from_secs(5),
+                4,
+            ))
+            .err()
+            .expect("over the limit must fail");
+        assert!(error.to_string().contains("sandbox upload"), "{error}");
     }
 }

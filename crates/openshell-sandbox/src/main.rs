@@ -33,7 +33,6 @@ const SANDBOX_RUNTIME_ROOT: &str = "/.openshell/runtime";
 #[cfg(target_os = "linux")]
 const SANDBOX_STATE_ROOT: &str = "/.openshell/state";
 
-const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 const CAPABILITY_PROBE_SUBCOMMAND: &str = "capability-probe";
 const CAPABILITY_PROBE_LAUNCH_SUBCOMMAND: &str = "capability-probe-launch";
 const CAPABILITY_SOCKET_CHILD_SUBCOMMAND: &str = "capability-socket-child";
@@ -58,50 +57,6 @@ struct BoundaryArgs {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
-}
-
-/// Internal one-shot command used by trusted driver bootstrap to validate an
-/// image-provided workdir as the final sandbox identity.
-#[derive(Parser, Debug)]
-#[command(name = "validate-workspace", hide = true)]
-struct ValidateWorkspaceArgs {
-    #[arg(long)]
-    workdir: String,
-    #[arg(long)]
-    expected_uid: u32,
-    #[arg(long)]
-    expected_gid: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn validate_workspace(args: &[String]) -> Result<()> {
-    let args = ValidateWorkspaceArgs::try_parse_from(
-        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
-    )
-    .into_diagnostic()?;
-    let actual = (
-        nix::unistd::geteuid().as_raw(),
-        nix::unistd::getegid().as_raw(),
-    );
-    if actual != (args.expected_uid, args.expected_gid) {
-        return Err(miette::miette!(
-            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
-            args.expected_uid,
-            args.expected_gid,
-            actual.0,
-            actual.1
-        ));
-    }
-    openshell_sandbox::process::validate_oci_workspace_as_effective_identity(Path::new(
-        &args.workdir,
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_workspace(_args: &[String]) -> Result<()> {
-    Err(miette::miette!(
-        "workspace validation is only supported on Unix"
-    ))
 }
 
 /// Run the active Phase 0 probe inside the exact workload runtime profile.
@@ -146,6 +101,11 @@ struct QualificationReport {
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
     wait_killable_recv: bool,
+    /// Selected seccomp listener cancellation mode: `killable` (>= 5.19) or
+    /// `legacy_read_only` (< 5.19, broker output writes disabled).
+    seccomp_listener_mode: &'static str,
+    /// Whether the broker disables task-memory output writes (legacy mode).
+    task_memory_writes_disabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -192,6 +152,11 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     openshell_isolation_interface::linux::task_memory::probe_child_access()
         .into_diagnostic()
         .wrap_err("same-UID task-memory probe")?;
+    // The successful production-shaped parent-to-child round trip above is
+    // the task-memory evidence. Do not test /proc/self/mem here: this trusted
+    // broker is intentionally nondumpable, so that fallback is inaccessible
+    // even though /proc/<dumpable-child>/mem remains available to mediation.
+    let task_memory_copy = true;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
     let notification =
         openshell_isolation_interface::linux::seccomp_notify::probe_notification_api()
@@ -228,7 +193,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         landlock_allow_deny: true,
         seccomp_notification: notification.notification_round_trip(),
         seccomp_addfd_send: notification.addfd_send(),
-        task_memory_copy: notification.task_memory_copy(),
+        task_memory_copy,
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
         dns_relay_bind: true,
@@ -237,6 +202,12 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
         wait_killable_recv: notification.wait_killable_recv,
+        seccomp_listener_mode: if notification.wait_killable_recv {
+            "killable"
+        } else {
+            "legacy_read_only"
+        },
+        task_memory_writes_disabled: !notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
@@ -246,9 +217,12 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             addfd_send: notification.addfd_send(),
             retained_socket_operation: true,
             proc_fd_identity: true,
-            task_memory_read: notification.task_memory_copy(),
-            task_memory_write: notification.task_memory_copy(),
+            task_memory_read: task_memory_copy,
+            task_memory_write: task_memory_copy,
             cancellation: notification.wait_killable_recv,
+            // Legacy plain listener (< 5.19) disables broker output writes;
+            // satisfies the `cancellation || writes_disabled` launch invariant.
+            task_memory_writes_disabled: !notification.wait_killable_recv,
         },
         landlock_abi,
         landlock_allow_deny: true,
@@ -1866,9 +1840,11 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
         .with(
-            OcsfShorthandLayer::new(std::io::stderr())
-                .with_non_ocsf(true)
-                .with_filter(console_filter),
+            OcsfShorthandLayer::new(
+                openshell_sandbox::container_log::ContainerLog::process().launcher_writer(),
+            )
+            .with_non_ocsf(true)
+            .with_filter(console_filter),
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;
@@ -1903,9 +1879,6 @@ fn main() -> Result<()> {
             ));
         }
         return seed_kubernetes_workspace();
-    }
-    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
-        return validate_workspace(&raw_args[2..]);
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
@@ -2010,31 +1983,6 @@ mod tests {
             0
         );
         assert!(destination.join(".openshell-initialized").is_file());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn workspace_validation_subcommand_uses_final_policy_identity() {
-        let uid = nix::unistd::geteuid().as_raw();
-        let gid = nix::unistd::getegid().as_raw();
-        if uid < 1000 || gid < 1000 {
-            return;
-        }
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-        let root = dir.path().canonicalize().unwrap().join("workspace");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = vec![
-            "--workdir".to_string(),
-            root.display().to_string(),
-            "--expected-uid".to_string(),
-            uid.to_string(),
-            "--expected-gid".to_string(),
-            gid.to_string(),
-        ];
-
-        validate_workspace(&args).expect("current identity should retain workspace authority");
     }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path

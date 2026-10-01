@@ -145,6 +145,9 @@ impl FakeComputeDriver {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
                 capabilities: GetCapabilitiesResponse {
+                    resource_admission_policy:
+                        openshell_core::resource_admission::DriverAdmissionConfig::default()
+                            .acknowledgement(),
                     driver_name: "fake-compute-driver".to_string(),
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
@@ -204,6 +207,10 @@ impl FakeComputeDriver {
 
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
+    }
+
+    pub fn set_admission_acknowledgement(&self, acknowledgement: String) {
+        self.with_state(|state| state.capabilities.resource_admission_policy = acknowledgement);
     }
 
     #[cfg(unix)]

@@ -113,7 +113,11 @@ pub async fn spawn_workload(
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    let main_session = crate::main_session::MainSession::new(handle.take_io(), handle.pid());
+    let main_session = crate::main_session::MainSession::new(
+        handle.take_io(),
+        handle.pid(),
+        Some(crate::container_log::ContainerLog::process_agent_output()),
+    );
     let (terminal, signal_lock) = handle.signaling_state();
     boundary_runtime
         .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())

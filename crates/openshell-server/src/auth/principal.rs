@@ -75,12 +75,9 @@ pub struct PeerPrincipal {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SandboxIdentitySource {
-    /// Gateway-minted JWT validated against the gateway's signing key.
-    /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
+    /// Generation-bound gateway JWT validated against the persisted runtime
+    /// identity by [`super::sandbox_jwt::SandboxSessionJwtAuthenticator`].
     BootstrapJwt { issuer: String },
-    /// Per-sandbox client certificate. Reserved for channel-bound sandbox
-    /// identity.
-    BootstrapCert { fingerprint: String },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
     /// sandbox identity and its concrete runtime binding; the gateway still

@@ -120,7 +120,7 @@ default = ["telemetry"]
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.
 telemetry = ["openshell-core/telemetry"]
-bundled-z3 = ["openshell-prover/bundled-z3"]
+vendored-z3 = ["openshell-prover/vendored-z3"]
 prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 test-support = []
 
@@ -129,11 +129,11 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Tests import the example profiles from providers/ the way an operator
 # would; the feature is test-only and never reaches a release binary.
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 base64 = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }

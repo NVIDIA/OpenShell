@@ -28,6 +28,7 @@ use openshell_isolation_interface::linux::task_memory;
 use tokio::sync::{mpsc, oneshot};
 
 const SOCKET_CAPACITY: usize = 4_096;
+const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
 const ACCEPT_WORKER_CAPACITY: usize = 64;
 const DNS_QUEUE_CAPACITY: usize = 256;
@@ -189,6 +190,7 @@ fn register_dns_socket(
 
 #[derive(Clone)]
 struct NotificationQueues {
+    provider_files: crate::provider_files::ProviderFiles,
     protected_control_port: Option<u16>,
     accept_registrar: crate::accept_interrupt::AcceptRegistrar,
     identity_resolver: ProcfsIdentityResolver,
@@ -196,12 +198,14 @@ struct NotificationQueues {
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
     active_accepts: Arc<AtomicUsize>,
+    retained_socket_capacity: usize,
     decision_timeout: Duration,
 }
 
 /// Live broker handle retained by the sandbox boundary.
 #[derive(Clone)]
 pub struct NetworkBroker {
+    provider_files: crate::provider_files::ProviderFiles,
     _accept_monitor: Arc<crate::accept_interrupt::AcceptMonitor>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
@@ -252,12 +256,15 @@ impl NetworkBroker {
         })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
-        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let active_opens = Arc::new(AtomicUsize::new(0));
         let active_accepts = Arc::new(AtomicUsize::new(0));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
+        let retained_socket_capacity = retained_socket_capacity()?;
+        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
+        let provider_files = crate::provider_files::ProviderFiles::default();
         let queues = NotificationQueues {
+            provider_files: provider_files.clone(),
             protected_control_port,
             accept_registrar: accept_monitor.registrar(),
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
@@ -265,6 +272,7 @@ impl NetworkBroker {
             dns_relay,
             active_opens,
             active_accepts,
+            retained_socket_capacity,
             decision_timeout,
         };
         let healthy = Arc::new(AtomicBool::new(true));
@@ -307,6 +315,7 @@ impl NetworkBroker {
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
+            provider_files,
             _accept_monitor: accept_monitor,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
@@ -347,6 +356,10 @@ impl NetworkBroker {
                 "network broker is not running",
             ))
         }
+    }
+
+    pub(crate) fn provider_files(&self) -> &crate::provider_files::ProviderFiles {
+        &self.provider_files
     }
 }
 
@@ -524,6 +537,13 @@ fn dispatch_notification(
     queues: NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
+    if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
+        return queues.provider_files.handle_open(&listener, notification);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if syscall == libc::SYS_open {
+        return queues.provider_files.handle_open(&listener, notification);
+    }
     if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
         return openshell_isolation_interface::linux::process_signal::mediate_process_signal(
             &listener,
@@ -539,7 +559,12 @@ fn dispatch_notification(
         );
     }
     if syscall == libc::SYS_socket {
-        return create_socket(&registry, &listener, notification);
+        return create_socket(
+            &registry,
+            &listener,
+            notification,
+            queues.retained_socket_capacity,
+        );
     }
     if syscall == libc::SYS_connect {
         return connect_socket(registry, listener, notification, queues);
@@ -587,6 +612,7 @@ fn create_socket(
     registry: &Mutex<SocketRegistry>,
     listener: &NotificationListener,
     notification: Notification,
+    retained_socket_capacity: usize,
 ) -> io::Result<()> {
     let domain = i32::try_from(notification.args[0])
         .map_err(|_| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?;
@@ -608,6 +634,12 @@ fn create_socket(
     } else {
         InetFamily::V6
     };
+    // Reclaim stale descriptors before the broker exhausts its process limit.
+    // Connected sockets remain in the metadata registry without consuming
+    // this broker-owned descriptor budget.
+    if let Err(error) = prepare_registry_for_socket(registry, retained_socket_capacity) {
+        return listener.respond_errno(notification.id, error_to_errno(&error));
+    }
     // SAFETY: arguments were reduced to the supported native INET matrix. A
     // successful call returns one newly owned descriptor.
     let mut source = unsafe { libc::socket(domain, raw_kind, protocol) };
@@ -640,6 +672,44 @@ fn create_socket(
         metadata.close_on_exec,
     )?;
     registry.commit(tentative)?;
+    Ok(())
+}
+
+fn retained_socket_capacity() -> io::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let soft_limit = usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
+    let open_descriptors = std::fs::read_dir("/proc/self/fd")?.count();
+    Ok(retained_socket_capacity_for_limit(
+        soft_limit,
+        open_descriptors,
+    ))
+}
+
+fn retained_socket_capacity_for_limit(soft_limit: usize, open_descriptors: usize) -> usize {
+    soft_limit
+        .saturating_sub(open_descriptors)
+        .saturating_sub(SOCKET_FD_HEADROOM)
+        .clamp(1, SOCKET_CAPACITY)
+}
+
+fn prepare_registry_for_socket(
+    registry: &Mutex<SocketRegistry>,
+    retained_socket_capacity: usize,
+) -> io::Result<()> {
+    let mut registry = lock(registry);
+    if registry.is_full() || registry.retained_preconnect_count() >= retained_socket_capacity {
+        collect_closed_socket_entries_locked(&mut registry)?;
+    }
+    if registry.is_full() || registry.retained_preconnect_count() >= retained_socket_capacity {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
     Ok(())
 }
 
@@ -1325,8 +1395,8 @@ fn classify_send(
                 if let Some(length_address) = message.result_length_address {
                     let length = u32::try_from(message.data.len())
                         .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-                    listener.validate_id(notification.id)?;
-                    task_memory::write_exact(
+                    listener.write_task_output(
+                        notification.id,
                         notification.tid,
                         length_address,
                         &length.to_ne_bytes(),
@@ -1679,6 +1749,15 @@ fn write_socket_addr(
     length_address: u64,
     value: SocketAddr,
 ) -> io::Result<()> {
+    // A LegacyReadOnly listener (kernels < 5.19) cannot safely write into
+    // workload memory: without WAIT_KILLABLE_RECV the notified accept/
+    // getpeername could resume and repurpose these buffers between validation
+    // and the broker write. Fail closed before reading or writing anything, so
+    // this address-writing path is inert in legacy mode. Callers that pass a
+    // null address argument (accept with a null peer address) never reach here.
+    if listener.writes_disabled() {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
     let mut supplied_length = [0_u8; size_of::<libc::socklen_t>()];
     task_memory::read_exact(tid, length_address, &mut supplied_length)?;
     let supplied_length = libc::socklen_t::from_ne_bytes(supplied_length);
@@ -1686,12 +1765,15 @@ fn write_socket_addr(
     let copied = usize::try_from(supplied_length)
         .unwrap_or(0)
         .min(bytes.len());
-    listener.validate_id(notification_id)?;
     if copied != 0 {
-        task_memory::write_exact(tid, address, &bytes[..copied])?;
+        listener.write_task_output(notification_id, tid, address, &bytes[..copied])?;
     }
-    listener.validate_id(notification_id)?;
-    task_memory::write_exact(tid, length_address, &actual_length.to_ne_bytes())
+    listener.write_task_output(
+        notification_id,
+        tid,
+        length_address,
+        &actual_length.to_ne_bytes(),
+    )
 }
 
 fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {
@@ -1760,8 +1842,172 @@ fn error_to_errno(error: &io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
+
+    #[test]
+    fn provider_files_are_opened_on_demand_and_replaced() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start broker");
+        let path = "/run/openshell/providers/acme/client.toml".to_string();
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path.clone(), "version = 1\n".into())]))
+            .unwrap();
+        let first = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::read_to_string(path)
+            })
+            .unwrap()
+            .expect("first open");
+        assert_eq!(first, "version = 1\n");
+        let mut old_descriptor = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::File::open(path)
+            })
+            .unwrap()
+            .expect("open old version");
+        let denied_write = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::OpenOptions::new().write(true).open(path)
+            })
+            .unwrap()
+            .expect_err("provider file is read only");
+        assert_eq!(denied_write.raw_os_error(), Some(libc::EACCES));
+        broker
+            .provider_files()
+            .replace(HashMap::from([(path.clone(), "version = 2\n".into())]))
+            .unwrap();
+        let mut old_content = String::new();
+        io::Read::read_to_string(&mut old_descriptor, &mut old_content).unwrap();
+        assert_eq!(old_content, "version = 1\n");
+        let second = launcher
+            .execute({
+                let path = path.clone();
+                move || std::fs::read_to_string(path)
+            })
+            .unwrap()
+            .expect("second open");
+        assert_eq!(second, "version = 2\n");
+        let via_openat2 = launcher
+            .execute({
+                let path = path.clone();
+                move || -> io::Result<String> {
+                    let path = std::ffi::CString::new(path).unwrap();
+                    let how = [libc::O_CLOEXEC as u64, 0, 0];
+                    let fd = unsafe {
+                        libc::syscall(
+                            libc::SYS_openat2,
+                            libc::AT_FDCWD,
+                            path.as_ptr(),
+                            how.as_ptr(),
+                            24_usize,
+                        )
+                    };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut file = unsafe {
+                        std::fs::File::from_raw_fd(i32::try_from(fd).expect("open fd fits"))
+                    };
+                    let mut content = String::new();
+                    io::Read::read_to_string(&mut file, &mut content)?;
+                    Ok(content)
+                }
+            })
+            .unwrap();
+        assert_eq!(via_openat2.unwrap(), "version = 2\n");
+        broker.provider_files().replace(HashMap::new()).unwrap();
+        let detached = launcher.execute(move || std::fs::read(path)).unwrap();
+        assert_eq!(detached.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+    }
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn retained_socket_capacity_reserves_process_descriptor_headroom() {
+        assert_eq!(retained_socket_capacity_for_limit(1_024, 24), 936);
+        assert_eq!(retained_socket_capacity_for_limit(128, 32), 32);
+        assert_eq!(retained_socket_capacity_for_limit(64, 0), 1);
+        assert_eq!(
+            retained_socket_capacity_for_limit(usize::MAX, 0),
+            SOCKET_CAPACITY
+        );
+    }
+
+    #[test]
+    fn retained_socket_limit_reclaims_stale_entry_before_opening_another_socket() {
+        // SAFETY: socket returns one newly owned descriptor on success.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry.commit(tentative).unwrap();
+        assert!(!registry.is_full());
+        assert_eq!(registry.retained_preconnect_count(), 1);
+
+        let registry = Mutex::new(registry);
+        prepare_registry_for_socket(&registry, 1).unwrap();
+
+        assert!(lock(&registry).is_empty());
+    }
+
+    #[test]
+    fn retained_socket_limit_does_not_cap_connected_metadata() {
+        // SAFETY: socket returns one newly owned descriptor on success.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry
+            .commit_with_state(
+                tentative,
+                SocketState::Connected {
+                    original_peer: "127.0.0.1:443".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.retained_preconnect_count(), 0);
+
+        let registry = Mutex::new(registry);
+        prepare_registry_for_socket(&registry, 1).unwrap();
+
+        assert_eq!(lock(&registry).len(), 1);
+    }
 
     #[test]
     fn notification_receive_retries_interrupted_and_disappeared_targets() {
@@ -1774,6 +2020,25 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
+    }
+
+    #[test]
+    fn legacy_listener_rejects_socket_addr_write() {
+        // accept-with-address and getpeername both route through
+        // write_socket_addr; on a LegacyReadOnly listener the path must fail
+        // closed (EOPNOTSUPP) before any task-memory access.
+        // SAFETY: dup returns a new descriptor or a negative error.
+        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(dup >= 0, "dup stderr");
+        let listener = NotificationListener::from_fd_with_mode(
+            // SAFETY: successful dup returned a new owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(dup) },
+            ListenerMode::LegacyReadOnly,
+        );
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let error = write_socket_addr(&listener, 1, 0, 0, 0, peer)
+            .expect_err("legacy listener must reject socket-address writes");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
     }
 
     #[test]
@@ -2046,10 +2311,6 @@ mod tests {
 
     #[test]
     fn accepted_loopback_stream_is_registered_for_notified_operations() {
-        let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
-        let address = reservation.local_addr().expect("reserved address");
-        drop(reservation);
-
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
@@ -2057,9 +2318,9 @@ mod tests {
         let workload = std::thread::spawn(move || {
             launcher
                 .execute(move || -> io::Result<SocketAddr> {
-                    let listener = TcpListener::bind(address)?;
+                    let listener = TcpListener::bind("127.0.0.1:0")?;
                     ready_tx
-                        .send(())
+                        .send(listener.local_addr()?)
                         .map_err(|_| io::Error::other("test client disappeared"))?;
                     let (stream, _) = listener.accept()?;
                     let peer = stream.peer_addr()?;
@@ -2088,7 +2349,13 @@ mod tests {
                 .expect("launcher result")
         });
 
-        ready_rx.recv().expect("listener ready");
+        let Ok(address) = ready_rx.recv() else {
+            let error = workload
+                .join()
+                .expect("join workload")
+                .expect_err("listener not ready");
+            panic!("workload listener failed: {error}");
+        };
         let mut client = TcpStream::connect(address).expect("connect loopback client");
         let mut payload = [0_u8; 8];
         client

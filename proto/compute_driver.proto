@@ -102,6 +102,10 @@ message GetCapabilitiesResponse {
   uint64 rootfs_tar_max_bytes = 11;
   // Compute extension protocol metadata. Required for protocol negotiation.
   openshell.extension.v1.PeerMetadata extension = 12;
+  // Versioned effective operator admission policy (v1: followed by JSON).
+  // Gateways require an exact policy match before activating the driver.
+  // Empty denotes a legacy driver and requires explicit admission opt-out.
+  string resource_admission_policy = 13;
 }
 
 message AuthenticateSandboxRequest {

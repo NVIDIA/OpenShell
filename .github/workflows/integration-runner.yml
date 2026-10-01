@@ -25,8 +25,9 @@ on:
         default: >-
           [
             {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+            {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
           ]
 
 permissions:
@@ -67,6 +68,7 @@ jobs:
       - uses: ./.github/actions/setup-nix
 
       - name: Cache tmachine disks
+        if: matrix.environment != 'ubuntu-k3s'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/tmachine

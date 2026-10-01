@@ -60,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
@@ -125,9 +132,23 @@
           firmwarePkgs = tmachineRuntimePkgs;
         };
         artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
         apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
           build-artifacts = {
             type = "app";
             program = "${artifacts.all}/bin/build-artifacts";
@@ -139,6 +160,14 @@
           build-artifacts-test-archives = {
             type = "app";
             program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
+          };
+          build-artifacts-test-images = {
+            type = "app";
+            program = "${artifacts.testImages}/bin/build-artifacts-test-images";
+          };
+          generate-podman-e2e-ci-tests = {
+            type = "app";
+            program = "${artifacts.podmanE2eCiTests}/bin/generate-podman-e2e-ci-tests";
           };
           build-artifacts-helm = {
             type = "app";

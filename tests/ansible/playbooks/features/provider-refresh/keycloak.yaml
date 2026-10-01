@@ -88,11 +88,12 @@
       ansible.builtin.command:
         argv:
           - journalctl
-          - --unit
-          - openshell-gateway.service
           - --no-pager
           - --lines
           - "500"
+          - _SYSTEMD_UNIT=openshell-gateway.service
+          - "+"
+          - _SYSTEMD_USER_UNIT=openshell-gateway.service
       register: openshell_gateway_logs
       changed_when: false
       failed_when: false

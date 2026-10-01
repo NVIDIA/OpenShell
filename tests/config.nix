@@ -44,6 +44,17 @@ let
         };
       }
       {
+        name = "ubuntu-k3s";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = false;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/k3s.yaml"
+          ];
+        };
+      }
+      {
         name = "fedora-podman-rootful";
         machine = "fedora";
         setup = {
@@ -70,6 +81,19 @@ let
     ];
 
     installers = [
+      {
+        name = "k3s";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        inputs = {
+          agent_sandbox_version = "0.5.0";
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+        };
+      }
       {
         name = "none";
         use_galaxy = false;
@@ -102,6 +126,17 @@ let
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
+      {
+        name = "rpm";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];
+        inputs = {
+          openshell_rpm = "../artifacts/packages/rpm/openshell.rpm";
+          openshell_gateway_rpm = "../artifacts/packages/rpm/openshell-gateway.rpm";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
     ];
 
     testsuites = [
@@ -119,11 +154,48 @@ let
         };
       }
       {
+        name = "policy-advisor";
+        playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
+        inputs = {
+          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+        };
+      }
+      {
         name = "provider-refresh";
         playbooks = [ "ansible/playbooks/features/provider-refresh/keycloak.yaml" ];
         inputs = {
           keycloak_realm_file = "../scripts/keycloak-realm.json";
           provider_refresh_keycloak_test_bundle = "../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
+        };
+      }
+      {
+        name = "e2e-podman";
+        playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
+        inputs = {
+          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
+          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
+        };
+      }
+      {
+        name = "driver-podman";
+        playbooks = [
+          "ansible/playbooks/drivers/podman/default-userns-baseline.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-auto.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-keep-id.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+          "ansible/playbooks/drivers/podman/userns-private.yaml"
+          "ansible/playbooks/drivers/podman/tests.yaml"
+        ];
+        inputs = {
+          openshell_podman_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-tests.tar";
+          # Match OpenShell's compiled-in default so direct Podman and
+          # OpenShell containers resolve the same workload image metadata.
+          openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
+          openshell_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
+          openshell_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
+          openshell_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
         };
       }
     ];

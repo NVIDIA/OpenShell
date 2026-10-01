@@ -3,6 +3,11 @@
 
 //! Embedded SSH server for sandbox access.
 
+mod input;
+
+#[cfg(test)]
+mod exec_input_tests;
+
 use crate::main_session::{MainOutput, MainSession};
 #[cfg(unix)]
 use libc;
@@ -17,7 +22,7 @@ use russh::{ChannelId, ChannelOpenFailure, Sig};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
@@ -25,6 +30,15 @@ use tracing::warn;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAIN_DETACH_PREFIX: u8 = 0x10;
 const MAIN_DETACH_KEY: u8 = 0x11;
+const MAIN_DETACH_EOF: u8 = 0x04;
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+
+mod peer_stream;
+
+#[cfg(test)]
+#[path = "ssh/reconnect_tests.rs"]
+mod reconnect_tests;
 
 fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
     let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
@@ -36,6 +50,9 @@ fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u
             }
             forward.push(MAIN_DETACH_PREFIX);
             *prefix_pending = false;
+        }
+        if byte == MAIN_DETACH_EOF {
+            return (forward, true);
         }
         if byte == MAIN_DETACH_PREFIX {
             *prefix_pending = true;
@@ -66,6 +83,9 @@ fn ssh_server_init(
     let mut config = russh::server::Config {
         server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
+        // Peer replies keep idle attachments alive without relying on shell I/O.
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: 3,
         ..Default::default()
     };
     config.keys.push(host_key);
@@ -155,9 +175,15 @@ pub async fn run_ssh_server(
                 let main_session = main_session.clone();
 
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        handle_connection(stream, config, port_forward, boundary_exec, main_session)
-                            .await
+                    if let Err(err) = handle_connection(
+                        stream,
+                        config,
+                        port_forward,
+                        boundary_exec,
+                        main_session,
+                        SSH_PEER_TIMEOUT,
+                    )
+                    .await
                     {
                         ocsf_emit!(
                             SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -296,6 +322,7 @@ async fn handle_connection(
     port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
+    peer_timeout: Duration,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -312,9 +339,12 @@ async fn handle_connection(
     );
 
     let handler = SshHandler::new(port_forward, boundary_exec, main_session);
+    let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
-        .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
+        .map_err(|err| miette::miette!("ssh stream error: {err}"))?
+        .await
+        .map_err(|err| miette::miette!("ssh session error: {err}"))?;
     Ok(())
 }
 
@@ -328,6 +358,7 @@ async fn handle_connection(
 #[derive(Default)]
 struct ChannelState {
     input_sender: Option<InputSender>,
+    input_task: Option<input::InputTask>,
     process: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryProcess>>,
     terminal: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryTerminal>>,
     pty_request: Option<PtyRequest>,
@@ -335,19 +366,25 @@ struct ChannelState {
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
+    /// A writable attachment denied stdin may retry on later input. Explicit
+    /// viewers and channels that sent EOF must never acquire a new lease.
+    main_input_pending: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
 }
 
 enum InputSender {
-    Process(mpsc::Sender<Vec<u8>>),
+    Process(input::InputSender),
     Main(tokio::sync::mpsc::Sender<Vec<u8>>),
 }
 
 impl InputSender {
     fn send(&self, data: Vec<u8>) -> Result<(), &'static str> {
         match self {
-            Self::Process(sender) => sender.send(data).map_err(|_| "process stdin closed"),
+            Self::Process(sender) => sender.send(&data).map_err(|error| match error {
+                input::SendError::Full => "process stdin buffer is full",
+                input::SendError::Closed => "process stdin closed",
+            }),
             Self::Main(sender) => sender.try_send(data).map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => "canonical stdin buffer is full",
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
@@ -430,15 +467,15 @@ impl russh::server::Handler for SshHandler {
 
     /// Clean up per-channel state when the channel is closed.
     ///
-    /// This is the final cleanup and subsumes `channel_eof` — if `channel_close`
-    /// fires without a preceding `channel_eof`, all resources (`pty_master` File,
-    /// `input_sender`) are dropped here.
+    /// Unlike EOF, close cancels pending stdin writes before terminating the
+    /// process. A child that does not read stdin must not retain queued input.
     async fn channel_close(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(mut state) = self.channels.remove(&channel) {
+            state.input_task.take();
             if state.main_attached
                 && let Some(main_session) = self.main_session.as_ref()
             {
@@ -635,14 +672,45 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if name == "openshell-main" {
-            let Some(main_session) = self.main_session.clone() else {
+            let Some(state) = self.channels.get(&channel) else {
                 session.channel_failure(channel)?;
                 return Ok(());
             };
-            if !begin_main_attachment(&main_session, self.channels.contains_key(&channel)) {
-                session.channel_failure(channel)?;
-                return Ok(());
-            }
+            // Supervisor diagnostics bypass the PTY's output processing. SSH
+            // puts terminal clients in raw mode, so send the carriage return too.
+            let line_ending = if state.pty_request.is_some() {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let main_session = self
+                .main_session
+                .clone()
+                .ok_or("no main session is available")
+                .and_then(|main_session| {
+                    main_session.begin_terminal_attachment()?;
+                    Ok(main_session)
+                });
+            let main_session = match main_session {
+                Ok(main_session) => main_session,
+                Err(error) => {
+                    // The subsystem is supported, but its terminal is unavailable.
+                    // A bare request failure hides this reason in OpenSSH clients.
+                    session.channel_success(channel)?;
+                    session.extended_data(
+                        channel,
+                        1,
+                        format!(
+                            "openshell: cannot connect to the canonical main process: {error}{line_ending}"
+                        )
+                        .into_bytes(),
+                    )?;
+                    session.exit_status_request(channel, 1)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            };
             let state = self
                 .channels
                 .get_mut(&channel)
@@ -669,6 +737,7 @@ impl russh::server::Handler for SshHandler {
                     Err(error) => (None, Some(error)),
                 }
             };
+            state.main_input_pending = warning.is_some();
             state.input_sender = input;
             state.main_detach_prefix_pending = false;
             let mut output = main_session.subscribe();
@@ -680,7 +749,7 @@ impl russh::server::Handler for SshHandler {
                     .extended_data(
                         channel,
                         1,
-                        format!("openshell: {error}; attached read-only\n").into_bytes(),
+                        format!("openshell: {error}; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}").into_bytes(),
                     )
                     .await;
             }
@@ -789,11 +858,53 @@ impl russh::server::Handler for SshHandler {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
         };
-        let (forward, detach) = if state.main_attached {
+        if !state.main_attached {
+            // Russh replenishes receive credit before this callback. Waiting
+            // for space here would block signals, close, and output credit on
+            // the same SSH connection. Reject overflow before copying input.
+            if let Some(InputSender::Process(sender)) = &state.input_sender
+                && sender.send(data) == Err(input::SendError::Full)
+            {
+                self.reject_exec_input(channel, session)?;
+            }
+            return Ok(());
+        }
+        // A viewer has no process stdin to interrupt. Ctrl-C closes only its
+        // attachment; the input owner's Ctrl-C still reaches the process.
+        if state.main_attached && state.main_input_owner.is_none() && data.contains(&0x03) {
+            self.close_main_attachment(channel, session.handle(), None)
+                .await;
+            return Ok(());
+        }
+        let denied_prefix = state.main_input_pending && state.main_detach_prefix_pending;
+        let (mut forward, detach) = if state.main_attached {
             filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
         } else {
             (data.to_vec(), false)
         };
+        // Remember a denied viewer's prefix only to recognize split detach
+        // sequences. It must not become process input when a later frame wins
+        // the lease: that earlier keystroke was sent without write ownership.
+        if denied_prefix && forward.first() == Some(&MAIN_DETACH_PREFIX) {
+            forward.remove(0);
+        }
+        // A reconnect can precede detection of the old connection's failure.
+        // Retry only on new input, using the same exclusive acquisition as a
+        // fresh attachment. Detach keys retain their read-only behavior.
+        if state.main_attached
+            && state.main_input_pending
+            && !state.main_read_only
+            && !detach
+            && !forward.is_empty()
+            && let Some(main_session) = self.main_session.as_ref()
+            && !main_session.finished()
+            && let Ok((owner, input)) = main_session.acquire_input()
+        {
+            state.main_input_owner = Some(owner);
+            state.input_sender = Some(InputSender::Main(input));
+            state.main_input_pending = false;
+            session.extended_data(channel, 1, b"openshell: input enabled\r\n".to_vec())?;
+        }
         let error = (!forward.is_empty())
             .then(|| state.input_sender.as_ref()?.send(forward).err())
             .flatten();
@@ -809,10 +920,9 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Drop the input sender so the stdin writer thread sees a
-        // disconnected channel and closes the child's stdin pipe.  This
-        // is essential for commands like `cat | tar xf -` which need
-        // stdin EOF to know the input stream is complete.
+        // Drop only the sender: the writer drains accepted bytes and then
+        // closes stdin. Commands such as `cat | tar xf -` need this half-close
+        // to finish while their output remains available to the SSH client.
         if let Some(state) = self.channels.get_mut(&channel) {
             if state.main_attached
                 && let Some(owner) = state.main_input_owner.take()
@@ -824,6 +934,7 @@ impl russh::server::Handler for SshHandler {
                 main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
@@ -881,6 +992,33 @@ impl russh::server::Handler for SshHandler {
 }
 
 impl SshHandler {
+    fn reject_exec_input(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
+        if let Some(mut state) = self.channels.remove(&channel) {
+            // A locally initiated close may never call channel_close. Release
+            // input here and keep backend termination off the session loop.
+            state.input_task.take();
+            if let Some(process) = state.process.take() {
+                tokio::spawn(async move {
+                    if let Err(error) = process.terminate().await {
+                        warn!(%error, "failed to terminate exec after stdin overflow");
+                    }
+                });
+            }
+        }
+        // Session methods enqueue directly. Do not add stderr data here: with
+        // no output credit, russh would retain it and stop draining Handle
+        // messages for other channels. Exit status needs no output credit.
+        warn!(?channel, "process stdin buffer is full; terminating exec");
+        session.exit_status_request(channel, 74)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
     async fn start_shell(
         &mut self,
         channel: ChannelId,
@@ -935,7 +1073,7 @@ impl SshHandler {
         handle: Handle,
         spec: openshell_isolation_interface::contract::ExecSpec,
     ) -> anyhow::Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
 
         let mut exec = self
             .boundary_exec
@@ -948,19 +1086,17 @@ impl SshHandler {
             .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
         state.process = Some(exec.process.clone());
         state.terminal = exec.terminal.take();
+        let output_status = exec.output_status.take();
 
-        if let Some(mut stdin) = exec.stdin.take() {
-            let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-            let runtime = tokio::runtime::Handle::current();
-            std::thread::spawn(move || {
-                while let Ok(bytes) = receiver.recv() {
-                    if runtime.block_on(stdin.write_all(&bytes)).is_err() {
-                        break;
-                    }
-                }
-            });
+        if let Some(stdin) = exec.stdin.take() {
+            let (sender, task) = input::InputTask::spawn(stdin);
             state.input_sender = Some(InputSender::Process(sender));
+            state.input_task = Some(task);
         }
+        let input_abort = state
+            .input_task
+            .as_ref()
+            .map(input::InputTask::abort_handle);
 
         let mut stdout = exec.stdout;
         let stdout_handle = handle.clone();
@@ -992,19 +1128,33 @@ impl SshHandler {
             })
         });
         tokio::spawn(async move {
-            let status = exec.process.wait().await;
-            let _ = stdout_task.await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
+            let status = if let Some(output_status) = output_status {
+                // The boundary stream's final status includes output delivery
+                // failure. Process wait alone reports only the child's exit.
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                output_status.await.ok()
+            } else {
+                let status = exec.process.wait().await.ok();
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                status
+            };
+            if let Some(input_abort) = input_abort {
+                input_abort.abort();
             }
             let code = match status {
-                Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
                     code.max(0).cast_unsigned()
                 }
-                Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
                     signal,
                 )) => (128_i32.saturating_add(signal)).max(0).cast_unsigned(),
-                Err(_) => 1,
+                None => 74,
             };
             let _ = handle.eof(channel).await;
             let _ = handle.exit_status_request(channel, code).await;
@@ -1032,6 +1182,7 @@ impl SshHandler {
                 main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
@@ -1050,10 +1201,6 @@ impl SshHandler {
         let _ = handle.exit_status_request(channel, 0).await;
         let _ = handle.close(channel).await;
     }
-}
-
-fn begin_main_attachment(main_session: &MainSession, channel_exists: bool) -> bool {
-    channel_exists && main_session.begin_terminal_attachment().is_ok()
 }
 
 async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
@@ -1169,9 +1316,8 @@ fn direct_tcpip_target(
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
 
-    struct AcceptAnyServerKey;
+    pub(super) struct AcceptAnyServerKey;
 
     impl russh::client::Handler for AcceptAnyServerKey {
         type Error = russh::Error;
@@ -1184,7 +1330,7 @@ mod tests {
         }
     }
 
-    struct TestLoopbackConnector;
+    pub(super) struct TestLoopbackConnector;
 
     #[async_trait::async_trait]
     impl openshell_isolation_interface::contract::BoundaryLoopbackConnector for TestLoopbackConnector {
@@ -1206,7 +1352,7 @@ mod tests {
         }
     }
 
-    struct RejectingExec;
+    pub(super) struct RejectingExec;
 
     #[async_trait::async_trait]
     impl openshell_isolation_interface::contract::BoundaryExec for RejectingExec {
@@ -1226,6 +1372,25 @@ mod tests {
     }
 
     async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
+        main_test_client(Some(MainSession::inert())).await
+    }
+
+    async fn main_test_client(
+        main_session: Option<Arc<MainSession>>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        test_client(
+            main_session,
+            Arc::new(RejectingExec),
+            russh::client::Config::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn test_client(
+        main_session: Option<Arc<MainSession>>,
+        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+        client_config: russh::client::Config,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
         let host_key = {
             let mut rng = rand::rng();
             PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key")
@@ -1236,11 +1401,7 @@ mod tests {
         };
         server_config.keys.push(host_key);
 
-        let handler = SshHandler::new(
-            Arc::new(TestLoopbackConnector),
-            Arc::new(RejectingExec),
-            Some(MainSession::inert()),
-        );
+        let handler = SshHandler::new(Arc::new(TestLoopbackConnector), boundary_exec, main_session);
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             if let Ok(session) =
@@ -1251,7 +1412,7 @@ mod tests {
         });
 
         let mut client = russh::client::connect_stream(
-            Arc::new(russh::client::Config::default()),
+            Arc::new(client_config),
             client_stream,
             AcceptAnyServerKey,
         )
@@ -1373,19 +1534,317 @@ mod tests {
         assert_eq!(&echoed, b"ping");
     }
 
+    async fn next_main_event(
+        channel: &mut russh::Channel<russh::client::Msg>,
+    ) -> russh::ChannelMsg {
+        tokio::time::timeout(Duration::from_secs(5), channel.wait())
+            .await
+            .expect("main attachment event timeout")
+            .expect("main attachment channel closed before expected event")
+    }
+
+    async fn assert_main_rejection(
+        main_session: Option<Arc<MainSession>>,
+        terminal: bool,
+        message: &str,
+    ) {
+        let client = main_test_client(main_session).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                assert_eq!(String::from_utf8_lossy(&data), message);
+            }
+            event => panic!("expected actionable stderr, got {event:?}"),
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 1 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_missing_session_reports_terminal_error() {
+        assert_main_rejection(None, false, "openshell: cannot connect to the canonical main process: no main session is available\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_finished_session_reports_terminal_error() {
+        let main_session = MainSession::inert();
+        assert!(!main_session.finish(130, false).await);
+        assert_main_rejection(Some(main_session), false, "openshell: cannot connect to the canonical main process: canonical main process already finished\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_pty_rejections_return_cursor_to_start_of_line() {
+        assert_main_rejection(None, true, "openshell: cannot connect to the canonical main process: no main session is available\r\n").await;
+        let main_session = MainSession::inert();
+        assert!(!main_session.finish(130, false).await);
+        assert_main_rejection(Some(main_session), true, "openshell: cannot connect to the canonical main process: canonical main process already finished\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_occupied_stdin_still_attaches_read_only() {
+        assert_read_only_attachment(false, "\n", 0x03).await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_read_only_pty_warning_returns_cursor_to_start_of_line() {
+        assert_read_only_attachment(true, "\r\n", 0x03).await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_read_only_ctrl_d_detaches_without_releasing_owner_lease() {
+        assert_read_only_attachment(false, "\n", MAIN_DETACH_EOF).await;
+    }
+
+    async fn assert_read_only_attachment(terminal: bool, line_ending: &str, detach_key: u8) {
+        let main_session = MainSession::inert();
+        let (owner, _input) = main_session.acquire_input().unwrap();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                assert_eq!(
+                    String::from_utf8_lossy(&data),
+                    format!(
+                        "openshell: canonical main process already has an input owner; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}"
+                    )
+                );
+            }
+            event => panic!("expected read-only warning, got {event:?}"),
+        }
+        assert!(main_session.acquire_input().is_err());
+        let mut data = b"ignored".to_vec();
+        data.push(detach_key);
+        data.extend_from_slice(b"also ignored");
+        channel.data(&data[..]).await.unwrap();
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(
+            main_session.acquire_input().is_err(),
+            "viewer must not release the owner's input lease"
+        );
+        main_session.release_input(owner);
+    }
+
+    async fn assert_viewer_closed(channel: &mut russh::Channel<russh::client::Msg>) {
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 0 }
+        ));
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_explicit_read_only_ctrl_c_exits_without_input_lease() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, "OPENSHELL_MAIN_READ_ONLY", "1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        channel.data(&b"\x03"[..]).await.unwrap();
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(matches!(
+            input.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (owner, _) = main_session
+            .acquire_input()
+            .expect("viewer leaves stdin available");
+        main_session.release_input(owner);
+    }
+
+    #[tokio::test]
+    async fn main_attachment_ctrl_d_detaches_without_closing_main_stdin() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+
+        channel.data(&b"hello\x04ignored"[..]).await.unwrap();
+        assert_eq!(input.recv().await.unwrap(), b"hello");
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(matches!(
+            input.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (owner, _) = main_session
+            .acquire_input()
+            .expect("detaching must release the input lease");
+        main_session.release_input(owner);
+    }
+
+    #[test]
+    fn main_detach_filter_preserves_prefix_before_ctrl_d() {
+        let mut prefix_pending = false;
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10"),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x04ignored"),
+            (vec![0x10], true)
+        );
+        assert!(!prefix_pending);
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10\x11"),
+            (Vec::new(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn main_attachment_input_owner_ctrl_c_reaches_main_stdin() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session)).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        for data in [b"\x03".as_slice(), b"still attached".as_slice()] {
+            channel.data(data).await.unwrap();
+            let forwarded = tokio::time::timeout(Duration::from_secs(5), input.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(forwarded, data);
+        }
+        channel.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn main_attachment_accepts_declared_session_after_process_exit() {
-        let main_session = MainSession::inert();
-        assert!(main_session.finish(23, true).await);
-        assert!(main_session.finished());
-
-        assert!(begin_main_attachment(&main_session, true));
+        let (main_session, mut slave) = MainSession::terminal_for_test();
         let mut output = main_session.subscribe();
+        slave.write_all(b"retained output").unwrap();
         assert!(matches!(
-            output.recv().await.expect("retained terminal status"),
-            MainOutput::Exit(23)
+            tokio::time::timeout(Duration::from_secs(5), output.recv()).await.unwrap().unwrap(),
+            MainOutput::Stdout(data) if data == b"retained output"[..]
         ));
-        main_session.end_terminal_attachment();
+        drop(slave);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), main_session.finish(23, true))
+                .await
+                .unwrap()
+        );
+        main_session.mark_terminal_reported();
+        let client = main_test_client(Some(main_session)).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        assert!(
+            matches!(next_main_event(&mut channel).await, russh::ChannelMsg::Data { data } if data == b"retained output"[..])
+        );
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 23 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_unknown_subsystem_still_fails_request() {
+        let client = main_test_client(None).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "unknown-subsystem")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Failure
+        ));
     }
 
     #[cfg(unix)]
@@ -1450,109 +1909,6 @@ mod tests {
         drop(listener);
     }
 
-    /// Verify that dropping the input sender (the operation `channel_eof`
-    /// performs) causes the stdin writer loop to exit and close the child's
-    /// stdin pipe.  Without this, commands like `cat | tar xf -` used by
-    /// `sync --up` hang forever waiting for EOF on stdin.
-    #[test]
-    fn dropping_input_sender_closes_child_stdin() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-
-        let mut child = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn cat");
-
-        let child_stdin = child.stdin.take().expect("stdin must be piped");
-
-        // Replicate the stdin writer loop from spawn_pipe_exec.
-        std::thread::spawn(move || {
-            let mut stdin = child_stdin;
-            while let Ok(bytes) = receiver.recv() {
-                if stdin.write_all(&bytes).is_err() {
-                    break;
-                }
-                let _ = stdin.flush();
-            }
-        });
-
-        sender.send(b"hello".to_vec()).unwrap();
-
-        // Simulate what channel_eof does: drop the sender.
-        drop(sender);
-
-        // cat should see EOF on stdin and exit.  Use a timeout so the test
-        // fails fast instead of hanging if the mechanism is broken.
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(child.wait_with_output());
-        });
-        let output = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("cat hung for 5s — stdin was not closed (channel_eof bug)")
-            .expect("failed to wait for cat");
-
-        assert!(
-            output.status.success(),
-            "cat exited with {:?}",
-            output.status
-        );
-        assert_eq!(output.stdout, b"hello");
-    }
-
-    /// Verify that the stdin writer delivers all buffered data before exiting
-    /// when the sender is dropped.  This ensures channel_eof doesn't cause
-    /// data loss — only signals "no more data after this".
-    #[test]
-    fn stdin_writer_delivers_buffered_data_before_eof() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-
-        let mut child = Command::new("wc")
-            .arg("-c")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn wc");
-
-        let child_stdin = child.stdin.take().expect("stdin must be piped");
-
-        std::thread::spawn(move || {
-            let mut stdin = child_stdin;
-            while let Ok(bytes) = receiver.recv() {
-                if stdin.write_all(&bytes).is_err() {
-                    break;
-                }
-                let _ = stdin.flush();
-            }
-        });
-
-        // Send multiple chunks, then drop the sender.
-        for _ in 0..100 {
-            sender.send(vec![0u8; 1024]).unwrap();
-        }
-        drop(sender);
-
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(child.wait_with_output());
-        });
-        let output = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("wc hung for 5s — stdin was not closed")
-            .expect("failed to wait for wc");
-
-        let count: usize = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .expect("wc output was not a number");
-        assert_eq!(
-            count,
-            100 * 1024,
-            "expected all 100 KiB delivered before EOF"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // SEC-007: is_loopback_host tests
     // -----------------------------------------------------------------------
@@ -1601,56 +1957,5 @@ mod tests {
         assert!(!is_loopback_host(""));
         assert!(!is_loopback_host("not-an-ip"));
         assert!(!is_loopback_host("[]"));
-    }
-
-    #[test]
-    fn channel_state_independent_input_senders() {
-        // Verify that each channel gets its own input sender so that
-        // data() and channel_eof() affect only the targeted channel.
-        let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
-        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
-
-        let mut state_a = ChannelState {
-            input_sender: Some(InputSender::Process(tx_a)),
-            ..Default::default()
-        };
-        let state_b = ChannelState {
-            input_sender: Some(InputSender::Process(tx_b)),
-            ..Default::default()
-        };
-
-        // Send data to channel A only.
-        state_a
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"hello-a".to_vec())
-            .unwrap();
-        // Send data to channel B only.
-        state_b
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"hello-b".to_vec())
-            .unwrap();
-
-        assert_eq!(rx_a.recv().unwrap(), b"hello-a");
-        assert_eq!(rx_b.recv().unwrap(), b"hello-b");
-
-        // EOF on channel A (drop sender) should not affect channel B.
-        state_a.input_sender.take();
-        assert!(
-            rx_a.recv().is_err(),
-            "channel A sender dropped, recv should fail"
-        );
-
-        // Channel B should still be functional.
-        state_b
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"still-alive".to_vec())
-            .unwrap();
-        assert_eq!(rx_b.recv().unwrap(), b"still-alive");
     }
 }

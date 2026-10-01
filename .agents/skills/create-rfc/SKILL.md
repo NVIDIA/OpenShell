@@ -33,12 +33,12 @@ Keep the template as the source of truth for section guidance.
 ## Writing Standards
 
 - Prefer concrete design statements over placeholder language.
-- Link to relevant issues, prior RFCs, and architecture docs when they provide
+- Link to relevant issues, prior RFCs, and published docs when they provide
   needed context.
 - Keep rejected or left-out designs in Alternatives, not Proposal.
 - Use Mermaid diagrams for architecture or data flow when a diagram would make
   the proposal easier to review.
-- Do not update `architecture/` or published docs just because an RFC was
+- Do not update published docs just because an RFC was
   drafted. Those updates belong with implementation or with an accepted RFC when
   the user asks for them.
 

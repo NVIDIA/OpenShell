@@ -833,9 +833,7 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
     if !proposed.protocol.is_empty() && !protocols_match(&loaded.protocol, &proposed.protocol) {
         return false;
     }
-    if proposed.tls != NetworkTlsMode::Unspecified as i32
-        && effective_tls(loaded.tls) != effective_tls(proposed.tls)
-    {
+    if proposed.tls != NetworkTlsMode::Unspecified as i32 && loaded.tls != proposed.tls {
         return false;
     }
     if proposed.enforcement != NetworkEnforcementMode::Unspecified as i32
@@ -937,19 +935,6 @@ fn protocols_match(left: &str, right: &str) -> bool {
         left.eq_ignore_ascii_case("mcp") && right.eq_ignore_ascii_case("mcp")
     } else {
         left == right
-    }
-}
-
-#[allow(deprecated)]
-fn effective_tls(value: i32) -> i32 {
-    match value {
-        value
-            if value == NetworkTlsMode::Terminate as i32
-                || value == NetworkTlsMode::Passthrough as i32 =>
-        {
-            NetworkTlsMode::Unspecified as i32
-        }
-        value => value,
     }
 }
 
@@ -3134,6 +3119,8 @@ mod tests {
         for versions in [
             &["2025-03-26"][..],
             &["2025-03-26", DEFAULT_MCP_VERSION][..],
+            &["2026-07-28"][..],
+            &[DEFAULT_MCP_VERSION, "2026-07-28"][..],
         ] {
             let existing = rule_with_authorizations(
                 "existing",
@@ -3179,6 +3166,7 @@ mod tests {
         let existing = rule_with_authorizations(
             "existing",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -3190,6 +3178,7 @@ mod tests {
             vec![mcp_endpoint_with_versions(&[
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
                 "2025-03-26",
             ])],
             &["/usr/bin/new"],
@@ -3212,7 +3201,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3223,6 +3212,7 @@ mod tests {
             rule_with_authorizations(
                 "mcp",
                 vec![mcp_endpoint_with_versions(&[
+                    "2026-07-28",
                     "2025-11-25",
                     "2025-03-26",
                     "2025-06-18",
@@ -3240,7 +3230,7 @@ mod tests {
                 .as_ref()
                 .expect("MCP endpoint must retain options")
                 .versions,
-            ["2025-03-26", "2025-06-18", "2025-11-25"]
+            ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
         );
     }
 
@@ -3252,6 +3242,7 @@ mod tests {
                 "2025-03-26",
                 "2025-06-18",
                 "2025-11-25",
+                "2026-07-28",
             ])],
             &["/usr/bin/client"],
         );
@@ -3266,6 +3257,7 @@ mod tests {
         let equivalent = rule_with_authorizations(
             "proposed",
             vec![mcp_endpoint_with_versions(&[
+                "2026-07-28",
                 "2025-11-25",
                 "2025-03-26",
                 "2025-06-18",
@@ -3783,7 +3775,6 @@ mod tests {
         assert!(!policy_covers_rule(&loaded, &different_body));
 
         let mut explicit_defaults = loaded_endpoint;
-        explicit_defaults.tls = 3; // deprecated passthrough compatibility value
         explicit_defaults.enforcement = NetworkEnforcementMode::Audit as i32;
         let runtime_defaults = rule_with_authorizations(
             "proposed",
@@ -3791,14 +3782,6 @@ mod tests {
             &["/usr/bin/client"],
         );
         assert!(policy_covers_rule(&loaded, &runtime_defaults));
-
-        explicit_defaults.tls = 2; // deprecated terminate compatibility value
-        let legacy_terminate = rule_with_authorizations(
-            "proposed",
-            vec![explicit_defaults.clone()],
-            &["/usr/bin/client"],
-        );
-        assert!(policy_covers_rule(&loaded, &legacy_terminate));
 
         explicit_defaults.tls = NetworkTlsMode::Skip as i32;
         let skip_tls = rule_with_authorizations(

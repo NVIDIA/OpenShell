@@ -14,6 +14,9 @@ use tracing::info;
 #[derive(Debug, Parser)]
 #[command(name = "openshell-driver-docker", version = VERSION)]
 struct Args {
+    /// Override the operator admission policy in the driver TOML file.
+    #[arg(long, env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON")]
+    admission_config_json: Option<openshell_core::resource_admission::DriverAdmissionConfig>,
     /// Public compute-driver Unix socket used by the gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: PathBuf,
@@ -54,7 +57,12 @@ async fn main() -> Result<()> {
     );
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
-    let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
+    let mut docker_config: DockerComputeConfig =
+        toml::from_str(&config_source).into_diagnostic()?;
+    if let Some(policy) = args.admission_config_json {
+        docker_config.allow_driver_config = policy.allow_driver_config;
+        docker_config.resource_admission = policy.resource_admission;
+    }
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;

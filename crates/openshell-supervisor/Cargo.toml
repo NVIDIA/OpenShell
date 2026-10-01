@@ -35,6 +35,7 @@ rustls = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+socket2 = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }

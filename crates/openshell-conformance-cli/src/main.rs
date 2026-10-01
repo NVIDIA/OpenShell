@@ -91,7 +91,7 @@ fn list(output: OutputFormat) -> Result<(), String> {
     match output {
         OutputFormat::Text => {
             for candidate in scenarios() {
-                println!("{:<16} {}", candidate.name, candidate.description);
+                println!("{:<24} {}", candidate.name, candidate.description);
             }
         }
         OutputFormat::Json => {
@@ -229,6 +229,22 @@ mod tests {
     fn unknown_scenario_has_actionable_diagnostic() {
         let error = select_scenarios(&["missing".to_string()]).expect_err("unknown scenario");
         assert!(error.contains("openshell-conformance list"));
+    }
+
+    #[test]
+    fn selects_named_policy_scenarios() {
+        let selected = select_scenarios(&[
+            "mechanistic-proposal".to_string(),
+            "policy-local".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|scenario| scenario.name)
+                .collect::<Vec<_>>(),
+            ["mechanistic-proposal", "policy-local"]
+        );
     }
 
     #[test]

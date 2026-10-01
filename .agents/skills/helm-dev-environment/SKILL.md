@@ -69,13 +69,24 @@ mise run helm:skaffold:dev
 mise run helm:skaffold:run
 ```
 
+Resource admission defaults to enabled and caller driver config to disabled.
+Driver-config scenarios need an explicit `allowDriverConfig` opt-in; external
+attachments also need administrator-controlled approval labels in the target
+namespace. GPU attachments and operator-selected image-pull Secrets are exempt
+from labels. Managed workspace image-pull Secrets are copied from the configured
+source in the gateway namespace; do not grant approval to the gateway database
+PVC or disable admission to make tests pass.
+
 The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
 workload Pod. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. The default Skaffold values export
+generates gateway and CLI TLS secrets on first install. Supervisor Pods project
+only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
+client certificates and private keys remain outside supervisor and workload Pods.
+The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 

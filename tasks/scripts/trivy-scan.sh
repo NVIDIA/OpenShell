@@ -24,7 +24,6 @@ PREFLIGHT_OFF=(--helm-set agentSandbox.preflight.enabled=false)
 # These Dockerfiles do not produce release runtime images.
 SKIP_DOCKERFILES=(
   --skip-files 'deploy/docker/Dockerfile.ci'
-  --skip-files 'deploy/docker/Dockerfile.*-macos'
 )
 
 # Explicit OpenShell variants, including dev/E2E regression coverage.

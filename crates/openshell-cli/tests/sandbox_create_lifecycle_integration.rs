@@ -743,6 +743,7 @@ impl OpenShell for TestOpenShell {
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
+                    cursor: String::new(),
                 }))
                 .await;
             if terminal_after_provisional_container_exit
@@ -753,6 +754,7 @@ impl OpenShell for TestOpenShell {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(
                             provisional_container_exit,
                         )),
+                        cursor: String::new(),
                     }))
                     .await;
                 provisional_container_exit_sent.notify_waiters();
@@ -764,6 +766,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -777,11 +780,13 @@ impl OpenShell for TestOpenShell {
                             message: "Started VM launcher".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -801,12 +806,14 @@ impl OpenShell for TestOpenShell {
                                 source: "gateway".to_string(),
                                 fields: HashMap::new(),
                             })),
+                            cursor: String::new(),
                         }))
                         .await;
                 }
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -815,6 +822,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -829,6 +837,7 @@ impl OpenShell for TestOpenShell {
                             message: "Preparing rootfs".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
@@ -840,12 +849,14 @@ impl OpenShell for TestOpenShell {
                             message: "Formatting root disk".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -857,11 +868,13 @@ impl OpenShell for TestOpenShell {
                         message: "Sandbox scheduled".to_string(),
                         ..PlatformEvent::default()
                     })),
+                    cursor: String::new(),
                 }))
                 .await;
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    cursor: String::new(),
                 }))
                 .await;
         });
@@ -2771,6 +2784,8 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
             name: Some("sandbox"),
             keep: false,
             expose: Some(4500),
+            expose_authorization_mode:
+                openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
             detach: true,
             ..test_config()
         },
@@ -2786,7 +2801,36 @@ async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
     assert_eq!(create_requests[0].service_exposures.len(), 1);
     assert_eq!(create_requests[0].service_exposures[0].service, "");
     assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+    assert_eq!(
+        create_requests[0].service_exposures[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
     assert!(expose_service_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn service_expose_forwards_bearer_passthrough_mode() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    run::service_expose(
+        &server.endpoint,
+        "sandbox",
+        "codex",
+        4500,
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        "default",
+        &tls,
+    )
+    .await
+    .expect("service expose should succeed");
+
+    let requests = expose_service_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
 }
 
 #[tokio::test]
