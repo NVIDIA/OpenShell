@@ -72,7 +72,7 @@ runs:
           --entitlements "${INPUTS_MACOS_ENTITLEMENTS}" \
           --force -s - "${binary}"
         /usr/bin/codesign --verify --strict "${binary}"
-        /usr/bin/codesign --display --entitlements :- "${binary}" > "${signed_entitlements}"
+        /usr/bin/codesign --display --entitlements - --xml "${binary}" > "${signed_entitlements}"
         /usr/bin/plutil -extract com.apple.security.hypervisor raw -o - "${signed_entitlements}" \
           | grep -qx true
 
