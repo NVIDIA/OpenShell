@@ -6697,7 +6697,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         std::fs::write(
             &path,
-            "version: 1\\nprocess:\\n  run_as_user: \\\"0\\\"\\n  run_as_group: \\\"0\\\"\\n",
+            "version: 1\nprocess:\n  run_as_user: \"0\"\n  run_as_group: \"0\"\n",
         )
         .expect("write policy");
 
