@@ -1677,6 +1677,10 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Stop only this execution; reject a restarted or replaced sandbox.
+        #[arg(long)]
+        execution_id: Option<String>,
     },
 
     /// Start a stopped sandbox.
@@ -3578,9 +3582,16 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Stop { name } => {
+                        SandboxCommands::Stop { name, execution_id } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                            run::sandbox_stop(
+                                endpoint,
+                                &name,
+                                &cli.workspace,
+                                execution_id.as_deref(),
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::Start { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -5502,7 +5513,7 @@ mod tests {
         assert!(matches!(
             stop.command,
             Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+                command: Some(SandboxCommands::Stop { name: Some(ref name), execution_id: None }),
             }) if name == "demo"
         ));
 
@@ -5514,6 +5525,22 @@ mod tests {
                 command: Some(SandboxCommands::Start { name: None }),
             })
         ));
+    }
+
+    #[test]
+    fn sandbox_stop_accepts_execution_precondition() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "stop",
+            "demo",
+            "--execution-id",
+            "e2f8625a-f7c5-4bca-bbb3-4d793c646643",
+        ])
+        .expect("conditional stop should parse");
+        assert!(matches!(cli.command, Some(Commands::Sandbox {
+            command: Some(SandboxCommands::Stop { name: Some(ref name), execution_id: Some(ref id) })
+        }) if name == "demo" && id == "e2f8625a-f7c5-4bca-bbb3-4d793c646643"));
     }
 
     #[test]

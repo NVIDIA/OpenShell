@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use openshell_core::ObjectId;
 use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::sandbox_generation::SandboxGenerationId;
@@ -23,6 +24,58 @@ const REFRESH_REPLAY_UNTIL_ANNOTATION: &str = "internal.openshell.ai/refresh-rep
 const REFRESH_REQUEST_HASH_ANNOTATION: &str = "internal.openshell.ai/refresh-request-hash";
 const REFRESH_ISSUED_AT_ANNOTATION: &str = "internal.openshell.ai/refresh-issued-at";
 const REFRESH_ROTATION_ID_ANNOTATION: &str = "internal.openshell.ai/refresh-rotation-id";
+
+/// Non-secret, opaque precondition bound to one authenticated runtime launch.
+/// Credential refresh changes token IDs, but never this launch identity.
+pub fn execution_id(
+    sandbox_id: &str,
+    generation: &SandboxGenerationId,
+    epoch: CredentialEpoch,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"openshell-execution-v1\0");
+    for value in [sandbox_id, generation.as_str()] {
+        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(epoch.get().to_be_bytes());
+    format!("exec-v1:{}", hex::encode(digest.finalize()))
+}
+
+#[allow(clippy::result_large_err)]
+pub fn validate_execution_id(value: &str) -> Result<(), Status> {
+    if value.strip_prefix("exec-v1:").is_none_or(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(Status::invalid_argument(
+            "execution_id must be a valid execution identity",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+pub fn sandbox_execution_id(sandbox: &Sandbox) -> Result<String, Status> {
+    if sandbox.object_id().is_empty() {
+        return Err(Status::failed_precondition(
+            "sandbox has no authenticated execution identity",
+        ));
+    }
+    let metadata = sandbox.metadata.as_ref().ok_or_else(|| {
+        Status::failed_precondition("sandbox has no authenticated execution identity")
+    })?;
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations).map_err(|_| {
+        Status::failed_precondition("sandbox has no authenticated execution identity")
+    })?;
+    Ok(execution_id(
+        sandbox.object_id(),
+        &identity.runtime_generation,
+        identity.auth_epoch,
+    ))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshRequestHash(String);
@@ -417,6 +470,63 @@ mod tests {
             token_id,
             issued_at: 1,
             expires_at: 2,
+        }
+    }
+
+    #[test]
+    fn execution_identity_is_bound_to_sandbox_and_launch_not_refresh() {
+        let identity = PersistedSandboxIdentity::new().unwrap();
+        let initial = execution_id(
+            "sandbox-a",
+            &identity.runtime_generation,
+            identity.auth_epoch,
+        );
+        validate_execution_id(&initial).unwrap();
+        let refreshed =
+            identity.next_gateway_token(RefreshRequestHash::from_extension_services(&[]), 123, 30);
+        assert_eq!(
+            initial,
+            execution_id(
+                "sandbox-a",
+                &refreshed.runtime_generation,
+                refreshed.auth_epoch
+            )
+        );
+        assert_ne!(
+            initial,
+            execution_id(
+                "sandbox-b",
+                &identity.runtime_generation,
+                identity.auth_epoch
+            )
+        );
+        assert_ne!(
+            initial,
+            execution_id(
+                "sandbox-a",
+                &identity.runtime_generation,
+                CredentialEpoch::new(2).unwrap()
+            )
+        );
+        assert_ne!(
+            initial,
+            execution_id(
+                "sandbox-a",
+                &SandboxGenerationId::parse("replacement").unwrap(),
+                identity.auth_epoch
+            )
+        );
+        for invalid in [
+            "",
+            "exec-v1:",
+            "other",
+            &initial.to_uppercase(),
+            &format!("{initial}0"),
+        ] {
+            assert_eq!(
+                validate_execution_id(invalid).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
         }
     }
 

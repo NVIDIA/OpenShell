@@ -136,6 +136,15 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn stop_sandbox_execution(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxExecutionRequest>,
+    ) -> Result<Response<openshell_core::proto::StopSandboxExecutionResponse>, Status> {
+        Err(Status::unimplemented(
+            "execution stop is not implemented by this fixture",
+        ))
+    }
+
     async fn start_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,

@@ -25,28 +25,32 @@ import (
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu                   sync.Mutex
-	sandboxes            map[string]*pb.Sandbox
-	providers            map[string][]*dm.Provider
-	createErr            error
-	getErr               error
-	listErr              error
-	listPages            [][]*pb.Sandbox
-	listRequests         []*pb.ListSandboxesRequest
-	listProviderPages    [][]*dm.Provider
-	listProviderRequests []*pb.ListSandboxProvidersRequest
-	deleteErr            error
-	deleteResponse       *pb.DeleteSandboxResponse
-	deleteRequest        *pb.DeleteSandboxRequest
-	attachErr            error
-	detachErr            error
-	listProvErr          error
-	createRequest        *pb.CreateSandboxRequest
-	watchEvents          []*pb.SandboxStreamEvent
-	watchErr             error
-	watchPostEventsErr   error
-	watchKeepOpen        chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest         *pb.WatchSandboxRequest // recorded request
+	mu                    sync.Mutex
+	sandboxes             map[string]*pb.Sandbox
+	providers             map[string][]*dm.Provider
+	createErr             error
+	getErr                error
+	listErr               error
+	listPages             [][]*pb.Sandbox
+	listRequests          []*pb.ListSandboxesRequest
+	listProviderPages     [][]*dm.Provider
+	listProviderRequests  []*pb.ListSandboxProvidersRequest
+	deleteErr             error
+	deleteResponse        *pb.DeleteSandboxResponse
+	deleteRequest         *pb.DeleteSandboxRequest
+	stopExecutionRequest  *pb.StopSandboxExecutionRequest
+	stopExecutionResponse *pb.StopSandboxExecutionResponse
+	stopExecutionErr      error
+	stopCalls             int
+	attachErr             error
+	detachErr             error
+	listProvErr           error
+	createRequest         *pb.CreateSandboxRequest
+	watchEvents           []*pb.SandboxStreamEvent
+	watchErr              error
+	watchPostEventsErr    error
+	watchKeepOpen         chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest          *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -160,6 +164,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stopCalls++
 	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
@@ -167,6 +172,13 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 	}
 	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) StopSandboxExecution(_ context.Context, req *pb.StopSandboxExecutionRequest) (*pb.StopSandboxExecutionResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopExecutionRequest = proto.Clone(req).(*pb.StopSandboxExecutionRequest)
+	return s.stopExecutionResponse, s.stopExecutionErr
 }
 
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
@@ -611,6 +623,50 @@ func TestSandboxStopAndStart(t *testing.T) {
 }
 
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---
+
+func TestSandboxStopExecution(t *testing.T) {
+	const executionID = "e2f8625a-f7c5-4bca-bbb3-4d793c646643"
+	const requestID = "21398f54-4c52-4f83-af5f-eec325df40a9"
+	mock := newMockSandboxServer()
+	mock.stopExecutionResponse = &pb.StopSandboxExecutionResponse{ExecutionId: executionID, Phase: pb.SandboxPhase_SANDBOX_PHASE_STOPPED}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+	result, err := client.StopExecution(context.Background(), "team-a", "worker", executionID, StopExecutionOptions{RequestID: requestID})
+	require.NoError(t, err)
+	assert.Equal(t, &StopExecutionResult{ExecutionID: executionID, Phase: SandboxStopped}, result)
+	assert.Equal(t, "worker", mock.stopExecutionRequest.GetName())
+	assert.Equal(t, "team-a", mock.stopExecutionRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, executionID, mock.stopExecutionRequest.GetExecutionId())
+	assert.Equal(t, requestID, mock.stopExecutionRequest.GetRequestId())
+	assert.Zero(t, mock.stopCalls)
+}
+
+func TestSandboxStopExecutionNeverFallsBack(t *testing.T) {
+	for _, code := range []codes.Code{codes.Unimplemented, codes.FailedPrecondition, codes.InvalidArgument} {
+		t.Run(code.String(), func(t *testing.T) {
+			mock := newMockSandboxServer()
+			mock.stopExecutionErr = status.Error(code, "execution stop rejected")
+			client, cleanup := setupSandboxTest(t, mock)
+			defer cleanup()
+			_, err := client.StopExecution(context.Background(), "team-a", "worker", "e2f8625a-f7c5-4bca-bbb3-4d793c646643")
+			require.Error(t, err)
+			var statusErr *StatusError
+			require.ErrorAs(t, err, &statusErr)
+			assert.Equal(t, int32(code), statusErr.GRPCCode)
+			assert.Zero(t, mock.stopCalls)
+		})
+	}
+}
+
+func TestSandboxStopExecutionEmptyIdentity(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+	_, err := client.StopExecution(context.Background(), "default", "worker", "")
+	require.True(t, IsInvalidArgument(err))
+	assert.Nil(t, mock.stopExecutionRequest)
+	assert.Zero(t, mock.stopCalls)
+}
 
 func TestSandboxAttachProvider(t *testing.T) {
 	mock := newMockSandboxServer()

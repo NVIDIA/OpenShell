@@ -21,6 +21,7 @@ type ClientInterface interface {
 	Sandboxes() SandboxInterface
 	SandboxTemplates() SandboxTemplateInterface
 	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	StopSandboxExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error)
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -53,6 +54,7 @@ type Client struct {
 
 	sandboxes      SandboxInterface
 	templateCreate SandboxTemplateCreateInterface
+	executionStops SandboxExecutionInterface
 	templates      SandboxTemplateInterface
 	providers      ProviderInterface
 	services       ServiceInterface
@@ -99,6 +101,7 @@ func NewClient(cfg Config) (*Client, error) {
 	sandboxes := newSandboxClient(conn)
 	c.sandboxes = sandboxes
 	c.templateCreate = sandboxes
+	c.executionStops = sandboxes
 	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
@@ -124,6 +127,13 @@ func (c *Client) SandboxTemplates() SandboxTemplateInterface { return c.template
 // without changing the legacy Sandboxes() interface.
 func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
 	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+}
+
+// StopSandboxExecution stops only the requested execution. A stale identity
+// fails without stopping a replacement. The result is a historical receipt,
+// including on request replay; unsupported gateways return Unimplemented.
+func (c *Client) StopSandboxExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error) {
+	return c.executionStops.StopExecution(ctx, workspace, name, executionID, opts...)
 }
 
 // Providers returns the provider sub-client.

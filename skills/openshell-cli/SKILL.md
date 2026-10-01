@@ -492,6 +492,16 @@ stopped or completed. Starting a retained `Completed` or
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
 
+For a response to an event from a specific execution, retain the event's
+execution identity and use `openshell sandbox stop NAME --execution-id ID`.
+The gateway rejects stale identities without stopping a replacement; the CLI
+never falls back to a name-only stop. `sandbox get NAME --output json` exposes
+`execution_id` for status observations. Middleware events must use the verified
+supervisor JWT claim. Do not substitute a fresh status identity for a delayed
+event. Conditional stop returns an execution receipt and does not manage local
+forwards or poll by name. It currently requires a single SQLite gateway;
+PostgreSQL/multi-replica deployments reject it with `FailedPrecondition`.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop

@@ -233,6 +233,12 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn stop_sandbox_execution(
+        &self,
+        _: tonic::Request<openshell_core::proto::StopSandboxExecutionRequest>,
+    ) -> Result<Response<openshell_core::proto::StopSandboxExecutionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn get_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxRequest>,

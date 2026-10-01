@@ -56,6 +56,8 @@ struct MockState {
     last_delete_name: Mutex<Option<String>>,
     last_delete_workspace: Mutex<Option<String>>,
     last_stop: Mutex<Option<proto::StopSandboxRequest>>,
+    last_execution_stop: Mutex<Option<proto::StopSandboxExecutionRequest>>,
+    execution_stop_error: Option<Status>,
     last_start: Mutex<Option<proto::StartSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
     list_requests: Mutex<Vec<proto::ListSandboxesRequest>>,
@@ -128,6 +130,7 @@ fn sandbox_with_phase_ws(
         spec: None,
         status: Some(proto::SandboxStatus {
             phase: phase.into(),
+            execution_id: "e2f8625a-f7c5-4bca-bbb3-4d793c646643".to_string(),
             ..Default::default()
         }),
         created_from_workload_template,
@@ -420,6 +423,22 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+        }))
+    }
+
+    async fn stop_sandbox_execution(
+        &self,
+        request: tonic::Request<proto::StopSandboxExecutionRequest>,
+    ) -> Result<Response<proto::StopSandboxExecutionResponse>, Status> {
+        let request = request.into_inner();
+        let execution_id = request.execution_id.clone();
+        *self.state.last_execution_stop.lock().await = Some(request);
+        if let Some(error) = &self.state.execution_stop_error {
+            return Err(error.clone());
+        }
+        Ok(Response::new(proto::StopSandboxExecutionResponse {
+            execution_id,
+            phase: proto::SandboxPhase::Stopped.into(),
         }))
     }
 
@@ -1408,6 +1427,10 @@ async fn stop_and_start_map_requests_and_phases() {
 
     let stopped = client.stop_sandbox("sleepy").await.unwrap();
     assert_eq!(stopped.phase, SandboxPhase::Stopped);
+    assert_eq!(
+        stopped.execution_id.as_deref(),
+        Some("e2f8625a-f7c5-4bca-bbb3-4d793c646643")
+    );
     let stop = state.last_stop.lock().await.clone().unwrap();
     assert_eq!(Some(stop.name.as_str()), Some("sleepy"));
     assert_eq!(selected_workspace(&stop.workspace_scope), Some("default"));
@@ -1421,6 +1444,68 @@ async fn stop_and_start_map_requests_and_phases() {
     let start = state.last_start.lock().await.clone().unwrap();
     assert_eq!(Some(start.name.as_str()), Some("sleepy"));
     assert_eq!(selected_workspace(&start.workspace_scope), Some("team-a"));
+}
+
+#[tokio::test]
+async fn execution_stop_maps_identity_workspace_and_receipt() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+    let execution_id = "e2f8625a-f7c5-4bca-bbb3-4d793c646643";
+    let request_id = "21398f54-4c52-4f83-af5f-eec325df40a9";
+    for workspace in ["default", "team-a"] {
+        let opts = openshell_sdk::StopExecutionOptions {
+            request_id: Some(request_id.into()),
+        };
+        let receipt = if workspace == "default" {
+            client
+                .stop_sandbox_execution("worker", execution_id, opts)
+                .await
+        } else {
+            client
+                .workspace(workspace)
+                .stop_sandbox_execution("worker", execution_id, opts)
+                .await
+        }
+        .unwrap();
+        assert_eq!(receipt.execution_id, execution_id);
+        assert_eq!(receipt.phase, SandboxPhase::Stopped);
+        let request = state.last_execution_stop.lock().await.clone().unwrap();
+        assert_eq!(request.execution_id, execution_id);
+        assert_eq!(request.name, "worker");
+        assert_eq!(request.request_id, request_id);
+        assert_eq!(
+            selected_workspace(&request.workspace_scope),
+            Some(workspace)
+        );
+        assert!(state.last_stop.lock().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn execution_stop_never_falls_back_to_name_only_stop() {
+    for code in [
+        tonic::Code::Unimplemented,
+        tonic::Code::FailedPrecondition,
+        tonic::Code::InvalidArgument,
+    ] {
+        let state = Arc::new(MockState {
+            execution_stop_error: Some(Status::new(code, "execution stop rejected")),
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+        let error = client
+            .stop_sandbox_execution(
+                "worker",
+                "e2f8625a-f7c5-4bca-bbb3-4d793c646643",
+                openshell_sdk::StopExecutionOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.grpc_status().unwrap().code(), code);
+        assert!(state.last_stop.lock().await.is_none());
+    }
 }
 
 #[tokio::test]

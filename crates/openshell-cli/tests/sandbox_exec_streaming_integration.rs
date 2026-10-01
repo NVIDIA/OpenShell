@@ -235,6 +235,7 @@ mock_gateway! {
         get_sandbox_provider_status(proto::GetSandboxProviderStatusRequest) -> proto::GetSandboxProviderStatusResponse;
         delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
         stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
+        stop_sandbox_execution(proto::StopSandboxExecutionRequest) -> proto::StopSandboxExecutionResponse;
         start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
         create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
         expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;

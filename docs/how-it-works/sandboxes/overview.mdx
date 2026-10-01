@@ -905,6 +905,41 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+### Stop a Specific Execution
+
+Controllers responding to a delayed event must retain the execution identity
+observed with that event. `sandbox get --output json` exposes `execution_id`.
+Pass that identity when stopping the sandbox:
+
+```shell
+openshell sandbox stop my-sandbox --execution-id "$EXECUTION_ID"
+```
+
+The gateway checks the identity atomically with stop admission. If the sandbox
+has restarted or a replacement has reused its name, the request fails with
+`FailedPrecondition` and leaves the replacement running. An empty or malformed
+identity returns `InvalidArgument`. Older gateways return `Unimplemented`;
+the CLI never falls back to an unconditional stop.
+
+The execution identity represents a gateway-authenticated runtime launch epoch.
+It changes on explicit start, automatic restart, and gateway recovery starts,
+including another driver launch attempt while a sandbox is already `Starting`.
+Each launch attempt rotates the runtime generation and authorization epoch;
+credential refresh preserves them and the execution identity. The execution
+identity is distinct from the sandbox ID, a Kubernetes Pod UID, and a token's
+`jti`.
+
+Conditional stop returns a receipt identifying the targeted execution and the
+phase recorded by that operation. The CLI does not poll or stop local forwards
+by sandbox name for this operation. A later read may already describe another
+execution. API clients can supply a `request_id` to replay the same successful
+receipt for 24 hours without stopping a newer execution.
+
+Conditional execution stop currently requires the SQLite store with a single
+gateway process. PostgreSQL and multi-replica deployments return
+`FailedPrecondition` because lifecycle coordination is process-local. They do
+not downgrade to an unconditional stop.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

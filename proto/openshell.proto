@@ -186,6 +186,17 @@ service OpenShell {
     };
   }
 
+  // Stop only the execution identified by an authenticated observation.
+  // Older gateways reject this method rather than ignoring a precondition.
+  rpc StopSandboxExecution(StopSandboxExecutionRequest)
+      returns (StopSandboxExecutionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Start a previously stopped sandbox.
   rpc StartSandbox(StartSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -1192,6 +1203,11 @@ message SandboxStatus {
   google.protobuf.Timestamp next_restart_time = 15;
   // Time when the current main process became ready.
   google.protobuf.Timestamp main_process_started_time = 16;
+  // Opaque identity of the current or most recently stopped execution.
+  // Changes when the gateway starts a replacement runtime; credential refresh
+  // does not change it. Empty for records without authenticated runtime identity.
+  // Use as a StopSandboxExecution precondition, never as an authorization token.
+  string execution_id = 17;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1447,6 +1463,29 @@ message StopSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
+}
+
+// Conditional stop of one sandbox execution, addressed by workspace and name.
+message StopSandboxExecutionRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Required opaque execution identity from sandbox status or a verified
+  // supervisor extension JWT. A missing or stale identity never falls back to
+  // unconditional stop. The comparison is atomic with lifecycle admission.
+  string execution_id = 3;
+  // Optional nonzero UUID for durable at-most-once admission. Successful results
+  // can be replayed for 24 hours; replay retains the original execution receipt.
+  string request_id = 4;
+}
+
+// Historical receipt for an execution stop. A replay does not describe the
+// current sandbox: obtain fresh sandbox status to verify current state.
+message StopSandboxExecutionResponse {
+  // Execution to which the operation applied, including on request replay.
+  string execution_id = 1;
+  // Observed lifecycle phase when this operation completed.
+  SandboxPhase phase = 2;
 }
 
 // Start sandbox request.

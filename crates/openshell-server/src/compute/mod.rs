@@ -65,6 +65,8 @@ use tonic::{Code, Request, Status};
 pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-driver";
 pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
     "internal.openshell.ai/compute-runtime-identity";
+pub const COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION: &str =
+    "internal.openshell.ai/bootstrap-execution-id";
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
@@ -1444,6 +1446,31 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
+        self.stop_sandbox_inner(workspace, name, None).await
+    }
+
+    pub(crate) async fn stop_sandbox_execution(
+        &self,
+        workspace: &str,
+        name: &str,
+        execution_id: &str,
+    ) -> Result<Sandbox, Status> {
+        crate::auth::sandbox_session::validate_execution_id(execution_id)?;
+        self.stop_sandbox_inner(workspace, name, Some(execution_id))
+            .await
+    }
+
+    async fn stop_sandbox_inner(
+        &self,
+        workspace: &str,
+        name: &str,
+        expected_execution_id: Option<&str>,
+    ) -> Result<Sandbox, Status> {
+        if expected_execution_id.is_some() && !self.store.is_single_replica() {
+            return Err(Status::failed_precondition(
+                "execution-conditional stop requires a single-replica persistence backend",
+            ));
+        }
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
@@ -1467,6 +1494,18 @@ impl ComputeRuntime {
         }
 
         provisioning_operation::ensure_operation_settled(&current)?;
+
+        // Compare the attested execution after acquiring lifecycle ownership and
+        // re-reading durable state. A lookup before the gate could target the
+        // replacement execution after an intervening restart or name reuse.
+        if let Some(expected) = expected_execution_id
+            && crate::auth::sandbox_session::sandbox_execution_id(&current)? != expected
+        {
+            return Err(Status::failed_precondition(
+                "sandbox execution has changed; the requested execution was not stopped",
+            ));
+        }
+
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
         if matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
             || is_failed_main_process_result(&current)
@@ -1694,23 +1733,11 @@ impl ComputeRuntime {
                     .map_err(Status::internal)?;
             }
 
-            if phase == SandboxPhase::Starting {
-                // Acquiring the lifecycle gate proves that no local worker still
-                // owns this transition. Retry the idempotent driver operation
-                // with the identity committed by the original transition.
-                let authentication =
-                    serialize_persisted_launch_authentication(authority, &current)?;
-                break (current.clone(), current, authentication);
-            }
-
             let previous = current.clone();
-            let next_identity = if authority.is_some()
-                && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-            {
-                Some(next_runtime_identity(&current)?)
-            } else {
-                None
-            };
+            // A new owner may have to reconstruct an incomplete runtime even
+            // from Starting. Give every driver launch attempt a fresh identity:
+            // an earlier attempt could already have emitted observations.
+            let next_identity = Some(next_runtime_identity(&current)?);
             let launch_authentication =
                 if let (Some(authority), Some(identity)) = (authority, next_identity.as_ref()) {
                     serialize_launch_authentication(
@@ -1732,6 +1759,13 @@ impl ComputeRuntime {
                         {
                             identity.write(&mut metadata.annotations);
                         }
+                        project_execution_identity(sandbox);
+                        // Recovery rotates the execution, but must not extend
+                        // the existing provisioning attempt or its deadline.
+                        let prior_provisioning = sandbox
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.provisioning.clone());
                         apply_lifecycle_phase(
                             sandbox,
                             SandboxPhase::Starting,
@@ -1739,6 +1773,12 @@ impl ComputeRuntime {
                             "Sandbox start requested",
                             self.image_preparation_timeout_seconds,
                         );
+                        if phase == SandboxPhase::Starting {
+                            sandbox
+                                .status
+                                .get_or_insert_with(Default::default)
+                                .provisioning = prior_provisioning;
+                        }
                     },
                 )
                 .await
@@ -1967,12 +2007,14 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, String> {
         provisioning_operation::ensure_current_result(starting, starting)
             .map_err(|error| error.to_string())?;
-        let expected_generation = sandbox_runtime_generation(starting)?;
+        let expected_execution_id = crate::auth::sandbox_session::sandbox_execution_id(starting)
+            .map_err(|error| error.to_string())?;
         let mut expected_resource_version = sandbox_resource_version(starting);
 
         for attempt in 1..=START_PHASE_CAS_RETRY_LIMIT {
             let driver_name = driver_name.to_string();
             let runtime_identity = runtime_identity.to_string();
+            let bootstrap_execution_id = expected_execution_id.clone();
             match self
                 .store
                 .update_message_cas::<Sandbox, _>(
@@ -1986,6 +2028,14 @@ impl ComputeRuntime {
                             metadata.annotations.insert(
                                 COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
                                 runtime_identity.clone(),
+                            );
+                            // Old native credentials must not bootstrap into a
+                            // newly committed launch while the driver is still
+                            // replacing the previous runtime. Publish its exact
+                            // execution only with the returned runtime binding.
+                            metadata.annotations.insert(
+                                COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION.to_string(),
+                                bootstrap_execution_id.clone(),
                             );
                         }
                     },
@@ -2004,10 +2054,12 @@ impl ComputeRuntime {
                         .ok_or_else(|| {
                             "sandbox was removed while persisting runtime identity".to_string()
                         })?;
-                    let current_generation = sandbox_runtime_generation(&current)?;
+                    let current_execution_id =
+                        crate::auth::sandbox_session::sandbox_execution_id(&current)
+                            .map_err(|error| error.to_string())?;
                     let phase =
                         SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if current_generation != expected_generation
+                    if current_execution_id != expected_execution_id
                         || provisioning_operation::ensure_current_result(&current, starting)
                             .is_err()
                         || !allowed_phases.contains(&phase)
@@ -2260,7 +2312,24 @@ impl ComputeRuntime {
             .update_message_cas::<Sandbox, _>(
                 &sandbox_id,
                 sandbox_resource_version(owned),
-                move |sandbox| *sandbox = previous.clone(),
+                move |sandbox| {
+                    // Launch credentials may already have escaped to a runtime,
+                    // even when the driver reports failure. Never restore an old
+                    // authorization epoch: the next launch must not reuse an
+                    // execution identity observed during the failed attempt.
+                    let identity = sandbox.metadata.as_ref().and_then(|metadata| {
+                        crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                            &metadata.annotations,
+                        )
+                        .ok()
+                    });
+                    *sandbox = previous.clone();
+                    if let (Some(identity), Some(metadata)) = (identity, sandbox.metadata.as_mut())
+                    {
+                        identity.write(&mut metadata.annotations);
+                    }
+                    project_execution_identity(sandbox);
+                },
             )
             .await
         {
@@ -3116,12 +3185,13 @@ impl ComputeRuntime {
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
-        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
-        Committed: Fn(&str) -> CommittedFuture,
-        CommittedFuture: Future<Output = Result<(), String>>,
-        Failed: Fn(&str),
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+        Committed: Fn(&str) -> CommittedFuture + Send + Sync,
+        CommittedFuture: Future<Output = Result<(), String>> + Send,
+        Failed: Fn(&str) + Send + Sync,
     {
+        Box::pin(async {
         self.recover_persisted_lifecycle_transitions().await?;
         if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
@@ -3182,6 +3252,44 @@ impl ComputeRuntime {
                 // its replacement, including after a gateway crash.
                 continue;
             }
+
+            // Startup recovery may recreate runtime Pods or containers even
+            // when the previous record was Ready. Commit a new execution before
+            // minting launch credentials, so observations from that old runtime
+            // can never target its replacement after gateway restart.
+            let next_identity = match next_runtime_identity(&sandbox) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                    authentication_failed(sandbox.object_id());
+                    failed += 1;
+                    continue;
+                }
+            };
+            let sandbox = match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    &sandbox_id,
+                    sandbox_resource_version(&sandbox),
+                    |sandbox| {
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            next_identity.write(&mut metadata.annotations);
+                        }
+                        project_execution_identity(sandbox);
+                    },
+                )
+                .await
+            {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    warn!(sandbox_id, %error, "Failed to commit recovery execution identity");
+                    authentication_failed(sandbox.object_id());
+                    failed += 1;
+                    continue;
+                }
+            };
+            self.sandbox_index.update_from_sandbox(&sandbox);
+            self.sandbox_watch_bus.notify(&sandbox_id);
 
             let sandbox_name = sandbox.object_name().to_string();
             let generation_id = match sandbox_runtime_generation(&sandbox) {
@@ -3384,6 +3492,7 @@ impl ComputeRuntime {
             );
         }
         Ok(())
+        }).await
     }
 
     async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
@@ -3391,7 +3500,7 @@ impl ComputeRuntime {
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -3471,53 +3580,22 @@ impl ComputeRuntime {
                     }
                 }
                 SandboxPhase::Starting => {
-                    if let Err(error) = self.validate_caller_driver_config(
-                        sandbox
-                            .spec
-                            .as_ref()
-                            .and_then(|spec| spec.template.as_ref()),
-                    ) {
-                        self.mark_sandbox_error(
-                            &sandbox,
-                            "ResourceAdmissionDenied",
-                            error.message(),
-                        )
-                        .await;
+                    // The running-intent sweep supplies authentication for
+                    // gateway-managed drivers; the restart controller owns
+                    // automatic replacement and must stop the old runtime first.
+                    if self.driver_info.gateway_manages_lifecycle
+                        || is_automatic_restart_transition(&sandbox)
+                    {
                         continue;
                     }
-                    let sandbox_id = sandbox.object_id().to_string();
-                    let sandbox_name = sandbox.object_name().to_string();
-                    let driver_sandbox_id = sandbox_id.clone();
-                    let generation_id = match sandbox_runtime_generation(&sandbox) {
-                        Ok(generation) => generation.into_string(),
-                        Err(error) => {
-                            warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
-                            continue;
-                        }
-                    };
-                    let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
-                    // Recovery retains the original attempt and deadline. A
-                    // stalled driver must release this lifecycle gate after
-                    // expiry so the deadline worker can reclaim its compute.
+                    let workspace = sandbox.object_workspace().to_string();
+                    let name = sandbox.object_name().to_string();
+                    drop(lifecycle_guard);
+                    let authority = self.restart_authority.get().and_then(Option::as_deref);
+                    // Re-enter the normal start boundary so a recovered attempt
+                    // commits fresh identity and persists the new driver binding.
                     if let Err(err) = self
-                        .await_provisioning_operation(
-                            &sandbox,
-                            self.driver.call_owned(
-                                openshell_otel::rpc::START_SANDBOX,
-                                Some(&sandbox_id),
-                                |driver| async move {
-                                    driver
-                                        .start_sandbox(Request::new(StartSandboxRequest {
-                                            sandbox_id: driver_sandbox_id,
-                                            name: sandbox_name,
-                                            launch_authentication: Vec::new(),
-                                            generation_id,
-                                            expected_runtime_identity,
-                                        }))
-                                        .await
-                                },
-                            ),
-                        )
+                        .start_sandbox_authenticated(&workspace, &name, authority)
                         .await
                     {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
@@ -3895,22 +3973,11 @@ impl ComputeRuntime {
         }
 
         let sandbox_name = current.object_name().to_string();
-        let authority = self.restart_authority.get().and_then(Option::as_deref);
-        let already_claimed = current
-            .status
-            .as_ref()
-            .is_some_and(|status| next_restart_at_ms(status) == 0);
-        let next_identity = if already_claimed {
-            None
-        } else {
-            authority
-                .map(|_| next_runtime_identity(&current))
-                .transpose()
-                .map_err(|status| status.to_string())?
-        };
-        let claimed = if already_claimed && sandbox_provisioning_attempt_id(&current).is_none() {
-            current.clone()
-        } else {
+        // Every recovered launch can reconstruct compute. Rotate the execution
+        // while retaining upstream's atomic provisioning-operation ownership.
+        let next_identity =
+            Some(next_runtime_identity(&current).map_err(|error| error.to_string())?);
+        let claimed = {
             // Claim the restart schedule and driver ownership in one CAS. A
             // pending check followed by an unclaimed STOP races another replica.
             match self
@@ -3924,6 +3991,7 @@ impl ComputeRuntime {
                         {
                             identity.write(&mut metadata.annotations);
                         }
+                        project_execution_identity(sandbox);
                         provisioning_operation::claim_record(sandbox);
                         let status = sandbox.status.get_or_insert_with(Default::default);
                         set_next_restart_at_ms(status, 0);
@@ -6251,6 +6319,15 @@ fn sandbox_runtime_generation(
         .map_err(|error| error.to_string())
 }
 
+pub fn project_execution_identity(sandbox: &mut Sandbox) {
+    let execution_id =
+        crate::auth::sandbox_session::sandbox_execution_id(sandbox).unwrap_or_default();
+    sandbox
+        .status
+        .get_or_insert_with(Default::default)
+        .execution_id = execution_id;
+}
+
 fn public_status_from_driver(
     status: &DriverSandboxStatus,
     phase: SandboxPhase,
@@ -6292,6 +6369,7 @@ fn public_status_from_driver(
         restart_count: 0,
         next_restart_time: None,
         main_process_started_time: None,
+        execution_id: String::new(),
     }
 }
 
@@ -6301,6 +6379,7 @@ fn apply_driver_snapshot(
     session_connected: bool,
     driver_reports_runtime_readiness: bool,
 ) {
+    project_execution_identity(sandbox);
     // Endpoint results belong to the gateway. A driver reports infrastructure
     // and runtime state, so a full driver snapshot must preserve these records.
     let endpoint_statuses = sandbox
@@ -6367,6 +6446,7 @@ fn apply_driver_snapshot(
         new_status.restart_count = old_status.restart_count;
         new_status.next_restart_time = old_status.next_restart_time;
         new_status.main_process_started_time = old_status.main_process_started_time;
+        new_status.execution_id.clone_from(&old_status.execution_id);
     }
 
     phase = match old_phase {
@@ -6876,7 +6956,10 @@ fn next_runtime_identity(
         .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
         .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
     Ok(crate::auth::sandbox_session::PersistedSandboxIdentity {
-        runtime_generation: current.runtime_generation,
+        runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
         auth_epoch: next_epoch,
         gateway_token_id: uuid::Uuid::new_v4(),
         refresh_replay: None,
@@ -8330,6 +8413,7 @@ mod tests {
     }
 
     fn set_compute_runtime_binding(sandbox: &mut Sandbox, identity: &str) {
+        let execution_id = crate::auth::sandbox_session::sandbox_execution_id(sandbox).unwrap();
         let annotations = &mut sandbox
             .metadata
             .as_mut()
@@ -8342,6 +8426,10 @@ mod tests {
         annotations.insert(
             COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
             identity.to_string(),
+        );
+        annotations.insert(
+            COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION.to_string(),
+            execution_id,
         );
     }
 
@@ -8576,8 +8664,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            stored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            stored.metadata.as_ref().unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
             "new-runtime-identity"
+        );
+        assert_eq!(
+            stored.metadata.as_ref().unwrap().annotations[COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION],
+            crate::auth::sandbox_session::sandbox_execution_id(&stored).unwrap(),
+            "a created runtime binding must attest the same committed execution"
         );
         assert_eq!(driver.delete_calls(), 0);
     }
@@ -8715,6 +8808,66 @@ mod tests {
         assert_eq!(
             restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
             "previous-runtime-identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_authorize_old_runtime_bootstrap_for_new_execution() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("replacement-runtime");
+        driver.block_start();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut previous = sandbox_record("sb-bootstrap", "bootstrap", SandboxPhase::Stopped);
+        set_compute_runtime_binding(&mut previous, "previous-runtime");
+        let previous_execution =
+            crate::auth::sandbox_session::sandbox_execution_id(&previous).unwrap();
+        runtime.store.put_message(&previous).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let start =
+            tokio::spawn(async move { start_runtime.start_sandbox("default", "bootstrap").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("restart did not reach the driver");
+        let pending = runtime
+            .store
+            .get_message::<Sandbox>(previous.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_execution =
+            crate::auth::sandbox_session::sandbox_execution_id(&pending).unwrap();
+        assert_ne!(pending_execution, previous_execution);
+        let annotations = &pending.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "previous-runtime"
+        );
+        assert_eq!(
+            annotations[COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION],
+            previous_execution
+        );
+        assert_ne!(
+            annotations[COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION], pending_execution,
+            "old runtime evidence must fail bootstrap until the replacement binding commits"
+        );
+
+        driver.release_start();
+        let started = start.await.unwrap().unwrap();
+        let annotations = &started.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "replacement-runtime"
+        );
+        assert_eq!(
+            annotations[COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION],
+            pending_execution
+        );
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["previous-runtime".to_string()],
+            "retain the old driver binding for safe resource selection during replacement"
         );
     }
 
@@ -11290,6 +11443,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_stop_matches_once_and_rejects_missing_or_stale_identity() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-execution", "execution", SandboxPhase::Ready);
+        let execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        for invalid in ["", "sandbox-name", "exec-v1:invalid"] {
+            let error = runtime
+                .stop_sandbox_execution("default", "execution", invalid)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+        let other = sandbox_record("sb-other", "other", SandboxPhase::Ready);
+        let stale = crate::auth::sandbox_session::sandbox_execution_id(&other).unwrap();
+        let error = runtime
+            .stop_sandbox_execution("default", "execution", &stale)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.stop_calls(), 0);
+        for _ in 0..2 {
+            let stopped = runtime
+                .stop_sandbox_execution("default", "execution", &execution)
+                .await
+                .unwrap();
+            assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        }
+        assert_eq!(
+            driver.stop_calls(),
+            1,
+            "same-execution terminal retry is a no-op"
+        );
+        let error = runtime
+            .stop_sandbox_execution("default", "execution", &stale)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            Code::FailedPrecondition,
+            "terminal-phase no-op must still enforce the execution precondition"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stop_rechecks_identity_after_waiting_for_lifecycle_gate() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-execution-race", "execution-race", SandboxPhase::Ready);
+        let execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
+        let guard = gate.clone().lock_owned().await;
+        let stop_runtime = runtime.clone();
+        let stop = tokio::spawn(async move {
+            stop_runtime
+                .stop_sandbox_execution("default", "execution-race", &execution)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("conditional stop did not wait on the lifecycle gate");
+        let mut replacement = sandbox.clone();
+        next_runtime_identity(&replacement)
+            .unwrap()
+            .write(&mut replacement.metadata.as_mut().unwrap().annotations);
+        project_execution_identity(&mut replacement);
+        runtime.store.put_message(&replacement).await.unwrap();
+        drop(guard);
+        let error = stop.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            driver.stop_calls(),
+            0,
+            "replacement must never reach the driver stop"
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Ready as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_stop_rejects_a_replacement_with_the_same_name() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let old = sandbox_record("sb-old", "reused", SandboxPhase::Ready);
+        let execution = crate::auth::sandbox_session::sandbox_execution_id(&old).unwrap();
+        let replacement = sandbox_record("sb-new", "reused", SandboxPhase::Ready);
+        runtime.store.put_message(&replacement).await.unwrap();
+        let error = runtime
+            .stop_sandbox_execution("default", "reused", &execution)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_main_process_start_advances_execution_identity() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let mut sandbox = sandbox_record("sb-error-start", "error-start", SandboxPhase::Ready);
+        apply_main_process_exit(&mut sandbox, "failed-main", 1);
+        assert!(is_failed_main_process_result(&sandbox));
+        let old_execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let started = runtime
+            .start_sandbox("default", "error-start")
+            .await
+            .unwrap();
+        assert_ne!(
+            crate::auth::sandbox_session::sandbox_execution_id(&started).unwrap(),
+            old_execution
+        );
+        assert_eq!(
+            started.status.as_ref().unwrap().execution_id,
+            crate::auth::sandbox_session::sandbox_execution_id(&started).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rollback_never_reuses_an_issued_execution_identity() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let mut previous = sandbox_record("sb-rollback", "rollback", SandboxPhase::Stopped);
+        set_compute_runtime_binding(&mut previous, "previous-runtime");
+        let previous_execution =
+            crate::auth::sandbox_session::sandbox_execution_id(&previous).unwrap();
+        let mut attempted = previous.clone();
+        next_runtime_identity(&attempted)
+            .unwrap()
+            .write(&mut attempted.metadata.as_mut().unwrap().annotations);
+        attempted.set_phase(SandboxPhase::Starting as i32);
+        runtime.store.put_message(&attempted).await.unwrap();
+        let attempted = runtime
+            .store
+            .get_message::<Sandbox>(attempted.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let attempted_execution =
+            crate::auth::sandbox_session::sandbox_execution_id(&attempted).unwrap();
+        assert!(
+            runtime
+                .restore_lifecycle_snapshot(&attempted, &previous)
+                .await
+        );
+        let restored = runtime
+            .store
+            .get_message::<Sandbox>(previous.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(
+            crate::auth::sandbox_session::sandbox_execution_id(&restored).unwrap(),
+            attempted_execution
+        );
+        assert_eq!(
+            restored.metadata.as_ref().unwrap().annotations[COMPUTE_BOOTSTRAP_EXECUTION_ANNOTATION],
+            previous_execution,
+            "rollback must not authorize old runtime evidence for the advanced execution"
+        );
+        assert_ne!(previous_execution, attempted_execution);
+        let restarted = runtime.start_sandbox("default", "rollback").await.unwrap();
+        assert_ne!(
+            crate::auth::sandbox_session::sandbox_execution_id(&restarted).unwrap(),
+            attempted_execution
+        );
+        assert_eq!(
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &restarted.metadata.as_ref().unwrap().annotations
+            )
+            .unwrap()
+            .auth_epoch
+            .get(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_advances_execution_before_minting_credentials() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        let sandbox = sandbox_record("sb-recovery", "recovery", SandboxPhase::Ready);
+        let old_execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |sandbox| {
+                    let execution =
+                        crate::auth::sandbox_session::sandbox_execution_id(sandbox).unwrap();
+                    assert_ne!(execution, old_execution);
+                    async move { Ok(execution.into_bytes()) }
+                },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let recovered = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let execution = crate::auth::sandbox_session::sandbox_execution_id(&recovered).unwrap();
+        assert_eq!(
+            driver.start_authentications(),
+            vec![execution.as_bytes().to_vec()]
+        );
+        assert_eq!(recovered.status.unwrap().execution_id, execution);
+        assert_eq!(
+            runtime
+                .stop_sandbox_execution("default", "recovery", &old_execution)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn authenticated_start_commits_identity_with_starting_phase() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
@@ -11341,18 +11728,20 @@ mod tests {
 
         let authentications = driver.start_authentications();
         assert_eq!(authentications.len(), 2);
-        for encoded in authentications {
-            let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
-                serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(
-                authentication.supervisor.auth_epoch,
-                stored_identity.auth_epoch
-            );
-            assert_eq!(
-                authentication.supervisor.runtime_generation,
-                stored_identity.runtime_generation
-            );
-        }
+        let first: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        let retry: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[1]).unwrap();
+        assert_eq!(first.supervisor.auth_epoch, stored_identity.auth_epoch);
+        assert_eq!(
+            first.supervisor.runtime_generation,
+            stored_identity.runtime_generation
+        );
+        assert!(retry.supervisor.auth_epoch.get() > first.supervisor.auth_epoch.get());
+        assert_ne!(
+            retry.supervisor.runtime_generation,
+            first.supervisor.runtime_generation
+        );
         let after_retry = runtime
             .store
             .get_message::<Sandbox>(sandbox.object_id())
@@ -11361,8 +11750,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             sandbox_resource_version(&after_retry),
-            sandbox_resource_version(&stored) + 2,
-            "Starting retry claims and settles another operation without rotating identity"
+            sandbox_resource_version(&stored) + 3,
+            "Starting retry rotates identity, claims an operation, and settles it"
         );
     }
 
@@ -17229,6 +17618,8 @@ mod tests {
         let preparation = provisioning_deadline::new_preparation_record(now, 1800);
         let mut sandbox = sandbox_record("sb-recovery-ttl", "recovery-ttl", SandboxPhase::Starting);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        let original_execution =
+            crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
         runtime.store.put_message(&sandbox).await.unwrap();
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
@@ -17250,6 +17641,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        assert_ne!(
+            crate::auth::sandbox_session::sandbox_execution_id(&expired).unwrap(),
+            original_execution,
+            "recovery rotates execution identity without renewing the provisioning deadline"
+        );
         let status = expired.status.as_ref().unwrap();
         let record = status.provisioning.as_ref().unwrap();
         assert_eq!(record.attempt_id, preparation.attempt_id);

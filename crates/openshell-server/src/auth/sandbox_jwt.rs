@@ -351,6 +351,7 @@ impl ExtensionJwtIssuer {
             audience,
             caller_kind,
             sandbox_id,
+            None,
             ttl,
             now_secs(),
             uuid::Uuid::new_v4(),
@@ -358,11 +359,13 @@ impl ExtensionJwtIssuer {
     }
 
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mint_extension_token_with_metadata(
         &self,
         audience: &ExtensionAudience,
         caller_kind: ExtensionCallerKind,
         sandbox_id: Option<&str>,
+        execution_id: Option<&str>,
         ttl: Duration,
         issued_at: i64,
         token_id: uuid::Uuid,
@@ -396,6 +399,14 @@ impl ExtensionJwtIssuer {
             }
         };
 
+        if let Some(execution_id) = execution_id {
+            if caller_kind != ExtensionCallerKind::Supervisor {
+                return Err(Status::invalid_argument(
+                    "only supervisor extension tokens may carry execution identity",
+                ));
+            }
+            crate::auth::sandbox_session::validate_execution_id(execution_id)?;
+        }
         let exp = issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
         let claims = ExtensionJwtClaims {
             iss: self.issuer.clone(),
@@ -406,6 +417,7 @@ impl ExtensionJwtIssuer {
             jti: token_id.to_string(),
             caller_kind,
             sandbox_id,
+            execution_id: execution_id.map(str::to_string),
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
@@ -563,6 +575,66 @@ mod tests {
         assert_eq!(claims.sub, "spiffe://openshell/sandbox/sandbox-a");
         assert_eq!(claims.caller_kind, ExtensionCallerKind::Supervisor);
         assert_eq!(claims.sandbox_id.as_deref(), Some("sandbox-a"));
+    }
+
+    #[test]
+    fn execution_claim_is_signed_and_restricted_to_supervisors() {
+        let mat = generate_jwt_key().unwrap();
+        let issuer = ExtensionJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
+            mat.kid,
+            "gateway-a",
+            Duration::from_mins(15),
+        )
+        .unwrap();
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let execution = crate::auth::sandbox_session::execution_id(
+            "sandbox-a",
+            &identity.runtime_generation,
+            identity.auth_epoch,
+        );
+        let audience = extension_audience("urn:openshell:extension:middleware:scanner");
+        let minted = issuer
+            .mint_extension_token_with_metadata(
+                &audience,
+                ExtensionCallerKind::Supervisor,
+                Some("sandbox-a"),
+                Some(&execution),
+                Duration::from_mins(5),
+                now_secs(),
+                uuid::Uuid::new_v4(),
+            )
+            .unwrap();
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&["openshell-gateway:gateway-a"]);
+        validation.set_audience(&[audience.as_str()]);
+        let key = DecodingKey::from_ed_pem(mat.public_key_pem.as_bytes()).unwrap();
+        let claims = decode::<ExtensionJwtClaims>(&minted.token, &key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.execution_id.as_deref(), Some(execution.as_str()));
+        assert_eq!(claims.sandbox_id.as_deref(), Some("sandbox-a"));
+        for (caller, sandbox, execution) in [
+            (ExtensionCallerKind::Gateway, None, execution.as_str()),
+            (ExtensionCallerKind::Supervisor, Some("sandbox-a"), ""),
+        ] {
+            assert_eq!(
+                issuer
+                    .mint_extension_token_with_metadata(
+                        &audience,
+                        caller,
+                        sandbox,
+                        Some(execution),
+                        Duration::from_mins(5),
+                        now_secs(),
+                        uuid::Uuid::new_v4(),
+                    )
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 
     #[test]

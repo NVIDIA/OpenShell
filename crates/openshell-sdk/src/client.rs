@@ -17,7 +17,7 @@ use crate::refresh::{RefreshedToken, TokenSource};
 use crate::types::{
     DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
     SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
-    SandboxWorkloadTemplate, WorkspaceRef,
+    SandboxWorkloadTemplate, StopExecutionOptions, StopExecutionResult, WorkspaceRef,
 };
 use crate::{WatchEvent, WatchOptions, transport};
 use futures::{Stream, StreamExt};
@@ -383,6 +383,22 @@ impl OpenShellClient {
             })
             .await?;
         sandbox_from_response(response.sandbox)
+    }
+
+    /// Stop only the requested execution in the default workspace.
+    ///
+    /// Stale identities fail without stopping a replacement. Unsupported
+    /// gateways return `Unimplemented`; this never falls back to stopping by name.
+    /// A replay returns a historical receipt, not the current sandbox state.
+    pub async fn stop_sandbox_execution(
+        &self,
+        name: &str,
+        execution_id: &str,
+        opts: StopExecutionOptions,
+    ) -> Result<StopExecutionResult> {
+        self.workspace("default")
+            .stop_sandbox_execution(name, execution_id, opts)
+            .await
     }
 
     /// Start a stopped sandbox by name.
@@ -1100,6 +1116,39 @@ impl WorkspaceScopedClient {
             })
             .await?;
         sandbox_from_response(response.sandbox)
+    }
+
+    /// Stop only the requested execution in this workspace.
+    ///
+    /// The execution identity must come from sandbox status or a verified
+    /// supervisor extension JWT. Unsupported gateways never fall back to stop.
+    pub async fn stop_sandbox_execution(
+        &self,
+        name: &str,
+        execution_id: &str,
+        opts: StopExecutionOptions,
+    ) -> Result<StopExecutionResult> {
+        if execution_id.is_empty() {
+            return Err(SdkError::from_status(tonic::Status::invalid_argument(
+                "execution ID must not be empty",
+            )));
+        }
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::StopSandboxExecutionRequest {
+                    request_id: opts.request_id.clone().unwrap_or_default(),
+                    name: name.to_string(),
+                    execution_id: execution_id.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                };
+                async move { grpc.stop_sandbox_execution(request).await }
+            })
+            .await?;
+        Ok(StopExecutionResult {
+            execution_id: response.execution_id,
+            phase: response.phase.into(),
+        })
     }
 
     /// Start a stopped sandbox by name in this workspace.

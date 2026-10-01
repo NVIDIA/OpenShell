@@ -35,8 +35,9 @@ use openshell_core::proto::{
     ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
     SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    StartSandboxRequest, StopSandboxExecutionRequest, StopSandboxExecutionResponse,
+    StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
+    relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
@@ -651,6 +652,7 @@ async fn handle_create_sandbox_inner(
     if let Some(metadata) = sandbox.metadata.as_mut() {
         runtime_identity.write(&mut metadata.annotations);
     }
+    crate::compute::project_execution_identity(&mut sandbox);
     let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
         Some(authority.mint_persisted_launch(&id, &runtime_identity)?)
     } else {
@@ -891,7 +893,7 @@ pub(super) async fn handle_get_sandbox(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let sandbox = resolve_and_authorize_sandbox_name(
+    let mut sandbox = resolve_and_authorize_sandbox_name(
         state,
         &principal,
         &req.name,
@@ -899,6 +901,7 @@ pub(super) async fn handle_get_sandbox(
         MinWorkspaceRole::User,
     )
     .await?;
+    crate::compute::project_execution_identity(&mut sandbox);
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
@@ -950,11 +953,14 @@ pub(super) async fn handle_list_sandboxes(
             label_selector: selector,
         },
     };
-    let page = state
+    let mut page = state
         .store
         .list_message_page::<Sandbox>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    for sandbox in &mut page.messages {
+        crate::compute::project_execution_identity(sandbox);
+    }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListSandboxesResponse {
         sandboxes: page.messages,
@@ -1695,6 +1701,37 @@ async fn handle_stop_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
+    }))
+}
+
+pub(super) async fn handle_stop_sandbox_execution(
+    state: &Arc<ServerState>,
+    request: Request<StopSandboxExecutionRequest>,
+) -> Result<Response<StopSandboxExecutionResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    crate::auth::sandbox_session::validate_execution_id(&req.execution_id)?;
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let sandbox = state
+        .compute
+        .stop_sandbox_execution(
+            resolved.object_workspace(),
+            resolved.object_name(),
+            &req.execution_id,
+        )
+        .await?;
+    // This receipt describes the completed operation, never a later lookup of
+    // the mutable sandbox. Durable replay preserves the same execution ID.
+    Ok(Response::new(StopSandboxExecutionResponse {
+        execution_id: req.execution_id,
+        phase: sandbox.phase(),
     }))
 }
 

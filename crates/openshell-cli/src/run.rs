@@ -2966,6 +2966,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref()))),
         "phase": phase_name(sandbox.phase()),
+        "execution_id": sandbox.status.as_ref().map(|status| status.execution_id.as_str()).filter(|id| !id.is_empty()),
         "current_policy_version": sandbox.current_policy_version(),
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
@@ -3857,8 +3858,31 @@ pub async fn sandbox_stop(
     server: &str,
     name: &str,
     workspace: &str,
+    execution_id: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
+    if let Some(execution_id) = execution_id {
+        let mut client = grpc_client(server, tls).await?;
+        let receipt = client
+            .stop_sandbox_execution(openshell_core::proto::StopSandboxExecutionRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                name: name.to_string(),
+                execution_id: execution_id.to_string(),
+                request_id: String::new(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        // Do not poll by name or change name-keyed forwards: either could now
+        // belong to a later execution. This is the requested execution's receipt.
+        let phase = SandboxPhase::try_from(receipt.phase).unwrap_or(SandboxPhase::Unknown);
+        println!(
+            "{} Execution {} stop receipt: {phase:?}",
+            "✓".green().bold(),
+            receipt.execution_id
+        );
+        return Ok(());
+    }
     if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
         for port in stopped {
             eprintln!(

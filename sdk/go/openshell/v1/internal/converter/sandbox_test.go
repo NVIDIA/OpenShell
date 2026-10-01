@@ -96,6 +96,7 @@ func TestSandboxFromProto(t *testing.T) {
 			ResourceVersion: "7",
 		},
 		Status: &pb.SandboxStatus{
+			ExecutionId:            "execution-1",
 			AgentPod:               "agent-pod-xyz",
 			AgentFd:                "fd-agent",
 			SandboxFd:              "fd-sandbox",
@@ -121,6 +122,7 @@ func TestSandboxFromProto(t *testing.T) {
 	s := SandboxFromProto(proto)
 
 	require.NotNil(t, s)
+	assert.Equal(t, "execution-1", s.Status.ExecutionID)
 	assert.Equal(t, "sb-1", s.ID)
 	assert.Equal(t, "my-sandbox", s.Name)
 	assert.Equal(t, time.UnixMilli(1700000000000).UTC(), s.CreatedAt)
