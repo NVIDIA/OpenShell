@@ -34,7 +34,8 @@ pub use openshell_core::proto::{
     SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
     SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SuspendSandboxRequest, UpdateSandboxRequest, Workspace,
+    StopSandboxExecutionRequest, StopSandboxExecutionResponse, StopSandboxRequest,
+    SuspendSandboxRequest, UpdateSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.

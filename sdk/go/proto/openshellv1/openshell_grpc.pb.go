@@ -40,6 +40,7 @@ const (
 	OpenShell_GetSandboxProviderStatus_FullMethodName      = "/openshell.v1.OpenShell/GetSandboxProviderStatus"
 	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
 	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
+	OpenShell_StopSandboxExecution_FullMethodName          = "/openshell.v1.OpenShell/StopSandboxExecution"
 	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
 	OpenShell_SuspendSandbox_FullMethodName                = "/openshell.v1.OpenShell/SuspendSandbox"
 	OpenShell_ResumeSandbox_FullMethodName                 = "/openshell.v1.OpenShell/ResumeSandbox"
@@ -165,6 +166,9 @@ type OpenShellClient interface {
 	DeleteSandbox(ctx context.Context, in *DeleteSandboxRequest, opts ...grpc.CallOption) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(ctx context.Context, in *StopSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Stop only the execution identified by an authenticated observation.
+	// Older gateways reject this method rather than ignoring a precondition.
+	StopSandboxExecution(ctx context.Context, in *StopSandboxExecutionRequest, opts ...grpc.CallOption) (*StopSandboxExecutionResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(ctx context.Context, in *StartSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Freeze a ready sandbox and retain its memory state for a later resume.
@@ -531,6 +535,16 @@ func (c *openShellClient) StopSandbox(ctx context.Context, in *StopSandboxReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
 	err := c.cc.Invoke(ctx, OpenShell_StopSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) StopSandboxExecution(ctx context.Context, in *StopSandboxExecutionRequest, opts ...grpc.CallOption) (*StopSandboxExecutionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopSandboxExecutionResponse)
+	err := c.cc.Invoke(ctx, OpenShell_StopSandboxExecution_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1317,6 +1331,9 @@ type OpenShellServer interface {
 	DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error)
+	// Stop only the execution identified by an authenticated observation.
+	// Older gateways reject this method rather than ignoring a precondition.
+	StopSandboxExecution(context.Context, *StopSandboxExecutionRequest) (*StopSandboxExecutionResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error)
 	// Freeze a ready sandbox and retain its memory state for a later resume.
@@ -1569,6 +1586,9 @@ func (UnimplementedOpenShellServer) DeleteSandbox(context.Context, *DeleteSandbo
 }
 func (UnimplementedOpenShellServer) StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StopSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) StopSandboxExecution(context.Context, *StopSandboxExecutionRequest) (*StopSandboxExecutionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopSandboxExecution not implemented")
 }
 func (UnimplementedOpenShellServer) StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSandbox not implemented")
@@ -2100,6 +2120,24 @@ func _OpenShell_StopSandbox_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).StopSandbox(ctx, req.(*StopSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_StopSandboxExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopSandboxExecutionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).StopSandboxExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_StopSandboxExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).StopSandboxExecution(ctx, req.(*StopSandboxExecutionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3340,6 +3378,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StopSandbox",
 			Handler:    _OpenShell_StopSandbox_Handler,
+		},
+		{
+			MethodName: "StopSandboxExecution",
+			Handler:    _OpenShell_StopSandboxExecution_Handler,
 		},
 		{
 			MethodName: "StartSandbox",

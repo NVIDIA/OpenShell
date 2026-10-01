@@ -26,6 +26,10 @@ When several middleware match the same traffic, OpenShell calls them in ascendin
 
 Every operation includes a request context. The context always includes `sandbox_id`. Use it for authorization, persistence, and correlation. The context also includes `sandbox` and `workspace` names when available. Names can be reused, so use them only for display and logging.
 
+For a delayed action tied to one runtime execution, use the `execution_id` from
+the [verified supervisor JWT](/extensibility/overview#authenticating-extensions).
+The sandbox ID persists across restarts and does not identify one execution.
+
 Operations that include headers deliver them in wire order, and repeated headers stay separate. OpenShell removes credential, routing, and hop-by-hop headers before sending them to your service. It also removes framing headers from request input. Response preflight retains upstream `Content-Length`, `Content-Encoding`, and `Content-Range` as read-only metadata, unless `Connection` names them as hop-by-hop headers. Your service cannot change or remove these fields; OpenShell handles downstream framing.
 
 Every result can include an optional reason code, findings, and metadata:

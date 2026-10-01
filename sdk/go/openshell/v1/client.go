@@ -22,6 +22,7 @@ type ClientInterface interface {
 	SandboxTemplates() SandboxTemplateInterface
 	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 	SandboxSuspendResume() SandboxSuspendResumeInterface
+	StopSandboxExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error)
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -55,6 +56,7 @@ type Client struct {
 	sandboxes      SandboxInterface
 	templateCreate SandboxTemplateCreateInterface
 	suspendResume  SandboxSuspendResumeInterface
+	executionStops SandboxExecutionInterface
 	templates      SandboxTemplateInterface
 	providers      ProviderInterface
 	services       ServiceInterface
@@ -102,6 +104,7 @@ func NewClient(cfg Config) (*Client, error) {
 	c.sandboxes = sandboxes
 	c.templateCreate = sandboxes
 	c.suspendResume = sandboxes
+	c.executionStops = sandboxes
 	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
@@ -131,6 +134,13 @@ func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name,
 
 // SandboxSuspendResume returns the sandbox suspend and resume sub-client.
 func (c *Client) SandboxSuspendResume() SandboxSuspendResumeInterface { return c.suspendResume }
+
+// StopSandboxExecution stops only the requested execution. A stale identity
+// fails without stopping a replacement. The result is a historical receipt,
+// including on request replay; unsupported gateways return Unimplemented.
+func (c *Client) StopSandboxExecution(ctx context.Context, workspace, name, executionID string, opts ...StopExecutionOptions) (*StopExecutionResult, error) {
+	return c.executionStops.StopExecution(ctx, workspace, name, executionID, opts...)
+}
 
 // Providers returns the provider sub-client.
 func (c *Client) Providers() ProviderInterface { return c.providers }
