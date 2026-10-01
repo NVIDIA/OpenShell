@@ -135,7 +135,7 @@ groups and manual runs use their explicit baseline. Findings are reported by
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
 Branch Checks compares the prospective merge tree with its target; Release Tag
 compares the tagged candidate with the previous stable release. Both use
-the shared `check-protobuf-compatibility` action with `nix develop .#proto`.
+the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.

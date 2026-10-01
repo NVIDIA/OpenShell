@@ -51,7 +51,7 @@ jobs:
 
       - uses: ./.github/actions/check-protobuf-compatibility
         with:
-          target-ref: >-
+          ref: >-
             ${{ github.event_name == 'workflow_dispatch'
                 && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
                 || github.event.merge_group.base_sha

@@ -228,7 +228,7 @@ jobs:
 
       - uses: ./.github/actions/check-protobuf-compatibility
         with:
-          release-tag: ${{ env.RELEASE_TAG }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
   qualification-result:
     name: Release Qualification

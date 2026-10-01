@@ -112,19 +112,18 @@ def compare(candidate: str, baseline: str, allows_breaks: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--target", help="PR or merge-group target commit/ref")
-    mode.add_argument("--release", help="Prerelease or stable tag to qualify")
+    parser.add_argument("ref", help="Target branch/commit, or release tag to qualify")
     args = parser.parse_args()
-    if args.release:
-        candidate = git("rev-parse", "--verify", f"refs/tags/{args.release}^{{commit}}")
-        baseline, train, allows_breaks = train_policy(candidate, args.release)
-        baseline = f"refs/tags/{baseline}"
-    else:
-        baseline = git(
-            "rev-parse", "--verify", "--end-of-options", f"{args.target}^{{commit}}"
-        )
-        _, train, allows_breaks = train_policy(baseline, None)
+    ref = git(
+        "rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", args.ref
+    )
+    candidate = git(
+        "rev-parse", "--verify", "--end-of-options", f"{args.ref}^{{commit}}"
+    )
+    release = ref.removeprefix("refs/tags/") if ref.startswith("refs/tags/") else None
+    stable, train, allows_breaks = train_policy(candidate, release)
+    baseline = f"refs/tags/{stable}" if release else candidate
+    if not release:
         # merge-tree writes only Git objects, leaving HEAD and the worktree
         # intact. Target-only additions are therefore not mistaken for deletions.
         candidate = git("merge-tree", "--write-tree", baseline, "HEAD").splitlines()[0]

@@ -20,7 +20,8 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 ### Protobuf API compatibility
 
 `Protobuf Compatibility` runs in Branch Checks and Release Tag through the shared
-`check-protobuf-compatibility` action and lockfile-pinned `proto` Nix shell.
+`check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
+and Git from the flake lockfile.
 It uses Buf's `FILE` policy for the `proto/`
 module, covering SDK descriptors and extension contracts. Storage-only protobufs
 remain subject to their separate durability checks.
@@ -51,13 +52,14 @@ Fetch the target and tags to check committed branch changes locally, replacing
 
 ```shell
 git fetch origin main --tags
-nix develop .#proto -c uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py --target origin/main
+nix run .#check-protobuf-compatibility -- origin/main
 ```
 
-To qualify a tag:
+The same command accepts a release tag to qualify it against the previous stable
+release. Branch names and commit SHAs select the branch comparison instead:
 
 ```shell
-nix develop .#proto -c uv run --no-project --python python3 tasks/scripts/check_proto_compatibility.py --release v0.2.0-pre.1
+nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
 ```
 
 For an intentional minor-train incompatibility, record the Buf finding,
