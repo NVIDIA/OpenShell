@@ -312,12 +312,14 @@ The RPM gateway package is configured for the Podman driver.
 On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
 Homebrew installs `openshell`, `openshell-gateway`, and the self-contained
-`openshell-driver-vm` with its embedded native supervisor. It ad-hoc signs the
-driver with the Hypervisor entitlement in `post_install` and owns the `brew
-services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS` unset
+`openshell-driver-vm` with its embedded native supervisor. The release workflow
+ad-hoc signs the macOS driver with the Hypervisor entitlement before packaging,
+so Homebrew and direct tarball installs consume the same signed artifact. Homebrew
+owns the `brew services` gateway lifecycle. The service also leaves
+`OPENSHELL_DRIVERS` unset
 so driver choice remains automatic unless the user explicitly overrides it.
 
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
-- macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.
+- macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; release builds are signed before artifact upload using `crates/openshell-driver-vm/entitlements.plist`.
