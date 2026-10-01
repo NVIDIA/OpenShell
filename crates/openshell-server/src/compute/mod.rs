@@ -5992,15 +5992,31 @@ fn public_status_from_driver(
     phase: SandboxPhase,
     current_policy_version: u32,
 ) -> SandboxStatus {
+    let mut conditions = status
+        .conditions
+        .iter()
+        .map(public_condition_from_driver)
+        .collect::<Vec<_>>();
+    if let Some(identity) = &status.resolved_identity {
+        // Keep the requested policy intact. This condition reports the
+        // immutable runtime identity through existing CLI/API status views.
+        conditions.retain(|condition| condition.r#type != "WorkloadIdentity");
+        conditions.push(SandboxCondition {
+            r#type: "WorkloadIdentity".to_string(),
+            status: "True".to_string(),
+            reason: "DriverResolved".to_string(),
+            message: format!(
+                "Resolved workload UID:GID is {}:{}",
+                identity.uid, identity.gid
+            ),
+            transition_time: None,
+        });
+    }
     SandboxStatus {
         agent_pod: status.instance_id.clone(),
         agent_fd: status.agent_fd.clone(),
         sandbox_fd: status.sandbox_fd.clone(),
-        conditions: status
-            .conditions
-            .iter()
-            .map(public_condition_from_driver)
-            .collect(),
+        conditions,
         phase: phase as i32,
         current_policy_version,
         main_process_instance_id: String::new(),
@@ -9762,6 +9778,39 @@ mod tests {
             deleting: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn public_status_reports_driver_identity_without_rewriting_policy_or_readiness() {
+        let mut driver_status =
+            make_driver_status(make_driver_condition("Starting", "VM is starting"));
+        let unresolved = public_status_from_driver(&driver_status, SandboxPhase::Provisioning, 0);
+        assert!(
+            !unresolved
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "WorkloadIdentity")
+        );
+        driver_status.resolved_identity = Some(
+            openshell_core::proto::compute::v1::ResolvedWorkloadIdentity {
+                uid: 1000,
+                gid: 1001,
+                source: "vm-config".into(),
+                resource_digest: "sha256:image".into(),
+                ..Default::default()
+            },
+        );
+        let status = public_status_from_driver(&driver_status, SandboxPhase::Provisioning, 0);
+        assert_eq!(status.phase, SandboxPhase::Provisioning as i32);
+        assert_eq!(status.current_policy_version, 0);
+        assert_eq!(status.conditions[0], unresolved.conditions[0]);
+        let identity = status
+            .conditions
+            .iter()
+            .find(|condition| condition.r#type == "WorkloadIdentity")
+            .unwrap();
+        assert_eq!(identity.reason, "DriverResolved");
+        assert_eq!(identity.message, "Resolved workload UID:GID is 1000:1001");
     }
 
     fn ready_driver_sandbox(id: &str, name: &str) -> DriverSandbox {

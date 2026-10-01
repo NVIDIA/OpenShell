@@ -357,6 +357,34 @@ mod linux {
         Ok(())
     }
 
+    /// VM selectors assert the protected overlay owner; they cannot choose a
+    /// replacement identity. Guest init maps `sandbox` to that owner before
+    /// launching this boundary, so no account lookup or privilege change belongs here.
+    fn validate_vm_policy_identity(
+        config: &BoundaryConfig,
+        policy: &SandboxPolicyWire,
+    ) -> Result<(), String> {
+        if !config.resource_claims.contains_key("vm.generation") {
+            return Ok(());
+        }
+        let identity = &config.workload_identity;
+        for (field, selector, expected) in [
+            ("run_as_user", policy.run_as_user.as_deref(), identity.uid),
+            ("run_as_group", policy.run_as_group.as_deref(), identity.gid),
+        ] {
+            let Some(selector) = selector.filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if selector != "sandbox" && selector.parse::<u32>() != Ok(expected) {
+                return Err(format!(
+                    "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+                    identity.uid, identity.gid
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn tls_paths_are_absolute(
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> bool {
@@ -2247,6 +2275,11 @@ mod linux {
         }
 
         fn attach(&self, policy: SandboxPolicyWire) -> Response {
+            // Reject a conflicting request before establishing the boundary
+            // or retaining the caller's policy for later replay.
+            if let Err(error) = validate_vm_policy_identity(&self.config, &policy) {
+                return guest_error(BoundaryErrorKind::Denied, error);
+            }
             let mut state = lock(&self.state);
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
@@ -2439,6 +2472,11 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // Check the supplied launch policy before installing materials or
+            // replacing its selectors with the measured driver's numeric pair.
+            if let Err(error) = validate_vm_policy_identity(&self.config, &policy) {
+                return guest_error(BoundaryErrorKind::Denied, error);
+            }
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
@@ -4643,6 +4681,192 @@ mod linux {
 
             validate_config(&config).unwrap();
             validate_running_identity(&config.workload_identity, false).unwrap();
+            let mut wrong_uid = config.workload_identity.clone();
+            wrong_uid.uid = if wrong_uid.uid == 10000 { 10001 } else { 10000 };
+            assert!(validate_running_identity(&wrong_uid, false).is_err());
+            let mut wrong_gid = config.workload_identity.clone();
+            wrong_gid.gid = if wrong_gid.gid == 10000 { 10001 } else { 10000 };
+            assert!(validate_running_identity(&wrong_gid, false).is_err());
+        }
+
+        fn vm_identity_test_runtime() -> (tokio::runtime::Runtime, Arc<BoundaryRuntime>) {
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let mut boundary = {
+                let _entered = process_runtime.enter();
+                availability_test_runtime().0
+            };
+            let config = &mut Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config;
+            config
+                .resource_claims
+                .insert("vm.generation".to_string(), config.generation.clone());
+            (process_runtime, boundary)
+        }
+
+        fn vm_identity_test_policy(user: Option<&str>, group: Option<&str>) -> SandboxPolicyWire {
+            SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy {
+                    run_as_user: user.map(str::to_string),
+                    run_as_group: group.map(str::to_string),
+                },
+            })
+        }
+
+        #[test]
+        fn vm_policy_identity_checks_independent_selectors() {
+            let (_runtime, mut boundary) = vm_identity_test_runtime();
+            let uid = boundary.config.workload_identity.uid.to_string();
+            let gid = boundary.config.workload_identity.gid.to_string();
+            for (user, group) in [
+                (None, None),
+                (Some(""), Some("")),
+                (Some(uid.as_str()), None),
+                (None, Some(gid.as_str())),
+                (Some(uid.as_str()), Some(gid.as_str())),
+                (Some("sandbox"), Some(gid.as_str())),
+                (Some(uid.as_str()), Some("sandbox")),
+                (Some("sandbox"), Some("sandbox")),
+            ] {
+                validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect("matching or omitted VM selectors");
+            }
+            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            for (user, group, field) in [
+                (Some(wrong_uid), None, "run_as_user"),
+                (None, Some(wrong_gid), "run_as_group"),
+                (Some(uid.as_str()), Some(wrong_gid), "run_as_group"),
+                (Some(wrong_uid), Some(gid.as_str()), "run_as_user"),
+                (Some(wrong_uid), Some(wrong_gid), "run_as_user"),
+            ] {
+                let error = validate_vm_policy_identity(
+                    &boundary.config,
+                    &vm_identity_test_policy(user, group),
+                )
+                .expect_err("either mismatched selector must fail");
+                assert!(error.contains(field), "{error}");
+                assert!(error.contains(&format!("{uid}:{gid}")), "{error}");
+            }
+            for malformed in [
+                "root",
+                "-1",
+                "4294967296",
+                "1000:1000",
+                " sandbox",
+                "sandbox\n",
+            ] {
+                for (user, group) in [(Some(malformed), None), (None, Some(malformed))] {
+                    assert!(
+                        validate_vm_policy_identity(
+                            &boundary.config,
+                            &vm_identity_test_policy(user, group),
+                        )
+                        .is_err(),
+                        "invalid selector {malformed:?} must fail"
+                    );
+                }
+            }
+            Arc::get_mut(&mut boundary)
+                .expect("test boundary has one owner")
+                .config
+                .resource_claims
+                .remove("vm.generation");
+            validate_vm_policy_identity(
+                &boundary.config,
+                &vm_identity_test_policy(Some(wrong_uid), Some("image-user")),
+            )
+            .expect("non-VM identity behavior is unchanged");
+        }
+
+        #[test]
+        fn vm_attach_rejects_conflicting_identity_without_binding() {
+            let (_runtime, boundary) = vm_identity_test_runtime();
+            let identity = &boundary.config.workload_identity;
+            let uid = identity.uid.to_string();
+            let gid = identity.gid.to_string();
+            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            for (user, group, field, requested) in [
+                (Some(wrong_uid), None, "run_as_user", wrong_uid),
+                (None, Some(wrong_gid), "run_as_group", wrong_gid),
+            ] {
+                let response = boundary.attach(vm_identity_test_policy(user, group));
+                let Response::Error { kind, message } = response else {
+                    panic!("conflicting identity was attached: {response:?}");
+                };
+                assert_eq!(kind, BoundaryErrorKind::Denied);
+                assert!(
+                    message.contains(&format!("{field} '{requested}'")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{uid}:{gid}")), "{message}");
+                assert!(matches!(
+                    *lock(&boundary.state),
+                    RuntimeState::AwaitingAttach
+                ));
+                assert!(lock(&boundary.attached_policy).is_none());
+            }
+            assert!(matches!(
+                boundary.attach(vm_identity_test_policy(Some("sandbox"), Some("sandbox"))),
+                Response::Attached { .. }
+            ));
+        }
+
+        #[test]
+        fn vm_start_rejects_conflicting_identity_without_launch() {
+            let (_runtime, boundary) = vm_identity_test_runtime();
+            let identity = &boundary.config.workload_identity;
+            let uid = identity.uid.to_string();
+            let gid = identity.gid.to_string();
+            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            *lock(&boundary.state) = RuntimeState::Ready(PreparedBoundary {
+                network_broker: boundary.network_broker.clone(),
+            });
+            for (user, group, field, requested) in [
+                (Some(wrong_uid), None, "run_as_user", wrong_uid),
+                (None, Some(wrong_gid), "run_as_group", wrong_gid),
+            ] {
+                let response = boundary.start_agent(
+                    boundary.config.boundary_id.clone(),
+                    AgentSpecWire {
+                        program: "/bin/true".to_string(),
+                        args: Vec::new(),
+                        workdir: None,
+                        timeout_secs: 5,
+                        interactive: false,
+                    },
+                    vm_identity_test_policy(user, group),
+                    None,
+                    None,
+                    0,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                );
+                let Response::Error { kind, message } = response else {
+                    panic!("conflicting identity reached process start: {response:?}");
+                };
+                assert_eq!(kind, BoundaryErrorKind::Denied);
+                assert!(
+                    message.contains(&format!("{field} '{requested}'")),
+                    "{message}"
+                );
+                assert!(message.contains(&format!("{uid}:{gid}")), "{message}");
+                assert!(matches!(*lock(&boundary.state), RuntimeState::Ready(_)));
+                assert!(lock(&boundary.started_agent).is_none());
+            }
         }
 
         #[test]

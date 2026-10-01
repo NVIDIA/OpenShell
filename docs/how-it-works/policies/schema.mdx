@@ -89,11 +89,9 @@ and skipped.
 | `run_as_group` | string | Driver default | `sandbox` or a numeric GID for the workload. |
 
 A numeric ID must be from `1` through `4294967294`, so OpenShell rejects root.
-Each field is independent, so you can set one and let the compute driver choose
-the other. Only Docker and Podman apply these fields, and only from the policy
-that you pass when you create the sandbox. Without them, Docker and Podman use
-the image's `USER`. Kubernetes and VM sandboxes run as the identity configured
-for their driver.
+Each field is independent, so you can set one and let the compute driver choose the other. Docker and Podman use these fields to select the workload identity from the policy passed at creation; omitted fields use the image's `USER`. Kubernetes uses the identity configured for its driver.
+
+MicroVM preserves the driver's resolved overlay owner. An explicit numeric selector must match that owner; `sandbox` names the guest account reconciled to that owner. A conflicting selector fails before the workload starts, and omitted fields accept the driver default. `openshell sandbox get <name>` reports the resolved UID:GID in its `WorkloadIdentity` condition. This condition reports identity selection, not workload readiness. Sandbox policy updates cannot change process selectors; global policy updates must still match the resolved identity. Ordinary exec uses the same identity as the canonical process.
 
 ```yaml showLineNumbers={false}
 process:

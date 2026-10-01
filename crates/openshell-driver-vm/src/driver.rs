@@ -52,11 +52,12 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
-    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, WorkloadIdentityRequest, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1391,6 +1392,10 @@ impl VmDriver {
                 &overlay_disk,
                 &owner_source_disk,
                 overlay_preparation,
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.workload_identity.as_ref()),
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
@@ -1723,6 +1728,18 @@ impl VmDriver {
                 Some(record) if !record.deleting => {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
+                    let identity = &runtime_descriptor.workload_identity;
+                    record
+                        .snapshot
+                        .status
+                        .get_or_insert_with(SandboxStatus::default)
+                        .resolved_identity = Some(ResolvedWorkloadIdentity {
+                        uid: identity.uid,
+                        gid: identity.gid,
+                        supplementary_gids: identity.supplementary_gids.clone(),
+                        source: identity.source.clone(),
+                        resource_digest: identity.resource_digest.clone(),
+                    });
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -2765,6 +2782,7 @@ impl VmDriver {
         overlay_disk: &Path,
         owner_source_disk: &Path,
         preparation: OverlayPreparation,
+        requested_identity: Option<&WorkloadIdentityRequest>,
     ) -> Result<SandboxOwnerIdentity, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let overlay_disk = overlay_disk.to_path_buf();
@@ -2786,6 +2804,9 @@ impl VmDriver {
             preparation,
         )
         .await?;
+        // Validate before creating or recovering an overlay. A conflicting
+        // request must never change the persisted owner or its files.
+        validate_vm_workload_identity(requested_identity, owner_state)?;
         let owner_state_written_before_prepare =
             write_owner_state && preparation == OverlayPreparation::Fresh;
         if owner_state_written_before_prepare {
@@ -6788,8 +6809,33 @@ fn status_with_condition(
         sandbox_fd: String::new(),
         conditions: vec![condition],
         deleting,
-        ..Default::default()
+        ..snapshot.status.clone().unwrap_or_default()
     }
+}
+
+/// VM init reconciles the named `sandbox` account to this overlay's owner.
+/// Numeric selectors assert that same immutable identity; they cannot select
+/// a new owner. Each empty selector independently accepts the driver default.
+fn validate_vm_workload_identity(
+    request: Option<&WorkloadIdentityRequest>,
+    owner: SandboxOwnerIdentity,
+) -> Result<(), String> {
+    let Some(request) = request else {
+        return Ok(());
+    };
+    for (field, selector, expected) in [
+        ("run_as_user", request.user.as_str(), owner.uid),
+        ("run_as_group", request.group.as_str(), owner.gid),
+    ] {
+        if selector.is_empty() || selector == "sandbox" || selector.parse::<u32>() == Ok(expected) {
+            continue;
+        }
+        return Err(format!(
+            "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+            owner.uid, owner.gid
+        ));
+    }
+    Ok(())
 }
 
 fn provisioning_condition() -> SandboxCondition {
@@ -7591,6 +7637,7 @@ mod tests {
                 Path::new("/unused"),
                 Path::new("/unused"),
                 OverlayPreparation::Fresh,
+                None,
             )
             .instrument(parent)
             .await;
@@ -8174,6 +8221,117 @@ mod tests {
                 .expect_err("path-unsafe sandbox id should be rejected");
             assert_eq!(err.code(), Code::InvalidArgument, "id={sandbox_id:?}");
             assert!(err.message().contains("sandbox id"), "id={sandbox_id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_vm_identity_preserves_overlay_and_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        write_sandbox_owner_state(directory.path(), owner)
+            .await
+            .unwrap();
+        let overlay = directory.path().join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"existing overlay must not be touched").unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.sandbox_uid = Some(10000);
+        driver.config.sandbox_gid = Some(10001);
+        let request = WorkloadIdentityRequest {
+            user: "10000".into(),
+            group: "10001".into(),
+        };
+        let error = driver
+            .prepare_runtime_overlay(
+                directory.path(),
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                Some(&request),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("run_as_user '10000'"), "{error}");
+        assert!(error.contains("1000:1001"), "{error}");
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"existing overlay must not be touched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(SANDBOX_OWNER_STATE_FILE)).unwrap(),
+            owner.marker_contents()
+        );
+    }
+
+    #[test]
+    fn vm_workload_identity_checks_independent_numeric_and_symbolic_selectors() {
+        let owner = SandboxOwnerIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        validate_vm_workload_identity(None, owner).unwrap();
+        for (user, group) in [
+            ("", ""),
+            ("1000", ""),
+            ("", "1001"),
+            ("sandbox", "1001"),
+            ("1000", "sandbox"),
+            ("sandbox", "sandbox"),
+        ] {
+            validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap();
+        }
+        for (user, group, field) in [
+            ("10000", "", "run_as_user"),
+            ("", "10001", "run_as_group"),
+            ("sandbox", "10001", "run_as_group"),
+            ("nobody", "", "run_as_user"),
+        ] {
+            let error = validate_vm_workload_identity(
+                Some(&WorkloadIdentityRequest {
+                    user: user.into(),
+                    group: group.into(),
+                }),
+                owner,
+            )
+            .unwrap_err();
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("1000:1001"), "{error}");
+        }
+    }
+
+    #[test]
+    fn vm_lifecycle_status_retains_resolved_workload_identity() {
+        let identity = ResolvedWorkloadIdentity {
+            uid: 1000,
+            gid: 1001,
+            source: "vm-config".into(),
+            resource_digest: "sha256:image".into(),
+            ..Default::default()
+        };
+        let snapshot = Sandbox {
+            status: Some(SandboxStatus {
+                resolved_identity: Some(identity.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for condition in [
+            provisioning_condition(),
+            stopped_condition(),
+            deleting_condition(),
+            error_condition("ProcessExited", "exited"),
+        ] {
+            let status = status_with_condition(&snapshot, condition, false);
+            assert_eq!(status.resolved_identity.as_ref(), Some(&identity));
         }
     }
 

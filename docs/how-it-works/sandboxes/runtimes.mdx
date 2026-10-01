@@ -292,12 +292,14 @@ openshell sandbox create \
 
 ## Sandbox User Identity
 
-Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to choose the sandbox user. Any non-root UID or GID is allowed. When a field is unset, the driver supplies it:
+On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in the creation policy to choose the sandbox user. Selectors accept `sandbox` or numeric IDs from `1` through `4294967294`. Kubernetes and MicroVM select the identity through driver configuration. When a field is unset, the driver supplies it:
 
 | Driver | Default identity |
 |---|---|
 | Docker, Podman | The image's `USER`. Images without `USER` must set both fields in policy. |
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
+
+MicroVM persists the resolved UID:GID with the writable overlay and retains it across restarts, even if driver defaults change. Explicit policy selectors must match that identity. For example, `run_as_user: "10000"` fails when the overlay owner is `1000:1000`; OpenShell reports both values without changing file ownership. The symbolic selector `sandbox` refers to the guest account for that owner, and each omitted selector accepts its driver default. The `WorkloadIdentity` condition in `openshell sandbox get <name>` shows the resolved pair separately from workload readiness. Canonical and exec processes use this same pair; live policy updates cannot change it.
 
 On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Podman, Kubernetes, and MicroVM always use `/sandbox`.

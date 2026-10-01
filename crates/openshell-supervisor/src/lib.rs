@@ -701,6 +701,14 @@ pub async fn run_sandbox(
         ImagePolicyDiscovery::Missing
     };
 
+    let vm_policy_identity = runtime_descriptor
+        .resource_claims
+        .contains_key("vm.generation")
+        .then_some(VmPolicyIdentity {
+            uid: runtime_descriptor.workload_identity.uid,
+            gid: runtime_descriptor.workload_identity.gid,
+        });
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -721,6 +729,7 @@ pub async fn run_sandbox(
         policy_data,
         &extension_credentials,
         LocalPolicyIdentity::Required,
+        vm_policy_identity,
         Some(image_discovery),
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
@@ -1092,6 +1101,7 @@ pub async fn run_sandbox(
             sandbox: poll_sandbox,
             opa_engine: poll_engine,
             loaded_policy_origin,
+            vm_identity: vm_policy_identity,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
@@ -2044,6 +2054,39 @@ enum LocalPolicyIdentity {
     EndpointOnly,
 }
 
+/// The VM driver fixes overlay ownership before this supervisor starts. Guest
+/// init maps the `sandbox` account to this pair; the host must not resolve
+/// guest selectors through its own account database.
+#[derive(Clone, Copy)]
+struct VmPolicyIdentity {
+    uid: u32,
+    gid: u32,
+}
+
+impl VmPolicyIdentity {
+    fn validate(self, policy: &openshell_core::proto::SandboxPolicy) -> Result<()> {
+        let Some(process) = policy.process.as_ref() else {
+            return Ok(());
+        };
+        for (field, selector, expected) in [
+            ("run_as_user", process.run_as_user.as_str(), self.uid),
+            ("run_as_group", process.run_as_group.as_str(), self.gid),
+        ] {
+            if !selector.is_empty()
+                && selector != "sandbox"
+                && selector.parse::<u32>() != Ok(expected)
+            {
+                return Err(miette::miette!(
+                    "VM {field} '{selector}' conflicts with the resolved workload identity {}:{}; omit the selector or request the driver-owned identity",
+                    self.uid,
+                    self.gid
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 struct CapturedProviderEnvironment {
     credentials: ProviderCredentialState,
     expires_at_ms: Option<i64>,
@@ -2100,6 +2143,7 @@ async fn load_policy(
         extension_credentials,
         local_policy_identity,
         None,
+        None,
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.unwrap_or_default(),
         },
@@ -2119,6 +2163,7 @@ async fn load_policy_with_gateway(
     policy_data: Option<String>,
     extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
     local_policy_identity: LocalPolicyIdentity,
+    vm_identity: Option<VmPolicyIdentity>,
     image_discovery: Option<ImagePolicyDiscovery>,
     gateway: &impl StartupGateway,
 ) -> Result<(
@@ -2403,6 +2448,23 @@ async fn load_policy_with_gateway(
                         &snapshot.configuration_error
                     },
                     None,
+                )
+                .await?;
+                reconciliation_attempts = 0;
+                continue;
+            }
+            // Admission must reject incompatible image-discovered or repaired
+            // selectors before reporting this policy effective.
+            if let Some(identity) = vm_identity
+                && let Err(error) = identity.validate(&proto_policy)
+            {
+                reject_startup_configuration(
+                    gateway,
+                    &mut rejection_log,
+                    id,
+                    &instance_id,
+                    &snapshot,
+                    &error.to_string(),
                 )
                 .await?;
                 reconciliation_attempts = 0;
@@ -2862,6 +2924,7 @@ async fn reload_gateway_policy_runtime(
         entrypoint_pid,
         middleware,
         transparent_tcp,
+        None,
         || {},
     )
     .await
@@ -2873,8 +2936,16 @@ async fn reload_gateway_configuration_runtime(
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
     transparent_tcp: TransparentTcpReloadState,
+    vm_identity: Option<VmPolicyIdentity>,
     commit_credentials: impl FnOnce(),
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
+    if let (Some(identity), Some(policy)) = (vm_identity, policy) {
+        // Global policy changes also reach this path. Validate before any
+        // policy generation, middleware or provider credentials are committed.
+        identity
+            .validate(policy)
+            .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+    }
     if let Some(policy) = policy
         && policy_contains_explicit_tcp(policy)
     {
@@ -3540,6 +3611,8 @@ struct PolicyPollLoopContext {
     /// explicit local-file override from an unbound gateway revision so the
     /// former is never replaced by policy polling.
     loaded_policy_origin: LoadedPolicyOrigin,
+    /// Immutable VM overlay identity, also enforced for global policy updates.
+    vm_identity: Option<VmPolicyIdentity>,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
@@ -4448,6 +4521,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     connector: &ctx.middleware_connector,
                 },
                 ctx.transparent_tcp,
+                ctx.vm_identity,
                 || {
                     if let Some(prepared) = prepared_provider.as_ref() {
                         ctx.provider_credentials.install_prepared(prepared);
@@ -5501,6 +5575,150 @@ network_policies:
     }
 
     #[tokio::test(start_paused = true)]
+    async fn startup_rejects_vm_identity_until_matching_policy_is_available() {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        let mut policy = proto_policy_fixture();
+        enrich_proto_baseline_paths(&mut policy);
+        policy.process = Some(openshell_core::proto::ProcessPolicy {
+            run_as_user: "10000".into(),
+            run_as_group: "1001".into(),
+        });
+        let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = TestStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                Some(policy),
+                1,
+                PolicySource::Sandbox,
+            ))),
+            reports,
+            reject_next_accept: Arc::new(AtomicBool::new(false)),
+            snapshot_error: None,
+            report_error: None,
+            pending_snapshot: false,
+            pending_acceptance: false,
+        };
+        let active_gateway = gateway.clone();
+        let handle = tokio::spawn(async move {
+            load_policy_with_gateway(
+                Some("sandbox-id".into()),
+                Some("sandbox".into()),
+                Some("http://unused.invalid".into()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                Some(VmPolicyIdentity {
+                    uid: 1000,
+                    gid: 1001,
+                }),
+                Some(ImagePolicyDiscovery::Missing),
+                &active_gateway,
+            )
+            .await
+        });
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Pending)
+        );
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Rejected)
+        );
+        assert!(
+            !handle.is_finished(),
+            "mismatched policy must never be returned as effective"
+        );
+        {
+            let mut desired = gateway.desired.lock().unwrap();
+            desired
+                .policy
+                .as_mut()
+                .unwrap()
+                .process
+                .as_mut()
+                .unwrap()
+                .run_as_user = "sandbox".into();
+            desired.config_revision += 1;
+        }
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Accepted)
+        );
+        handle
+            .await
+            .unwrap()
+            .expect("matching repair should permit startup");
+    }
+
+    #[test]
+    fn vm_startup_identity_validates_selectors_independently() {
+        let identity = VmPolicyIdentity {
+            uid: 1000,
+            gid: 1001,
+        };
+        for (user, group, accepted) in [
+            ("", "", true),
+            ("1000", "", true),
+            ("", "1001", true),
+            ("sandbox", "sandbox", true),
+            ("10000", "", false),
+            ("", "10001", false),
+        ] {
+            let policy = openshell_core::proto::SandboxPolicy {
+                process: Some(openshell_core::proto::ProcessPolicy {
+                    run_as_user: user.into(),
+                    run_as_group: group.into(),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                identity.validate(&policy).is_ok(),
+                accepted,
+                "{user}:{group}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vm_identity_conflict_prevents_runtime_policy_and_credential_commit() {
+        let mut policy = proto_policy_fixture();
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let before = engine.current_generation();
+        policy.process = Some(openshell_core::proto::ProcessPolicy {
+            run_as_user: "sandbox".into(),
+            run_as_group: "10000".into(),
+        });
+        let committed = AtomicBool::new(false);
+        let result = reload_gateway_configuration_runtime(
+            &engine,
+            Some(&policy),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+            Some(VmPolicyIdentity {
+                uid: 1000,
+                gid: 1001,
+            }),
+            || {
+                committed.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+        let Err(GatewayRuntimeReloadError::PolicyValidation(error)) = result else {
+            panic!("conflicting VM group should fail policy validation");
+        };
+        assert!(error.to_string().contains("run_as_group '10000'"));
+        assert!(error.to_string().contains("1000:1001"));
+        assert_eq!(engine.current_generation(), before);
+        assert!(!committed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
             let mut policy = proto_policy_fixture();
@@ -5529,6 +5747,7 @@ network_policies:
                     None,
                     &openshell_extension_core::ExtensionCredentialStore::new(),
                     LocalPolicyIdentity::Required,
+                    None,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
                 ),
@@ -5605,6 +5824,7 @@ network_policies:
                     None,
                     &openshell_extension_core::ExtensionCredentialStore::new(),
                     LocalPolicyIdentity::Required,
+                    None,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
                 ),
@@ -5650,6 +5870,7 @@ network_policies:
                 None,
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
+                None,
                 Some(ImagePolicyDiscovery::Missing),
                 &active_gateway,
             )
@@ -7539,6 +7760,7 @@ network_policies:
             sandbox: "sandbox-test-name".to_string(),
             opa_engine,
             loaded_policy_origin,
+            vm_identity: None,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
