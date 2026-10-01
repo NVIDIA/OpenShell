@@ -411,8 +411,16 @@ async fn finalize_sandbox_create_session(
 
     let names = [sandbox_name.to_string()];
     if let Err(err) = sandbox_delete(
-        server, &names, false, workspace, tls, gateway, SandboxDeleteOptions::default(),
-    ).await {
+        server,
+        &names,
+        false,
+        workspace,
+        tls,
+        gateway,
+        SandboxDeleteOptions::default(),
+    )
+    .await
+    {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3813,6 +3821,9 @@ pub async fn sandbox_delete(
         };
 
         let deletion = response.into_inner();
+        if deletion.outcome() != DeletionOutcome::Unspecified {
+            clear_last_sandbox_if_matches(gateway, workspace, name);
+        }
         match deletion.outcome() {
             DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
             DeletionOutcome::Accepted if !options.wait => println!(
@@ -3821,10 +3832,19 @@ pub async fn sandbox_delete(
             ),
             DeletionOutcome::Accepted => {
                 if let Err(err) = wait_for_sandbox_deleted(
-                    &mut client, name, workspace, &deletion.sandbox_id, options.timeout,
-                ).await {
-                    eprintln!("{} Failed to verify sandbox {name} deletion: {err}", "!".red().bold());
-                    failures.push(name.clone());
+                    &mut client,
+                    name,
+                    workspace,
+                    &deletion.sandbox_id,
+                    options.timeout,
+                )
+                .await
+                {
+                    eprintln!(
+                        "{} Failed to verify sandbox {name} deletion: {err}",
+                        "!".red().bold()
+                    );
+                    failures.push(format!("{name}: {err}"));
                     continue;
                 }
                 println!("{} Deleted sandbox {name}", "✓".green().bold());
@@ -3838,10 +3858,8 @@ pub async fn sandbox_delete(
                     "!".red().bold()
                 );
                 failures.push(name.clone());
-                continue;
             }
         }
-        clear_last_sandbox_if_matches(gateway, workspace, name);
     }
 
     aggregate_delete_failures("sandbox", &failures)
@@ -3895,9 +3913,13 @@ async fn wait_for_sandbox_deleted(
         )
         .await
         {
-            Ok(Ok(response)) if response.into_inner().sandbox.as_ref().is_some_and(|sandbox| {
-                !expected_sandbox_id.is_empty() && sandbox.object_id() != expected_sandbox_id
-            }) => return Ok(()),
+            Ok(Ok(response))
+                if response.get_ref().sandbox.as_ref().is_some_and(|sandbox| {
+                    !expected_sandbox_id.is_empty() && sandbox.object_id() != expected_sandbox_id
+                }) =>
+            {
+                return Ok(());
+            }
             Ok(Ok(_)) => {}
             Ok(Err(status)) if status.code() == Code::NotFound => return Ok(()),
             Ok(Err(status)) => {

@@ -613,7 +613,7 @@ func (c *fakeSandboxClient) WaitDeleted(ctx context.Context, workspace, name str
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return &types.StatusError{Code: types.ErrorCancelled, Message: err.Error(), Cause: err}
+			return sandboxWaitContextError(err)
 		}
 		sandbox, err := c.store.Get(workspace, name)
 		if types.IsNotFound(err) {

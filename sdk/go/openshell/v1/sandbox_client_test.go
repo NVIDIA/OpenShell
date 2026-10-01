@@ -38,6 +38,7 @@ type mockSandboxServer struct {
 	deleteErr            error
 	deleteResponse       *pb.DeleteSandboxResponse
 	deleteRequest        *pb.DeleteSandboxRequest
+	deleteLeavesDeleting bool
 	attachErr            error
 	detachErr            error
 	listProvErr          error
@@ -149,12 +150,19 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 		return nil, s.deleteErr
 	}
 	name := req.GetName()
-	_, ok := s.sandboxes[name]
+	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
+	if s.deleteLeavesDeleting {
+		if sb.Status == nil {
+			sb.Status = &pb.SandboxStatus{}
+		}
+		sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_DELETING
+		return &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_ACCEPTED, SandboxId: sb.GetMetadata().GetId()}, nil
+	}
 	delete(s.sandboxes, name)
-	return &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
+	return &pb.DeleteSandboxResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED, SandboxId: sb.GetMetadata().GetId()}, nil
 }
 
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
@@ -602,9 +610,10 @@ func TestSandboxDelete_AcknowledgesWhileDeleting(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "async-delete")
+	result, err := client.Delete(context.Background(), "default", "async-delete")
 
 	require.NoError(t, err)
+	assert.Equal(t, DeletionAccepted, result.Outcome)
 	assert.Equal(t, pb.SandboxPhase_SANDBOX_PHASE_DELETING, mock.sandboxes["async-delete"].GetStatus().GetPhase())
 }
 
@@ -614,6 +623,18 @@ func TestSandboxWaitDeleted_AlreadyAbsent(t *testing.T) {
 	defer cleanup()
 
 	require.NoError(t, client.WaitDeleted(context.Background(), "default", "absent"))
+}
+
+func TestSandboxWaitDeleted_SameNameReplacement(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["replacement"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Id: "new-id", Name: "replacement"},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	require.NoError(t, client.WaitDeleted(context.Background(), "default", "replacement",
+		WaitOptions{ExpectedSandboxID: "old-id"}))
 }
 
 func TestSandboxWaitDeleted_BecomesAbsent(t *testing.T) {

@@ -1854,7 +1854,7 @@ impl ProviderReadinessArgs {
     fn options(&self) -> run::ProviderWaitOptions<'_> {
         run::ProviderWaitOptions {
             wait: self.wait,
-            timeout: std::time::Duration::from_secs(self.timeout),
+            timeout: Duration::from_secs(self.timeout),
             output: self.output.as_str(),
         }
     }

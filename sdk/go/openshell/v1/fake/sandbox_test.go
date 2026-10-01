@@ -373,8 +373,18 @@ func TestSandbox_WaitDeleted(t *testing.T) {
 
 	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
 	require.NoError(t, err)
-	require.NoError(t, sc.Delete(ctx, "default", "test-sb"))
+	_, err = sc.Delete(ctx, "default", "test-sb")
+	require.NoError(t, err)
 	require.NoError(t, sc.WaitDeleted(ctx, "default", "test-sb"))
+}
+
+func TestSandbox_WaitDeleted_SameNameReplacement(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+	created, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, sc.WaitDeleted(ctx, "default", "test-sb",
+		v1.WaitOptions{ExpectedSandboxID: created.ID + "-previous"}))
 }
 
 func TestSandbox_WaitDeleted_HonorsPreCanceledContext(t *testing.T) {

@@ -157,7 +157,9 @@ type OpenShellClient interface {
 	DetachSandboxProvider(ctx context.Context, in *DetachSandboxProviderRequest, opts ...grpc.CallOption) (*DetachSandboxProviderResponse, error)
 	// Inspect the installed authority for one sandbox provider mutation.
 	GetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
-	// Delete a sandbox by name.
+	// Request sandbox deletion by name. An ACCEPTED outcome acknowledges the
+	// request; poll GetSandbox for NOT_FOUND or a different sandbox ID when
+	// terminal deletion is required.
 	DeleteSandbox(ctx context.Context, in *DeleteSandboxRequest, opts ...grpc.CallOption) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(ctx context.Context, in *StopSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
@@ -1251,7 +1253,9 @@ type OpenShellServer interface {
 	DetachSandboxProvider(context.Context, *DetachSandboxProviderRequest) (*DetachSandboxProviderResponse, error)
 	// Inspect the installed authority for one sandbox provider mutation.
 	GetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
-	// Delete a sandbox by name.
+	// Request sandbox deletion by name. An ACCEPTED outcome acknowledges the
+	// request; poll GetSandbox for NOT_FOUND or a different sandbox ID when
+	// terminal deletion is required.
 	DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
 	StopSandbox(context.Context, *StopSandboxRequest) (*SandboxResponse, error)
