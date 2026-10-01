@@ -96,6 +96,32 @@ jobs:
           retention-days: 5
           if-no-files-found: error
 
+
+  smoke-vm-driver-macos:
+    name: Smoke packaged VM driver (aarch64-apple-darwin)
+    needs: package
+    runs-on: macos-15-xlarge
+    timeout-minutes: 10
+    steps:
+      - name: Download packaged VM driver
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: driver-vm-macos
+          path: package
+
+      - name: Verify Hypervisor entitlement
+        run: |
+          set -euo pipefail
+          mkdir extracted
+          tar -xzf package/openshell-driver-vm-aarch64-apple-darwin.tar.gz -C extracted
+          test "$(find extracted -type f | wc -l | tr -d ' ')" = 1
+          test -x extracted/openshell-driver-vm
+          signed_entitlements="${RUNNER_TEMP}/openshell-driver-vm.entitlements.plist"
+          /usr/bin/codesign --verify --strict extracted/openshell-driver-vm
+          /usr/bin/codesign --display --entitlements :- extracted/openshell-driver-vm > "${signed_entitlements}"
+          /usr/bin/plutil -extract com.apple.security.hypervisor raw -o - "${signed_entitlements}" \
+            | grep -qx true
+
   smoke-prover:
     name: Smoke packaged prover (${{ matrix.triple }})
     needs: package
