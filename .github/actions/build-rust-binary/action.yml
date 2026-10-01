@@ -29,6 +29,10 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
+  macos-entitlements:
+    description: Optional entitlements plist used for ad-hoc macOS signing before upload
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -53,6 +57,24 @@ runs:
         INPUTS_TRIPLE: ${{ inputs.triple }}
         INPUTS_EXTRA_CARGO_FLAGS: ${{ inputs.extra-cargo-flags }}
       run: cargo auditable build --release --target "${INPUTS_TRIPLE}" --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
+
+    - name: Sign ${{ inputs.binary }} for macOS
+      if: inputs.macos-entitlements != ''
+      shell: bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_MACOS_ENTITLEMENTS: ${{ inputs.macos-entitlements }}
+      run: |
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
+        signed_entitlements="${RUNNER_TEMP}/${INPUTS_BINARY}.entitlements.plist"
+        /usr/bin/codesign \
+          --entitlements "${INPUTS_MACOS_ENTITLEMENTS}" \
+          --force -s - "${binary}"
+        /usr/bin/codesign --verify --strict "${binary}"
+        /usr/bin/codesign --display --entitlements :- "${binary}" > "${signed_entitlements}"
+        /usr/bin/plutil -extract com.apple.security.hypervisor raw -o - "${signed_entitlements}" \
+          | grep -qx true
 
     - name: Verify ${{ inputs.binary }}
       shell: nix develop -c bash -euo pipefail {0}
