@@ -885,18 +885,6 @@ homebrew_formula_path() {
   printf '%s/%s.rb\n' "$_formula_dir" "$_formula"
 }
 
-patch_homebrew_formula() {
-  _formula_file="$1"
-  _patched_file="${_formula_file}.patched"
-
-  if grep -q 'entitlements.write <<~XML' "$_formula_file"; then
-    info "patching Homebrew formula for idempotent postinstall..."
-    sed 's/entitlements\.write <<~XML/entitlements.atomic_write <<~XML/' "$_formula_file" >"$_patched_file"
-    mv "$_patched_file" "$_formula_file"
-  fi
-
-}
-
 patch_prerelease_homebrew_formula_urls() {
   _formula_file="$1"
   [ -n "$RELEASE_ASSET_DIR" ] || return 0
@@ -1394,7 +1382,6 @@ install_macos_homebrew() {
   }
   chmod 0644 "$_formula_file"
   patch_prerelease_homebrew_formula_urls "$_formula_file"
-  patch_homebrew_formula "$_formula_file"
 
   _tap_formula_file="$(homebrew_formula_path "$HOMEBREW_TAP" "$HOMEBREW_FORMULA_NAME")"
   info "staging Homebrew formula in tap ${HOMEBREW_TAP}..."
