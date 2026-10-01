@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: GRPCRoute replica routing
+templates:
+  - templates/grpcroute.yaml
+  - templates/replica-services.yaml
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+set:
+  grpcRoute.enabled: true
+  replicaCount: 2
+  workload.allowMultiReplicaStatefulSet: true
+  server.externalDbSecret: db
+
+tests:
+  - it: routes every request to the shared Service by default
+    template: templates/grpcroute.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.rules
+          count: 1
+      - equal:
+          path: spec.rules[0].backendRefs[0].name
+          value: openshell
+
+  - it: renders no per-replica Services by default
+    template: templates/replica-services.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: routes a named replica to its own Service ahead of the shared rule
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.replicaRouting.enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.rules
+          count: 3
+      - equal:
+          path: spec.rules[1].matches[0].headers[0]
+          value:
+            type: Exact
+            name: x-openshell-replica
+            value: openshell-1
+      - equal:
+          path: spec.rules[1].backendRefs[0].name
+          value: openshell-replica-1
+      - equal:
+          path: spec.rules[2].backendRefs[0].name
+          value: openshell
+
+  - it: selects exactly one pod per replica Service
+    template: templates/replica-services.yaml
+    set:
+      grpcRoute.replicaRouting.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: openshell-replica-1
+        documentIndex: 1
+      - equal:
+          path: spec.selector["statefulset.kubernetes.io/pod-name"]
+          value: openshell-1
+        documentIndex: 1
+
+  - it: requires a StatefulSet for stable replica names
+    template: templates/statefulset.yaml
+    set:
+      grpcRoute.replicaRouting.enabled: true
+      workload.kind: deployment
+    asserts:
+      - failedTemplate:
+          errorMessage: "grpcRoute.replicaRouting.enabled requires workload.kind=statefulset so each replica has a stable name."

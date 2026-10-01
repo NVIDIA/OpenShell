@@ -14,6 +14,8 @@ const OWNER_OBJECT_TYPE: &str = "supervisor_session_owner";
 
 pub const OWNER_TTL: Duration = Duration::from_secs(45);
 
+const PUBLISH_ATTEMPTS: u32 = 3;
+
 fn owner_object_id(sandbox_id: &str) -> String {
     format!("supervisor-owner:{sandbox_id}")
 }
@@ -119,22 +121,31 @@ impl SupervisorOwnerIndex {
             connected_at_ms,
         };
 
-        let condition = match self.read(sandbox_id).await? {
-            None => WriteCondition::MustCreate,
-            Some(existing)
-                if can_supersede(
-                    &existing,
-                    supervisor_instance_id,
-                    connection_epoch,
-                    self.ttl,
-                ) =>
-            {
-                WriteCondition::MatchResourceVersion(existing.resource_version)
+        // A previous owner releasing its record between our read and write
+        // (as a replica does while handing sessions off on shutdown) shows up
+        // as a conflict; re-read and decide again.
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let condition = match self.read(sandbox_id).await? {
+                None => WriteCondition::MustCreate,
+                Some(existing)
+                    if can_supersede(
+                        &existing,
+                        supervisor_instance_id,
+                        connection_epoch,
+                        self.ttl,
+                    ) =>
+                {
+                    WriteCondition::MatchResourceVersion(existing.resource_version)
+                }
+                Some(_) => return Err(OwnerError::AlreadyOwned),
+            };
+            match self.write_payload(sandbox_id, &payload, condition).await {
+                Err(OwnerError::Conflict) if attempts < PUBLISH_ATTEMPTS => {}
+                other => break other?,
             }
-            Some(_) => return Err(OwnerError::AlreadyOwned),
         };
-
-        let result = self.write_payload(sandbox_id, &payload, condition).await?;
         Ok(OwnerGuard {
             sandbox_id: sandbox_id.to_string(),
             session_id: session_id.to_string(),
@@ -395,6 +406,25 @@ mod tests {
         let record = index.read("sbx").await.unwrap().unwrap();
         assert_eq!(record.session_id, guard.session_id);
         assert_eq!(record.owner_replica_id, "gw-2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_survives_the_previous_owner_releasing_concurrently() {
+        let index = Arc::new(test_index(OWNER_TTL).await);
+        for i in 0..200u64 {
+            let sandbox = format!("sbx-{i}");
+            let old = index
+                .publish(&sandbox, "s1", "inst", 1, "gw-1", "http://gw-1")
+                .await
+                .unwrap();
+            let releaser = Arc::clone(&index);
+            let release = tokio::spawn(async move { releaser.release_if_current(&old).await });
+            let publish = index
+                .publish(&sandbox, "s2", "inst", 2, "gw-2", "http://gw-2")
+                .await;
+            let _ = release.await.unwrap();
+            assert!(publish.is_ok(), "iteration {i}: {:?}", publish.err());
+        }
     }
 
     #[tokio::test]

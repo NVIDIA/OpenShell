@@ -664,6 +664,14 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  replicaRouting:
+    # -- Route requests carrying an `x-openshell-replica` header straight to
+    # that gateway replica. The CLI sets the header on long-lived sandbox
+    # connections (SSH, port forwards, exec) using the owner the gateway
+    # reports, so they skip the relay through a peer replica. Renders one
+    # Service per replica. Requires workload.kind=statefulset and at most 15
+    # replicas.
+    enabled: false
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates
   # client-facing TLS at the listener and re-encrypts when connecting to the

@@ -1,0 +1,24 @@
+{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.replicaRouting.enabled }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- $fullname := include "openshell.fullname" . }}
+{{- range $i := until (int .Values.replicaCount) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-replica-%d" $fullname $i }}
+  labels:
+    {{- include "openshell.labels" $ | nindent 4 }}
+spec:
+  ports:
+    - port: {{ $.Values.service.port }}
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+      appProtocol: grpc
+  selector:
+    {{- include "openshell.selectorLabels" $ | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ printf "%s-%d" $fullname $i }}
+{{- end }}
+{{- end }}

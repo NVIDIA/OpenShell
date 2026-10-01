@@ -891,10 +891,17 @@ pub(super) async fn handle_get_sandbox(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(SandboxResponse {
+    let owner = crate::supervisor_session::owner_replica_id(state, sandbox.object_id()).await;
+    let mut response = Response::new(SandboxResponse {
         sandbox: Some(sandbox),
         service_urls: HashMap::new(),
-    }))
+    });
+    if let Some(value) = owner.and_then(|owner| owner.parse().ok()) {
+        response
+            .metadata_mut()
+            .insert(openshell_core::replica_routing::OWNER_REPLICA_HEADER, value);
+    }
+    Ok(response)
 }
 
 pub(super) async fn handle_list_sandboxes(
@@ -6714,6 +6721,38 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.annotations.get(&annotation_key)),
             Some(&annotation_value)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_replica_get_sandbox_sends_no_owner_hint() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("hinted", Vec::new());
+        sandbox.metadata.as_mut().unwrap().workspace = "default".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "session-a".to_string(),
+            mpsc::channel(1).0,
+            oneshot::channel().0,
+        );
+
+        let response = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "hinted".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response
+                .metadata()
+                .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
+                .is_none()
         );
     }
 

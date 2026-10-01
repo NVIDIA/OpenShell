@@ -20,6 +20,13 @@ spec:
     - group: ""
       kind: Service
       name: {{ include "openshell.fullname" . }}
+    {{- if and .Values.grpcRoute.enabled .Values.grpcRoute.replicaRouting.enabled }}
+    {{- range $i := until (int .Values.replicaCount) }}
+    - group: ""
+      kind: Service
+      name: {{ printf "%s-replica-%d" (include "openshell.fullname" $) $i }}
+    {{- end }}
+    {{- end }}
   validation:
     caCertificateRefs:
       - group: ""

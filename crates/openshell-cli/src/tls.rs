@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -463,9 +464,70 @@ fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
     EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
 }
 
+/// Gateway replica that owns the sandbox named in `response`, when it says.
+pub fn owner_replica<T>(response: &tonic::Response<T>) -> Option<AsciiMetadataValue> {
+    response
+        .metadata()
+        .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
+        .cloned()
+}
+
+/// Wrap `message` so the edge proxy can route it straight to `replica`.
+pub fn routed_to<T>(message: T, replica: Option<&AsciiMetadataValue>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(replica) = replica {
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::ROUTE_REPLICA_HEADER,
+            replica.clone(),
+        );
+    }
+    request
+}
+
+/// A routed call can fail when the replica it named has gone away; such
+/// calls are retried once without routing.
+pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Status) -> bool {
+    replica.is_some() && status.code() == tonic::Code::Unavailable
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tls_server_name;
+    use super::{owner_replica, retry_unrouted, routed_to, tls_server_name};
+    use openshell_core::replica_routing::{OWNER_REPLICA_HEADER, ROUTE_REPLICA_HEADER};
+
+    #[test]
+    fn owner_replica_is_carried_to_the_routed_request() {
+        let mut response = tonic::Response::new(());
+        response
+            .metadata_mut()
+            .insert(OWNER_REPLICA_HEADER, "openshell-1".parse().unwrap());
+        let replica = owner_replica(&response);
+        let request = routed_to((), replica.as_ref());
+        assert_eq!(
+            request.metadata().get(ROUTE_REPLICA_HEADER).unwrap(),
+            "openshell-1"
+        );
+    }
+
+    #[test]
+    fn requests_without_a_known_owner_are_not_routed() {
+        let replica = owner_replica(&tonic::Response::new(()));
+        assert!(replica.is_none());
+        let request = routed_to((), replica.as_ref());
+        assert!(request.metadata().get(ROUTE_REPLICA_HEADER).is_none());
+    }
+
+    #[test]
+    fn only_unavailable_routed_calls_are_retried() {
+        let replica = "openshell-1".parse().unwrap();
+        let unavailable = tonic::Status::unavailable("no healthy upstream");
+        assert!(retry_unrouted(Some(&replica), &unavailable));
+        assert!(!retry_unrouted(None, &unavailable));
+        assert!(!retry_unrouted(
+            Some(&replica),
+            &tonic::Status::permission_denied("denied")
+        ));
+    }
 
     #[test]
     fn tls_server_name_normalizes_bracketed_ipv6_endpoint() {

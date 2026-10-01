@@ -4,7 +4,7 @@
 //! SSH connection and proxy utilities.
 
 use crate::color::Colorize;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{GrpcClient, TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to};
 use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
@@ -30,6 +30,7 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
+use tonic::metadata::AsciiMetadataValue;
 
 /// Time budget for the local listener to become reachable after `ssh` starts.
 /// This is a user-visible readiness deadline for both foreground and background
@@ -1905,8 +1906,18 @@ pub async fn sandbox_ssh_proxy(
     let server = grpc_server_from_ssh_gateway_url(gateway_url)?;
     let mut client = grpc_client(&server, tls).await?;
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
+    let replica = client
+        .get_sandbox(GetSandboxRequest {
+            name: sandbox_name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .ok()
+        .and_then(|response| owner_replica(&response));
+
+    let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: sandbox_name.to_string(),
@@ -1916,15 +1927,9 @@ pub async fn sandbox_ssh_proxy(
                 authorization_token: token.to_string(),
             },
         )),
-    })
-    .await
-    .map_err(|_| miette::miette!("failed to initialize SSH forward stream"))?;
-
-    let mut response = client
-        .forward_tcp(ReceiverStream::new(rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    };
+    let (tx, response) = open_forward_tcp(&mut client, init, replica.as_ref()).await;
+    let mut response = response.into_diagnostic()?.into_inner();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -1972,6 +1977,32 @@ pub async fn sandbox_ssh_proxy(
     to_remote.abort();
 
     Ok(())
+}
+
+/// Open a `ForwardTcp` stream whose first frame is `init`, routed to `replica`
+/// when known. Returns the sender for the frames that follow.
+pub(crate) async fn open_forward_tcp(
+    client: &mut GrpcClient,
+    init: TcpForwardFrame,
+    replica: Option<&AsciiMetadataValue>,
+) -> (
+    tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    std::result::Result<tonic::Response<tonic::Streaming<TcpForwardFrame>>, tonic::Status>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    let _ = tx.try_send(init.clone());
+    let response = client
+        .forward_tcp(routed_to(ReceiverStream::new(rx), replica))
+        .await;
+    match response {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+            let _ = tx.try_send(init);
+            let response = client.forward_tcp(ReceiverStream::new(rx)).await;
+            (tx, response)
+        }
+        response => (tx, response),
+    }
 }
 
 fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {

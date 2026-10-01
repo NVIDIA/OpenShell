@@ -401,6 +401,14 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
+{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.replicaRouting.enabled -}}
+{{- if ne $workloadKind "statefulset" -}}
+{{- fail "grpcRoute.replicaRouting.enabled requires workload.kind=statefulset so each replica has a stable name." -}}
+{{- end -}}
+{{- if gt $replicaCount 15 -}}
+{{- fail "grpcRoute.replicaRouting.enabled supports at most 15 replicas; a GRPCRoute holds at most 16 rules." -}}
+{{- end -}}
+{{- end -}}
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
 {{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
