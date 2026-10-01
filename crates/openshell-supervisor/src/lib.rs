@@ -512,6 +512,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        None,
     )
     .await?;
 
@@ -632,6 +633,26 @@ pub async fn run_sandbox(
         LocalPolicyIdentity::Required,
     )
     .await?;
+
+    // Cedar shadow-mode network evaluator (experimental, off by default).
+    // Built independently of `load_policy`'s `OpaEngine` construction since
+    // it only needs the retained proto; OPA stays the sole authoritative
+    // decision-maker regardless of whether this succeeds.
+    let shadow_engine = if openshell_supervisor_network::cedar_shadow::shadow_mode_enabled() {
+        retained_proto.as_ref().and_then(|proto| {
+            match openshell_supervisor_network::cedar_shadow::ShadowCedarEngine::from_proto(proto) {
+                Ok(engine) => Some(Arc::new(engine)),
+                Err(e) => {
+                    warn!(
+                        "Cedar shadow engine construction failed (non-fatal, shadow mode only): {e}"
+                    );
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
@@ -866,6 +887,7 @@ pub async fn run_sandbox(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            shadow_engine.as_ref(),
         )
         .await?,
     );
@@ -980,6 +1002,7 @@ pub async fn run_sandbox(
         let poll_id = id.to_string();
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
+        let poll_shadow_engine = shadow_engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
@@ -996,6 +1019,7 @@ pub async fn run_sandbox(
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
             opa_engine: poll_engine,
+            shadow_engine: poll_shadow_engine,
             loaded_policy_origin,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
@@ -2547,6 +2571,7 @@ struct MiddlewareReloadContext<'a> {
 
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
+    shadow_engine: Option<&Arc<openshell_supervisor_network::cedar_shadow::ShadowCedarEngine>>,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
@@ -2570,7 +2595,7 @@ async fn reload_gateway_policy_runtime(
             ));
         }
     }
-    match policy {
+    let result = match policy {
         Some(policy) if middleware.registry_changed => {
             let registry = (middleware.connector)(
                 middleware.desired_services.to_vec(),
@@ -2591,7 +2616,17 @@ async fn reload_gateway_policy_runtime(
         None => Err(GatewayRuntimeReloadError::PolicyValidation(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
+    };
+    // Rebuild the Cedar shadow engine alongside a successful OPA reload.
+    // Never affects `result`: OPA stays the sole authoritative decision on
+    // whether this reload succeeds.
+    if result.is_ok()
+        && let (Some(shadow_engine), Some(policy)) = (shadow_engine, policy)
+        && let Err(e) = shadow_engine.rebuild_from_proto_with_pid(policy, entrypoint_pid)
+    {
+        warn!("Cedar shadow engine rebuild failed (non-fatal, shadow mode only): {e}");
     }
+    result
 }
 
 fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
@@ -3191,6 +3226,10 @@ struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
     opa_engine: Arc<OpaEngine>,
+    /// Cedar shadow-mode network evaluator, rebuilt alongside `opa_engine`
+    /// on every successful reload. `None` when shadow mode is disabled
+    /// (`openshell_supervisor_network::cedar_shadow::shadow_mode_enabled`).
+    shadow_engine: Option<Arc<openshell_supervisor_network::cedar_shadow::ShadowCedarEngine>>,
     /// Source of the policy currently loaded into OPA. This distinguishes an
     /// explicit local-file override from an unbound gateway revision so the
     /// former is never replaced by policy polling.
@@ -4012,6 +4051,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_policy_runtime(
                 &ctx.opa_engine,
+                ctx.shadow_engine.as_ref(),
                 result.policy.as_ref(),
                 pid,
                 MiddlewareReloadContext {
@@ -5419,6 +5459,7 @@ network_policies:
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
             opa_engine,
+            shadow_engine: None,
             loaded_policy_origin,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
@@ -5987,6 +6028,7 @@ network_policies:
             .host = "repaired.example.com".into();
         let failure = reload_gateway_policy_runtime(
             &engine,
+            None,
             Some(&candidate),
             0,
             middleware(),
@@ -6019,6 +6061,7 @@ network_policies:
         candidate.landlock.as_mut().unwrap().compatibility = "best_effort".into();
         reload_gateway_policy_runtime(
             &engine,
+            None,
             Some(&candidate),
             0,
             middleware(),
@@ -6179,6 +6222,7 @@ network_policies:
 
         let failure = reload_gateway_policy_runtime(
             &engine,
+            None,
             Some(&proto_policy_fixture()),
             0,
             MiddlewareReloadContext {
@@ -6215,6 +6259,7 @@ network_policies:
 
         let failure = reload_gateway_policy_runtime(
             &engine,
+            None,
             Some(&proto_tcp_policy_fixture()),
             0,
             MiddlewareReloadContext {
@@ -6256,6 +6301,7 @@ network_policies:
 
         let failure = reload_gateway_policy_runtime(
             &engine,
+            None,
             Some(&proto_tcp_policy_fixture()),
             0,
             MiddlewareReloadContext {

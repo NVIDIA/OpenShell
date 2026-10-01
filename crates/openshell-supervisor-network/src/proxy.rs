@@ -771,6 +771,7 @@ impl TransparentTcpHandle {
         activity_tx: Option<ActivitySender>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         engine_ready: tokio::sync::watch::Receiver<bool>,
+        shadow_engine: Option<Arc<crate::cedar_shadow::ShadowCedarEngine>>,
     ) -> Result<Self> {
         let upstream_proxy = Arc::new(
             UpstreamProxyConfig::from_args(upstream_proxy_args)
@@ -787,6 +788,7 @@ impl TransparentTcpHandle {
             let activity_tx = activity_tx.clone();
             let upstream_proxy = upstream_proxy.clone();
             let mut engine_ready = engine_ready.clone();
+            let shadow_engine = shadow_engine.clone();
             joins.push(tokio::spawn(async move {
                 if tokio::time::timeout(
                     std::time::Duration::from_secs(15),
@@ -812,6 +814,7 @@ impl TransparentTcpHandle {
                     let denial_tx = denial_tx.clone();
                     let activity_tx = activity_tx.clone();
                     let upstream_proxy = upstream_proxy.clone();
+                    let shadow_engine = shadow_engine.clone();
                     tokio::spawn(async move {
                         if let Err(error) = handle_transparent_tcp_connection(
                             stream,
@@ -823,6 +826,7 @@ impl TransparentTcpHandle {
                             denial_tx,
                             activity_tx,
                             upstream_proxy,
+                            shadow_engine,
                         )
                         .await
                         {
@@ -864,6 +868,7 @@ async fn handle_transparent_tcp_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    shadow_engine: Option<Arc<crate::cedar_shadow::ShadowCedarEngine>>,
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
@@ -893,6 +898,38 @@ async fn handle_transparent_tcp_connection(
     })
     .await
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
+
+    // Shadow-mode comparison: off the hot path (plain `tokio::spawn`, not
+    // awaited), never affects `decision` or anything returned to the
+    // caller. See `crate::cedar_shadow` for scope and rationale.
+    if let Some(shadow_engine) = shadow_engine.clone() {
+        let shadow_host = host.clone();
+        let shadow_port = port;
+        let shadow_input = crate::opa::NetworkInput {
+            host: shadow_host.clone(),
+            port: shadow_port,
+            binary_path: decision.binary.clone().unwrap_or_default(),
+            binary_sha256: String::new(),
+            ancestors: decision.ancestors.clone(),
+            cmdline_paths: Vec::new(),
+        };
+        let rego_action = decision.action.clone();
+        tokio::spawn(async move {
+            match shadow_engine.evaluate_network(&shadow_input) {
+                Ok(cedar_decision) => {
+                    ocsf_emit!(build_cedar_shadow_comparison_ocsf_event(
+                        &shadow_host,
+                        shadow_port,
+                        &rego_action,
+                        &cedar_decision,
+                    ));
+                }
+                Err(error) => {
+                    debug!(%error, "Cedar shadow evaluation failed");
+                }
+            }
+        });
+    }
 
     if let NetworkAction::Deny { reason } = &decision.action {
         emit_transparent_policy_denial(&decision, workload_addr, &host, port);
@@ -1145,6 +1182,71 @@ fn build_transparent_tcp_allow_ocsf_event(
         builder = builder.unmapped("connected_real_destination", destination.to_string());
     }
     builder.build()
+}
+
+/// Builds the OCSF Detection Finding comparing OPA's and the Cedar shadow
+/// engine's decisions for one CONNECT-time request.
+///
+/// `is_alert` is true only for a genuine Allow/Deny disagreement.
+/// [`openshell_policy_cedar::NetworkDecision::Unsupported`] is always
+/// informational: the shadow engine is known not to cover that request, so
+/// disagreement isn't meaningful there.
+#[cfg(target_os = "linux")]
+fn build_cedar_shadow_comparison_ocsf_event(
+    host: &str,
+    port: u16,
+    rego: &NetworkAction,
+    cedar: &openshell_policy_cedar::NetworkDecision,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{DetectionFindingBuilder, FindingInfo};
+
+    let rego_label = match rego {
+        NetworkAction::Allow { .. } => "allow",
+        NetworkAction::Deny { .. } => "deny",
+    };
+    let cedar_label = match cedar {
+        openshell_policy_cedar::NetworkDecision::Allow { .. } => "allow",
+        openshell_policy_cedar::NetworkDecision::Deny { .. } => "deny",
+        openshell_policy_cedar::NetworkDecision::Unsupported { .. } => "unsupported",
+    };
+    let disagreement = matches!(
+        (rego, cedar),
+        (
+            NetworkAction::Allow { .. },
+            openshell_policy_cedar::NetworkDecision::Deny { .. }
+        ) | (
+            NetworkAction::Deny { .. },
+            openshell_policy_cedar::NetworkDecision::Allow { .. }
+        )
+    );
+    let host_port = format!("{host}:{port}");
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .severity(if disagreement {
+            SeverityId::Medium
+        } else {
+            SeverityId::Informational
+        })
+        .is_alert(disagreement)
+        .finding_info(
+            FindingInfo::new(
+                "cedar-shadow-comparison",
+                "Cedar shadow-mode decision comparison",
+            )
+            .with_desc(&format!(
+                "rego={rego_label} cedar={cedar_label} endpoint={host_port}"
+            )),
+        )
+        .evidence_pairs(&[
+            ("endpoint", host_port.as_str()),
+            ("rego_decision", rego_label),
+            ("cedar_decision", cedar_label),
+        ])
+        .message(format!(
+            "Cedar shadow comparison for {host_port}: rego={rego_label} cedar={cedar_label}"
+        ))
+        .build()
 }
 
 #[cfg(target_os = "linux")]
