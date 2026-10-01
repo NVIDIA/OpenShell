@@ -9,17 +9,23 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::StreamExt;
 use metrics::counter;
+use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
-    ConfigBootstrap, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigSnapshot,
+    ConfigBootstrap, PeerConfigSandboxTarget, PeerConfigUpdateHintRequest,
+    PeerConfigUpdateHintResponse, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigSnapshot,
+    peer_config_update_hint_request,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::{Code, Status};
+use tonic::{Code, Request, Response, Status};
 use tracing::warn;
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
 use crate::grpc::policy::{build_provider_environment_snapshot, build_sandbox_config_snapshot};
 use crate::persistence::ObjectWorkspace;
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 
 /// Leaves headroom below tonic's default 4 MiB decode limit for framing and
@@ -66,6 +72,7 @@ impl fmt::Debug for SupervisorConfigMessage {
 pub enum DeliveryDisposition {
     Enqueued,
     NoActiveSession,
+    UnsupportedSession,
     QueueFull,
     SessionClosed,
     PayloadTooLarge,
@@ -164,6 +171,7 @@ impl ConfigComponentKind {
 struct DeliveryKey {
     sandbox_id: String,
     component: ConfigComponentKind,
+    route_remote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -176,6 +184,7 @@ enum FanoutScope {
 struct FanoutKey {
     scope: FanoutScope,
     component: ConfigComponentKind,
+    route_remote: bool,
 }
 
 /// Coalesces publications and bounds workers per sandbox and component.
@@ -405,14 +414,24 @@ pub fn publish_sandbox_components(
     sandbox_id: &str,
     components: ConfigComponents,
 ) {
-    enqueue_sandbox(state, sandbox_id, components);
+    if state.config.config_delivery_mode != ConfigDeliveryMode::Push {
+        return;
+    }
+    enqueue_sandbox(state, sandbox_id, components, true);
 }
 
-fn enqueue_sandbox(state: &Arc<ServerState>, sandbox_id: &str, components: ConfigComponents) {
+fn enqueue_sandbox(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    components: ConfigComponents,
+    route_remote: bool,
+) -> bool {
+    let mut accepted = true;
     for component in components.selected() {
         let key = DeliveryKey {
             sandbox_id: sandbox_id.to_string(),
             component,
+            route_remote,
         };
         match state.config_delivery_queue.enqueue(key.clone()) {
             DeliveryEnqueue::StartWorker(permit) => {
@@ -420,10 +439,12 @@ fn enqueue_sandbox(state: &Arc<ServerState>, sandbox_id: &str, components: Confi
             }
             DeliveryEnqueue::Coalesced => {}
             DeliveryEnqueue::Full => {
+                accepted = false;
                 record_delivery_worker_full(sandbox_id, component.name());
             }
         }
     }
+    accepted
 }
 
 fn spawn_delivery_worker(state: &Arc<ServerState>, key: DeliveryKey, permit: OwnedSemaphorePermit) {
@@ -448,6 +469,7 @@ async fn enqueue_sandbox_from_fanout(
     let key = DeliveryKey {
         sandbox_id: sandbox_id.to_string(),
         component,
+        route_remote: false,
     };
     match state
         .config_delivery_queue
@@ -461,6 +483,18 @@ async fn enqueue_sandbox_from_fanout(
 }
 
 async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryKey) {
+    if key.route_remote && route_remote_sandbox_component(state, key).await {
+        return;
+    }
+    if !key.route_remote && !is_current_local_owner(state, &key.sandbox_id).await {
+        return;
+    }
+    if !state
+        .supervisor_sessions
+        .is_config_push_capable(&key.sandbox_id)
+    {
+        return;
+    }
     let component = key.component.name();
     let build = async {
         let sandbox = state
@@ -501,27 +535,135 @@ async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryK
     }
 }
 
+async fn is_current_local_owner(state: &Arc<ServerState>, sandbox_id: &str) -> bool {
+    let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
+    match owners.read(sandbox_id).await {
+        Ok(Some(owner)) => {
+            owner.is_fresh(OWNER_TTL)
+                && owner.owner_replica_id == state.replica_id
+                && state
+                    .supervisor_sessions
+                    .is_current_session(sandbox_id, &owner.session_id)
+        }
+        Ok(None) => false,
+        Err(error) => {
+            warn!(sandbox_id, error = %error, "configuration owner lookup failed");
+            false
+        }
+    }
+}
+
+/// Return true when the current owner is remote or the session is gone.
+/// The owner builds its own snapshot after receiving this secret-free hint.
+async fn route_remote_sandbox_component(state: &Arc<ServerState>, key: &DeliveryKey) -> bool {
+    let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
+    let mut final_outcome = "stale_owner";
+    for attempt in 0..2 {
+        let owner = match owners.read(&key.sandbox_id).await {
+            Ok(Some(owner)) if owner.is_fresh(OWNER_TTL) => owner,
+            Ok(_) => return true,
+            Err(error) => {
+                warn!(sandbox_id = %key.sandbox_id, error = %error, "configuration owner lookup failed");
+                return true;
+            }
+        };
+        if owner.owner_replica_id == state.replica_id {
+            return !state
+                .supervisor_sessions
+                .is_current_session(&key.sandbox_id, &owner.session_id);
+        }
+        if !owner.owner_peer_endpoint.starts_with("http://")
+            && !owner.owner_peer_endpoint.starts_with("https://")
+        {
+            warn!(sandbox_id = %key.sandbox_id, owner = %owner.owner_replica_id, "configuration owner has no reachable peer endpoint");
+            return true;
+        }
+        let request = PeerConfigUpdateHintRequest {
+            scope: Some(peer_config_update_hint_request::Scope::Sandbox(
+                PeerConfigSandboxTarget {
+                    sandbox_id: key.sandbox_id.clone(),
+                    session_id: owner.session_id,
+                },
+            )),
+            sandbox_config: key.component == ConfigComponentKind::SandboxConfig,
+            provider_environment: key.component == ConfigComponentKind::ProviderEnvironment,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::supervisor_session::forward_config_hint_to_peer(
+                state,
+                &owner.owner_peer_endpoint,
+                request,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(response)) if !response.stale_owner && !response.queue_full => {
+                counter!("openshell_supervisor_config_peer_hints_total", "outcome" => "accepted")
+                    .increment(1);
+                return true;
+            }
+            Ok(Ok(response)) if response.queue_full => {
+                counter!("openshell_supervisor_config_peer_hints_total", "outcome" => "queue_full")
+                    .increment(1);
+                return true;
+            }
+            Ok(Err(error)) if error.code() == Code::Unimplemented => {
+                counter!("openshell_supervisor_config_peer_hints_total", "outcome" => "unsupported_peer")
+                    .increment(1);
+                return true;
+            }
+            Ok(Err(error)) => {
+                final_outcome = "peer_error";
+                warn!(sandbox_id = %key.sandbox_id, owner = %owner.owner_replica_id, attempt, code = ?error.code(), "configuration peer hint failed");
+            }
+            Err(_) => {
+                final_outcome = "timeout";
+                warn!(sandbox_id = %key.sandbox_id, owner = %owner.owner_replica_id, attempt, "configuration peer hint timed out");
+            }
+            Ok(Ok(_)) => final_outcome = "stale_owner",
+        }
+    }
+    counter!("openshell_supervisor_config_peer_hints_total", "outcome" => final_outcome)
+        .increment(1);
+    true
+}
+
 pub fn publish_workspace_components(
     state: &Arc<ServerState>,
     workspace: &str,
     components: ConfigComponents,
 ) {
+    if state.config.config_delivery_mode != ConfigDeliveryMode::Push {
+        return;
+    }
     enqueue_fanout(
         state,
         FanoutScope::Workspace(workspace.to_string()),
         components,
+        true,
     );
 }
 
 pub fn publish_all_connected(state: &Arc<ServerState>, components: ConfigComponents) {
-    enqueue_fanout(state, FanoutScope::AllConnected, components);
+    if state.config.config_delivery_mode != ConfigDeliveryMode::Push {
+        return;
+    }
+    enqueue_fanout(state, FanoutScope::AllConnected, components, true);
 }
 
-fn enqueue_fanout(state: &Arc<ServerState>, scope: FanoutScope, components: ConfigComponents) {
+fn enqueue_fanout(
+    state: &Arc<ServerState>,
+    scope: FanoutScope,
+    components: ConfigComponents,
+    route_remote: bool,
+) -> bool {
+    let mut accepted = true;
     for component in components.selected() {
         let key = FanoutKey {
             scope: scope.clone(),
             component,
+            route_remote,
         };
         match state.config_delivery_queue.enqueue_fanout(key.clone()) {
             FanoutEnqueue::StartWorker => {
@@ -538,6 +680,7 @@ fn enqueue_fanout(state: &Arc<ServerState>, scope: FanoutScope, components: Conf
             }
             FanoutEnqueue::Coalesced => {}
             FanoutEnqueue::Full => {
+                accepted = false;
                 counter!("openshell_supervisor_config_fanout_total", "outcome" => "queue_full")
                     .increment(1);
                 warn!(
@@ -547,9 +690,13 @@ fn enqueue_fanout(state: &Arc<ServerState>, scope: FanoutScope, components: Conf
             }
         }
     }
+    accepted
 }
 
 async fn publish_fanout_now(state: &Arc<ServerState>, key: &FanoutKey) {
+    if key.route_remote {
+        notify_remote_fanout(state, key).await;
+    }
     let sandbox_ids = state
         .supervisor_config_router()
         .routable_sandbox_ids()
@@ -572,6 +719,126 @@ async fn publish_fanout_now(state: &Arc<ServerState>, key: &FanoutKey) {
     }
 }
 
+async fn notify_remote_fanout(state: &Arc<ServerState>, key: &FanoutKey) {
+    let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
+    let endpoints = match owners.list_fresh_peer_endpoints(&state.replica_id).await {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            warn!(error = %error, "configuration peer fanout owner listing failed");
+            return;
+        }
+    };
+    futures::stream::iter(endpoints)
+        .for_each_concurrent(8, |endpoint| async move {
+            let scope = match &key.scope {
+                FanoutScope::Workspace(workspace) => {
+                    peer_config_update_hint_request::Scope::Workspace(workspace.clone())
+                }
+                FanoutScope::AllConnected => {
+                    peer_config_update_hint_request::Scope::AllConnected(true)
+                }
+            };
+            let request = PeerConfigUpdateHintRequest {
+                scope: Some(scope),
+                sandbox_config: key.component == ConfigComponentKind::SandboxConfig,
+                provider_environment: key.component == ConfigComponentKind::ProviderEnvironment,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::supervisor_session::forward_config_hint_to_peer(state, &endpoint, request),
+            )
+            .await;
+            match result {
+                Ok(Ok(response)) if !response.queue_full => {
+                    counter!("openshell_supervisor_config_peer_hints_total", "outcome" => "accepted")
+                        .increment(1);
+                }
+                Ok(Ok(_)) => {
+                    counter!("openshell_supervisor_config_peer_hints_total", "outcome" => "queue_full")
+                        .increment(1);
+                }
+                Ok(Err(error)) => {
+                    warn!(endpoint = %endpoint, code = ?error.code(), "configuration peer fanout hint failed");
+                }
+                Err(_) => {
+                    warn!(endpoint = %endpoint, "configuration peer fanout hint timed out");
+                }
+            }
+        })
+        .await;
+}
+
+pub async fn handle_peer_config_update_hint(
+    state: &Arc<ServerState>,
+    request: Request<PeerConfigUpdateHintRequest>,
+) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
+    if !matches!(
+        request.extensions().get::<Principal>(),
+        Some(Principal::Peer(_))
+    ) {
+        return Err(Status::permission_denied("gateway peer principal required"));
+    }
+    if state.config.config_delivery_mode != ConfigDeliveryMode::Push {
+        return Err(Status::failed_precondition(
+            "configuration push is disabled",
+        ));
+    }
+    let hint = request.into_inner();
+    let components = ConfigComponents {
+        sandbox_config: hint.sandbox_config,
+        provider_environment: hint.provider_environment,
+    };
+    if !components.sandbox_config && !components.provider_environment {
+        return Err(Status::invalid_argument(
+            "at least one configuration component is required",
+        ));
+    }
+    let mut response = PeerConfigUpdateHintResponse::default();
+    match hint.scope {
+        Some(peer_config_update_hint_request::Scope::Sandbox(target)) => {
+            if target.sandbox_id.is_empty() || target.session_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "sandbox and session IDs are required",
+                ));
+            }
+            let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
+            let owner = owners
+                .read(&target.sandbox_id)
+                .await
+                .map_err(|_| Status::unavailable("configuration owner lookup failed"))?;
+            response.stale_owner = owner.is_none_or(|owner| {
+                !owner.is_fresh(OWNER_TTL)
+                    || owner.owner_replica_id != state.replica_id
+                    || owner.session_id != target.session_id
+                    || !state
+                        .supervisor_sessions
+                        .is_current_session(&target.sandbox_id, &target.session_id)
+            });
+            if !response.stale_owner {
+                response.queue_full =
+                    !enqueue_sandbox(state, &target.sandbox_id, components, false);
+            }
+        }
+        Some(peer_config_update_hint_request::Scope::Workspace(workspace)) => {
+            if workspace.is_empty() {
+                return Err(Status::invalid_argument("workspace is required"));
+            }
+            response.queue_full =
+                !enqueue_fanout(state, FanoutScope::Workspace(workspace), components, false);
+        }
+        Some(peer_config_update_hint_request::Scope::AllConnected(true)) => {
+            response.queue_full =
+                !enqueue_fanout(state, FanoutScope::AllConnected, components, false);
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "configuration hint scope is required",
+            ));
+        }
+    }
+    Ok(Response::new(response))
+}
+
 fn record_delivery_worker_full(sandbox_id: &str, component: &'static str) {
     counter!(
         "openshell_supervisor_config_delivery_workers_total",
@@ -588,6 +855,7 @@ fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
     let outcome = match disposition {
         DeliveryDisposition::Enqueued => "enqueued",
         DeliveryDisposition::NoActiveSession => "no_active_session",
+        DeliveryDisposition::UnsupportedSession => "unsupported_session",
         DeliveryDisposition::QueueFull => "queue_full",
         DeliveryDisposition::SessionClosed => "session_closed",
         DeliveryDisposition::PayloadTooLarge => "payload_too_large",
@@ -622,10 +890,111 @@ mod tests {
     use crate::grpc::test_support::{connect_supervisor_stream, test_server_state};
     use openshell_core::proto::{GatewayMessage, ObjectMeta, SandboxSpec, gateway_message};
 
+    fn peer_hint(sandbox_id: &str, session_id: &str) -> Request<PeerConfigUpdateHintRequest> {
+        let mut request = Request::new(PeerConfigUpdateHintRequest {
+            scope: Some(peer_config_update_hint_request::Scope::Sandbox(
+                PeerConfigSandboxTarget {
+                    sandbox_id: sandbox_id.into(),
+                    session_id: session_id.into(),
+                },
+            )),
+            sandbox_config: true,
+            provider_environment: false,
+        });
+        request
+            .extensions_mut()
+            .insert(Principal::Peer(crate::auth::principal::PeerPrincipal {
+                replica_id: "other-replica".into(),
+                pod_uid: "peer-pod".into(),
+            }));
+        request
+    }
+
+    #[tokio::test]
+    async fn peer_hint_requires_push_and_current_session() {
+        let mut state = test_server_state().await;
+        let error = handle_peer_config_update_hint(&state, peer_hint("sandbox", "old-session"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = ConfigDeliveryMode::Push;
+        let response = handle_peer_config_update_hint(&state, peer_hint("sandbox", "old-session"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.stale_owner);
+        assert!(!response.queue_full);
+
+        let error = handle_peer_config_update_hint(
+            &state,
+            Request::new(PeerConfigUpdateHintRequest::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn peer_hint_rebuilds_snapshot_on_the_session_owner() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = ConfigDeliveryMode::Push;
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "owned-sandbox".into(),
+                    name: "owned-sandbox".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut harness = connect_supervisor_stream(
+            &state,
+            "owned-sandbox",
+            openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
+        )
+        .await
+        .unwrap();
+        let accepted = harness.inbound.message().await.unwrap().unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = accepted.payload else {
+            panic!("expected SessionAccepted");
+        };
+        let response = handle_peer_config_update_hint(
+            &state,
+            peer_hint("owned-sandbox", &accepted.session_id),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.stale_owner && !response.queue_full);
+        let update = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            update.payload,
+            Some(gateway_message::Payload::ConfigUpdate(_))
+        ));
+    }
+
     fn key(sandbox_id: &str, component: ConfigComponentKind) -> DeliveryKey {
         DeliveryKey {
             sandbox_id: sandbox_id.to_string(),
             component,
+            route_remote: true,
         }
     }
 
@@ -784,6 +1153,7 @@ mod tests {
         let first = FanoutKey {
             scope: FanoutScope::Workspace("workspace-0".into()),
             component: ConfigComponentKind::SandboxConfig,
+            route_remote: true,
         };
         assert_eq!(
             queue.enqueue_fanout(first.clone()),
@@ -801,6 +1171,7 @@ mod tests {
                 queue.enqueue_fanout(FanoutKey {
                     scope: FanoutScope::Workspace(format!("workspace-{index}")),
                     component: ConfigComponentKind::SandboxConfig,
+                    route_remote: true,
                 }),
                 FanoutEnqueue::StartWorker
             );
@@ -809,6 +1180,7 @@ mod tests {
             queue.enqueue_fanout(FanoutKey {
                 scope: FanoutScope::Workspace("overflow".into()),
                 component: ConfigComponentKind::SandboxConfig,
+                route_remote: true,
             }),
             FanoutEnqueue::Full
         );
@@ -829,7 +1201,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_acceptance_precedes_live_configuration_updates() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = ConfigDeliveryMode::Push;
         state
             .store
             .put_message(&Sandbox {
@@ -877,6 +1253,47 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn legacy_supervisor_keeps_polling_when_gateway_shadow_push_is_enabled() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = ConfigDeliveryMode::Push;
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "legacy-sandbox".into(),
+                    name: "legacy-sandbox".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut harness = connect_supervisor_stream(
+            &state,
+            "legacy-sandbox",
+            openshell_core::proto::LEGACY_SUPERVISOR_PROTOCOL_REVISION,
+        )
+        .await
+        .unwrap();
+        let first = harness.inbound.message().await.unwrap().unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
+            panic!("expected SessionAccepted");
+        };
+        assert!(accepted.bootstrap.is_none());
+        publish_sandbox_components(&state, "legacy-sandbox", ConfigComponents::SANDBOX_CONFIG);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.inbound.message())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn bootstrap_requires_matching_provider_revision_fence() {
         let mut bootstrap = ConfigBootstrap {
@@ -902,7 +1319,11 @@ mod tests {
     async fn stalled_credentials_do_not_block_session_acceptance() {
         use openshell_core::proto::{CredentialHandle, Provider};
 
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = ConfigDeliveryMode::Push;
         state
             .store
             .put_message(&Provider {

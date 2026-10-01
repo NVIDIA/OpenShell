@@ -123,6 +123,9 @@ pub struct GatewayFileSection {
     /// Security posture when a sandbox rejects a candidate policy generation.
     #[serde(default)]
     pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
+    /// Supervisor configuration delivery; omitted uses the release default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -1028,6 +1031,29 @@ policy_validation_failure_mode = "keep_old"
         );
         let error = load(tmp.path()).expect_err("unknown posture must fail TOML validation");
         assert!(error.to_string().contains("policy_validation_failure_mode"));
+    }
+
+    #[test]
+    fn parses_delivery_mode_and_rejects_unknown_value() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "push"
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        assert_eq!(
+            file.openshell.gateway.config_delivery_mode,
+            Some(openshell_core::config::ConfigDeliveryMode::Push)
+        );
+
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "enabled"
+"#,
+        );
+        assert!(load(tmp.path()).is_err());
     }
 
     #[test]

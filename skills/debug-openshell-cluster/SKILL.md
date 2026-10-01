@@ -482,6 +482,15 @@ be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
 projected peer ServiceAccount token volume, and TokenReview RBAC:
 
+The experimental `server.configDeliveryMode: push` sends configuration hints
+to that same peer endpoint over `PeerNotifyConfigUpdate`. Check that every
+gateway replica runs a version supporting the RPC and uses the same mode.
+`poll` is the 0.1.x default; a push setting in this release sends shadow
+snapshots while supervisors still poll. If hints fail, inspect
+`openshell_supervisor_config_peer_hints_total` and peer authentication logs.
+An old peer returns `UNIMPLEMENTED`, and a peer still set to `poll` returns
+`FAILED_PRECONDITION`.
+
 ```bash
 kubectl -n openshell get svc openshell-peer -o wide
 kubectl -n openshell get endpoints openshell-peer

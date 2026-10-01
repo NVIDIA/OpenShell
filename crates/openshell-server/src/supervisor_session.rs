@@ -19,12 +19,13 @@ use uuid::Uuid;
 
 use openshell_core::proto::{
     ConfigUpdate, GatewayMessage, GetSandboxProviderStatusRequest,
-    GetSandboxProviderStatusResponse, PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation,
-    RelayFrame, RelayInit, RelayOpen, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
-    ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportProviderReadinessRequest,
-    ReportProviderReadinessResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
-    SupervisorHello, SupervisorMessage, config_update, gateway_message, open_shell_client,
-    peer_relay_frame, relay_open, supervisor_message,
+    GetSandboxProviderStatusResponse, PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse,
+    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
+    ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
+    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
+    config_update, gateway_message, open_shell_client, peer_relay_frame, relay_open,
+    supervisor_message,
 };
 use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -282,6 +283,7 @@ struct LiveSession {
     /// Uniquely identifies this session instance. Used by cleanup to avoid
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
+    config_push_capable: bool,
     tx: mpsc::Sender<GatewayMessage>,
     config_sequences: ConfigSequences,
     /// Fires when this session is superseded by a reconnect so the old session
@@ -420,6 +422,17 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
+        self.register_with_config_push(sandbox_id, session_id, tx, shutdown, true)
+    }
+
+    pub fn register_with_config_push(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+        config_push_capable: bool,
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
         sessions.insert(
@@ -427,6 +440,7 @@ impl SupervisorSessionRegistry {
             LiveSession {
                 sandbox_id,
                 session_id,
+                config_push_capable,
                 tx,
                 config_sequences: ConfigSequences::default(),
                 shutdown,
@@ -545,7 +559,21 @@ impl SupervisorSessionRegistry {
     }
 
     pub(crate) fn connected_sandbox_ids(&self) -> Vec<String> {
-        self.sessions.lock().unwrap().keys().cloned().collect()
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, session)| session.config_push_capable)
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn is_config_push_capable(&self, sandbox_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.config_push_capable)
     }
 
     pub(crate) fn deliver_config(
@@ -558,6 +586,9 @@ impl SupervisorSessionRegistry {
         let Some(session) = sessions.get_mut(sandbox_id) else {
             return DeliveryDisposition::NoActiveSession;
         };
+        if !session.config_push_capable {
+            return DeliveryDisposition::UnsupportedSession;
+        }
         let sequence = match &message {
             SupervisorConfigMessage::SandboxConfig(_) => {
                 &mut session.config_sequences.sandbox_config
@@ -1420,6 +1451,19 @@ async fn peer_rpc_client(
     ))
 }
 
+pub(crate) async fn forward_config_hint_to_peer(
+    state: &Arc<ServerState>,
+    endpoint: &str,
+    request: PeerConfigUpdateHintRequest,
+) -> Result<PeerConfigUpdateHintResponse, Status> {
+    let mut client = peer_rpc_client(state, endpoint).await?;
+    client
+        .peer_notify_config_update(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| state.peer_routes.evict_channel(endpoint))
+}
+
 pub(crate) async fn remote_supervisor_owner(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1947,27 +1991,34 @@ pub async fn handle_connect_supervisor(
     }
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
-    let bootstrap = match crate::config_delivery::build_config_bootstrap(state, &sandbox).await {
-        Ok(bootstrap) => {
-            counter!(
-                "openshell_supervisor_config_bootstrap_total",
-                "outcome" => "built"
-            )
-            .increment(1);
-            Some(bootstrap)
-        }
-        Err(error) => {
-            counter!(
-                "openshell_supervisor_config_bootstrap_total",
-                "outcome" => "build_failed"
-            )
-            .increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                error_code = ?error.code(),
-                "failed to build supervisor configuration bootstrap"
-            );
-            None
+    let bootstrap = if state.config.config_delivery_mode
+        == openshell_core::config::ConfigDeliveryMode::Poll
+        || hello.protocol_revision == LEGACY_SUPERVISOR_PROTOCOL_REVISION
+    {
+        None
+    } else {
+        match crate::config_delivery::build_config_bootstrap(state, &sandbox).await {
+            Ok(bootstrap) => {
+                counter!(
+                    "openshell_supervisor_config_bootstrap_total",
+                    "outcome" => "built"
+                )
+                .increment(1);
+                Some(bootstrap)
+            }
+            Err(error) => {
+                counter!(
+                    "openshell_supervisor_config_bootstrap_total",
+                    "outcome" => "build_failed"
+                )
+                .increment(1);
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error_code = ?error.code(),
+                    "failed to build supervisor configuration bootstrap"
+                );
+                None
+            }
         }
     };
     // Validate readiness identities before replacing a healthy session. Older
@@ -2065,11 +2116,12 @@ async fn establish_supervisor_session(
         return Err(Status::internal("failed to send session accepted"));
     }
 
-    let superseded = state.supervisor_sessions.register(
+    let superseded = state.supervisor_sessions.register_with_config_push(
         sandbox_id.clone(),
         session_id.clone(),
         tx.clone(),
         shutdown_tx,
+        hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION,
     );
     if superseded {
         info!(

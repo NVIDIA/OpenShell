@@ -12732,7 +12732,11 @@ mod tests {
 
     #[tokio::test]
     async fn committed_policy_update_publishes_complete_snapshot() {
-        let state = test_server_state().await;
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Push;
         let mut sandbox = test_sandbox(
             "sb-published-policy",
             "published-policy",
@@ -12750,6 +12754,21 @@ mod tests {
             tx,
             shutdown_tx,
         );
+        let owner_index = crate::supervisor_owner::SupervisorOwnerIndex::new(
+            Arc::clone(&state.store),
+            crate::supervisor_owner::OWNER_TTL,
+        );
+        owner_index
+            .publish(
+                "sb-published-policy",
+                "session-1",
+                "test-supervisor",
+                1,
+                &state.replica_id,
+                "local://test",
+            )
+            .await
+            .unwrap();
 
         handle_update_config(
             &state,

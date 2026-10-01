@@ -50,7 +50,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -888,6 +889,13 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxProviderStatusRequest>,
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
+    }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerConfigUpdateHintRequest>,
+    ) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
+        crate::config_delivery::handle_peer_config_update_hint(&self.state, request).await
     }
 }
 

@@ -46,6 +46,13 @@ data:
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
     compute_driver        = "kubernetes"
+    {{- $configDeliveryMode := .Values.server.configDeliveryMode | default "" }}
+    {{- if not (has $configDeliveryMode (list "" "poll" "push")) }}
+    {{- fail "server.configDeliveryMode must be empty, poll, or push" }}
+    {{- end }}
+    {{- if $configDeliveryMode }}
+    config_delivery_mode  = {{ $configDeliveryMode | quote }}
+    {{- end }}
     {{- if $credentialDrivers }}
     credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
     {{- end }}

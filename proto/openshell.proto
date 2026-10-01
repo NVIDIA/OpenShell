@@ -623,6 +623,15 @@ service OpenShell {
     };
   }
 
+  // Best-effort notification to the replica that owns a supervisor session.
+  // The receiver rebuilds snapshots from authoritative state.
+  rpc PeerNotifyConfigUpdate(PeerConfigUpdateHintRequest)
+      returns (PeerConfigUpdateHintResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "peer"
+    };
+  }
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -3208,6 +3217,29 @@ message PeerRelayFrame {
     PeerRelayInit init = 1;
     bytes data = 2;
   }
+}
+
+message PeerConfigSandboxTarget {
+  string sandbox_id = 1;
+  // Fences a targeted hint to the session observed by the sending replica.
+  string session_id = 2;
+}
+
+message PeerConfigUpdateHintRequest {
+  oneof scope {
+    PeerConfigSandboxTarget sandbox = 1;
+    string workspace = 2;
+    bool all_connected = 3;
+  }
+  bool sandbox_config = 4;
+  bool provider_environment = 5;
+}
+
+message PeerConfigUpdateHintResponse {
+  // The targeted session moved before the receiving replica accepted the hint.
+  bool stale_owner = 1;
+  // The bounded local delivery or fanout queue could not accept the hint.
+  bool queue_full = 2;
 }
 
 // Supervisor reports the result of a relay open request.
