@@ -104,6 +104,17 @@ incidental presentation text is not a conformance contract. Native runtime
 inspection may provide best-effort failure diagnostics, but must not determine
 whether general conformance passed.
 
+General conformance assertions require only public CLI/API access and sandbox
+operations. Host or runtime administrative access belongs to provisioning,
+best-effort diagnostics, or disruption actuators, not general-conformance
+pass/fail assertions. Unavailable diagnostic access must not change the result.
+
+Each test is the single source of truth for its behavioral contract. Keep its
+stable identity, preconditions, expected behavior, mandatory/optional status,
+and significant side effects alongside the test. Shared guidance defines these
+conventions, not a duplicate catalogue of contracts. Adding a test must not
+require manually updating its specification in another location.
+
 Tests must not update gateway startup configuration, driver flags, deployment
 manifests, or gateway.toml. They may create and mutate public API-managed state,
 including sandboxes, policies, providers, workspaces, and settings. Use unique
@@ -117,6 +128,12 @@ prerequisite. Public capabilities must not become an inventory of third-party
 services, credentials, or fixture configuration. Missing prerequisites for a
 selected feature suite are setup errors.
 
+General conformance must not depend on public internet services for behavioral
+assertions. Images and dependencies may be downloaded during provisioning;
+gateway connectivity and test-owned services remain allowed. Demonstrating a
+complete run with public internet access disabled is an incremental infrastructure
+follow-up, not an immediate migration gate.
+
 Start with existing general-purpose workload images and a small common toolset.
 The harness supplies an appropriate image for each target. Missing fixture
 tooling is an infrastructure error. Defer a dedicated image until concrete
@@ -129,6 +146,14 @@ not a limit on subsequent execution. Run it against every supported driver for
 which infrastructure exists. Docker and Podman are acceptable initial targets.
 Unavailable infrastructure is a coverage gap. A successful test against one
 configuration does not establish success for all deployments of its driver.
+
+Admission uses normal PR review and the required driver-validation evidence,
+without a fixed soak period or separate promotion PR. Resolve known flakiness
+rather than concealing it with retries. Migration, admission, and removal of
+covered source tests may occur in the same PR. Changes to or removal of an
+established contract also use normal PR review; explicitly distinguish a test
+correction from a change to promised product behavior, including removal of
+previously advertised support.
 
 Disruption conformance has a separate execution family. Portable assertions
 describe continuity or recovery; actuators induce gateway restart, runtime loss,
@@ -176,6 +201,13 @@ report behavioral failures without blocking a merge; that job policy must not
 turn those failures into passing scenario results. Mock-MXC execution, for
 example, needs to identify the mock target and cannot qualify the production
 driver. A focused or incomplete invocation must not imply complete coverage.
+
+A complete run evaluates the entire identified suite without filtering. A
+filtered run is partial even if every selected test passes. Evaluating an
+optional capability and recording unsupported accounts for that test without
+making the run partial. Missing mandatory support fails. An unfiltered invocation
+that stops before accounting for all tests is incomplete; completeness and
+success are distinct, and errors must not be reported as a complete pass.
 
 ### 4. Keep execution reusable and select CI gates explicitly
 
@@ -261,7 +293,9 @@ and Helm/Kubernetes paths can reuse conformance. Native Homebrew qualification
 uses its appropriate platform. Passing behavior after installation does not by
 itself prove package ownership, service setup, upgrade, or uninstall contracts;
 installation-specific assertions must cover those separately. Upgrade and
-version-skew obligations remain explicit follow-up decisions.
+version-skew obligations remain explicit follow-up decisions. Initially, the
+suite, CLI, and gateway use the same OpenShell revision. Version-skew testing is
+deferred, and these results make no cross-version compatibility claim.
 
 Start report attribution with the OpenShell Git SHA and the tmachine
 configuration used for a run. Preserve enough configuration identity to recover
@@ -351,13 +385,15 @@ must not describe proposed gates as already enforced.
 7. Expand destination-suite CI and candidate-installation validation, documenting
    actual gates and coverage gaps as they become operational. Preserve existing
    coverage until its intent has a validated destination; no mandatory overlap
-   period is needed solely for migration.
+   period is needed solely for migration. Add enforced offline validation as an
+   infrastructure follow-up after provisioning supplies images and dependencies.
 
 ## Risks
 
 - Optional capability reporting can hide regressions if an implementation simply
-  stops advertising support. Mandatory contracts remain test-owned; policy for
-  reviewing optional-support removal needs an explicit decision.
+  stops advertising support. Mandatory contracts remain test-owned; review
+  removal of advertised support explicitly as a product-contract change, not
+  merely as a way to avoid failing tests.
 - Two Linux container drivers can pass a scenario containing OS assumptions.
   Admission evidence is a starting point; broader platform validation and probe
   review remain necessary.
@@ -423,16 +459,8 @@ suites is deferred; this alternative concerns support requirements, not naming.
 - Should portable, capability-dependent tests belong in general conformance or
   feature-specific suites? Resolve this using the first concrete migration
   example that requires the distinction, without adding a category in advance.
-- What constitutes a complete conformance claim, and how are suite versions
-  matched to gateway/CLI releases? Which version-skew guarantees are required?
-- What maturity and reliability evidence is required beyond two-driver success?
-  How are promotion, material changes, and demotion reviewed without imposing
-  an unnecessary new governance process?
-- What minimal normative description and stable identity must each scenario
-  carry, and how is removal of previously advertised support reviewed?
-- Should general conformance explicitly require offline execution after artifact
-  provisioning, and what host privileges and fixture reachability assumptions
-  are allowed for externally provisioned gateways?
+- What fixture reachability assumptions are needed for tests against externally
+  provisioned gateways, without requiring administrative access for assertions?
 - Which source and integration jobs are required for merges and release
   promotion? How should Windows, GPU, disruption, and load/scale runs be scheduled?
 - Where should disruption and load/scale suites live, and what is the smallest
