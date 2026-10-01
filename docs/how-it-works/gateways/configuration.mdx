@@ -1123,6 +1123,8 @@ runtime-selected profile.
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
 
+The VM driver requires gateway-minted Sandbox Protocol launch credentials even when the gateway listener TLS configuration is valid. A missing, partial, or malformed launch-signing bundle is rejected during create preflight, before registry access or image preparation. Configure `[openshell.gateway.gateway_jwt]` explicitly as above, or use the supported local gateway setup that discovers the complete generated `jwt/signing.pem`, `jwt/public.pem`, and `jwt/kid` bundle. Listener certificates and client CAs do not substitute for these signing keys.
+
 ```toml
 [openshell]
 version = 2
@@ -1134,6 +1136,15 @@ log_level       = "info"
 compute_driver = "vm"
 # Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/var/lib/openshell/guest-tls/ca.pem"
+
+# Sandbox launch signing is separate from listener TLS. These files are created
+# by the gateway certificate/bootstrap tooling; point this table at the complete
+# local signing bundle when discovery is not being used.
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/var/lib/openshell/guest-tls/jwt/signing.pem"
+public_key_path  = "/var/lib/openshell/guest-tls/jwt/public.pem"
+kid_path         = "/var/lib/openshell/guest-tls/jwt/kid"
+gateway_id       = "openshell"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"
