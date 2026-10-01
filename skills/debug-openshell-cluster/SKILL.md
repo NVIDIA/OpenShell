@@ -747,6 +747,12 @@ remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
 
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
+
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
