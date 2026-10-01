@@ -105,6 +105,28 @@ compatibility baseline for the v1beta1 Sandbox API. It does not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
+### K3s boot readiness and diagnostics
+
+The K3s installer checks readiness during provisioning and again after the automated
+test VM boots, including boots from cached installer disks. The checks wait for the
+API, nodes, and gateway StatefulSet, then require `openshell status --output json`
+to report the registered `tmachine` gateway as connected through the forwarder. Readiness
+failures stop the suite before its scenarios run; scenario timeouts are unchanged.
+The loopback forwarder retries every five seconds without a systemd start limit
+so it can recover after temporary K3s API failures.
+
+Interactive `shell` suites skip test-boot preparation so you can inspect a gateway
+that failed during boot. They still run the installer checks when provisioning.
+
+Installation, readiness, and conformance failures collect bounded K3s and
+forwarder journals, service state, listener state, Pod identity and container
+status, endpoints, events, and current and previous gateway logs before the VM
+exits. The collector omits Secrets, kubeconfigs, environment dumps, and full Pod
+specifications and redacts common credential fields. Local runs save these to
+`artifacts/tmachine-diagnostics`; CI uploads them as `tmachine-diagnostics-*`
+artifacts even when the test step fails. Check these alongside the Ansible error
+to distinguish forwarding failures from gateway restarts or readiness failures.
+
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an
