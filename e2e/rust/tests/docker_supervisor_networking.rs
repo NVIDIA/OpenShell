@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e-docker")]
 
-//! Run with both the default auto mode and forced bridge mode to exercise
+//! Exercise automatic networking selection using the workload runtime, along with
 //! authenticated gateway callbacks, interactive access, and supervisor restart.
 
 use std::time::Duration;
@@ -65,11 +65,7 @@ network_policies:
         .await
         .expect("create sandbox");
     let workload = inspect_role(&sandbox.name, "sandbox").await;
-    let requested = std::env::var("OPENSHELL_E2E_DOCKER_SUPERVISOR_NETWORK_MODE")
-        .unwrap_or_else(|_| "auto".into());
-    let expected = if requested == "bridge"
-        || (requested == "auto" && workload["HostConfig"]["Runtime"] == "sysbox-runc")
-    {
+    let expected = if workload["HostConfig"]["Runtime"] == "sysbox-runc" {
         "bridge"
     } else {
         "host"
