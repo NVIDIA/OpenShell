@@ -81,7 +81,7 @@ pub fn project_policy_revision_onto_sandbox(
     write: &AtomicPolicyRevisionWrite,
     payload: &[u8],
     current_resource_version: u64,
-) -> PersistenceResult<(Sandbox, bool)> {
+) -> PersistenceResult<Sandbox> {
     if write.expected_resource_version != 0
         && write.expected_resource_version != current_resource_version
     {
@@ -95,7 +95,6 @@ pub fn project_policy_revision_onto_sandbox(
         .map_err(|e| PersistenceError::Decode(format!("decode sandbox payload failed: {e}")))?;
     sandbox.set_resource_version(current_resource_version);
 
-    let mut changed = false;
     let startup_blocked = permits_initial_static_policy_repair(&sandbox);
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
         let spec = sandbox
@@ -105,12 +104,10 @@ pub fn project_policy_revision_onto_sandbox(
         match spec.policy.as_ref() {
             None => {
                 spec.policy = Some(backfill_policy.clone());
-                changed = true;
             }
             Some(current) if current == backfill_policy => {}
             Some(_) if startup_blocked => {
                 spec.policy = Some(backfill_policy.clone());
-                changed = true;
             }
             Some(_) => {
                 return Err(PersistenceError::Conflict {
@@ -125,14 +122,11 @@ pub fn project_policy_revision_onto_sandbox(
             PersistenceError::Decode("sandbox payload missing metadata".to_string())
         })?;
         for (key, value) in &write.annotations {
-            if metadata.annotations.get(key) != Some(value) {
-                metadata.annotations.insert(key.clone(), value.clone());
-                changed = true;
-            }
+            metadata.annotations.insert(key.clone(), value.clone());
         }
     }
 
-    Ok((sandbox, changed))
+    Ok(sandbox)
 }
 
 pub trait PolicyStoreExt {
@@ -147,7 +141,9 @@ pub trait PolicyStoreExt {
     ) -> PersistenceResult<()>;
 
     /// Atomically create a sandbox policy revision, project its annotations
-    /// onto sandbox metadata, and optionally backfill `spec.policy`.
+    /// onto sandbox metadata, and optionally backfill `spec.policy`. Every new
+    /// revision advances the sandbox resource version, even without projection
+    /// changes, so concurrent policy writers can use the sandbox version for CAS.
     async fn put_policy_revision_atomic(
         &self,
         write: &AtomicPolicyRevisionWrite,
@@ -742,8 +738,7 @@ mod tests {
                 let result =
                     project_policy_revision_onto_sandbox(&write, &sandbox.encode_to_vec(), 1);
                 if activated == Some(false) && state != Admission::Accepted {
-                    let (projected, changed) = result.unwrap();
-                    assert!(changed);
+                    let projected = result.unwrap();
                     assert_eq!(projected.spec.unwrap().policy, Some(replacement.clone()));
                 } else {
                     assert!(
