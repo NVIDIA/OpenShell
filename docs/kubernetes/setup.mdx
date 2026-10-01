@@ -49,10 +49,12 @@ Make sure the following are in place before you install.
 
 OpenShell uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the OpenShell Helm chart.
 
-Apply the latest release manifest:
+Apply the Agent Sandbox `v1.0.3` core manifest. This version is exercised by
+OpenShell's Kubernetes CI. Pinning the version keeps upstream release changes
+from silently changing this installation:
 
 ```shell
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/sandbox.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.3/sandbox.yaml
 ```
 
 This creates the `agent-sandbox-system` namespace, installs the `sandboxes.agents.x-k8s.io` CRD, and starts the controller.
@@ -71,7 +73,14 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. Mirror the OpenShell gateway, supervisor, and trusted sandbox runtime images, then set `global.image.registry` to the mirror. Configure the separate default workload sandbox image with `sandbox.image` when needed.
+For air-gapped clusters, download the `v1.0.3` `sandbox.yaml` manifest from the
+URL above and transfer it to your installation environment. Mirror the
+`registry.k8s.io/agent-sandbox/agent-sandbox-controller` image at the exact tag
+or digest referenced in that manifest to your internal registry, then update
+the manifest's image reference to your mirror before applying the local file.
+Mirror the OpenShell gateway, supervisor, and trusted sandbox runtime images,
+then set `global.image.registry` to the mirror. Configure the separate default
+workload sandbox image with `sandbox.image` when needed.
 </Note>
 
 Confirm the controller pod is running before proceeding:

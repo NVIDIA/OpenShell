@@ -134,10 +134,13 @@ apply it. Re-run the cluster-admin step after changing values that affect the
 > sandbox workloads may connect directly and bypass supervisor network policy.
 > Verify CNI support before installing OpenShell.
 
-The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:
+The Kubernetes Agent Sandbox CRDs and controller must be installed on the
+cluster before deploying OpenShell. Install the `v1.0.3` core manifest, matching
+the version exercised by OpenShell's Kubernetes CI. The pinned version keeps
+upstream release changes from silently changing this installation:
 
 ```shell
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/sandbox.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.3/sandbox.yaml
 ```
 
 The chart does not install this cluster-scoped dependency. By default, it
