@@ -40,6 +40,34 @@ pub struct Installer {
     pub use_galaxy: bool,
     pub playbooks: Vec<PathBuf>,
     pub inputs: BTreeMap<String, PathBuf>,
+    /// Readiness checks run on every test boot, including cached installations.
+    #[serde(default)]
+    pub prepare_playbooks: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Installer;
+
+    #[test]
+    fn existing_installers_need_no_boot_preparation() {
+        let installer: Installer =
+            serde_saphyr::from_str("name: none\nuse_galaxy: false\nplaybooks: []\ninputs: {}\n")
+                .unwrap();
+        assert!(installer.prepare_playbooks.is_empty());
+    }
+
+    #[test]
+    fn installer_can_request_boot_preparation() {
+        let installer: Installer = serde_saphyr::from_str(
+            "name: k3s\nuse_galaxy: false\nplaybooks: []\ninputs: {}\nprepare_playbooks: [ready.yaml]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            installer.prepare_playbooks,
+            [std::path::PathBuf::from("ready.yaml")]
+        );
+    }
 }
 
 #[derive(Clone, Deserialize)]

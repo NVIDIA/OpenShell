@@ -85,6 +85,7 @@ let
         name = "k3s";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ready.yaml" ];
         inputs = {
           agent_sandbox_version = "0.5.0";
           openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
@@ -213,6 +214,7 @@ let
       root=$(git rev-parse --show-toplevel)
       cd "$root/tests"
       export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
+      export TMACHINE_DIAGNOSTICS_DIR="$root/artifacts/tmachine-diagnostics"
       exec ${tmachine}/bin/tmachine --config ${config} "$@"
     '';
   };

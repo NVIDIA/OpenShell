@@ -86,3 +86,12 @@ jobs:
           INSTALLER: ${{ matrix.installer }}
           TESTSUITE: ${{ matrix.testsuite }}
         run: nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"
+
+      - name: Upload tmachine diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tmachine-diagnostics-${{ inputs.category }}-${{ matrix.environment }}-${{ matrix.installer }}-${{ matrix.testsuite }}
+          path: artifacts/tmachine-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7

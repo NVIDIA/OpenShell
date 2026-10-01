@@ -144,6 +144,13 @@ the `release-tag-v1` qualification profile. Failed qualification prevents stable
 publication but still allows pre-release artifacts to publish with the failure
 recorded.
 
+For tmachine K3s conformance failures, download the job's
+`tmachine-diagnostics-*` artifact. It contains diagnostics fetched before the VM
+exits: forwarder restart counts and start-limit settings, K3s and forwarder
+journals, listener state, gateway Pod identity/readiness, endpoint state, and
+current/previous gateway logs. A readiness failure means scenarios did not run;
+use the collector output to identify the failing layer before rerunning.
+
 View logs for a specific run:
 
 ```bash
