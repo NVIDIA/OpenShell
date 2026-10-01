@@ -118,7 +118,7 @@ jobs:
           test -x extracted/openshell-driver-vm
           signed_entitlements="${RUNNER_TEMP}/openshell-driver-vm.entitlements.plist"
           /usr/bin/codesign --verify --strict extracted/openshell-driver-vm
-          /usr/bin/codesign --display --entitlements :- extracted/openshell-driver-vm > "${signed_entitlements}"
+          /usr/bin/codesign --display --entitlements - --xml extracted/openshell-driver-vm > "${signed_entitlements}"
           /usr/bin/plutil -extract com.apple.security.hypervisor raw -o - "${signed_entitlements}" \
             | grep -qx true
 
