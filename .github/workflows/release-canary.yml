@@ -221,7 +221,7 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
-          sudo systemctl set-environment \
+          systemctl --user set-environment \
             "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           sudo snap list openshell
@@ -234,8 +234,12 @@ jobs:
           sudo snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
           openshell.prover --version
-          sudo snap services openshell
-          sudo journalctl -b -u snap.openshell.gateway.service --no-pager |
+          snap services openshell
+          systemctl --user is-enabled --quiet snap.openshell.user-gateway.service
+          systemctl --user is-active snap.openshell.user-gateway.service
+          ! systemctl is-enabled --quiet snap.openshell.system-gateway.service
+          ! systemctl is-active --quiet snap.openshell.system-gateway.service
+          journalctl --user -u snap.openshell.user-gateway.service --no-pager |
             grep -F "mTLS user authentication enabled"
           openshell gateway list | grep -F "https://127.0.0.1:17670"
           openshell status
@@ -280,10 +284,12 @@ jobs:
           sudo snap services openshell
           sudo snap connections openshell
           sudo snap changes
-          sudo systemctl status snap.openshell.gateway.service --no-pager
-          sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300
+          systemctl --user status snap.openshell.user-gateway.service --no-pager
+          journalctl --user -u snap.openshell.user-gateway.service --no-pager -n 300
+          sudo systemctl status snap.openshell.system-gateway.service --no-pager
+          sudo journalctl -b -u snap.openshell.system-gateway.service --no-pager -n 300
           sudo journalctl -b -u snapd.service --no-pager -n 300
-          sudo snap logs openshell.gateway -n=300
+          snap logs openshell.user-gateway -n=300
           sudo ss -ltnp '( sport = :17670 )'
 
   ubuntu-snap-docker-preflight:

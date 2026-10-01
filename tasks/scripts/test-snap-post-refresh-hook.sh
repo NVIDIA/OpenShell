@@ -4,144 +4,125 @@
 
 set -euo pipefail
 
-hook_input=${1:?Usage: test-snap-post-refresh-hook.sh <post-refresh-hook>}
-hook_dir=$(cd "$(dirname "$hook_input")" && pwd)
-hook="${hook_dir}/$(basename "$hook_input")"
+hook=${1:?Usage: test-snap-post-refresh-hook.sh <post-refresh-hook>}
 work=$(mktemp -d "${TMPDIR:-/tmp}/openshell snap post-refresh hook.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-mkdir -p "${work}/bin"
-cat >"${work}/bin/snapctl" <<EOF
-#!/bin/sh
-printf '%s\\n' "\$*" >>"${work}/snapctl.log"
-EOF
-chmod 755 "${work}/bin/snapctl"
-
 run_hook() {
   local common=$1
-
-  PATH="${work}/bin:$PATH" SNAP_COMMON="$common" SNAP_INSTANCE_NAME=openshell "$hook"
-}
-
-assert_no_restart() {
-  local name=$1
-  local common=$2
-
-  rm -f "${work}/snapctl.log"
-  run_hook "$common"
-  if [[ -e "${work}/snapctl.log" ]]; then
-    echo "FAIL: post-refresh hook restarted the gateway for ${name}" >&2
-    cat "${work}/snapctl.log" >&2
-    exit 1
-  fi
-}
-
-assert_removed_and_restarted() {
-  local name=$1
-  local common=$2
-
-  rm -f "${work}/snapctl.log"
-  run_hook "$common"
-  if [[ -e "$common/gateway.toml" ]] || [[ -L "$common/gateway.toml" ]]; then
-    echo "FAIL: post-refresh hook did not remove ${name}" >&2
-    exit 1
-  fi
-  if [[ $(cat "${work}/snapctl.log") != "restart openshell.gateway" ]]; then
-    echo "FAIL: post-refresh hook did not restart the gateway once for ${name}" >&2
-    cat "${work}/snapctl.log" >&2
-    exit 1
-  fi
-}
-
-common="${work}/missing"
-mkdir -p "$common"
-assert_no_restart "a missing config" "$common"
-if [[ -e "$common/gateway.toml" ]] || [[ -L "$common/gateway.toml" ]]; then
-  echo "FAIL: post-refresh hook created a missing config" >&2
-  exit 1
+  local mode=$2
+  rm -f "$work/snapctl.log"
+  mkdir -p "$work/bin"
+  cat >"$work/bin/snapctl" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = get ]; then
+  printf '%s\n' '$mode'
+  exit 0
 fi
+printf '%s\n' "\$*" >>'$work/snapctl.log'
+EOF
+  chmod 755 "$work/bin/snapctl"
+  PATH="$work/bin:$PATH" SNAP_COMMON="$common" SNAP_INSTANCE_NAME=openshell "$hook"
+}
 
-common="${work}/secure"
+for mode in user system; do
+  common="$work/$mode"
+  mkdir -p "$common"
+  printf '%s\n' 'disable_tls = true' >"$common/gateway.toml"
+  cp "$common/gateway.toml" "$work/$mode-before"
+  run_hook "$common" "$mode"
+  cmp -s "$work/$mode-before" "$common/gateway.toml"
+  [[ ! -e "$work/snapctl.log" ]]
+done
+
+common="$work/missing"
+mkdir -p "$common"
+run_hook "$common" ""
+expected='set gateway-mode=system'
+[[ $(cat "$work/snapctl.log") == "$expected" ]]
+
+common="$work/secure"
 mkdir -p "$common"
 cat >"$common/gateway.toml" <<'EOF'
 [openshell]
 version = 2
-
 [openshell.gateway]
-compute_driver = "docker"
 disable_tls = false
-
 [openshell.gateway.auth]
 allow_unauthenticated_users = false
-# allow_unauthenticated_users = true
 EOF
-cp "$common/gateway.toml" "${work}/secure-before"
-assert_no_restart "a secure config" "$common"
-cmp -s "${work}/secure-before" "$common/gateway.toml"
+cp "$common/gateway.toml" "$work/secure-before"
+run_hook "$common" ""
+cmp -s "$work/secure-before" "$common/gateway.toml"
+[[ $(cat "$work/snapctl.log") == "$expected" ]]
 
-common="${work}/unauthenticated"
+for setting in 'allow_unauthenticated_users = true' 'disable_tls = true # legacy'; do
+  common="$work/unsafe-${setting%% *}"
+  mkdir -p "$common"
+  printf '%s\n' "$setting" >"$common/gateway.toml"
+  run_hook "$common" ""
+  [[ ! -e "$common/gateway.toml" ]]
+  expected='set gateway-mode=system'
+  [[ $(cat "$work/snapctl.log") == "$expected" ]]
+done
+
+common="$work/symlink"
 mkdir -p "$common"
-cat >"$common/gateway.toml" <<'EOF'
-[openshell.gateway.auth]
-allow_unauthenticated_users = true
-EOF
-assert_removed_and_restarted "an unauthenticated config" "$common"
+printf '%s\n' 'disable_tls = true' >"$work/linked-config.toml"
+ln -s "$work/linked-config.toml" "$common/gateway.toml"
+run_hook "$common" ""
+[[ ! -e "$common/gateway.toml" && ! -L "$common/gateway.toml" ]]
+[[ -f "$work/linked-config.toml" ]]
+expected='set gateway-mode=system'
+[[ $(cat "$work/snapctl.log") == "$expected" ]]
 
-common="${work}/tls-disabled"
+common="$work/broken-symlink"
 mkdir -p "$common"
-cat >"$common/gateway.toml" <<'EOF'
-[openshell.gateway]
-disable_tls = true # old local override
+ln -s "$work/missing-target" "$common/gateway.toml"
+run_hook "$common" ""
+[[ -L "$common/gateway.toml" ]]
+[[ $(cat "$work/snapctl.log") == "$expected" ]]
 
-# operator note
-EOF
-assert_removed_and_restarted "an edited TLS-disabled config" "$common"
-
-common="${work}/broken-link"
+common="$work/unknown"
 mkdir -p "$common"
-ln -s "${work}/missing-target" "$common/gateway.toml"
-assert_no_restart "a broken operator symlink" "$common"
-if [[ $(readlink "$common/gateway.toml") != "${work}/missing-target" ]]; then
-  echo "FAIL: post-refresh hook replaced a broken operator symlink" >&2
+if run_hook "$common" invalid >"$work/out" 2>"$work/err"; then
+  echo "FAIL: post-refresh hook accepted unknown service mode" >&2
   exit 1
 fi
+grep -Fq 'unsupported gateway-mode: invalid' "$work/err"
+[[ ! -e "$work/snapctl.log" ]]
 
-common="${work}/existing-link"
-mkdir -p "$common"
-printf '%s\n' 'disable_tls = true' >"${work}/linked-config.toml"
-ln -s "${work}/linked-config.toml" "$common/gateway.toml"
-assert_no_restart "an existing operator symlink" "$common"
-if [[ $(readlink "$common/gateway.toml") != "${work}/linked-config.toml" ]]; then
-  echo "FAIL: post-refresh hook replaced an existing operator symlink" >&2
-  exit 1
-fi
-
-common="${work}/directory"
-mkdir -p "$common/gateway.toml"
-assert_no_restart "an operator-owned directory" "$common"
-if [[ ! -d "$common/gateway.toml" ]]; then
-  echo "FAIL: post-refresh hook replaced an operator-owned directory" >&2
-  exit 1
-fi
-
-common="${work}/remove-failure"
-mkdir -p "$common" "${work}/failing-bin"
-printf '%s\n' 'disable_tls = true' >"$common/gateway.toml"
-cat >"${work}/failing-bin/rm" <<'EOF'
+common="$work/get-failure"
+mkdir -p "$common" "$work/get-failure-bin"
+cat >"$work/get-failure-bin/snapctl" <<'EOF'
 #!/bin/sh
 exit 1
 EOF
-chmod 755 "${work}/failing-bin/rm"
-rm -f "${work}/snapctl.log"
-if PATH="${work}/failing-bin:${work}/bin:$PATH" SNAP_COMMON="$common" \
+chmod 755 "$work/get-failure-bin/snapctl"
+if PATH="$work/get-failure-bin:$PATH" SNAP_COMMON="$common" \
   SNAP_INSTANCE_NAME=openshell "$hook"; then
-  echo "FAIL: post-refresh hook succeeded when config removal failed" >&2
+  echo "FAIL: post-refresh hook treated snapctl get failure as a missing mode" >&2
   exit 1
 fi
-if [[ -e "${work}/snapctl.log" ]]; then
-  echo "FAIL: post-refresh hook restarted after config removal failed" >&2
-  cat "${work}/snapctl.log" >&2
+
+common="$work/remove-failure"
+mkdir -p "$common" "$work/remove-failure-bin"
+printf '%s\n' 'disable_tls = true' >"$common/gateway.toml"
+cat >"$work/remove-failure-bin/snapctl" <<EOF
+#!/bin/sh
+  if [ "\${1:-}" = get ]; then exit 0; fi
+printf '%s\n' "\$*" >>'$work/remove-failure.log'
+EOF
+cat >"$work/remove-failure-bin/rm" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 755 "$work/remove-failure-bin/snapctl" "$work/remove-failure-bin/rm"
+if PATH="$work/remove-failure-bin:$PATH" SNAP_COMMON="$common" \
+  SNAP_INSTANCE_NAME=openshell "$hook"; then
+  echo "FAIL: post-refresh hook ignored config removal failure" >&2
   exit 1
 fi
+[[ ! -e "$work/remove-failure.log" ]]
 
 echo "Snap post-refresh hook tests passed"

@@ -220,4 +220,31 @@ cp "$canonical/marker" "$work/marker-before"
 assert_preflight_failure nonregular
 cmp -s "$work/marker-before" "$canonical/marker"
 
+user_common="$work/user-common"
+user_config="$user_common/.config/openshell/gateway.toml"
+user_tls="$user_common/.local/state/openshell/tls"
+user_db="sqlite:$user_common/gateway.db?mode=rwc"
+mkdir -p "$(dirname "$user_config")"
+printf 'user config\n' >"$user_config"
+: >"$log"
+env -u OPENSHELL_GATEWAY_CONFIG \
+  SNAP="$snap" \
+  SNAP_COMMON="$common" \
+  OPENSHELL_SNAP_CONFIG_FILE="$user_config" \
+  OPENSHELL_DB_URL="$user_db" \
+  OPENSHELL_LOCAL_TLS_DIR="$user_tls" \
+  FAKE_GATEWAY_LOG="$log" \
+  "$wrapper" --trace
+printf '%s\n' \
+  "generate-certs --output-dir $user_tls --server-san host.openshell.internal" \
+  "config preflight -- --config $user_config --trace" \
+  "env:|$user_db|" \
+  "--config $user_config --trace" \
+  "env:|$user_db|" >"$expected"
+if ! cmp -s "$expected" "$log"; then
+  echo "FAIL: user gateway path overrides were not applied" >&2
+  diff -u "$expected" "$log" >&2
+  exit 1
+fi
+
 echo "Snap gateway wrapper tests passed"
