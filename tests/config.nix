@@ -126,6 +126,17 @@ let
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
+      {
+        name = "rpm";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];
+        inputs = {
+          openshell_rpm = "../artifacts/packages/rpm/openshell.rpm";
+          openshell_gateway_rpm = "../artifacts/packages/rpm/openshell-gateway.rpm";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
     ];
 
     testsuites = [

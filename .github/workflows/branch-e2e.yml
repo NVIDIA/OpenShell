@@ -82,13 +82,15 @@ jobs:
 
   version:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       cargo: ${{ steps.version.outputs.cargo }}
+      rpm_version: ${{ steps.version.outputs.rpm_version }}
+      rpm_release: ${{ steps.version.outputs.rpm_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,7 +101,13 @@ jobs:
         id: version
         run: |
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
-          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+          rpm_version="$(python3 tasks/scripts/release.py get-version --dev --rpm-version)"
+          rpm_release="$(python3 tasks/scripts/release.py get-version --dev --rpm-release)"
+          {
+            echo "cargo=$cargo"
+            echo "rpm_version=$rpm_version"
+            echo "rpm_release=$rpm_release"
+          } >> "$GITHUB_OUTPUT"
 
   build-binaries:
     needs: version
@@ -200,14 +208,30 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-images.yml
 
+  build-rpm:
+    name: Build RPM packages
+    needs: [pr_metadata, version, build-binaries]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      rpm-version: ${{ needs.version.outputs.rpm_version }}
+      rpm-release: ${{ needs.version.outputs.rpm_release }}
+      cargo-version: ${{ needs.version.outputs.cargo }}
+
   prepare-integration:
-    needs: [pr_metadata, build-binaries, build-images]
+    needs: [pr_metadata, build-binaries, build-images, build-rpm]
     if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      rpm-artifact-name: rpm-linux-x86_64
 
   # Run driver-independent conformance tests.
   conformance-integration:
@@ -225,8 +249,8 @@ jobs:
         [
           {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
           {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
         ]
 
   # Run feature-specific integration tests:
