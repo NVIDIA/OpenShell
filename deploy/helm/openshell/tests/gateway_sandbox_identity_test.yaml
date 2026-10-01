@@ -77,3 +77,17 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a boolean sandbox UID
+    set:
+      server.sandboxUid: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxUid must be an integer between 1 and 4294967294"
+
+  - it: rejects a boolean sandbox GID
+    set:
+      server.sandboxGid: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.sandboxGid must be an integer between 1 and 4294967294"
