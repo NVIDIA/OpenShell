@@ -37,6 +37,19 @@ openshell sandbox create --name my-sandbox
 Without either, the sandbox uses a policy from its image or the restrictive
 [default policy](/how-it-works/policies/default-policy).
 
+## Check a Policy Before Creating a Sandbox
+
+Use `openshell policy check` to validate a policy file locally before submitting it. The command does not contact a gateway, create a sandbox, or pull an image:
+
+```shell
+openshell policy check ./policy.yaml
+```
+
+A valid file exits with status 0. An invalid file exits non-zero and reports all
+file-local policy validation errors found in that run. Checks that require
+runtime state, such as registered middleware, attached providers, or the
+sandbox image, still happen when the sandbox is created.
+
 ## Ship a Policy in an Image
 
 To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:
