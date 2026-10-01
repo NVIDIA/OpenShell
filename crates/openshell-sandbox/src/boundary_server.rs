@@ -4681,12 +4681,20 @@ mod linux {
 
             validate_config(&config).unwrap();
             validate_running_identity(&config.workload_identity, false).unwrap();
-            let mut wrong_uid = config.workload_identity.clone();
-            wrong_uid.uid = if wrong_uid.uid == 10000 { 10001 } else { 10000 };
-            assert!(validate_running_identity(&wrong_uid, false).is_err());
-            let mut wrong_gid = config.workload_identity.clone();
-            wrong_gid.gid = if wrong_gid.gid == 10000 { 10001 } else { 10000 };
-            assert!(validate_running_identity(&wrong_gid, false).is_err());
+            let mut wrong_user = config.workload_identity.clone();
+            wrong_user.uid = if wrong_user.uid == 10000 {
+                10001
+            } else {
+                10000
+            };
+            assert!(validate_running_identity(&wrong_user, false).is_err());
+            let mut wrong_group = config.workload_identity;
+            wrong_group.gid = if wrong_group.gid == 10000 {
+                10001
+            } else {
+                10000
+            };
+            assert!(validate_running_identity(&wrong_group, false).is_err());
         }
 
         fn vm_identity_test_runtime() -> (tokio::runtime::Runtime, Arc<BoundaryRuntime>) {
@@ -4742,14 +4750,14 @@ mod linux {
                 )
                 .expect("matching or omitted VM selectors");
             }
-            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
-            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
             for (user, group, field) in [
-                (Some(wrong_uid), None, "run_as_user"),
-                (None, Some(wrong_gid), "run_as_group"),
-                (Some(uid.as_str()), Some(wrong_gid), "run_as_group"),
-                (Some(wrong_uid), Some(gid.as_str()), "run_as_user"),
-                (Some(wrong_uid), Some(wrong_gid), "run_as_user"),
+                (Some(wrong_user), None, "run_as_user"),
+                (None, Some(wrong_group), "run_as_group"),
+                (Some(uid.as_str()), Some(wrong_group), "run_as_group"),
+                (Some(wrong_user), Some(gid.as_str()), "run_as_user"),
+                (Some(wrong_user), Some(wrong_group), "run_as_user"),
             ] {
                 let error = validate_vm_policy_identity(
                     &boundary.config,
@@ -4785,7 +4793,7 @@ mod linux {
                 .remove("vm.generation");
             validate_vm_policy_identity(
                 &boundary.config,
-                &vm_identity_test_policy(Some(wrong_uid), Some("image-user")),
+                &vm_identity_test_policy(Some(wrong_user), Some("image-user")),
             )
             .expect("non-VM identity behavior is unchanged");
         }
@@ -4796,11 +4804,11 @@ mod linux {
             let identity = &boundary.config.workload_identity;
             let uid = identity.uid.to_string();
             let gid = identity.gid.to_string();
-            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
-            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
             for (user, group, field, requested) in [
-                (Some(wrong_uid), None, "run_as_user", wrong_uid),
-                (None, Some(wrong_gid), "run_as_group", wrong_gid),
+                (Some(wrong_user), None, "run_as_user", wrong_user),
+                (None, Some(wrong_group), "run_as_group", wrong_group),
             ] {
                 let response = boundary.attach(vm_identity_test_policy(user, group));
                 let Response::Error { kind, message } = response else {
@@ -4830,14 +4838,14 @@ mod linux {
             let identity = &boundary.config.workload_identity;
             let uid = identity.uid.to_string();
             let gid = identity.gid.to_string();
-            let wrong_uid = if uid == "10000" { "10001" } else { "10000" };
-            let wrong_gid = if gid == "10000" { "10001" } else { "10000" };
+            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
+            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
             *lock(&boundary.state) = RuntimeState::Ready(PreparedBoundary {
                 network_broker: boundary.network_broker.clone(),
             });
             for (user, group, field, requested) in [
-                (Some(wrong_uid), None, "run_as_user", wrong_uid),
-                (None, Some(wrong_gid), "run_as_group", wrong_gid),
+                (Some(wrong_user), None, "run_as_user", wrong_user),
+                (None, Some(wrong_group), "run_as_group", wrong_group),
             ] {
                 let response = boundary.start_agent(
                     boundary.config.boundary_id.clone(),
