@@ -279,7 +279,7 @@ async fn wait_for_authorization(url: &str, expected: &str) -> Result<(), String>
 
 #[tokio::test]
 async fn service_bearer_passthrough_preserves_authorization_header() {
-    let sandbox_name = format!("service-auth-{}", std::process::id());
+    let sandbox_name = format!("svc-auth-{}", std::process::id());
     let create = run_cli(&[
         "sandbox",
         "create",
