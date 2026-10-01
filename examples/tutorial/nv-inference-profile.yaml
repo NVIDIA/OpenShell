@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 id: nv-inference
 display_name: NVIDIA Inference (custom endpoint)
 description: OpenAI-compatible credential for a self-hosted NVIDIA inference endpoint. Endpointless by design; the sandbox policy binds it explicitly via credential_binding.provider.
