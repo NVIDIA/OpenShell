@@ -330,6 +330,8 @@ The gateway already uses the Rust `tracing` framework for structured logs sent t
 [openshell.gateway.otlp]
 endpoint     = "http://otel-collector.observability.svc:4317"
 service_name = "openshell-gateway"
+# Optional separate collector for relayed agent traces.
+# agent_endpoint = "http://agent-collector.observability.svc:4317"
 ```
 
 `endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
@@ -348,11 +350,12 @@ The gateway forwards the OTLP configuration, configured gateway name, configured
 
 Configuring this table also enables the sandbox telemetry relay. `CreateSandbox` sets `OTEL_EXPORTER_OTLP_ENDPOINT=http://192.0.0.8:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` in each new sandbox's environment unless the caller already supplied an endpoint. The values persist in the sandbox spec and survive restarts. OTel SDKs inside the sandbox export to that address over HTTP/protobuf or HTTP/JSON.
 
-The address is never routed. The sandbox stages the connection for the supervisor, which serves the OTLP receiver itself, adds `openshell.sandbox.id`, `openshell.workspace.id`, `openshell.sandbox.policy`, `openshell.sandbox.user`, `openshell.sandbox.image`, `openshell.sandbox.driver`, and `openshell.telemetry.source=agent`, and forwards the spans to the gateway. The gateway exports them to the same `endpoint` through a dedicated exporter, so agent spans arrive with the supervisor's resource attributes rather than the gateway's. Agent traces need no sandbox egress and no network policy entry. Telemetry never blocks sandbox control traffic: the relay buffers up to 4096 items per sandbox and drops the newest on overflow.
+The address is never routed. The sandbox stages the connection for the supervisor, which serves the OTLP receiver itself, adds `openshell.sandbox.id`, `openshell.workspace.id`, `openshell.sandbox.policy`, `openshell.sandbox.user`, `openshell.sandbox.image`, `openshell.sandbox.driver`, and `openshell.telemetry.source=agent`, and forwards the spans to the gateway. The gateway exports them through a dedicated exporter, so agent spans arrive with the supervisor's resource attributes rather than the gateway's. Agent traces ride their own lane: set `agent_endpoint` to send them to a separate collector, for example one deployed near the workloads or scaled independently of infrastructure tracing. When `agent_endpoint` is absent, agent traces go to `endpoint` and one collector serves both lanes; the `openshell.telemetry.source=agent` attribute still distinguishes them. Agent traces need no sandbox egress and no network policy entry. Telemetry never blocks sandbox control traffic: the relay buffers up to 4096 items per sandbox and drops the newest on overflow.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
-driver service names remain fixed.
+driver service names remain fixed. The optional `server.otlp.agentEndpoint`
+value renders `agent_endpoint` for a separate agent-trace collector.
 
 The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
 enables Agent Sandbox controller tracing on supported releases, and configures
