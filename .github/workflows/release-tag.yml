@@ -777,6 +777,33 @@ jobs:
 
           echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
 
+  notify-prerelease-failure:
+    name: Notify Prerelease Failure
+    needs: [release-helm, publish-qualification]
+    if: failure() && contains(inputs.tag || github.ref_name, '-pre.')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          # Configure this repository secret once the triage webhook is approved.
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT}). <!subteam^S0C099KM56F>"
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
+            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"
+
   publish-fern-docs:
     name: Sync and Publish Fern Docs
     needs: [compute-versions, release, publish-sdk-typescript, release-helm, trigger-wheel-publish]

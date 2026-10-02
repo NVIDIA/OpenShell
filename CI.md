@@ -194,6 +194,13 @@ temporarily informational for tagged releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
 
+Failed prerelease attempts send a Slack notification mentioning
+`@openshell-duty-eng` and linking to the specific attempt. Configure the triage
+channel's incoming webhook as the repository secret
+`SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` to enable notifications. The notification
+skips sending when the secret is unset, and delivery failures do not affect
+release results.
+
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
