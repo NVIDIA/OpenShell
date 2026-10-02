@@ -81,6 +81,12 @@ impl CedarOnlyEngine {
         })
     }
 
+    /// Returns the active policy generation, advanced by each committed reload.
+    #[must_use]
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Builds an L7 decision handle for a tunnel pinned at
     /// `captured_generation`. See [`crate::opa::NetworkPolicyEngine::l7_engine_for_tunnel`].
     fn l7_handle(&self, captured_generation: u64) -> Arc<dyn L7PolicyEngine> {
@@ -105,17 +111,46 @@ impl CedarOnlyEngine {
     /// previous policy and generation stay active (last-known-good,
     /// matching `OpaEngine`'s reload failure behavior).
     pub fn reload_from_policy_str(&self, policy_src: &str) -> Result<()> {
-        {
-            let current_source = self
-                .source
-                .read()
-                .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
-            if current_source.as_str() == policy_src {
-                return Ok(());
-            }
+        let staged = self.stage(policy_src)?;
+        self.commit(staged)
+    }
+
+    /// Parses and validates `policy_src` without activating it.
+    ///
+    /// Lets a caller validate the Cedar policy before committing any other
+    /// engine's reload, so a rejected Cedar policy leaves every engine on
+    /// the previous revision. Pass the result to [`Self::commit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `policy_src` fails to load (see
+    /// [`Self::from_policy_str`]), or the engine lock is poisoned.
+    pub fn stage(&self, policy_src: &str) -> Result<StagedCedarPolicy> {
+        let unchanged = self
+            .source
+            .read()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?
+            .as_str()
+            == policy_src;
+        if unchanged {
+            return Ok(StagedCedarPolicy(None));
         }
         let engine =
             CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
+        Ok(StagedCedarPolicy(Some((engine, policy_src.to_string()))))
+    }
+
+    /// Activates a policy returned by [`Self::stage`] and advances the generation.
+    ///
+    /// A no-op when the staged source matched the active one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned.
+    pub fn commit(&self, staged: StagedCedarPolicy) -> Result<()> {
+        let Some((engine, source)) = staged.0 else {
+            return Ok(());
+        };
         let mut guard = self
             .engine
             .write()
@@ -124,7 +159,10 @@ impl CedarOnlyEngine {
         *self
             .source
             .write()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))? = policy_src.to_string();
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))? = source;
+        // Advanced while the engine write lock is held, so a reader that
+        // observes the new generation under the read lock also sees the new
+        // policy.
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         Ok(())
@@ -147,6 +185,12 @@ impl CedarOnlyEngine {
         Ok(guard.filesystem_grants().clone())
     }
 }
+
+/// A validated Cedar policy waiting for [`CedarOnlyEngine::commit`].
+///
+/// Empty when the staged source matched the active policy.
+#[derive(Debug)]
+pub struct StagedCedarPolicy(Option<(CedarNetworkEngine, String)>);
 
 /// Value of an L7 endpoint config's `enforcement` key that makes the relay
 /// deny requests the policy does not allow. Any other value means audit-only
@@ -230,7 +274,7 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
     }
 
     fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        Self::current_generation(self)
     }
 
     fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {

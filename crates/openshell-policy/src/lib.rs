@@ -919,8 +919,20 @@ pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// This is the inverse of [`parse_sandbox_policy`] — the output uses the
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
+///
+/// A Cedar-authored policy serializes to its Cedar source instead, which is
+/// round-trippable through [`parse_cedar_sandbox_policy_file`]. Its YAML
+/// fields are unused, so rendering them would hide the enforced rules.
+///
+/// # Errors
+///
+/// Returns an error if the policy version is unsupported or the policy is
+/// invalid.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     validate_proto_version_for_authored_serialization(policy)?;
+    if !policy.cedar_policy_source.is_empty() {
+        return Ok(policy.cedar_policy_source.clone());
+    }
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
@@ -931,8 +943,22 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 ///
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
+///
+/// A Cedar-authored policy renders as `{"version": 1, "cedar_policy_source":
+/// "<Cedar text>"}`, since its YAML fields are unused.
+///
+/// # Errors
+///
+/// Returns an error if the policy version is unsupported or the policy is
+/// invalid.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
     validate_proto_version_for_authored_serialization(policy)?;
+    if !policy.cedar_policy_source.is_empty() {
+        return Ok(serde_json::json!({
+            "version": 1,
+            "cedar_policy_source": policy.cedar_policy_source,
+        }));
+    }
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
@@ -1414,6 +1440,11 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
     if !policy.network_policies.is_empty() {
         violations.push(PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies);
     }
+    if !policy.network_middlewares.is_empty() {
+        violations.push(PolicyViolation::InvalidCedarPolicy {
+            reason: "network_middlewares are not supported for Cedar policies".to_string(),
+        });
+    }
     match openshell_policy_cedar::CedarNetworkEngine::from_policy_str(&policy.cedar_policy_source) {
         Ok(engine) => {
             let grants = engine.filesystem_grants();
@@ -1423,6 +1454,23 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
             reason: error.to_string(),
         }),
     }
+}
+
+/// Returns the Landlock grants a Cedar policy source authorizes.
+///
+/// Grants are returned as a proto `FilesystemPolicy` so callers can compare
+/// them with the same rules that apply to YAML `filesystem` sections.
+/// Returns `None` if the source does not load; validation reports why.
+#[must_use]
+pub fn cedar_filesystem_grants(cedar_policy_source: &str) -> Option<FilesystemPolicy> {
+    let engine =
+        openshell_policy_cedar::CedarNetworkEngine::from_policy_str(cedar_policy_source).ok()?;
+    let grants = engine.filesystem_grants();
+    Some(FilesystemPolicy {
+        include_workdir: false,
+        read_only: grants.read_only.clone(),
+        read_write: grants.read_write.clone(),
+    })
 }
 
 /// Checks filesystem grant paths for safety, appending any violations.
@@ -2123,6 +2171,22 @@ when { context.binary_path == "/usr/bin/curl" };
             network_middlewares: HashMap::default(),
             cedar_policy_source: cedar_policy_source.to_string(),
         }
+    }
+
+    #[test]
+    fn cedar_policy_serializes_to_its_cedar_source() {
+        let source = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#;
+        let policy = cedar_sourced_policy(source);
+
+        assert_eq!(
+            serialize_sandbox_policy(&policy).expect("serialize"),
+            source
+        );
+        assert_eq!(
+            sandbox_policy_to_json_value(&policy).expect("serialize")["cedar_policy_source"],
+            source
+        );
     }
 
     #[test]

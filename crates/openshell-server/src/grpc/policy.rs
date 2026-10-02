@@ -1818,7 +1818,12 @@ async fn apply_effective_policy_context(
         provider_names,
     )
     .await?;
-    if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
+    // Provider layers are YAML rules and never apply to a Cedar policy; see
+    // `validate_candidate_effective_policy`.
+    if !matches!(policy_source, PolicySource::Global)
+        && policy.cedar_policy_source.is_empty()
+        && !provider_context.layers.is_empty()
+    {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
     let policy_credential_bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
@@ -1851,6 +1856,16 @@ pub(super) fn validate_candidate_effective_policy(
     base_policy: &ProtoSandboxPolicy,
     provider_layers: &[ProviderPolicyLayer],
 ) -> Result<(), Status> {
+    // Provider layers are YAML network rules. Composing them into a Cedar
+    // policy would give the sandbox both formats, and the Cedar engine would
+    // ignore them, so provider endpoints and credential injection would
+    // silently not work.
+    if !base_policy.cedar_policy_source.is_empty() && !provider_layers.is_empty() {
+        return Err(Status::failed_precondition(
+            "providers with network policies cannot be attached to a sandbox whose policy is \
+             written in Cedar; grant the provider's endpoints in the Cedar policy instead",
+        ));
+    }
     let effective_policy = if provider_layers.is_empty() {
         base_policy.clone()
     } else {
@@ -3516,6 +3531,14 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            // A global policy replaces every sandbox's policy, and a sandbox
+            // cannot switch formats after it starts, so a Cedar global policy
+            // would be rejected by every YAML sandbox.
+            if !new_policy.cedar_policy_source.is_empty() {
+                return Err(Status::invalid_argument(
+                    "global policies must be YAML; Cedar policies can only be set per sandbox",
+                ));
+            }
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
@@ -10691,6 +10714,30 @@ mod tests {
             response.policy_hash,
             deterministic_policy_hash(&effective_policy)
         );
+    }
+
+    #[test]
+    fn candidate_effective_policy_rejects_providers_on_a_cedar_policy() {
+        let base = ProtoSandboxPolicy {
+            cedar_policy_source:
+                "permit(principal, action == Sandbox::Action::\"NetworkConnect\", \
+                                  resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                    .to_string(),
+            ..Default::default()
+        };
+        let provider_rule = test_policy_with_rule("provider", "api.example.com")
+            .network_policies
+            .remove("provider")
+            .unwrap();
+        let layers = [ProviderPolicyLayer {
+            rule_name: "_provider_test".to_string(),
+            rule: provider_rule,
+        }];
+
+        let error = validate_candidate_effective_policy(&base, &layers)
+            .expect_err("provider layers must not compose into a Cedar policy");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(validate_candidate_effective_policy(&base, &[]).is_ok());
     }
 
     #[test]
@@ -18686,6 +18733,31 @@ mod tests {
             "expected rejection message to echo the bad value and list allowed values; got: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_policy_rejects_cedar_policy() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(ProtoSandboxPolicy {
+                    version: 1,
+                    cedar_policy_source: "permit(principal, \
+                        action == Sandbox::Action::\"NetworkConnect\", \
+                        resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                        .to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a Cedar global policy must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Cedar"), "{}", err.message());
     }
 
     #[tokio::test]

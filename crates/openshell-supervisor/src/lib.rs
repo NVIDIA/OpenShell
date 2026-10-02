@@ -465,17 +465,21 @@ pub async fn run_network_proxy(
     }
 
     let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
-    let (mut policy, opa_engine, _, _, _, initial_agent_proposals_enabled, _, _cedar_engine) =
-        load_policy(
-            None,
-            None,
-            None,
-            Some(policy_rules),
-            Some(policy_data),
-            &extension_credentials,
-            LocalPolicyIdentity::EndpointOnly,
-        )
-        .await?;
+    let LoadedPolicy {
+        mut policy,
+        opa_engine,
+        agent_proposals_enabled: initial_agent_proposals_enabled,
+        ..
+    } = load_policy(
+        None,
+        None,
+        None,
+        Some(policy_rules),
+        Some(policy_data),
+        &extension_credentials,
+        LocalPolicyIdentity::EndpointOnly,
+    )
+    .await?;
     policy.network = NetworkPolicy {
         mode: NetworkMode::Proxy,
         proxy: Some(ProxyPolicy {
@@ -617,16 +621,16 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (
+    let LoadedPolicy {
         policy,
         opa_engine,
-        retained_proto,
+        proto: retained_proto,
         middleware_registry_status,
-        loaded_policy_origin,
-        initial_agent_proposals_enabled,
-        initial_extension_authentication_enabled,
+        origin: loaded_policy_origin,
+        agent_proposals_enabled: initial_agent_proposals_enabled,
+        extension_authentication_enabled: initial_extension_authentication_enabled,
         cedar_engine,
-    ) = load_policy(
+    } = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -2094,6 +2098,21 @@ enum LocalPolicyIdentity {
     EndpointOnly,
 }
 
+/// Policy state produced by [`load_policy`] at supervisor startup.
+struct LoadedPolicy {
+    policy: SandboxPolicy,
+    opa_engine: Option<Arc<OpaEngine>>,
+    /// The gateway-delivered policy, retained for reload comparison.
+    proto: Option<openshell_core::proto::SandboxPolicy>,
+    middleware_registry_status: MiddlewareRegistryStatus,
+    origin: LoadedPolicyOrigin,
+    agent_proposals_enabled: bool,
+    extension_authentication_enabled: bool,
+    /// The authoritative engine when the policy is Cedar-authored. The OPA
+    /// engine then only serves middleware and tunnel plumbing.
+    cedar_engine: Option<Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine>>,
+}
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -2102,16 +2121,7 @@ async fn load_policy(
     policy_data: Option<String>,
     extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
     local_policy_identity: LocalPolicyIdentity,
-) -> Result<(
-    SandboxPolicy,
-    Option<Arc<OpaEngine>>,
-    Option<openshell_core::proto::SandboxPolicy>,
-    MiddlewareRegistryStatus,
-    LoadedPolicyOrigin,
-    bool,
-    bool,
-    Option<Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine>>,
-)> {
+) -> Result<LoadedPolicy> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -2162,16 +2172,16 @@ async fn load_policy(
         };
         enrich_sandbox_baseline_paths(&mut policy);
         // File mode has no operator-registered middleware to connect.
-        return Ok((
+        return Ok(LoadedPolicy {
             policy,
-            Some(Arc::new(engine)),
-            None,
-            MiddlewareRegistryStatus::Synchronized,
-            LoadedPolicyOrigin::LocalOverride,
-            false,
-            false,
-            None,
-        ));
+            opa_engine: Some(Arc::new(engine)),
+            proto: None,
+            middleware_registry_status: MiddlewareRegistryStatus::Synchronized,
+            origin: LoadedPolicyOrigin::LocalOverride,
+            agent_proposals_enabled: false,
+            extension_authentication_enabled: false,
+            cedar_engine: None,
+        });
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -2239,7 +2249,11 @@ async fn load_policy(
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
-        let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+        // A Cedar-authored policy's Landlock grants come from the Cedar text,
+        // not `filesystem`, so its baseline paths are added after extraction
+        // below instead.
+        let enriched = proto_policy.cedar_policy_source.is_empty()
+            && enrich_proto_baseline_paths(&mut proto_policy);
         let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
         if let Some(sync_policy) = sync_policy {
             if let Some(sandbox_name) = sandbox.as_deref() {
@@ -2448,20 +2462,24 @@ async fn load_policy(
                     .collect(),
                 include_workdir: false,
             };
+            // Same baseline YAML proxy-mode sandboxes get. Without it, a
+            // Cedar policy with no filesystem permits would yield an empty
+            // grant list, which applies no Landlock ruleset at all.
+            enrich_sandbox_baseline_paths(&mut policy);
         }
-        return Ok((
+        return Ok(LoadedPolicy {
             policy,
             opa_engine,
-            Some(proto_policy),
+            proto: Some(proto_policy),
             middleware_registry_status,
-            LoadedPolicyOrigin::Gateway {
+            origin: LoadedPolicyOrigin::Gateway {
                 revision: loaded_policy_revision,
                 has_last_valid_policy,
             },
-            agent_proposals_enabled_from_settings(&snapshot.settings),
-            snapshot.extension_authentication_enabled,
+            agent_proposals_enabled: agent_proposals_enabled_from_settings(&snapshot.settings),
+            extension_authentication_enabled: snapshot.extension_authentication_enabled,
             cedar_engine,
-        ));
+        });
     }
 
     // No policy source available
@@ -2663,6 +2681,35 @@ async fn reload_gateway_policy_runtime(
             ));
         }
     }
+    // The authoritative engine is chosen once at startup from the policy
+    // format, so a reload cannot switch formats. Accepting one would leave
+    // the previous engine enforcing a stale policy while reporting success.
+    // A Cedar policy is validated here, before the OPA reload commits, so a
+    // rejected Cedar policy leaves both engines on the previous revision.
+    let staged_cedar = match (cedar_engine, policy) {
+        (Some(_), Some(policy)) if policy.cedar_policy_source.is_empty() => {
+            return Err(GatewayRuntimeReloadError::PolicyValidation(
+                miette::miette!(
+                    "candidate policy is YAML, but this sandbox enforces a Cedar policy; \
+                 a sandbox cannot switch policy formats; previous policy remains active"
+                ),
+            ));
+        }
+        (None, Some(policy)) if !policy.cedar_policy_source.is_empty() => {
+            return Err(GatewayRuntimeReloadError::PolicyValidation(
+                miette::miette!(
+                    "candidate policy is Cedar, but this sandbox enforces a YAML policy; \
+                 a sandbox cannot switch policy formats; previous policy remains active"
+                ),
+            ));
+        }
+        (Some(cedar_engine), Some(policy)) => Some(
+            cedar_engine
+                .stage(&policy.cedar_policy_source)
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?,
+        ),
+        _ => None,
+    };
     let result = match policy {
         Some(policy) if middleware.registry_changed => {
             let registry = (middleware.connector)(
@@ -2685,15 +2732,12 @@ async fn reload_gateway_policy_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
     };
-    // Cedar-sourced sandbox: reload the authoritative Cedar engine alongside
-    // the (harmless, OPA-call-site-only) OPA reload above. Unlike the shadow
-    // engine below, a failure here is authoritative and fails the reload.
+    // Cedar-sourced sandbox: activate the Cedar policy validated above, now
+    // that the OPA plumbing reload has succeeded.
     let result = result.and_then(|guard| {
-        if let (Some(cedar_engine), Some(policy)) = (cedar_engine, policy)
-            && !policy.cedar_policy_source.is_empty()
-        {
+        if let (Some(cedar_engine), Some(staged)) = (cedar_engine, staged_cedar) {
             cedar_engine
-                .reload_from_policy_str(&policy.cedar_policy_source)
+                .commit(staged)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
         }
         Ok(guard)
@@ -6219,8 +6263,15 @@ network_policies:
                 LocalPolicyIdentity::Required,
             )
         };
-        let (_, engine, proto, registry, origin, proposals, extension_authentication_enabled, _) =
-            startup().await.expect("load valid local policy");
+        let LoadedPolicy {
+            opa_engine: engine,
+            proto,
+            middleware_registry_status: registry,
+            origin,
+            agent_proposals_enabled: proposals,
+            extension_authentication_enabled,
+            ..
+        } = startup().await.expect("load valid local policy");
         assert!(proto.is_none());
         assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
         assert!(matches!(registry, MiddlewareRegistryStatus::Synchronized));
@@ -6342,6 +6393,103 @@ network_policies:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+    }
+
+    const CEDAR_RELOAD_POLICY: &str = r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");
+"#;
+
+    fn cedar_proto_policy(source: &str) -> openshell_core::proto::SandboxPolicy {
+        openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn reload_with_cedar(
+        engine: &OpaEngine,
+        cedar_engine: Option<&Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine>>,
+        policy: &openshell_core::proto::SandboxPolicy,
+    ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
+        reload_gateway_policy_runtime(
+            engine,
+            None,
+            cedar_engine,
+            Some(policy),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn yaml_reload_of_a_cedar_sandbox_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&cedar_proto_policy(CEDAR_RELOAD_POLICY))
+            .expect("build OPA engine");
+        let cedar = Arc::new(
+            openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_policy_str(
+                CEDAR_RELOAD_POLICY,
+            )
+            .expect("build Cedar engine"),
+        );
+        let opa_generation = engine.current_generation();
+        let cedar_generation = cedar.current_generation();
+
+        let failure = reload_with_cedar(&engine, Some(&cedar), &proto_policy_fixture())
+            .await
+            .expect_err("format switch must be rejected");
+
+        assert!(
+            matches!(failure, GatewayRuntimeReloadError::PolicyValidation(_)),
+            "{failure:?}"
+        );
+        assert_eq!(engine.current_generation(), opa_generation);
+        assert_eq!(cedar.current_generation(), cedar_generation);
+    }
+
+    #[tokio::test]
+    async fn cedar_reload_of_a_yaml_sandbox_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let opa_generation = engine.current_generation();
+
+        let failure = reload_with_cedar(&engine, None, &cedar_proto_policy(CEDAR_RELOAD_POLICY))
+            .await
+            .expect_err("format switch must be rejected");
+
+        assert!(
+            matches!(failure, GatewayRuntimeReloadError::PolicyValidation(_)),
+            "{failure:?}"
+        );
+        assert_eq!(engine.current_generation(), opa_generation);
+    }
+
+    #[tokio::test]
+    async fn invalid_cedar_reload_leaves_both_engines_on_the_previous_policy() {
+        let engine = OpaEngine::from_proto(&cedar_proto_policy(CEDAR_RELOAD_POLICY))
+            .expect("build OPA engine");
+        let cedar = Arc::new(
+            openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_policy_str(
+                CEDAR_RELOAD_POLICY,
+            )
+            .expect("build Cedar engine"),
+        );
+        let opa_generation = engine.current_generation();
+        let cedar_generation = cedar.current_generation();
+
+        reload_with_cedar(&engine, Some(&cedar), &cedar_proto_policy("not cedar {{{"))
+            .await
+            .expect_err("invalid Cedar policy must be rejected");
+
+        assert_eq!(engine.current_generation(), opa_generation);
+        assert_eq!(cedar.current_generation(), cedar_generation);
     }
 
     #[tokio::test]

@@ -113,10 +113,11 @@ func SandboxPolicyFromProto(p *sbv1.SandboxPolicy) *types.SandboxPolicy {
 		return nil
 	}
 	result := &types.SandboxPolicy{
-		Version:    p.GetVersion(),
-		Filesystem: filesystemPolicyFromProto(p.GetFilesystem()),
-		Landlock:   landlockPolicyFromProto(p.GetLandlock()),
-		Process:    processPolicyFromProto(p.GetProcess()),
+		Version:           p.GetVersion(),
+		Filesystem:        filesystemPolicyFromProto(p.GetFilesystem()),
+		Landlock:          landlockPolicyFromProto(p.GetLandlock()),
+		Process:           processPolicyFromProto(p.GetProcess()),
+		CedarPolicySource: p.GetCedarPolicySource(),
 	}
 	if np := p.GetNetworkPolicies(); np != nil {
 		result.NetworkPolicies = make(map[string]types.NetworkPolicyRule, len(np))
@@ -144,10 +145,11 @@ func SandboxPolicyToProto(p *types.SandboxPolicy) *sbv1.SandboxPolicy {
 		return nil
 	}
 	result := &sbv1.SandboxPolicy{
-		Version:    p.Version,
-		Filesystem: filesystemPolicyToProto(p.Filesystem),
-		Landlock:   landlockPolicyToProto(p.Landlock),
-		Process:    processPolicyToProto(p.Process),
+		Version:           p.Version,
+		Filesystem:        filesystemPolicyToProto(p.Filesystem),
+		Landlock:          landlockPolicyToProto(p.Landlock),
+		Process:           processPolicyToProto(p.Process),
+		CedarPolicySource: p.CedarPolicySource,
 	}
 	if p.NetworkPolicies != nil {
 		result.NetworkPolicies = make(map[string]*sbv1.NetworkPolicyRule, len(p.NetworkPolicies))

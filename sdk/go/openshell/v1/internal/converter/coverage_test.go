@@ -168,6 +168,7 @@ func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 		"process":             true,
 		"landlock":            true,
 		"network_middlewares": true,
+		"cedar_policy_source": true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.SandboxPolicy{}).ProtoReflect().Descriptor(), handled, nil)

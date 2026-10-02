@@ -143,8 +143,18 @@ type SandboxPolicy struct {
 	// policy-local names. At most 10 configs are accepted, and at most 10 stages
 	// can be selected per request.
 	NetworkMiddlewares map[string]*NetworkMiddlewareConfig `protobuf:"bytes,6,rep,name=network_middlewares,json=networkMiddlewares,proto3" json:"network_middlewares,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Raw Cedar policy source (.cedar syntax, against the canonical schema
+	// published by the openshell-policy-cedar-schema crate). When non-empty,
+	// this sandbox's network, per-request, and filesystem decisions come
+	// entirely from Cedar: Landlock grants are derived from the Cedar text
+	// (plus the supervisor's baseline paths), and `filesystem` is not used.
+	// `landlock.compatibility` and `process` are still honored. Rejected at
+	// validation if `network_policies` or `network_middlewares` is also set.
+	// A sandbox cannot switch between Cedar and YAML after creation, and
+	// global policies must be YAML.
+	CedarPolicySource string `protobuf:"bytes,7,opt,name=cedar_policy_source,json=cedarPolicySource,proto3" json:"cedar_policy_source,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *SandboxPolicy) Reset() {
@@ -217,6 +227,13 @@ func (x *SandboxPolicy) GetNetworkMiddlewares() map[string]*NetworkMiddlewareCon
 		return x.NetworkMiddlewares
 	}
 	return nil
+}
+
+func (x *SandboxPolicy) GetCedarPolicySource() string {
+	if x != nil {
+		return x.CedarPolicySource
+	}
+	return ""
 }
 
 // Filesystem access policy.
@@ -2067,7 +2084,7 @@ var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
 	"\n" +
-	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\"\xa8\x05\n" +
+	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\"\xd8\x05\n" +
 	"\rSandboxPolicy\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12F\n" +
 	"\n" +
@@ -2076,7 +2093,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\blandlock\x18\x03 \x01(\v2$.openshell.sandbox.v1.LandlockPolicyR\blandlock\x12=\n" +
 	"\aprocess\x18\x04 \x01(\v2#.openshell.sandbox.v1.ProcessPolicyR\aprocess\x12c\n" +
 	"\x10network_policies\x18\x05 \x03(\v28.openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntryR\x0fnetworkPolicies\x12l\n" +
-	"\x13network_middlewares\x18\x06 \x03(\v2;.openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntryR\x12networkMiddlewares\x1ak\n" +
+	"\x13network_middlewares\x18\x06 \x03(\v2;.openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntryR\x12networkMiddlewares\x12.\n" +
+	"\x13cedar_policy_source\x18\a \x01(\tR\x11cedarPolicySource\x1ak\n" +
 	"\x14NetworkPoliciesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12=\n" +
 	"\x05value\x18\x02 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\x05value:\x028\x01\x1at\n" +

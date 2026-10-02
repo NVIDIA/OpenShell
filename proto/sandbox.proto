@@ -34,13 +34,13 @@ message SandboxPolicy {
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
   // Raw Cedar policy source (.cedar syntax, against the canonical schema
   // published by the openshell-policy-cedar-schema crate). When non-empty,
-  // this sandbox's network and filesystem decisions come entirely from
-  // Cedar: `filesystem`, `landlock`, and `network_policies` above are
-  // ignored. `process` is still honored (identity passthrough, not a
-  // policy decision). Mutually exclusive with a non-empty
-  // `network_policies`; rejected at validation if both are set.
-  // Middleware (`network_middlewares`) is not supported for Cedar-sourced
-  // policies.
+  // this sandbox's network, per-request, and filesystem decisions come
+  // entirely from Cedar: Landlock grants are derived from the Cedar text
+  // (plus the supervisor's baseline paths), and `filesystem` is not used.
+  // `landlock.compatibility` and `process` are still honored. Rejected at
+  // validation if `network_policies` or `network_middlewares` is also set.
+  // A sandbox cannot switch between Cedar and YAML after creation, and
+  // global policies must be YAML.
   string cedar_policy_source = 7;
 }
 

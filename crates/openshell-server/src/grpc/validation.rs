@@ -1051,6 +1051,20 @@ pub(super) fn validate_static_fields_unchanged(
              recreate the sandbox instead",
         ));
     }
+    // A Cedar policy's Landlock grants come from its text. Apply the same
+    // additive-only rule as YAML `filesystem`: Landlock cannot revoke a grant
+    // from a running process, so a narrowing edit would report success while
+    // the old grants stay in force until restart.
+    if !baseline.cedar_policy_source.is_empty()
+        && baseline.cedar_policy_source != new.cedar_policy_source
+    {
+        let baseline_grants =
+            openshell_policy::cedar_filesystem_grants(&baseline.cedar_policy_source);
+        let new_grants = openshell_policy::cedar_filesystem_grants(&new.cedar_policy_source);
+        if let (Some(baseline_grants), Some(new_grants)) = (baseline_grants, new_grants) {
+            validate_filesystem_additive(Some(&baseline_grants), Some(&new_grants))?;
+        }
+    }
     Ok(())
 }
 
@@ -2282,6 +2296,39 @@ mod tests {
             cedar_policy_source: "forbid(principal, action, resource);".into(),
             ..Default::default()
         };
+        assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
+    }
+
+    fn cedar_policy_granting(paths: &[&str]) -> ProtoSandboxPolicy {
+        let cedar_policy_source = paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "permit(principal, action == Sandbox::Action::\"ReadFile\", \
+                     resource in Sandbox::FilesystemPath::\"{path}\");"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ProtoSandboxPolicy {
+            cedar_policy_source,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_removing_a_cedar_filesystem_grant() {
+        let baseline = cedar_policy_granting(&["/usr", "/etc"]);
+        let new = cedar_policy_granting(&["/usr"]);
+        let error = validate_static_fields_unchanged(&baseline, &new)
+            .expect_err("narrowing Landlock grants on a live sandbox must be rejected");
+        assert!(error.message().contains("/etc"), "{}", error.message());
+    }
+
+    #[test]
+    fn validate_static_fields_allows_adding_a_cedar_filesystem_grant() {
+        let baseline = cedar_policy_granting(&["/usr"]);
+        let new = cedar_policy_granting(&["/usr", "/etc"]);
         assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
     }
 
