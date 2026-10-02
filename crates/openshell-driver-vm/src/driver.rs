@@ -1021,6 +1021,15 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
+        let mut extension = openshell_core::extension_protocol::extension_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "openshell/vm",
+            openshell_core::VERSION,
+            [],
+        );
+        extension
+            .required_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: self.config.allow_driver_config,
@@ -1051,12 +1060,7 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
-                "openshell/vm",
-                openshell_core::VERSION,
-                [],
-            )),
+            extension: Some(extension),
         }
     }
 
@@ -1084,6 +1088,12 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         self.validate_sandbox(sandbox)?;
+        decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        )?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1274,6 +1284,14 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
+        // Launch credentials are independent of the image. Validate them before
+        // resolving registry references, preparing disks, or publishing progress.
+        let launch_authentication = decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        )?;
         let is_gpu = sandbox
             .spec
             .as_ref()
@@ -1353,29 +1371,6 @@ impl VmDriver {
                     )));
                 }
             };
-        let launch_authentication = sandbox
-            .spec
-            .as_ref()
-            .filter(|spec| !spec.launch_authentication.is_empty())
-            .ok_or_else(|| {
-                Status::failed_precondition("VM sandbox launch authentication is required")
-            })
-            .and_then(|spec| {
-                serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
-                    &spec.launch_authentication,
-                )
-                .map_err(|error| {
-                    Status::failed_precondition(format!(
-                        "decode VM sandbox launch authentication: {error}"
-                    ))
-                })
-            })?;
-        launch_authentication.validate().map_err(|error| {
-            Status::failed_precondition(format!(
-                "validate VM sandbox launch authentication: {error}"
-            ))
-        })?;
-
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -1889,6 +1884,10 @@ impl VmDriver {
                 return Ok(());
             }
         }
+        // An invalid replacement must not stop the active VM or remove the
+        // previous generation's credentials. Preserve the empty idempotent
+        // replay above, which does not request a new launch.
+        decode_launch_authentication(&launch_authentication)?;
         let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
             .await
             .map_err(|error| {
@@ -1916,17 +1915,6 @@ impl VmDriver {
         )
         .await
         .map_err(|error| Status::internal(format!("persist VM start generation: {error}")))?;
-        let authentication = serde_json::from_slice::<
-            openshell_core::jwt::SandboxLaunchAuthentication,
-        >(&launch_authentication)
-        .map_err(|error| {
-            Status::failed_precondition(format!("decode VM sandbox launch authentication: {error}"))
-        })?;
-        authentication.validate().map_err(|error| {
-            Status::failed_precondition(format!(
-                "validate VM sandbox launch authentication: {error}"
-            ))
-        })?;
         let spec = sandbox
             .spec
             .as_mut()
@@ -2219,6 +2207,17 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
+        // Startup recovery bypasses create/start admission. Validate saved
+        // credentials before host preparation, extension hooks, or state changes.
+        if let Err(error) = decode_launch_authentication(
+            sandbox
+                .spec
+                .as_ref()
+                .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+        ) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by launch authentication");
+            return false;
+        }
         if let Err(error) = self.validate_sandbox(&sandbox) {
             warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
             return false;
@@ -4511,6 +4510,29 @@ fn check_gpu_privileges() -> Result<(), String> {
 
 // `tonic::Status` is ~176 bytes; it's the standard error type across the
 // gRPC API surface, so boxing here would diverge from every other handler.
+#[allow(clippy::result_large_err)]
+fn decode_launch_authentication(
+    encoded: &[u8],
+) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
+    if encoded.is_empty() {
+        return Err(Status::failed_precondition(
+            "VM sandbox launch authentication is required; configure the gateway's \
+                 [openshell.gateway.gateway_jwt] signing bundle. Listener TLS is separate",
+        ));
+    }
+    // Serde errors may quote an unexpected field or value from the secret
+    // bundle. Return fixed diagnostics rather than forwarding those details.
+    let authentication =
+        serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(encoded)
+            .map_err(|_| {
+                Status::failed_precondition("VM sandbox launch authentication is malformed")
+            })?;
+    authentication.validate().map_err(|_| {
+        Status::failed_precondition("VM sandbox launch authentication has invalid fields")
+    })?;
+    Ok(authentication)
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     validate_sandbox_id(&sandbox.id)?;
@@ -7350,6 +7372,7 @@ mod tests {
             id: "sb-spawned-trace".to_string(),
             name: "spawned-trace".to_string(),
             spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("spawned-trace").0,
                 template: Some(SandboxTemplate {
                     image: "invalid image reference".to_string(),
                     ..Default::default()
@@ -7399,6 +7422,7 @@ mod tests {
                 id: format!("sb-restored-trace-{suffix}"),
                 name: format!("restored-trace-{suffix}"),
                 spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication(suffix).0,
                     template: Some(SandboxTemplate {
                         image: "invalid image reference".to_string(),
                         ..Default::default()
@@ -8873,6 +8897,78 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn malformed_start_preserves_active_and_stopped_generation_material() {
+        for active in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            driver.config.state_dir = directory.path().to_path_buf();
+            driver.config.default_image = "test/image:latest".to_string();
+            let sandbox = Sandbox {
+                id: "sb-auth-start".to_string(),
+                name: "auth-start".to_string(),
+                spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication("existing").0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let state_dir = directory.path().join("sandbox");
+            create_private_dir_all(&state_dir).await.unwrap();
+            write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+            // An empty marker on the stopped fixture avoids invoking debugfs if
+            // the guard regresses, so the test reaches the destructive host cleanup.
+            let generation = if active { "g0000000000000001" } else { "" };
+            std::fs::write(state_dir.join(HOST_BOUNDARY_GENERATION_FILE), generation).unwrap();
+            std::fs::write(
+                state_dir.join(HOST_AUTH_BUNDLE_FILE),
+                b"retained authentication",
+            )
+            .unwrap();
+            let task = active.then(|| tokio::spawn(std::future::pending()));
+            driver.registry.lock().await.insert(
+                sandbox.id.clone(),
+                SandboxRecord {
+                    snapshot: sandbox.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: task,
+                    gpu_bdf: None,
+                    deleting: false,
+                },
+            );
+            let error = driver
+                .start_sandbox(
+                    &sandbox.id,
+                    &sandbox.name,
+                    "g0000000000000001",
+                    br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert_eq!(
+                error.message(),
+                "VM sandbox launch authentication is malformed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).unwrap(),
+                generation
+            );
+            assert_eq!(
+                std::fs::read(state_dir.join(HOST_AUTH_BUNDLE_FILE)).unwrap(),
+                b"retained authentication"
+            );
+            let record = driver.registry.lock().await.remove(&sandbox.id).unwrap();
+            assert_eq!(record.snapshot, sandbox);
+            assert_eq!(record.provisioning_task.is_some(), active);
+            if let Some(task) = record.provisioning_task {
+                assert!(!task.is_finished());
+                task.abort();
+            }
+        }
+    }
+
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {
         use openshell_core::jwt::{
             SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey, SupervisorAuthBundle,
@@ -9002,6 +9098,227 @@ mod tests {
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
+        let gateway = openshell_core::extension_protocol::gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+        );
+        let negotiated = openshell_core::extension_protocol::negotiate(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "vm",
+            &gateway,
+            driver.capabilities().extension,
+        )
+        .unwrap();
+        assert!(negotiated.required_capabilities.iter().any(|capability| {
+            capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
+        }));
+    }
+
+    #[tokio::test]
+    async fn launch_authentication_is_checked_before_create_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        driver.config.default_image = "invalid image reference".to_string();
+        let mut events = driver.events.subscribe();
+        let mut invalid_fields: serde_json::Value =
+            serde_json::from_slice(&test_launch_authentication("invalid-fields").0).unwrap();
+        invalid_fields["verification_keys"] = serde_json::json!([]);
+        let malformed = br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec();
+
+        for (authentication, diagnostic) in [
+            (Vec::new(), "is required"),
+            (malformed, "is malformed"),
+            (
+                serde_json::to_vec(&invalid_fields).unwrap(),
+                "has invalid fields",
+            ),
+        ] {
+            let sandbox = Sandbox {
+                id: "sb-auth-preflight".to_string(),
+                name: "auth-preflight".to_string(),
+                spec: Some(SandboxSpec {
+                    launch_authentication: authentication,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let error = driver
+                .create_sandbox(&sandbox)
+                .await
+                .expect_err("invalid launch material must fail synchronously");
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert!(error.message().contains(diagnostic), "{error}");
+            assert!(!error.message().contains("secret-marker"));
+            assert!(driver.registry.lock().await.is_empty());
+            assert!(directory.path().read_dir().unwrap().next().is_none());
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioning_rechecks_launch_authentication_before_resolving_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
+        let sandbox = Sandbox {
+            id: "sb-auth-recovery".to_string(),
+            name: "auth-recovery".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let state_dir = directory.path().join("sandbox");
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox.clone(),
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        let mut events = driver.events.subscribe();
+        let error = driver
+            .provision_sandbox_inner(
+                sandbox,
+                "invalid image reference".to_string(),
+                state_dir,
+                None,
+                OverlayPreparation::PreserveExisting,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("VM sandbox launch authentication is required")
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_invalid_launch_authentication_before_side_effects() {
+        #[derive(Debug, Default)]
+        struct RestoreObserver {
+            calls: AtomicUsize,
+        }
+
+        #[tonic::async_trait]
+        impl LifecycleExtension for RestoreObserver {
+            fn name(&self) -> &'static str {
+                "restore-observer"
+            }
+
+            async fn before_restore(&self, _sandbox: &RestoreContext) -> LifecycleResult<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        for scan_at_startup in [true, false] {
+            for authentication in [
+                Vec::new(),
+                br#"{"secret-marker-that-must-not-be-logged":true}"#.to_vec(),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let observer = Arc::new(RestoreObserver::default());
+                let mut driver =
+                    test_driver_with_extensions(LifecycleExtensionRegistry::with(vec![
+                        observer.clone(),
+                    ]));
+                driver.config.state_dir = directory.path().to_path_buf();
+                driver.config.default_image = "invalid image reference".to_string();
+                let sandbox = Sandbox {
+                    id: "sb-auth-restore".to_string(),
+                    name: "auth-restore".to_string(),
+                    spec: Some(SandboxSpec {
+                        launch_authentication: authentication,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let state_dir = sandbox_state_dir(directory.path(), &sandbox.id).unwrap();
+                create_private_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                fs::write(state_dir.join("overlay.ext4"), b"retained overlay").unwrap();
+                fs::write(state_dir.join(HOST_AUTH_BUNDLE_FILE), b"retained auth").unwrap();
+                if !scan_at_startup {
+                    fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n").unwrap();
+                }
+                let mut original_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                original_files.sort();
+                let mut events = driver.events.subscribe();
+
+                let accepted = if scan_at_startup {
+                    driver.restore_persisted_sandboxes().await;
+                    false
+                } else {
+                    driver
+                        .restore_persisted_sandbox(
+                            sandbox.clone(),
+                            state_dir.clone(),
+                            true,
+                            &tracing::Span::current(),
+                        )
+                        .await
+                };
+                // If validation regresses, join the failed provisioning task so
+                // its later cleanup cannot race with the state assertions.
+                let task = driver
+                    .registry
+                    .lock()
+                    .await
+                    .get_mut(&sandbox.id)
+                    .and_then(|record| record.provisioning_task.take());
+                if let Some(task) = task {
+                    task.await.unwrap();
+                }
+
+                assert!(
+                    !accepted,
+                    "invalid launch credentials must deny restoration"
+                );
+                assert_eq!(
+                    observer.calls.load(Ordering::Relaxed),
+                    0,
+                    "launch authentication must precede lifecycle extension hooks"
+                );
+                assert!(driver.registry.lock().await.is_empty());
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+                assert!(
+                    !extension_state_dir(&state_dir, "restore-observer")
+                        .unwrap()
+                        .exists()
+                );
+                let mut retained_files = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (entry.file_name(), fs::read(entry.path()).unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                retained_files.sort();
+                assert_eq!(retained_files, original_files);
+            }
+        }
     }
 
     #[test]
@@ -9967,7 +10284,10 @@ mod tests {
             .create_sandbox(&Sandbox {
                 id: "sandbox-123".to_string(),
                 name: "sandbox-123".to_string(),
-                spec: Some(SandboxSpec::default()),
+                spec: Some(SandboxSpec {
+                    launch_authentication: test_launch_authentication("duplicate").0,
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
             .await

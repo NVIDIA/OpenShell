@@ -363,7 +363,15 @@ fn prepare_server_config_with_drivers(
         args.disable_tls,
     )
     .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
-    let local_jwt = defaults::complete_local_jwt_config()?;
+    // Explicit signing configuration must not depend on an unrelated, partial
+    // local bundle left by a package-managed installation.
+    let explicit_jwt = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.gateway_jwt.clone());
+    let gateway_jwt = match explicit_jwt {
+        Some(jwt) => Some(jwt),
+        None => defaults::complete_local_jwt_config()?,
+    };
 
     let bind = SocketAddr::new(args.bind_address, args.port);
 
@@ -569,14 +577,7 @@ fn prepare_server_config_with_drivers(
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
-    if let Some(jwt) = file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
-    {
-        config.gateway_jwt = Some(jwt);
-    } else if let Some(jwt) = local_jwt {
-        config.gateway_jwt = Some(jwt);
-    }
+    config.gateway_jwt = gateway_jwt;
 
     Ok(ServerStartupConfig {
         config,
@@ -3283,5 +3284,53 @@ mem_mib = "not-a-number"
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn explicit_launch_signing_config_ignores_partial_local_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", directory.path().to_str().unwrap());
+        let _local = EnvVarGuard::set(
+            "OPENSHELL_LOCAL_TLS_DIR",
+            directory.path().to_str().unwrap(),
+        );
+        std::fs::create_dir(directory.path().join("jwt")).unwrap();
+        std::fs::write(
+            directory.path().join("jwt/signing.pem"),
+            "incomplete local bundle",
+        )
+        .unwrap();
+        let config_path = directory.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/explicit/signing.pem"
+public_key_path = "/explicit/public.pem"
+kid_path = "/explicit/kid"
+gateway_id = "explicit-gateway"
+"#,
+        )
+        .unwrap();
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+        let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+        assert_eq!(
+            prepared.config.gateway_jwt.unwrap().gateway_id,
+            "explicit-gateway"
+        );
     }
 }
