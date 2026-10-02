@@ -4,6 +4,7 @@
 //! Persistence layer for `OpenShell` Server.
 
 mod legacy_time_wire;
+pub mod mutation_lock;
 mod postgres;
 mod sqlite;
 
@@ -17,6 +18,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
@@ -58,6 +60,10 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// The mutation lock was not acquired before its deadline, so this
+    /// request's guarded writes did not run; the operation is safe to retry.
+    #[error("mutation lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 impl PersistenceError {
@@ -202,6 +208,21 @@ pub struct DistributedMutationGuard {
     _postgres: Option<postgres::PostgresAdvisoryLockGuard>,
 }
 
+#[cfg(test)]
+impl DistributedMutationGuard {
+    /// Backend process id of the `PostgreSQL` session holding the locks, or
+    /// `None` on `SQLite`.
+    pub(crate) async fn postgres_backend_pid(&mut self) -> Option<i32> {
+        let Self {
+            _postgres: postgres,
+        } = self;
+        match postgres {
+            Some(guard) => Some(guard.backend_pid().await),
+            None => None,
+        }
+    }
+}
+
 /// Trait for inferring an object type string from a message type.
 pub trait ObjectType {
     fn object_type() -> &'static str;
@@ -285,15 +306,22 @@ impl Store {
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local
-    /// mutex. `PostgreSQL` deployments additionally hold a session-level
-    /// advisory lock so concurrent gateway replicas cannot validate and write
-    /// the same cross-object invariant independently.
+    /// locks. `PostgreSQL` deployments additionally hold `locks` as
+    /// session-level advisory locks, taken in ascending key order on one
+    /// connection from the dedicated lock pool, so concurrent gateway replicas
+    /// cannot validate and write the same cross-object invariant
+    /// independently. Fails with [`PersistenceError::LockTimeout`] when the
+    /// locks are not acquired by `deadline`, and with
+    /// [`PersistenceError::Database`] when `PostgreSQL` does not open a lock
+    /// connection in at least [`mutation_lock::LOCK_CONNECTION_MIN_BUDGET`].
     pub async fn acquire_distributed_mutation_guard(
         &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
     ) -> PersistenceResult<DistributedMutationGuard> {
         match self {
             Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_cross_object_lock().await?),
+                _postgres: Some(store.acquire_mutation_locks(locks, deadline).await?),
             }),
             Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
         }
@@ -1028,20 +1056,6 @@ impl Store {
             .collect()
     }
 
-    /// List and decode protobuf messages across all workspaces, hydrating
-    /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<T>> {
-        self.list_by_type(T::object_type(), limit, offset)
-            .await?
-            .into_iter()
-            .map(decode_record)
-            .collect()
-    }
-
     /// List and decode objects that have a related membership record, with
     /// pagination. See [`Store::list_with_membership`] for details.
     pub async fn list_messages_with_membership<
@@ -1396,6 +1410,12 @@ pub async fn test_store() -> Store {
         .await
         .expect("in-memory SQLite store should connect")
 }
+
+#[cfg(test)]
+pub mod test_postgres;
+
+#[cfg(test)]
+mod mutation_lock_pg_tests;
 
 #[cfg(test)]
 mod tests;

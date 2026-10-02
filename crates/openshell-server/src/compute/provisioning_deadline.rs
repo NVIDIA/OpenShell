@@ -339,7 +339,7 @@ impl super::ComputeRuntime {
     pub(super) async fn reconcile_provisioning_deadlines(&self, now_ms: i64) -> Result<(), String> {
         use crate::persistence::{ObjectListQuery, ObjectType};
         use openshell_core::{
-            ObjectId,
+            ObjectId, ObjectWorkspace,
             proto::{Sandbox, SandboxPhase},
         };
         use prost::Message;
@@ -361,7 +361,9 @@ impl super::ComputeRuntime {
             // Expiration can fence Starting while its driver RPC owns the
             // lifecycle gate. Cleanup waits for that gate; Error never waits
             // for compute I/O, matching the existing driver-observation fence.
-            let global = self.sync_lock.clone().lock_owned().await;
+            let local_guard = self
+                .lock_sandbox_local_in_workspace(candidate.object_workspace(), &record.id)
+                .await;
             let Some(mut current) = self
                 .store
                 .get_message::<Sandbox>(&record.id)
@@ -387,7 +389,7 @@ impl super::ComputeRuntime {
             if let Some(expired) = self.claim_provisioning_timeout(&current, now_ms).await? {
                 current = expired;
             }
-            drop(global);
+            drop(local_guard);
             if timed_out(&current)
                 && current
                     .status
@@ -402,10 +404,9 @@ impl super::ComputeRuntime {
                                 .is_none_or(|t| t <= now_ms)
                     })
             {
-                let Ok(guard) = self.lifecycle_gates.gate_for(&record.id).try_lock_owned() else {
+                let Some(gate) = self.lifecycle_gates.try_lock_for(&record.id) else {
                     continue;
                 };
-                let gate = super::SandboxLifecycleGuard { _guard: guard };
                 let runtime = self.clone();
                 tokio::spawn(async move {
                     if let Err(error) = runtime.reclaim_provisioning_timeout(&current, &gate).await
@@ -419,7 +420,7 @@ impl super::ComputeRuntime {
     }
 
     /// Claim expiration durably before touching the backend. The caller owns the
-    /// global configuration guard; CAS fences concurrent lifecycle operations.
+    /// sandbox's local mutation lock; CAS fences concurrent lifecycle operations.
     /// The separate cleanup step also requires the per-sandbox lifecycle gate.
     pub(crate) async fn claim_provisioning_timeout(
         &self,
@@ -505,7 +506,7 @@ impl super::ComputeRuntime {
         use openshell_core::proto::compute::v1::StopSandboxRequest;
         use openshell_core::{ObjectId, ObjectName};
         let current = {
-            let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+            let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
             self.store
                 .get_message::<Sandbox>(expired.object_id())
                 .await
@@ -554,7 +555,7 @@ impl super::ComputeRuntime {
         // Cross-replica cleanup claim. A replacement leader waits longer than
         // the bounded driver call before retrying an interrupted reclamation.
         {
-            let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+            let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
             self.store
                 .update_message_cas::<Sandbox, _>(
                     expired.object_id(),
@@ -595,7 +596,7 @@ impl super::ComputeRuntime {
         .await;
         let reclaimed = matches!(&result, Ok(Ok(_)))
             || matches!(&result, Ok(Err(error)) if error.code() == tonic::Code::NotFound);
-        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
         let Some(current) = self
             .store
             .get_message::<Sandbox>(&sandbox_id)

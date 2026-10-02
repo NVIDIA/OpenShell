@@ -189,6 +189,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
+- [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -275,6 +276,32 @@ DNS name while connecting directly to the owning pod. Custom TLS Secrets must
 include that Service DNS name in the server certificate and provide the CA and
 client credentials configured by `server.tls`.
 
+Set `autoscaling.enabled=true` to render an `autoscaling/v2`
+HorizontalPodAutoscaler for the gateway workload. The Deployment or
+StatefulSet then omits `spec.replicas`, and the chart applies its
+multi-replica checks to `autoscaling.maxReplicas`. CPU and memory targets
+need a matching `resources.requests` entry, or a `resources.limits` entry,
+which Kubernetes copies into the request. Add custom metrics from a metrics
+adapter with `autoscaling.metrics`. See the
+[High Availability guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability)
+for the metrics to scale and alert on.
+
+Enabling autoscaling on an existing release removes `spec.replicas` from the
+workload in that upgrade. Kubernetes can reset the workload to one replica
+until the HPA scales it back to at least `autoscaling.minReplicas`, which
+disconnects supervisor sessions from the other gateway pods; they reconnect to the remaining replica. Enable autoscaling
+when you install the chart, or during a maintenance window. On an existing
+release, upgrade with `--reset-then-reuse-values`, which needs Helm 3.14 or
+later. With an older Helm, save the values with
+`helm get values <release> -o yaml > values.yaml` and upgrade with
+`--reset-values -f values.yaml`. `--reuse-values` keeps the
+previous chart version's defaults, which lack the autoscaling values,
+including the scale-down `behavior`, when that release predates them. For background, refer to
+[Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
+Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
+which defaults to 1, so set `replicaCount` to the replica count you want in
+that upgrade.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -311,6 +338,13 @@ discovery endpoint or its TLS CA.
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules for the gateway pod. |
 | agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
+| autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Scale-down disconnects the removed pod's supervisor sessions; they reconnect to the remaining replicas, so the default removes at most one replica every two minutes after a five-minute stabilization window. Helm merges maps: set autoscaling.behavior.scaleDown to null to drop the default. |
+| autoscaling.enabled | bool | `false` | Render a HorizontalPodAutoscaler and stop rendering spec.replicas. |
+| autoscaling.maxReplicas | int | `4` | Maximum gateway replicas. Each replica opens up to 14 PostgreSQL connections; size the database for rollouts at this count, as the High Availability guide describes. With a Deployment, the default of 4 needs `max_connections` of at least 126, more than the PostgreSQL default of 100. |
+| autoscaling.metrics | list | `[]` | Additional autoscaling/v2 MetricSpec entries appended verbatim, such as Pods metrics served by prometheus-adapter. |
+| autoscaling.minReplicas | int | `2` | Minimum gateway replicas. Use 2 or more to survive a pod failure. |
+| autoscaling.targetCPUUtilizationPercentage | int | `80` | Target average CPU utilization, as a percentage of resources.requests.cpu. Set to null to disable. Requires resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies into the request. |
+| autoscaling.targetMemoryUtilizationPercentage | int | `nil` | Target average memory utilization, as a percentage of resources.requests.memory. Null disables it. Requires resources.requests.memory, or resources.limits.memory, which Kubernetes copies into the request. |
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
