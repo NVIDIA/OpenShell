@@ -96,6 +96,10 @@ impl ChildHardeningProgram {
 /// ordinary workload listener additionally mediates `kill`, `tkill`, and
 /// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
+/// The caller must already have matching real, effective, and saved IDs. Those
+/// IDs are captured before `fork` so workload `setresuid`/`setresgid` calls can
+/// preserve the identity without gaining authority to change it.
+#[allow(clippy::similar_names)]
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
         return Err(io::Error::new(
@@ -103,6 +107,7 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
             "sandbox TGID must be nonzero",
         ));
     }
+    let (workload_uid, workload_gid) = fixed_process_identity()?;
 
     let mut instructions = vec![
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
@@ -148,8 +153,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_setgid,
         libc::SYS_setreuid,
         libc::SYS_setregid,
-        libc::SYS_setresuid,
-        libc::SYS_setresgid,
         libc::SYS_setfsuid,
         libc::SYS_setfsgid,
         libc::SYS_setgroups,
@@ -160,6 +163,13 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     ] {
         append_unconditional_deny(&mut instructions, syscall)?;
     }
+
+    // GNU Make resets its effective IDs before launching each recipe, even
+    // when it is already running with the intended identity. Permit only the
+    // fixed workload ID or the kernel's "leave unchanged" sentinel in every
+    // slot; changing any real, effective, or saved ID remains denied.
+    append_identity_preserving_setres(&mut instructions, libc::SYS_setresuid, workload_uid)?;
+    append_identity_preserving_setres(&mut instructions, libc::SYS_setresgid, workload_gid)?;
 
     // Modern launchers fall back from clone3 and pidfd_open only for ENOSYS.
     // Returning EPERM here breaks otherwise portable process creation. The
@@ -219,6 +229,67 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
 
     instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
     Ok(ChildHardeningProgram { instructions })
+}
+
+#[allow(clippy::similar_names)]
+fn fixed_process_identity() -> io::Result<(u32, u32)> {
+    let mut real_uid = 0;
+    let mut effective_uid = 0;
+    let mut saved_uid = 0;
+    let mut real_gid = 0;
+    let mut effective_gid = 0;
+    let mut saved_gid = 0;
+    // SAFETY: each pointer references live scalar output storage. These
+    // read-only calls run before fork and before the child filter is installed.
+    if unsafe {
+        libc::getresuid(
+            &raw mut real_uid,
+            &raw mut effective_uid,
+            &raw mut saved_uid,
+        )
+    } != 0
+        || unsafe {
+            libc::getresgid(
+                &raw mut real_gid,
+                &raw mut effective_gid,
+                &raw mut saved_gid,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if real_uid != effective_uid
+        || saved_uid != effective_uid
+        || real_gid != effective_gid
+        || saved_gid != effective_gid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "child hardening requires matching real, effective, and saved IDs",
+        ));
+    }
+    Ok((effective_uid, effective_gid))
+}
+
+fn append_identity_preserving_setres(
+    instructions: &mut Vec<libc::sock_filter>,
+    syscall: i64,
+    identity: u32,
+) -> io::Result<()> {
+    instructions.extend([
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+        jump(BPF_JMP_JEQ_K, syscall_number(syscall)?, 0, 12),
+    ]);
+    for argument in 0..3 {
+        // Linux consumes uid_t/gid_t as 32-bit values, including (uid_t)-1.
+        instructions.extend([
+            stmt(BPF_LD_W_ABS, argument_word_offset(argument)),
+            jump(BPF_JMP_JEQ_K, identity, 2, 0),
+            jump(BPF_JMP_JEQ_K, u32::MAX, 1, 0),
+            errno(libc::EPERM),
+        ]);
+    }
+    Ok(())
 }
 
 fn append_unconditional_deny(
@@ -357,6 +428,78 @@ mod tests {
         assert_eq!(
             prepare(0).err().expect("zero TGID must fail").kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn filter_preserves_identity_but_denies_changes() {
+        const PROBE_ENV: &str = "OPENSHELL_CHILD_SECCOMP_IDENTITY_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let (uid, gid) = fixed_process_identity().expect("measure test identity");
+            let mut filter = prepare(std::process::id().saturating_add(1))
+                .expect("prepare child hardening filter");
+            filter.install().expect("install child hardening filter");
+
+            for (syscall, identity) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
+                // Exercise every combination of fixed ID and unchanged ID,
+                // including Make's (-1, effective ID, -1) recipe setup.
+                for mask in 0..8 {
+                    let args: [u32; 3] = std::array::from_fn(|slot| {
+                        if mask & (1 << slot) == 0 {
+                            identity
+                        } else {
+                            u32::MAX
+                        }
+                    });
+                    assert_eq!(
+                        unsafe { libc::syscall(syscall, args[0], args[1], args[2]) },
+                        0,
+                        "identity-preserving syscall {syscall} with {args:?}"
+                    );
+                }
+                // Root and another identity must fail in every slot, even
+                // when the remaining slots use the unchanged sentinel.
+                for other in [0, identity.wrapping_add(1)] {
+                    if other == identity || other == u32::MAX {
+                        continue;
+                    }
+                    for slot in 0..3 {
+                        let mut args = [u32::MAX; 3];
+                        args[slot] = other;
+                        assert_eq!(
+                            unsafe { libc::syscall(syscall, args[0], args[1], args[2]) },
+                            -1,
+                            "identity-changing syscall {syscall} with {args:?}"
+                        );
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+                    }
+                }
+            }
+            assert_eq!(
+                fixed_process_identity().expect("identity after probe"),
+                (uid, gid)
+            );
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) },
+                -1
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "linux::child_seccomp::tests::filter_preserves_identity_but_denies_changes",
+                "--nocapture",
+            ])
+            .env(PROBE_ENV, "1")
+            .output()
+            .expect("run isolated identity probe");
+        assert!(
+            output.status.success(),
+            "isolated identity probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
