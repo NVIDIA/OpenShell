@@ -7,9 +7,10 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, Permissions};
 use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, RwLock};
 
 use openshell_isolation_interface::linux::seccomp_notify::{Notification, NotificationListener};
@@ -211,6 +212,9 @@ fn sealed_memfd(content: &[u8]) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
+    // memfd_create defaults to 0777. Keep the metadata private as well as the
+    // returned descriptor read-only, since workloads may inspect it with fstat.
+    file.set_permissions(Permissions::from_mode(0o600))?;
     file.write_all(content)?;
     file.seek(SeekFrom::Start(0))?;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
@@ -228,6 +232,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn paths_cannot_escape_the_managed_tree() {
@@ -249,6 +254,7 @@ mod tests {
     #[test]
     fn memfd_is_read_only_and_positioned_at_start() {
         let mut file = sealed_memfd(b"version = 1\n").unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
         let mut read = String::new();

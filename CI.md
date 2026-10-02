@@ -491,7 +491,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Protobuf, security, and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 
@@ -511,3 +511,24 @@ merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
+
+## Nix download recovery
+
+Jobs that enter the development shell enable `prepare-shell: "true"` on
+`setup-nix`. After configuring Cachix, the action prepares the shell with
+`nix develop -c true` and retries once on failure. Use `shell-installable`
+to select a different development shell. Rust setup assumes this preparation
+has completed. Jobs that only use Nix apps leave shell preparation disabled.
+
+Nix can report a transport error after receiving a complete cache download,
+then resume at EOF and receive HTTP 416. A fresh invocation restarts the
+operation. Both attempts appear in the job log; a second failure fails the
+step. Any preparation failure is retried once, including deterministic errors.
+Cargo, lint, and test commands are not retried.
+
+Direct `nix build` commands retry once. Before each `nix run`, CI builds the
+app's package with `nix build --no-link`, retrying preparation once, then runs
+the app once. The artifact and protobuf-check apps expose matching package
+outputs for this preparation. Runtime failures from tests, artifact generation,
+and compatibility checks are not retried. Downloads initiated inside an app
+are outside this preparation retry.

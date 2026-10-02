@@ -85,4 +85,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
           INSTALLER: ${{ matrix.installer }}
           TESTSUITE: ${{ matrix.testsuite }}
-        run: nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"
+        run: |
+          # Retry dependency preparation, then execute the test suite once.
+          nix build --no-link .#tmachine || nix build --no-link .#tmachine
+          nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"

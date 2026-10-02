@@ -125,6 +125,13 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+`setup-nix` retries development-shell preparation once when `prepare-shell`
+is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
+shell has already been prepared. Cargo, lint, and test commands are not retried.
+Direct Nix builds and app dependency preparation also retry once; apps run
+once after preparation succeeds. Skipped dependent E2E suites indicate blocked
+coverage.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do

@@ -29,6 +29,10 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
+  entitlements-file:
+    description: Path to an entitlements plist for macOS ad-hoc codesigning (skipped when empty or not on macOS)
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -65,6 +69,15 @@ runs:
         "$binary" --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
         SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+    - name: Codesign with entitlements
+      if: inputs.entitlements-file != '' && runner.os == 'macOS'
+      shell: bash
+      env:
+        INPUTS_ENTITLEMENTS: ${{ inputs.entitlements-file }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: /usr/bin/codesign --entitlements "${INPUTS_ENTITLEMENTS}" --force -s - "target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

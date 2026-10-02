@@ -323,19 +323,27 @@ Pipe stdin into the command:
 echo "hello" | openshell sandbox exec -n my-sandbox -- cat
 ```
 
-The CLI waits up to 200 ms for piped input to reach EOF. If EOF arrives within that period, it sends small input in one request and larger input in bounded frames. If the pipe stays open, the command starts after the grace period and the remaining input streams as it arrives. Input above 4 MiB is rejected before launch when detected during the grace period; after launch, exceeding the same total limit cancels execution. Use `sandbox upload` for larger files, or redirect stdin from `/dev/null` when a command needs no input.
+The CLI sends small piped input in one request for compatibility with older
+gateways. It streams larger input in bounded frames, including for commands
+without a TTY, so input is not limited by the gateway's per-message request
+size. Piped input is limited to 4 MiB; use `sandbox upload` for larger files.
+The CLI waits at most 200 ms for piped stdin to reach EOF. If the pipe is
+still open after that, for example under a CI runner or a harness that never
+closes stdin, the command starts anyway and the remaining input streams to it
+as it arrives. The CLI closes remote stdin when the pipe reaches EOF and
+continues reading command output until the command finishes. Redirect stdin
+from `/dev/null` when a command needs no input.
 
-For commands that must respond while stdin remains open, add `--stream-stdin`:
+If streamed stdin exceeds the 4 MiB limit, the CLI reports an error and warns that the command may already have processed partial input. Cancellation does not undo that work.
 
-```shell
-openshell sandbox exec -n my-sandbox --stream-stdin -- cat
-```
+The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
+Large stdout and stderr streams are delivered before a successful exit. A slow
+reader backpressures the command. If output delivery fails, `exec` returns a
+failure instead of reporting success with incomplete output.
+If a background process keeps stdout or stderr open for more than 30 seconds
+after the command exits, `exec` reports an output delivery failure.
 
-This mode skips the grace period and starts the command before stdin reaches EOF and forwards input as it arrives. It disables TTY allocation and keeps stdout and stderr separate. You cannot combine it with `--tty`; `--no-tty` is allowed. Closing stdin ends the command's input while the CLI continues reading output until completion.
-
-The 4 MiB limit applies to total stdin bytes for the command, including with `--stream-stdin`. Exceeding the limit cancels the execution and returns an error. The command may already have processed earlier input, and cancellation does not undo that work.
-
-The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes. Large stdout and stderr streams are delivered before a successful exit. A slow reader backpressures the command. If output delivery fails, `exec` returns a failure instead of reporting success with incomplete output. If a background process keeps stdout or stderr open for more than 30 seconds after the command exits, `exec` reports an output delivery failure. A failed final gRPC status also makes the CLI report failure, even after exit code zero. The CLI does not automatically retry the execution.
+A failed final gRPC status also makes the CLI report failure, even if the remote command reported exit code zero. The CLI does not automatically retry the execution.
 
 Run an interactive shell with a TTY:
 
@@ -354,7 +362,6 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
 | `--tty`           | Force TTY allocation.                                    |
 | `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
-| `--stream-stdin`  | Start before stdin EOF without a TTY; retain the 4 MiB total input limit. |
 | `--no-login-shell`| Run the command without sourcing shell login startup files. |
 | `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
 
@@ -854,10 +861,24 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 By default, uploads inside a Git repository respect `.gitignore` rules so that
 build artifacts, dependency caches, and other ignored files are not transferred.
-If `.gitignore` filtering excludes every file in the upload path, the CLI falls
-back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
-opt into unfiltered uploads explicitly, upload a path outside the Git work
-tree, or force-add the intended files if they should remain Git-aware.
+The CLI stops the affected upload if Git filtering fails or selects no files.
+When the CLI confirms that the source is outside a Git work tree, it uploads
+without filtering and warns that `.gitignore` rules are not applied. Git must
+be installed to determine whether filtering applies. A broken or inaccessible
+repository stops the upload. Pass `--no-git-ignore` to intentionally upload
+without filtering. These rules apply to both `sandbox upload` and
+`sandbox create --upload`.
+
+`sandbox create --upload` provisions the sandbox before checking Git filtering.
+If filtering rejects an upload, the command exits with an error, but the sandbox
+remains running. Earlier uploads in the same command may already have completed.
+Use `openshell sandbox upload` to retry against the existing sandbox, or
+`openshell sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
+if you intend to upload without filtering.
+
+Uploads preserve symlinks, including dangling links, instead of dereferencing
+their targets. A symlink source bypasses Git filtering so the link itself is
+archived.
 
 ## Stop and Start Sandboxes
 

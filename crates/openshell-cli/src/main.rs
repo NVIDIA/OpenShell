@@ -1459,8 +1459,10 @@ enum SandboxCommands {
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
         /// working directory.
-        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
-        /// upload everything.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1727,13 +1729,6 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Stream stdin as it arrives without allocating a pseudo-terminal.
-        /// Starts the command before stdin closes. Input is limited to 4 MiB
-        /// per command. Exceeding the limit cancels execution; input may already
-        /// have been processed.
-        #[arg(long, conflicts_with = "tty")]
-        stream_stdin: bool,
-
         /// Run the command without sourcing shell login/profile startup files.
         ///
         /// Default sources them so tool-specific env (`VIRTUAL_ENV`, etc.) is
@@ -1771,6 +1766,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
@@ -3615,7 +3615,6 @@ async fn run_async() -> Result<()> {
                             timeout,
                             tty,
                             no_tty,
-                            stream_stdin,
                             envs,
                             command,
                             no_login_shell,
@@ -3638,7 +3637,6 @@ async fn run_async() -> Result<()> {
                                 workdir.as_deref(),
                                 timeout,
                                 tty_override,
-                                stream_stdin,
                                 &env_map,
                                 no_login_shell,
                                 &tls,
@@ -4248,55 +4246,6 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::fs;
-
-    #[test]
-    fn sandbox_exec_stream_stdin_is_explicit() {
-        for flags in [
-            vec![],
-            vec!["--stream-stdin"],
-            vec!["--stream-stdin", "--no-tty"],
-            vec!["--no-tty", "--stream-stdin"],
-            vec!["--stream-stdin", "--tty", "--no-tty"],
-            vec!["--tty", "--no-tty", "--stream-stdin"],
-        ] {
-            let mut args = vec!["openshell", "sandbox", "exec", "-n", "sandbox-1"];
-            args.extend(flags.iter().copied());
-            args.extend(["--", "cat"]);
-            let cli = Cli::try_parse_from(args).expect("exec options should parse");
-            let Some(Commands::Sandbox {
-                command:
-                    Some(SandboxCommands::Exec {
-                        stream_stdin,
-                        tty,
-                        no_tty,
-                        ..
-                    }),
-            }) = cli.command
-            else {
-                panic!("expected sandbox exec");
-            };
-            assert_eq!(stream_stdin, flags.contains(&"--stream-stdin"));
-            assert!(!tty);
-            assert_eq!(no_tty, flags.contains(&"--no-tty"));
-        }
-    }
-
-    #[test]
-    fn sandbox_exec_stream_stdin_conflicts_with_tty() {
-        for flags in [
-            vec!["--stream-stdin", "--tty"],
-            vec!["--tty", "--stream-stdin"],
-            vec!["--stream-stdin", "--no-tty", "--tty"],
-            vec!["--no-tty", "--tty", "--stream-stdin"],
-        ] {
-            let mut args = vec!["openshell", "sandbox", "exec", "-n", "sandbox-1"];
-            args.extend(flags);
-            args.extend(["--", "cat"]);
-            let error =
-                Cli::try_parse_from(args).expect_err("streaming stdin must not allocate a PTY");
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
-    }
 
     #[test]
     fn policy_update_parses_explicit_l7_scope_and_endpoint_path() {

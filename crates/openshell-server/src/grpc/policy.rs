@@ -13780,6 +13780,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn annotated_profile_has_stable_provider_environment_revision() {
+        let state = test_server_state().await;
+        let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+        profile.annotations = (0..8)
+            .map(|index| (format!("key-{index}"), format!("value-{index}")))
+            .collect();
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile,
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-stable-provider-revision",
+            "stable-provider-revision",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut revisions = HashSet::new();
+        for _ in 0..16 {
+            let config = load_sandbox_config(&state, &sandbox).await.unwrap();
+            let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                config.provider_env_revision,
+                environment.provider_env_revision
+            );
+            revisions.insert(config.provider_env_revision);
+        }
+        assert_eq!(revisions.len(), 1);
+    }
+
+    #[tokio::test]
     async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,

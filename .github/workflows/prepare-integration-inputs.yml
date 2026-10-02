@@ -152,13 +152,22 @@ jobs:
           docker save --output artifacts/images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 
       - name: Build test archives
-        run: nix run .#build-artifacts-test-archives
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-test-archives || nix build --no-link .#build-artifacts-test-archives
+          nix run .#build-artifacts-test-archives
 
       - name: Build test workload images
-        run: nix run .#build-artifacts-test-images
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-test-images || nix build --no-link .#build-artifacts-test-images
+          nix run .#build-artifacts-test-images
 
       - name: Package Helm chart
-        run: nix run .#build-artifacts-helm
+        run: |
+          # Retry dependency preparation, then generate artifacts once.
+          nix build --no-link .#build-artifacts-helm || nix build --no-link .#build-artifacts-helm
+          nix run .#build-artifacts-helm
 
       - name: Upload integration inputs
         id: upload-integration-inputs

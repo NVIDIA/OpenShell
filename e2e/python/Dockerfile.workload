@@ -19,7 +19,7 @@ RUN apt-get update \
     && useradd --uid 1000 --gid sandbox --create-home --shell /bin/bash sandbox \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python install "${PYTHON_VERSION}" \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv venv --python "${PYTHON_VERSION}" --seed /sandbox/.venv \
-    && uv pip install --python /sandbox/.venv/bin/python cloudpickle==3.1.2 \
+    && uv pip install --python /sandbox/.venv/bin/python cloudpickle==3.1.2 google-auth==2.40.3 requests==2.32.5 \
     && chown -R sandbox:sandbox /sandbox \
     && uv cache clean
 

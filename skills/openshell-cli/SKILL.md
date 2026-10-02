@@ -398,7 +398,9 @@ openshell sandbox upload my-sandbox ./src
 openshell sandbox download my-sandbox output ./local-output
 ```
 
-Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
+Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
+
+If `sandbox create --upload` rejects an upload, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
 
@@ -428,8 +430,6 @@ Check whether the command ran before retrying work with side effects. Use
 `sandbox connect` to attach to the canonical main process.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
-
-When a client must read responses before closing stdin, check `openshell sandbox exec --help` for `--stream-stdin`. Use that mode to start the command immediately without a TTY and keep stdout and stderr separate. It conflicts with `--tty`. Total stdin remains limited to 4 MiB; exceeding the limit cancels the command after it may have processed earlier input. Without this flag, the CLI waits up to 200 ms for piped input to reach EOF, then streams any remaining input. Oversized input is rejected before launch only when detected during that grace period. After a stream failure, inspect the command's effects before retrying it.
 
 ### Change attached providers
 

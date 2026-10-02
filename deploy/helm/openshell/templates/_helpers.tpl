@@ -380,6 +380,23 @@ never
 {{- end }}
 
 {{/*
+Render a sandbox UID/GID chart value as an integer, or nothing when unset.
+Takes a dict with `name` (the values key, for errors) and `value`. The bounds
+match openshell_policy::MIN_SANDBOX_UID..=MAX_SANDBOX_UID. Helm parses YAML
+numbers as float64, so the integer conversion also avoids `2e+09` rendering.
+Booleans are rejected because they would otherwise convert to 1 or 0.
+*/}}
+{{- define "openshell.sandboxId" -}}
+{{- if not (or (kindIs "invalid" .value) (eq (toString .value) "")) -}}
+{{- $id := int64 .value -}}
+{{- if or (kindIs "bool" .value) (ne (float64 .value) (float64 $id)) (lt $id 1) (gt $id 4294967294) -}}
+{{- fail (printf "%s must be an integer between 1 and 4294967294" .name) -}}
+{{- end -}}
+{{- $id -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}

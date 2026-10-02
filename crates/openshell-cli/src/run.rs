@@ -107,7 +107,6 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
-    GitFilteredEmpty,
 }
 
 enum ProgressOutput {
@@ -1059,29 +1058,18 @@ pub async fn sandbox_create(
                     );
                 }
                 let local = Path::new(local_path);
-                match sandbox_upload_plan(local, *git_ignore)? {
+                let upload_plan = sandbox_upload_plan(local, *git_ignore).wrap_err_with(|| {
+                    format!(
+                        "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                    )
+                })?;
+                match upload_plan {
                     SandboxUploadPlan::GitAware { base_dir, files } => {
                         sandbox_sync_up_files(
                             &effective_server,
                             &sandbox_name,
                             &base_dir,
                             &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::GitFilteredEmpty => {
-                        eprintln!(
-                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                            "⚠".yellow().bold(),
-                            local.display(),
-                        );
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
                             local,
                             dest,
                             &effective_tls,
@@ -1904,33 +1892,6 @@ fn spawn_piped_stdin_reader(
     rx
 }
 
-// Adapt the grace-period reader's queued chunks to the bounded stdin writer.
-// Read this only on the detached forwarding thread: blocking_recv must never
-// run on a Tokio worker. Keep partial chunks so the writer can probe exactly
-// one byte beyond its allowance without losing any permitted input.
-struct PipedStdinReader {
-    rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    chunk: std::io::Cursor<Vec<u8>>,
-}
-
-impl Read for PipedStdinReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let size = self.chunk.read(buffer)?;
-            if size != 0 {
-                return Ok(size);
-            }
-            match self.rest.blocking_recv() {
-                Some(chunk) => self.chunk = std::io::Cursor::new(chunk?),
-                None => return Ok(0),
-            }
-        }
-    }
-}
-
 /// Collect piped stdin until EOF or until `grace` elapses, whichever comes
 /// first. Input beyond `limit` bytes is rejected with the upload hint.
 async fn collect_piped_stdin(
@@ -1961,9 +1922,6 @@ fn piped_stdin_limit_error() -> miette::Report {
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
-/// With `stream_stdin`, starts before local EOF and sends up to 4 MiB without a
-/// pseudo-terminal. Exceeding that limit cancels execution; the command may have
-/// processed partial input.
 /// Returns the remote command's exit code, or an error if the event stream
 /// closes before the command reports an exit status.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
@@ -1974,7 +1932,6 @@ pub async fn sandbox_exec_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     tty_override: Option<bool>,
-    stream_stdin: bool,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
     tls: &TlsOptions,
@@ -2005,16 +1962,20 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Streaming stdin preserves stdout/stderr separately and never allocates
-    // a PTY. Other invocations retain explicit overrides and auto-detection.
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
     let stdin_is_terminal = std::io::stdin().is_terminal();
-    let tty = !stream_stdin
-        && tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
 
-    // Small pipes retain unary exec. An open pipe starts after the grace
-    // period; explicit streaming skips that wait and always disables the PTY.
-    // Both paths enforce the same cumulative input cap while forwarding.
-    let (stdin_prefix, stdin_rest) = if stream_stdin || stdin_is_terminal {
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
+    //
+    // Never block on stdin EOF before starting the command: a pipe that stays
+    // open (CI runners, harnesses) would otherwise hang the exec forever
+    // without the gateway ever seeing the request. After a short grace period
+    // the command starts and the remaining input streams until EOF.
+    let (stdin_prefix, stdin_rest) = if stdin_is_terminal {
         (Vec::new(), None)
     } else {
         match collect_piped_stdin(
@@ -2059,8 +2020,7 @@ pub async fn sandbox_exec_grpc(
             "exec command or environment exceeds the gateway's 1 MiB message limit"
         ));
     }
-    if stream_stdin
-        || (tty && stdin_is_terminal)
+    if (tty && stdin_is_terminal)
         || stdin_rest.is_some()
         || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
     {
@@ -2076,7 +2036,6 @@ pub async fn sandbox_exec_grpc(
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
             stdin_rest,
-            (stream_stdin || !stdin_is_terminal).then_some(MAX_EXEC_STDIN_BYTES),
         )
         .await;
     }
@@ -2451,91 +2410,6 @@ impl Drop for TaskGuard {
     }
 }
 
-// Only an explicit local EOF closes this request-body stream. A failed reader
-// drops its sender while the RPC remains open until response cancellation.
-enum ExecInputMessage {
-    Frame(Box<openshell_core::proto::ExecSandboxInput>),
-    Eof,
-}
-
-fn exec_input_stream(
-    input_rx: tokio::sync::mpsc::Receiver<ExecInputMessage>,
-) -> impl futures::Stream<Item = openshell_core::proto::ExecSandboxInput> + Send {
-    futures::stream::unfold(input_rx, |mut input_rx| async move {
-        match input_rx.recv().await {
-            Some(ExecInputMessage::Frame(frame)) => Some((*frame, input_rx)),
-            Some(ExecInputMessage::Eof) => None,
-            None => futures::future::pending().await,
-        }
-    })
-}
-
-// Reading at most the remaining allowance preserves every permitted byte.
-// At the limit, one additional byte distinguishes EOF from an oversized input;
-// that byte is never forwarded, even if the remote command consumes eagerly.
-fn forward_exec_stdin(
-    mut reader: impl Read,
-    prefix: &[u8],
-    limit: Option<usize>,
-    mut send: impl FnMut(&[u8]) -> bool,
-) -> std::io::Result<()> {
-    let limit_error = || {
-        std::io::Error::other(
-            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
-        )
-    };
-    if limit.is_some_and(|limit| prefix.len() > limit) {
-        return Err(limit_error());
-    }
-    let mut buf = [0u8; 4096];
-    for chunk in prefix.chunks(buf.len()) {
-        if !send(chunk) {
-            return Ok(());
-        }
-    }
-    let mut remaining = limit.map(|limit| limit - prefix.len());
-    loop {
-        let read_size = remaining.map_or(buf.len(), |remaining| remaining.clamp(1, buf.len()));
-        match reader.read(&mut buf[..read_size]) {
-            Ok(0) => return Ok(()),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-            Ok(n) => {
-                if let Some(remaining) = &mut remaining {
-                    if n > *remaining {
-                        return Err(limit_error());
-                    }
-                    *remaining -= n;
-                }
-                if !send(&buf[..n]) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-// Keep the EOF decision beside the reader result so failures cannot queue a
-// successful end-of-input marker before the response loop cancels the RPC.
-fn write_exec_stdin_frames(
-    reader: impl Read,
-    prefix: &[u8],
-    limit: Option<usize>,
-    sender: &tokio::sync::mpsc::Sender<ExecInputMessage>,
-) -> std::io::Result<()> {
-    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
-
-    forward_exec_stdin(reader, prefix, limit, |chunk| {
-        sender
-            .blocking_send(ExecInputMessage::Frame(Box::new(ExecSandboxInput {
-                payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
-            })))
-            .is_ok()
-    })?;
-    let _ = sender.blocking_send(ExecInputMessage::Eof);
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
@@ -2549,11 +2423,11 @@ async fn sandbox_exec_streaming_grpc(
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
-    stdin_limit: Option<usize>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
+    use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = if tty {
         local_terminal_size().unwrap_or((80, 24))
@@ -2561,11 +2435,11 @@ async fn sandbox_exec_streaming_grpc(
         (0, 0)
     };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecInputMessage>(64);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
 
     // Send the start message with exec metadata.
     input_tx
-        .send(ExecInputMessage::Frame(Box::new(ExecSandboxInput {
+        .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
                 request_id: String::new(),
                 sandbox: sandbox.object_name().to_string(),
@@ -2582,12 +2456,12 @@ async fn sandbox_exec_streaming_grpc(
                 cols,
                 rows,
             })),
-        })))
+        })
         .await
         .into_diagnostic()?;
 
     let mut stream = client
-        .exec_sandbox_interactive(exec_input_stream(input_rx))
+        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2600,38 +2474,94 @@ async fn sandbox_exec_streaming_grpc(
         None
     };
 
-    // A detached OS thread keeps an idle stdin read from blocking Tokio runtime
-    // shutdown. It can outlive this operation until input/EOF arrives, but never
-    // keeps the CLI process alive after the response completes or fails.
+    // Stdin reader on a detached OS thread. Using std::thread (not
+    // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
+    // thread blocked on stdin.read(). The thread exits when the channel
+    // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
     let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        // The grace-period reader already owns an open pipe. Reuse its queued
-        // chunks through the same bounded writer as explicit streaming so cap
-        // violations and read failures never become a successful stdin EOF.
-        let result = stdin_rest.map_or_else(
-            || {
-                write_exec_stdin_frames(
-                    std::io::stdin().lock(),
-                    &stdin_prefix,
-                    stdin_limit,
-                    &stdin_tx,
-                )
-            },
-            |rest| {
-                write_exec_stdin_frames(
-                    PipedStdinReader {
-                        rest,
-                        chunk: std::io::Cursor::new(Vec::new()),
-                    },
-                    &stdin_prefix,
-                    stdin_limit,
-                    &stdin_tx,
-                )
-            },
-        );
-        let _ = stdin_result_tx.send(result);
-    });
+    if let Some(mut rest) = stdin_rest {
+        // Piped stdin that was still open when the command started: the
+        // reader thread from `spawn_piped_stdin_reader` already owns stdin,
+        // so forward its chunks here after the collected prefix. The 4 MiB
+        // cap covers the prefix and the streamed remainder together.
+        tokio::spawn(async move {
+            let mut forwarded = 0usize;
+            let result = async {
+                for chunk in stdin_prefix.chunks(4096) {
+                    forwarded += chunk.len();
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                while let Some(chunk) = rest.recv().await {
+                    let chunk = chunk?;
+                    forwarded += chunk.len();
+                    if forwarded > MAX_EXEC_STDIN_BYTES {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
+                        ));
+                    }
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk)),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = stdin_result_tx.send(result);
+        });
+    } else {
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            let result = (|| {
+                for chunk in stdin_prefix.chunks(buf.len()) {
+                    if stdin_tx
+                        .blocking_send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                        Ok(n) => {
+                            if stdin_tx
+                                .blocking_send(ExecSandboxInput {
+                                    payload: Some(exec_sandbox_input::Payload::Stdin(
+                                        buf[..n].to_vec(),
+                                    )),
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            })();
+            let _ = stdin_result_tx.send(result);
+        });
+    }
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
@@ -2648,11 +2578,7 @@ async fn sandbox_exec_streaming_grpc(
                             ExecSandboxWindowResize { cols, rows },
                         )),
                     };
-                    if resize_tx
-                        .send(ExecInputMessage::Frame(Box::new(msg)))
-                        .await
-                        .is_err()
-                    {
+                    if resize_tx.send(msg).await.is_err() {
                         break;
                     }
                 }
@@ -2664,8 +2590,10 @@ async fn sandbox_exec_streaming_grpc(
     #[cfg(unix)]
     let _resize_guard = resize_task.map(TaskGuard);
 
-    // Retain a sender to invalidate the request on a read error. The request
-    // stream sends EOF only after the reader explicitly reports clean EOF.
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
@@ -2678,13 +2606,24 @@ async fn sandbox_exec_streaming_grpc(
             result = &mut stdin_result_rx, if !stdin_reader_done => {
                 stdin_reader_done = true;
                 match result.into_diagnostic()? {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
                     Err(error) => {
-                        // An invalid frame aborts the command if it reaches the
-                        // gateway. If delivery is blocked, closing the response
-                        // cancels the relay independently of request termination.
-                        let abort = ExecInputMessage::Frame(Box::new(ExecSandboxInput { payload: None }));
-                        let _ = tokio::time::timeout(Duration::from_secs(5), input_tx.send(abort)).await;
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
                         drop(stream);
                         return Err(error).into_diagnostic();
                     }
@@ -2709,8 +2648,9 @@ async fn sandbox_exec_streaming_grpc(
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
                 exit_seen = true;
-                // A terminal event does not guarantee successful gRPC trailers.
-                // Keep draining so a relay failure cannot become a successful exit.
+                // Process exit does not complete the RPC. Keep draining so a
+                // failing final gRPC status cannot turn partial output into
+                // a successful execution result.
             }
             None => {}
         }
@@ -4788,6 +4728,13 @@ fn workspace_to_json(workspace: &openshell_core::proto::Workspace) -> serde_json
 }
 
 pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
+    discover_git_repo_root(local_path)?
+        .ok_or_else(|| miette::miette!("path is outside a Git work tree: {}", local_path.display()))
+}
+
+/// Only return `None` when Git reports no repository and no ancestor has a
+/// `.git` entry. A corrupt repository can produce the same Git diagnostic.
+fn discover_git_repo_root(local_path: &Path) -> Result<Option<PathBuf>> {
     let git_dir = if local_path.is_dir() {
         local_path
     } else {
@@ -4798,6 +4745,9 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
     let mut command = Command::new("git");
     scrub_git_env(&mut command);
     let output = command
+        .env("LC_ALL", "C")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(git_dir)
         .output()
@@ -4805,6 +4755,32 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         .wrap_err("failed to run git rev-parse")?;
 
     if !output.status.success() {
+        if output.status.code() == Some(128)
+            && String::from_utf8_lossy(&output.stderr).trim_end()
+                == "fatal: not a git repository (or any of the parent directories): .git"
+        {
+            for ancestor in git_dir.ancestors() {
+                let marker = ancestor.join(".git");
+                match std::fs::symlink_metadata(&marker) {
+                    Ok(_) => {
+                        return Err(miette::miette!(
+                            "Git repository discovery failed despite an existing .git entry: {}",
+                            marker.display()
+                        ));
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).into_diagnostic().wrap_err_with(|| {
+                            format!(
+                                "failed to inspect Git repository marker: {}",
+                                marker.display()
+                            )
+                        });
+                    }
+                }
+            }
+            return Ok(None);
+        }
         return Err(miette::miette!(
             "git rev-parse --show-toplevel failed with status {}",
             output.status
@@ -4818,24 +4794,21 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         ));
     }
 
-    Ok(PathBuf::from(root))
+    Ok(Some(PathBuf::from(root)))
 }
 
 pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
-    let repo_root = std::fs::canonicalize(git_repo_root(local_path)?)
-        .into_diagnostic()
-        .wrap_err("failed to canonicalize git repository root")?;
-    let local_path = if local_path.is_absolute() {
-        local_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .into_diagnostic()
-            .wrap_err("failed to resolve current directory")?
-            .join(local_path)
-    };
     let local_path = std::fs::canonicalize(local_path)
         .into_diagnostic()
         .wrap_err("failed to canonicalize local upload path")?;
+    let repo_root = git_repo_root(&local_path)?;
+    git_sync_files_in_repo(&local_path, &repo_root)
+}
+
+fn git_sync_files_in_repo(local_path: &Path, repo_root: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize git repository root")?;
     let relative_path = local_path
         .strip_prefix(&repo_root)
         .into_diagnostic()
@@ -4854,7 +4827,7 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
             .map(Path::to_path_buf)
             .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
     } else {
-        local_path.clone()
+        local_path.to_path_buf()
     };
     let pathspec = if relative_path.as_os_str().is_empty() {
         None
@@ -4921,17 +4894,40 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore
-        && !metadata.file_type().is_symlink()
-        && let Ok((base_dir, files)) = git_sync_files(local_path)
-    {
-        if files.is_empty() {
-            return Ok(SandboxUploadPlan::GitFilteredEmpty);
-        }
-        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if !git_ignore || metadata.file_type().is_symlink() {
+        return Ok(SandboxUploadPlan::Regular);
     }
 
-    Ok(SandboxUploadPlan::Regular)
+    let plan = git_filtered_upload_plan(local_path).wrap_err_with(|| {
+        format!(
+            "Git filtering failed for {}; upload stopped.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        )
+    })?;
+    if let SandboxUploadPlan::GitAware { files, .. } = &plan
+        && files.is_empty()
+    {
+        return Err(miette::miette!(
+            "Git filtering selected no files for {}; upload stopped.\nGit returned 0 uploadable paths: the source may be empty or all files may be ignored.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        ));
+    }
+    Ok(plan)
+}
+
+fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
+    let canonical_path = std::fs::canonicalize(local_path)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize local upload path")?;
+    let Some(repo_root) = discover_git_repo_root(&canonical_path)? else {
+        eprintln!(
+            "Warning: {} is outside a Git work tree; uploading without Git filtering (.gitignore rules are not applied).",
+            local_path.display()
+        );
+        return Ok(SandboxUploadPlan::Regular);
+    };
+    let (base_dir, files) = git_sync_files_in_repo(&canonical_path, &repo_root)?;
+    Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
 /// Upload a local path to a sandbox.
@@ -4968,14 +4964,6 @@ pub async fn sandbox_upload(
                 workspace,
             )
             .await?;
-        }
-        SandboxUploadPlan::GitFilteredEmpty => {
-            eprintln!(
-                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                "⚠".yellow().bold(),
-                local_path.display(),
-            );
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
         }
         SandboxUploadPlan::Regular => {
             sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
@@ -6716,203 +6704,6 @@ mod tests {
     };
 
     #[test]
-    fn exec_stdin_limit_counts_prefix_and_never_forwards_the_extra_byte() {
-        let prefix = vec![b'p'; 4095];
-        let mut forwarded = Vec::new();
-        let error = super::forward_exec_stdin(&b"xy"[..], &prefix, Some(4096), |chunk| {
-            assert!(chunk.len() <= 4096);
-            forwarded.extend_from_slice(chunk);
-            true
-        })
-        .expect_err("one byte above the limit must fail");
-        assert_eq!(forwarded.len(), 4096);
-        assert_eq!(forwarded.last(), Some(&b'x'));
-        assert!(
-            error
-                .to_string()
-                .contains("may have processed partial input")
-        );
-    }
-
-    #[test]
-    fn exec_stdin_accepts_exact_limit_and_preserves_chunk_order() {
-        let prefix = vec![b'p'; 4097];
-        let input = vec![b'i'; 4097];
-        let mut forwarded = Vec::new();
-        super::forward_exec_stdin(input.as_slice(), &prefix, Some(8194), |chunk| {
-            assert!(chunk.len() <= 4096);
-            forwarded.extend_from_slice(chunk);
-            true
-        })
-        .expect("exact limit followed by EOF must succeed");
-        assert_eq!(forwarded, [prefix, input].concat());
-    }
-
-    #[test]
-    fn exec_stdin_propagates_read_failure_after_partial_input() {
-        struct FailedReader<R>(R);
-        impl<R: std::io::Read> std::io::Read for FailedReader<R> {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                match self.0.read(buffer)? {
-                    0 => Err(std::io::Error::other("synthetic read failure")),
-                    size => Ok(size),
-                }
-            }
-        }
-        let mut forwarded = Vec::new();
-        let error =
-            super::forward_exec_stdin(FailedReader(&b"request"[..]), &[], Some(4096), |chunk| {
-                forwarded.extend_from_slice(chunk);
-                true
-            })
-            .expect_err("reader failures must not become EOF");
-        assert_eq!(forwarded, b"request");
-        assert_eq!(error.to_string(), "synthetic read failure");
-    }
-
-    #[tokio::test]
-    async fn exec_input_requires_explicit_clean_eof() {
-        use futures::StreamExt;
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let stream = super::exec_input_stream(receiver);
-        tokio::pin!(stream);
-        sender.send(super::ExecInputMessage::Eof).await.unwrap();
-        assert!(stream.next().await.is_none());
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let stream = super::exec_input_stream(receiver);
-        tokio::pin!(stream);
-        drop(sender);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), stream.next())
-                .await
-                .is_err()
-        );
-    }
-
-    fn assert_exec_stdin_writer_error(reader: impl std::io::Read, prefix: &[u8]) -> std::io::Error {
-        use futures::{FutureExt, StreamExt};
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        let error = super::write_exec_stdin_frames(reader, prefix, Some(2), &sender)
-            .expect_err("a failed reader must not queue EOF");
-        drop(sender);
-        let mut stream = Box::pin(super::exec_input_stream(receiver));
-        let frame = stream
-            .next()
-            .now_or_never()
-            .expect("the permitted bytes are already queued")
-            .expect("the request body must contain its input frame");
-        assert_eq!(
-            frame.payload,
-            Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(
-                b"ab".to_vec()
-            )),
-        );
-        assert!(
-            stream.next().now_or_never().is_none(),
-            "a failed reader must leave the request pending, not queue an explicit EOF",
-        );
-        error
-    }
-
-    #[test]
-    fn exec_stdin_writer_overflow_does_not_queue_eof() {
-        let error = assert_exec_stdin_writer_error(&b"abc"[..], &[]);
-        assert!(error.to_string().contains("partial input"));
-    }
-
-    #[test]
-    fn exec_stdin_writer_read_error_does_not_queue_eof() {
-        struct FailedReader;
-        impl std::io::Read for FailedReader {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("synthetic read failure"))
-            }
-        }
-
-        let error = assert_exec_stdin_writer_error(FailedReader, b"ab");
-        assert_eq!(error.to_string(), "synthetic read failure");
-    }
-
-    #[test]
-    fn exec_stdin_writer_exact_limit_queues_eof() {
-        use futures::{FutureExt, StreamExt};
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        super::write_exec_stdin_frames(&b"ab"[..], &[], Some(2), &sender)
-            .expect("the exact limit followed by EOF is valid");
-        drop(sender);
-        let mut stream = Box::pin(super::exec_input_stream(receiver));
-        let frame = stream
-            .next()
-            .now_or_never()
-            .expect("the input is already queued")
-            .expect("the request body must contain its input frame");
-        assert_eq!(
-            frame.payload,
-            Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(
-                b"ab".to_vec()
-            )),
-        );
-        assert!(
-            stream
-                .next()
-                .now_or_never()
-                .expect("EOF is already queued")
-                .is_none(),
-        );
-    }
-
-    fn queued_stdin_reader(chunks: Vec<std::io::Result<Vec<u8>>>) -> super::PipedStdinReader {
-        let (sender, rest) = tokio::sync::mpsc::channel(chunks.len().max(1));
-        for chunk in chunks {
-            sender.try_send(chunk).unwrap();
-        }
-        super::PipedStdinReader {
-            rest,
-            chunk: std::io::Cursor::new(Vec::new()),
-        }
-    }
-
-    #[test]
-    fn piped_stdin_reader_preserves_partial_chunks_and_exact_limit_eof() {
-        let reader = queued_stdin_reader(vec![Ok(Vec::new()), Ok(b"b".to_vec())]);
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
-        super::write_exec_stdin_frames(reader, b"a", Some(2), &sender).unwrap();
-        let mut bytes = Vec::new();
-        for _ in 0..2 {
-            let super::ExecInputMessage::Frame(frame) = receiver.try_recv().unwrap() else {
-                panic!("expected input before EOF");
-            };
-            let Some(openshell_core::proto::exec_sandbox_input::Payload::Stdin(chunk)) =
-                frame.payload
-            else {
-                panic!("expected stdin frame");
-            };
-            bytes.extend(chunk);
-        }
-        assert_eq!(bytes, b"ab");
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(super::ExecInputMessage::Eof)
-        ));
-
-        // The writer reads only two permitted bytes from this three-byte chunk.
-        // Its next read must see the remaining byte, reject it, and omit EOF.
-        let reader = queued_stdin_reader(vec![Ok(b"abc".to_vec())]);
-        let error = assert_exec_stdin_writer_error(reader, &[]);
-        assert!(error.to_string().contains("partial input"));
-    }
-
-    #[test]
-    fn piped_stdin_reader_failure_after_prefix_does_not_queue_eof() {
-        let reader = queued_stdin_reader(vec![Err(std::io::Error::other("pipe failed"))]);
-        let error = assert_exec_stdin_writer_error(reader, b"ab");
-        assert_eq!(error.to_string(), "pipe failed");
-    }
-
-    #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
         use super::draft_approval_error;
         use tonic::Status;
@@ -8024,7 +7815,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+    fn sandbox_upload_plan_rejects_empty_filtered_selections() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("runs")).expect("create repo");
@@ -8032,14 +7823,126 @@ mod tests {
         fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
         fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
 
-        let plan =
-            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+        fs::create_dir(repo.join("empty")).expect("create empty directory");
+
+        for path in [
+            repo.join("runs"),
+            repo.join("runs/test.json"),
+            repo.join("empty"),
+        ] {
+            let err =
+                sandbox_upload_plan(&path, true).expect_err("empty selection must stop upload");
+            let message = err.to_string();
+            assert!(message.contains("filtering selected no files"), "{message}");
+            assert!(
+                message.contains("Git returned 0 uploadable paths"),
+                "{message}"
+            );
+            assert!(message.contains("--no-git-ignore"), "{message}");
+            assert_eq!(
+                sandbox_upload_plan(&path, false).expect("explicit unfiltered upload"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_allows_paths_outside_git_repository() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        fs::write(tmpdir.path().join("file.txt"), "hello").expect("write file");
+
+        for path in [tmpdir.path().to_path_buf(), tmpdir.path().join("file.txt")] {
+            assert_eq!(
+                sandbox_upload_plan(&path, true).expect("upload outside a repository"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_selects_only_unignored_files() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path();
+        init_git_repo(repo);
+        fs::write(repo.join(".gitignore"), "*.log\n").expect("write .gitignore");
+        fs::create_dir(repo.join("files")).expect("create files directory");
+        fs::write(repo.join("files/keep.txt"), "keep").expect("write included file");
+        fs::write(repo.join("files/skip.log"), "skip").expect("write ignored file");
 
         assert_eq!(
-            plan,
-            super::SandboxUploadPlan::GitFilteredEmpty,
-            "gitignored directory should fall back with GitFilteredEmpty"
+            sandbox_upload_plan(&repo.join("files"), true).expect("filtered upload"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo.join("files")).expect("canonical path"),
+                files: vec!["keep.txt".to_string()],
+            },
         );
+    }
+
+    #[test]
+    fn sandbox_upload_plan_filters_linked_worktrees_and_separate_git_dirs() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo");
+        init_git_repo(&repo);
+        let mut commit = Command::new("git");
+        super::scrub_git_env(&mut commit);
+        assert!(
+            commit
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&repo)
+                .status()
+                .expect("initial commit")
+                .success()
+        );
+
+        let worktree = tmpdir.path().join("worktree");
+        let mut add = Command::new("git");
+        super::scrub_git_env(&mut add);
+        assert!(
+            add.args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .current_dir(&repo)
+                .status()
+                .expect("add worktree")
+                .success()
+        );
+
+        let separate = tmpdir.path().join("separate");
+        let mut init = Command::new("git");
+        super::scrub_git_env(&mut init);
+        assert!(
+            init.args(["init", "--separate-git-dir"])
+                .arg(tmpdir.path().join("metadata"))
+                .arg(&separate)
+                .status()
+                .expect("initialize separate git directory")
+                .success()
+        );
+
+        for source in [worktree, separate] {
+            assert!(source.join(".git").is_file());
+            fs::write(source.join(".gitignore"), ".env\n").expect("write ignore rule");
+            fs::write(source.join(".env"), "dummy").expect("write ignored file");
+            fs::write(source.join("keep.txt"), "keep").expect("write included file");
+            let super::SandboxUploadPlan::GitAware { mut files, .. } =
+                sandbox_upload_plan(&source, true).expect("filter gitfile worktree")
+            else {
+                panic!("a gitfile worktree must be filtered");
+            };
+            files.sort();
+            assert_eq!(files, vec![".gitignore", "keep.txt"]);
+        }
     }
 
     #[test]

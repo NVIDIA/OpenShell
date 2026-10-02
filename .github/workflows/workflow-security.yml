@@ -54,6 +54,7 @@ jobs:
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Actionlint
@@ -141,6 +142,7 @@ jobs:
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Zizmor

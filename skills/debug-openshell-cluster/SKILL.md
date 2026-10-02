@@ -240,6 +240,10 @@ errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 
+The sandbox container's log holds the sandbox runtime's warnings and the
+main process's stdout and stderr when it runs without a TTY. The supervisor
+container's log holds supervisor diagnostics.
+
 ```bash
 docker info
 docker ps --filter name=openshell
@@ -742,6 +746,12 @@ with the same sandbox label and requires the persisted namespace and CR UID to
 remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
+
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
