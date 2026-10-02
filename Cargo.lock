@@ -4898,6 +4898,7 @@ dependencies = [
  "owo-colors",
  "ratatui",
  "serde",
+ "shell-words",
  "terminal-colorsaurus",
  "tokio",
  "tonic",
