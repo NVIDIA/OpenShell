@@ -107,7 +107,7 @@ impl OpenShellRuntimeBackend {
         }
     }
 
-    /// Select the platform implementation that validates opaque audit evidence.
+    /// Select the backend implementation that validates opaque audit evidence.
     #[must_use]
     pub fn with_audit_validator(
         mut self,
@@ -370,7 +370,7 @@ impl BoundBoundary for RemoteBound {
         let properties = self.audit_validator.validate(&confirmation.backend_audit)?;
         if confirmation.properties != properties {
             return Err(BackendError::Confirm(
-                "sandbox confirmation properties do not match OpenShell audit evidence".to_string(),
+                "sandbox confirmation properties do not match validated audit evidence".to_string(),
             ));
         }
         let client = self.client.clone();

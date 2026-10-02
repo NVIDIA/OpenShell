@@ -23,6 +23,14 @@ supported deliverables:
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
 
+The supervisor and supervisor-process libraries participate in native Windows
+checks and tests. Their gateway session, boundary attachment, and TCP readiness
+are portable; only the optional Unix SSH/readiness socket adapters are gated.
+This is compile and control-plane coverage, not Windows isolation qualification.
+Preserve readiness gating on authenticated gateway acceptance and reconnection.
+Shared Sandbox Protocol audit validation defaults to strict Linux evidence;
+concrete platform validators must be selected by the implementing backend.
+
 The dedicated Windows sandbox binary links the Windows-only `openshell-mxc-boundary`
 library for process operations, containment confirmation, and loopback
 forwarding. The generic sandbox does not link this library and remains a Linux

@@ -120,6 +120,10 @@ boundary on Windows. The Kubernetes Secrets and Vault libraries still compile
 as gateway dependencies; only their standalone Unix-socket binaries and
 package-level tests are excluded as top-level targets.
 
+The supervisor and supervisor-process packages now participate as top-level
+native check/test targets. Their portable session, attachment, and TCP readiness
+coverage does not enable a Windows isolation runtime.
+
 ## Common Errors
 
 ### Unix imports leak into Windows builds

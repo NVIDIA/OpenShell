@@ -15,7 +15,7 @@ links:
 OpenShell runs natively on Windows 11 by using Microsoft Execution Containers
 (MXC, through `wxc-exec.exe`) as an RFC 0012 isolation backend. The gateway's
 in-process MXC compute driver provisions a host
-`openshell-supervisor --role=isolation-backend` and an `openshell-sandbox`
+`openshell-supervisor --role=isolation-backend` and an `openshell-windows-sandbox`
 boundary inside each ProcessContainer.
 
 The authenticated Sandbox Protocol is the only runtime control and forwarding
@@ -56,7 +56,7 @@ authenticated paths instead of MXC-only side channels.
 flowchart TD
     Gateway[Gateway / in-process MXC driver]
     Supervisor[openshell-supervisor<br/>role=isolation-backend]
-    Sandbox[openshell-sandbox<br/>inside MXC ProcessContainer]
+    Sandbox[openshell-windows-sandbox<br/>inside MXC ProcessContainer]
     Workload[Workload process tree]
 
     Gateway -->|policy + launch authentication| Supervisor
@@ -74,7 +74,7 @@ probe, as runtime readiness.
 ### Outer fence and confirmation
 
 MXC receives the mapped filesystem, UI, and network constraints before
-`openshell-sandbox` starts. The boundary consumes and deletes its one-use
+`openshell-windows-sandbox` starts. The boundary consumes and deletes its one-use
 configuration and TLS private key before releasing workload code. It confirms
 the ProcessContainer generation, resource claims, filesystem fence, egress
 fence, authenticated control transport, and controller-loss behavior through
@@ -89,7 +89,7 @@ descriptors are stored beneath an owner-only Windows DACL.
 MXC denies direct Internet egress and permits the loopback route used by the
 Sandbox Protocol and explicit proxy. The host supervisor owns a distinct proxy
 listener and random authorization value for every sandbox generation.
-`openshell-sandbox` injects the proxy URL and public CA paths only into workload
+`openshell-windows-sandbox` injects the proxy URL and public CA paths only into workload
 children. The supervisor retains private CA keys and provider secrets, applies
 network policy, and refreshes provider state through the ordinary session.
 
@@ -115,7 +115,7 @@ resize is deferred; non-terminal exec and byte-stream I/O are supported first.
 ### Configuration and packaging
 
 The Windows release contains `openshell-gateway.exe`, `openshell.exe`,
-`openshell-supervisor.exe`, and `openshell-sandbox.exe`. The runtime binaries
+`openshell-supervisor.exe`, and `openshell-windows-sandbox.exe`. The runtime binaries
 default to siblings of the gateway and may be overridden for development.
 Gateway TLS uses the gateway-owned guest certificate bundle.
 
@@ -163,7 +163,7 @@ credentials, readiness, and proxy lifecycle in the driver. It reduced the
 initial Windows porting work but created a second security protocol and repeated
 existing supervisor patterns. This proposal removes it.
 
-### Supervisor-only host proxy without `openshell-sandbox`
+### Supervisor-only host proxy without `openshell-windows-sandbox`
 
 Running only the host supervisor cannot provide authenticated in-boundary
 process lifecycle, retained I/O, controller-loss handling, or loopback target

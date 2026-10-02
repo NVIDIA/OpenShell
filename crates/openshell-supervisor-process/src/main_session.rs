@@ -690,7 +690,25 @@ impl MainSession {
         }
     }
 
-    pub async fn signal_group(&self, signal: BoundarySignal) -> Result<(), String> {
+    /// Preserve the local Unix signal surface, including SIGQUIT.
+    #[cfg(unix)]
+    pub async fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+        if self.boundary_process.is_some() {
+            let boundary_signal = match signal {
+                nix::sys::signal::Signal::SIGHUP => BoundarySignal::Hup,
+                nix::sys::signal::Signal::SIGINT => BoundarySignal::Int,
+                nix::sys::signal::Signal::SIGKILL => BoundarySignal::Kill,
+                nix::sys::signal::Signal::SIGTERM => BoundarySignal::Term,
+                other => return Err(format!("boundary signal {other:?} is unsupported")),
+            };
+            return self.signal_boundary_group(boundary_signal).await;
+        }
+        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn signal_boundary_group(&self, signal: BoundarySignal) -> Result<(), String> {
         if let Some(process) = self.boundary_process.as_ref() {
             return process
                 .signal(signal)
@@ -809,7 +827,10 @@ mod tests {
 
         session.resize(120, 40, 0, 0).await;
         assert_eq!(*terminal.size.lock().unwrap(), Some((120, 40)));
-        session.signal_group(BoundarySignal::Int).await.unwrap();
+        session
+            .signal_boundary_group(BoundarySignal::Int)
+            .await
+            .unwrap();
         assert_eq!(*process.signals.lock().unwrap(), vec![BoundarySignal::Int]);
     }
 

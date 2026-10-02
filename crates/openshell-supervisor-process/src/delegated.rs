@@ -263,7 +263,7 @@ mod tests {
     use super::*;
 
     // Unit-only boundary fixture: these tests exercise access-plane composition,
-    // not MXC enforcement or E2E qualification.
+    // not isolation enforcement or E2E qualification.
     struct AccessBoundary;
 
     #[async_trait::async_trait]
