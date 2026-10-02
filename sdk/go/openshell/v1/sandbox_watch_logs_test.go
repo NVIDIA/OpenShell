@@ -376,7 +376,8 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	var recordedBackoffs []time.Duration
 	var mu sync.Mutex
 
-	// Inject test hook to record requested backoff delays without wall-clock overhead.
+	// Record each requested backoff delay. The hook only observes; the watcher
+	// still waits out the real delay.
 	oldHook := testHookWatchLogsSleep
 	testHookWatchLogsSleep = func(d time.Duration) {
 		mu.Lock()
@@ -408,6 +409,81 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	require.Len(t, recordedBackoffs, 2)
 	assert.Equal(t, watchLogsInitialBackoff, recordedBackoffs[0])
 	assert.Equal(t, watchLogsInitialBackoff, recordedBackoffs[1])
+}
+
+func TestWatchLogs_BackoffWaitsOncePerRetry(t *testing.T) {
+	// Each retry must wait the requested backoff once. Three retries from the
+	// initial delay add up to 100+200+400ms; waiting each delay twice would
+	// double that.
+	mock := watchLogsMock()
+	var mu sync.Mutex
+	var dials []time.Time
+	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, _ grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
+		mu.Lock()
+		dials = append(dials, time.Now())
+		mu.Unlock()
+		if attempt >= 3 {
+			return nil
+		}
+		return status.Error(codes.Unavailable, "connection reset")
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+	defer w.Stop()
+	drainWatchLogs(t, w)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, dials, 4)
+	const expected = 7 * watchLogsInitialBackoff
+	elapsed := dials[3].Sub(dials[0])
+	assert.GreaterOrEqual(t, elapsed, expected)
+	assert.Less(t, elapsed, expected+expected/2, "retries waited the backoff more than once")
+}
+
+func TestWatchLogs_StopInterruptsBackoff(t *testing.T) {
+	// Stop during a reconnect backoff must return promptly instead of waiting
+	// out the delay, which grows to the 2s cap against a gateway that stays
+	// unavailable.
+	const longBackoff = 8 * watchLogsInitialBackoff
+	mock := watchLogsMock()
+	inLongBackoff := make(chan struct{})
+	var once sync.Once
+	oldHook := testHookWatchLogsSleep
+	testHookWatchLogsSleep = func(d time.Duration) {
+		if d >= longBackoff {
+			once.Do(func() { close(inLongBackoff) })
+		}
+	}
+	defer func() { testHookWatchLogsSleep = oldHook }()
+
+	mock.watchFunc = func(int, *pb.WatchSandboxRequest, grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
+		return status.Error(codes.Unavailable, "gateway down")
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+
+	select {
+	case <-inLongBackoff:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for a long backoff")
+	}
+
+	start := time.Now()
+	w.Stop()
+	select {
+	case _, ok := <-w.ResultChan():
+		assert.False(t, ok, "channel should close after Stop")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for channel close after Stop")
+	}
+	assert.Less(t, time.Since(start), longBackoff/2, "Stop waited out the backoff")
 }
 
 func TestWatchLogs_StopClosesChannel(t *testing.T) {
