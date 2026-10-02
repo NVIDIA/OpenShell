@@ -185,6 +185,33 @@ tests:
           path: data["gateway.toml"]
           pattern: omitted_value
 
+  - it: renders top-level lists as ordered TOML arrays of tables
+    set:
+      gatewayConfig:
+        openshell.gateway.interceptors:
+          - name: governance
+            grpc_endpoint: http://governance.ns.svc.cluster.local:18081
+            order: 0
+            failure_policy: fail_closed
+          - name: audit
+            grpc_endpoint: http://audit.ns.svc.cluster.local:18081
+            order: 1
+            failure_policy: fail_open
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)^\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_closed"\ngrpc_endpoint = "http://governance\.ns\.svc\.cluster\.local:18081"\nname = "governance"\norder = 0\n\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_open"\ngrpc_endpoint = "http://audit\.ns\.svc\.cluster\.local:18081"\nname = "audit"\norder = 1$'
+
+  - it: rejects non-map entries in a top-level array of tables
+    set:
+      gatewayConfig:
+        example.entries:
+          - valid: true
+          - invalid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig array-of-tables "example.entries" entry 1 must be a map, got string'
+
   - it: evaluates templates only in string values
     set:
       gatewayConfig:

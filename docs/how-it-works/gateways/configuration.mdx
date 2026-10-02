@@ -36,9 +36,15 @@ copies referenced Secret data into `gateway.toml`.
 
 The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
 are omitted; `null` array members are rejected because TOML has no equivalent.
-Strings, booleans, integers, and floats preserve their types. Scalar arrays
-become TOML arrays, maps become inline tables, and arrays of maps become arrays
-of inline tables. Keys are ordered alphabetically, so equivalent input produces
+Strings and booleans retain their TOML types, and numeric values remain TOML
+numbers. Helm normalizes YAML numbers before templates run, so it cannot retain
+the lexical distinction between an integral float such as `1.0` and an integer
+such as `1`; both render as the compact TOML value `1`. Scalar arrays become
+TOML arrays, maps become inline tables, and arrays of maps inside a table become
+arrays of inline tables. A top-level `gatewayConfig` list instead renders an
+ordered TOML array of tables: each list item must be a map and emits one
+`[[table]]` block. Keys are ordered alphabetically within each table, while
+array-of-tables item order follows the YAML list, so equivalent input produces
 the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
 string values, never in keys or YAML structure.
 

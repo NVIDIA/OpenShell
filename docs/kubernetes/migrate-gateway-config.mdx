@@ -2,7 +2,8 @@
 
 Chart schema v2 replaces application-specific Helm values with one non-secret
 `gatewayConfig` map. Its top-level keys are TOML tables; nested maps are TOML
-inline tables. Kubernetes resource references (Secrets, certificates, Services,
+inline tables. A top-level YAML list is an ordered TOML array of tables, with
+one map per `[[table]]` entry. Kubernetes resource references (Secrets, certificates, Services,
 and mounts) remain chart values.
 
 ## Upgrade compatibility
