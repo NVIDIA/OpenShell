@@ -789,10 +789,7 @@ impl PodmanComputeDriver {
                         let options_ok = volume.options.is_empty()
                             || (workspace_volume
                                 && numeric_user(&inspect.config.user).is_some_and(|owner| {
-                                    crate::client::volume_options_match_owner(
-                                        &volume.options,
-                                        Some(owner),
-                                    )
+                                    volume.options_match_requested_owner(Some(owner))
                                 }));
                         if !owned || volume.driver != "local" || !options_ok {
                             return Err(missing());

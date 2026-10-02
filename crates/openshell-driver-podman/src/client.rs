@@ -189,25 +189,6 @@ pub struct ImageConfig {
     pub env: Vec<String>,
 }
 
-/// Whether a driver-owned volume has exactly the options `OpenShell` creates it
-/// with: none, or `uid`/`gid` for `owner`. Podman records the parsed `UID` and
-/// `GID` next to the raw `o` option.
-pub fn volume_options_match_owner(
-    options: &HashMap<String, String>,
-    owner: Option<(u32, u32)>,
-) -> bool {
-    let Some((uid, gid)) = owner else {
-        return options.is_empty();
-    };
-    options.get("o").map(String::as_str) == Some(format!("uid={uid},gid={gid}").as_str())
-        && options.iter().all(|(key, value)| match key.as_str() {
-            "o" => true,
-            "UID" => *value == uid.to_string(),
-            "GID" => *value == gid.to_string(),
-            _ => false,
-        })
-}
-
 /// A container summary returned by the list API.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -259,6 +240,38 @@ pub struct VolumeInspect {
 }
 
 impl VolumeInspect {
+    /// Whether metadata matches a managed local volume with the exact labels
+    /// and requested ownership options. This does not inspect filesystem ownership.
+    pub(crate) fn matches_managed_volume(
+        &self,
+        labels: &HashMap<String, String>,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        self.driver == "local"
+            && self.labels.as_ref() == Some(labels)
+            && self.options_match_requested_owner(requested_owner)
+    }
+
+    /// Whether option metadata matches the requested owner. `None` means no
+    /// ownership options were requested and requires an empty options map.
+    /// This does not inspect filesystem ownership. Podman records the parsed
+    /// `UID` and `GID` next to the raw `o` option.
+    pub(crate) fn options_match_requested_owner(
+        &self,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        let Some((uid, gid)) = requested_owner else {
+            return self.options.is_empty();
+        };
+        self.options.get("o").map(String::as_str) == Some(format!("uid={uid},gid={gid}").as_str())
+            && self.options.iter().all(|(key, value)| match key.as_str() {
+                "o" => true,
+                "UID" => *value == uid.to_string(),
+                "GID" => *value == gid.to_string(),
+                _ => false,
+            })
+    }
+
     pub(crate) fn admission_identity(&self) -> Value {
         serde_json::json!({"name": self.name, "driver": self.driver, "options": self.options, "created_at": self.created_at})
     }
@@ -721,6 +734,28 @@ impl PodmanClient {
 
     // ── Volume operations ────────────────────────────────────────────────
 
+    /// Create and inspect a local volume. HTTP 409 conflicts also proceed to
+    /// inspection; callers must verify the returned labels and options.
+    async fn create_volume(
+        &self,
+        name: &str,
+        labels: &HashMap<String, String>,
+        options: &HashMap<String, String>,
+    ) -> Result<VolumeInspect, PodmanApiError> {
+        validate_name(name)?;
+        let mut body = serde_json::json!({
+            "Name": name,
+            "Driver": "local",
+            "Labels": labels,
+        });
+        if !options.is_empty() {
+            body["Options"] = serde_json::json!(options);
+        }
+        self.create_ignore_conflict("/libpod/volumes/create", &body)
+            .await?;
+        self.inspect_volume(name).await
+    }
+
     /// Never adopt an unrelated existing volume on a private provisioning path.
     ///
     /// With `owner`, Podman creates the volume root owned by that UID and GID,
@@ -732,8 +767,6 @@ impl PodmanClient {
         workspace: &str,
         owner: Option<(u32, u32)>,
     ) -> Result<(), PodmanApiError> {
-        let owned_as_requested =
-            |options: &HashMap<String, String>| volume_options_match_owner(options, owner);
         let labels = HashMap::from([
             (
                 openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
@@ -746,10 +779,7 @@ impl PodmanClient {
         ]);
         match self.inspect_volume(name).await {
             Ok(existing) => {
-                if existing.driver != "local"
-                    || !owned_as_requested(&existing.options)
-                    || existing.labels.as_ref() != Some(&labels)
-                {
+                if !existing.matches_managed_volume(&labels, owner) {
                     return Err(PodmanApiError::InvalidInput(
                         "private volume name collides with an unrelated resource".into(),
                     ));
@@ -759,17 +789,11 @@ impl PodmanClient {
             Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        let mut body = serde_json::json!({"Name":name,"Driver":"local","Labels":labels});
-        if let Some((uid, gid)) = owner {
-            body["Options"] = serde_json::json!({ "o": format!("uid={uid},gid={gid}") });
-        }
-        self.create_ignore_conflict("/libpod/volumes/create", &body)
-            .await?;
-        let created = self.inspect_volume(name).await?;
-        if created.driver != "local"
-            || !owned_as_requested(&created.options)
-            || created.labels.as_ref() != Some(&labels)
-        {
+        let options = owner.map_or_else(HashMap::new, |(uid, gid)| {
+            HashMap::from([("o".to_string(), format!("uid={uid},gid={gid}"))])
+        });
+        let created = self.create_volume(name, &labels, &options).await?;
+        if !created.matches_managed_volume(&labels, owner) {
             return Err(PodmanApiError::InvalidInput(
                 "private volume ownership verification failed".into(),
             ));
