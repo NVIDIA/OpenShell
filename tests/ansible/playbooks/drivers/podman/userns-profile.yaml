@@ -12,6 +12,10 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Resolve installed gateway context
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+
     - name: Detect tmachine container runtime
       ansible.builtin.include_role:
         name: tmachine_container_runtime
@@ -38,21 +42,15 @@
     - name: Apply the Podman user-namespace fixture
       become: true
       ansible.builtin.blockinfile:
-        path: /etc/openshell/gateway.toml
+        path: "{{ openshell_test_gateway.config_path }}"
+        insertafter: '^\[openshell\.drivers\.podman\]$'
         marker: "# {mark} OpenShell Podman userns test fixture"
         block: "{{ lookup('ansible.builtin.file', podman_userns_config) | trim }}"
 
-    - name: Restart OpenShell gateway with the Podman user-namespace fixture
-      become: true
-      ansible.builtin.systemd_service:
-        name: openshell-gateway.service
-        state: restarted
-
-    - name: Wait for the configured OpenShell gateway
-      ansible.builtin.wait_for:
-        host: 127.0.0.1
-        port: 17670
-        timeout: 60
+    - name: Restart installed gateway with the Podman user-namespace fixture
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+        tasks_from: restart.yaml
 
     - name: Capture direct Podman user-namespace mapping
       become: true

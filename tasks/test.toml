@@ -16,6 +16,7 @@ depends = [
   "test:e2e-image-overrides",
   "test:gateway-config",
   "test:packaging-assets",
+  "test:tmachine-gateway",
   "test:qualification-summary",
   "test:codex-security-release-range",
   "test:docs-website",
@@ -306,4 +307,10 @@ run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debu
 description = "Test generated local gateway TOML without starting a runtime"
 run = "bash tasks/scripts/test-gateway-config.sh"
 run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
+hide = true
+
+["test:tmachine-gateway"]
+description = "Check tmachine binary and package gateway service contexts"
+run = "ANSIBLE_LOCAL_TEMP=/tmp/openshell-ansible-local uv run --no-project --with pytest --with ansible-core --with pyyaml pytest tests/ansible/gateway_context_test.py"
+run_windows = "echo Skipping test:tmachine-gateway: Ansible gateway qualification runs on Unix hosts."
 hide = true
