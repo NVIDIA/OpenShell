@@ -5,6 +5,8 @@
 //!
 //! This crate provides the CLI implementation for `OpenShell`.
 
+#![forbid(unsafe_code)]
+
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]

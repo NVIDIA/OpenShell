@@ -3,13 +3,10 @@
 
 //! Bounded registry for socket-time seccomp virtualization.
 
-#![allow(unsafe_code)]
-
 use std::collections::BTreeMap;
 use std::io;
-use std::mem::size_of;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::fs::fstat;
 
@@ -134,7 +131,7 @@ impl SocketEntry {
     /// inode.
     pub fn validate_retained_identity(&self) -> io::Result<()> {
         let retained = self.retained_preconnect()?;
-        let identity = socket_identity(retained.as_raw_fd(), self.identity.listener_generation)?;
+        let identity = socket_identity(retained.as_fd(), self.identity.listener_generation)?;
         if identity == self.identity {
             Ok(())
         } else {
@@ -231,7 +228,7 @@ impl SocketRegistry {
         if self.entries.len() >= self.capacity {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
         }
-        let identity = socket_identity(source.as_raw_fd(), self.listener_generation)?;
+        let identity = socket_identity(source.as_fd(), self.listener_generation)?;
         if self.entries.contains_key(&identity.inode) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -324,33 +321,16 @@ impl SocketRegistry {
     }
 }
 
-fn socket_identity(fd: RawFd, listener_generation: u64) -> io::Result<SocketIdentity> {
-    // SAFETY: `fd` remains open for this function; the borrow never escapes.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let stat = fstat(borrowed)?;
+fn socket_identity(fd: BorrowedFd<'_>, listener_generation: u64) -> io::Result<SocketIdentity> {
+    let stat = fstat(fd)?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "registry source descriptor is not a socket",
         ));
     }
-    let mut cookie = 0_u64;
-    let mut length =
-        libc::socklen_t::try_from(size_of::<u64>()).expect("SO_COOKIE length fits socklen_t");
-    // SAFETY: getsockopt writes at most the supplied u64 and socklen_t.
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_COOKIE,
-            std::ptr::addr_of_mut!(cookie).cast(),
-            std::ptr::addr_of_mut!(length),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if usize::try_from(length).ok() != Some(size_of::<u64>()) || cookie == 0 {
+    let cookie = rustix::net::sockopt::socket_cookie(fd)?;
+    if cookie == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "kernel returned an invalid SO_COOKIE",
@@ -365,22 +345,18 @@ fn socket_identity(fd: RawFd, listener_generation: u64) -> io::Result<SocketIden
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::FromRawFd;
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto};
 
     use super::*;
 
     fn tcp_socket() -> OwnedFd {
-        // SAFETY: socket returns one newly owned descriptor on success.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_INET,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                libc::IPPROTO_TCP,
-            )
-        };
-        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
-        // SAFETY: successful socket returned one owned descriptor.
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        rustix::net::socket_with(
+            AddressFamily::INET,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            Some(ipproto::TCP),
+        )
+        .expect("socket")
     }
 
     fn metadata() -> SocketMetadata {
@@ -428,13 +404,7 @@ mod tests {
     fn dup_alias_resolves_to_same_open_file_description() {
         let mut registry = SocketRegistry::new(9, 4).unwrap();
         let socket = tcp_socket();
-        let original_fd = socket.as_raw_fd();
-        // SAFETY: dup returns a new descriptor for the same open-file
-        // description or a negative error.
-        let alias_fd = unsafe { libc::dup(original_fd) };
-        assert!(alias_fd >= 0, "dup: {}", io::Error::last_os_error());
-        // SAFETY: successful dup returned one owned descriptor.
-        let alias = unsafe { OwnedFd::from_raw_fd(alias_fd) };
+        let alias = rustix::io::dup(&socket).expect("dup");
 
         let tentative = registry.stage(socket, metadata()).unwrap();
         let identity = registry.commit(tentative).unwrap();

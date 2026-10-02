@@ -3909,6 +3909,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -4674,13 +4675,10 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "libc",
  "openshell-core",
- "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "socket2",
  "tokio",
 ]
 
@@ -5091,9 +5089,11 @@ dependencies = [
  "ipnet",
  "libc",
  "miette",
+ "nix 0.29.0",
  "noyalib",
  "openshell-binary-identity",
  "openshell-core",
+ "openshell-driver-vm",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-otel",
@@ -5106,6 +5106,7 @@ dependencies = [
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -5146,6 +5147,7 @@ dependencies = [
  "openshell-ocsf",
  "rand 0.10.2",
  "russh",
+ "rustix 1.1.4",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

@@ -1010,19 +1010,12 @@ impl VmDriver {
             })?;
         }
         #[cfg(unix)]
-        let liveness_read_fd = liveness_read.as_raw_fd();
-        #[cfg(unix)]
         command
-            .arg("--parent-liveness-fd")
-            .arg(liveness_read_fd.to_string());
+            .stdin(Stdio::from(liveness_read))
+            .arg("--parent-liveness-stdin");
         #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
-                nix::fcntl::fcntl(
-                    liveness_read_fd,
-                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                )
-                .map_err(std::io::Error::other)?;
                 #[cfg(target_os = "linux")]
                 nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::other)?;
                 Ok(())
@@ -1036,7 +1029,6 @@ impl VmDriver {
         })?;
         #[cfg(unix)]
         {
-            drop(liveness_read);
             Ok((child, Some(fs::File::from(liveness_write))))
         }
         #[cfg(not(unix))]

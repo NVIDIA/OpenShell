@@ -76,7 +76,7 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command, In
 fn prepare_network() -> Result<(), InitError> {
     // The helper is only invoked by trusted VM guest init, before it hands the
     // workload to the capability-free sandbox identity.
-    if unsafe { libc::geteuid() } != 0 {
+    if rustix::process::geteuid().as_raw() != 0 {
         return Err(InitError(
             "prepare-network must run as the VM guest root user".to_string(),
         ));
