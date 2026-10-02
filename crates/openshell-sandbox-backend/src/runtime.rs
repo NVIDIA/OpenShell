@@ -73,6 +73,7 @@ fn begin_recovery_window(
 /// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
+    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -99,10 +100,21 @@ impl OpenShellRuntimeBackend {
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
+            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
         }
+    }
+
+    /// Select the backend implementation that validates opaque audit evidence.
+    #[must_use]
+    pub fn with_audit_validator(
+        mut self,
+        validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
+    ) -> Self {
+        self.audit_validator = validator;
+        self
     }
 }
 
@@ -147,6 +159,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             ));
         }
         Ok(Box::new(RemoteBound {
+            audit_validator: self.audit_validator.clone(),
             client: client.clone(),
             agent: sandbox.agent,
             policy: sandbox.policy,
@@ -292,6 +305,7 @@ fn validate_control_port(port: u32) -> Result<(), BackendError> {
 }
 
 struct RemoteBound {
+    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
@@ -332,17 +346,10 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
-        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
-            serde_json::from_value(confirmation.backend_audit.clone()).map_err(|error| {
-                BackendError::Confirm(format!(
-                    "decode native Linux sandbox audit evidence: {error}"
-                ))
-            })?;
-        audit.validate()?;
-        if confirmation.properties != audit.properties() {
+        let properties = self.audit_validator.validate(&confirmation.backend_audit)?;
+        if confirmation.properties != properties {
             return Err(BackendError::Confirm(
-                "sandbox confirmation properties do not match native Linux audit evidence"
-                    .to_string(),
+                "sandbox confirmation properties do not match validated audit evidence".to_string(),
             ));
         }
         let client = self.client.clone();
@@ -2959,6 +2966,7 @@ mod tests {
             test_bearer(&expected_token),
         ));
         let bound = RemoteBound {
+            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             client: client.clone(),
             agent: context.agent,
             policy: context.policy,
