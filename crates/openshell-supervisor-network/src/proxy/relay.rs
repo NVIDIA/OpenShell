@@ -5,9 +5,8 @@
 
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{
-    NetworkAction, NetworkPolicyEngine, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine,
-};
+use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::policy_engine::PolicyEngine;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
@@ -107,39 +106,24 @@ pub(super) fn http_context(
 
 /// Pin a generation for a relay or the forward HTTP single-request path.
 pub(super) fn pin_policy_generation(
-    network_engine: &dyn NetworkPolicyEngine,
+    network_engine: &PolicyEngine,
     expected_generation: u64,
 ) -> Result<PolicyGenerationGuard> {
     network_engine.generation_guard(expected_generation)
 }
 
-/// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
+/// Build the L7 evaluator for a relay or the forward HTTP single-request path.
 ///
-/// The returned [`TunnelPolicyEngine`] always exists (middleware/generation
-/// tracking are OPA-coupled regardless of which engine is authoritative —
-/// see [`NetworkPolicyEngine`] module docs), but its L7 *decision* comes
-/// from `network_engine` when it provides one (a Cedar-sourced sandbox),
-/// via [`TunnelPolicyEngine::with_l7_override`].
+/// `opa_engine` supplies middleware and per-tunnel plumbing; `network_engine`
+/// pins the tunnel to the generation of the decision that allowed it and,
+/// for a Cedar policy, makes the L7 decisions. See
+/// [`PolicyEngine::tunnel_engine`].
 pub(super) fn pin_l7_evaluator(
     opa_engine: &OpaEngine,
-    network_engine: &dyn NetworkPolicyEngine,
+    network_engine: &PolicyEngine,
     expected_generation: u64,
 ) -> Result<TunnelPolicyEngine> {
-    // Validate staleness against the authoritative engine (OPA or Cedar),
-    // not opa_engine's own generation: for a Cedar-sourced sandbox,
-    // opa_engine is a structural stand-in whose counter is independent of
-    // Cedar's (e.g. it advances once from builtin middleware registry
-    // installation at startup, permanently offsetting it from Cedar's,
-    // which never reflects that event). `expected_generation` here is the
-    // CONNECT decision's generation, always reported by whichever engine
-    // was actually authoritative for that decision.
-    network_engine.generation_guard(expected_generation)?;
-    // Clone against opa_engine's own live generation: the real staleness
-    // check already happened above, so this is structural only (it always
-    // succeeds short of a concurrent OPA reload landing in this instant).
-    let tunnel = opa_engine.clone_engine_for_tunnel(opa_engine.current_generation())?;
-    let l7_override = network_engine.l7_engine_for_tunnel(expected_generation);
-    Ok(tunnel.with_l7_override(l7_override))
+    network_engine.tunnel_engine(opa_engine, expected_generation)
 }
 
 pub(super) fn validate_route_generation(
@@ -167,7 +151,7 @@ pub(super) fn validate_route_generation(
 pub(super) fn prepare_http_relay<'a>(
     route: Option<&L7RouteSnapshot>,
     opa_engine: &'a OpaEngine,
-    network_engine: &dyn NetworkPolicyEngine,
+    network_engine: &PolicyEngine,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
@@ -230,7 +214,7 @@ pub(super) fn prepare_http_relay<'a>(
 /// a stale decision.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
-    network_engine: &dyn NetworkPolicyEngine,
+    network_engine: &PolicyEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
@@ -369,6 +353,7 @@ mod tests {
                 matched_policy: Some("test".to_string()),
             },
             policy_generation,
+            engine: "opa",
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,
@@ -402,11 +387,12 @@ mod tests {
 
     #[test]
     fn relay_without_route_pins_l4_decision_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(engine.current_generation());
         let request = request_context();
 
-        let context = prepare_http_relay(None, &engine, &engine, &decision, &request)
+        let context = prepare_http_relay(None, &engine, &policy, &decision, &request)
             .expect("current L4 generation should prepare a relay");
         let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
             panic!("route-less relay should use a generation guard");
@@ -420,7 +406,8 @@ mod tests {
 
     #[test]
     fn empty_hydrated_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -429,14 +416,15 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &engine, &decision, &request).is_none(),
+            prepare_http_relay(Some(&route), &engine, &policy, &decision, &request).is_none(),
             "a current L7 lookup must not freshen a stale L4 allow"
         );
     }
 
     #[test]
     fn inspected_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![super::super::L7ConfigSnapshot {
@@ -467,14 +455,15 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &engine, &decision, &request).is_none(),
+            prepare_http_relay(Some(&route), &engine, &policy, &decision, &request).is_none(),
             "an inspected route must use the generation that authorized CONNECT"
         );
     }
 
     #[test]
     fn raw_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -482,20 +471,21 @@ mod tests {
         };
 
         assert!(
-            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
+            prepare_raw_relay(Some(&route), &policy, &decision).is_none(),
             "a raw relay must not freshen a stale L4 allow"
         );
     }
 
     #[test]
     fn stale_generation_fails_before_relay_context_is_created() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(engine.current_generation());
         let request = request_context();
         engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
 
         assert!(
-            prepare_http_relay(None, &engine, &engine, &decision, &request).is_none(),
+            prepare_http_relay(None, &engine, &policy, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
     }

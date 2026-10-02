@@ -2813,7 +2813,7 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 ///
 /// Returns `(allowed, deny_reason)`.
 pub fn evaluate_l7_request(
-    engine: &dyn crate::opa::L7PolicyEngine,
+    engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
@@ -2841,7 +2841,7 @@ pub fn evaluate_l7_request(
 }
 
 fn evaluate_jsonrpc_l7_request_for_log(
-    engine: &dyn crate::opa::L7PolicyEngine,
+    engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
@@ -3149,16 +3149,11 @@ where
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
-            // Compare against the middleware engine's own live generation,
-            // not generation_guard: for a Cedar-sourced sandbox,
-            // generation_guard tracks Cedar's generation while `engine`
-            // here is always the (middleware-only) dummy OpaEngine — a
-            // different counter that need not, and often permanently
-            // doesn't, match Cedar's. The real staleness protection for
-            // this tunnel is the close_if_stale(generation_guard, ..) calls
-            // elsewhere in this loop; this check only guards against the
-            // middleware chain changing out from under this one query.
-            if generation != engine.current_generation() {
+            // `engine` supplies middleware and has its own generation, which
+            // for a Cedar sandbox is unrelated to `generation_guard` (pinned
+            // to Cedar). Stop if either the middleware chain just changed or
+            // the tunnel's policy is stale.
+            if generation != engine.current_generation() || generation_guard.is_stale() {
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;

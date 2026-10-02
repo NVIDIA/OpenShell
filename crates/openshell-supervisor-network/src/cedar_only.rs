@@ -15,8 +15,8 @@
 //! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_network`].
 //! Per-request L7 enforcement is covered by
 //! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_l7`] via
-//! [`CedarL7TunnelEngine`], this engine's [`crate::opa::L7PolicyEngine`]
-//! handle. [`l7_endpoint_configs_for`] populates
+//! [`CedarL7TunnelEngine`], the handle each inspected tunnel's
+//! [`crate::opa::TunnelPolicyEngine`] delegates to. [`l7_endpoint_configs_for`] populates
 //! `EgressAuthorization::endpoint_configs` for every endpoint an
 //! `HttpRequest` policy names, so the proxy routes an allowed CONNECT into
 //! L7 inspection instead of unconditional passthrough. The Cedar engine
@@ -24,7 +24,12 @@
 //! `EgressAuthorization::matched_endpoints` stays empty; that feeds the
 //! transparent-TCP policy-DNS adapter, which no current driver uses. DNS
 //! eligibility is covered separately by
-//! [`crate::opa::NetworkPolicyEngine::policy_dns_eligibility_snapshot`].
+//! [`CedarOnlyEngine::policy_dns_eligibility_snapshot`].
+//!
+//! Every read of the generation counter happens under the engine lock, and
+//! [`CedarOnlyEngine::commit`] advances it under the write lock, so a
+//! decision is always reported against the generation of the policy that
+//! made it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -35,8 +40,7 @@ use tokio::sync::watch;
 
 use crate::cedar_shadow::{PLACEHOLDER_IDENTITY, network_request_from_input};
 use crate::opa::{
-    EgressAuthorization, L7PolicyEngine, MatchedEndpoint, NetworkAction, NetworkInput,
-    PolicyDnsEligibilitySnapshot,
+    EgressAuthorization, MatchedEndpoint, NetworkAction, NetworkInput, PolicyDnsEligibilitySnapshot,
 };
 use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 
@@ -45,11 +49,10 @@ use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 /// No hidden fallback to OPA: a sandbox either uses this engine for every
 /// network decision, or [`crate::opa::OpaEngine`] for every network
 /// decision, chosen once at policy load.
+#[derive(Debug)]
 pub struct CedarOnlyEngine {
-    /// `Arc`-wrapped (rather than a plain `RwLock`) so [`Self::l7_handle`]
-    /// can hand out a lightweight, independently-staleness-checked clone
-    /// without needing the enclosing `Arc<CedarOnlyEngine>` — trait objects
-    /// reached through `&dyn NetworkPolicyEngine` only ever see `&self`.
+    /// Shared with every [`CedarL7TunnelEngine`] handed out by
+    /// [`Self::l7_handle`].
     engine: Arc<RwLock<CedarNetworkEngine>>,
     /// The currently-loaded policy source, so [`Self::reload_from_policy_str`]
     /// can no-op on an unchanged reload instead of unconditionally advancing
@@ -87,14 +90,54 @@ impl CedarOnlyEngine {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Builds an L7 decision handle for a tunnel pinned at
-    /// `captured_generation`. See [`crate::opa::NetworkPolicyEngine::l7_engine_for_tunnel`].
-    fn l7_handle(&self, captured_generation: u64) -> Arc<dyn L7PolicyEngine> {
-        Arc::new(CedarL7TunnelEngine {
+    /// Builds the L7 decision handle for a tunnel pinned at `captured_generation`.
+    pub(crate) fn l7_handle(&self, captured_generation: u64) -> CedarL7TunnelEngine {
+        CedarL7TunnelEngine {
             engine: Arc::clone(&self.engine),
             generation: Arc::clone(&self.generation),
             captured_generation,
-        })
+        }
+    }
+
+    /// Pins `expected_generation` for a long-lived operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `expected_generation` is already stale.
+    pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
+        generation_guard_for(
+            expected_generation,
+            self.current_generation(),
+            &self.generation,
+            &self.generation_tx,
+        )
+    }
+
+    /// Runs `operation` only while `expected_generation` is current.
+    ///
+    /// Holds the engine read lock across the check and `operation`, so no
+    /// reload can commit between them. `operation` must not block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned.
+    pub fn with_current_generation<T>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<Option<T>> {
+        let _engine = self.read_engine()?;
+        let current_generation = self.current_generation();
+        if current_generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(operation(current_generation)))
+    }
+
+    fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, CedarNetworkEngine>> {
+        self.engine
+            .read()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))
     }
 
     /// Rebuilds the engine from a freshly reloaded policy and advances the
@@ -178,11 +221,7 @@ impl CedarOnlyEngine {
     pub fn filesystem_grants(
         &self,
     ) -> Result<openshell_policy_cedar::filesystem::FilesystemPolicyInput> {
-        let guard = self
-            .engine
-            .read()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
-        Ok(guard.filesystem_grants().clone())
+        Ok(self.read_engine()?.filesystem_grants().clone())
     }
 }
 
@@ -226,15 +265,17 @@ fn l7_endpoint_configs_for(
     Ok(vec![config])
 }
 
-impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
-    fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+impl CedarOnlyEngine {
+    /// Authorizes one egress request against the active Cedar policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned, or Cedar fails to
+    /// evaluate the request. Callers deny the connection on error.
+    pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         let request = network_request_from_input(input);
+        let guard = self.read_engine()?;
         let generation = self.current_generation();
-
-        let guard = self
-            .engine
-            .read()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
         let decision = guard
             .evaluate_network(&request)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -262,48 +303,22 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
         Ok(EgressAuthorization {
             action,
             endpoint_configs,
-            // The policy-DNS adapter (transparent TCP's host:port-to-policy
-            // correlation) is out of scope for Cedar-sourced sandboxes in
-            // this phase — see module docs. It's unrelated to L7 config
-            // lookup above, which `policy_dns_eligibility_snapshot` (a
-            // separate NetworkPolicyEngine method) now covers independently.
+            // Feeds the transparent-TCP policy-DNS correlation, which no
+            // current driver uses; see the module docs.
             matched_endpoints: Vec::<MatchedEndpoint>::new(),
             exact_declared_endpoint_host: false,
             generation,
         })
     }
 
-    fn current_generation(&self) -> u64 {
-        Self::current_generation(self)
-    }
-
-    fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
-        generation_guard_for(
-            expected_generation,
-            self.current_generation(),
-            &self.generation,
-            &self.generation_tx,
-        )
-    }
-
-    fn binary_identity_required(&self) -> bool {
-        true
-    }
-
-    fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
-        crate::l7::websocket::WebSocketAssemblyBudget::default()
-    }
-
-    fn l7_engine_for_tunnel(&self, captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
-        Some(self.l7_handle(captured_generation))
-    }
-
-    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+    /// Returns the endpoints eligible for policy-gated DNS resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned.
+    pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        let guard = self.read_engine()?;
         let generation = self.current_generation();
-        let guard = self
-            .engine
-            .read()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
         let endpoints = guard
             .dns_endpoints()
             .iter()
@@ -336,18 +351,32 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
 /// concurrent evaluation is just concurrent `RwLock::read()` calls, same as
 /// [`CedarOnlyEngine::authorize_egress`]. Only `captured_generation` is
 /// per-tunnel state.
-struct CedarL7TunnelEngine {
+#[derive(Debug)]
+pub(crate) struct CedarL7TunnelEngine {
     engine: Arc<RwLock<CedarNetworkEngine>>,
     generation: Arc<AtomicU64>,
     captured_generation: u64,
 }
 
-impl L7PolicyEngine for CedarL7TunnelEngine {
-    fn evaluate_request(
+impl CedarL7TunnelEngine {
+    /// Evaluates one L7 request and returns `(allowed, deny_reason)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel's generation is stale, the engine lock
+    /// is poisoned, or Cedar fails to evaluate the request.
+    pub(crate) fn evaluate_request(
         &self,
         ctx: &crate::l7::relay::L7EvalContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<(bool, String)> {
+        // Compare under the read lock: a reload advances the generation
+        // under the write lock, so this request is judged by the policy
+        // generation the tunnel was pinned to, never a newer one.
+        let guard = self
+            .engine
+            .read()
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
         let current_generation = self.generation.load(Ordering::Acquire);
         if current_generation != self.captured_generation {
             return Err(miette::miette!(
@@ -383,10 +412,6 @@ impl L7PolicyEngine for CedarL7TunnelEngine {
             jsonrpc_method,
         };
 
-        let guard = self
-            .engine
-            .read()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
         let (allowed, _matched) = guard
             .evaluate_l7(&l7_request)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -404,7 +429,6 @@ mod tests {
     use super::*;
     use crate::l7::L7RequestInfo;
     use crate::l7::relay::L7EvalContext;
-    use crate::opa::{L7PolicyEngine, NetworkPolicyEngine};
 
     const POLICY: &str = r#"
 permit (
@@ -506,9 +530,7 @@ when { context.binary_path == "/usr/bin/curl" };
     fn l7_override_allows_the_permitted_request() {
         let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
         let generation = engine.current_generation();
-        let handle = engine
-            .l7_engine_for_tunnel(generation)
-            .expect("Cedar engine provides an L7 handle");
+        let handle = engine.l7_handle(generation);
         let (allowed, _) = handle
             .evaluate_request(&ctx(), &request("GET", "/v1/status"))
             .expect("request evaluates");
@@ -519,9 +541,7 @@ when { context.binary_path == "/usr/bin/curl" };
     fn l7_override_denies_a_different_path() {
         let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
         let generation = engine.current_generation();
-        let handle = engine
-            .l7_engine_for_tunnel(generation)
-            .expect("Cedar engine provides an L7 handle");
+        let handle = engine.l7_handle(generation);
         let (allowed, reason) = handle
             .evaluate_request(&ctx(), &request("GET", "/v1/admin"))
             .expect("request evaluates");
@@ -533,9 +553,7 @@ when { context.binary_path == "/usr/bin/curl" };
     fn l7_override_fails_closed_when_tunnel_generation_is_stale() {
         let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
         let captured_generation = engine.current_generation();
-        let handle = engine
-            .l7_engine_for_tunnel(captured_generation)
-            .expect("Cedar engine provides an L7 handle");
+        let handle = engine.l7_handle(captured_generation);
         // A reload with genuinely different policy text must still advance
         // the generation — only a byte-identical reload is a no-op.
         let changed_policy = format!("{POLICY}\n// a trailing comment to change the source\n");
@@ -568,32 +586,72 @@ when { context.binary_path == "/usr/bin/curl" };
         );
     }
 
-    #[test]
-    fn tunnel_policy_engine_delegates_to_cedar_override() {
-        let cedar = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
-        let generation = cedar.current_generation();
-        let l7_override = cedar.l7_engine_for_tunnel(generation);
-
-        // A restrictive-default OPA engine (no network_policies at all) would
-        // deny every L7 request on its own — proving the override, not the
-        // underlying regorus engine, produced the Allow below.
-        let opa = crate::opa::OpaEngine::from_strings(
-            include_str!("../data/sandbox-policy.rego"),
-            "network_policies: {}",
+    fn plumbing_opa_engine() -> Arc<crate::opa::OpaEngine> {
+        // No network policies: the Rego engine alone would deny every L7
+        // request, so an Allow below can only come from Cedar.
+        Arc::new(
+            crate::opa::OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}",
+            )
+            .expect("restrictive OPA engine builds"),
         )
-        .expect("restrictive OPA engine builds");
-        let opa_generation = opa.current_generation();
-        let tunnel = opa
-            .clone_engine_for_tunnel(opa_generation)
-            .expect("tunnel clones")
-            .with_l7_override(l7_override);
+    }
+
+    #[test]
+    fn tunnel_engine_delegates_l7_decisions_to_cedar() {
+        let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
+        let plumbing = plumbing_opa_engine();
+        let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+
+        let tunnel = engine
+            .tunnel_engine(&plumbing, cedar.current_generation())
+            .expect("tunnel builds");
 
         let (allowed, _) = tunnel
             .evaluate_request(&ctx(), &request("GET", "/v1/status"))
             .expect("request evaluates");
         assert!(
             allowed,
-            "override must take priority over the dummy OPA engine"
+            "Cedar must decide, not the empty-policy OPA engine"
         );
+    }
+
+    #[test]
+    fn tunnel_engine_tracks_the_cedar_generation() {
+        let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
+        let plumbing = plumbing_opa_engine();
+        let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+        let tunnel = engine
+            .tunnel_engine(&plumbing, cedar.current_generation())
+            .expect("tunnel builds");
+
+        // A change to the plumbing engine (for example a middleware registry
+        // swap) must not close a Cedar tunnel.
+        plumbing
+            .replace_middleware_registry(
+                openshell_supervisor_middleware::MiddlewareRegistry::default(),
+            )
+            .expect("registry swap");
+        assert!(!tunnel.is_stale());
+
+        // A Cedar reload must.
+        cedar
+            .reload_from_policy_str(&format!("{POLICY}\n// changed\n"))
+            .expect("reload");
+        assert!(tunnel.is_stale());
+    }
+
+    #[test]
+    fn tunnel_engine_rejects_a_stale_cedar_generation() {
+        let cedar = Arc::new(CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses"));
+        let plumbing = plumbing_opa_engine();
+        let engine = crate::policy_engine::PolicyEngine::from(Arc::clone(&cedar));
+        let decided_at = cedar.current_generation();
+        cedar
+            .reload_from_policy_str(&format!("{POLICY}\n// changed\n"))
+            .expect("reload");
+
+        assert!(engine.tunnel_engine(&plumbing, decided_at).is_err());
     }
 }

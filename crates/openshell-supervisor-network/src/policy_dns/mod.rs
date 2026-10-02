@@ -32,7 +32,7 @@ pub(crate) use store::{
     SyntheticPools,
 };
 
-use crate::opa::NetworkPolicyEngine;
+use crate::policy_engine::PolicyEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
 use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
@@ -81,7 +81,7 @@ pub(crate) enum PolicyDnsError {
 /// No socket is bound by this type. A later runtime adapter owns listener and
 /// namespace lifecycle and calls the bounded wire helpers in this module.
 pub(crate) struct PolicyDnsService<R> {
-    policy: Arc<dyn NetworkPolicyEngine>,
+    policy: PolicyEngine,
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
     trusted_host_gateway: Option<std::net::IpAddr>,
@@ -89,13 +89,13 @@ pub(crate) struct PolicyDnsService<R> {
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn new(
-        policy: Arc<dyn NetworkPolicyEngine>,
+        policy: impl Into<PolicyEngine>,
         resolver: R,
         store: Arc<ResolvedEndpointStore>,
         trusted_host_gateway: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
-            policy,
+            policy: policy.into(),
             resolver,
             store,
             trusted_host_gateway,
@@ -205,19 +205,13 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             ttl,
             contracts,
         };
-        // Re-check the generation immediately before publishing instead of
-        // holding an engine-internal lock across the check (OpaEngine's
-        // former with_current_generation did this to linearize against
-        // reload/fail-closed transitions — a guarantee this trait-generic
-        // path can't express for every implementor). The remaining race
-        // window is pure in-memory work with no I/O, and the published
-        // record's own `policy_generation` is checked again downstream, so
-        // a reload landing in that window is caught, not silently trusted.
-        let publish_result = (self.policy.current_generation() == snapshot.generation)
-            .then(|| self.store.publish(request, snapshot.generation, now));
-        let record = match publish_result {
-            Some(Ok(record)) => record,
-            Some(Err(error)) => {
+        let record = match self
+            .policy
+            .with_current_generation(snapshot.generation, |current_generation| {
+                self.store.publish(request, current_generation, now)
+            }) {
+            Ok(Some(Ok(record))) => record,
+            Ok(Some(Err(error))) => {
                 // InvalidMapping is unreachable for the well-formed request
                 // assembled above, and LockPoisoned requires a prior panic
                 // while holding the store lock. Keep both defensive outcomes
@@ -232,7 +226,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
                 );
                 return Err(PolicyDnsError::Publish(error));
             }
-            None => {
+            Ok(None) => {
                 emit_dns_failure(
                     &normalized_name,
                     family,
@@ -242,6 +236,17 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
                     "Policy DNS discarded a stale resolved-endpoint mapping",
                 );
                 return Err(PolicyDnsError::StalePolicy);
+            }
+            Err(error) => {
+                emit_dns_failure(
+                    &normalized_name,
+                    family,
+                    &endpoint_context,
+                    snapshot.generation,
+                    "policy_dns_publication_generation_check_failed",
+                    "Policy DNS could not validate the active policy generation before publication",
+                );
+                return Err(PolicyDnsError::Policy(error.to_string()));
             }
         };
         emit_mapping_publication(&record);

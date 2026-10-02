@@ -2398,14 +2398,10 @@ async fn load_policy(
         let opa_engine = Some(engine);
 
         // Cedar-sourced sandbox: a non-empty `cedar_policy_source` makes
-        // Cedar the sole authoritative network/filesystem engine for this
-        // sandbox. The OPA engine built above still exists (constructed
-        // from a proto with empty `filesystem`/`landlock`/`network_policies`
-        // for a Cedar submission, so it's already a harmless, restrictive
-        // stand-in) purely to satisfy call sites that remain structurally
-        // OPA-coupled (middleware chain, L7 tunnel setup) until those gain
-        // Cedar equivalents; it is never consulted for network decisions
-        // when a Cedar engine is active (see `NetworkPolicyEngine`).
+        // Cedar the sole authoritative network, L7, and filesystem engine.
+        // The OPA engine built above has no network policies and only
+        // supplies middleware and tunnel plumbing; it never makes a decision
+        // (see `openshell_supervisor_network::policy_engine`).
         let cedar_engine = if proto_policy.cedar_policy_source.is_empty() {
             None
         } else {
@@ -3359,7 +3355,7 @@ struct PolicyPollLoopContext {
     /// alongside `opa_engine` on every successful reload. `None` when this
     /// sandbox's policy was submitted as YAML (`opa_engine` stays
     /// authoritative for the sandbox's whole lifetime — see
-    /// `openshell_supervisor_network::opa::NetworkPolicyEngine`).
+    /// `openshell_supervisor_network::policy_engine`).
     cedar_engine: Option<Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine>>,
     /// Source of the policy currently loaded into OPA. This distinguishes an
     /// explicit local-file override from an unbound gateway revision so the

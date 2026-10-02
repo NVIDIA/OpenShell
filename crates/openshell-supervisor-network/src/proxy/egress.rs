@@ -146,6 +146,8 @@ pub(super) struct EgressDecision {
     pub(super) action: NetworkAction,
     /// Policy generation used for the complete authorization snapshot.
     pub(super) policy_generation: u64,
+    /// Engine that made the decision (`opa` or `cedar`), for OCSF events.
+    pub(super) engine: &'static str,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.

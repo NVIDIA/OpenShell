@@ -85,88 +85,6 @@ pub struct EgressAuthorization {
     pub generation: u64,
 }
 
-/// The network CONNECT-time decision-maker, independent of which policy
-/// language authored the active policy.
-///
-/// Exactly one implementation is active per sandbox, chosen by which policy
-/// format the sandbox's `SandboxPolicy` was submitted in: [`OpaEngine`] for
-/// YAML (`network_policies`), [`crate::cedar_only::CedarOnlyEngine`] for a
-/// `cedar_policy_source`. There is no dual-run — see
-/// `architecture/plans/cedar-policy-engine-rfc-draft.md` for why Cedar's
-/// authoritative role here is scoped to this trait's surface (L7/middleware
-/// stay OPA-only; `endpoint_configs`/`matched_endpoints` on
-/// [`EgressAuthorization`] are always empty from a Cedar-sourced sandbox,
-/// since those feed L7 config lookup and the not-yet-landed policy-DNS
-/// adapter, neither of which Cedar covers in this phase).
-pub trait NetworkPolicyEngine: Send + Sync {
-    /// Authorize one egress request and return all connection metadata from
-    /// one decision evaluated against one policy generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only for an evaluator-internal failure (e.g. a
-    /// poisoned lock) — never for a policy-content denial, which is
-    /// `Ok(EgressAuthorization { action: NetworkAction::Deny { .. }, .. })`.
-    fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization>;
-
-    /// Current policy generation. Successful reloads increment this value.
-    fn current_generation(&self) -> u64;
-
-    /// Pins the current generation for a long-lived operation (e.g. an L7
-    /// relay), returning a guard that can detect a subsequent reload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `expected_generation` is already stale.
-    fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard>;
-
-    /// Whether network authorization requires a workload binary identity.
-    ///
-    /// `CedarOnlyEngine` always returns `true` — there is no "trusted
-    /// runtime" override for Cedar-sourced policies in this phase.
-    fn binary_identity_required(&self) -> bool;
-
-    /// Assembly budget for buffering WebSocket frames pending L7 inspection.
-    ///
-    /// `CedarOnlyEngine` returns the default budget — WebSocket L7
-    /// inspection is middleware-adjacent and out of scope for Cedar-sourced
-    /// policies in this phase; the budget value itself is just a resource
-    /// limit, harmless to report even when nothing uses it.
-    fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget;
-
-    /// L7 decision override for a tunnel pinned at `captured_generation`,
-    /// if this engine provides one.
-    ///
-    /// `None` (the default, and `OpaEngine`'s only answer) means "use the
-    /// tunnel's own [`TunnelPolicyEngine`] as the L7 decision engine" — the
-    /// existing per-tunnel-cloned-regorus path, unchanged. A Cedar-sourced
-    /// sandbox's `CedarOnlyEngine` returns `Some`, so the tunnel's
-    /// (dummy-restrictive) `TunnelPolicyEngine` is used for middleware and
-    /// generation tracking only, while this handle makes the actual L7
-    /// allow/deny call.
-    fn l7_engine_for_tunnel(&self, _captured_generation: u64) -> Option<Arc<dyn L7PolicyEngine>> {
-        None
-    }
-
-    /// Endpoints eligible for policy-gated DNS resolution under the active
-    /// policy generation.
-    ///
-    /// Consulted by `policy_dns` before any CONNECT decision: a DNS query
-    /// for a host not covered here is refused outright. `OpaEngine` reads
-    /// `network_policies` directly; `CedarOnlyEngine` uses the endpoints
-    /// named in `NetworkConnect` permit scopes (see
-    /// [`openshell_policy_cedar::CedarNetworkEngine::dns_endpoints`]).
-    /// Hosts reachable only through a glob condition are not eligible,
-    /// which fails closed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only for an evaluator-internal failure (e.g. a
-    /// poisoned lock) — an empty-but-`Ok` snapshot is the correct result
-    /// when no host is currently eligible.
-    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot>;
-}
-
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -335,21 +253,26 @@ pub struct TunnelPolicyEngine {
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
-    /// When set (a Cedar-sourced sandbox), [`L7PolicyEngine::evaluate_request`]
-    /// delegates here instead of evaluating this tunnel's regorus engine.
-    /// Middleware/generation/websocket-budget services above stay this
-    /// (possibly dummy-restrictive) OPA tunnel regardless — see
-    /// [`NetworkPolicyEngine::l7_engine_for_tunnel`].
-    l7_override: Option<Arc<dyn L7PolicyEngine>>,
+    /// Set for a Cedar-sourced sandbox: [`Self::evaluate_request`] delegates
+    /// here instead of evaluating this tunnel's Rego engine, which then only
+    /// supplies middleware. See [`crate::policy_engine::PolicyEngine::tunnel_engine`].
+    cedar_l7: Option<crate::cedar_only::CedarL7TunnelEngine>,
 }
 
 impl TunnelPolicyEngine {
-    /// Sets the L7 decision override. Called once, right after
-    /// [`OpaEngine::clone_engine_for_tunnel`], by whichever code pins a
-    /// tunnel's generation (`proxy::relay::pin_l7_evaluator`).
+    /// Makes Cedar authoritative for this tunnel.
+    ///
+    /// Replaces the generation guard with one pinned to Cedar's generation,
+    /// so a Cedar reload closes the tunnel and an unrelated change to the
+    /// plumbing OPA engine does not, and routes L7 decisions to `cedar_l7`.
     #[must_use]
-    pub fn with_l7_override(mut self, l7_override: Option<Arc<dyn L7PolicyEngine>>) -> Self {
-        self.l7_override = l7_override;
+    pub(crate) fn with_cedar(
+        mut self,
+        generation_guard: PolicyGenerationGuard,
+        cedar_l7: crate::cedar_only::CedarL7TunnelEngine,
+    ) -> Self {
+        self.generation_guard = generation_guard;
+        self.cedar_l7 = Some(cedar_l7);
         self
     }
 
@@ -389,31 +312,23 @@ impl TunnelPolicyEngine {
     }
 }
 
-/// Per-request L7 policy decision.
-///
-/// Independent of middleware/generation services (which stay concretely
-/// [`TunnelPolicyEngine`]/OPA-coupled — see module docs on
-/// [`NetworkPolicyEngine`]). Implemented by [`TunnelPolicyEngine`] (OPA)
-/// and, for a Cedar-sourced sandbox, by a Cedar-backed equivalent in
-/// `openshell-supervisor-network::cedar_only`.
-pub trait L7PolicyEngine: Send + Sync {
-    /// Evaluates one L7 request. Returns `(allowed, reason)`; `reason` is
-    /// only meaningful when `!allowed`.
-    fn evaluate_request(
-        &self,
-        ctx: &crate::l7::relay::L7EvalContext,
-        request: &crate::l7::L7RequestInfo,
-    ) -> Result<(bool, String)>;
-}
-
-impl L7PolicyEngine for TunnelPolicyEngine {
-    fn evaluate_request(
+impl TunnelPolicyEngine {
+    /// Evaluates one L7 request and returns `(allowed, deny_reason)`.
+    ///
+    /// For a Cedar-sourced sandbox the decision comes from Cedar; otherwise
+    /// from this tunnel's Rego engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel's policy generation is stale or the
+    /// evaluation fails. Callers treat an error as a denial.
+    pub fn evaluate_request(
         &self,
         ctx: &crate::l7::relay::L7EvalContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<(bool, String)> {
-        if let Some(l7_override) = &self.l7_override {
-            return l7_override.evaluate_request(ctx, request);
+        if let Some(cedar) = &self.cedar_l7 {
+            return cedar.evaluate_request(ctx, request);
         }
         if self.is_stale() {
             return Err(miette::miette!(
@@ -1047,7 +962,6 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
-    #[allow(dead_code)]
     pub(crate) fn with_current_generation<T>(
         &self,
         expected_generation: u64,
@@ -1309,34 +1223,8 @@ impl OpaEngine {
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
-            l7_override: None,
+            cedar_l7: None,
         })
-    }
-}
-
-impl NetworkPolicyEngine for OpaEngine {
-    fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
-        Self::authorize_egress(self, input)
-    }
-
-    fn current_generation(&self) -> u64 {
-        Self::current_generation(self)
-    }
-
-    fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
-        Self::generation_guard(self, expected_generation)
-    }
-
-    fn binary_identity_required(&self) -> bool {
-        Self::binary_identity_required(self)
-    }
-
-    fn websocket_assembly_budget(&self) -> crate::l7::websocket::WebSocketAssemblyBudget {
-        Self::websocket_assembly_budget(self)
-    }
-
-    fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
-        Self::policy_dns_eligibility_snapshot(self)
     }
 }
 

@@ -206,15 +206,13 @@ pub async fn run_networking(
     shadow_engine: Option<&Arc<crate::cedar_shadow::ShadowCedarEngine>>,
     cedar_network_engine: Option<&Arc<crate::cedar_only::CedarOnlyEngine>>,
 ) -> Result<Networking> {
-    // The active network-decision engine: an explicit Cedar engine (a
-    // Cedar-sourced sandbox) takes priority; otherwise fall back to the
-    // OPA engine already required for YAML-sourced sandboxes. Exactly one
-    // of these is ever meaningfully present per sandbox — see
-    // `crate::opa::NetworkPolicyEngine`.
-    let network_engine: Option<Arc<dyn crate::opa::NetworkPolicyEngine>> =
+    // The authoritative engine: Cedar for a Cedar-authored policy,
+    // otherwise the OPA engine. The OPA engine is still passed separately
+    // for middleware and tunnel plumbing; see `crate::policy_engine`.
+    let network_engine: Option<crate::policy_engine::PolicyEngine> =
         match (cedar_network_engine, opa_engine) {
-            (Some(cedar), _) => Some(cedar.clone()),
-            (None, Some(opa)) => Some(opa.clone()),
+            (Some(cedar), _) => Some(Arc::clone(cedar).into()),
+            (None, Some(opa)) => Some(Arc::clone(opa).into()),
             (None, None) => None,
         };
 
@@ -543,7 +541,7 @@ pub async fn run_networking(
             .ok_or_else(|| miette::miette!("transparent TCP requires a process identity cache"))?;
         let trusted_gateway = crate::proxy::detect_trusted_host_gateway();
         let dns = crate::policy_dns::PolicyDnsRuntime::start(
-            engine.clone(),
+            active_network_engine.clone(),
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,

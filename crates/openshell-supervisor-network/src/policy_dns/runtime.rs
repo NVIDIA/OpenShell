@@ -3,10 +3,10 @@
 
 //! Runtime-owned policy DNS listeners for combined Linux supervisors.
 
-use crate::opa::NetworkPolicyEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
 use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_engine::PolicyEngine;
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -87,7 +87,7 @@ impl PolicyDnsRuntime {
     /// Start policy DNS over an isolation-backend exchange source. No UDP or
     /// TCP listener is bound in the supervisor namespace.
     pub(crate) fn start_mediated(
-        policy: Arc<dyn NetworkPolicyEngine>,
+        policy: PolicyEngine,
         source: Arc<dyn NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
@@ -176,7 +176,7 @@ impl PolicyDnsRuntime {
     }
 
     pub(crate) fn start(
-        policy: Arc<dyn NetworkPolicyEngine>,
+        policy: PolicyEngine,
         udp: tokio::net::UdpSocket,
         tcp: tokio::net::TcpListener,
         trusted_host_gateway: Option<IpAddr>,
