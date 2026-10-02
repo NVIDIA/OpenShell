@@ -7,7 +7,7 @@ use crate::color::Colorize;
 use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
@@ -24,6 +24,7 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -60,6 +61,14 @@ const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
+static DEFAULT_SSH_LOG_LEVEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Set the SSH log level derived from CLI verbosity before starting commands.
+pub fn set_default_ssh_log_level(level: &'static str) {
+    DEFAULT_SSH_LOG_LEVEL
+        .set(level)
+        .expect("SSH log level is configured only once");
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -189,12 +198,18 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
-    // SSH log level follows the program's verbosity.  main() maps the `-v`
-    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
-    let ssh_log_level =
-        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+    // An explicit environment override wins over the CLI verbosity default.
+    let ssh_log_level = std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| {
+        DEFAULT_SSH_LOG_LEVEL
+            .get()
+            .copied()
+            .unwrap_or("ERROR")
+            .to_string()
+    });
 
     let mut command = Command::new("ssh");
+    // Nested ProxyCommand processes inherit the effective verbosity too.
+    command.env("OPENSHELL_SSH_LOG_LEVEL", &ssh_log_level);
     command
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
@@ -217,63 +232,7 @@ fn ssh_base_command(proxy_command: &str) -> Command {
     command
 }
 
-#[cfg(unix)]
-const TRANSIENT_TTY_SIGNALS: &[Signal] = &[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM];
-
-#[cfg(unix)]
-struct ParentSignalGuard {
-    previous: Vec<(Signal, SigAction)>,
-}
-
-#[cfg(unix)]
-impl ParentSignalGuard {
-    #[allow(unsafe_code)]
-    fn ignore_transient_tty_signals() -> Result<Self> {
-        let mut previous = Vec::with_capacity(TRANSIENT_TTY_SIGNALS.len());
-        for &signal in TRANSIENT_TTY_SIGNALS {
-            let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-            // SAFETY: `sigaction` is the POSIX API for updating process signal
-            // dispositions. We install `SIG_IGN` for a small fixed set of
-            // terminal signals and store the previous handlers for restoration.
-            let old = unsafe { sigaction(signal, &action) }.into_diagnostic()?;
-            previous.push((signal, old));
-        }
-        Ok(Self { previous })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ParentSignalGuard {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        for &(signal, previous) in self.previous.iter().rev() {
-            // SAFETY: these `SigAction` values were returned by `sigaction`
-            // above for this process, so restoring them here returns the parent
-            // signal handlers to their original state.
-            let _ = unsafe { sigaction(signal, &previous) };
-        }
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn reset_transient_tty_signals(command: &mut Command) {
-    // SAFETY: `pre_exec` runs in the forked child immediately before `exec`.
-    // We only reset a small fixed set of signal handlers to `SIG_DFL`, which is
-    // required so SSH receives terminal signals normally even though the parent
-    // process temporarily ignores them to preserve cleanup.
-    unsafe {
-        command.pre_exec(|| {
-            for &signal in TRANSIENT_TTY_SIGNALS {
-                let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-                sigaction(signal, &action).map_err(|err| std::io::Error::other(err.to_string()))?;
-            }
-            Ok(())
-        });
-    }
-}
-
-fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
+async fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
     if replace_process && std::io::stdin().is_terminal() {
         #[cfg(unix)]
         {
@@ -282,17 +241,29 @@ fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
         }
     }
 
+    // Catch terminal signals in the parent while SSH receives the same signals
+    // from the foreground process group. Unlike SIG_IGN, caught dispositions
+    // reset to their defaults when the child execs, so SSH stays interruptible.
     #[cfg(unix)]
-    let _signal_guard = if !replace_process && std::io::stdin().is_terminal() {
-        reset_transient_tty_signals(&mut command);
-        Some(ParentSignalGuard::ignore_transient_tty_signals()?)
+    let mut signals = if !replace_process && std::io::stdin().is_terminal() {
+        Some(TerminationSignals::new()?)
     } else {
         None
     };
-
-    let status = command.status().into_diagnostic()?;
-
-    Ok(status.code().unwrap_or(1))
+    let mut child = TokioCommand::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .into_diagnostic()?;
+    #[cfg(unix)]
+    if let Some(signals) = signals.as_mut() {
+        loop {
+            tokio::select! {
+                status = child.wait() => return Ok(process_exit_code(status.into_diagnostic()?)),
+                _ = signals.recv() => {}
+            }
+        }
+    }
+    Ok(process_exit_code(child.wait().await.into_diagnostic()?))
 }
 
 fn main_attach_command(session: &SshSessionConfig) -> Command {
@@ -316,9 +287,7 @@ fn main_attach_command(session: &SshSessionConfig) -> Command {
 
 async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
     let command = main_attach_command(session);
-    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
-        .await
-        .into_diagnostic()?
+    exec_or_wait(command, replace_process).await
 }
 
 fn process_exit_code(status: ExitStatus) -> i32 {
@@ -1040,9 +1009,7 @@ async fn sandbox_exec_with_mode(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    tokio::task::spawn_blocking(move || exec_or_wait(ssh, tty && replace_process))
-        .await
-        .into_diagnostic()??;
+    exec_or_wait(ssh, tty && replace_process).await?;
 
     Ok(())
 }
@@ -2238,8 +2205,119 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ssh_verbosity_reaches_nested_proxy_commands_and_respects_override() {
+        for override_level in [None, Some("INFO")] {
+            let environment = override_level.map_or_else(
+                || Environment::new().remove("OPENSHELL_SSH_LOG_LEVEL"),
+                |level| Environment::new().set("OPENSHELL_SSH_LOG_LEVEL", level),
+            );
+            environment.run(|| {
+                set_default_ssh_log_level("DEBUG");
+                let expected = override_level.unwrap_or("DEBUG");
+                let command = ssh_base_command("openshell ssh-tunnel");
+                assert!(
+                    command
+                        .get_args()
+                        .any(|arg| arg == std::ffi::OsStr::new(&format!("LogLevel={expected}")))
+                );
+                assert!(command.get_envs().any(|(key, value)| {
+                    key == "OPENSHELL_SSH_LOG_LEVEL"
+                        && value == Some(std::ffi::OsStr::new(expected))
+                }));
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_signal_wait_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_SIGNAL_WAIT_MARKER") else {
+            return;
+        };
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "ulimit -c 0; printf '%s' $$ > \"$1\"; exec sleep 30",
+                "signal-probe",
+            ])
+            .arg(marker)
+            .stdin(Stdio::inherit());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(exec_or_wait(command, false)).unwrap(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_wait_survives_terminal_signals_and_reaps_child() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = killpg(Pid::from_raw(self.0.id().cast_signed()), Signal::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+        for signal in [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("ready");
+            let terminal = nix::pty::openpty(None, None).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "ssh::tests::interactive_signal_wait_child",
+                    "--nocapture",
+                ])
+                .env("OPENSHELL_SIGNAL_WAIT_MARKER", &marker)
+                .process_group(0)
+                .stdin(Stdio::from(terminal.slave))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut probe = Probe(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(pid) = fs::read_to_string(&marker)
+                    && let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe"))
+                    && executable.file_name().is_some_and(|name| name == "sleep")
+                {
+                    break;
+                }
+                assert!(
+                    probe.0.try_wait().unwrap().is_none(),
+                    "probe exited before ready"
+                );
+                assert!(Instant::now() < deadline, "probe did not become ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            killpg(Pid::from_raw(probe.0.id().cast_signed()), signal).unwrap();
+            loop {
+                if let Some(status) = probe.0.try_wait().unwrap() {
+                    assert!(status.success(), "parent failed under {signal}: {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "parent did not reap SSH after {signal}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(terminal.master);
+        }
+    }
+
     use super::*;
     use crate::TEST_ENV_LOCK;
+    use crate::test_utils::Environment;
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
@@ -2370,55 +2448,41 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let xdg = tempfile::tempdir().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
-        }
 
-        let ssh_dir = home.path().join(".ssh");
-        fs::create_dir_all(&ssh_dir).unwrap();
-        let user_config = ssh_dir.join("config");
-        fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
+        Environment::new()
+            .set("HOME", home.path())
+            .set("XDG_CONFIG_HOME", xdg.path())
+            .run(|| {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap());
 
-        let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
-        install_ssh_config("openshell", "demo", "default").unwrap();
+                let ssh_dir = home.join(".ssh");
+                fs::create_dir_all(&ssh_dir).unwrap();
+                let user_config = ssh_dir.join("config");
+                fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
 
-        let main_contents = fs::read_to_string(&user_config).unwrap();
-        assert!(main_contents.contains("Host personal"));
-        assert_eq!(main_contents.matches("Include ").count(), 1);
-        assert!(main_contents.contains(&render_include_line(&managed_path)));
-        let include_idx = main_contents.find("Include ").unwrap();
-        let host_idx = main_contents.find("Host personal").unwrap();
-        assert!(include_idx < host_idx);
+                let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
+                install_ssh_config("openshell", "demo", "default").unwrap();
 
-        let managed_contents = fs::read_to_string(&managed_path).unwrap();
-        assert_eq!(
-            managed_contents
-                .matches("Host openshell-demo.default")
-                .count(),
-            1
-        );
-        assert!(managed_contents.contains("ProxyCommand"));
+                let main_contents = fs::read_to_string(&user_config).unwrap();
+                assert!(main_contents.contains("Host personal"));
+                assert_eq!(main_contents.matches("Include ").count(), 1);
+                assert!(main_contents.contains(&render_include_line(&managed_path)));
+                let include_idx = main_contents.find("Include ").unwrap();
+                let host_idx = main_contents.find("Host personal").unwrap();
+                assert!(include_idx < host_idx);
 
-        unsafe {
-            match old_home {
-                Some(val) => std::env::set_var("HOME", val),
-                None => std::env::remove_var("HOME"),
-            }
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+                let managed_contents = fs::read_to_string(&managed_path).unwrap();
+                assert_eq!(
+                    managed_contents
+                        .matches("Host openshell-demo.default")
+                        .count(),
+                    1
+                );
+                assert!(managed_contents.contains("ProxyCommand"));
+            });
     }
 
     #[test]
@@ -2566,97 +2630,76 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn track_background_forward_or_cleanup_runs_cleanup_when_pidfile_write_fails() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         // Make forward PID-file writes fail with ENOTDIR after listener readiness.
         let blocking_file = tmp.path().join("not-a-dir");
         fs::write(&blocking_file, b"x").unwrap();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &blocking_file);
-        }
 
-        let mut cleaned_up = false;
-        let result = track_background_forward_or_cleanup(
-            "default",
-            "demo",
-            8080,
-            4242,
-            "sbx-1",
-            "127.0.0.1",
-            || {
-                cleaned_up = true;
-            },
-        );
+        Environment::new()
+            .set("XDG_CONFIG_HOME", &blocking_file)
+            .run(|| {
+                let mut cleaned_up = false;
+                let result = track_background_forward_or_cleanup(
+                    "default",
+                    "demo",
+                    8080,
+                    4242,
+                    "sbx-1",
+                    "127.0.0.1",
+                    || {
+                        cleaned_up = true;
+                    },
+                );
 
-        unsafe {
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert!(
-            result.is_err(),
-            "PID-file write failure must surface as an error"
-        );
-        assert!(
-            cleaned_up,
-            "the owned SSH child must be cleaned up when tracking fails so no \
+                assert!(
+                    result.is_err(),
+                    "PID-file write failure must surface as an error"
+                );
+                assert!(
+                    cleaned_up,
+                    "the owned SSH child must be cleaned up when tracking fails so no \
              reachable-but-untracked forward is left running"
-        );
+                );
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn track_background_forward_or_cleanup_tracks_pid_without_cleanup_on_success() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
 
-        let mut cleaned_up = false;
-        let result = track_background_forward_or_cleanup(
-            "default",
-            "demo",
-            8080,
-            4242,
-            "sbx-1",
-            "127.0.0.1",
-            || {
-                cleaned_up = true;
-            },
-        );
-        let pid_file_exists = openshell_core::forward::forward_pid_path("default", "demo", 8080)
-            .is_ok_and(|path| path.exists());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let mut cleaned_up = false;
+                let result = track_background_forward_or_cleanup(
+                    "default",
+                    "demo",
+                    8080,
+                    4242,
+                    "sbx-1",
+                    "127.0.0.1",
+                    || {
+                        cleaned_up = true;
+                    },
+                );
+                let pid_file_exists =
+                    openshell_core::forward::forward_pid_path("default", "demo", 8080)
+                        .is_ok_and(|path| path.exists());
 
-        unsafe {
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert!(
-            result.is_ok(),
-            "a writable PID directory must track successfully"
-        );
-        assert!(
-            pid_file_exists,
-            "successful tracking must persist a PID file"
-        );
-        assert!(
-            !cleaned_up,
-            "successful tracking must not terminate the forward process"
-        );
+                assert!(
+                    result.is_ok(),
+                    "a writable PID directory must track successfully"
+                );
+                assert!(
+                    pid_file_exists,
+                    "successful tracking must persist a PID file"
+                );
+                assert!(
+                    !cleaned_up,
+                    "successful tracking must not terminate the forward process"
+                );
+            });
     }
 
     #[test]

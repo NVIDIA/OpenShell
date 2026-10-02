@@ -3,6 +3,8 @@
 
 //! `OpenShell` supervisor executable.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -128,32 +130,21 @@ struct Args {
     #[arg(long, hide = true)]
     main_exit_marker: Option<PathBuf>,
 
-    /// Read end of a driver-owned pipe. EOF means the owning driver exited.
+    /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
-    parent_liveness_fd: Option<i32>,
+    parent_liveness_stdin: bool,
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
-fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
+fn arm_parent_liveness(enabled: bool) -> Result<()> {
     use std::io::Read as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-
-    let Some(raw_fd) = raw_fd else {
+    if !enabled {
         return Ok(());
-    };
-    if raw_fd <= 2 {
-        return Err(miette::miette!("parent liveness descriptor is invalid"));
     }
-    nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFD)
-        .map_err(|error| miette::miette!("parent liveness descriptor is not open: {error}"))?;
-    // SAFETY: the driver transfers this inherited descriptor to the
-    // supervisor exactly once through the private command line.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     std::thread::Builder::new()
         .name("supervisor-parent-liveness".to_string())
         .spawn(move || {
-            let mut stream = std::fs::File::from(fd);
+            let mut stream = std::io::stdin().lock();
             let mut byte = [0_u8; 1];
             loop {
                 match stream.read(&mut byte) {
@@ -167,10 +158,10 @@ fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn arm_parent_liveness(raw_fd: Option<i32>) -> Result<()> {
-    if raw_fd.is_some() {
+fn arm_parent_liveness(enabled: bool) -> Result<()> {
+    if enabled {
         return Err(miette::miette!(
-            "parent liveness descriptors are unsupported on this platform"
+            "parent liveness stdin is unsupported on this platform"
         ));
     }
     Ok(())
@@ -240,7 +231,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                 || args.health_socket_path.is_some()
                 || args.health_port.is_some()
                 || args.main_exit_marker.is_some()
-                || args.parent_liveness_fd.is_some()
+                || args.parent_liveness_stdin
             {
                 return Err(miette::miette!(
                     "--role=network-proxy does not use sandbox identity, gateway, runtime, or process-control arguments"
@@ -296,7 +287,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     validate_role_arguments(&args)?;
-    arm_parent_liveness(args.parent_liveness_fd)?;
+    arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let descriptor = backend_descriptor(&args)?;
@@ -480,6 +471,81 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_liveness_stdin_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_LIVENESS_TEST_MARKER") else {
+            return;
+        };
+        arm_parent_liveness(true).unwrap();
+        std::fs::write(marker, "ready").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("liveness EOF did not terminate the supervisor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_liveness_exits_only_after_writer_closes() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
+        let (read, write) = nix::unistd::pipe().unwrap();
+        for fd in [&read, &write] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let mut writer = std::fs::File::from(write);
+        let mut probe = Probe(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::parent_liveness_stdin_child",
+                    "--nocapture",
+                ])
+                .env("OPENSHELL_LIVENESS_TEST_MARKER", &marker)
+                .stdin(Stdio::from(read))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(probe.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "liveness probe did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        writer.write_all(&[1]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            probe.0.try_wait().unwrap().is_none(),
+            "data must not terminate supervisor"
+        );
+        drop(writer);
+        loop {
+            if let Some(status) = probe.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(1));
+                break;
+            }
+            assert!(Instant::now() < deadline, "liveness EOF was not observed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     use super::*;
 
     #[test]

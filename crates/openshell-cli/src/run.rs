@@ -6736,7 +6736,7 @@ mod tests {
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
     };
-    use crate::test_utils::EnvVarGuard;
+    use crate::test_utils::Environment;
     use openshell_bootstrap::GatewayMetadata;
     use std::fs;
     use std::path::Path;
@@ -6924,81 +6924,97 @@ mod tests {
 
     #[test]
     fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
-
-        let parsed =
-            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
-            Some(&"from-env".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env")
+            .run(|| {
+                let parsed = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()])
+                    .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+                    Some(&"from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
-            .expect_err("missing env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .remove("NAV_PARSE_CREDENTIAL_MISSING")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+                    .expect_err("missing env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
-            .expect_err("empty env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_EMPTY", "")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+                    .expect_err("empty env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
-
-        let parsed =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+        Environment::new()
+            .set("NAV_PARSE_SME_NAMED", "pem-material")
+            .run(|| {
+                let parsed = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_NAMED".to_string()
+                ])
                 .expect("parse");
-        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+                assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
-
-        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
-            .expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
-            Some(&"key-only-material".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_KEY_ONLY", "key-only-material")
+            .run(|| {
+                let parsed =
+                    parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+                        .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+                    Some(&"key-only-material".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_missing_environment() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
-
-        let err =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
-                .expect_err("missing env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
-        ));
+        Environment::new().remove("NAV_PARSE_SME_MISSING").run(|| {
+            let err =
+                parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                    .expect_err("missing env should error");
+            assert!(err.to_string().contains(
+                "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+            ));
+        });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
-
-        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
-            .expect_err("blank env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
-        ));
+        Environment::new()
+            .set("NAV_PARSE_SME_EMPTY", "   ")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_EMPTY".to_string()
+                ])
+                .expect_err("blank env should error");
+                assert!(err.to_string().contains(
+                    "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+                ));
+            });
     }
 
     #[test]
@@ -7010,17 +7026,19 @@ mod tests {
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
-
-        let err = parse_secret_material_env_pairs(&[
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-        ])
-        .expect_err("duplicate key should error");
-        assert!(
-            err.to_string()
-                .contains("key 'private_key' supplied more than once")
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_DUP", "value")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                ])
+                .expect_err("duplicate key should error");
+                assert!(
+                    err.to_string()
+                        .contains("key 'private_key' supplied more than once")
+                );
+            });
     }
 
     #[test]
@@ -7956,17 +7974,19 @@ mod tests {
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("top.txt"), "top").expect("write top.txt");
 
-        let _git_dir = EnvVarGuard::set("GIT_DIR", "/tmp/not-the-test-repo/.git");
-        let _git_work_tree = EnvVarGuard::set("GIT_WORK_TREE", "/tmp/not-the-test-repo");
+        Environment::new()
+            .set("GIT_DIR", "/tmp/not-the-test-repo/.git")
+            .set("GIT_WORK_TREE", "/tmp/not-the-test-repo")
+            .run(|| {
+                let result = git_sync_files(&repo.join("nested"));
+                let (base_dir, files) = result.expect("git_sync_files should succeed");
 
-        let result = git_sync_files(&repo.join("nested"));
-        let (base_dir, files) = result.expect("git_sync_files should succeed");
-
-        assert_eq!(
-            base_dir,
-            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
-        );
-        assert_eq!(files, vec!["file.txt"]);
+                assert_eq!(
+                    base_dir,
+                    fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+                );
+                assert_eq!(files, vec!["file.txt"]);
+            });
     }
 
     #[test]

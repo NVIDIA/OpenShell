@@ -464,15 +464,14 @@ fn configure_runtime_loader_env(_runtime_dir: &Path) -> Result<(), String> {
 
 fn raise_nofile_limit() {
     #[cfg(unix)]
-    unsafe {
-        let mut rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) == 0 {
-            rlim.rlim_cur = rlim.rlim_max;
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim);
-        }
+    if let Ok((_, maximum)) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+    {
+        let _ = nix::sys::resource::setrlimit(
+            nix::sys::resource::Resource::RLIMIT_NOFILE,
+            maximum,
+            maximum,
+        );
     }
 }
 

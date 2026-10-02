@@ -3,18 +3,15 @@
 
 //! Read-only provider files served on demand through seccomp FD injection.
 
-#![allow(unsafe_code)]
-
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs::{File, Permissions};
 use std::io::{self, Seek as _, SeekFrom, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, RwLock};
 
-use openshell_isolation_interface::linux::seccomp_notify::{Notification, NotificationListener};
-use openshell_isolation_interface::linux::task_memory;
+use crate::linux::seccomp_notify::{Notification, NotificationListener};
+use crate::linux::task_memory;
 
 const PREFIX: &str = "/run/openshell/providers/";
 const MAX_FILE_BYTES: usize = 65_536;
@@ -205,22 +202,22 @@ fn open_flags(notification: &Notification) -> io::Result<i32> {
 }
 
 fn sealed_memfd(content: &[u8]) -> io::Result<File> {
-    let name = CString::new("openshell-provider").expect("static name");
-    let fd =
-        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    // memfd_create defaults to 0777. Keep the metadata private as well as the
-    // returned descriptor read-only, since workloads may inspect it with fstat.
+    let fd = rustix::fs::memfd_create(
+        "openshell-provider",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )?;
+    let mut file = File::from(fd);
+    // Keep metadata private as well as the returned descriptor read-only.
     file.set_permissions(Permissions::from_mode(0o600))?;
     file.write_all(content)?;
     file.seek(SeekFrom::Start(0))?;
-    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    rustix::fs::fcntl_add_seals(
+        &file,
+        rustix::fs::SealFlags::SEAL
+            | rustix::fs::SealFlags::WRITE
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::SHRINK,
+    )?;
     // memfd_create returns O_RDWR. Reopen the sealed object through our own
     // procfs descriptor so the child receives an actual O_RDONLY description.
     File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
@@ -231,7 +228,6 @@ mod tests {
     use super::{ProviderFiles, sealed_memfd};
     use std::collections::HashMap;
     use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
@@ -255,8 +251,11 @@ mod tests {
     fn memfd_is_read_only_and_positioned_at_start() {
         let mut file = sealed_memfd(b"version = 1\n").unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        let flags = rustix::fs::fcntl_getfl(&file).unwrap();
+        assert_eq!(
+            flags & rustix::fs::OFlags::ACCMODE,
+            rustix::fs::OFlags::RDONLY
+        );
         let mut read = String::new();
         file.read_to_string(&mut read).unwrap();
         assert_eq!(read, "version = 1\n");

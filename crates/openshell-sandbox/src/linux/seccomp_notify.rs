@@ -532,25 +532,13 @@ fn probe_addfd_send() -> io::Result<()> {
             .map_err(|_| io::Error::other("injected descriptor does not fit RawFd"))?;
         // SAFETY: ADDFD-SEND returned one newly owned descriptor to this task.
         let injected = unsafe { OwnedFd::from_raw_fd(injected) };
-        // SAFETY: `injected` was returned as an open descriptor by the kernel.
-        let descriptor_flags = unsafe { libc::fcntl(injected.as_raw_fd(), libc::F_GETFD) };
-        if descriptor_flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if descriptor_flags & libc::FD_CLOEXEC == 0 {
+        let descriptor_flags = rustix::io::fcntl_getfd(&injected)?;
+        if !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC) {
             return Err(io::Error::other("ADDFD did not preserve close-on-exec"));
         }
-        let mut value = 0_u64;
-        // SAFETY: eventfd reads exactly one u64 into a valid aligned pointer.
-        let read = unsafe {
-            libc::read(
-                injected.as_raw_fd(),
-                std::ptr::addr_of_mut!(value).cast(),
-                size_of::<u64>(),
-            )
-        };
-        let word_size = isize::try_from(size_of::<u64>()).map_err(io::Error::other)?;
-        if read != word_size || value != 7 {
+        let mut value = [0_u8; size_of::<u64>()];
+        let read = rustix::io::read(&injected, &mut value[..]);
+        if read != Ok(value.len()) || u64::from_ne_bytes(value) != 7 {
             return Err(io::Error::other("injected eventfd was not usable"));
         }
         Ok(())
@@ -569,13 +557,7 @@ fn probe_addfd_send() -> io::Result<()> {
     if i64::from(notification.syscall) != libc::SYS_socket {
         return Err(io::Error::other("unexpected ADDFD probe syscall"));
     }
-    // SAFETY: eventfd has no pointer arguments and returns an owned descriptor.
-    let source = unsafe { libc::eventfd(7, libc::EFD_CLOEXEC) };
-    if source < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: eventfd returned a new owned descriptor.
-    let source = unsafe { OwnedFd::from_raw_fd(source) };
+    let source = rustix::event::eventfd(7, rustix::event::EventfdFlags::CLOEXEC)?;
     listener.add_fd_and_send(notification.id, source.as_raw_fd(), true)?;
     launcher
         .join()
@@ -584,23 +566,7 @@ fn probe_addfd_send() -> io::Result<()> {
 }
 
 fn probe_connected_sendto_fast_path() -> io::Result<()> {
-    let mut pair = [-1; 2];
-    // SAFETY: `pair` points to storage for exactly two returned descriptors.
-    let result = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            pair.as_mut_ptr(),
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful socketpair returned two independently owned FDs.
-    let sender_fd = unsafe { OwnedFd::from_raw_fd(pair[0]) };
-    // SAFETY: successful socketpair returned two independently owned FDs.
-    let receiver_fd = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+    let (sender_fd, receiver_fd) = std::os::unix::net::UnixStream::pair()?;
 
     let (sender, receiver) = mpsc::sync_channel(1);
     let launcher = thread::spawn(move || -> io::Result<()> {
@@ -628,15 +594,8 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         }
 
         let mut payload = [0_u8; 6];
-        // SAFETY: the receive buffer is live for its full declared length.
-        let read = unsafe {
-            libc::read(
-                receiver_fd.as_raw_fd(),
-                payload.as_mut_ptr().cast(),
-                payload.len(),
-            )
-        };
-        if read != isize::try_from(payload.len()).map_err(io::Error::other)? || &payload != direct {
+        let read = rustix::io::read(&receiver_fd, &mut payload[..]);
+        if read != Ok(payload.len()) || &payload != direct {
             return Err(io::Error::other(
                 "connected sendto fast path did not relay data",
             ));
@@ -732,25 +691,26 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
 }
 
 fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Notification> {
-    let mut descriptor = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
-    };
+    use std::os::fd::AsFd as _;
+
+    let mut descriptors = [nix::poll::PollFd::new(
+        listener.fd.as_fd(),
+        nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP,
+    )];
     let timeout =
-        i32::try_from(PROBE_NOTIFICATION_TIMEOUT.as_millis()).map_err(io::Error::other)?;
-    // SAFETY: descriptor points to one live pollfd for the duration of poll.
-    let ready = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
-    if ready < 0 {
-        return Err(io::Error::last_os_error());
-    }
+        nix::poll::PollTimeout::try_from(PROBE_NOTIFICATION_TIMEOUT).map_err(io::Error::other)?;
+    let ready = nix::poll::poll(&mut descriptors, timeout)?;
     if ready == 0 {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "seccomp notification probe timed out",
         ));
     }
-    if descriptor.revents & libc::POLLIN == 0 {
+    if !descriptors[0]
+        .revents()
+        .unwrap_or_else(nix::poll::PollFlags::empty)
+        .contains(nix::poll::PollFlags::POLLIN)
+    {
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "seccomp notification probe listener closed",
@@ -991,7 +951,7 @@ mod tests {
             // inspect this trusted process through /proc/self/mem: a
             // nondumpable non-root process cannot open that file, while the
             // separately qualified dumpable workload child remains readable.
-            if unsafe { libc::geteuid() } == 0 {
+            if rustix::process::geteuid().as_raw() == 0 {
                 // SAFETY: this disposable subprocess permanently drops its
                 // supplementary groups and root identity before probing.
                 assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
@@ -1070,13 +1030,10 @@ mod tests {
     #[test]
     fn errno_response_rejects_nonpositive_values() {
         // The input validation occurs before the listener FD is used.
-        // SAFETY: dup takes one valid descriptor and returns a new descriptor
-        // or a negative error without modifying memory.
-        let duplicated = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(duplicated >= 0, "duplicate stderr for validation test");
+        let duplicated =
+            rustix::io::dup(io::stderr()).expect("duplicate stderr for validation test");
         let listener = NotificationListener {
-            // SAFETY: successful dup returned a new owned descriptor.
-            fd: unsafe { OwnedFd::from_raw_fd(duplicated) },
+            fd: duplicated,
             wait_killable_recv: false,
         };
         let error = listener
@@ -1091,15 +1048,10 @@ mod tests {
         // task-memory output write rather than race a resumed syscall. The
         // guard short-circuits before touching the descriptor or workload
         // memory, so a dup of stderr is a sufficient stand-in.
-        // SAFETY: dup takes one valid descriptor and returns a new descriptor
-        // or a negative error without modifying memory.
-        let duplicated = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(duplicated >= 0, "duplicate stderr for validation test");
-        // SAFETY: successful dup returned a new owned descriptor.
-        let listener = NotificationListener::from_fd_with_mode(
-            unsafe { OwnedFd::from_raw_fd(duplicated) },
-            ListenerMode::LegacyReadOnly,
-        );
+        let duplicated =
+            rustix::io::dup(io::stderr()).expect("duplicate stderr for validation test");
+        let listener =
+            NotificationListener::from_fd_with_mode(duplicated, ListenerMode::LegacyReadOnly);
         assert!(listener.writes_disabled());
         assert_eq!(listener.mode(), ListenerMode::LegacyReadOnly);
         let error = listener

@@ -291,6 +291,7 @@ pub mod test_exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_environment::Environment;
 
     fn config() -> OtlpConfig {
         OtlpConfig {
@@ -305,15 +306,12 @@ mod tests {
 
     #[test]
     fn resource_defaults_the_service_name() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::remove("OTEL_SERVICE_NAME");
-
-        assert_eq!(
-            service_name_of(&build_test_resource(&config())),
-            Some(DEFAULT_SERVICE_NAME.to_string())
-        );
+        Environment::new().remove("OTEL_SERVICE_NAME").run(|| {
+            assert_eq!(
+                service_name_of(&build_test_resource(&config())),
+                Some(DEFAULT_SERVICE_NAME.to_string())
+            );
+        });
     }
 
     #[test]
@@ -361,40 +359,6 @@ mod tests {
         );
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            unsafe { std::env::remove_var(key) };
-            Self { key, original }
-        }
-
-        #[allow(unsafe_code)]
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
-            match self.original.as_deref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn service_name_of(resource: &Resource) -> Option<String> {
         resource
             .get(&opentelemetry::Key::from_static_str("service.name"))
@@ -406,48 +370,43 @@ mod tests {
     /// when an operator has stated it explicitly.
     #[test]
     fn configured_service_name_wins_over_the_env_var() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OTEL_SERVICE_NAME", "from-env");
+        Environment::new()
+            .set("OTEL_SERVICE_NAME", "from-env")
+            .run(|| {
+                let mut cfg = config();
+                cfg.service_name = Some("from-config".into());
 
-        let mut cfg = config();
-        cfg.service_name = Some("from-config".into());
-
-        assert_eq!(
-            service_name_of(&build_test_resource(&cfg)),
-            Some("from-config".to_string())
-        );
+                assert_eq!(
+                    service_name_of(&build_test_resource(&cfg)),
+                    Some("from-config".to_string())
+                );
+            });
     }
 
     /// With no `service_name` in the config file, the SDK's env detector is
     /// the fallback rather than the built-in default.
     #[test]
     fn env_service_name_applies_when_config_omits_it() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OTEL_SERVICE_NAME", "from-env");
-
-        assert_eq!(
-            service_name_of(&build_test_resource(&config())),
-            Some("from-env".to_string())
-        );
+        Environment::new()
+            .set("OTEL_SERVICE_NAME", "from-env")
+            .run(|| {
+                assert_eq!(
+                    service_name_of(&build_test_resource(&config())),
+                    Some("from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn blank_service_name_falls_back_to_the_default() {
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::remove("OTEL_SERVICE_NAME");
-
-        let mut cfg = config();
-        cfg.service_name = Some("   ".into());
-        assert_eq!(
-            service_name_of(&build_test_resource(&cfg)),
-            Some(DEFAULT_SERVICE_NAME.to_string())
-        );
+        Environment::new().remove("OTEL_SERVICE_NAME").run(|| {
+            let mut cfg = config();
+            cfg.service_name = Some("   ".into());
+            assert_eq!(
+                service_name_of(&build_test_resource(&cfg)),
+                Some(DEFAULT_SERVICE_NAME.to_string())
+            );
+        });
     }
 
     #[test]

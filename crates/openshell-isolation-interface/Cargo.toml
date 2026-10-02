@@ -18,12 +18,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true, features = ["fs", "process"] }
-
 [dev-dependencies]
 tokio = { workspace = true }
 

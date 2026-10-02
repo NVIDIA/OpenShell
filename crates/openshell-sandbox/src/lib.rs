@@ -13,6 +13,8 @@ pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
 #[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "linux")]
 pub mod main_session;
 pub mod managed_children;
 #[cfg(target_os = "linux")]
