@@ -10,8 +10,9 @@
 import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
+  __setWatchLogsBackoffSleepForTests,
   errorCode,
   Pager,
   PHASE_NAMES,
@@ -22,6 +23,7 @@ import {
   SCOPE_NAMES,
   ServiceAuthorizationMode,
   STATUS_NAMES,
+  type WatchEvent,
 } from './client.js';
 import {
   OpenShell,
@@ -278,6 +280,387 @@ describe('exec / execStream', () => {
       code: 'not_found',
     });
     await expect(sandbox.exec('sb', ['x'])).rejects.toSatisfy((e) => errorCode(e) === 'not_found');
+  });
+});
+
+describe('watchLogs', () => {
+  afterEach(() => {
+    // Restore the real timer-based backoff sleep for any test that stubbed it.
+    __setWatchLogsBackoffSleepForTests();
+  });
+
+  it('yields log, event, and warning items with curated field mapping', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      watchSandbox: async function* () {
+        yield {
+          payload: {
+            case: 'log',
+            value: { sandboxId: 'sb-id-1', level: 'INFO', target: 't', message: 'hello', source: '', fields: {} },
+          },
+          cursor: 'c1',
+        };
+        yield {
+          payload: {
+            case: 'event',
+            value: { source: 'kubernetes', type: 'Normal', reason: 'Started', message: 'started', metadata: {} },
+          },
+          cursor: 'c2',
+        };
+        yield { payload: { case: 'warning', value: { message: 'lagged' } }, cursor: '' };
+      },
+    });
+
+    const events: WatchEvent[] = [];
+    for await (const event of sandbox.watchLogs('sb')) events.push(event);
+
+    expect(events).toEqual([
+      {
+        kind: 'log',
+        cursor: 'c1',
+        line: {
+          sandboxId: 'sb-id-1',
+          timestampMs: 0,
+          level: 'INFO',
+          target: 't',
+          message: 'hello',
+          source: 'gateway',
+          fields: {},
+        },
+      },
+      {
+        kind: 'event',
+        cursor: 'c2',
+        event: {
+          timestampMs: 0,
+          source: 'kubernetes',
+          type: 'Normal',
+          reason: 'Started',
+          message: 'started',
+          metadata: {},
+        },
+      },
+      { kind: 'warning', message: 'lagged' },
+    ]);
+  });
+
+  it('passes through fields and metadata maps unmodified', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      watchSandbox: async function* () {
+        yield {
+          payload: {
+            case: 'log',
+            value: {
+              sandboxId: 'sb',
+              level: 'INFO',
+              target: 't',
+              message: 'm',
+              source: 'sandbox',
+              fields: { dst_host: 'example.com' },
+            },
+          },
+          cursor: 'c1',
+        };
+        yield {
+          payload: {
+            case: 'event',
+            value: {
+              source: 'docker',
+              type: 'Normal',
+              reason: 'Pulled',
+              message: 'pulled',
+              metadata: { image: 'nginx' },
+            },
+          },
+          cursor: 'c2',
+        };
+      },
+    });
+
+    const events: WatchEvent[] = [];
+    for await (const event of sandbox.watchLogs('sb')) events.push(event);
+
+    expect(events[0]).toMatchObject({ kind: 'log', line: { fields: { dst_host: 'example.com' } } });
+    expect(events[1]).toMatchObject({ kind: 'event', event: { metadata: { image: 'nginx' } } });
+  });
+
+  it('completes without error when the stream ends with no events', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      watchSandbox: async function* () {},
+    });
+
+    const events: WatchEvent[] = [];
+    await expect(
+      (async () => {
+        for await (const event of sandbox.watchLogs('sb')) events.push(event);
+      })(),
+    ).resolves.toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it('defaults to followLogs when neither followLogs nor followEvents is set', async () => {
+    let req: { followLogs?: boolean; followEvents?: boolean } = {};
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only captures the request, no events to yield
+      watchSandbox: async function* (r) {
+        req = r;
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb')) {
+      // drain
+    }
+    expect(req.followLogs).toBe(true);
+    expect(req.followEvents).toBe(false);
+  });
+
+  it('defaults to followLogs when followLogs is explicitly false and followEvents is unset', async () => {
+    // Regression: an earlier `??`-based default only checked whether
+    // followLogs was unset, not whether both flags resolved false, so an
+    // explicit `followLogs: false` alone silently produced a stream with
+    // both flags false — the exact hang the default exists to prevent.
+    let req: { followLogs?: boolean; followEvents?: boolean } = {};
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only captures the request, no events to yield
+      watchSandbox: async function* (r) {
+        req = r;
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb', { followLogs: false })) {
+      // drain
+    }
+    expect(req.followLogs).toBe(true);
+    expect(req.followEvents).toBe(false);
+  });
+
+  it('respects an explicit followLogs: false when followEvents is also explicitly true', async () => {
+    let req: { followLogs?: boolean; followEvents?: boolean } = {};
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only captures the request, no events to yield
+      watchSandbox: async function* (r) {
+        req = r;
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb', { followLogs: false, followEvents: true })) {
+      // drain
+    }
+    expect(req.followLogs).toBe(false);
+    expect(req.followEvents).toBe(true);
+  });
+
+  it('resumes with the high-water-mark cursor after a reconnect, ignoring out-of-order arrival', async () => {
+    const requests: Array<{ resumeAfterCursor?: string }> = [];
+    let call = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      watchSandbox: async function* (req) {
+        requests.push(req);
+        call++;
+        if (call === 1) {
+          yield {
+            payload: {
+              case: 'log',
+              value: { sandboxId: 'sb', level: 'INFO', target: 't', message: 'm1', source: '', fields: {} },
+            },
+            cursor: 'b',
+          };
+          yield {
+            payload: {
+              case: 'event',
+              value: { source: 's', type: 'Normal', reason: 'r', message: 'm2', metadata: {} },
+            },
+            cursor: 'a',
+          };
+          throw new ConnectError('dropped', Code.Unavailable);
+        }
+        // call 2: clean end, nothing to replay.
+      },
+    });
+
+    const events: WatchEvent[] = [];
+    for await (const event of sandbox.watchLogs('sb')) events.push(event);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0].resumeAfterCursor).toBe('');
+    // 'b' > 'a' lexicographically: the high-water mark, not the last-seen cursor.
+    expect(requests[1].resumeAfterCursor).toBe('b');
+    expect(events).toHaveLength(2);
+  });
+
+  it('a warning does not advance or reset the resume cursor', async () => {
+    const requests: Array<{ resumeAfterCursor?: string }> = [];
+    let call = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      watchSandbox: async function* (req) {
+        requests.push(req);
+        call++;
+        if (call === 1) {
+          yield {
+            payload: {
+              case: 'log',
+              value: { sandboxId: 'sb', level: 'INFO', target: 't', message: 'm1', source: '', fields: {} },
+            },
+            cursor: 'c1',
+          };
+          yield { payload: { case: 'warning', value: { message: 'lagged' } }, cursor: '' };
+          throw new ConnectError('dropped', Code.Unavailable);
+        }
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb')) {
+      // drain
+    }
+    expect(requests[1].resumeAfterCursor).toBe('c1');
+  });
+
+  it('doubles the backoff delay on repeated drops and resets it after a delivered event', async () => {
+    const delays: number[] = [];
+    __setWatchLogsBackoffSleepForTests(async (delayMs) => {
+      delays.push(delayMs);
+    });
+    let call = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      watchSandbox: async function* () {
+        call++;
+        if (call <= 3) throw new ConnectError('dropped', Code.Unavailable);
+        if (call === 4) {
+          yield {
+            payload: {
+              case: 'log',
+              value: { sandboxId: 'sb', level: 'INFO', target: 't', message: 'm', source: '', fields: {} },
+            },
+            cursor: 'c1',
+          };
+          throw new ConnectError('dropped again', Code.Unavailable);
+        }
+        // call 5: clean end.
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb')) {
+      // drain
+    }
+    // Three drops before any delivery double the delay; a delivered event
+    // between the fourth and fifth calls resets it back to the initial value.
+    expect(delays).toEqual([100, 200, 400, 100]);
+  });
+
+  it('caps the backoff delay at 2000ms', async () => {
+    const delays: number[] = [];
+    __setWatchLogsBackoffSleepForTests(async (delayMs) => {
+      delays.push(delayMs);
+    });
+    let call = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only drops the stream, no events to yield
+      watchSandbox: async function* () {
+        call++;
+        if (call <= 7) throw new ConnectError('dropped', Code.Unavailable);
+        // call 8: clean end.
+      },
+    });
+
+    for await (const _event of sandbox.watchLogs('sb')) {
+      // drain
+    }
+    expect(delays).toEqual([100, 200, 400, 800, 1600, 2000, 2000]);
+  });
+
+  it('a caller abort during backoff stops the loop without redialing', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only drops the stream, no events to yield
+      watchSandbox: async function* () {
+        calls++;
+        throw new ConnectError('dropped', Code.Unavailable);
+      },
+    });
+    setTimeout(() => controller.abort(), 10);
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.watchLogs('sb', { signal: controller.signal })) {
+          // drain
+        }
+      })(),
+    ).rejects.toBeInstanceOf(Error);
+    expect(calls).toBe(1);
+  });
+
+  it('terminates on OUT_OF_RANGE without retrying', async () => {
+    let calls = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only terminates the stream, no events to yield
+      watchSandbox: async function* () {
+        calls++;
+        throw new ConnectError('gap', Code.OutOfRange);
+      },
+    });
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.watchLogs('sb')) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'out_of_range' });
+    expect(calls).toBe(1);
+  });
+
+  it('terminates on any other non-Unavailable error without retrying', async () => {
+    let calls = 0;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // biome-ignore lint/correctness/useYield: mock only terminates the stream, no events to yield
+      watchSandbox: async function* () {
+        calls++;
+        throw new ConnectError('bad cursor', Code.InvalidArgument);
+      },
+    });
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.watchLogs('sb')) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'invalid_config' });
+    expect(calls).toBe(1);
+  });
+
+  it('surfaces a not_found preflight failure before dialing watchSandbox', async () => {
+    let calls = 0;
+    const sandbox = client({
+      getSandbox: () => {
+        throw new ConnectError('missing', Code.NotFound);
+      },
+      // biome-ignore lint/correctness/useYield: mock only counts calls, no events to yield
+      watchSandbox: async function* () {
+        calls++;
+      },
+    });
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.watchLogs('sb')) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    expect(calls).toBe(0);
   });
 });
 
