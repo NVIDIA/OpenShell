@@ -3688,3 +3688,32 @@ fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
     assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
     assert_eq!(lookup.message, "inspect docker volume failed");
 }
+
+#[test]
+fn normalize_pull_reference_appends_latest_only_when_untagged() {
+    // A bare repository reference must resolve to a single tag so the daemon
+    // does not pull every tag in the repository (issue #4029).
+    assert_eq!(
+        normalize_pull_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    // An explicit tag is preserved untouched.
+    assert_eq!(normalize_pull_reference("foo:1.2"), "foo:1.2");
+    // A digest-pinned reference already names an exact image.
+    assert_eq!(
+        normalize_pull_reference(
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    // A registry port is not a tag, so `:latest` is still appended.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app"),
+        "registry:5000/team/app:latest"
+    );
+    // A registry port combined with an explicit tag is left unchanged.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app:v1"),
+        "registry:5000/team/app:v1"
+    );
+}
