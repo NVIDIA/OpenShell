@@ -25,7 +25,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1914,81 +1913,28 @@ pub async fn sandbox_ssh_proxy(
                 service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
+                capabilities: Vec::new(),
             },
         )),
     })
     .await
     .map_err(|_| miette::miette!("failed to initialize SSH forward stream"))?;
 
-    let mut response = client
+    let response = client
         .forward_tcp(ReceiverStream::new(rx))
         .await
         .into_diagnostic()?
         .into_inner();
 
-    let stdout = tokio::io::stdout();
-
-    // Tokio stdin uses an uncancellable read on the runtime's blocking pool.
-    // If the relay closes while SSH still holds the pipe open, runtime shutdown
-    // would wait forever for that read. A dedicated thread can be left behind
-    // when this ProxyCommand process exits without holding the runtime alive.
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(8);
-    std::thread::Builder::new()
-        .name("ssh-proxy-stdin".into())
-        .spawn(move || {
-            use std::io::Read as _;
-            let mut stdin = std::io::stdin().lock();
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .into_diagnostic()?;
-    let to_remote = tokio::spawn(async move {
-        while let Some(data) = stdin_rx.recv().await {
-            if tx
-                .send(TcpForwardFrame {
-                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        data,
-                    )),
-                })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    let from_remote = tokio::spawn(async move {
-        let mut stdout = stdout;
-        loop {
-            let frame = match response.message().await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return Ok::<_, Report>(()),
-                Err(error) => return Err(error).into_diagnostic(),
-            };
-            let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
-            else {
-                continue;
-            };
-            if data.is_empty() {
-                continue;
-            }
-            stdout.write_all(&data).await.into_diagnostic()?;
-            stdout.flush().await.into_diagnostic()?;
-        }
-    });
-    let result = from_remote.await;
-    to_remote.abort();
-
-    result.into_diagnostic()?
+    openshell_core::stream_lifecycle::client(
+        response,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        tx,
+        false,
+    )
+    .await
+    .into_diagnostic()
 }
 
 fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use openshell_core::proto::{
     GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
-    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
+    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayOpen,
     ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
     Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
@@ -30,6 +30,7 @@ use crate::auth::principal::Principal;
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
+use openshell_core::stream_lifecycle::{self, AbortHandle, RelayIo};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
@@ -315,7 +316,7 @@ pub(crate) struct EndpointReportCursor {
 
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
 /// target-open failure reported by the supervisor.
-type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>>;
+type RelayStreamSender = oneshot::Sender<Result<RelayIo, Status>>;
 
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
@@ -329,6 +330,25 @@ pub struct SupervisorSessionRegistry {
     session_lifetimes: Arc<RwLock<()>>,
     admission_closed: AtomicBool,
     shutdown: watch::Sender<bool>,
+    active_relays: Arc<Mutex<HashMap<String, ActiveRelay>>>,
+}
+
+#[derive(Debug)]
+struct ActiveRelay {
+    sandbox_id: String,
+    session_id: String,
+    abort: AbortHandle,
+}
+
+#[derive(Debug)]
+pub struct ActiveRelayGuard {
+    channels: Arc<Mutex<HashMap<String, ActiveRelay>>>,
+    channel_id: String,
+}
+impl Drop for ActiveRelayGuard {
+    fn drop(&mut self) {
+        self.channels.lock().unwrap().remove(&self.channel_id);
+    }
 }
 
 struct PendingRelay {
@@ -336,14 +356,14 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
-    /// Last session whose outbound queue received this `RelayOpen`.
-    delivered_session_id: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct ClaimedRelay {
-    pub stream: tokio::io::DuplexStream,
+    pub guard: ActiveRelayGuard,
+    pub stream: RelayIo,
     pub sandbox_id: String,
+    session_id: String,
 }
 
 impl std::fmt::Debug for SupervisorSessionRegistry {
@@ -468,28 +488,23 @@ impl SupervisorSessionRegistry {
         None
     }
 
-    /// Look up a supervisor session without extending the setup deadline.
+    /// Look up the sender for a supervisor session, waiting up to `timeout`
+    /// for it to appear if absent.
     ///
     /// Uses exponential backoff (100ms → 2s) while polling the sessions map.
     async fn wait_for_session(
         &self,
         sandbox_id: &str,
-        deadline: tokio::time::Instant,
-        wait_for_missing_session: bool,
-    ) -> Result<(String, mpsc::Sender<GatewayMessage>), Status> {
+        timeout: Duration,
+    ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
+        let deadline = Instant::now() + timeout;
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
         loop {
-            let session = self
-                .sessions
-                .lock()
-                .unwrap()
-                .get(sandbox_id)
-                .map(|session| (session.session_id.clone(), session.tx.clone()));
-            if let Some(session) = session {
-                return Ok(session);
+            if let Some(tx) = self.lookup_session(sandbox_id) {
+                return Ok(tx);
             }
-            if !wait_for_missing_session || tokio::time::Instant::now() + backoff > deadline {
+            if Instant::now() + backoff > deadline {
                 return Err(Status::unavailable("supervisor session not connected"));
             }
             tokio::time::sleep(backoff).await;
@@ -497,7 +512,6 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    #[cfg(test)]
     fn lookup_session(&self, sandbox_id: &str) -> Option<mpsc::Sender<GatewayMessage>> {
         self.sessions
             .lock()
@@ -736,8 +750,7 @@ impl SupervisorSessionRegistry {
     ///   blip, gateway restart, supervisor restart) and the supervisor is
     ///   in its reconnect backoff loop
     ///
-    /// The timeout bounds session lookup, reconnect retries, and outbound queue
-    /// capacity waits together. Callers pick it based on their patience.
+    /// Callers pick the timeout based on how much patience the caller needs.
     /// A first `sandbox connect` right after `sandbox create` may need to
     /// wait for the supervisor's initial TLS + gRPC handshake (tens of
     /// seconds on a slow cluster), while mid-lifetime calls typically just
@@ -746,13 +759,7 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
         session_wait_timeout: Duration,
-    ) -> Result<
-        (
-            String,
-            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-        ),
-        Status,
-    > {
+    ) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
         self.open_relay_with_target(
             sandbox_id,
             relay_open::Target::Ssh(SshRelayTarget {}),
@@ -768,13 +775,7 @@ impl SupervisorSessionRegistry {
         target: relay_open::Target,
         service_id: String,
         session_wait_timeout: Duration,
-    ) -> Result<
-        (
-            String,
-            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-        ),
-        Status,
-    > {
+    ) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
         let channel_id = Uuid::new_v4().to_string();
         let relay_open = RelayOpen {
             channel_id: channel_id.clone(),
@@ -790,113 +791,108 @@ impl SupervisorSessionRegistry {
         sandbox_id: &str,
         relay_open: RelayOpen,
         session_wait_timeout: Duration,
-    ) -> Result<
-        (
-            String,
-            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-        ),
-        Status,
-    > {
-        self.open_relay_with_message_until(
-            sandbox_id,
-            relay_open,
-            tokio::time::Instant::now() + session_wait_timeout,
-            true,
-        )
-        .await
-    }
-
-    /// Local routing skips waiting for a missing session, but queue capacity
-    /// and reconnect retries still share the routing caller's setup deadline.
-    async fn open_relay_with_message_until(
-        &self,
-        sandbox_id: &str,
-        relay_open: RelayOpen,
-        deadline: tokio::time::Instant,
-        wait_for_missing_session: bool,
-    ) -> Result<
-        (
-            String,
-            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-        ),
-        Status,
-    > {
+    ) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
         if relay_open.channel_id.is_empty() {
             return Err(Status::invalid_argument("relay channel_id is required"));
         }
-        tokio::time::timeout_at(deadline, async {
-            let channel_id = relay_open.channel_id.clone();
+        let tx = self
+            .wait_for_session(sandbox_id, session_wait_timeout)
+            .await?;
 
-            // Register the pending relay before sending RelayOpen to avoid a race.
-            // Both caps are checked and the insert happens under a single lock hold
-            // so two concurrent calls can't both observe "under the cap" and then
-            // both insert past it.
-            let (relay_tx, relay_rx) = oneshot::channel();
-            let mut relay_tx = Some(relay_tx);
-            loop {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
-                }
-                let (session_id, tx) = self
-                    .wait_for_session(sandbox_id, deadline, wait_for_missing_session)
-                    .await?;
-                // Reserve capacity before taking synchronous locks. The session
-                // may change while waiting; validate it again before insertion.
-                let permit = tx
-                    .reserve()
-                    .await
-                    .map_err(|_| Status::unavailable("supervisor session disconnected"))?;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
-                }
-                let sent = {
-                    let sessions = self.sessions.lock().unwrap();
-                    if sessions
-                        .get(sandbox_id)
-                        .is_some_and(|session| session.session_id == session_id)
-                    {
-                        let mut pending = self.pending_relays.lock().unwrap();
-                        if pending.len() >= MAX_PENDING_RELAYS {
-                            return Err(Status::resource_exhausted(format!(
-                                "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
-                            )));
-                        }
-                        let per_sandbox = pending
-                            .values()
-                            .filter(|p| p.sandbox_id == sandbox_id)
-                            .count();
-                        if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
-                            return Err(Status::resource_exhausted(format!(
-                                "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
-                            )));
-                        }
-                        pending.insert(
-                            channel_id.clone(),
-                            PendingRelay {
-                                sender: relay_tx.take().unwrap(),
-                                sandbox_id: sandbox_id.to_string(),
-                                relay_open: relay_open.clone(),
-                                created_at: Instant::now(),
-                                delivered_session_id: Some(session_id),
-                            },
-                        );
-                        // Insertion, delivery selection, and enqueueing are atomic with
-                        // respect to registration and replay. No await holds these locks.
-                        permit.send(GatewayMessage {
-                            payload: Some(gateway_message::Payload::RelayOpen(relay_open.clone())),
-                        });
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if sent {
-                    return Ok((channel_id, relay_rx));
-                }
+        let channel_id = relay_open.channel_id.clone();
+
+        // Register the pending relay before sending RelayOpen to avoid a race.
+        // Both caps are checked and the insert happens under a single lock hold
+        // so two concurrent calls can't both observe "under the cap" and then
+        // both insert past it.
+        let (relay_tx, relay_rx) = oneshot::channel();
+        {
+            // Serialize allocation with claim activation. PeerRelay supplies
+            // its channel ID, so it must not replace a pending or active relay.
+            let _sessions = self.sessions.lock().unwrap();
+            let mut pending = self.pending_relays.lock().unwrap();
+            if pending.contains_key(&channel_id)
+                || self.active_relays.lock().unwrap().contains_key(&channel_id)
+            {
+                return Err(Status::already_exists("relay channel already exists"));
             }
-        })
-        .await
-        .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
+            if pending.len() >= MAX_PENDING_RELAYS {
+                return Err(Status::resource_exhausted(format!(
+                    "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                )));
+            }
+            let per_sandbox = pending
+                .values()
+                .filter(|p| p.sandbox_id == sandbox_id)
+                .count();
+            if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                return Err(Status::resource_exhausted(format!(
+                    "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                )));
+            }
+            pending.insert(
+                channel_id.clone(),
+                PendingRelay {
+                    sender: relay_tx,
+                    sandbox_id: sandbox_id.to_string(),
+                    relay_open: relay_open.clone(),
+                    created_at: Instant::now(),
+                },
+            );
+        }
+
+        let msg = GatewayMessage {
+            payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
+        };
+
+        if tx.send(msg).await.is_err() {
+            // Session dropped between our lookup and send.
+            self.pending_relays.lock().unwrap().remove(&channel_id);
+            return Err(Status::unavailable("supervisor session disconnected"));
+        }
+
+        Ok((channel_id, relay_rx))
+    }
+
+    fn abort_relay(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        close: &openshell_core::proto::RelayClose,
+    ) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(sandbox_id)
+            .is_none_or(|session| session.session_id != session_id)
+        {
+            return false;
+        }
+        // Keep the session lock through cancellation so a concurrent claim
+        // cannot move the channel from pending to active between these checks.
+        {
+            let mut pending = self.pending_relays.lock().unwrap();
+            if let Some(relay) = pending.get(&close.channel_id) {
+                if relay.sandbox_id != sandbox_id {
+                    return false;
+                }
+                let relay = pending
+                    .remove(&close.channel_id)
+                    .expect("pending relay existed before removal");
+                let _ = relay
+                    .sender
+                    .send(Err(stream_lifecycle::close_status(close)));
+                return true;
+            }
+        }
+        let active = self.active_relays.lock().unwrap();
+        let Some(relay) = active
+            .get(&close.channel_id)
+            .filter(|relay| relay.sandbox_id == sandbox_id && relay.session_id == session_id)
+        else {
+            return false;
+        };
+        relay.abort.abort(stream_lifecycle::close_status(close));
+        true
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
@@ -920,6 +916,17 @@ impl SupervisorSessionRegistry {
         channel_id: &str,
         principal: Option<&Principal>,
     ) -> Result<ClaimedRelay, Status> {
+        self.claim_relay_for_session(channel_id, principal, "", false)
+    }
+
+    fn claim_relay_for_session(
+        &self,
+        channel_id: &str,
+        principal: Option<&Principal>,
+        session_id: &str,
+        half_close: bool,
+    ) -> Result<ClaimedRelay, Status> {
+        let sessions = self.sessions.lock().unwrap();
         let pending = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
@@ -940,6 +947,16 @@ impl SupervisorSessionRegistry {
                 return Err(status);
             }
 
+            if !session_id.is_empty()
+                && sessions
+                    .get(&pending.sandbox_id)
+                    .is_none_or(|session| session.session_id != session_id)
+            {
+                return Err(Status::failed_precondition(
+                    "relay belongs to a stale supervisor session",
+                ));
+            }
+
             if pending.created_at.elapsed() > RELAY_PENDING_TIMEOUT {
                 map.remove(channel_id);
                 return Err(Status::deadline_exceeded("relay channel timed out"));
@@ -951,16 +968,34 @@ impl SupervisorSessionRegistry {
 
         // Create a duplex stream pair: one end for the gateway bridge, one for
         // the supervisor HTTP CONNECT handler.
-        let (gateway_stream, supervisor_stream) = tokio::io::duplex(64 * 1024);
+        let (gateway_stream, supervisor_stream) = RelayIo::pair_with_half_close(half_close);
 
+        let session_id = sessions
+            .get(&pending.sandbox_id)
+            .map(|session| session.session_id.clone())
+            .unwrap_or_default();
+        self.active_relays.lock().unwrap().insert(
+            channel_id.to_string(),
+            ActiveRelay {
+                sandbox_id: pending.sandbox_id.clone(),
+                session_id: session_id.clone(),
+                abort: gateway_stream.abort_handle(),
+            },
+        );
+        let guard = ActiveRelayGuard {
+            channels: Arc::clone(&self.active_relays),
+            channel_id: channel_id.to_string(),
+        };
         // Send the gateway-side stream to the waiter (exec handler or forward handler).
         if pending.sender.send(Ok(gateway_stream)).is_err() {
             return Err(Status::internal("relay requester dropped"));
         }
 
         Ok(ClaimedRelay {
+            guard,
             stream: supervisor_stream,
             sandbox_id: pending.sandbox_id,
+            session_id,
         })
     }
 
@@ -975,43 +1010,23 @@ impl SupervisorSessionRegistry {
         self.remove(sandbox_id);
     }
 
-    pub async fn replay_pending_relays(
-        &self,
-        sandbox_id: &str,
-        session_id: &str,
-        tx: &mpsc::Sender<GatewayMessage>,
-    ) {
+    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
-            let needs_replay = {
+            let relay_open = {
                 let pending = self.pending_relays.lock().unwrap();
-                pending.get(&channel_id).is_some_and(|pending| {
-                    pending.delivered_session_id.as_deref() != Some(session_id)
-                })
+                pending
+                    .get(&channel_id)
+                    .map(|pending| pending.relay_open.clone())
             };
-            if !needs_replay {
+            let Some(relay_open) = relay_open else {
                 continue;
-            }
-            let Ok(permit) = tx.reserve().await else {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to connected session");
-                break;
             };
-            let sessions = self.sessions.lock().unwrap();
-            if sessions
-                .get(sandbox_id)
-                .is_none_or(|session| session.session_id != session_id)
-            {
+            let msg = GatewayMessage {
+                payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
+            };
+            if tx.send(msg).await.is_err() {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
                 break;
-            }
-            let mut pending = self.pending_relays.lock().unwrap();
-            if let Some(pending) = pending.get_mut(&channel_id)
-                && pending.delivered_session_id.as_deref() != Some(session_id)
-            {
-                pending.delivered_session_id = Some(session_id.to_string());
-                permit.send(GatewayMessage {
-                    payload: Some(gateway_message::Payload::RelayOpen(
-                        pending.relay_open.clone(),
-                    )),
-                });
             }
         }
     }
@@ -1066,10 +1081,7 @@ async fn require_persisted_sandbox(
 // RelayStream gRPC handler
 // ---------------------------------------------------------------------------
 
-/// Size of chunks read from the gateway-side `DuplexStream` when forwarding
-/// bytes back to the supervisor over the gRPC response stream.
-const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
-
+/// Response frames and terminal status for a supervisor relay.
 type RelayStreamResponse = Response<
     Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>,
 >;
@@ -1102,114 +1114,82 @@ async fn handle_relay_stream_inner(
     let principal = request.extensions().get::<Principal>().cloned();
     let mut inbound = request.into_inner();
 
-    // First frame must identify the channel.
     let first = inbound
         .message()
         .await?
         .ok_or_else(|| Status::invalid_argument("empty RelayStream"))?;
-    let channel_id = match first.payload {
-        Some(openshell_core::proto::relay_frame::Payload::Init(RelayInit { channel_id }))
-            if !channel_id.is_empty() =>
-        {
-            channel_id
-        }
-        _ => {
-            return Err(Status::invalid_argument(
-                "first RelayFrame must be init with non-empty channel_id",
-            ));
-        }
+    let Some(openshell_core::proto::relay_frame::Payload::Init(init)) = first.payload else {
+        return Err(Status::invalid_argument("first RelayFrame must be init"));
     };
-
-    // Claim the pending relay. Consumes the entry — it cannot be reused.
-    let claimed = registry.claim_relay(&channel_id, principal.as_ref())?;
-    let sandbox_id = claimed.sandbox_id;
-    let supervisor_side = claimed.stream;
-    info!(channel_id = %channel_id, sandbox_id = %sandbox_id, "relay stream: claimed pending relay, bridging");
-
-    let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);
-
-    // Supervisor → gateway: drain `inbound` and write to the DuplexStream.
-    let channel_id_in = channel_id.clone();
-    let sandbox_id_in = sandbox_id;
-    let state_in = state.clone();
+    if init.channel_id.is_empty() {
+        return Err(Status::invalid_argument("channel_id is required"));
+    }
+    let half_close = stream_lifecycle::supports_half_close(&init.capabilities);
+    if half_close && init.session_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "negotiated relay requires session_id",
+        ));
+    }
+    let mut claimed = registry.claim_relay_for_session(
+        &init.channel_id,
+        principal.as_ref(),
+        &init.session_id,
+        half_close,
+    )?;
+    let (out_tx, out_rx) = mpsc::channel(16);
+    let completion = claimed.stream.completion_guard();
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
-                    let Some(openshell_core::proto::relay_frame::Payload::Data(data)) =
-                        frame.payload
-                    else {
-                        warn!(channel_id = %channel_id_in, "relay stream: received non-data frame after init");
-                        break;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) =
-                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
-                    {
-                        warn!(channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    if let Some(state) = state_in.as_ref()
-                        && expected_transport_close_during_sandbox_teardown(
-                            state,
-                            &sandbox_id_in,
-                            &e,
-                        )
-                        .await
-                    {
-                        info!(
-                            sandbox_id = %sandbox_id_in,
-                            channel_id = %channel_id_in,
-                            error = %e,
-                            "relay stream: expected transport close during sandbox teardown"
-                        );
-                    } else {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: inbound errored");
-                    }
-                    break;
-                }
+        let mut out_tx = Some(out_tx);
+        let _guard = claimed.guard;
+        let abort = claimed.stream.abort_handle();
+        let result = abort
+            .run(stream_lifecycle::serve_relay(
+                inbound,
+                &mut claimed.stream,
+                &mut out_tx,
+                half_close,
+            ))
+            .await;
+        completion.finish(result.clone());
+        if let Err(status) = result {
+            abort.abort(status.clone());
+            let expected_close = if let Some(state) = &state {
+                expected_transport_close_during_sandbox_teardown(
+                    state,
+                    &claimed.sandbox_id,
+                    &status,
+                )
+                .await
+            } else {
+                false
+            };
+            if expected_close {
+                debug!(channel_id = %init.channel_id, "relay closed during sandbox teardown");
             }
-        }
-        // Best-effort half-close on the write side so the reader sees EOF.
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
-    });
-
-    // Gateway → supervisor: read the DuplexStream and emit RelayFrame::data messages.
-    let (out_tx, out_rx) = mpsc::channel::<Result<RelayFrame, Status>>(16);
-    let channel_id_out = channel_id;
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = RelayFrame {
-                        payload: Some(openshell_core::proto::relay_frame::Payload::Data(
-                            buf[..n].to_vec(),
+            // Typed abort is observable through both the byte pipe and trailers.
+            if let Some(state) = state {
+                let tx = state
+                    .supervisor_sessions
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&claimed.sandbox_id)
+                    .filter(|session| session.session_id == claimed.session_id)
+                    .map(|session| session.tx.clone());
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(GatewayMessage {
+                        payload: Some(gateway_message::Payload::RelayClose(
+                            stream_lifecycle::close_message(init.channel_id, &status),
                         )),
-                    };
-                    if out_tx.send(Ok(chunk)).await.is_err() {
-                        break;
-                    }
+                    });
                 }
-                Err(e) => {
-                    warn!(channel_id = %channel_id_out, error = %e, "relay stream: read from duplex failed");
-                    break;
-                }
+            }
+            if let Some(out_tx) = out_tx {
+                let _ = out_tx.send(Err(status)).await;
             }
         }
     });
-
-    let stream = ReceiverStream::new(out_rx);
-    let stream: Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
-    > = Box::pin(stream);
-    Ok(Response::new(stream))
+    Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
 }
 
 fn expected_transport_close_during_shutdown(status: &Status, terminating: bool) -> bool {
@@ -1439,13 +1419,7 @@ pub async fn open_routed_relay_with_target(
     target: relay_open::Target,
     service_id: String,
     session_wait_timeout: Duration,
-) -> Result<
-    (
-        String,
-        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-    ),
-    Status,
-> {
+) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
     let channel_id = Uuid::new_v4().to_string();
     let relay_open = RelayOpen {
         channel_id: channel_id.clone(),
@@ -1460,96 +1434,86 @@ pub async fn open_routed_relay_with_message(
     sandbox_id: &str,
     relay_open: RelayOpen,
     session_wait_timeout: Duration,
-) -> Result<
-    (
-        String,
-        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-    ),
-    Status,
-> {
-    let deadline = tokio::time::Instant::now() + session_wait_timeout;
-    tokio::time::timeout_at(deadline, async {
-        let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
-        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-        loop {
-            if state.supervisor_sessions.has_session(sandbox_id) {
-                match state
-                    .supervisor_sessions
-                    .open_relay_with_message_until(sandbox_id, relay_open.clone(), deadline, false)
-                    .await
-                {
-                    Ok(relay) => return Ok(relay),
-                    Err(status) if status.code() == tonic::Code::Unavailable => {
-                        // The session can migrate after `has_session` but before
-                        // RelayOpen reaches its sender. Fall through and reread the
-                        // persisted owner instead of surfacing a handoff race.
-                        warn!(
-                            sandbox_id,
-                            error = %status,
-                            "local supervisor relay disappeared during open; resolving owner again"
-                        );
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-
-            if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
-                && owner_is_fresh(&owner)
+) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
+    let deadline = Instant::now() + session_wait_timeout;
+    let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    loop {
+        if state.supervisor_sessions.has_session(sandbox_id) {
+            match state
+                .supervisor_sessions
+                .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
+                .await
             {
-                if owner.owner_replica_id == state.replica_id {
+                Ok(relay) => return Ok(relay),
+                Err(status) if status.code() == tonic::Code::Unavailable => {
+                    // The session can migrate after `has_session` but before
+                    // RelayOpen reaches its sender. Fall through and reread the
+                    // persisted owner instead of surfacing a handoff race.
+                    warn!(
+                        sandbox_id,
+                        error = %status,
+                        "local supervisor relay disappeared during open; resolving owner again"
+                    );
+                }
+                Err(status) => return Err(status),
+            }
+        }
+
+        if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
+            && owner_is_fresh(&owner)
+        {
+            if owner.owner_replica_id == state.replica_id {
+                warn!(
+                    sandbox_id,
+                    owner_replica_id = %owner.owner_replica_id,
+                    "supervisor owner record points at this replica but no local session is registered; retrying"
+                );
+                state.peer_routes.evict_owner(sandbox_id);
+                if Instant::now() + backoff > deadline {
+                    return Err(Status::unavailable("supervisor session not connected"));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+                continue;
+            }
+            if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
+                     set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
+                    owner.owner_replica_id
+                )));
+            }
+            match open_peer_relay(
+                state,
+                owner.owner_peer_endpoint.clone(),
+                sandbox_id,
+                relay_open.clone(),
+            )
+            .await
+            {
+                Ok(relay) => return Ok(relay),
+                Err(status) => {
                     warn!(
                         sandbox_id,
                         owner_replica_id = %owner.owner_replica_id,
-                        "supervisor owner record points at this replica but no local session is registered; retrying"
+                        owner_peer_endpoint = %owner.owner_peer_endpoint,
+                        error = %status,
+                        "gateway peer owner relay open failed; retrying until session wait timeout"
                     );
+                    // The record may name a replaced pod, so retry against a
+                    // fresh read rather than the cached endpoint.
                     state.peer_routes.evict_owner(sandbox_id);
-                    if tokio::time::Instant::now() + backoff > deadline {
-                        return Err(Status::unavailable("supervisor session not connected"));
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
-                    continue;
-                }
-                if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
-                    return Err(Status::failed_precondition(format!(
-                        "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
-                         set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
-                        owner.owner_replica_id
-                    )));
-                }
-                match open_peer_relay(
-                    state,
-                    owner.owner_peer_endpoint.clone(),
-                    sandbox_id,
-                    relay_open.clone(),
-                )
-                .await
-                {
-                    Ok(relay) => return Ok(relay),
-                    Err(status) => {
-                        warn!(
-                            sandbox_id,
-                            owner_replica_id = %owner.owner_replica_id,
-                            owner_peer_endpoint = %owner.owner_peer_endpoint,
-                            error = %status,
-                            "gateway peer owner relay open failed; retrying until session wait timeout"
-                        );
-                        // The record may name a replaced pod, so retry against a
-                        // fresh read rather than the cached endpoint.
-                        state.peer_routes.evict_owner(sandbox_id);
-                    }
                 }
             }
-
-            if tokio::time::Instant::now() + backoff > deadline {
-                return Err(Status::unavailable("supervisor session not connected"));
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
         }
-    })
-    .await
-    .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
+
+        if Instant::now() + backoff > deadline {
+            return Err(Status::unavailable("supervisor session not connected"));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+    }
 }
 
 /// Reads the owning replica, reusing a recent result when one is cached.
@@ -1591,13 +1555,7 @@ async fn open_peer_relay(
     owner_peer_endpoint: String,
     sandbox_id: &str,
     relay_open: RelayOpen,
-) -> Result<
-    (
-        String,
-        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
-    ),
-    Status,
-> {
+) -> Result<(String, oneshot::Receiver<Result<RelayIo, Status>>), Status> {
     let channel_id = relay_open.channel_id.clone();
     let (relay_tx, relay_rx) = oneshot::channel();
     let stream = connect_peer_relay(state, &owner_peer_endpoint, sandbox_id, relay_open).await?;
@@ -1610,7 +1568,7 @@ async fn connect_peer_relay(
     owner_peer_endpoint: &str,
     sandbox_id: &str,
     relay_open: RelayOpen,
-) -> Result<tokio::io::DuplexStream, Status> {
+) -> Result<RelayIo, Status> {
     let token = state.peer_routes.peer_token().await?;
     let channel = state.peer_routes.channel(owner_peer_endpoint).await?;
     let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
@@ -1623,6 +1581,7 @@ async fn connect_peer_relay(
                 sandbox_id: sandbox_id.to_string(),
                 relay_open: Some(relay_open),
                 requester_replica_id: state.replica_id.clone(),
+                capabilities: stream_lifecycle::capabilities(),
             })),
         })
         .await
@@ -1635,8 +1594,12 @@ async fn connect_peer_relay(
             state.peer_routes.evict_channel(owner_peer_endpoint);
             Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
         })?;
+    let half_close = response
+        .metadata()
+        .get(stream_lifecycle::HALF_CLOSE_METADATA)
+        .is_some_and(|value| value == "v1");
     let inbound = response.into_inner();
-    let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+    let (gateway_stream, bridge_stream) = RelayIo::pair_with_half_close(half_close);
     spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
     Ok(gateway_stream)
 }
@@ -1677,6 +1640,7 @@ pub async fn handle_peer_relay(
             "peer relay requester does not match authenticated gateway replica",
         ));
     }
+    let half_close = stream_lifecycle::supports_half_close(&init.capabilities);
     let relay_open = init
         .relay_open
         .ok_or_else(|| Status::invalid_argument("relay_open is required"))?;
@@ -1702,6 +1666,7 @@ pub async fn handle_peer_relay(
         Err(_) => return Err(Status::deadline_exceeded("relay open timed out")),
     };
 
+    let half_close = half_close && supervisor_stream.supports_half_close();
     let (out_tx, out_rx) = mpsc::channel::<Result<PeerRelayFrame, Status>>(16);
     spawn_peer_owner_bridge(
         supervisor_stream,
@@ -1709,133 +1674,62 @@ pub async fn handle_peer_relay(
         out_tx,
         init.sandbox_id,
         channel_id,
+        half_close,
     );
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>,
     > = Box::pin(ReceiverStream::new(out_rx));
-    Ok(Response::new(stream))
+    let mut response = Response::new(stream);
+    if half_close {
+        response.metadata_mut().insert(
+            stream_lifecycle::HALF_CLOSE_METADATA,
+            MetadataValue::from_static("v1"),
+        );
+    }
+    Ok(response)
 }
 
 fn spawn_peer_bridge(
-    bridge_stream: tokio::io::DuplexStream,
-    mut inbound: tonic::Streaming<PeerRelayFrame>,
+    mut bridge_stream: RelayIo,
+    inbound: tonic::Streaming<PeerRelayFrame>,
     out_tx: mpsc::Sender<PeerRelayFrame>,
-    sandbox_id: String,
+    _sandbox_id: String,
 ) {
-    let (mut read_half, mut write_half) = tokio::io::split(bridge_stream);
-    let sandbox_id_in = sandbox_id.clone();
+    let completion = bridge_stream.completion_guard();
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
-                    let Some(peer_relay_frame::Payload::Data(data)) = frame.payload else {
-                        warn!(sandbox_id = %sandbox_id_in, "gateway peer relay: non-data frame after init");
-                        break;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Err(err) =
-                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
-                    {
-                        warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
-                    break;
-                }
-            }
-        }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
-    });
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if out_tx
-                        .send(PeerRelayFrame {
-                            payload: Some(peer_relay_frame::Payload::Data(buf[..n].to_vec())),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
-                    break;
-                }
-            }
-        }
+        let abort = bridge_stream.abort_handle();
+        let half_close = bridge_stream.supports_half_close();
+        let (read, write) = tokio::io::split(&mut bridge_stream);
+        let result = abort
+            .run(stream_lifecycle::client_relay(
+                inbound, read, write, out_tx, half_close,
+            ))
+            .await;
+        completion.finish(result);
     });
 }
 
 fn spawn_peer_owner_bridge(
-    supervisor_stream: tokio::io::DuplexStream,
-    mut inbound: tonic::Streaming<PeerRelayFrame>,
+    mut supervisor_stream: RelayIo,
+    inbound: tonic::Streaming<PeerRelayFrame>,
     out_tx: mpsc::Sender<Result<PeerRelayFrame, Status>>,
-    sandbox_id: String,
-    channel_id: String,
+    _sandbox_id: String,
+    _channel_id: String,
+    half_close: bool,
 ) {
-    let (mut read_half, mut write_half) = tokio::io::split(supervisor_stream);
-    let sandbox_id_in = sandbox_id.clone();
-    let channel_id_in = channel_id.clone();
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
-                    let Some(peer_relay_frame::Payload::Data(data)) = frame.payload else {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, "gateway peer relay owner: non-data frame after init");
-                        break;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Err(err) =
-                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
-                    {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
-                    break;
-                }
-            }
-        }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
-    });
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if out_tx
-                        .send(Ok(PeerRelayFrame {
-                            payload: Some(peer_relay_frame::Payload::Data(buf[..n].to_vec())),
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
-                    break;
-                }
-            }
+        let abort = supervisor_stream.abort_handle();
+        if let Err(error) = abort
+            .run(stream_lifecycle::serve_forward(
+                inbound,
+                &mut supervisor_stream,
+                &out_tx,
+                half_close,
+            ))
+            .await
+        {
+            abort.abort(error.clone());
+            let _ = out_tx.send(Err(error)).await;
         }
     });
 }
@@ -1995,6 +1889,11 @@ async fn establish_supervisor_session(
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
+            capabilities: if stream_lifecycle::supports_half_close(&hello.capabilities) {
+                stream_lifecycle::capabilities()
+            } else {
+                Vec::new()
+            },
             heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
                 u64::from(HEARTBEAT_INTERVAL_SECS),
             ))
@@ -2041,13 +1940,12 @@ async fn establish_supervisor_session(
     }
     state.telemetry.sandbox_session_connected(&sandbox_id);
 
-    // A disconnected session may already have removed its registration while
-    // an unclaimed RelayOpen remains pending. Replay on every accepted session,
-    // including reconnects that did not supersede a live registration.
-    state
-        .supervisor_sessions
-        .replay_pending_relays(&sandbox_id, &session_id, &tx)
-        .await;
+    if superseded {
+        state
+            .supervisor_sessions
+            .replay_pending_relays(&sandbox_id, &tx)
+            .await;
+    }
 
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
@@ -2154,18 +2052,10 @@ pub async fn handle_finalize_main_process_exit(
         .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
         .await
         .map_err(Status::failed_precondition)?;
-    let session_finalized = state
+    if !state
         .supervisor_sessions
-        .finalize_main_process_exit(&report.sandbox_id);
-    // The session can close between durable result validation and this mark.
-    // Schedule cleanup in either case so a disconnect with an unfinalized
-    // in-memory session cannot strand the ephemeral sandbox.
-    state
-        .compute
-        .cleanup_finalized_ephemeral_sandbox(&report.sandbox_id, &report.instance_id)
-        .await
-        .map_err(Status::internal)?;
-    if !session_finalized {
+        .finalize_main_process_exit(&report.sandbox_id)
+    {
         return Err(Status::failed_precondition(
             "supervisor session is not connected",
         ));
@@ -2331,6 +2221,9 @@ async fn handle_supervisor_message(
             }
         }
         Some(supervisor_message::Payload::RelayClose(close)) => {
+            state
+                .supervisor_sessions
+                .abort_relay(sandbox_id, session_id, &close);
             info!(
                 sandbox_id = %sandbox_id,
                 session_id = %session_id,
@@ -2586,7 +2479,6 @@ mod tests {
                 service_id: String::new(),
             },
             created_at,
-            delivered_session_id: None,
         }
     }
 
@@ -3012,200 +2904,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_relay_attempt_skips_missing_session_without_spending_setup_budget() {
-        let registry = SupervisorSessionRegistry::new();
-        let started = tokio::time::Instant::now();
-        let attempt = registry.open_relay_with_message_until(
-            "missing",
-            RelayOpen {
-                channel_id: "test-channel".into(),
-                ..Default::default()
-            },
-            started + Duration::from_secs(15),
-            false,
-        );
-        tokio::pin!(attempt);
-        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(&mut attempt) else {
-            panic!("local routing must immediately fall back when its session disappears");
-        };
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(registry.pending_relays.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn relay_setup_deadline_bounds_queue_wait_for_nonwaiting_local_attempt() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        registry.register("sbx".into(), "session".into(), tx.clone(), make_shutdown());
-        tx.send(GatewayMessage::default()).await.unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let attempt = registry.open_relay_with_message_until(
-            "sbx",
-            RelayOpen {
-                channel_id: "test-channel".into(),
-                ..Default::default()
-            },
-            deadline,
-            false,
-        );
-        tokio::pin!(attempt);
-        // Skipping a missing-session wait must not imply a zero queue budget.
-        assert!(futures_util::poll!(&mut attempt).is_pending());
-        tokio::time::advance(Duration::from_secs(15)).await;
-        assert_eq!(
-            attempt.await.unwrap_err().code(),
-            tonic::Code::DeadlineExceeded
-        );
-        assert!(registry.pending_relays.lock().unwrap().is_empty());
-        rx.recv().await.unwrap();
-        assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn relay_setup_deadline_is_not_reset_by_reconnects() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        registry.register(
-            "sbx".into(),
-            "session-0".into(),
-            tx.clone(),
-            make_shutdown(),
-        );
-        tx.send(GatewayMessage::default()).await.unwrap();
-        let started = tokio::time::Instant::now();
-        let attempt = registry.open_relay("sbx", Duration::from_secs(9));
-        tokio::pin!(attempt);
-        assert!(futures_util::poll!(&mut attempt).is_pending());
-        for generation in 1..=2 {
-            tokio::time::advance(Duration::from_secs(3)).await;
-            let (new_tx, new_rx) = mpsc::channel(1);
-            new_tx.send(GatewayMessage::default()).await.unwrap();
-            registry.register(
-                "sbx".into(),
-                format!("session-{generation}"),
-                new_tx,
-                make_shutdown(),
-            );
-            rx.recv().await.unwrap();
-            assert!(futures_util::poll!(&mut attempt).is_pending());
-            rx = new_rx;
-        }
-        tokio::time::advance(Duration::from_secs(3)).await;
-        assert_eq!(
-            attempt.await.unwrap_err().code(),
-            tonic::Code::DeadlineExceeded
-        );
-        assert_eq!(started.elapsed(), Duration::from_secs(9));
-        assert!(registry.pending_relays.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn replay_pending_relays_does_not_duplicate_forward_opened_after_registration() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx_old, mut rx_old) = mpsc::channel(4);
-        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
-        let (old_channel, _old_relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
-            .await
-            .unwrap();
-        rx_old.recv().await.unwrap();
-        registry.remove_if_current("sbx", "old");
-
-        // Session establishment is paused between registration and replay.
-        let (tx_new, mut rx_new) = mpsc::channel(4);
-        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
-        let (new_channel, new_relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
-            .await
-            .unwrap();
-        registry.replay_pending_relays("sbx", "new", &tx_new).await;
-        registry.replay_pending_relays("sbx", "new", &tx_new).await;
-
-        for expected in [new_channel.clone(), old_channel] {
-            let Some(gateway_message::Payload::RelayOpen(open)) =
-                rx_new.recv().await.unwrap().payload
-            else {
-                panic!("expected RelayOpen");
-            };
-            assert_eq!(open.channel_id, expected);
-        }
-        assert!(matches!(
-            rx_new.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        let principal = sandbox_principal("sbx");
-        let _claimed = registry
-            .claim_relay(&new_channel, Some(&principal))
-            .unwrap();
-        assert!(new_relay_rx.await.unwrap().is_ok());
-        assert_eq!(
-            registry
-                .claim_relay(&new_channel, Some(&principal))
-                .unwrap_err()
-                .code(),
-            tonic::Code::NotFound
-        );
-    }
-
-    #[tokio::test]
-    async fn open_relay_rechecks_session_after_waiting_for_queue_capacity() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx_old, mut rx_old) = mpsc::channel(1);
-        registry.register("sbx".into(), "old".into(), tx_old.clone(), make_shutdown());
-        tx_old.send(GatewayMessage::default()).await.unwrap();
-        let open = registry.open_relay("sbx", Duration::from_secs(1));
-        tokio::pin!(open);
-        assert!(futures_util::poll!(&mut open).is_pending());
-
-        let (tx_new, mut rx_new) = mpsc::channel(4);
-        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
-        registry.replay_pending_relays("sbx", "new", &tx_new).await;
-        rx_old.recv().await.unwrap();
-        let (channel_id, _relay_rx) = open.await.unwrap();
-        registry.replay_pending_relays("sbx", "new", &tx_new).await;
-        let Some(gateway_message::Payload::RelayOpen(message)) =
-            rx_new.recv().await.unwrap().payload
-        else {
-            panic!("expected RelayOpen on replacement session");
-        };
-        assert_eq!(message.channel_id, channel_id);
-        assert!(rx_old.try_recv().is_err());
-        assert!(matches!(
-            rx_new.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn replay_pending_relays_after_disconnected_session_was_removed() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx_old, mut rx_old) = mpsc::channel(4);
-        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
-        let (channel_id, relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
-            .await
-            .unwrap();
-        rx_old.recv().await.unwrap();
-        registry.remove_if_current("sbx", "old");
-
-        let (tx_new, mut rx_new) = mpsc::channel(4);
-        assert!(!registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown()));
-        registry.replay_pending_relays("sbx", "new", &tx_new).await;
-        let replayed = rx_new.recv().await.unwrap();
-        let Some(gateway_message::Payload::RelayOpen(open)) = replayed.payload else {
-            panic!("expected replayed RelayOpen");
-        };
-        assert_eq!(open.channel_id, channel_id);
-        let _claimed = registry
-            .claim_relay(&channel_id, Some(&sandbox_principal("sbx")))
-            .unwrap();
-        assert!(relay_rx.await.unwrap().is_ok());
-    }
-
-    #[tokio::test]
     async fn replay_pending_relays_reissues_open_to_superseding_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
@@ -3241,7 +2939,7 @@ mod tests {
         assert!(superseded);
 
         registry
-            .replay_pending_relays("sbx", "s-new", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
             .await;
 
         let replayed = rx_new
@@ -3328,6 +3026,163 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
 
         assert!(!sandbox_proto_is_terminating(&sandbox));
+    }
+
+    #[tokio::test]
+    async fn typed_close_requires_the_owning_sandbox_and_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register(
+            "sbx-test".into(),
+            "current".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        registry.register(
+            "other".into(),
+            "other-session".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        let (relay_tx, relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch".into(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+        let principal = sandbox_principal("sbx-test");
+        assert_eq!(
+            registry
+                .claim_relay_for_session("ch", Some(&principal), "stale", true)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(registry.pending_relays.lock().unwrap().contains_key("ch"));
+        let claimed = registry
+            .claim_relay_for_session("ch", Some(&principal), "current", true)
+            .unwrap();
+        let mut pipe = relay_rx.await.unwrap().unwrap();
+        let close =
+            stream_lifecycle::close_message("ch".into(), &Status::deadline_exceeded("deadline"));
+        assert!(!registry.abort_relay("other", "other-session", &close));
+        assert!(!registry.abort_relay("sbx-test", "stale", &close));
+        assert!(registry.abort_relay("sbx-test", "current", &close));
+        let error = pipe.read(&mut [0]).await.unwrap_err();
+        assert_eq!(
+            stream_lifecycle::io_status(error).code(),
+            tonic::Code::DeadlineExceeded
+        );
+        registry.register("sbx-test".into(), "replacement".into(), tx, make_shutdown());
+        assert!(!registry.abort_relay("sbx-test", "current", &close));
+        assert!(!registry.abort_relay("sbx-test", "replacement", &close));
+        drop(claimed);
+        assert!(registry.active_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_close_before_claim_reports_error_and_releases_capacity() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register("sbx-test".into(), "current".into(), tx, make_shutdown());
+        {
+            let mut pending = registry.pending_relays.lock().unwrap();
+            for i in 0..MAX_PENDING_RELAYS_PER_SANDBOX - 1 {
+                let (sender, _) = oneshot::channel();
+                pending.insert(
+                    format!("channel-{i}"),
+                    pending_relay("sbx-test", sender, Instant::now()),
+                );
+            }
+        }
+        let (channel_id, mut relay_rx) = registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .open_relay("sbx-test", Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+
+        let close = stream_lifecycle::close_message(
+            channel_id.clone(),
+            &Status::deadline_exceeded("relay setup failed"),
+        );
+        assert!(registry.abort_relay("sbx-test", "current", &close));
+        let error = relay_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(error.message(), "relay setup failed");
+        assert!(
+            !registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id)
+        );
+        assert_eq!(
+            registry
+                .claim_relay_for_session(
+                    &channel_id,
+                    Some(&sandbox_principal("sbx-test")),
+                    "current",
+                    true,
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+        assert!(!registry.abort_relay("sbx-test", "current", &close));
+        registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .expect("closing a pending relay should immediately free capacity");
+    }
+
+    #[tokio::test]
+    async fn typed_close_before_claim_requires_current_session_and_matching_sandbox() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(4);
+        registry.register("sbx-test".into(), "old".into(), tx.clone(), make_shutdown());
+        let (channel_id, mut relay_rx) = registry
+            .open_relay("sbx-test", Duration::from_secs(1))
+            .await
+            .unwrap();
+        registry.register(
+            "sbx-test".into(),
+            "current".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        registry.register("other".into(), "other-session".into(), tx, make_shutdown());
+        let close = stream_lifecycle::close_message(
+            channel_id.clone(),
+            &Status::cancelled("relay setup cancelled"),
+        );
+
+        assert!(!registry.abort_relay("sbx-test", "old", &close));
+        assert!(!registry.abort_relay("other", "other-session", &close));
+        assert!(
+            registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key(&channel_id)
+        );
+        assert!(matches!(
+            relay_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Pending relays survive session replacement and can be replayed to
+        // the current session, which owns their cancellation before claim.
+        assert!(registry.abort_relay("sbx-test", "current", &close));
+        assert_eq!(
+            relay_rx.try_recv().unwrap().unwrap_err().code(),
+            tonic::Code::Cancelled
+        );
     }
 
     // ---- claim_relay: expiry, drop, wiring ----
@@ -3452,7 +3307,7 @@ mod tests {
     #[test]
     fn claim_relay_receiver_dropped_returns_internal() {
         let registry = SupervisorSessionRegistry::new();
-        let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
+        let (relay_tx, relay_rx) = oneshot::channel::<Result<RelayIo, Status>>();
         drop(relay_rx); // Gateway-side waiter has given up already.
         registry.pending_relays.lock().unwrap().insert(
             "ch-1".to_string(),
@@ -3468,7 +3323,7 @@ mod tests {
     #[tokio::test]
     async fn claim_relay_connects_both_ends() {
         let registry = SupervisorSessionRegistry::new();
-        let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
+        let (relay_tx, relay_rx) = oneshot::channel::<Result<RelayIo, Status>>();
         registry.pending_relays.lock().unwrap().insert(
             "ch-io".to_string(),
             pending_relay("sbx-test", relay_tx, Instant::now()),
