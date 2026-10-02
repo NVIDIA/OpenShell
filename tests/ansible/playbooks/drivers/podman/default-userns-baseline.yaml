@@ -12,6 +12,10 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Resolve installed gateway context
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+
     - name: Detect tmachine container runtime
       ansible.builtin.include_role:
         name: tmachine_container_runtime
@@ -38,7 +42,7 @@
     - name: Read OpenShell gateway configuration
       become: true
       ansible.builtin.slurp:
-        src: /etc/openshell/gateway.toml
+        src: "{{ openshell_test_gateway.config_path }}"
       register: openshell_gateway_config
 
     - name: Require unconfigured Podman user namespaces

@@ -12,3 +12,17 @@
       - --local
       - --name
       - "{{ openshell_client_gateway_name | default('tmachine') }}"
+
+- name: Publish test gateway context
+  ansible.builtin.include_role:
+    name: openshell_test_gateway
+    tasks_from: publish.yaml
+  vars:
+    openshell_test_gateway_context:
+      name: "{{ openshell_client_gateway_name | default('tmachine') }}"
+      config_path: "{{ openshell_client_gateway_config_path | default('/etc/openshell/gateway.toml') }}"
+      service_scope: "{{ openshell_client_gateway_service_scope | default('system') }}"
+      service_user: "{{ openshell_gateway_user if openshell_client_gateway_service_scope | default('system') == 'user' else 'root' }}"
+      service_home: "{{ openshell_gateway_home if openshell_client_gateway_service_scope | default('system') == 'user' else '/root' }}"
+      service_uid: "{{ openshell_gateway_uid if openshell_client_gateway_service_scope | default('system') == 'user' else '0' }}"
+      network_name: "{{ openshell_client_gateway_network_name | default('tmachine') }}"
