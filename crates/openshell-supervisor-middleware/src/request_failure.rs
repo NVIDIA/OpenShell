@@ -39,7 +39,7 @@ impl HttpRequestFailureKind {
         }
     }
 
-    /// Identifies the platform deadline; a remote DEADLINE_EXCEEDED is a status.
+    /// Identifies the platform deadline; a remote `DEADLINE_EXCEEDED` is a status.
     #[must_use]
     pub const fn deadline_scope(self) -> Option<&'static str> {
         match self {

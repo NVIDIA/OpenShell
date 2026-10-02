@@ -10,7 +10,7 @@ use std::sync::{
 
 /// Local forwarding progress; completion does not prove upstream processing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequestDeliveryState {
+pub enum RequestDeliveryState {
     NotStarted,
     Started,
     Completed,
@@ -18,7 +18,7 @@ pub(crate) enum RequestDeliveryState {
 
 /// Shared by the body runner and its writer so cancellation retains progress.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RequestDelivery(Arc<AtomicU8>);
+pub struct RequestDelivery(Arc<AtomicU8>);
 
 impl RequestDelivery {
     /// Observe a header write, retaining Started even if only a prefix is sent.
