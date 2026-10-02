@@ -978,9 +978,13 @@ async fn handle_shell_connect(
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -1114,9 +1118,13 @@ async fn handle_exec_command(
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        &app.endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1575,9 +1583,13 @@ async fn start_port_forwards(
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+    let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+        &session.gateway_scheme,
+        &session.gateway_host,
+        gateway_port_u16,
+        endpoint,
+    );
+    let gateway_url = format_gateway_url(&gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {

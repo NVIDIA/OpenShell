@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+ACTION="${1:-install}"
+KUBE_CONTEXT="${OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT:-}"
+NAMESPACE="agentgateway-system"
+RELEASE_NAME="agentgateway"
+AGENTGATEWAY_VERSION="${OPENSHELL_AGENTGATEWAY_VERSION:-v1.5.0}"
+AGENTGATEWAY_CHART="${OPENSHELL_AGENTGATEWAY_CHART:-oci://cr.agentgateway.dev/charts/agentgateway}"
+AGENTGATEWAY_CRDS_CHART="${OPENSHELL_AGENTGATEWAY_CRDS_CHART:-oci://cr.agentgateway.dev/charts/agentgateway-crds}"
+GATEWAY_API_VERSION="${OPENSHELL_GATEWAY_API_VERSION:-v1.6.2}"
+
+kubectl_args=()
+helm_args=()
+if [ -n "${KUBE_CONTEXT}" ]; then
+  kubectl_args+=(--context "${KUBE_CONTEXT}")
+  helm_args+=(--kube-context "${KUBE_CONTEXT}")
+fi
+
+case "${ACTION}" in
+  install)
+    kubectl "${kubectl_args[@]}" apply --server-side -f \
+      "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
+    helm "${helm_args[@]}" upgrade --install "${RELEASE_NAME}-crds" \
+      "${AGENTGATEWAY_CRDS_CHART}" \
+      --version "${AGENTGATEWAY_VERSION}" \
+      --namespace "${NAMESPACE}" --create-namespace \
+      --wait --timeout 5m
+    helm "${helm_args[@]}" upgrade --install "${RELEASE_NAME}" \
+      "${AGENTGATEWAY_CHART}" \
+      --version "${AGENTGATEWAY_VERSION}" \
+      --namespace "${NAMESPACE}" \
+      --wait --timeout 5m
+
+    ;;
+  delete)
+    helm "${helm_args[@]}" uninstall "${RELEASE_NAME}" \
+      --namespace "${NAMESPACE}" --wait --timeout 60s 2>/dev/null || true
+    helm "${helm_args[@]}" uninstall "${RELEASE_NAME}-crds" \
+      --namespace "${NAMESPACE}" --wait --timeout 60s 2>/dev/null || true
+    kubectl "${kubectl_args[@]}" delete namespace "${NAMESPACE}" \
+      --ignore-not-found --wait=true --timeout=60s
+    ;;
+  *)
+    echo "Usage: $0 [install|delete]" >&2
+    exit 2
+    ;;
+esac

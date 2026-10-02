@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Terminate frontend TLS at a dedicated agentgateway Gateway, then re-encrypt
+# traffic to the OpenShell gateway pod. The frontend TLS Secret must exist in
+# the Helm release namespace. The chart's certgen hook creates the backend
+# server certificate and CA ConfigMap.
+grpcRoute:
+  enabled: true
+  gateway:
+    create: true
+    className: agentgateway
+    name: openshell-ingress
+    listener:
+      port: 443
+      protocol: HTTPS
+      allowedRoutes: Same
+      tls:
+        certificateRefs:
+          - name: openshell-ingress-tls
+  backendTLSPolicy:
+    enabled: true
+
+server:
+  # Keep pod TLS enabled for agentgateway's re-encrypted backend connection.
+  disableTls: false
+  tls:
+    # Gateway API BackendTLSPolicy provides one-way TLS; the proxy does not
+    # present an OpenShell client certificate to the backend.
+    enableMtls: false

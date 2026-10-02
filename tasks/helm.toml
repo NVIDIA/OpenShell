@@ -124,3 +124,11 @@ run = "tasks/scripts/helm-k3s-local.sh forward"
 ["helm:gateway:apply"]
 description = "Apply the Envoy GatewayClass manifest (run after helm:skaffold:run when gateway routing is enabled)"
 run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-openshell.yaml"
+
+["helm:agentgateway:install"]
+description = "Install pinned Gateway API CRDs and agentgateway"
+run = "tasks/scripts/agentgateway-k8s-setup.sh install"
+
+["helm:agentgateway:delete"]
+description = "Remove the agentgateway releases"
+run = "tasks/scripts/agentgateway-k8s-setup.sh delete"

@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Gateway API resources
+templates:
+  - templates/gateway.yaml
+  - templates/grpcroute.yaml
+release:
+  name: openshell
+  namespace: openshell
+
+tests:
+  - it: keeps Envoy Gateway as the default class for chart-created Gateways
+    template: templates/gateway.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+    asserts:
+      - equal:
+          path: spec.gatewayClassName
+          value: eg
+
+  - it: creates a dedicated Gateway for agentgateway
+    template: templates/gateway.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-ingress
+      - equal:
+          path: spec.gatewayClassName
+          value: agentgateway
+      - equal:
+          path: spec.listeners[0].protocol
+          value: HTTP
+
+  - it: attaches the GRPCRoute to the named agentgateway Gateway
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+    asserts:
+      - equal:
+          path: spec.parentRefs[0]
+          value:
+            name: openshell-ingress
+            namespace: openshell
+
+  - it: rejects an agentgateway Gateway that collides with the OpenShell Service
+    template: templates/gateway.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+    asserts:
+      - failedTemplate:
+          errorMessage: "grpcRoute.gateway.name must differ from the OpenShell Service name when grpcRoute.gateway.className=agentgateway; set a distinct name such as openshell-ingress"
+
+  - it: creates a dedicated HTTPS Gateway for agentgateway
+    template: templates/gateway.yaml
+    set:
+      server.disableTls: true
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+      grpcRoute.gateway.listener.port: 443
+      grpcRoute.gateway.listener.protocol: HTTPS
+      grpcRoute.gateway.listener.tls.certificateRefs[0].name: openshell-ingress-tls
+    asserts:
+      - equal:
+          path: spec.listeners[0].protocol
+          value: HTTPS
+      - equal:
+          path: spec.listeners[0].port
+          value: 443
+      - equal:
+          path: spec.listeners[0].tls.certificateRefs[0].name
+          value: openshell-ingress-tls
+
+  - it: requires a certificate for a dedicated HTTPS Gateway
+    template: templates/gateway.yaml
+    set:
+      server.disableTls: true
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+      grpcRoute.gateway.listener.protocol: HTTPS
+    asserts:
+      - failedTemplate:
+          errorMessage: "grpcRoute.gateway.listener.tls.certificateRefs is required when grpcRoute.gateway.listener.protocol is HTTPS"

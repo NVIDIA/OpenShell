@@ -1,10 +1,14 @@
 {{- if and .Values.grpcRoute.enabled .Values.grpcRoute.gateway.create }}
+{{- $gatewayName := default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
+{{- if and (eq .Values.grpcRoute.gateway.className "agentgateway") (eq $gatewayName (include "openshell.fullname" .)) }}
+{{- fail "grpcRoute.gateway.name must differ from the OpenShell Service name when grpcRoute.gateway.className=agentgateway; set a distinct name such as openshell-ingress" }}
+{{- end }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
+  name: {{ $gatewayName }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}

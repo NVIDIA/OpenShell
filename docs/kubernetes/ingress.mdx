@@ -4,15 +4,68 @@
 title: "Ingress"
 sidebar-title: "Ingress"
 description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
-keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
+keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, agentgateway, Envoy Gateway, GRPCRoute, Ingress, External Access"
 position: 5
 ---
 
 By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. OpenShell tests this integration with [agentgateway](https://agentgateway.dev) and [Envoy Gateway](https://gateway.envoyproxy.io). The installation examples below pin known-good versions.
 
-## Install Envoy Gateway
+## Install agentgateway
+
+Install the standard Gateway API resources, then install the pinned agentgateway charts:
+
+```shell
+export OPENSHELL_GATEWAY_API_VERSION=v1.6.2
+export OPENSHELL_AGENTGATEWAY_VERSION=v1.5.0
+
+kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${OPENSHELL_GATEWAY_API_VERSION}/standard-install.yaml"
+
+helm upgrade --install agentgateway-crds \
+  oci://cr.agentgateway.dev/charts/agentgateway-crds \
+  --version "${OPENSHELL_AGENTGATEWAY_VERSION}" \
+  --namespace agentgateway-system \
+  --create-namespace \
+  --wait
+
+helm upgrade --install agentgateway \
+  oci://cr.agentgateway.dev/charts/agentgateway \
+  --version "${OPENSHELL_AGENTGATEWAY_VERSION}" \
+  --namespace agentgateway-system \
+  --wait
+```
+
+### Install OpenShell with a dedicated Gateway
+
+Let the OpenShell chart create the agentgateway `Gateway` and `GRPCRoute` in the release namespace:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --create-namespace \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=true \
+  --set grpcRoute.gateway.className=agentgateway \
+  --set grpcRoute.gateway.name=openshell-ingress
+```
+
+Agentgateway names its generated proxy Service after the Gateway. The explicit `openshell-ingress` name prevents a collision with the OpenShell Service named `openshell`; the chart rejects an agentgateway Gateway that resolves to the same name as the Service.
+
+Agentgateway creates the proxy Service in the OpenShell namespace:
+
+```shell
+kubectl -n openshell get gateway,service openshell-ingress
+kubectl -n openshell get grpcroute openshell
+```
+
+Agentgateway leaves request and backend response deadlines unset unless explicitly configured, so OpenShell does not require an `AgentgatewayPolicy` timeout override for long-running gRPC streams. See [agentgateway timeout configuration](https://agentgateway.dev/docs/kubernetes/latest/documentation/resiliency/timeouts/about/).
+
+## Envoy Gateway
+
+### Install Envoy Gateway
 
 Envoy Gateway installs the Gateway API CRDs and controller:
 
@@ -25,7 +78,7 @@ helm install eg \
   --wait
 ```
 
-## Create the GatewayClass
+### Create the GatewayClass
 
 Create the `eg` GatewayClass that the OpenShell chart references:
 
@@ -48,7 +101,7 @@ kubectl get gatewayclass eg
 
 The `ACCEPTED` column should show `True`.
 
-## Install OpenShell with Gateway API enabled
+### Install OpenShell with Gateway API enabled
 
 Enable the GRPCRoute and let the chart create a Gateway resource in the `openshell` namespace:
 
@@ -62,7 +115,7 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.className=eg
 ```
 
-## Get the external address
+### Get the external address
 
 After the Gateway is provisioned, Envoy Gateway creates a LoadBalancer service in the `openshell` namespace. Wait for it to get an external address:
 
@@ -81,15 +134,17 @@ This setup is plaintext end-to-end and is intended for development. For external
 
 ## HTTPS (TLS termination)
 
-Envoy Gateway can terminate TLS at the listener and forward plaintext to the OpenShell gateway pod:
+Envoy Gateway and agentgateway can terminate TLS at a chart-created Gateway listener and forward plaintext to the OpenShell gateway pod:
 
 ```text
-client → HTTPS → Envoy Gateway (terminate TLS) → plaintext → openshell gateway pod
+client → HTTPS → Gateway (terminate TLS) → plaintext → openshell gateway pod
 ```
 
-Envoy Gateway only terminates TLS here — it does not perform OIDC. Do not enable an Envoy Gateway OIDC `SecurityPolicy` in front of the gateway: that flow relies on browser redirects and cookies and cannot work with the OpenShell CLI or headless agents. Instead, the OpenShell gateway validates an OIDC bearer token that the client sends in the gRPC `authorization` metadata, which Envoy forwards untouched.
+The Gateway only terminates TLS here; OpenShell still authenticates clients. When using Envoy Gateway, do not enable an OIDC `SecurityPolicy` in front of OpenShell: that flow relies on browser redirects and cookies and cannot work with the OpenShell CLI or headless agents. Instead, the OpenShell gateway validates an OIDC bearer token that the client sends in the gRPC `authorization` metadata, which the proxy forwards untouched.
 
-Because Envoy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
+With agentgateway, an [`AgentgatewayPolicy`](https://agentgateway.dev/docs/kubernetes/latest/documentation/security/jwt/setup/) can validate the CLI's bearer token without a browser redirect. Set `spec.traffic.jwtAuthentication.preserveToken` to `true` so the token is forwarded to OpenShell for validation; agentgateway removes validated tokens by default.
+
+Because the ingress proxy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
 
 For an interactive login on a headless machine, set `OPENSHELL_NO_BROWSER=1` before running `openshell gateway add`. The CLI uses the Device Authorization Grant with S256 PKCE and prompts the user to approve the login from another browser. For unattended agents and CI, set `OPENSHELL_OIDC_CLIENT_SECRET` to use the OAuth2 client-credentials grant instead. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your identity provider uses a different id. Interactive users with a local browser get the Authorization Code flow with PKCE by default.
 
@@ -106,7 +161,7 @@ The Secret may also be issued by cert-manager, or you can reference the chart's 
 
 ### Install with HTTPS termination
 
-Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so Envoy forwards plaintext, and configure an OIDC issuer for client identity:
+Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so the proxy forwards plaintext, and configure an OIDC issuer for client identity:
 
 ```shell
 helm upgrade --install openshell \
@@ -115,7 +170,8 @@ helm upgrade --install openshell \
   --namespace openshell \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg \
+  --set grpcRoute.gateway.className=<gateway-class> \
+  --set grpcRoute.gateway.name=openshell-ingress \
   --set grpcRoute.gateway.listener.protocol=HTTPS \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
@@ -125,7 +181,9 @@ helm upgrade --install openshell \
   --set 'grpcRoute.hostnames[0]=gateway.example.com'
 ```
 
-Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
+Set `<gateway-class>` to `eg` for Envoy Gateway or `agentgateway` for agentgateway. The explicit Gateway name is required for agentgateway to avoid colliding with the OpenShell Service. Keep the certificate Secret in the release namespace; referencing a Secret in another namespace requires a `ReferenceGrant`.
+
+From a source checkout, run `mise run e2e:kubernetes:agentgateway-tls` to verify agentgateway frontend TLS termination with CLI conformance and SSH forwarding.
 
 ### Register over HTTPS
 
@@ -151,6 +209,8 @@ This keeps TLS on the gateway pod rather than disabling it with `server.disableT
 
 BackendTLSPolicy is a standard Gateway API resource. It is supported on OpenShift 4.22+ (via the OpenShift gateway controller) and on other platforms where the Gateway API implementation supports it (check your controller's documentation).
 
+OpenShell tests this path with a dedicated agentgateway Gateway by terminating frontend HTTPS on its listener, applying `BackendTLSPolicy` to the OpenShell Service, and running CLI conformance over the re-encrypted connection. From a source checkout, run `mise run e2e:kubernetes:agentgateway-backend-tls`.
+
 ### Install with e2e TLS
 
 The certgen hook automatically creates the backend CA ConfigMap when `backendTLSPolicy` is enabled:
@@ -163,7 +223,8 @@ helm upgrade --install openshell \
   --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg \
+  --set grpcRoute.gateway.className=<gateway-class> \
+  --set grpcRoute.gateway.name=openshell-ingress \
   --set grpcRoute.gateway.listener.protocol=HTTPS \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
