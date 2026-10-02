@@ -136,7 +136,6 @@ impl OpenShellRuntimeBackend {
         self.connector = Some(connector);
         self
     }
-
     /// Select the backend implementation that validates opaque audit evidence.
     #[must_use]
     pub fn with_audit_validator(
