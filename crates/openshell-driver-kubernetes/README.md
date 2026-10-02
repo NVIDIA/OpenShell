@@ -182,6 +182,13 @@ The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
 
+Creation records the validated namespace workload NetworkPolicy UID and spec
+generation in the initial suspended Sandbox CR. Restart records a fresh fence
+binding in the same patch that enables the preparing workload. Reconciliation
+can therefore inspect either bootstrap before its workload Pod exists without
+mistaking an unpublished fence identity for a policy replacement. Provisioning
+retains that binding and verifies it again before releasing the scheduling gates.
+
 ## GPU Support
 
 When a sandbox requests GPU support, the driver checks node allocatable capacity

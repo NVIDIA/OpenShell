@@ -763,7 +763,11 @@ bootstrap Secret.
 
 The workload Pod runs `/openshell-sandbox`. It has no gateway credentials and
 no direct egress. One namespace-wide workload NetworkPolicy is created before
-the suspended Sandbox resource. It denies all workload egress and allows
+the suspended Sandbox resource. The initial resource records that policy's UID
+and spec generation; restart publishes the current binding with the preparing
+state. A fence-generation warning during bootstrap means the recorded binding
+differs from the live policy, so inspect both resources. The policy denies all
+workload egress and allows
 supervisor Pods to reach sandbox TLS listeners. The driver then creates a
 per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs

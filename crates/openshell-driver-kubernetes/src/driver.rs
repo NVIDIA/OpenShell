@@ -1863,7 +1863,8 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
+        let fence = self
+            .create_sandbox_runtime_fence(&target_namespace, &proxy_names)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
         // depth, but the CR is also created suspended so the controller
@@ -1875,6 +1876,9 @@ impl KubernetesComputeDriver {
         }
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        // Reconciliation checks even suspended, preparing Sandboxes. Publish
+        // the validated fence identity with the CR, before it becomes visible.
+        annotations.extend(sandbox_runtime_fence_annotations(&fence)?);
         annotations.insert(
             crate::resource_admission::IDENTITIES.into(),
             serde_json::to_string(&resource_identities)
@@ -1980,7 +1984,7 @@ impl KubernetesComputeDriver {
                 &agent_sandbox_api,
                 &created,
                 &proxy_names,
-                &generation,
+                &fence,
                 resolved_user_id,
                 resolved_group_id,
                 &main_process_spec,
@@ -2005,12 +2009,12 @@ impl KubernetesComputeDriver {
         &self,
         namespace: &str,
         names: &SandboxRuntimeNames,
-    ) -> Result<(), KubernetesDriverError> {
-        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
+    ) -> Result<NetworkPolicy, KubernetesDriverError> {
+        let mut fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        for (mut policy, component) in [
-            (fence.workload_policy, "sandbox-workload-fence"),
-            (fence.supervisor_policy, "sandbox-supervisor-egress"),
+        for (policy, component) in [
+            (&mut fence.workload_policy, "sandbox-workload-fence"),
+            (&mut fence.supervisor_policy, "sandbox-supervisor-egress"),
         ] {
             let labels = policy.metadata.labels.get_or_insert_default();
             labels.insert(
@@ -2018,9 +2022,11 @@ impl KubernetesComputeDriver {
                 LABEL_MANAGED_BY_VALUE.to_string(),
             );
             labels.insert("openshell.ai/component".to_string(), component.to_string());
-            create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
         }
-        Ok(())
+        let workload =
+            create_or_validate_sandbox_runtime_fence(&policies, &fence.workload_policy).await?;
+        create_or_validate_sandbox_runtime_fence(&policies, &fence.supervisor_policy).await?;
+        Ok(workload)
     }
 
     async fn wait_for_bootstrap_workload_pod(
@@ -2280,7 +2286,7 @@ impl KubernetesComputeDriver {
         sandbox_api: &AgentSandboxApi,
         sandbox_cr: &DynamicObject,
         names: &SandboxRuntimeNames,
-        _generation: &str,
+        expected_fence: &NetworkPolicy,
         agent_uid: u32,
         agent_gid: u32,
         main_process_spec: &str,
@@ -2384,15 +2390,9 @@ impl KubernetesComputeDriver {
         })?;
 
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        let fence = policies
-            .get(&names.workload_policy)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
+        let fence = read_bound_sandbox_runtime_fence(&policies, expected_fence).await?;
         let fence_uid = fence.metadata.uid.ok_or_else(|| {
             KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
-        })?;
-        let fence_generation = fence.metadata.generation.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
         })?;
         let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
             KubernetesDriverError::Message(
@@ -2442,8 +2442,6 @@ impl KubernetesComputeDriver {
                     "annotations": {
                         ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
                     }
                 }
             })
@@ -2584,6 +2582,9 @@ impl KubernetesComputeDriver {
         )
         .await?;
 
+        // Do not release either Pod against a fence replaced during provisioning.
+        read_bound_sandbox_runtime_fence(&policies, expected_fence).await?;
+
         pods.patch(
             &names.supervisor_pod,
             &PatchParams::default(),
@@ -2631,7 +2632,7 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         cr_uid: &str,
         names: &SandboxRuntimeNames,
-        _generation: &str,
+        expected_fence: &NetworkPolicy,
         supervisor_uid: &str,
         agent_uid: u32,
         agent_gid: u32,
@@ -2671,15 +2672,9 @@ impl KubernetesComputeDriver {
                 ))
             })?;
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
-        let fence = policies
-            .get(&names.workload_policy)
-            .await
-            .map_err(KubernetesDriverError::from_kube)?;
+        let fence = read_bound_sandbox_runtime_fence(&policies, expected_fence).await?;
         let fence_uid = fence.metadata.uid.ok_or_else(|| {
             KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
-        })?;
-        let fence_generation = fence.metadata.generation.ok_or_else(|| {
-            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
         })?;
         let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
             KubernetesDriverError::Message(
@@ -2721,8 +2716,6 @@ impl KubernetesComputeDriver {
                     "annotations": {
                         ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
                     }
                 }
             })
@@ -2840,6 +2833,9 @@ impl KubernetesComputeDriver {
             vec![workload_owner, supervisor_owner],
         )
         .await?;
+
+        // Do not release either Pod against a fence replaced during provisioning.
+        read_bound_sandbox_runtime_fence(&policies, expected_fence).await?;
 
         pods.patch(
             &names.supervisor_pod,
@@ -3122,8 +3118,10 @@ impl KubernetesComputeDriver {
         }
 
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
-        self.create_sandbox_runtime_fence(&namespace, &names)
+        let fence = self
+            .create_sandbox_runtime_fence(&namespace, &names)
             .await?;
+        let fence_annotations = sandbox_runtime_fence_annotations(&fence)?;
         let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
         stale_generations.push(generation.as_str());
         self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
@@ -3226,6 +3224,8 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_annotations[ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID],
+                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_annotations[ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION],
                     });
                     running_patch["spec"]["podTemplate"]["spec"] =
                         restart_pod_template_spec(&volumes, &image_pull_secrets);
@@ -3242,7 +3242,7 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 cr_uid,
                 &names,
-                generation.as_str(),
+                &fence,
                 &supervisor_uid,
                 agent_uid,
                 agent_gid,
@@ -3700,7 +3700,7 @@ impl KubernetesComputeDriver {
             let names = SandboxRuntimeNames::new(&sandbox_id);
             let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
             match self.create_sandbox_runtime_fence(namespace, &names).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
                     self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
@@ -6725,11 +6725,12 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
 async fn create_or_validate_sandbox_runtime_fence(
     policies: &Api<NetworkPolicy>,
     expected: &NetworkPolicy,
-) -> Result<(), KubernetesDriverError> {
+) -> Result<NetworkPolicy, KubernetesDriverError> {
     let name = expected.metadata.name.as_deref().unwrap_or_default();
     match tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(name)).await {
         Ok(Ok(Some(existing))) => {
-            return validate_sandbox_runtime_fence(&existing, expected);
+            validate_sandbox_runtime_fence(&existing, expected)?;
+            return Ok(existing);
         }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
@@ -6746,7 +6747,10 @@ async fn create_or_validate_sandbox_runtime_fence(
     )
     .await
     {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(created)) => {
+            validate_sandbox_runtime_fence(&created, expected)?;
+            Ok(created)
+        }
         Ok(Err(KubeError::Api(error))) if error.code == 409 => {
             let existing = tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(name))
                 .await
@@ -6756,13 +6760,60 @@ async fn create_or_validate_sandbox_runtime_fence(
                     )
                 })?
                 .map_err(KubernetesDriverError::from_kube)?;
-            validate_sandbox_runtime_fence(&existing, expected)
+            validate_sandbox_runtime_fence(&existing, expected)?;
+            Ok(existing)
         }
         Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
         Err(_) => Err(KubernetesDriverError::Message(
             "timed out creating sandbox-runtime workload fence".to_string(),
         )),
     }
+}
+
+fn sandbox_runtime_fence_annotations(
+    fence: &NetworkPolicy,
+) -> Result<BTreeMap<String, String>, KubernetesDriverError> {
+    let uid = fence.metadata.uid.as_ref().ok_or_else(|| {
+        KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
+    })?;
+    let generation = fence.metadata.generation.ok_or_else(|| {
+        KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
+    })?;
+    Ok(BTreeMap::from([
+        (
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID.to_string(),
+            uid.clone(),
+        ),
+        (
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION.to_string(),
+            generation.to_string(),
+        ),
+    ]))
+}
+
+async fn read_bound_sandbox_runtime_fence(
+    policies: &Api<NetworkPolicy>,
+    expected: &NetworkPolicy,
+) -> Result<NetworkPolicy, KubernetesDriverError> {
+    let current = tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        policies.get(expected.metadata.name.as_deref().unwrap_or_default()),
+    )
+    .await
+    .map_err(|_| {
+        KubernetesDriverError::Message(
+            "timed out reading sandbox-runtime workload fence".to_string(),
+        )
+    })?
+    .map_err(KubernetesDriverError::from_kube)?;
+    validate_sandbox_runtime_fence(&current, expected)?;
+    if sandbox_runtime_fence_annotations(&current)? != sandbox_runtime_fence_annotations(expected)?
+    {
+        return Err(KubernetesDriverError::Precondition(
+            "workload NetworkPolicy identity changed during bootstrap".to_string(),
+        ));
+    }
+    Ok(current)
 }
 
 fn validate_sandbox_runtime_fence(
@@ -8219,6 +8270,214 @@ mod tests {
             ),
         ]));
         (policy, sandbox)
+    }
+
+    fn bootstrap_fences_for_test() -> (NetworkPolicy, NetworkPolicy) {
+        let names = SandboxRuntimeNames::new("sandbox-1");
+        let mut fences = workload_fence("openshell", &names, 50051);
+        for (policy, component) in [
+            (&mut fences.workload_policy, "sandbox-workload-fence"),
+            (&mut fences.supervisor_policy, "sandbox-supervisor-egress"),
+        ] {
+            policy.metadata.labels.get_or_insert_default().extend([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                ("openshell.ai/component".to_string(), component.to_string()),
+            ]);
+            policy.metadata.uid = Some(format!("{component}-uid"));
+            policy.metadata.generation = Some(7);
+            policy.metadata.resource_version = Some("200".to_string());
+        }
+        (fences.workload_policy, fences.supervisor_policy)
+    }
+
+    #[tokio::test]
+    async fn sandbox_runtime_create_publishes_fence_before_reconciliation() {
+        let (fence, supervisor_fence) = bootstrap_fences_for_test();
+        for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
+            let sandbox_path = if version == SANDBOX_VERSION_V1ALPHA1 {
+                "/apis/agents.x-k8s.io/v1alpha1/namespaces/openshell/sandboxes"
+            } else {
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes"
+            };
+            let config = KubernetesComputeConfig {
+                sandbox_uid: Some(1000),
+                sandbox_runtime: crate::config::KubernetesSandboxRuntimeConfig {
+                    boundary_port: 50051,
+                },
+                ..Default::default()
+            };
+            let (driver, steps, bodies) = scripted_driver(
+                config.clone(),
+                vec![
+                    (
+                        http::Method::GET,
+                        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/openshell-sandbox-workloads",
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::to_value(&fence).unwrap(),
+                        ),
+                    ),
+                    (
+                        http::Method::GET,
+                        "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/openshell-sandbox-supervisors",
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::to_value(&supervisor_fence).unwrap(),
+                        ),
+                    ),
+                    // Stop just after observing the first externally visible CR write.
+                    (
+                        http::Method::POST,
+                        sandbox_path,
+                        kube_test_response(
+                            http::StatusCode::FORBIDDEN,
+                            serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "Forbidden", "message": "fixture stop after publication", "code": 403}),
+                        ),
+                    ),
+                ],
+            );
+            driver.sandbox_api_version.set(version).unwrap();
+            let sandbox = Sandbox {
+                id: "sandbox-1".to_string(),
+                name: "sandbox-a".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            };
+            Box::pin(driver.create_sandbox_inner(&sandbox))
+                .await
+                .expect_err("fixture stops at CR write");
+            assert!(steps.lock().unwrap().is_empty());
+            let mut published: DynamicObject =
+                serde_json::from_value(bodies.lock().unwrap()[0].clone()).unwrap();
+            assert!(sandbox_runtime_namespace_fence_generation_matches(
+                &fence, &published
+            ));
+            assert!(!sandbox_runtime_should_run(&published));
+            published.metadata.uid = Some("sandbox-cr-uid".into());
+            published.metadata.resource_version = Some("100".into());
+
+            for (operation, running) in [("create", false), ("create", true), ("restart", true)] {
+                published.metadata.annotations.as_mut().unwrap().insert(
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                    operation.to_string(),
+                );
+                let state_patch = sandbox_operating_state_patch(version, "100", running);
+                for (key, value) in state_patch["spec"].as_object().unwrap() {
+                    published.data["spec"][key] = value.clone();
+                }
+                // Run the real reconciler while neither companion nor workload Pod
+                // exists. Any suspension PATCH is an unexpected request and fails.
+                let (driver, _, _) = scripted_driver(config.clone(), Vec::new());
+                let sandbox_value = serde_json::to_value(&published).unwrap();
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let observed = requests.clone();
+                let service = tower::service_fn(
+                    move |request: http::Request<kube::client::Body>| {
+                        assert_eq!(
+                            request.method(),
+                            http::Method::GET,
+                            "fresh bootstrap must not be suspended"
+                        );
+                        let path = request.uri().path();
+                        observed.lock().unwrap().push(path.to_string());
+                        let (status, body) = if path == sandbox_path {
+                            (
+                                http::StatusCode::OK,
+                                serde_json::json!({"apiVersion": format!("agents.x-k8s.io/{version}"), "kind": "SandboxList", "items": [sandbox_value]}),
+                            )
+                        } else if path.ends_with("/networkpolicies/openshell-sandbox-workloads") {
+                            (
+                                http::StatusCode::OK,
+                                serde_json::to_value(bootstrap_fences_for_test().0).unwrap(),
+                            )
+                        } else if path.ends_with("/networkpolicies/openshell-sandbox-supervisors") {
+                            (
+                                http::StatusCode::OK,
+                                serde_json::to_value(bootstrap_fences_for_test().1).unwrap(),
+                            )
+                        } else if path.ends_with("/pods/os-supervisor-sandbox-1")
+                            || path.ends_with("/services/os-boundary-sandbox-1")
+                        {
+                            (
+                                http::StatusCode::NOT_FOUND,
+                                serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "NotFound", "message": "not yet created", "code": 404}),
+                            )
+                        } else {
+                            panic!("unexpected bootstrap reconciliation request: {path}");
+                        };
+                        std::future::ready(Ok::<_, std::convert::Infallible>(kube_test_response(
+                            status, body,
+                        )))
+                    },
+                );
+                let client = Client::new(service, "openshell");
+                let driver = KubernetesComputeDriver {
+                    client: client.clone(),
+                    watch_client: client,
+                    sandbox_api_version: Arc::new(OnceCell::new()),
+                    ..driver
+                };
+                driver.sandbox_api_version.set(version).unwrap();
+                driver.reconcile_sandbox_runtime_resources().await;
+                assert!(
+                    requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.ends_with("/pods/os-supervisor-sandbox-1")),
+                    "reconciliation must reach bootstrap dependency checks"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_runtime_bootstrap_rejects_changed_fence_binding() {
+        let (fence, _) = bootstrap_fences_for_test();
+        for (uid, generation, accepted) in [
+            ("sandbox-workload-fence-uid", 7, true),
+            ("replacement-policy-uid", 7, false),
+            ("sandbox-workload-fence-uid", 8, false),
+        ] {
+            let mut current = fence.clone();
+            current.metadata.uid = Some(uid.to_string());
+            current.metadata.generation = Some(generation);
+            current.metadata.resource_version = Some("201".to_string());
+            let (driver, steps, _) = scripted_driver(
+                KubernetesComputeConfig::default(),
+                vec![(
+                    http::Method::GET,
+                    "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/openshell-sandbox-workloads",
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::to_value(current).unwrap(),
+                    ),
+                )],
+            );
+            let policies = Api::<NetworkPolicy>::namespaced(driver.client, "openshell");
+            let result = read_bound_sandbox_runtime_fence(&policies, &fence).await;
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert!(matches!(
+                    result,
+                    Err(KubernetesDriverError::Precondition(_))
+                ));
+            }
+            assert!(steps.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn sandbox_runtime_bootstrap_requires_fence_identity() {
+        let (mut fence, _) = bootstrap_fences_for_test();
+        fence.metadata.uid = None;
+        assert!(sandbox_runtime_fence_annotations(&fence).is_err());
+        fence.metadata.uid = Some("policy-uid".into());
+        fence.metadata.generation = None;
+        assert!(sandbox_runtime_fence_annotations(&fence).is_err());
     }
 
     #[test]
