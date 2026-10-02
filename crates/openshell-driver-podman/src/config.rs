@@ -174,6 +174,23 @@ pub struct PodmanComputeConfig {
     /// and upstream verification. Only meaningful with `https_proxy` set; the
     /// bundle must exist and contain at least one certificate.
     pub proxy_ca_bundle: Option<String>,
+    /// Path (on the gateway host) to a PEM CA bundle trusted for direct
+    /// (non-proxied), policy-inspected HTTPS egress to destinations signed by
+    /// a private CA.
+    ///
+    /// Unlike [`proxy_ca_bundle`](Self::proxy_ca_bundle), this applies
+    /// regardless of whether `https_proxy` is configured: it addresses
+    /// supervisors that run as their own container, separate from the
+    /// workload image, and therefore cannot inherit a private CA baked into
+    /// the workload's system trust store. The gateway bind-mounts this file
+    /// read-only into the supervisor container (at
+    /// [`ADDITIONAL_CA_MOUNT_PATH`](openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH))
+    /// and passes its path via `--additional-ca-bundle`. The supervisor folds
+    /// it into its upstream TLS trust store alongside (not instead of) the
+    /// system CA bundle. The bundle must exist and contain at least one
+    /// certificate; this is validated on the gateway host at sandbox-create
+    /// time, not deferred until the supervisor container starts.
+    pub additional_ca_bundle: Option<String>,
     /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
     /// When unset, containers use the default user namespace.
     pub userns: Option<String>,
@@ -327,6 +344,21 @@ impl PodmanComputeConfig {
                     "proxy_ca_bundle is set but no https_proxy is configured".to_string(),
                 ));
             }
+        }
+        // additional_ca_bundle is independent of the corporate proxy setting
+        // above: it applies to direct, inspected egress and has no
+        // https_proxy dependency. Read and validate the actual host file
+        // here (this path is not yet mounted into any container), rather
+        // than only checking it is non-empty: an operator with a mistyped
+        // path or a certificate-free bundle should see a config-validation
+        // error at sandbox-create time, not a failed/crash-looping sandbox
+        // once the supervisor container starts and tries to read it.
+        if let Some(path) = self.additional_ca_bundle.as_deref() {
+            openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+                path,
+                "additional_ca_bundle",
+            )
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         }
         Ok(())
     }
@@ -514,6 +546,7 @@ impl Default for PodmanComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            additional_ca_bundle: None,
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
@@ -825,6 +858,65 @@ mod tests {
         };
         let err = cfg.validate_proxy_config().unwrap_err();
         assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_accepts_additional_ca_bundle_without_proxy() {
+        // #3781: unlike proxy_ca_bundle, this must work with no corporate
+        // proxy configured at all.
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("additional-ca.pem");
+        std::fs::write(&ca_path, generate_test_ca_pem()).unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+        assert!(cfg.https_proxy.is_none());
+    }
+
+    #[test]
+    fn validate_configuration_rejects_empty_additional_ca_bundle() {
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_nonexistent_additional_ca_bundle() {
+        // #3781 fix requirement: an operator with a mistyped path must see
+        // this at config-validation time, not a failed sandbox later.
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some("/nonexistent/additional-ca.pem".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn validate_configuration_rejects_certificate_free_additional_ca_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("not-a-cert.pem");
+        std::fs::write(&ca_path, "not a certificate\n").unwrap();
+
+        let cfg = PodmanComputeConfig {
+            additional_ca_bundle: Some(ca_path.to_str().unwrap().to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("additional_ca_bundle"), "{err}");
+    }
+
+    /// Generate a real, valid self-signed CA certificate PEM for tests.
+    fn generate_test_ca_pem() -> String {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.self_signed(&key_pair).unwrap().pem()
     }
 
     #[test]
