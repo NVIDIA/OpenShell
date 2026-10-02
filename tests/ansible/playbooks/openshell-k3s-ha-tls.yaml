@@ -36,7 +36,9 @@
             externalDbSecret: openshell-e2e-postgres-credentials
             disableTls: false
             auth:
-              allowUnauthenticatedUsers: false
+              # Kubernetes has no mTLS user-identity mode. Require the client
+              # certificate at the TLS layer and use the fixture's dev user.
+              allowUnauthenticatedUsers: true
 
     - name: Apply PostgreSQL and TLS overlay to OpenShell
       ansible.builtin.command:
