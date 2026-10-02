@@ -97,7 +97,8 @@ field must not require a Helm template change.
 {{- end -}}
 {{- end -}}
 
-{{/* Render the top-level gatewayConfig map as deterministic TOML tables. */}}
+{{/* Render the top-level gatewayConfig map as deterministic TOML tables.
+Top-level lists represent TOML arrays of tables and preserve their YAML order. */}}
 {{- define "openshell.gatewayConfigToml" -}}
 {{- $root := . -}}
 {{- $config := deepCopy (.Values.gatewayConfig | default dict) -}}
@@ -276,7 +277,7 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- range $tableName := keys $config | sortAlpha -}}
 {{- $fields := get $config $tableName -}}
 {{- if ne $fields nil -}}
-{{- if not (kindIs "map" $fields) -}}
+{{- if and (not (kindIs "map" $fields)) (not (kindIs "slice" $fields)) -}}
 {{- fail (printf "gatewayConfig table %q must be a map, got %s" $tableName (kindOf $fields)) -}}
 {{- end -}}
 {{- $header := list -}}
@@ -287,6 +288,7 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{- end -}}
 {{- $header = append $header (include "openshell.toml.key" $segment) -}}
 {{- end -}}
+{{- if kindIs "map" $fields -}}
 {{ printf "[%s]\n" (join "." $header) }}
 {{- range $fieldName := keys $fields | sortAlpha }}
 {{- $value := get $fields $fieldName -}}
@@ -297,6 +299,23 @@ owner: server.*. Override any gatewayConfig copies before serializing TOML. */}}
 {{ printf "%s = %s\n" (include "openshell.toml.key" $fieldName) (include "openshell.toml.value" (list $root $value)) }}
 {{- end }}
 {{- end }}
+{{- else -}}
+{{- range $index, $entry := $fields -}}
+{{- if not (kindIs "map" $entry) -}}
+{{- fail (printf "gatewayConfig array-of-tables %q entry %d must be a map, got %s" $tableName $index (kindOf $entry)) -}}
+{{- end -}}
+{{ printf "[[%s]]\n" (join "." $header) }}
+{{- range $fieldName := keys $entry | sortAlpha }}
+{{- $value := get $entry $fieldName -}}
+{{- if ne $value nil }}
+{{- if eq $fieldName "database_url" -}}
+{{- fail "gatewayConfig must not contain database_url; provide database credentials through the chart's Secret-backed OPENSHELL_DB_URL environment variable" -}}
+{{- end -}}
+{{ printf "%s = %s\n" (include "openshell.toml.key" $fieldName) (include "openshell.toml.value" (list $root $value)) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
