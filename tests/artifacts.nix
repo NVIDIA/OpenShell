@@ -79,7 +79,7 @@ let
       '';
     };
 
-  conformanceCliArchive = mkTestArchive {
+  conformanceTestArchive = mkTestArchive {
     name = "openshell-conformance";
     workspacePath = "tests/suites/conformance";
     manifestPath = "tests/suites/conformance/Cargo.toml";
@@ -196,7 +196,7 @@ let
 in
 rec {
   inherit
-    conformanceCliArchive
+    conformanceTestArchive
     providerRefreshKeycloakArchive
     podmanDriverArchive
     podmanE2eArchive
@@ -244,7 +244,7 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceCliArchive
+      conformanceTestArchive
       providerRefreshKeycloakArchive
       podmanDriverArchive
       podmanE2eArchive
