@@ -2235,6 +2235,108 @@ mod tests {
     }
 
     #[test]
+    fn gcp_token_response_returns_sa_over_adc() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                ("GCP_SA_ACCESS_TOKEN".to_string(), "sa-tok".to_string()),
+                ("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let (placeholder, _) = state.gcp_token_response().expect("should find token");
+        assert_eq!(
+            placeholder, "openshell:resolve:env:v1_GCP_SA_ACCESS_TOKEN",
+            "metadata must return the current revision-scoped SA placeholder"
+        );
+    }
+
+    #[test]
+    fn gcp_token_response_falls_back_to_adc() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let (placeholder, _) = state.gcp_token_response().expect("should find ADC token");
+        assert_eq!(
+            placeholder, "openshell:resolve:env:v1_GCP_ADC_ACCESS_TOKEN",
+            "metadata must return the current revision-scoped ADC placeholder"
+        );
+    }
+
+    #[test]
+    fn gcp_token_response_returns_none_without_gcp() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(state.gcp_token_response().is_none());
+    }
+
+    #[test]
+    fn gcp_token_response_defaults_expires_in_to_3600() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let (_, expires_in) = state.gcp_token_response().unwrap();
+        assert_eq!(
+            expires_in, 3600,
+            "should default to 3600 when no expiry set"
+        );
+    }
+
+    #[test]
+    fn gcp_token_response_calculates_remaining() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), now_ms + 120_000)]),
+            HashMap::new(),
+        );
+        let (_, expires_in) = state.gcp_token_response().unwrap();
+        assert!(
+            (110..=120).contains(&expires_in),
+            "expected ~120s remaining, got {expires_in}"
+        );
+    }
+
+    #[test]
+    fn gcp_token_response_handles_already_expired_token_without_panic() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), now_ms - 1_000)]),
+            HashMap::new(),
+        );
+        assert!(
+            state.gcp_token_response().is_none(),
+            "expired token should be skipped rather than panic"
+        );
+    }
+
+    #[test]
     fn child_env_with_non_secret_resolved_resolves_vertex_vars_without_metadata_host() {
         let state = ProviderCredentialState::from_bound_environment(
             1,
