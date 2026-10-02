@@ -13,13 +13,15 @@ trap 'rm -rf "${PROFILE_WORK}"' EXIT
 mkdir -p "${PROFILE_WORK}/providers"
 printf 'id: google-cloud\n' > "${PROFILE_WORK}/providers/google-cloud.yaml"
 printf 'id: acme\nrequired_platform_adapter: gcp-metadata\n' > "${PROFILE_WORK}/providers/acme.yaml"
+printf 'id: future\nrequired_platform_adapter: future-adapter\n' > "${PROFILE_WORK}/providers/future.yaml"
 
 capture_profile_import() {
   printf '%s\n' "$*" >> "${PROFILE_WORK}/imports"
 }
 
 e2e_import_example_provider_profiles capture_profile_import "${PROFILE_WORK}"
-expected="provider profile import --file ${PROFILE_WORK}/providers/google-cloud.yaml --global"
+expected="provider profile import --file ${PROFILE_WORK}/providers/acme.yaml --global
+provider profile import --file ${PROFILE_WORK}/providers/google-cloud.yaml --global"
 if [ "$(cat "${PROFILE_WORK}/imports")" != "${expected}" ]; then
   echo "FAIL: profile selection must follow adapter declarations, independent of ID" >&2
   exit 1
