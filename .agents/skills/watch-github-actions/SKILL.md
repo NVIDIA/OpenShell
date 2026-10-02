@@ -125,14 +125,6 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
-For CI image pin changes, check both `CI image smoke` jobs in `Branch Checks`.
-They validate the multiarchitecture index and exercise the baked tools on native
-amd64/arm64 runners. A registry denial or missing platform fails these jobs;
-do not replace a digest with `latest` to work around it. Smoke checks do not
-replace packaging, SDK, kernel, or E2E validation. Follow `CI.md` under
-"CI container image pins" for the update and rollback procedure, including the
-separate image retained by Docker E2E.
-
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
