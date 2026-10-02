@@ -194,6 +194,13 @@ temporarily informational for tagged releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
 
+Failed pre-release builds send notifications via Slack using a webhook and
+at-mentioning the triage engineer with a link to the failure. The webhook is
+stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
+mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
+Notifications are non-blocking and do not affect release results; an unset
+webhook skips sending; an unset mention sends without a mention.
+
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
