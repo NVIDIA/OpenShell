@@ -28,7 +28,7 @@ var grpcToSDK = map[codes.Code]types.ErrorCode{
 	codes.Unauthenticated:    types.ErrorUnauthenticated,
 	codes.FailedPrecondition: types.ErrorConflict,
 	codes.ResourceExhausted:  types.ErrorUnavailable,
-	codes.OutOfRange:         types.ErrorInvalidArgument,
+	codes.OutOfRange:         types.ErrorOutOfRange,
 }
 
 // FromGRPCError converts a gRPC error to a typed StatusError.
