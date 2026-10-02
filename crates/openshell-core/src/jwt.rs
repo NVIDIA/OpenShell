@@ -13,12 +13,12 @@
 /// verifying the signature.
 ///
 /// Returns `None` when `token` is not a parseable JWT or has no integer `exp`
-/// claim. A leading `Bearer ` prefix is tolerated so callers can pass either a
-/// raw token or an `authorization` header value.
+/// claim. A leading `Bearer ` scheme, in any case, is tolerated so callers can
+/// pass either a raw token or an `authorization` header value.
 #[must_use]
 pub fn parse_exp_secs(token: &str) -> Option<i64> {
     use base64::Engine;
-    let raw = token.strip_prefix("Bearer ").unwrap_or(token);
+    let raw = crate::auth::strip_bearer_scheme(token).unwrap_or(token);
     let mut parts = raw.splitn(3, '.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;

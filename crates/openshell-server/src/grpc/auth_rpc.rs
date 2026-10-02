@@ -200,7 +200,7 @@ pub async fn handle_refresh_sandbox_token(
     let gateway_token = authorization
         .to_str()
         .ok()
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(openshell_core::auth::strip_bearer_scheme)
         .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
     let principal = session_authority.verify_gateway_token(gateway_token)?;
     if principal.sandbox_id.as_str() != sandbox.sandbox_id {
@@ -889,6 +889,53 @@ mod tests {
             .await
             .expect_err("obsolete runtime token must not reach provider access");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn session_authenticator_accepts_case_insensitive_bearer_scheme() {
+        use crate::auth::authenticator::Authenticator;
+        use crate::auth::principal::SandboxIdentitySource;
+        use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
+
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
+                    runtime_identity: "test-runtime".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        let resp = handle_issue_sandbox_token(&state, req)
+            .await
+            .expect("issue OK")
+            .into_inner();
+
+        let authenticator = SandboxSessionJwtAuthenticator::new(
+            state
+                .sandbox_session_jwt_authority
+                .clone()
+                .expect("session authority"),
+            state.store.clone(),
+        );
+        let provider_path = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment";
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!("{scheme} {}", resp.token)
+                    .parse()
+                    .expect("bearer header"),
+            );
+            let principal = authenticator
+                .authenticate(&headers, provider_path)
+                .await
+                .expect("token must authenticate")
+                .unwrap_or_else(|| panic!("{scheme} scheme must be recognized"));
+            assert!(matches!(principal, Principal::Sandbox(_)));
+        }
     }
 
     #[tokio::test]
