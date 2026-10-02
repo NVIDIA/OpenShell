@@ -359,8 +359,6 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--no-login-shell`| Run the command without sourcing shell login startup files. |
 | `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
 
-Exec requests have no lifetime count limit. If the supervisor loses its connection while starting a command, it can retry that same request for up to 30 seconds. After that deadline, recovery fails and the command may already be running. Check the sandbox before submitting the command again if it has side effects. This recovery deadline does not limit how long an admitted command can run.
-
 ### Skip shell startup files
 
 By default `sandbox exec` runs the command through a login shell (`bash -lc`), so the sandbox user's first available `.bash_profile`, `.bash_login`, or `.profile` is sourced first (and `.bashrc` only if that login file sources it). This makes tool-specific environment configuration available automatically, which suits interactive and tool-discovery use.
