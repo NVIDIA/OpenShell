@@ -242,9 +242,9 @@ e2e_import_example_provider_profiles() {
   echo "Importing example provider profiles from ${root}/providers..."
   for profile in "${root}"/providers/*.yaml; do
     adapter="$(yq -r '.required_platform_adapter // ""' "${profile}")" || return 1
-    # The standard test runtimes provide no platform adapters. Specialized
-    # suites must provision the capability before importing a profile needing it.
-    if [ -n "${adapter}" ]; then
+    # The standard Linux test runtimes provide the supervisor GCP metadata
+    # adapter. Other platform adapters need a specialized suite.
+    if [ -n "${adapter}" ] && [ "${adapter}" != "gcp-metadata" ]; then
       echo "Skipping ${profile}: requires platform adapter ${adapter}"
       continue
     fi

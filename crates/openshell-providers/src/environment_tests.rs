@@ -252,7 +252,12 @@ fn platform_adapter_availability_and_unknown_adapter_errors() {
     let mut profile = profile();
     let availability = profile.ensure_platform_adapter_available();
     if cfg!(windows) {
-        assert!(availability.unwrap_err().to_string().contains("unavailable"));
+        assert!(
+            availability
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
     } else {
         assert!(availability.is_ok());
     }
