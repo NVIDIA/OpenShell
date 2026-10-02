@@ -579,6 +579,17 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
+    if let Some(endpoint) = &config.supervisor_otlp_endpoint {
+        env.insert(
+            openshell_core::sandbox_env::OTLP_ENDPOINT.into(),
+            endpoint.clone(),
+        );
+        env.extend(
+            openshell_otel::current_trace_context_environment()
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
+    }
     // Runtime capabilities are driver-owned. Override image/user input with
     // only the substrate that this driver configures for the supervisor.
     env.insert(
@@ -2439,6 +2450,27 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/run/openshell/test-ssh.sock"),
             "OPENSHELL_SSH_SOCKET_PATH must not be overridden by user env"
+        );
+    }
+
+    #[test]
+    fn container_spec_passes_the_gateway_otlp_endpoint_to_the_supervisor() {
+        let sandbox = test_sandbox("test-id", "legit-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert!(
+            spec["env"]
+                .get(openshell_core::sandbox_env::OTLP_ENDPOINT)
+                .is_none()
+        );
+
+        let config = PodmanComputeConfig {
+            supervisor_otlp_endpoint: Some("http://127.0.0.1:4317".to_string()),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::OTLP_ENDPOINT],
+            "http://127.0.0.1:4317"
         );
     }
 

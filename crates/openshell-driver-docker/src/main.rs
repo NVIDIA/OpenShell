@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         docker_config.allow_driver_config = policy.allow_driver_config;
         docker_config.resource_admission = policy.resource_admission;
     }
+    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;

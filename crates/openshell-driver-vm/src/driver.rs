@@ -250,6 +250,10 @@ pub struct VmDriverConfig {
     #[serde(default)]
     pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisors. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -303,6 +307,7 @@ impl std::fmt::Debug for VmDriverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
+            .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -366,6 +371,7 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
             allow_driver_config: false,
             resource_admission:
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
@@ -959,6 +965,11 @@ impl VmDriver {
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
             );
+        if let Some(endpoint) = &self.config.supervisor_otlp_endpoint {
+            command
+                .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
+                .envs(openshell_otel::current_trace_context_environment());
+        }
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,

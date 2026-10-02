@@ -701,6 +701,19 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    /// Environment that lets a supervisor export spans and join the current trace.
+    fn supervisor_tracing_environment(&self) -> Vec<(&'static str, String)> {
+        let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() else {
+            return Vec::new();
+        };
+        let mut environment = vec![(
+            openshell_core::sandbox_env::OTLP_ENDPOINT,
+            endpoint.to_string(),
+        )];
+        environment.extend(openshell_otel::current_trace_context_environment());
+        environment
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(config: KubernetesComputeConfig) -> Self {
         let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
@@ -2374,6 +2387,7 @@ impl KubernetesComputeDriver {
                             .as_str(),
                     ),
                     dependent_owner.clone(),
+                    &self.supervisor_tracing_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -3178,6 +3192,7 @@ impl KubernetesComputeDriver {
                         &sandbox_api.resource.api_version,
                         false,
                     ),
+                    &self.supervisor_tracing_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
