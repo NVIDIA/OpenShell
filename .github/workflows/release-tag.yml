@@ -788,8 +788,8 @@ jobs:
       - name: Send Slack notification
         continue-on-error: true
         env:
-          # Configure this repository secret once the triage webhook is approved.
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          SLACK_MENTION: ${{ vars.SLACK_OPENSHELL_TRIAGE_MENTION }}
           RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
         run: |
           set -euo pipefail
@@ -798,7 +798,10 @@ jobs:
             exit 0
           fi
 
-          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT}). <!subteam^S0C099KM56F>"
+          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          if [[ -n "${SLACK_MENTION}" ]]; then
+            message+=" ${SLACK_MENTION}"
+          fi
           jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
             '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
             curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
