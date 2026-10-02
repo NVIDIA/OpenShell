@@ -25,6 +25,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
 
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    supervisor_image: Option<String>,
+
     /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
         long,
@@ -62,6 +70,12 @@ async fn main() -> Result<()> {
     if let Some(policy) = args.admission_config_json {
         docker_config.allow_driver_config = policy.allow_driver_config;
         docker_config.resource_admission = policy.resource_admission;
+    }
+    if let Some(image) = args.sandbox_runtime_image {
+        docker_config.sandbox_runtime_image = Some(image);
+    }
+    if let Some(image) = args.supervisor_image {
+        docker_config.supervisor_image = Some(image);
     }
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
