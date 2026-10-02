@@ -60,3 +60,6 @@ app_armor_profile = "Unconfined"
 # [openshell.gateway.otlp]
 # endpoint      = "http://host.docker.internal:4317"
 # service_name  = "openshell-gateway-dev"
+# Optional separate collector for relayed agent traces; omit to send agent
+# traces to `endpoint`.
+# agent_endpoint = "http://host.docker.internal:4319"

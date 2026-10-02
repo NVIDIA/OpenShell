@@ -89,14 +89,21 @@ pub async fn try_create_exporter(
         debug!("no [openshell.gateway.otlp] section in config; OTEL relay disabled");
         return None;
     };
-    match OtelRelayExporter::connect(&otlp.endpoint).await {
+    // Agent traces ride their own lane: `agent_endpoint` when the operator
+    // split the collectors, otherwise the shared infrastructure endpoint.
+    let endpoint = otlp.agent_lane_endpoint();
+    match OtelRelayExporter::connect(endpoint).await {
         Ok(exporter) => {
-            info!(endpoint = %otlp.endpoint, "OTEL relay exporter connected");
+            info!(
+                endpoint,
+                dedicated_lane = otlp.agent_endpoint.is_some(),
+                "OTEL relay exporter connected"
+            );
             Some(Arc::new(exporter))
         }
         Err(e) => {
             tracing::warn!(
-                endpoint = %otlp.endpoint,
+                endpoint,
                 error = %e,
                 "failed to connect OTEL relay exporter; relay disabled"
             );

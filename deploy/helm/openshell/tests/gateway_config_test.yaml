@@ -273,6 +273,16 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
 
+  - it: renders a separate agent-trace collector endpoint when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.agentEndpoint: http://agent-collector.observability.svc:4317
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?agent_endpoint\s*=\s*"http://agent-collector\.observability\.svc:4317"'
+
   - it: omits OTLP tracing configuration by default
     template: templates/gateway-config.yaml
     asserts:
