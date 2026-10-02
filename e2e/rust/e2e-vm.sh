@@ -288,8 +288,17 @@ else
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
+enable_bind_mounts = true
 EOF
 fi
+# Host bind mounts are exercised by vm_bind_mount, mirroring the Docker and
+# Podman e2e gateways. An external driver must acknowledge the same policy.
+cat >>"${GATEWAY_CONFIG}" <<EOF
+allow_driver_config = true
+
+[openshell.drivers.vm.resource_admission]
+enabled = false
+EOF
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   "${DRIVER_BIN}" \
@@ -299,6 +308,8 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
+    --admission-config-json '{"allow_driver_config":true,"resource_admission":{"enabled":false}}' \
+    --enable-bind-mounts \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -410,6 +421,7 @@ else
   run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
+  run_e2e_test vm_bind_mount
   run_e2e_test vm_gateway_start
   run_e2e_test vm_corporate_proxy
 fi
