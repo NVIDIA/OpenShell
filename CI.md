@@ -511,3 +511,17 @@ merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
+
+## Nix download recovery
+
+Jobs that enter the development shell enable `prepare-shell: "true"` on
+`setup-nix`. After configuring Cachix, the action prepares the shell with
+`nix develop -c true` and retries once on failure. Use `shell-installable`
+to select a different development shell. Rust setup assumes this preparation
+has completed. Jobs that only use Nix apps leave shell preparation disabled.
+
+Nix can report a transport error after receiving a complete cache download,
+then resume at EOF and receive HTTP 416. A fresh invocation restarts the
+operation. Both attempts appear in the job log; a second failure fails the
+step. Any preparation failure is retried once, including deterministic errors.
+Cargo, lint, and test commands are not retried.
