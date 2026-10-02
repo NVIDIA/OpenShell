@@ -1186,38 +1186,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_owned_volume_verifies_requested_owner() {
+    async fn create_owned_volume_verifies_requested_options() {
         let labels =
             r#"{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-workspace":"team-a"}"#;
-        for (options, accepted) in [
+        for (owner, options, accepted) in [
             (
+                Some((1234, 1235)),
                 r#"{"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"}"#,
                 true,
             ),
-            (r#"{"o":"uid=1234,gid=1235"}"#, true),
-            (r#"{"o":"uid=1234,gid=1235","UID":"0","GID":"1235"}"#, false),
-            (r#"{"o":"uid=1234,gid=1235","device":"/srv/work"}"#, false),
-            ("{}", false),
+            (Some((1234, 1235)), r#"{"o":"uid=1234,gid=1235"}"#, true),
+            // Podman accepts either order, but OpenShell always requests uid first.
+            (Some((1234, 1235)), r#"{"o":"gid=1235,uid=1234"}"#, false),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","UID":"0","GID":"1235"}"#,
+                false,
+            ),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","device":"/srv/work"}"#,
+                false,
+            ),
+            (Some((1234, 1235)), "{}", false),
+            (None, "{}", true),
+            (None, r#"{"o":"uid=1234,gid=1235"}"#, false),
+            (None, r#"{"o":"bind","device":"/srv/work"}"#, false),
         ] {
-            let (socket_path, _, handle) = spawn_podman_stub(
-                "owned-volume",
-                vec![
-                    StubResponse::new(StatusCode::NOT_FOUND, ""),
-                    StubResponse::new(StatusCode::CREATED, "{}"),
+            for existing in [false, true] {
+                let inspected = || {
                     StubResponse::new(
                         StatusCode::OK,
                         format!(
                             r#"{{"Name":"work","Driver":"local","Options":{options},"Labels":{labels}}}"#
                         ),
-                    ),
-                ],
-            );
-            let result = PodmanClient::new(socket_path.clone())
-                .create_owned_volume("work", "sandbox-1", "team-a", Some((1234, 1235)))
-                .await;
-            assert_eq!(result.is_ok(), accepted, "options {options}: {result:?}");
-            handle.await.expect("stub task should finish");
-            let _ = std::fs::remove_file(socket_path);
+                    )
+                };
+                let responses = if existing {
+                    vec![inspected()]
+                } else {
+                    vec![
+                        StubResponse::new(StatusCode::NOT_FOUND, ""),
+                        StubResponse::new(StatusCode::CREATED, "{}"),
+                        inspected(),
+                    ]
+                };
+                let (socket_path, request_log, handle) =
+                    spawn_podman_stub("owned-volume", responses);
+                let result = PodmanClient::new(socket_path.clone())
+                    .create_owned_volume("work", "sandbox-1", "team-a", owner)
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "owner {owner:?}, options {options}, existing {existing}: {result:?}"
+                );
+                handle.await.expect("stub task should finish");
+                let expected_requests = if existing {
+                    vec!["GET /v5.0.0/libpod/volumes/work/json"]
+                } else {
+                    vec![
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                        "POST /v5.0.0/libpod/volumes/create",
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                    ]
+                };
+                assert_eq!(
+                    request_log.lock().expect("request log lock").as_slice(),
+                    expected_requests,
+                );
+                let _ = std::fs::remove_file(socket_path);
+            }
         }
     }
 
