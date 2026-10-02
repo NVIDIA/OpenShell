@@ -69,9 +69,9 @@ mod tests {
             Arc::new(Mutex::new(None)),
             openshell_core::provider_credentials::ProviderCredentialState::from_environment(
                 0,
-                Default::default(),
-                Default::default(),
-                Default::default(),
+                std::collections::HashMap::default(),
+                std::collections::HashMap::default(),
+                std::collections::HashMap::default(),
             ),
             openshell_core::jwt::SessionBearerTokenSlot::empty(),
         ))

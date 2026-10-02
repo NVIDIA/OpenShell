@@ -439,8 +439,8 @@ mod tests {
             containment: "processcontainer".into(),
         };
 
-        let mapped = mapper.map(Some(&policy), &ctx).unwrap();
-        let trimmed = mapped.trimmed_policy.expect("trimmed proxy policy");
+        let result = mapper.map(Some(&policy), &ctx).unwrap();
+        let trimmed = result.trimmed_policy.expect("trimmed proxy policy");
         assert_eq!(trimmed.network_middlewares, policy.network_middlewares);
     }
 }

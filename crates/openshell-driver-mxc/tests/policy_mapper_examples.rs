@@ -219,13 +219,8 @@ fn all_example_policies_split_with_expected_invariants() {
         assert_eq!(cfg["network"]["ingress"]["hostLoopback"], "allow");
         assert!(cfg.get("runtimeConfig").is_none());
         assert!(cfg["network"].get("proxy").is_none());
-        let errors: Vec<_> = result
-            .loss
-            .iter()
-            .filter(|item| item.severity == "error")
-            .collect();
         assert!(
-            errors.is_empty(),
+            !result.loss.iter().any(|item| item.severity == "error"),
             "processcontainer split must not emit error losses for {}: {:?}",
             path.display(),
             result.loss

@@ -32,6 +32,11 @@ The resolved create-time `SandboxPolicy` is carried by
 launches the Windows boundary and separate host supervisor, and monitors both.
 The boundary launches the workload only after authenticated confirmation.
 
+The driver resolves its gateway endpoint and TLS server-name defaults from
+generic gateway inputs. The host supervisor authenticates its gateway session
+and retains main-process attachment independently of the optional Unix SSH
+adapter. TCP readiness remains gated by authenticated session acceptance.
+
 Windows boundary execution is implemented by the `openshell-mxc-boundary`
 library behind the dedicated `openshell-windows-sandbox.exe`. The compute driver does not
 embed the supervisor, and the sandbox does not link the compute driver.
