@@ -929,6 +929,10 @@ start_user_gateway() {
     return 0
   fi
 
+  # NRestarts is never reset by a restart, so read it before restarting the
+  # unit to tell a failure from this install apart from an earlier one.
+  GATEWAY_SERVICE_RESTART_BASELINE="$(gateway_user_service_field NRestarts)"
+
   as_target_user systemctl --user enable openshell-gateway
   as_target_user systemctl --user restart openshell-gateway
   as_target_user systemctl --user is-active --quiet openshell-gateway
@@ -1015,10 +1019,53 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+gateway_user_service_field() {
+  as_target_user systemctl --user show openshell-gateway -p "$1" --value 2>/dev/null || true
+}
+
+# The gateway runs as a systemd user service with Restart=on-failure and
+# RestartSec=5s, so a gateway that fails during startup never settles in a final
+# "failed" state: systemd keeps cycling it through "auto-restart", and 5s of
+# delay never trips the start limit that would eventually leave it failed.
+# Waiting on the listener alone therefore burns the whole timeout on a gateway
+# that cannot start. Report a final "failed" unit, and a restart loop that grew
+# past GATEWAY_SERVICE_RESTART_BASELINE, as a failed service.
+#
+# The baseline is the restart count from before the installer restarted the
+# unit, so a unit that only failed during an earlier run keeps being waited on.
+gateway_user_service_failed() {
+  case "${PLATFORM:-$(detect_platform)}" in
+    linux) ;;
+    *) return 1 ;;
+  esac
+  # Snap owns its own gateway service and its own listener probe.
+  [ "${LINUX_INSTALL_METHOD:-}" != "snap" ] || return 1
+
+  case "$(gateway_user_service_field ActiveState)" in
+    failed) return 0 ;;
+  esac
+
+  case "$(gateway_user_service_field SubState)" in
+    auto-restart) ;;
+    *) return 1 ;;
+  esac
+
+  _restarts="$(gateway_user_service_field NRestarts)"
+  case "$_restarts" in
+    "" | *[!0-9]*) return 1 ;;
+  esac
+  case "${GATEWAY_SERVICE_RESTART_BASELINE:-}" in
+    "" | *[!0-9]*) return 1 ;;
+  esac
+
+  [ "$_restarts" -gt "$GATEWAY_SERVICE_RESTART_BASELINE" ]
+}
+
 wait_for_local_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _unit_failed=0
   _probe_url="$(local_gateway_endpoint)/"
   _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
@@ -1030,12 +1077,21 @@ wait_for_local_gateway_listener() {
       info "local gateway listener is reachable"
       return 0
     fi
+
+    if gateway_user_service_failed; then
+      _unit_failed=1
+      break
+    fi
+
     sleep 1
     _elapsed=$((_elapsed + 1))
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
+  if [ "$_unit_failed" -eq 1 ]; then
+    error "the openshell-gateway service failed to start; retry it with: systemctl --user restart openshell-gateway"
+  fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 

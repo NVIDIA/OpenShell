@@ -549,6 +549,133 @@ if [ "$(PLATFORM=linux local_gateway_endpoint)" != "https://127.0.0.1:17670" ]; 
   exit 1
 fi
 
+# The gateway user service is Restart=on-failure with RestartSec=5s, so a
+# gateway that fails during startup never settles in a final "failed" state:
+# systemd keeps cycling it through "auto-restart". The installer has to
+# recognise that loop instead of waiting out its whole listener timeout.
+assert_gateway_service_failure() {
+  local name=$1
+  local expected=$2
+  local active_state=$3
+  local sub_state=$4
+  local nrestarts=$5
+  local baseline=$6
+  local platform=$7
+  local method=$8
+  local actual
+
+  actual="$(
+    as_target_user() {
+      case "$*" in
+        *"-p ActiveState --value"*) printf '%s\n' "$MOCK_ACTIVE_STATE" ;;
+        *"-p SubState --value"*) printf '%s\n' "$MOCK_SUB_STATE" ;;
+        *"-p NRestarts --value"*) printf '%s\n' "$MOCK_NRESTARTS" ;;
+        *) return 1 ;;
+      esac
+    }
+    MOCK_ACTIVE_STATE="$active_state"
+    MOCK_SUB_STATE="$sub_state"
+    MOCK_NRESTARTS="$nrestarts"
+    PLATFORM="$platform"
+    LINUX_INSTALL_METHOD="$method"
+    GATEWAY_SERVICE_RESTART_BASELINE="$baseline"
+    if gateway_user_service_failed; then printf 'failed\n'; else printf 'waiting\n'; fi
+  )"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_gateway_service_failure "a failed unit is reported" failed \
+  failed failed 0 0 linux deb
+assert_gateway_service_failure "a restart loop past the baseline is reported" failed \
+  activating auto-restart 1 0 linux deb
+assert_gateway_service_failure "a restart loop that predates the restart keeps waiting" waiting \
+  activating auto-restart 0 0 linux deb
+assert_gateway_service_failure "a starting unit keeps waiting" waiting \
+  activating start 0 0 linux deb
+assert_gateway_service_failure "a running unit keeps waiting" waiting \
+  active running 0 0 linux deb
+assert_gateway_service_failure "an unknown restart count keeps waiting" waiting \
+  activating auto-restart "" 0 linux deb
+assert_gateway_service_failure "a missing baseline keeps waiting" waiting \
+  activating auto-restart 3 "" linux deb
+assert_gateway_service_failure "macOS keeps waiting on its Homebrew service" waiting \
+  activating auto-restart 3 0 darwin deb
+assert_gateway_service_failure "snap keeps waiting on its own service" waiting \
+  activating auto-restart 3 0 linux snap
+
+# The probe must give up within seconds of the unit failing, and the service
+# failure has to be the last line rather than a bare listener timeout.
+started_at=$SECONDS
+if (
+  as_target_user() {
+    case "$*" in
+      "systemctl --user show"*) printf 'failed\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  dump_local_gateway_diagnostics() { :; }
+  info() { :; }
+  PLATFORM=linux
+  TARGET_HOME="${tmpdir}/no-gateway-home"
+  GATEWAY_SERVICE_RESTART_BASELINE=0
+  wait_for_local_gateway_listener
+) >"$out" 2>"$err"; then
+  echo "FAIL: the listener probe should fail when the gateway unit has failed" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+elapsed=$((SECONDS - started_at))
+if [ "$elapsed" -ge 5 ]; then
+  echo "FAIL: the listener probe waited ${elapsed}s on a failed gateway unit" >&2
+  exit 1
+fi
+expected_last_line="openshell: error: the openshell-gateway service failed to start; retry it with: systemctl --user restart openshell-gateway"
+if [ "$(tail -n 1 "$err")" != "$expected_last_line" ]; then
+  echo "FAIL: the failed gateway service must be the installer's last line" >&2
+  tail -n 1 "$err" >&2 || true
+  exit 1
+fi
+if grep -Fq "did not become reachable at https://127.0.0.1:17670/ within 30s" "$err"; then
+  echo "FAIL: a failed gateway unit must not be reported as a listener timeout" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
+# A unit that is only starting must keep the probe waiting out its timeout.
+probe_deadline=$((SECONDS + 3))
+if (
+  as_target_user() {
+    case "$*" in
+      "systemctl --user show"*) printf 'starting\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  dump_local_gateway_diagnostics() { :; }
+  info() { :; }
+  sleep() { :; }
+  PLATFORM=linux
+  TARGET_HOME="${tmpdir}/no-gateway-home"
+  GATEWAY_SERVICE_RESTART_BASELINE=0
+  OPENSHELL_INSTALL_GATEWAY_TIMEOUT=2
+  wait_for_local_gateway_listener
+) >"$out" 2>"$err"; then
+  echo "FAIL: the listener probe should fail when nothing ever listens" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [ "$(tail -n 1 "$err")" != "openshell: error: local gateway listener did not become reachable at https://127.0.0.1:17670/ within 2s" ]; then
+  echo "FAIL: a starting unit must not be reported as a failed service" >&2
+  tail -n 1 "$err" >&2 || true
+  exit 1
+fi
+if [ "$SECONDS" -ge "$probe_deadline" ]; then
+  echo "FAIL: the listener probe slept for real instead of respecting its timeout" >&2
+  exit 1
+fi
+
 cat >"${tmpdir}/checksums" <<'EOF'
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-dev-x86_64.rpm
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-gateway-dev-x86_64.rpm
