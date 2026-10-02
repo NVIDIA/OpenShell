@@ -82,7 +82,9 @@ jobs:
           path: vm-init
 
       - name: Build VM runtime
-        run: nix build .#vm-runtime
+        run: |
+          # HTTP 416 is not retried by Nix; restart the build once on failure.
+          nix build .#vm-runtime || nix build .#vm-runtime
 
       - name: Assemble compressed VM runtime
         run: |

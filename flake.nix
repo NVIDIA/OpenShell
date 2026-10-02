@@ -182,6 +182,11 @@
         };
 
         packages = {
+          # Expose app derivations so CI can prepare them before executing once.
+          check-protobuf-compatibility = checkProtobufCompatibility;
+          build-artifacts-test-archives = artifacts.testArchives;
+          build-artifacts-test-images = artifacts.testImages;
+          build-artifacts-helm = artifacts.helm;
           vm-runtime = vmRuntime;
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;

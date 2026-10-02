@@ -525,3 +525,10 @@ then resume at EOF and receive HTTP 416. A fresh invocation restarts the
 operation. Both attempts appear in the job log; a second failure fails the
 step. Any preparation failure is retried once, including deterministic errors.
 Cargo, lint, and test commands are not retried.
+
+Direct `nix build` commands retry once. Before each `nix run`, CI builds the
+app's package with `nix build --no-link`, retrying preparation once, then runs
+the app once. The artifact and protobuf-check apps expose matching package
+outputs for this preparation. Runtime failures from tests, artifact generation,
+and compatibility checks are not retried. Downloads initiated inside an app
+are outside this preparation retry.
