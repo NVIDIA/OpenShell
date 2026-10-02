@@ -475,6 +475,7 @@ Kubernetes e2e environment variables:
 | `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
 | `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
 | `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
+| `OPENSHELL_E2E_OPENSHIFT` | Force the OpenShift code paths on (`1`) or off (`0`), skipping cluster detection |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
 | `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
 | `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
