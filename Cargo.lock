@@ -3950,6 +3950,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openshell-accept-shim"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "libc",
+ "object",
+]
+
+[[package]]
 name = "openshell-binary-identity"
 version = "0.0.0"
 dependencies = [
@@ -4543,6 +4552,7 @@ dependencies = [
  "libc",
  "miette",
  "nix 0.29.0",
+ "openshell-accept-shim",
  "openshell-binary-identity",
  "openshell-core",
  "openshell-isolation-interface",

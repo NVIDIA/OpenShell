@@ -505,6 +505,8 @@ impl ProcessHandle {
             }
         }
 
+        child_env::apply_preload(cmd.as_std_mut(), true);
+
         // Probe Landlock availability and emit OCSF logs from the parent
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
@@ -1510,6 +1512,32 @@ mod tests {
                 WaitStatus::Exited(child, 0),
                 "Landlock must preserve non-root access only to admitted public CA material"
             ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn sealed_shim_does_not_create_a_user_landlock_ruleset() {
+        let object = openshell_accept_shim::install_shim().unwrap();
+        for restricted in [false, true] {
+            let mut policy = policy_with_process(ProcessPolicy::default());
+            policy.filesystem.include_workdir = false;
+            if restricted {
+                policy.filesystem.read_only = vec![PathBuf::from("/usr"), PathBuf::from("/lib")];
+            }
+            let prepared = prepare_child_sandbox(&policy, None, &[]).unwrap().unwrap();
+            match unsafe { fork() }.unwrap() {
+                ForkResult::Child => {
+                    let valid = sandbox::linux::enforce(prepared).is_ok()
+                        && std::fs::read(&object).is_ok()
+                        && std::fs::read("/usr/bin/env").is_ok();
+                    unsafe { libc::_exit(i32::from(!valid)) };
+                }
+                ForkResult::Parent { child } => {
+                    assert_eq!(waitpid(child, None).unwrap(), WaitStatus::Exited(child, 0));
+                }
+            }
         }
     }
 

@@ -191,6 +191,7 @@ impl LocalBoundaryExec {
         if let Some(workdir) = spec.workdir.as_deref().or(self.base_workdir.as_deref()) {
             command.current_dir(workdir);
         }
+        crate::child_env::apply_preload(&mut command, false);
         Ok(command)
     }
 
