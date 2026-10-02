@@ -288,6 +288,19 @@ pub struct OtlpConfig {
     /// `service.name` resource attribute. Defaults to `openshell-gateway`.
     #[serde(default)]
     pub service_name: Option<String>,
+
+    /// OTLP/gRPC collector endpoint for relayed agent traces. When absent,
+    /// agent traces go to `endpoint`, so one collector serves both lanes
+    /// unless the operator splits them.
+    #[serde(default)]
+    pub agent_endpoint: Option<String>,
+}
+
+impl OtlpConfig {
+    /// The collector endpoint for the agent-trace lane.
+    pub fn agent_lane_endpoint(&self) -> &str {
+        self.agent_endpoint.as_deref().unwrap_or(&self.endpoint)
+    }
 }
 
 /// `[openshell.supervisor]` section.
@@ -921,6 +934,21 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+        assert_eq!(otlp.agent_lane_endpoint(), otlp.endpoint);
+    }
+
+    #[test]
+    fn otlp_agent_endpoint_splits_the_agent_lane() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://infra-collector:4317"
+agent_endpoint = "http://agent-collector:4317"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(otlp.endpoint, "http://infra-collector:4317");
+        assert_eq!(otlp.agent_lane_endpoint(), "http://agent-collector:4317");
     }
 
     #[test]

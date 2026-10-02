@@ -254,6 +254,10 @@ After upgrading Agent Sandbox, restart the gateway.
 Workspace storage settings cannot change after a sandbox is created. Delete and recreate the sandbox to change them.
 </Note>
 
+### Relay Agent Telemetry
+
+When the gateway has `[openshell.gateway.otlp]` configured, agents in the workload Pod export OpenTelemetry traces to `http://192.0.0.8:4318`. That address is never routed. The sandbox seccomp broker stages the connection for the supervisor over the existing boundary channel, and the supervisor serves the OTLP receiver on that stream, adds sandbox attributes to the spans, and forwards them to the collector through the gateway. The workload egress fence stays empty and no NetworkPolicy change is needed. See [OTLP Export](/how-it-works/gateways/configuration#otlp-export).
+
 ### Kubernetes PVC Mounts
 
 Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.

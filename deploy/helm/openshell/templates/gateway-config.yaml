@@ -87,6 +87,9 @@ data:
     {{- if $otlp.serviceName }}
     service_name = {{ $otlp.serviceName | quote }}
     {{- end }}
+    {{- if $otlp.agentEndpoint }}
+    agent_endpoint = {{ $otlp.agentEndpoint | quote }}
+    {{- end }}
     {{- end }}
 
     {{- if $ocsfLog.enabled }}

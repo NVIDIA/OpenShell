@@ -11,6 +11,7 @@ pub mod debug_rpc;
 pub mod delegated;
 pub mod log_push;
 pub mod main_session;
+pub mod otlp;
 pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
