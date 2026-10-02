@@ -259,6 +259,8 @@ openshell sandbox create -- codex
 
 ### Rust build cache
 
+The core build script resolves Git metadata through Git, so ordinary clones and linked worktrees can reuse an unchanged build. It watches ref directories as well as existing packed refs to refresh the embedded version when branches or tags change, including when a packed branch acquires a loose ref. Source archives without Git metadata use the package version. Git ref changes can invalidate version generation even when Rust source is unchanged.
+
 Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
 to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
 the worktree-local `.cache/sccache` directory. To make cache entries available

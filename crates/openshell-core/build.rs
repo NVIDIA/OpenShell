@@ -4,7 +4,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-mod build_version;
+#[path = "build_support/git.rs"]
+mod git;
 
 const PROTO_REL: &str = "../../proto";
 
@@ -14,12 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Docker/CI builds where .git is absent, this silently does nothing and
     // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
     // by the build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
-    println!("cargo:rerun-if-changed=../../.git/packed-refs");
-
-    if let Some(version) = git_version() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    git::emit_rerun_if_changed(&manifest_dir);
+    if let Some(version) = git::version(&manifest_dir) {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
     }
 
@@ -37,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC_INCLUDE", protoc_bin_vendored::include_path()?);
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
@@ -74,45 +71,4 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
         }
     }
     Ok(())
-}
-
-/// Derive the release or development version from git metadata.
-///
-/// Implements the "guess-next-dev" convention used by the release pipeline
-/// (`tasks/scripts/release.py`): exact stable and prerelease tags retain their
-/// version. Otherwise, the latest merged stable release gets a patch bump and
-/// `-dev.<N>+g<sha>` is appended.
-///
-/// Examples:
-///   on tag v0.1.0-pre.1    → "0.1.0-pre.1"
-///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969ab"
-///
-/// Returns `None` when git metadata cannot be read.
-fn git_version() -> Option<String> {
-    let exact_tags = git_output(&["tag", "--points-at", "HEAD"])?;
-    if let Some(version) = build_version::exact_release_version(exact_tags.lines()) {
-        return Some(version);
-    }
-
-    let merged_tags = git_output(&["tag", "--merged", "HEAD", "--list", "v*.*.*"])?;
-    let latest_tag = build_version::latest_stable_tag(merged_tags.lines());
-    let revision_range = latest_tag
-        .as_deref()
-        .map_or_else(|| "HEAD".to_string(), |tag| format!("{tag}..HEAD"));
-    let distance = git_output(&["rev-list", "--count", &revision_range])?
-        .parse()
-        .ok()?;
-    let sha = git_output(&["rev-parse", "--short=9", "HEAD"])?;
-
-    build_version::next_dev_version(latest_tag.as_deref(), distance, &sha)
-}
-
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|output| output.trim().to_string())
 }
