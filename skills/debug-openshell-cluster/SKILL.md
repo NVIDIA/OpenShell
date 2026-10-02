@@ -19,8 +19,6 @@ The target deployment flow is:
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
-If supervisor sessions fail with a protocol revision mismatch, check that custom supervisor images match the gateway release. Gateway and supervisor require the same internal protocol revision; authentication success does not make mismatched versions compatible. Supervisors that predate the handshake still connect for one release. The gateway logs a warning for each such session and counts them in the `openshell_supervisor_protocol_legacy_sessions_total` metric, so recreate those sandboxes before the next gateway upgrade. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md).
-
 The `openshell-gateway` composition crate explicitly installs its compiled
 Docker, Podman, Kubernetes, and VM registrations at startup; `openshell-server`
 does not link compute-driver crates. Custom gateway binaries may include a
@@ -481,16 +479,6 @@ For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
 projected peer ServiceAccount token volume, and TokenReview RBAC:
-
-The experimental `[openshell.gateway].config_delivery_mode = "push"` sends
-configuration hints to that same peer endpoint over `PeerNotifyConfigUpdate`.
-Check that every gateway replica runs a version supporting the RPC and uses
-the same mode.
-`poll` is the 0.1.x default; a push setting in this release sends shadow
-snapshots while supervisors still poll. If hints fail, inspect
-`openshell_supervisor_config_peer_hints_total` and peer authentication logs.
-An old peer returns `UNIMPLEMENTED`, and a peer still set to `poll` returns
-`FAILED_PRECONDITION`.
 
 ```bash
 kubectl -n openshell get svc openshell-peer -o wide
