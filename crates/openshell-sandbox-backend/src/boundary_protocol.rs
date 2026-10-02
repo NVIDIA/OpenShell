@@ -498,13 +498,40 @@ impl RequestEnvelope {
 }
 
 fn request_payload_digest(request: &Request) -> Result<String, FrameError> {
-    // Round-tripping through Value canonicalizes every JSON object by key. In
-    // particular, this makes HashMap-backed provider environments stable
-    // across process restarts and independently serialized retries.
     let normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
-    let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
-    let digest = Sha256::digest(payload);
+    let digest = Sha256::digest(canonical_json(&normalized)?);
     Ok(format!("{digest:x}"))
+}
+
+/// Serializes `value` with every object's keys in sorted order.
+///
+/// Sort every map explicitly; do not depend on `serde_json`'s `preserve_order`
+/// feature. Any crate in a binary's dependency graph can enable it (Cedar
+/// does), which makes objects keep insertion order. The supervisor and the
+/// sandbox launcher are built with different dependency graphs, and
+/// HashMap-backed fields such as provider environments iterate in a
+/// different order in each process, so only an explicit sort gives both
+/// sides the same bytes.
+fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, FrameError> {
+    struct Canonical<'a>(&'a serde_json::Value);
+    impl Serialize for Canonical<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            match self.0 {
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .map(|(key, value)| (key, Canonical(value)))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .serialize(serializer),
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .map(Canonical)
+                    .collect::<Vec<_>>()
+                    .serialize(serializer),
+                value => value.serialize(serializer),
+            }
+        }
+    }
+    serde_json::to_vec(&Canonical(value)).map_err(FrameError::Serialize)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -1321,6 +1348,21 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn canonical_json_ignores_object_insertion_order() {
+        let mut first = serde_json::Map::new();
+        first.insert("b".to_string(), serde_json::json!({ "y": 1, "x": 2 }));
+        first.insert("a".to_string(), serde_json::json!([3]));
+        let mut second = serde_json::Map::new();
+        second.insert("a".to_string(), serde_json::json!([3]));
+        second.insert("b".to_string(), serde_json::json!({ "x": 2, "y": 1 }));
+
+        let first = canonical_json(&serde_json::Value::Object(first)).expect("first");
+        let second = canonical_json(&serde_json::Value::Object(second)).expect("second");
+        assert_eq!(first, second);
+        assert_eq!(first, br#"{"a":[3],"b":{"x":2,"y":1}}"#);
     }
 
     #[test]
