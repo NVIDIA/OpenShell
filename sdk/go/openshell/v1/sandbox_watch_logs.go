@@ -27,9 +27,10 @@ const (
 	watchLogsChannelBuffer = 64
 )
 
-// testHookWatchLogsSleep allows tests to inject a function to observe requested
-// backoff delays without wall-clock overhead. In production, it is time.Sleep.
-var testHookWatchLogsSleep = time.Sleep
+// testHookWatchLogsSleep, when set by a test, observes each requested backoff
+// delay. It never waits: watcher.sleep performs the only real, cancellable
+// wait. It is nil in production.
+var testHookWatchLogsSleep func(time.Duration)
 
 // WatchLogs streams a sandbox's log lines and platform events with loss-aware
 // resume.
@@ -165,7 +166,9 @@ func retryWatchLogs(ctx context.Context, w *watcher[*WatchLogEvent], err error, 
 		w.emit(ctx, Event[*WatchLogEvent]{Type: EventError, Err: converted})
 		return false
 	}
-	testHookWatchLogsSleep(*backoff)
+	if testHookWatchLogsSleep != nil {
+		testHookWatchLogsSleep(*backoff)
+	}
 	if !w.sleep(ctx, *backoff) {
 		return false
 	}
