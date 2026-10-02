@@ -18,8 +18,9 @@ import (
 
 const (
 	// watchLogsInitialBackoff is the delay before the first reconnect attempt.
-	// It is restored after every delivered event, so a long-lived stream that
-	// drops retries promptly instead of at the capped delay.
+	// It is restored after every delivered log, event, or warning, so a
+	// long-lived stream that drops retries promptly instead of at the capped
+	// delay.
 	watchLogsInitialBackoff = 100 * time.Millisecond
 	// watchLogsMaxBackoff caps the reconnect delay.
 	watchLogsMaxBackoff = 2 * time.Second
@@ -126,13 +127,16 @@ func (s *sandboxClient) runWatchLogs(ctx context.Context, w *watcher[*WatchLogEv
 				break
 			}
 
-			// A delivered event means the connection is healthy again.
-			backoff = watchLogsInitialBackoff
-
 			item := converter.WatchLogEventFromProto(ev)
 			if item == nil {
 				continue
 			}
+			// A delivered item means the connection is healthy again. The
+			// status snapshot the gateway sends at the start of every stream
+			// is skipped above and must not count: a gateway that accepts the
+			// stream and then drops it would otherwise be redialed at the
+			// initial delay forever.
+			backoff = watchLogsInitialBackoff
 			// The gateway reads the log and platform sources independently
 			// during live delivery, so arrival order can differ from cursor
 			// order. Keep the high-water mark: assigning directly would let a

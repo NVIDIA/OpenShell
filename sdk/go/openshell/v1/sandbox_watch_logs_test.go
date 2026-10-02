@@ -411,6 +411,54 @@ func TestWatchLogs_BackoffResetsAfterDeliveredEvent(t *testing.T) {
 	assert.Equal(t, watchLogsInitialBackoff, recordedBackoffs[1])
 }
 
+func TestWatchLogs_BackoffGrowsWhenOnlySnapshotsArrive(t *testing.T) {
+	// The gateway opens every stream with a status snapshot. A gateway that
+	// sends it and then drops has delivered nothing, so the backoff must keep
+	// growing instead of resetting on each attempt.
+	const attempts = 4
+	mock := watchLogsMock()
+	var recordedBackoffs []time.Duration
+	var mu sync.Mutex
+
+	oldHook := testHookWatchLogsSleep
+	testHookWatchLogsSleep = func(d time.Duration) {
+		mu.Lock()
+		recordedBackoffs = append(recordedBackoffs, d)
+		mu.Unlock()
+	}
+	defer func() { testHookWatchLogsSleep = oldHook }()
+
+	mock.watchFunc = func(attempt int, _ *pb.WatchSandboxRequest, stream grpc.ServerStreamingServer[pb.SandboxStreamEvent]) error {
+		if attempt >= attempts-1 {
+			return nil
+		}
+		snapshot := &pb.SandboxStreamEvent{Payload: &pb.SandboxStreamEvent_Sandbox{Sandbox: &pb.Sandbox{
+			Metadata: &dm.ObjectMeta{Name: "sb-1"},
+			Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+		}}}
+		if err := stream.Send(snapshot); err != nil {
+			return err
+		}
+		return status.Error(codes.Unavailable, "connection reset")
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	w, err := client.WatchLogs(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+	defer w.Stop()
+
+	assert.Empty(t, drainWatchLogs(t, w))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []time.Duration{
+		watchLogsInitialBackoff,
+		2 * watchLogsInitialBackoff,
+		4 * watchLogsInitialBackoff,
+	}, recordedBackoffs)
+}
+
 func TestWatchLogs_BackoffWaitsOncePerRetry(t *testing.T) {
 	// Each retry must wait the requested backoff once. Three retries from the
 	// initial delay add up to 100+200+400ms; waiting each delay twice would
