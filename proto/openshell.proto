@@ -2020,9 +2020,14 @@ message WatchSandboxRequest {
   bool follow_events = 4;
 
   // Replay the last N log lines (best-effort) before following.
+  //
+  // When following both sources, the replay can return fewer lines: events
+  // older than one the other source's replay left out are withheld and
+  // reported with a warning, even if both depths are equal.
   uint32 log_tail_lines = 5;
 
   // Replay the last N platform events (best-effort) before following.
+  // Defaults to 0. Can return fewer events; see log_tail_lines.
   uint32 event_tail = 6;
 
   // Stop streaming once the sandbox reaches READY or a terminal result phase
@@ -2056,6 +2061,8 @@ message WatchSandboxRequest {
   // empty resume_after_cursor, because retrying the same token fails
   // identically. A cursor this server could not have issued is rejected with
   // INVALID_ARGUMENT.
+  //
+  // One cursor covers both log and platform events.
   string resume_after_cursor = 12;
 }
 
