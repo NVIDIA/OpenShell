@@ -845,11 +845,10 @@ impl ProviderTypeProfile {
     /// provides GCP metadata for non-Windows sandbox runtimes.
     pub fn ensure_platform_adapter_available(&self) -> Result<(), crate::ProviderError> {
         match self.required_platform_adapter.as_str() {
-            "" => Ok(()),
             "gcp-metadata" if cfg!(windows) => {
                 Err(crate::ProviderError::UnavailableGcpMetadataAdapter)
             }
-            "gcp-metadata" => Ok(()),
+            "" | "gcp-metadata" => Ok(()),
             _ => Err(crate::ProviderError::UnknownPlatformAdapter),
         }
     }

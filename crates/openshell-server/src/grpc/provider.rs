@@ -5612,8 +5612,8 @@ mod tests {
             assert!(response.imported, "{:?}", response.diagnostics);
         }
 
-        // Existing stored profiles and interceptor-vended profiles must also
-        // fail at attachment, even when they did not pass this build's import.
+        // Existing stored and interceptor-vended profiles must pass the same
+        // capability check at attachment as profiles imported in this build.
         state
             .store
             .put_message(&stored_provider_profile(profile))
