@@ -2177,6 +2177,17 @@ fn validate_policy_credential_binding_context(
 }
 
 const SIGV4_REQUIRED_CREDENTIAL_KEYS: [&str; 2] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
+const OCI_REQUIRED_CREDENTIAL_KEYS: [&str; 2] = ["OCI_KEY_ID", "OCI_PRIVATE_KEY"];
+
+/// Credential environment keys a provider profile must declare to supply a
+/// `credential_signing` endpoint, keyed by the signing scheme in policy.
+fn required_signing_credential_keys(credential_signing: &str) -> &'static [&'static str] {
+    if credential_signing == "oci" {
+        &OCI_REQUIRED_CREDENTIAL_KEYS
+    } else {
+        &SIGV4_REQUIRED_CREDENTIAL_KEYS
+    }
+}
 
 fn validate_policy_signing_credential_sources(
     catalog: &EffectiveProviderProfileCatalog,
@@ -2188,12 +2199,13 @@ fn validate_policy_signing_credential_sources(
             if endpoint.credential_signing.is_empty() {
                 continue;
             }
+            let required_keys = required_signing_credential_keys(&endpoint.credential_signing);
 
             let source = endpoint.credential_binding.as_ref().map_or_else(
                 || {
                     records.iter().find_map(|record| {
                         signing_profile_for_record(catalog, record).filter(|profile| {
-                            profile_declares_sigv4_credentials(profile)
+                            profile_declares_signing_credentials(profile, required_keys)
                                 && !profile.endpoints.is_empty()
                                 && signed_endpoint_is_covered(
                                     endpoint,
@@ -2208,7 +2220,7 @@ fn validate_policy_signing_credential_sources(
                         .find(|record| record.name == binding.provider)
                         .and_then(|record| signing_profile_for_record(catalog, record))
                         .filter(|profile| {
-                            profile_declares_sigv4_credentials(profile)
+                            profile_declares_signing_credentials(profile, required_keys)
                                 && profile.endpoints.is_empty()
                         })
                 },
@@ -2216,8 +2228,14 @@ fn validate_policy_signing_credential_sources(
 
             if source.is_none() {
                 let selector = format_endpoint_selector(endpoint);
+                let keys = required_keys.join(" and ");
+                let vendor = if endpoint.credential_signing == "oci" {
+                    "OCI"
+                } else {
+                    "AWS"
+                };
                 return Err(Status::failed_precondition(format!(
-                    "credential_signing endpoint '{selector}' has no resolvable AWS credential source; attach an endpoint-bearing provider profile that declares AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and covers this endpoint, or set credential_binding.provider to an attached endpointless profile that declares those credentials"
+                    "credential_signing endpoint '{selector}' has no resolvable {vendor} credential source; attach an endpoint-bearing provider profile that declares {keys} and covers this endpoint, or set credential_binding.provider to an attached endpointless profile that declares those credentials"
                 )));
             }
         }
@@ -2236,9 +2254,12 @@ fn signing_profile_for_record(
     )
 }
 
-fn profile_declares_sigv4_credentials(profile: &openshell_providers::ProviderTypeProfile) -> bool {
+fn profile_declares_signing_credentials(
+    profile: &openshell_providers::ProviderTypeProfile,
+    required_keys: &[&str],
+) -> bool {
     let env_vars = profile.credential_env_vars();
-    SIGV4_REQUIRED_CREDENTIAL_KEYS
+    required_keys
         .iter()
         .all(|required| env_vars.contains(required))
 }
@@ -11108,6 +11129,36 @@ mod tests {
         provider
     }
 
+    fn test_oci_provider(name: &str, provider_type: &str) -> Provider {
+        let mut provider = test_provider(name, provider_type);
+        provider.credentials = [
+            (
+                "OCI_KEY_ID".to_string(),
+                "ocid1.tenancy.oc1..t/ocid1.user.oc1..u/aa:bb".to_string(),
+            ),
+            (
+                "OCI_PRIVATE_KEY".to_string(),
+                "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        provider
+    }
+
+    fn test_oci_policy(host: &str, provider: Option<&str>) -> ProtoSandboxPolicy {
+        let mut policy = test_policy_with_rule("oci", host);
+        let endpoint = &mut policy.network_policies.get_mut("oci").unwrap().endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        endpoint.credential_signing = "oci".to_string();
+        endpoint.credential_binding =
+            provider.map(|provider| openshell_core::proto::NetworkCredentialBinding {
+                provider: provider.to_string(),
+            });
+        policy
+    }
+
     fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
             network_policies: std::iter::once((
@@ -12410,6 +12461,84 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_accepts_oci_signing_bound_to_endpointless_oci_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_oci_provider("oci-prod", "oci"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-bound-oci",
+            "signing-bound-oci",
+            ProtoSandboxPolicy::default(),
+            vec!["oci-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "signing-bound-oci".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(test_oci_policy(
+                    "objectstorage.us-chicago-1.oraclecloud.com",
+                    Some("oci-prod"),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("bound endpointless OCI profile supplies OCI signing credentials");
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_oci_signing_when_only_aws_credentials_are_bound() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("aws-prod", "aws"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-oci-vs-aws",
+            "signing-oci-vs-aws",
+            ProtoSandboxPolicy::default(),
+            vec!["aws-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "signing-oci-vs-aws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(test_oci_policy(
+                    "objectstorage.us-chicago-1.oraclecloud.com",
+                    Some("aws-prod"),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("AWS credentials cannot satisfy an oci signing endpoint");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("no resolvable OCI credential source"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("OCI_KEY_ID and OCI_PRIVATE_KEY"));
     }
 
     #[tokio::test]

@@ -170,14 +170,16 @@ the gateway host.
 | `request_body_credential_rewrite` | bool | `false` | Replaces credential placeholders in REST request bodies. |
 | `websocket_credential_rewrite` | bool | `false` | Replaces credential placeholders in client WebSocket text messages. |
 | `allow_uninspected_credentials` | bool | `false` | Allows a provider-credentialed endpoint to omit request inspection or use `tls: skip`. |
-| `credential_signing` | string | None | AWS request signing: `sigv4`, `sigv4:body`, or `sigv4:no_body`. |
-| `signing_service` | string | None | AWS service name, such as `bedrock` or `s3`. Required with `credential_signing`. |
+| `credential_signing` | string | None | Proxy-side request signing: `sigv4`, `sigv4:body`, or `sigv4:no_body` for AWS, or `oci` for Oracle Cloud Infrastructure. |
+| `signing_service` | string | None | AWS service name, such as `bedrock` or `s3`. Required with the `sigv4` modes; not used by `oci`. |
 | `signing_region` | string | From hostname | AWS region override, such as `us-east-1`. |
 
 Credential placeholders use the form `openshell:resolve:env:KEY`. Body rewriting
 applies to UTF-8 JSON, form, and text bodies of up to 256 KiB, and cannot be
 combined with `credential_signing`. Signing requires an attached provider with
-AWS credentials. Refer to [AWS SigV4](/how-it-works/providers/aws) and [Static
+the scheme's credentials: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for
+`sigv4`, or `OCI_KEY_ID` and `OCI_PRIVATE_KEY` for `oci`. Refer to [AWS
+SigV4](/how-it-works/providers/aws) and [Static
 Credential Endpoint
 Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
 
