@@ -847,6 +847,26 @@ impl PodmanComputeDriver {
             return;
         };
         for entry in entries.iter().filter(|entry| entry.state == "running") {
+            let Some(sandbox_id) = entry.labels.get(LABEL_SANDBOX_ID) else {
+                continue;
+            };
+            let _operation = self.lifecycle_event_fences.lock(sandbox_id).await;
+            // The list predates the guard. Never carry its running state or a
+            // grant denial across a concurrent lifecycle operation.
+            let Ok(current) = self.client.inspect_container(&entry.id).await else {
+                continue;
+            };
+            if !current.state.running
+                || current.id != entry.id
+                || current.config.labels.get(LABEL_SANDBOX_ID) != Some(sandbox_id)
+                || current
+                    .config
+                    .labels
+                    .get(crate::isolation::LABEL_ROLE)
+                    .is_none_or(|role| role != "sandbox")
+            {
+                continue;
+            }
             if let Err(ComputeDriverError::Precondition(reason)) =
                 self.admit_container_resources(&entry.id).await
             {
@@ -889,6 +909,7 @@ impl PodmanComputeDriver {
         // Validate the composed container name early, before creating any
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
+        let _operation = self.lifecycle_event_fences.lock(&sandbox.id).await;
         let name = validated_container_name(sandbox)?;
         let validated = self.validated_sandbox_create(sandbox).await?;
 
@@ -1395,6 +1416,7 @@ impl PodmanComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _operation = self.lifecycle_event_fences.lock(sandbox_id).await;
         let container = self.find_container(sandbox_id).await?;
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self
@@ -1470,6 +1492,7 @@ impl PodmanComputeDriver {
         encoded_authentication: &[u8],
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _operation = self.lifecycle_event_fences.lock(sandbox_id).await;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
@@ -1596,6 +1619,7 @@ impl PodmanComputeDriver {
     )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _operation = self.lifecycle_event_fences.lock(sandbox_id).await;
         if sandbox_id.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox id is required".into(),
@@ -1723,11 +1747,13 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
         if entry.state == "running" {
-            Ok(watcher::inspect_workload(&self.client, &entry.id)
-                .await
-                .ok()
-                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
-                .or_else(|| driver_sandbox_from_list_entry(entry)))
+            Ok(
+                watcher::inspect_workload(&self.client, &entry.id, &self.lifecycle_event_fences)
+                    .await
+                    .ok()
+                    .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                    .or_else(|| driver_sandbox_from_list_entry(entry)),
+            )
         } else {
             Ok(driver_sandbox_from_list_entry(entry))
         }
@@ -1748,7 +1774,13 @@ impl PodmanComputeDriver {
         for entry in &entries {
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
-                match watcher::inspect_workload(&self.client, &entry.id).await {
+                match watcher::inspect_workload(
+                    &self.client,
+                    &entry.id,
+                    &self.lifecycle_event_fences,
+                )
+                .await
+                {
                     Ok(inspect) => {
                         if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                             sandboxes.push(sandbox);
@@ -2162,6 +2194,137 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("/stop?timeout=10"));
         assert!(requests[1].contains(&crate::isolation::supervisor_name("sandbox-1")));
+    }
+
+    // The stub pauses supervisor start after workload start has completed,
+    // while a clone performs the same reconciliation used by the watcher.
+    // This tests the real driver API over HTTP, without claiming live Podman qualification.
+    #[tokio::test]
+    async fn restart_and_reconciliation_do_not_stop_the_new_workload() {
+        restart_overlaps_reconciliation(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_restart_releases_containment_and_allows_retry() {
+        restart_overlaps_reconciliation(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_supervisor_start_releases_containment_and_allows_retry() {
+        restart_overlaps_reconciliation(false, true).await;
+    }
+
+    async fn restart_overlaps_reconciliation(cancel: bool, fail: bool) {
+        use tokio::sync::Notify;
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let running = r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"sandbox"}}}"#;
+        let exited = r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false},"Config":{}}"#;
+        let mut responses = vec![
+            StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+            StubResponse::new(StatusCode::OK, exited),
+        ];
+        let mut restart = restart_responses();
+        *restart.last_mut().unwrap() = StubResponse::new(
+            if fail {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::NO_CONTENT
+            },
+            "",
+        )
+        .with_gate(reached.clone(), release.clone());
+        responses.extend(restart);
+        // Identification may run during restart; containment must wait.
+        responses.push(StubResponse::new(StatusCode::OK, running));
+        if fail {
+            responses.push(StubResponse::new(StatusCode::NO_CONTENT, "")); // start rollback
+        }
+        responses.push(StubResponse::new(StatusCode::OK, running)); // fresh snapshot
+        responses.push(StubResponse::new(StatusCode::OK, if cancel || fail {
+            r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{}}"#
+        } else {
+            r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}},"Config":{}}"#
+        }));
+        if cancel || fail {
+            responses.push(StubResponse::new(StatusCode::NO_CONTENT, ""));
+            responses.push(StubResponse::new(StatusCode::OK, exited));
+            // A subsequent start through a clone must not inherit a stuck fence.
+            responses.push(StubResponse::new(
+                StatusCode::OK,
+                r#"[{"Id":"ctr-1","State":"stopped"}]"#,
+            ));
+            responses.push(StubResponse::new(StatusCode::OK, exited));
+            responses.extend(restart_responses());
+        }
+        let (socket, requests, handle) = spawn_podman_stub("restart-watch", responses);
+        let driver = test_driver(socket);
+        let starter = driver.clone();
+        let start = tokio::spawn(async move {
+            starter
+                .start_sandbox(
+                    "sandbox-1",
+                    "generation-1",
+                    &encoded_launch_authentication(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        let reader = driver.clone();
+        let mut inspect = Box::pin(watcher::inspect_workload(
+            &reader.client,
+            "ctr-1",
+            &reader.lifecycle_event_fences,
+        ));
+        // Poll through the identification request into the blocked operation lock.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut inspect)
+                .await
+                .is_err()
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/ctr-1/stop"))
+        );
+        if cancel {
+            start.abort();
+            assert!(start.await.unwrap_err().is_cancelled());
+            release.notify_one();
+        } else {
+            release.notify_one();
+            assert_eq!(start.await.unwrap().is_err(), fail);
+        }
+        let inspected = tokio::time::timeout(Duration::from_secs(5), inspect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.state.running, !(cancel || fail));
+        if cancel || fail {
+            driver
+                .clone()
+                .start_sandbox(
+                    "sandbox-1",
+                    "generation-1",
+                    &encoded_launch_authentication(),
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let stops = requests
+            .iter()
+            .filter(|r| r.contains("/ctr-1/stop"))
+            .count();
+        assert_eq!(stops, usize::from(cancel) + 2 * usize::from(fail));
     }
 
     #[tokio::test]
@@ -3031,6 +3194,82 @@ mod tests {
         assert_eq!(logged.len(), 1);
         assert!(logged[0].starts_with("GET "));
         let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn admission_denial_holds_lifecycle_guard_through_both_stops() {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (socket, requests, handle) = spawn_podman_stub("admission-gate", vec![
+            StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running","Labels":{"openshell.ai/sandbox-id":"sandbox-1"}}]"#),
+            StubResponse::new(StatusCode::OK, r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"sandbox"}}}"#),
+            // Missing admission provenance is a confirmed denial.
+            StubResponse::new(StatusCode::OK, r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"running","Running":true},"Config":{}}"#).with_gate(reached.clone(), release.clone()),
+            StubResponse::new(StatusCode::NO_CONTENT, ""),
+            StubResponse::new(StatusCode::NO_CONTENT, ""),
+        ]);
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            socket_path: Some(socket),
+            ..Default::default()
+        });
+        let reconciler = driver.clone();
+        let reconcile =
+            tokio::spawn(async move { reconciler.reconcile_resource_admission().await });
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        let mut later_operation = Box::pin(driver.lifecycle_event_fences.lock("sandbox-1"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut later_operation)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), reconcile)
+            .await
+            .unwrap()
+            .unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(5), later_operation)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        assert!(requests.lock().unwrap()[3].contains("/ctr-1/stop?timeout=0"));
+        assert!(
+            requests.lock().unwrap()[4].contains("/openshell-supervisor-sandbox-1/stop?timeout=0")
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn admission_rechecks_stale_running_entries_and_ownership() {
+        for (state, labels) in [
+            (
+                serde_json::json!({"Status":"exited","Running":false}),
+                serde_json::json!({"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/isolation-role":"sandbox"}),
+            ),
+            (
+                serde_json::json!({"Status":"running","Running":true}),
+                serde_json::json!({"openshell.ai/sandbox-id":"replacement","openshell.ai/isolation-role":"sandbox"}),
+            ),
+        ] {
+            let (socket, requests, handle) = spawn_podman_stub("admission-stale", vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running","Labels":{"openshell.ai/sandbox-id":"sandbox-1"}}]"#),
+                StubResponse::new(StatusCode::OK, serde_json::json!({"Id":"ctr-1","Name":"sandbox","State":state,"Config":{"Labels":labels}}).to_string()),
+            ]);
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                socket_path: Some(socket),
+                ..Default::default()
+            });
+            driver.reconcile_resource_admission().await;
+            handle.await.unwrap();
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.starts_with("GET "))
+            );
+        }
     }
 
     #[tokio::test]

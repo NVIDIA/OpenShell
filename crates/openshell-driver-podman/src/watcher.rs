@@ -18,7 +18,7 @@ use openshell_core::proto::compute::v1::{
 };
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -34,7 +34,7 @@ use openshell_core::driver_utils::{
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
 
-/// Per-sandbox container exit timestamps that fence state changes from an earlier run.
+/// Shared lifecycle coordination and exit timestamps for each sandbox.
 ///
 /// Podman can deliver a container's `die` or `stop` event after the stop API
 /// has returned. If a restart is already in progress, inspecting the container
@@ -43,9 +43,32 @@ pub type WatchStream =
 #[derive(Clone, Debug, Default)]
 pub struct LifecycleEventFences {
     previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+    operations: Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl LifecycleEventFences {
+    /// Serialize lifecycle mutations and containment for one sandbox. Weak entries
+    /// avoid retaining deleted sandboxes; never remove an entry while a guard or
+    /// waiter exists, including when clearing the previous-exit timestamp.
+    pub async fn lock(&self, sandbox_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let operation = {
+            let mut operations = self
+                .operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            operations.retain(|_, operation| operation.strong_count() > 0);
+            operations
+                .get(sandbox_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let operation = Arc::new(tokio::sync::Mutex::new(()));
+                    operations.insert(sandbox_id.to_string(), Arc::downgrade(&operation));
+                    operation
+                })
+        };
+        operation.lock_owned().await
+    }
+
     pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
         let mut fences = self
             .previous_finished_at
@@ -148,7 +171,7 @@ pub async fn start_watch(
         // health check status — matching the same condition derivation used
         // for live events.
         if entry.state == "running" {
-            match inspect_workload(&client, &entry.id).await {
+            match inspect_workload(&client, &entry.id, &lifecycle_event_fences).await {
                 Ok(inspect) => {
                     if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                         if tx.send(Ok(sandbox_event(sandbox))).await.is_err() {
@@ -264,7 +287,7 @@ async fn map_podman_event(
             .await
             .ok()?;
         let workload = workloads.first()?;
-        return inspect_workload(client, &workload.id)
+        return inspect_workload(client, &workload.id, lifecycle_event_fences)
             .await
             .ok()
             .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
@@ -275,7 +298,7 @@ async fn map_podman_event(
         "remove" => Some(deleted_event(sandbox_id.clone())),
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
-            match inspect_workload(client, container_id).await {
+            match inspect_workload(client, container_id, lifecycle_event_fences).await {
                 Ok(inspect) => {
                     if lifecycle_event_fences.matches_previous_exit(
                         event,
@@ -358,6 +381,7 @@ async fn map_podman_event(
 pub async fn inspect_workload(
     client: &PodmanClient,
     id: &str,
+    lifecycle_event_fences: &LifecycleEventFences,
 ) -> Result<ContainerInspect, PodmanApiError> {
     let mut workload = client.inspect_container(id).await?;
     if workload
@@ -371,8 +395,26 @@ pub async fn inspect_workload(
     let Some(sandbox_id) = workload.config.labels.get(LABEL_SANDBOX_ID) else {
         return Ok(workload);
     };
+    let sandbox_id = sandbox_id.clone();
+    let workload_id = workload.id.clone();
+    let _operation = lifecycle_event_fences.lock(&sandbox_id).await;
+    // The first inspect only identifies the sandbox. Re-read after acquiring
+    // the guard: a restart may have completed while this inspection waited.
+    workload = client.inspect_container(id).await?;
+    if workload.id != workload_id
+        || workload.config.labels.get(LABEL_SANDBOX_ID) != Some(&sandbox_id)
+        || workload
+            .config
+            .labels
+            .get(crate::isolation::LABEL_ROLE)
+            .is_none_or(|role| role != "sandbox")
+    {
+        return Err(PodmanApiError::Conflict(
+            "workload ownership changed during reconciliation".into(),
+        ));
+    }
     let supervisor = client
-        .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
+        .inspect_container(&crate::isolation::supervisor_name(&sandbox_id))
         .await;
     if workload.state.running {
         match supervisor {
@@ -620,6 +662,10 @@ mod tests {
                     StatusCode::OK,
                     r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
                 ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
+                ),
                 StubResponse::new(StatusCode::NOT_FOUND, "missing companion"),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(
@@ -629,7 +675,51 @@ mod tests {
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &LifecycleEventFences::default())
+            .await
+            .unwrap();
+        assert!(!inspected.state.running);
+        handle.await.unwrap();
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.ends_with("/libpod/containers/workload/stop?timeout=0"))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn exited_supervisor_still_stops_workload_during_reconciliation() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        let (path, requests, handle) = spawn_podman_stub(
+            "exited-supervisor",
+            vec![
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"exited","Running":false},"Config":{}}"#,
+                ),
+            ],
+        );
+        let client = PodmanClient::new(path.clone());
+        let inspected = inspect_workload(&client, "workload", &LifecycleEventFences::default())
+            .await
+            .unwrap();
         assert!(!inspected.state.running);
         handle.await.unwrap();
         assert!(
@@ -655,16 +745,22 @@ mod tests {
                 ),
                 StubResponse::new(
                     StatusCode::OK,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
                     r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"configured","Running":false},"Config":{}}"#,
                 ),
             ],
         );
         let client = PodmanClient::new(path.clone());
-        let inspected = inspect_workload(&client, "workload").await.unwrap();
+        let inspected = inspect_workload(&client, "workload", &LifecycleEventFences::default())
+            .await
+            .unwrap();
         assert!(inspected.state.running);
         assert_eq!(inspected.state.health.unwrap().status, "starting");
         handle.await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 3);
         let _ = std::fs::remove_file(path);
     }
 
@@ -677,6 +773,90 @@ mod tests {
                 attributes: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
             },
             time_nano,
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_exit_fences_preserves_active_operations_across_clones() {
+        let fences = LifecycleEventFences::default();
+        let operation = fences.lock("sandbox-1").await;
+        fences.record_previous_exit("sandbox-1", Some("previous-exit"));
+        fences.remove("sandbox-1");
+        let clone = fences.clone();
+        let mut waiting = Box::pin(clone.lock("sandbox-1"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        // One sandbox's lifecycle must not suspend containment for another.
+        let other =
+            tokio::time::timeout(std::time::Duration::from_secs(1), clone.lock("sandbox-2"))
+                .await
+                .unwrap();
+        drop(other);
+        drop(operation);
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap();
+        drop(resumed);
+    }
+
+    #[tokio::test]
+    async fn delayed_workload_and_supervisor_events_reinspect_after_restart() {
+        use crate::test_utils::{StubResponse, spawn_podman_stub};
+        use hyper::StatusCode;
+        for supervisor_event in [false, true] {
+            let stale = r#"{"Id":"container-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-name":"sandbox","openshell.ai/sandbox-workspace":"default","openshell.ai/isolation-role":"sandbox"}}}"#;
+            let running = r#"{"Id":"container-1","Name":"sandbox","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-name":"sandbox","openshell.ai/sandbox-workspace":"default","openshell.ai/isolation-role":"sandbox"}}}"#;
+            let mut responses = Vec::new();
+            if supervisor_event {
+                responses.push(StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"container-1","State":"running"}]"#,
+                ));
+            }
+            responses.extend([
+                StubResponse::new(StatusCode::OK, stale),
+                StubResponse::new(StatusCode::OK, running),
+                StubResponse::new(StatusCode::OK, r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}},"Config":{}}"#),
+            ]);
+            let (socket, requests, handle) = spawn_podman_stub("delayed-event", responses);
+            let client = PodmanClient::new(socket);
+            let fences = LifecycleEventFences::default();
+            fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+            let operation = fences.lock("sandbox-1").await;
+            let mut event = podman_event("die", "sandbox-1", 199);
+            if supervisor_event {
+                event
+                    .actor
+                    .attributes
+                    .insert(crate::isolation::LABEL_ROLE.into(), "supervisor".into());
+            }
+            let mut mapped = Box::pin(map_podman_event(&event, &client, &fences));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut mapped)
+                    .await
+                    .is_err()
+            );
+            drop(operation);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), mapped)
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(watch_sandboxes_event::Payload::Sandbox(snapshot)) = result.payload else {
+                panic!("expected sandbox event")
+            };
+            let snapshot = snapshot.sandbox.unwrap();
+            assert_eq!(snapshot.status.unwrap().conditions[0].status, "True");
+            handle.await.unwrap();
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.starts_with("GET "))
+            );
         }
     }
 
