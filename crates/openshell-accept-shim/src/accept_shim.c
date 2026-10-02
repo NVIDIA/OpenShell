@@ -23,9 +23,10 @@
 //
 // Raw syscalls are used rather than dlsym(RTLD_NEXT, ...) so the object needs
 // no DT_NEEDED entry and no loader-visible libc dependency. One build per
-// architecture therefore loads correctly under both glibc and musl. The only
-// undefined symbol is `__errno_location`, which both libcs export and the
-// dynamic linker resolves from the already-loaded libc at relocation time.
+// architecture therefore loads correctly under both glibc and musl. Both
+// export `__errno_location`. The weak `pthread_setcanceltype` reference also
+// resolves from libc or an already-loaded libpthread, but does not require
+// loading libpthread in a single-threaded workload on older glibc.
 //
 // Interposing here covers runtimes that call these functions through the
 // PLT (CPython, Node, Bun, and anything else dynamically linked against
@@ -36,6 +37,10 @@
 typedef unsigned int shim_socklen_t;
 
 extern int *__errno_location(void);
+extern int pthread_setcanceltype(int, int *) __attribute__((weak));
+
+// glibc and musl both use 1 for PTHREAD_CANCEL_ASYNCHRONOUS.
+#define SHIM_CANCEL_ASYNCHRONOUS 1
 
 #if defined(__x86_64__)
 #define SHIM_NR_ACCEPT 43
@@ -97,16 +102,31 @@ static int shim_finish(long result) {
     return (int)result;
 }
 
+// libc's accept wrappers are cancellation points. Temporarily enabling
+// asynchronous cancellation gives the raw blocking syscall the same behavior,
+// including cancellation already pending on entry. Preserve cancellation state
+// (a disabled caller stays disabled) and restore the caller's type immediately
+// after the syscall, before reporting the peer address.
+static long shim_cancellable_accept4(int sockfd, int flags) {
+    int old_type = 0;
+    int changed = pthread_setcanceltype != 0 &&
+                  pthread_setcanceltype(SHIM_CANCEL_ASYNCHRONOUS, &old_type) == 0;
+    long accepted = shim_syscall4(SHIM_NR_ACCEPT4, sockfd, 0, 0, flags);
+    if (changed) {
+        pthread_setcanceltype(old_type, 0);
+    }
+    return accepted;
+}
+
 static int shim_accept4(int sockfd, void *addr, shim_socklen_t *addrlen,
                         int flags) {
     // Without an output buffer the broker's existing path already works, so
     // forward unchanged and preserve its exact semantics.
     if (addr == 0 || addrlen == 0) {
-        return shim_finish(
-            shim_syscall4(SHIM_NR_ACCEPT4, sockfd, 0, 0, flags));
+        return shim_finish(shim_cancellable_accept4(sockfd, flags));
     }
 
-    long accepted = shim_syscall4(SHIM_NR_ACCEPT4, sockfd, 0, 0, flags);
+    long accepted = shim_cancellable_accept4(sockfd, flags);
     if (accepted < 0) {
         return shim_finish(accepted);
     }

@@ -32,6 +32,7 @@ pub const RUNTIME_DIR: &str = "/run/openshell-compat";
 /// before being renamed into place. The shim is a compatibility aid rather
 /// than a security control — a workload can always decline to load it — but
 /// installing it must still never write through a path the workload chose.
+#[cfg(unix)]
 pub fn install_object_at(
     directory: &std::path::Path,
     contents: &[u8],
@@ -144,6 +145,7 @@ fn preload_contains(value: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     /// The object is produced by a C compiler chosen at build time, so a
@@ -178,6 +180,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("openshell-accept-shim-{name}"));
         let _ = std::fs::remove_dir_all(&base);
@@ -185,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn installing_creates_a_read_only_executable_object() {
         let directory = scratch_dir("install");
         let installed = install_object_at(&directory, b"shim-bytes").expect("install");
@@ -200,6 +204,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn installing_twice_replaces_the_previous_object() {
         // A sandbox restart re-materializes into a directory that may already
         // hold a previous generation of the shim.
@@ -219,6 +224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_directory_is_refused() {
         // The directory lives on a workload-writable rootfs, so a redirect
         // must never be followed into a path the workload chose.
@@ -232,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_target_file_is_refused() {
         let directory = scratch_dir("symlink-file");
         std::fs::create_dir_all(&directory).expect("create");

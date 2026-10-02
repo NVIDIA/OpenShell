@@ -51,8 +51,8 @@ impl Shim {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
             .expect("shim path has no interior NUL");
         // RTLD_NOW so an unresolved symbol fails here rather than at the call
-        // site; the object's sole undefined symbol is `__errno_location`,
-        // which the already-loaded libc provides.
+        // site; libc provides the required `__errno_location`, while the weak
+        // pthread reference resolves from libc or an already-loaded libpthread.
         let handle = unsafe { libc::dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
         assert!(!handle.is_null(), "dlopen: {}", dl_error());
 
@@ -102,9 +102,11 @@ fn pending_connection(bind: SocketAddr) -> Pending {
 }
 
 /// What the kernel reports for `fd`'s peer, with no truncation.
+// The kernel copies sockaddr bytes; no typed Rust access requires alignment.
+#[allow(clippy::cast_ptr_alignment)]
 fn kernel_peer(fd: c_int) -> (Vec<u8>, socklen_t) {
     let mut storage = [0u8; size_of::<sockaddr_storage>()];
-    let mut length = storage.len() as socklen_t;
+    let mut length = socklen_t::try_from(storage.len()).unwrap();
     let result =
         unsafe { libc::getpeername(fd, storage.as_mut_ptr().cast::<sockaddr>(), &raw mut length) };
     assert_eq!(result, 0, "getpeername: {}", Error::last_os_error());
@@ -116,6 +118,8 @@ fn kernel_peer(fd: c_int) -> (Vec<u8>, socklen_t) {
 /// Returns the accepted descriptor, the whole buffer, and the `addrlen` the
 /// shim reported, so a caller can check both what was written and what was
 /// left alone.
+// The kernel copies sockaddr bytes; no typed Rust access requires alignment.
+#[allow(clippy::cast_ptr_alignment)]
 fn shim_accept4(listener: &TcpListener, capacity: socklen_t) -> (c_int, Vec<u8>, socklen_t) {
     const SENTINEL: u8 = 0xAA;
     let mut buffer = vec![SENTINEL; size_of::<sockaddr_storage>()];
@@ -145,7 +149,7 @@ fn the_reported_peer_matches_the_kernel_for_ipv4() {
         .expect("client local addr")
         .port();
 
-    let capacity = size_of::<sockaddr_in>() as socklen_t;
+    let capacity = socklen_t::try_from(size_of::<sockaddr_in>()).unwrap();
     let (accepted, buffer, length) = shim_accept4(&pending.listener, capacity);
     let (kernel, kernel_length) = kernel_peer(accepted);
 
@@ -175,7 +179,7 @@ fn the_reported_peer_matches_the_kernel_for_ipv6() {
         .expect("client local addr")
         .port();
 
-    let capacity = size_of::<sockaddr_in6>() as socklen_t;
+    let capacity = socklen_t::try_from(size_of::<sockaddr_in6>()).unwrap();
     let (accepted, buffer, length) = shim_accept4(&pending.listener, capacity);
     let (kernel, kernel_length) = kernel_peer(accepted);
 
@@ -195,7 +199,7 @@ fn a_short_buffer_truncates_and_still_reports_the_full_length() {
     // Linux signals truncation by returning an `addrlen` larger than the one
     // supplied. A caller that trusts the returned length would read past its
     // own buffer if the shim reported the truncated length instead.
-    let full = size_of::<sockaddr_in>() as socklen_t;
+    let full = socklen_t::try_from(size_of::<sockaddr_in>()).unwrap();
 
     for capacity in [0, 4, 8, full - 1] {
         let pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
@@ -223,11 +227,14 @@ fn a_short_buffer_truncates_and_still_reports_the_full_length() {
 #[test]
 fn an_oversized_buffer_is_filled_only_to_the_address_length() {
     let pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
-    let oversized = size_of::<sockaddr_storage>() as socklen_t;
+    let oversized = socklen_t::try_from(size_of::<sockaddr_storage>()).unwrap();
 
     let (accepted, buffer, length) = shim_accept4(&pending.listener, oversized);
 
-    assert_eq!(length, size_of::<sockaddr_in>() as socklen_t);
+    assert_eq!(
+        length,
+        socklen_t::try_from(size_of::<sockaddr_in>()).unwrap()
+    );
     assert!(
         buffer[length as usize..].iter().all(|byte| *byte == 0xAA),
         "bytes beyond the address must be left alone"
@@ -250,7 +257,7 @@ fn a_v4_mapped_peer_is_reported_as_the_kernel_reports_it() {
     };
     let expected_port = client.local_addr().expect("client local addr").port();
 
-    let capacity = size_of::<sockaddr_in6>() as socklen_t;
+    let capacity = socklen_t::try_from(size_of::<sockaddr_in6>()).unwrap();
     let (accepted, buffer, length) = shim_accept4(&listener, capacity);
     let (kernel, kernel_length) = kernel_peer(accepted);
 
@@ -286,7 +293,7 @@ fn the_accepted_descriptor_carries_the_connection() {
     // stream was unusable.
     let mut pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
 
-    let capacity = size_of::<sockaddr_in>() as socklen_t;
+    let capacity = socklen_t::try_from(size_of::<sockaddr_in>()).unwrap();
     let (accepted, _, _) = shim_accept4(&pending.listener, capacity);
 
     pending.client.write_all(b"ping").expect("client write");
@@ -306,6 +313,8 @@ fn the_accepted_descriptor_carries_the_connection() {
 }
 
 #[test]
+// The kernel copies sockaddr bytes; no typed Rust access requires alignment.
+#[allow(clippy::cast_ptr_alignment)]
 fn the_accept_entry_point_behaves_like_accept4_without_flags() {
     let pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     let expected_port = pending
@@ -315,7 +324,7 @@ fn the_accept_entry_point_behaves_like_accept4_without_flags() {
         .port();
 
     let mut buffer = vec![0xAAu8; size_of::<sockaddr_storage>()];
-    let mut length = size_of::<sockaddr_in>() as socklen_t;
+    let mut length = socklen_t::try_from(size_of::<sockaddr_in>()).unwrap();
     let accepted = unsafe {
         (shim().accept)(
             pending.listener.as_raw_fd(),
@@ -331,6 +340,8 @@ fn the_accept_entry_point_behaves_like_accept4_without_flags() {
 }
 
 #[test]
+// The kernel copies sockaddr bytes; no typed Rust access requires alignment.
+#[allow(clippy::cast_ptr_alignment)]
 fn a_failing_accept_reports_the_kernel_error() {
     // `shim_finish` must translate a raw negative return into `-1` plus
     // `errno`; a workload that sees the raw value instead would treat a
@@ -346,7 +357,7 @@ fn a_failing_accept_reports_the_kernel_error() {
     };
 
     let mut buffer = vec![0u8; size_of::<sockaddr_storage>()];
-    let mut length = buffer.len() as socklen_t;
+    let mut length = socklen_t::try_from(buffer.len()).unwrap();
     let result = unsafe {
         (shim().accept4)(
             stream.as_raw_fd(),
@@ -358,4 +369,46 @@ fn a_failing_accept_reports_the_kernel_error() {
 
     assert_eq!(result, -1, "accept on a connected socket must fail");
     assert_eq!(Error::last_os_error().raw_os_error(), Some(EINVAL));
+}
+
+#[test]
+fn preloaded_accept_preserves_pthread_cancellation() {
+    let directory =
+        std::env::temp_dir().join(format!("openshell-shim-cancellation-{}", process_id()));
+    std::fs::create_dir_all(&directory).expect("helper directory");
+    let object = install_object_at(&directory.join("shim"), SHIM_OBJECT).expect("install shim");
+    let executable = directory.join("cancellation");
+    let status = std::process::Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cancellation.c"
+        ))
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("compile cancellation helper");
+    assert!(status.success(), "compile cancellation helper: {status}");
+
+    for accept4 in [false, true] {
+        for address in [false, true] {
+            for disabled in [false, true] {
+                let args = [accept4, address, disabled].map(|flag| if flag { "1" } else { "0" });
+                // Pin the expected libc behavior before testing interposition.
+                for preload in [false, true] {
+                    let mut command = std::process::Command::new(&executable);
+                    command.args(args).env_remove("LD_PRELOAD");
+                    if preload {
+                        command.env("LD_PRELOAD", &object);
+                    }
+                    let output = command.output().expect("run cancellation helper");
+                    assert!(
+                        output.status.success(),
+                        "accept4={accept4} address={address} disabled={disabled} preload={preload}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+    }
 }

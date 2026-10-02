@@ -76,7 +76,7 @@ them is a bug:
 | --- | --- |
 | No `DT_NEEDED` | One build per architecture loads under both glibc and musl |
 | No `TEXTREL` | Avoids requiring SELinux `execmod`, the permission most likely denied to `container_t` |
-| Exactly one undefined symbol, `__errno_location` | Both libcs export it; the loader resolves it from the already-loaded libc |
+| Required `__errno_location` and weak `pthread_setcanceltype` references | Resolve from the workload's libc or already-loaded libpthread without adding a loader dependency |
 | Exactly two exported `FUNC` symbols, `accept` and `accept4` | Prevents accidental interposition of unrelated symbols such as `memcpy` |
 | ELF machine matches the Rust target | A host object loads nowhere, and the loader reports it as `cannot open shared object file` — indistinguishable from a policy denial |
 
@@ -95,6 +95,15 @@ The code performs no allocation, takes no locks, and cannot panic. When
 `getpeername` fails on an already-accepted connection it reports a zero-length
 address — what the kernel itself reports for an unnamed peer — rather than
 leaking the descriptor or failing an accept that has already succeeded.
+
+The blocking accept phase preserves libc's pthread cancellation behavior by
+temporarily switching the caller to asynchronous cancellation, then restoring
+its previous cancellation type before querying the peer. Disabled cancellation
+remains disabled. The pthread symbol is weak so a single-threaded workload on
+older glibc does not need to load libpthread just to use the shim.
+
+Unix installation helpers and their tests are gated with `cfg(unix)`. The
+preload-composition helpers also compile in the Windows workspace checks.
 
 ## Installation
 
