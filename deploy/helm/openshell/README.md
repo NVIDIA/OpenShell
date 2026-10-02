@@ -391,7 +391,6 @@ discovery endpoint or its TLS CA.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
-| server.configDeliveryMode | string | `""` | Supervisor configuration delivery. Empty uses the gateway release default (poll in 0.1.x). Push enables shadow snapshots in the Stage 1 gateway. |
 | server.credentialDrivers.kubernetesSecrets.createNamespace | bool | `false` | Create the credential namespace. Requires a namespace other than the release namespace. The Namespace is retained on uninstall so stored credentials survive; an existing Namespace not owned by this release is left untouched. |
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
 | server.credentialDrivers.kubernetesSecrets.namespace | string | `""` | Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace. A dedicated namespace is RECOMMENDED to isolate OpenShell-managed Secrets from other workloads. |

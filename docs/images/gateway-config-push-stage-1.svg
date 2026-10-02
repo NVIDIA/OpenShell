@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-labelledby="title desc">
+  <title id="title">Stage 1 gateway configuration delivery</title>
+  <desc id="desc">A configuration change is saved in the shared database. With push mode enabled, a hint reaches each gateway that owns an affected supervisor session. The owner sends a full snapshot, which the supervisor receives but ignores. In both modes, the supervisor continues to poll and apply configuration every ten seconds.</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#3276ae"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#598900"/>
+    </marker>
+    <style>
+      .title { font: 700 25px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #182337; }
+      .subtitle { font: 400 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #536274; }
+      .lane { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .04em; }
+      .heading { font: 700 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #182337; }
+      .detail { font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #536274; }
+      .source { fill: #fff; stroke: #aab7c7; stroke-width: 2; }
+      .push-bg { fill: #eef6fc; stroke: #b6d3e9; stroke-width: 2; }
+      .push-box { fill: #fff; stroke: #72a8cf; stroke-width: 2; }
+      .poll-bg { fill: #f2f8e9; stroke: #bbd594; stroke-width: 2; }
+      .poll-box { fill: #fff; stroke: #98c05e; stroke-width: 2; }
+      .blue-arrow { fill: none; stroke: #3276ae; stroke-width: 3; marker-end: url(#arrow-blue); }
+      .green-arrow { fill: none; stroke: #598900; stroke-width: 3; marker-end: url(#arrow-green); }
+    </style>
+  </defs>
+
+  <rect width="1200" height="500" fill="#fff"/>
+  <text x="42" y="48" class="title">Stage 1: push observes; polling applies</text>
+  <text x="42" y="75" class="subtitle">The saved configuration is the source for both paths.</text>
+
+  <rect x="42" y="202" width="175" height="84" rx="12" class="source"/>
+  <text x="129" y="236" text-anchor="middle" class="heading">Configuration</text>
+  <text x="129" y="261" text-anchor="middle" class="detail">change</text>
+  <path d="M217 244 H250" class="blue-arrow"/>
+  <rect x="252" y="202" width="171" height="84" rx="12" class="source"/>
+  <text x="337" y="236" text-anchor="middle" class="heading">Shared DB</text>
+  <text x="337" y="261" text-anchor="middle" class="detail">saves latest state</text>
+
+  <rect x="463" y="100" width="695" height="184" rx="15" class="push-bg"/>
+  <text x="483" y="129" class="lane" fill="#275f88">OPTIONAL PUSH MODE · SHADOW DELIVERY</text>
+  <path d="M423 225 H447 V191 H487" class="blue-arrow"/>
+  <rect x="489" y="155" width="195" height="92" rx="11" class="push-box"/>
+  <text x="586" y="187" text-anchor="middle" class="heading">Route update hint</text>
+  <text x="586" y="210" text-anchor="middle" class="detail">to session owner(s)</text>
+  <text x="586" y="230" text-anchor="middle" class="detail">across HA gateways</text>
+  <path d="M684 201 H716" class="blue-arrow"/>
+  <rect x="718" y="155" width="195" height="92" rx="11" class="push-box"/>
+  <text x="815" y="187" text-anchor="middle" class="heading">Owning gateway</text>
+  <text x="815" y="210" text-anchor="middle" class="detail">builds full snapshot</text>
+  <path d="M913 201 H945" class="blue-arrow"/>
+  <rect x="947" y="155" width="195" height="92" rx="11" class="push-box"/>
+  <text x="1044" y="187" text-anchor="middle" class="heading">Supervisor</text>
+  <text x="1044" y="210" text-anchor="middle" class="detail">receives and ignores</text>
+
+  <rect x="463" y="309" width="695" height="162" rx="15" class="poll-bg"/>
+  <text x="483" y="338" class="lane" fill="#4d7600">BOTH MODES · AUTHORITATIVE POLLING</text>
+  <path d="M423 265 H444 V409 H487" class="green-arrow"/>
+  <rect x="489" y="366" width="195" height="84" rx="11" class="poll-box"/>
+  <text x="586" y="400" text-anchor="middle" class="heading">Supervisor</text>
+  <text x="586" y="423" text-anchor="middle" class="detail">polls every 10 seconds</text>
+  <path d="M684 409 H716" class="green-arrow"/>
+  <rect x="718" y="366" width="195" height="84" rx="11" class="poll-box"/>
+  <text x="815" y="400" text-anchor="middle" class="heading">Gateway</text>
+  <text x="815" y="423" text-anchor="middle" class="detail">reads saved state</text>
+  <path d="M913 409 H945" class="green-arrow"/>
+  <rect x="947" y="366" width="195" height="84" rx="11" class="poll-box"/>
+  <text x="1044" y="400" text-anchor="middle" class="heading">Supervisor</text>
+  <text x="1044" y="423" text-anchor="middle" class="detail">applies configuration</text>
+</svg>

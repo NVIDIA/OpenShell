@@ -26,7 +26,17 @@ On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway ke
 
 When shadow push is enabled, the gateway waits at most one second for an optional configuration bootstrap during supervisor reconnects. If a credential backend stalls, the gateway accepts the session without that bootstrap so SSH, exec, and service connections can resume. Supervisor polling continues to supply configuration.
 
-In 0.1.x, `[openshell.gateway].config_delivery_mode` defaults to `poll`. Set it to `push` to enable experimental shadow configuration snapshots over the supervisor session. Supervisors in this release still apply configuration by polling, including when the gateway sends shadow snapshots. Set the mode with `--config-delivery-mode`, `OPENSHELL_CONFIG_DELIVERY_MODE`, or Helm `server.configDeliveryMode`. The Helm value is empty by default, so the chart omits the TOML key. During an upgrade, enable `push` only after every gateway replica supports this setting; an older gateway rejects the new TOML key. Keep the mode the same on all HA replicas.
+In 0.1.x, `[openshell.gateway].config_delivery_mode` defaults to `poll`. Set it to `push` to enable experimental shadow snapshots over the supervisor session. Supervisors still apply configuration by polling in both modes. The gateway also accepts `--config-delivery-mode` and `OPENSHELL_CONFIG_DELIVERY_MODE`.
+
+With a Helm chart that supports `gatewayConfig`, set the same gateway TOML field through chart values:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    config_delivery_mode: push
+```
+
+During an upgrade, enable `push` only after every gateway replica supports this setting. An older gateway rejects the new TOML key. Keep the mode the same on all HA replicas.
 
 On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
 

@@ -258,9 +258,6 @@ affinity: {}
 
 # Server configuration
 server:
-  # -- Supervisor configuration delivery. Empty uses the gateway release default
-  # (poll in 0.1.x). Push enables shadow snapshots in the Stage 1 gateway.
-  configDeliveryMode: ""
   # -- Operator-facing gateway name. Defaults to the chart fullname so all
   # replicas in one installation share an identity. Set explicitly when one
   # telemetry collector receives spans from multiple namespaces or clusters.
