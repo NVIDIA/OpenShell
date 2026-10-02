@@ -195,6 +195,13 @@ the sandbox preloads a small compatibility library into the workload that
 rewrites the call into a null-address `accept4` followed by `getpeername`, and
 fills the caller's buffer in the workload's own address space.
 
+The compatibility library returns `ECONNABORTED` for a reset queued client.
+It uses a separate sealed anonymous file for each launch and does not require
+a writable `/run`. Descendants must retain its inherited descriptor and access
+to `/proc/self/fd`. Remove the shim entry from `LD_PRELOAD` before a descendant
+closes the descriptor or starts a foreign-architecture loader to avoid a
+loader warning.
+
 `sendmmsg` paths that write per-message lengths back to the caller still fail
 closed with `EOPNOTSUPP`.
 

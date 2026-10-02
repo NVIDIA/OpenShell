@@ -17,106 +17,87 @@ pub const PRELOAD_ENV: &str = "LD_PRELOAD";
 #[cfg(target_os = "linux")]
 pub const SHIM_OBJECT: &[u8] = include_bytes!(env!("OPENSHELL_ACCEPT_SHIM"));
 
-/// Directory the shim is materialized into inside the workload.
+/// Probe and retain a private shim object in the boundary.
 ///
-/// This deliberately sits outside the driver-owned `/.openshell` hierarchy,
-/// which the capability-free Landlock baseline never exposes to a workload.
-/// The dynamic loader must be able to open and map the object, so it also has
-/// to live outside the `noexec` tmpfs mounts that carry supervisor material.
-pub const RUNTIME_DIR: &str = "/run/openshell-compat";
-
-/// Materialize an object into `directory` as a read-only executable file.
-///
-/// The target rootfs is writable by the workload, so every component is
-/// checked for symlink redirection and the file is created with `O_NOFOLLOW`
-/// before being renamed into place. The shim is a compatibility aid rather
-/// than a security control — a workload can always decline to load it — but
-/// installing it must still never write through a path the workload chose.
-#[cfg(unix)]
-pub fn install_object_at(
-    directory: &std::path::Path,
-    contents: &[u8],
-) -> Result<std::path::PathBuf, String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(format!(
-                "shim directory is a symlink: {}",
-                directory.display()
-            ));
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(format!(
-                "shim directory is not a directory: {}",
-                directory.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(directory).map_err(|error| {
-                format!("create shim directory {}: {error}", directory.display())
-            })?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "inspect shim directory {}: {error}",
-                directory.display()
-            ));
-        }
-    }
-    // Writable for the install itself; tightened to read-only below. The
-    // sandbox is not necessarily root, so the owner write bit is required
-    // here even on a freshly created directory.
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("set shim directory permissions: {error}"))?;
-
-    let path = directory.join(FILE_NAME);
-    if let Ok(metadata) = std::fs::symlink_metadata(&path)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(format!("shim path is a symlink: {}", path.display()));
-    }
-
-    let temporary = path.with_extension("tmp");
-    if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(format!(
-                "refusing unsafe temporary shim path: {}",
-                temporary.display()
-            ));
-        }
-        std::fs::remove_file(&temporary)
-            .map_err(|error| format!("remove stale temporary shim: {error}"))?;
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o555)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .map_err(|error| format!("create temporary shim: {error}"))?;
-    if let Err(error) = file
-        .write_all(contents)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o555)))
-        .and_then(|()| std::fs::rename(&temporary, &path))
-    {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!("install shim: {error}"));
-    }
-    // Traversable and readable by every workload identity, writable by none.
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
-        .map_err(|error| format!("seal shim directory permissions: {error}"))?;
-    Ok(path)
-}
-
-/// Materialize the embedded shim into [`RUNTIME_DIR`].
+/// This descriptor is
+/// close-on-exec; workloads receive their own anonymous inode via
+/// [`create_child_shim`], so changes to file permissions cannot affect later
+/// sessions. Anonymous inodes need no Landlock user-ruleset admission.
 #[cfg(target_os = "linux")]
 pub fn install_shim() -> Result<std::path::PathBuf, String> {
-    install_object_at(std::path::Path::new(RUNTIME_DIR), SHIM_OBJECT)
+    use std::os::fd::AsRawFd as _;
+    use std::sync::OnceLock;
+    static OBJECT: OnceLock<std::fs::File> = OnceLock::new();
+    if OBJECT.get().is_none() {
+        let _ = OBJECT.set(create_object(true)?);
+    }
+    Ok(std::path::PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        OBJECT.get().expect("installed object").as_raw_fd()
+    )))
+}
+
+/// Create a fresh sealed object for one workload launch.
+///
+/// The descriptor is
+/// close-on-exec in the boundary: the caller must retain the File until spawn
+/// and clear CLOEXEC only in the forked child, so concurrent launches cannot
+/// inherit and change permissions on one another's pending objects.
+#[cfg(target_os = "linux")]
+pub fn create_child_shim() -> Result<std::fs::File, String> {
+    create_object(true)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn create_object(close_on_exec: bool) -> Result<std::fs::File, String> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+    let flags = libc::MFD_ALLOW_SEALING | if close_on_exec { libc::MFD_CLOEXEC } else { 0 };
+    // MFD_EXEC overrides vm.memfd_noexec=1 on 6.3+. Older kernels reject
+    // that flag; retry with the original executable memfd ABI.
+    let mut fd = unsafe { libc::memfd_create(c"openshell-accept-shim".as_ptr(), flags | 0x10) };
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        fd = unsafe { libc::memfd_create(c"openshell-accept-shim".as_ptr(), flags) };
+    }
+    if fd < 0 {
+        return Err(format!(
+            "create shim memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(SHIM_OBJECT)
+        .map_err(|error| format!("write shim memfd: {error}"))?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(format!(
+            "seal shim memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Check executable mapping before exporting LD_PRELOAD: some hosts
+    // prohibit execution of anonymous files even when creation succeeds.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SHIM_OBJECT.len(),
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(format!(
+            "map executable shim: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    unsafe {
+        libc::munmap(mapping, SHIM_OBJECT.len());
+    }
+    Ok(file)
 }
 
 /// Compose an `LD_PRELOAD` value that keeps any workload-supplied entries.
@@ -145,8 +126,6 @@ fn preload_contains(value: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt as _;
 
     /// The object is produced by a C compiler chosen at build time, so a
     /// misresolved cross-compiler yields a host-architecture object that the
@@ -180,75 +159,35 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("openshell-accept-shim-{name}"));
-        let _ = std::fs::remove_dir_all(&base);
-        base
-    }
-
     #[test]
-    #[cfg(unix)]
-    fn installing_creates_a_read_only_executable_object() {
-        let directory = scratch_dir("install");
-        let installed = install_object_at(&directory, b"shim-bytes").expect("install");
-
-        assert_eq!(installed, directory.join(FILE_NAME));
-        assert_eq!(std::fs::read(&installed).expect("read"), b"shim-bytes");
-        // The workload must be able to map it executable but never rewrite it.
-        let mode = std::fs::metadata(&installed)
-            .expect("stat")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o555);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn installing_twice_replaces_the_previous_object() {
-        // A sandbox restart re-materializes into a directory that may already
-        // hold a previous generation of the shim.
-        let directory = scratch_dir("reinstall");
-        install_object_at(&directory, b"old").expect("first install");
-        let installed = install_object_at(&directory, b"new").expect("second install");
-
-        assert_eq!(std::fs::read(&installed).expect("read"), b"new");
+    #[cfg(target_os = "linux")]
+    fn installed_object_cannot_be_replaced_or_rewritten() {
+        use std::io::Write as _;
+        let path = install_shim().expect("install sealed object");
+        assert_eq!(std::fs::read(&path).unwrap(), SHIM_OBJECT);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         assert_eq!(
-            std::fs::metadata(&installed)
-                .expect("stat")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o555
+            file.write(b"replacement").unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
         );
+        assert_eq!(
+            file.set_len(0).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(install_shim().unwrap(), path);
     }
 
     #[test]
-    #[cfg(unix)]
-    fn a_symlinked_directory_is_refused() {
-        // The directory lives on a workload-writable rootfs, so a redirect
-        // must never be followed into a path the workload chose.
-        let base = scratch_dir("symlink-dir");
-        std::fs::create_dir_all(base.join("real")).expect("create real");
-        let link = base.join("link");
-        std::os::unix::fs::symlink(base.join("real"), &link).expect("symlink");
-
-        let error = install_object_at(&link, b"shim-bytes").expect_err("must refuse");
-        assert!(error.contains("symlink"), "unexpected error: {error}");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_symlinked_target_file_is_refused() {
-        let directory = scratch_dir("symlink-file");
-        std::fs::create_dir_all(&directory).expect("create");
-        let target = directory.join("elsewhere");
-        std::fs::write(&target, b"victim").expect("write victim");
-        std::os::unix::fs::symlink(&target, directory.join(FILE_NAME)).expect("symlink");
-
-        let error = install_object_at(&directory, b"shim-bytes").expect_err("must refuse");
-        assert!(error.contains("symlink"), "unexpected error: {error}");
-        assert_eq!(std::fs::read(&target).expect("read"), b"victim");
+    #[cfg(target_os = "linux")]
+    fn one_child_cannot_change_the_next_launch_object() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let first = create_child_shim().unwrap();
+        first
+            .set_permissions(std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let second = create_child_shim().unwrap();
+        assert_ne!(second.metadata().unwrap().permissions().mode() & 0o444, 0);
+        assert_eq!(std::fs::read(install_shim().unwrap()).unwrap(), SHIM_OBJECT);
     }
 
     #[test]

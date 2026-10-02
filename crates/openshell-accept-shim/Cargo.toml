@@ -19,5 +19,8 @@ libc = "0.2"
 # conventions, including the per-target wrappers cargo-zigbuild installs.
 cc = "1"
 
+[dev-dependencies]
+object = { version = "0.37.3", default-features = false, features = ["read_core", "elf", "std"] }
+
 [lints]
 workspace = true

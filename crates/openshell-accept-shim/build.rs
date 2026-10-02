@@ -49,6 +49,47 @@ fn main() {
         .unwrap_or_else(|error| panic!("run C compiler {command:?}: {error}"));
     assert!(status.success(), "compile {SOURCE}: {status}");
 
+    println!("cargo:rerun-if-changed=tests/fixtures/cancellation.c");
+    let helper = out_dir.join("cancellation");
+    let status = compiler_command()
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-lc",
+            "tests/fixtures/cancellation.c",
+            "-o",
+        ])
+        .arg(&helper)
+        .status()
+        .expect("compile cancellation helper");
+    assert!(status.success(), "compile cancellation helper: {status}");
+    println!(
+        "cargo:rustc-env=OPENSHELL_CANCELLATION_HELPER={}",
+        helper.display()
+    );
+
+    println!("cargo:rerun-if-changed=tests/fixtures/other_preload.c");
+    let other = out_dir.join("other_preload.so");
+    let status = compiler_command()
+        .args([
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "tests/fixtures/other_preload.c",
+            "-o",
+        ])
+        .arg(&other)
+        .status()
+        .expect("compile other preload fixture");
+    assert!(status.success(), "compile other preload fixture: {status}");
+    println!(
+        "cargo:rustc-env=OPENSHELL_OTHER_PRELOAD={}",
+        other.display()
+    );
+
     verify_object_architecture(&object);
 
     println!("cargo:rustc-env=OPENSHELL_ACCEPT_SHIM={}", object.display());
@@ -62,7 +103,7 @@ fn main() {
 /// Guessing a cross prefix instead would pick a binary that is frequently
 /// absent on the build host.
 fn compiler_command() -> Command {
-    match cc::Build::new().cargo_metadata(false).try_get_compiler() {
+    match cc::Build::new().try_get_compiler() {
         Ok(compiler) => compiler.to_command(),
         Err(error) => panic!("locate a C compiler for the shim: {error}"),
     }

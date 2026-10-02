@@ -47,8 +47,6 @@ statically, or issue raw syscalls, and gains nothing it did not already have —
 it only loses the compatibility benefit. The enforcement boundary remains the
 broker's fail-closed behavior.
 
-This is why the library's location on disk carries no privilege weight.
-
 ## Coverage
 
 `LD_PRELOAD` interposes library symbols, not syscalls.
@@ -81,7 +79,7 @@ them is a bug:
 | --- | --- |
 | No `DT_NEEDED` | One build per architecture loads under both glibc and musl |
 | No `TEXTREL` | Avoids requiring SELinux `execmod`, the permission most likely denied to `container_t` |
-| Required `__errno_location` and weak `pthread_setcanceltype` references | Resolve from the workload's libc or already-loaded libpthread without adding a loader dependency |
+| Required `__errno_location` and `dl_iterate_phdr` references | Resolve from glibc or musl without a loader dependency |
 | Exactly two exported `FUNC` symbols, `accept` and `accept4` | Prevents accidental interposition of unrelated symbols such as `memcpy` |
 | ELF machine matches the Rust target | A host object loads nowhere, and the loader reports it as `cannot open shared object file` — indistinguishable from a policy denial |
 
@@ -96,61 +94,56 @@ header against `CARGO_CFG_TARGET_ARCH` and fails the build on a mismatch,
 because a misresolved compiler otherwise produces a valid object for the wrong
 architecture.
 
-The code performs no allocation, takes no locks, and cannot panic. When
-`getpeername` fails on an already-accepted connection it reports a zero-length
-address — what the kernel itself reports for an unnamed peer — rather than
-leaking the descriptor or failing an accept that has already succeeded.
+The shim resolves libc's `accept4` from the already-loaded ELF image that
+provides `__errno_location`, using `dl_iterate_phdr`. Delegating the blocking
+phase preserves libc's cancellation handling, including the accepted-fd race
+addressed by glibc BZ #12683. Peer lookup and error-path close use raw syscalls,
+which are not cancellation points. A failed peer lookup closes the descriptor
+and returns the kernel error; `ENOTCONN` becomes `ECONNABORTED` so a reset peer
+does not produce a successful accept with an unusable address. Invalid output
+pointers return `EFAULT` without userspace dereferences.
 
-The blocking accept phase preserves libc's pthread cancellation behavior by
-temporarily switching the caller to asynchronous cancellation, then restoring
-its previous cancellation type before querying the peer. Disabled cancellation
-remains disabled. The pthread symbol is weak so a single-threaded workload on
-older glibc does not need to load libpthread just to use the shim.
+## Installation and child environments
 
-Unix installation helpers and their tests are gated with `cfg(unix)`. The
-preload-composition helpers also compile in the Windows workspace checks.
+The sandbox probes installation only for a legacy read-only listener. It
+creates a sealed executable memfd instead of writing into the image's `/run`.
+This works with a non-root identity, a read-only rootfs, and noexec temporary
+mounts. There are no workload-selected pathname components or symlinks. Write,
+grow, shrink, and seal seals prevent changing its bytes. The boundary's private
+probe descriptor is close-on-exec.
 
-## Installation
+Each entrypoint or exec launch gets a fresh sealed memfd inode. Its descriptor
+remains close-on-exec in the boundary and is made inheritable only in its own
+forked child. The loader opens `/proc/self/fd/N`.
+A workload can close or chmod its own inode, but cannot replace the object or
+change permissions on the inode used by a later operator exec session.
+Anonymous inodes need no extra Landlock admission, so the shim does not create
+a restrictive user ruleset when the authored policy has none.
 
-`install_shim` materializes the embedded object at
-`/run/openshell-compat/accept_shim.so`. The sandbox calls it during startup,
-only when `listener.writes_disabled()` reports legacy mode.
+Installation checks executable mapping before setting `LD_PRELOAD`. It requests
+`MFD_EXEC` where supported and falls back to the pre-6.3 ABI on older kernels.
+A host that forbids executable memfds keeps the broker's fail-closed behavior;
+installation failure is non-fatal and logged.
 
-The path is constrained from both sides:
-
-- **Not under `/.openshell`.** The capability-free Landlock baseline grants each
-  top-level filesystem entry *except* the driver-owned `.openshell` hierarchy,
-  and a user ruleset can only narrow the baseline. A workload physically cannot
-  open a file there, so a library placed there could never be preloaded.
-- **Not under the supervisor CA tmpfs.** That mount is `noexec`, so the loader
-  cannot map an object from it.
-
-`/run` satisfies both. On Docker and Podman it is part of the workload's own
-writable, exec-capable rootfs. On Kubernetes the workload receives it as an
-`emptyDir{medium: Memory}` tmpfs, mounted `rw,seclabel,relatime` with no
-`noexec` and mode `1777`, so a non-root sandbox identity can create its own
-subdirectory there. No compute driver needs a packaging change: the object is
-embedded in the `openshell-sandbox` binary with `include_bytes!`.
-
-Installation creates the directory, writes through a temporary file, `rename`s
-it into place, then seals both the file and the directory to `0o555`. Symlinked
-directories and symlinked targets are refused rather than followed. Failure is
-non-fatal and logged as an OCSF `Config State Change` event — the sandbox starts
-without the library and keeps the broker's existing fail-closed behavior.
-
-`LD_PRELOAD` composition preserves any value the workload supplied and is
-idempotent, so a child that re-inherits the variable and spawns its own child
-does not accumulate duplicate entries.
+Both launch paths compose the shim after all environment sources have been
+applied, preserving the final provider, workload, or per-session override.
+Directly launched ELF binaries for a different class or architecture do not
+receive the shim. Descendants inherit ordinary `LD_PRELOAD` semantics: a child
+that closes the descriptor, hides `/proc`, or invokes a foreign-architecture
+loader must remove the shim entry itself. The boundary cannot check arbitrary
+descendant execs, and those loaders may otherwise emit a preload warning.
+Static and secure-execution loaders do not use the shim.
 
 ## Validation
 
-Validated on OpenShift 4.21 / RHCOS 9.6 (kernel `5.14.0-570.141.1.el9_6`,
-SELinux enforcing), against the `emptyDir{medium: Memory}` mount the Kubernetes
-workload actually receives, running as a non-root uid with
-`readOnlyRootFilesystem: true`, all capabilities dropped, and the
-`RuntimeDefault` seccomp profile: the object maps `r-xp` with zero AVC denials.
+Tests check the embedded target-compiler output for ELF target, no `DT_NEEDED`,
+no text relocations, a non-executable stack, exactly `accept` and `accept4`
+exports, and the expected libc references. Behavioral tests cover IPv4, IPv6,
+truncation, reset peers, invalid length pointers, accepted streams, and pthread
+cancellation, including coexistence with a provider preload defining `accept4`.
+C fixtures use the same resolved target compiler as the shim.
 
-When validating across architectures, check `e_machine` in the ELF header
-before drawing conclusions. A wrong-architecture object produces
-`cannot open shared object file` from the loader, which reads like an SELinux
-denial and is not one.
+Sandbox tests exercise a forced legacy listener with the real broker and
+preloaded CPython: a rejected raw address-bearing accept must leave its client
+queued for a subsequent shimmed accept. They also check connected DNS peer
+queries and shim access under unrestricted and restricted Landlock policies.

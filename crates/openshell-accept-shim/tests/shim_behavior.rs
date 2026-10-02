@@ -20,6 +20,8 @@ use std::io::{Error, Read as _, Write as _};
 use std::mem::{size_of, transmute};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::process::id as process_id;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
@@ -29,7 +31,7 @@ use libc::{
     sockaddr_in6, sockaddr_storage, socklen_t,
 };
 
-use openshell_accept_shim::{SHIM_OBJECT, install_object_at};
+use openshell_accept_shim::install_shim;
 
 type Accept4Fn = unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t, c_int) -> c_int;
 
@@ -43,10 +45,7 @@ struct Shim {
 
 impl Shim {
     fn load() -> Self {
-        let directory =
-            std::env::temp_dir().join(format!("openshell-shim-behavior-{}", process_id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let path = install_object_at(&directory, SHIM_OBJECT).expect("install shim object");
+        let path = install_shim().expect("install shim object");
 
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
             .expect("shim path has no interior NUL");
@@ -376,30 +375,48 @@ fn preloaded_accept_preserves_pthread_cancellation() {
     let directory =
         std::env::temp_dir().join(format!("openshell-shim-cancellation-{}", process_id()));
     std::fs::create_dir_all(&directory).expect("helper directory");
-    let object = install_object_at(&directory.join("shim"), SHIM_OBJECT).expect("install shim");
+    let file = openshell_accept_shim::create_child_shim().expect("child shim");
+    let object = format!("/proc/self/fd/{}", file.as_raw_fd());
     let executable = directory.join("cancellation");
-    let status = std::process::Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/cancellation.c"
-        ))
-        .arg("-o")
-        .arg(&executable)
-        .status()
-        .expect("compile cancellation helper");
-    assert!(status.success(), "compile cancellation helper: {status}");
+    let other_preload = directory.join("other_preload.so");
+    std::fs::write(
+        &other_preload,
+        include_bytes!(env!("OPENSHELL_OTHER_PRELOAD")),
+    )
+    .unwrap();
+    std::fs::write(
+        &executable,
+        include_bytes!(env!("OPENSHELL_CANCELLATION_HELPER")),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     for accept4 in [false, true] {
         for address in [false, true] {
             for disabled in [false, true] {
                 let args = [accept4, address, disabled].map(|flag| if flag { "1" } else { "0" });
                 // Pin the expected libc behavior before testing interposition.
-                for preload in [false, true] {
+                for preload in [0, 1, 2] {
                     let mut command = std::process::Command::new(&executable);
+                    let descriptor = file.as_raw_fd();
+                    unsafe {
+                        command.pre_exec(move || {
+                            if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                                return Err(Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
                     command.args(args).env_remove("LD_PRELOAD");
-                    if preload {
-                        command.env("LD_PRELOAD", &object);
+                    if preload > 0 {
+                        command.env(
+                            "LD_PRELOAD",
+                            if preload == 1 {
+                                object.clone()
+                            } else {
+                                format!("{object}:{}", other_preload.display())
+                            },
+                        );
                     }
                     let output = command.output().expect("run cancellation helper");
                     assert!(
@@ -411,4 +428,123 @@ fn preloaded_accept_preserves_pthread_cancellation() {
             }
         }
     }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_reset_peer_never_succeeds_with_an_empty_address() {
+    let pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                pending.client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const linger).cast(),
+                socklen_t::try_from(size_of::<libc::linger>()).unwrap(),
+            )
+        },
+        0
+    );
+    let peer = pending.client.local_addr().unwrap();
+    drop(pending.client);
+    let mut storage = [0u8; size_of::<sockaddr_storage>()];
+    let mut length = socklen_t::try_from(storage.len()).unwrap();
+    let result = unsafe {
+        (shim().accept4)(
+            pending.listener.as_raw_fd(),
+            storage.as_mut_ptr().cast(),
+            &raw mut length,
+            0,
+        )
+    };
+    let error = Error::last_os_error().raw_os_error();
+    if result >= 0 {
+        close(result);
+        // Older kernels can retain the peer after a queued reset. Success
+        // must still contain the address CPython expects to unpack.
+        assert_eq!(length as usize, size_of::<sockaddr_in>());
+        assert_eq!(u16::from_be_bytes([storage[2], storage[3]]), peer.port());
+    } else {
+        assert_eq!(result, -1);
+        assert_eq!(error, Some(libc::ECONNABORTED));
+    }
+}
+
+#[test]
+fn a_bad_length_pointer_returns_efault() {
+    // Isolate the old shim's invalid userspace write from the test runner.
+    const CHILD: &str = "OPENSHELL_SHIM_BAD_POINTER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "a_bad_length_pointer_returns_efault"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "bad pointer must return EFAULT, not crash"
+        );
+        return;
+    }
+    let pending = pending_connection(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    let mut storage = [0u8; size_of::<sockaddr_storage>()];
+    let result = unsafe {
+        (shim().accept4)(
+            pending.listener.as_raw_fd(),
+            storage.as_mut_ptr().cast(),
+            std::ptr::dangling_mut(),
+            0,
+        )
+    };
+    assert_eq!(result, -1);
+    assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::EFAULT));
+}
+
+#[test]
+fn embedded_object_has_no_loader_dependencies_or_unsafe_relocations() {
+    use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
+    let bytes = openshell_accept_shim::SHIM_OBJECT;
+    let elf = object::File::parse(bytes).unwrap();
+    let dynamic = elf.section_by_name(".dynamic").unwrap().data().unwrap();
+    for entry in dynamic.chunks_exact(16) {
+        let tag = u64::from_le_bytes(entry[..8].try_into().unwrap());
+        let value = u64::from_le_bytes(entry[8..].try_into().unwrap());
+        assert_ne!(tag, 1, "DT_NEEDED adds a libc dependency");
+        assert_ne!(tag, 22, "DT_TEXTREL needs SELinux execmod");
+        if tag == 30 {
+            assert_eq!(value & 4, 0, "DF_TEXTREL");
+        }
+    }
+    let mut exports = elf
+        .dynamic_symbols()
+        .filter(|symbol| symbol.is_definition() && symbol.kind() == object::SymbolKind::Text)
+        .map(|symbol| symbol.name().unwrap())
+        .collect::<Vec<_>>();
+    exports.sort_unstable();
+    assert_eq!(exports, ["accept", "accept4"]);
+    let mut imports = elf
+        .dynamic_symbols()
+        .filter(object::ObjectSymbol::is_undefined)
+        .map(|symbol| symbol.name().unwrap())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    imports.sort_unstable();
+    assert_eq!(imports, ["__errno_location", "dl_iterate_phdr"]);
+    let offset = usize::try_from(u64::from_le_bytes(bytes[32..40].try_into().unwrap())).unwrap();
+    let stride = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
+    let stack = (0..count)
+        .map(|index| &bytes[offset + index * stride..][..stride])
+        .find(|header| u32::from_le_bytes(header[..4].try_into().unwrap()) == 0x6474_e551)
+        .expect("GNU_STACK header");
+    assert_eq!(
+        u32::from_le_bytes(stack[4..8].try_into().unwrap()) & 1,
+        0,
+        "shim must not require an executable stack"
+    );
 }

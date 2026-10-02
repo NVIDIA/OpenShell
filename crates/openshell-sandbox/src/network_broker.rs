@@ -1120,6 +1120,10 @@ fn accept_socket(
         let source = duplicate_close_on_exec(entry.retained_preconnect()?.as_raw_fd())?;
         (entry.identity().inode, entry.metadata(), source)
     };
+    // Reject unsupported output before consuming a queued client connection.
+    if listener.writes_disabled() && notification.args[1] != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
     let slot = acquire_pending_accept_slot(&active_accepts)?;
     let worker_listener = Arc::clone(&listener);
     std::thread::Builder::new()
@@ -1602,7 +1606,10 @@ fn get_peer_name(
         // write it keeps the sockaddr store inside the workload's address
         // space, which needs no cross-process task-memory write and therefore
         // works on kernels without SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV.
-        SocketState::Local { .. } | SocketState::AcceptedLocal { .. } => {
+        SocketState::Local { .. }
+        | SocketState::AcceptedLocal { .. }
+        | SocketState::DnsTcp { .. }
+        | SocketState::DnsUdp { .. } => {
             return listener.respond_continue(notification.id);
         }
         _ => return Err(io::Error::from_raw_os_error(libc::ENOTCONN)),
@@ -2119,6 +2126,8 @@ mod tests {
         for (label, state) in [
             ("AcceptedLocal", SocketState::AcceptedLocal { peer }),
             ("Local", SocketState::Local { peer }),
+            ("DnsTcp", SocketState::DnsTcp { relay: peer }),
+            ("DnsUdp", SocketState::DnsUdp { relay: peer }),
         ] {
             let (registry, installed) = registry_with_state(state);
             let listener = fake_listener(ListenerMode::LegacyReadOnly);
@@ -2128,9 +2137,9 @@ mod tests {
                 getpeername_notification(installed.as_raw_fd()),
             )
             .expect_err("the fake listener cannot complete any ioctl");
-            assert_ne!(
+            assert_eq!(
                 error.raw_os_error(),
-                Some(libc::EOPNOTSUPP),
+                Some(libc::ENOTTY),
                 "{label} must not route through the fail-closed task-memory write"
             );
         }
@@ -2257,11 +2266,11 @@ mod tests {
     #[test]
     fn killable_outbound_getpeername_returns_the_original_destination() {
         let result = mediated_outbound_peer(ListenerMode::Killable);
-        if let Err(error) = &result {
-            if error.kind() == io::ErrorKind::Unsupported {
-                eprintln!("skipping modern peer substitution: {error}");
-                return;
-            }
+        if let Err(error) = &result
+            && error.kind() == io::ErrorKind::Unsupported
+        {
+            eprintln!("skipping modern peer substitution: {error}");
+            return;
         }
         let peer = result.expect("modern outbound getpeername succeeds");
         assert_eq!(peer, "203.0.113.7:443".parse().unwrap());
@@ -2533,6 +2542,47 @@ mod tests {
         stream.read_exact(&mut payload).expect("read Unix payload");
         assert_eq!(&payload, b"unix");
         client.join().expect("join client").expect("Unix client");
+    }
+
+    #[test]
+    fn legacy_preloaded_accept_preserves_a_client_rejected_by_raw_accept() {
+        let (launcher, installed) =
+            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let descriptor = duplicate_close_on_exec(installed.as_raw_fd()).unwrap();
+        let listener =
+            NotificationListener::from_fd_with_mode(descriptor, ListenerMode::LegacyReadOnly);
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let mut command = std::process::Command::new("python3");
+        crate::child_env::apply_preload_for_child(&mut command, false);
+        command.args([
+            "-c",
+            r"
+import ctypes, errno, socket, platform
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+s.listen(4)
+c = socket.socket()
+c.connect(s.getsockname())
+libc = ctypes.CDLL(None, use_errno=True)
+address = ctypes.create_string_buffer(128)
+length = ctypes.c_uint(128)
+number = 288 if platform.machine() == 'x86_64' else 242
+result = libc.syscall(number, s.fileno(), ctypes.byref(address), ctypes.byref(length), 0)
+assert result == -1 and ctypes.get_errno() == errno.EOPNOTSUPP
+conn, peer = s.accept()
+assert peer == c.getsockname() == conn.getpeername()
+conn.sendall(b'ping')
+assert c.recv(4) == b'ping'
+print('legacy accept passed', flush=True)
+",
+        ]);
+        let output = launcher.execute(move || command.output()).unwrap().unwrap();
+        assert!(
+            output.status.success(),
+            "legacy preload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"legacy accept passed\n");
     }
 
     #[test]

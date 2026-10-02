@@ -21,31 +21,133 @@
 // Both halves are required: without the broker's CONTINUE for `getpeername`
 // step 2 fails closed for the same reason step 1 did.
 //
-// Raw syscalls are used rather than dlsym(RTLD_NEXT, ...) so the object needs
-// no DT_NEEDED entry and no loader-visible libc dependency. One build per
-// architecture therefore loads correctly under both glibc and musl. Both
-// export `__errno_location`. The weak `pthread_setcanceltype` reference also
-// resolves from libc or an already-loaded libpthread, but does not require
-// loading libpthread in a single-threaded workload on older glibc.
-//
-// Interposing here covers runtimes that call these functions through the
-// PLT (CPython, Node, Bun, and anything else dynamically linked against
-// libc). It cannot cover statically linked binaries or programs that issue
-// the syscall instruction directly; those remain subject to the broker's
-// fail-closed behavior.
+// Delegate the blocking call to libc's accept4 wrapper. Its cancellation
+// assembly distinguishes a cancelled syscall from one that already returned
+// an fd (glibc BZ #12683). Switching to asynchronous cancellation around a raw
+// syscall cannot make that distinction and can leak the accepted descriptor.
+// Resolve the wrapper from loaded ELF objects without dlsym: older glibc puts
+// dlsym in libdl, while dl_iterate_phdr is provided by both glibc and musl.
+// ELF64 ABI definitions: keeping this source header-free lets the release
+// compiler build it with -nostdlib, without selecting a libc sysroot.
+typedef unsigned long size_t;
+typedef unsigned long ElfAddr;
+typedef struct {
+    unsigned int p_type, p_flags;
+    unsigned long p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+} ElfPhdr;
+typedef struct {
+    long d_tag;
+    union { unsigned long d_ptr, d_val; } d_un;
+} ElfDyn;
+typedef struct {
+    unsigned int st_name;
+    unsigned char st_info, st_other;
+    unsigned short st_shndx;
+    unsigned long st_value, st_size;
+} ElfSym;
+// The first four fields are the stable dl_iterate_phdr ABI on glibc and musl.
+struct dl_phdr_info {
+    ElfAddr dlpi_addr;
+    const char *dlpi_name;
+    const ElfPhdr *dlpi_phdr;
+    unsigned short dlpi_phnum;
+};
+extern int dl_iterate_phdr(int (*)(struct dl_phdr_info *, size_t, void *), void *);
+#define PT_LOAD 1
+#define PT_DYNAMIC 2
+#define DT_NULL 0
+#define DT_HASH 4
+#define DT_STRTAB 5
+#define DT_SYMTAB 6
+#define DT_GNU_HASH 0x6ffffef5
+#define SHN_UNDEF 0
+#define STT_FUNC 2
 
 typedef unsigned int shim_socklen_t;
-
 extern int *__errno_location(void);
-extern int pthread_setcanceltype(int, int *) __attribute__((weak));
+int accept4(int, void *, shim_socklen_t *, int);
+typedef int (*accept4_fn)(int, void *, shim_socklen_t *, int);
+static accept4_fn libc_accept4;
 
-// glibc and musl both use 1 for PTHREAD_CANCEL_ASYNCHRONOUS.
-#define SHIM_CANCEL_ASYNCHRONOUS 1
+static unsigned long dynamic_pointer(unsigned long base, unsigned long value) {
+    // glibc relocates these pointers; musl leaves them relative to the DSO.
+    return value < base ? base + value : value;
+}
+
+static int find_accept4(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    (void)data;
+    // Resolve only inside the DSO providing libc's errno accessor. Selecting
+    // an arbitrary provider preload's accept4 can recurse back through accept
+    // and need not preserve libc cancellation semantics.
+    int is_libc = 0;
+    for (unsigned int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfPhdr *segment = info->dlpi_phdr + i;
+        unsigned long start = info->dlpi_addr + segment->p_vaddr;
+        if (segment->p_type == PT_LOAD && (unsigned long)__errno_location >= start &&
+            (unsigned long)__errno_location - start < segment->p_memsz) is_libc = 1;
+    }
+    if (!is_libc) return 0;
+    const ElfDyn *dynamic = 0;
+    for (unsigned int i = 0; i < info->dlpi_phnum; ++i) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dynamic = (const ElfDyn *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dynamic) return 0;
+    const ElfSym *symbols = 0;
+    const char *strings = 0;
+    const unsigned int *hash = 0;
+    const unsigned int *gnu_hash = 0;
+    for (; dynamic->d_tag != DT_NULL; ++dynamic) {
+        unsigned long pointer = dynamic_pointer(info->dlpi_addr, dynamic->d_un.d_ptr);
+        if (dynamic->d_tag == DT_SYMTAB) symbols = (const ElfSym *)pointer;
+        if (dynamic->d_tag == DT_STRTAB) strings = (const char *)pointer;
+        if (dynamic->d_tag == DT_HASH) hash = (const unsigned int *)pointer;
+        if (dynamic->d_tag == DT_GNU_HASH) gnu_hash = (const unsigned int *)pointer;
+    }
+    if (!symbols || !strings) return 0;
+    unsigned int count = 0;
+    if (hash) {
+        count = hash[1];
+    } else if (gnu_hash) {
+        // The last nonempty GNU hash bucket ends at the highest symbol index.
+        const unsigned int *buckets = (const unsigned int *)
+            ((const ElfAddr *)(gnu_hash + 4) + gnu_hash[2]);
+        const unsigned int *chains = buckets + gnu_hash[0];
+        unsigned int last = 0;
+        for (unsigned int i = 0; i < gnu_hash[0]; ++i)
+            if (buckets[i] > last) last = buckets[i];
+        if (last) {
+            count = last;
+            while (!(chains[count - gnu_hash[1]] & 1)) ++count;
+            ++count;
+        }
+    }
+    for (unsigned int i = 0; i < count; ++i) {
+        const ElfSym *symbol = symbols + i;
+        if (symbol->st_shndx == SHN_UNDEF || (symbol->st_info & 15) != STT_FUNC)
+            continue;
+        const char *name = strings + symbol->st_name;
+        const char wanted[] = "accept4";
+        unsigned int j = 0;
+        while (name[j] && name[j] == wanted[j]) ++j;
+        if (name[j] != wanted[j]) continue;
+        accept4_fn candidate = (accept4_fn)(info->dlpi_addr + symbol->st_value);
+        libc_accept4 = candidate;
+        return 1;
+    }
+    return 0;
+}
+
+__attribute__((constructor)) static void resolve_accept4(void) {
+    dl_iterate_phdr(find_accept4, 0);
+}
 
 #if defined(__x86_64__)
-#define SHIM_NR_ACCEPT 43
+#define SHIM_NR_CLOSE 3
 #define SHIM_NR_GETPEERNAME 52
-#define SHIM_NR_ACCEPT4 288
 
 static long shim_syscall3(long number, long a0, long a1, long a2) {
     long result;
@@ -56,20 +158,9 @@ static long shim_syscall3(long number, long a0, long a1, long a2) {
     return result;
 }
 
-static long shim_syscall4(long number, long a0, long a1, long a2, long a3) {
-    long result;
-    register long r10 __asm__("r10") = a3;
-    __asm__ volatile("syscall"
-                     : "=a"(result)
-                     : "a"(number), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
-                     : "rcx", "r11", "memory");
-    return result;
-}
-
 #elif defined(__aarch64__)
-#define SHIM_NR_ACCEPT 202
+#define SHIM_NR_CLOSE 57
 #define SHIM_NR_GETPEERNAME 205
-#define SHIM_NR_ACCEPT4 242
 
 static long shim_syscall4(long number, long a0, long a1, long a2, long a3) {
     register long x8 __asm__("x8") = number;
@@ -102,42 +193,27 @@ static int shim_finish(long result) {
     return (int)result;
 }
 
-// libc's accept wrappers are cancellation points. Temporarily enabling
-// asynchronous cancellation gives the raw blocking syscall the same behavior,
-// including cancellation already pending on entry. Preserve cancellation state
-// (a disabled caller stays disabled) and restore the caller's type immediately
-// after the syscall, before reporting the peer address.
-static long shim_cancellable_accept4(int sockfd, int flags) {
-    int old_type = 0;
-    int changed = pthread_setcanceltype != 0 &&
-                  pthread_setcanceltype(SHIM_CANCEL_ASYNCHRONOUS, &old_type) == 0;
-    long accepted = shim_syscall4(SHIM_NR_ACCEPT4, sockfd, 0, 0, flags);
-    if (changed) {
-        pthread_setcanceltype(old_type, 0);
-    }
-    return accepted;
-}
-
 static int shim_accept4(int sockfd, void *addr, shim_socklen_t *addrlen,
                         int flags) {
     // Without an output buffer the broker's existing path already works, so
     // forward unchanged and preserve its exact semantics.
-    if (addr == 0 || addrlen == 0) {
-        return shim_finish(shim_cancellable_accept4(sockfd, flags));
+    if (!libc_accept4) {
+        return shim_finish(-95); // EOPNOTSUPP: unsupported dynamic loader.
     }
-
-    long accepted = shim_cancellable_accept4(sockfd, flags);
+    int accepted = libc_accept4(sockfd, 0, 0, flags);
     if (accepted < 0) {
-        return shim_finish(accepted);
+        return accepted;
     }
 
-    // The connection is already established; a failure to report its address
-    // must not leak the descriptor or fail the accept. Report a zero-length
-    // address instead, which is the same thing the kernel reports for an
-    // unnamed peer, rather than leaving the caller's buffer undefined.
-    if (shim_syscall3(SHIM_NR_GETPEERNAME, accepted, (long)addr,
-                      (long)addrlen) < 0) {
-        *addrlen = 0;
+    if (addr != 0) {
+        long result = shim_syscall3(SHIM_NR_GETPEERNAME, accepted, (long)addr,
+                                   (long)addrlen);
+        if (result < 0) {
+            // Never dereference output pointers in userspace. The kernel
+            // reports EFAULT, and a reset queued peer may report ENOTCONN.
+            shim_syscall3(SHIM_NR_CLOSE, accepted, 0, 0);
+            return shim_finish(result == -107 ? -103 : result); // ENOTCONN -> ECONNABORTED
+        }
     }
     return (int)accepted;
 }
