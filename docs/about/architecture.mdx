@@ -91,6 +91,12 @@ The mediated channel to the **supervisor** is the workload's only allowed egress
 path. The outer fence denies everything else, so the agent can't reach a
 service, the gateway, DNS, or another private address directly.
 
+### Keep Credential References Current
+
+The supervisor gives the workload a credential reference and resolves it only when an authorized request leaves the sandbox. Gateway-managed refresh already keeps that reference stable as tokens rotate. Ordinary static credentials use revision-scoped references, so a running client can keep using an older value after a provider update.
+
+For an externally rotated credential, a provider profile can enable [`stable_placeholder`](/how-it-works/providers/profiles#keep-an-externally-updated-placeholder-stable). After the supervisor applies a value-only update, the client's existing reference uses the new value. The handle remains bound to the sandbox, provider instance, credential key, and authorized endpoint. Replacement or a binding change revokes access to the replacement credential; expiry and an applied detach stop resolution. The real credential remains with the supervisor.
+
 ## How Each Runtime Builds the Boundary
 
 Every runtime follows the same contract, but each one uses the tools it already

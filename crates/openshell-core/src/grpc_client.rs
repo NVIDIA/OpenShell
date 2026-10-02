@@ -1068,6 +1068,19 @@ pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
 ) -> Result<ProviderEnvironmentResult> {
+    fetch_provider_environment_with_stable_placeholders(endpoint, sandbox_id, false).await
+}
+
+/// Fetch a snapshot without downgrading previously activated external stable credentials.
+///
+/// Ordinary credentials remain compatible with gateways predating stable delivery.
+/// Callers retain the requirement across refresh failures until an acknowledged
+/// snapshot removes the last external stable credential.
+pub async fn fetch_provider_environment_with_stable_placeholders(
+    endpoint: &str,
+    sandbox_id: &str,
+    requires_stable_placeholders: bool,
+) -> Result<ProviderEnvironmentResult> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -1076,18 +1089,28 @@ pub async fn fetch_provider_environment(
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
             supports_static_credential_bindings: true,
+            supports_stable_placeholder_environment_keys: true,
         })
         .await
         .map_err(grpc_status_error)?;
 
-    provider_environment_result(response.into_inner())
+    provider_environment_result(response.into_inner(), requires_stable_placeholders)
 }
 
 /// Preserve snapshot authority and reject invalid credential expiration times.
 /// Unknown delivery reasons withhold credentials rather than implying readiness.
+/// A gateway must acknowledge stable delivery until a successful snapshot removes it.
 fn provider_environment_result(
     inner: GetSandboxProviderEnvironmentResponse,
+    requires_stable_placeholders: bool,
 ) -> Result<ProviderEnvironmentResult> {
+    // An empty stable-key list cannot distinguish an acknowledged detach from
+    // an older gateway silently discarding the activated delivery requirement.
+    if !inner.supports_stable_placeholder_environment_keys
+        && (requires_stable_placeholders || !inner.stable_placeholder_environment_keys.is_empty())
+    {
+        miette::bail!("gateway does not support the required stable credential placeholders");
+    }
     let credential_expires_at_ms = inner
         .credential_expiration_times
         .iter()
@@ -1109,30 +1132,112 @@ fn provider_environment_result(
         dynamic_credentials: inner.dynamic_credentials,
         static_credential_bindings: inner.static_credential_bindings,
         non_secret_environment_keys: inner.non_secret_environment_keys,
+        stable_placeholder_environment_keys: inner.stable_placeholder_environment_keys,
     })
 }
 
 #[cfg(test)]
 mod provider_environment_tests {
     use super::*;
+    use crate::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use prost::Message;
 
     #[test]
-    fn provider_environment_preserves_readiness_identity() {
-        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
+    fn stable_placeholder_gateway_ack_preserves_legacy_compatibility() {
+        let response = GetSandboxProviderEnvironmentResponse {
             environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
-            provider_env_revision: 42,
-            provider_attachment_epoch: "attachment-epoch".to_string(),
-            policy_hash: "binding-policy".to_string(),
-            readiness_reason: crate::proto::ProviderReadinessReason::CredentialsWithheld.into(),
-            credential_expiration_times: HashMap::from([(
+            static_credential_bindings: HashMap::from([(
                 "TOKEN".to_string(),
-                prost_types::Timestamp {
-                    seconds: 1_900_000_000,
-                    nanos: 123_000_000,
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider:TOKEN".to_string(),
+                    ..Default::default()
                 },
             )]),
             ..Default::default()
-        })
+        };
+        // Legacy wire responses omit field 12. Also test an explicit false value
+        // rather than relying only on a locally constructed default message.
+        let absent = response.encode_to_vec();
+        let mut explicit_false = absent.clone();
+        explicit_false.extend_from_slice(&[0x60, 0x00]);
+        for encoded in [absent, explicit_false] {
+            let decoded = GetSandboxProviderEnvironmentResponse::decode(encoded.as_slice())
+                .expect("provider response wire format");
+            assert!(provider_environment_result(decoded.clone(), false).is_ok());
+            assert!(provider_environment_result(decoded, true).is_err());
+        }
+        assert!(
+            provider_environment_result(GetSandboxProviderEnvironmentResponse::default(), false)
+                .is_ok()
+        );
+        assert!(
+            provider_environment_result(GetSandboxProviderEnvironmentResponse::default(), true)
+                .is_err()
+        );
+
+        let mut declared_stable = response.clone();
+        declared_stable.stable_placeholder_environment_keys = vec!["TOKEN".to_string()];
+        assert!(provider_environment_result(declared_stable, false).is_err());
+
+        // Managed refresh handles predate this external opt-in and do not
+        // require the new capability merely because they use opaque handles.
+        let mut managed_refresh = response;
+        managed_refresh
+            .static_credential_bindings
+            .get_mut("TOKEN")
+            .expect("binding")
+            .workload_credential_handle = "managed-refresh-handle".to_string();
+        assert!(provider_environment_result(managed_refresh, false).is_ok());
+    }
+
+    #[test]
+    fn stable_placeholder_gateway_ack_preserves_environment_metadata() {
+        for stable_keys in [Vec::new(), vec!["TOKEN".to_string()]] {
+            let response = GetSandboxProviderEnvironmentResponse {
+                environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+                provider_env_revision: 42,
+                stable_placeholder_environment_keys: stable_keys.clone(),
+                supports_stable_placeholder_environment_keys: true,
+                ..Default::default()
+            };
+            let result =
+                provider_environment_result(response, true).expect("acknowledged delivery");
+            assert_eq!(result.provider_env_revision, 42);
+            assert_eq!(result.stable_placeholder_environment_keys, stable_keys);
+            assert!(
+                result
+                    .environment
+                    .get("TOKEN")
+                    .is_some_and(|value| value == "synthetic")
+            );
+        }
+    }
+
+    #[test]
+    fn provider_environment_preserves_readiness_identity() {
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+                provider_env_revision: 42,
+                provider_attachment_epoch: "attachment-epoch".to_string(),
+                policy_hash: "binding-policy".to_string(),
+                readiness_reason: crate::proto::ProviderReadinessReason::CredentialsWithheld.into(),
+                credential_expiration_times: HashMap::from([(
+                    "TOKEN".to_string(),
+                    prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: 123_000_000,
+                    },
+                )]),
+                ..Default::default()
+            },
+            false,
+        )
         .expect("valid provider environment");
         assert_eq!(result.provider_env_revision, 42);
         assert_eq!(result.provider_attachment_epoch, "attachment-epoch");
@@ -1153,11 +1258,14 @@ mod provider_environment_tests {
 
     #[test]
     fn provider_readiness_unknown_delivery_reason_is_withheld() {
-        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
-            policy_hash: "binding-policy".to_string(),
-            readiness_reason: i32::MAX,
-            ..Default::default()
-        })
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                policy_hash: "binding-policy".to_string(),
+                readiness_reason: i32::MAX,
+                ..Default::default()
+            },
+            false,
+        )
         .expect("valid provider environment");
         assert_eq!(
             result.readiness_reason,
@@ -1167,16 +1275,19 @@ mod provider_environment_tests {
 
     #[test]
     fn provider_environment_rejects_invalid_credential_expiration() {
-        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
-            credential_expiration_times: HashMap::from([(
-                "TOKEN".to_string(),
-                prost_types::Timestamp {
-                    seconds: 1_900_000_000,
-                    nanos: -1,
-                },
-            )]),
-            ..Default::default()
-        });
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                credential_expiration_times: HashMap::from([(
+                    "TOKEN".to_string(),
+                    prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: -1,
+                    },
+                )]),
+                ..Default::default()
+            },
+            false,
+        );
         assert!(result.is_err());
     }
 }
@@ -1376,6 +1487,9 @@ pub struct ProviderEnvironmentResult {
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
     pub non_secret_environment_keys: Vec<String>,
+    /// Credential keys whose stable opaque handles are explicitly authorized
+    /// by the gateway's endpoint bindings.
+    pub stable_placeholder_environment_keys: Vec<String>,
 }
 
 pub struct ProviderSubjectTokenExchangeResult {

@@ -128,12 +128,18 @@ mod tests {
     // the additive file map while retaining the rest of the response.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Stable placeholders add a stored credential flag whose absent value is
+    // false. Capability negotiation and delivered key lists are public-only;
+    // the set of shared message and enum types remains unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "c363b716dec5c9ca6c9154f28a6ef43d5c79dbe696f2388828748abc4ee54265";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "ba08a016c14fe5d5485751d55d630f3c201f60e995913f8001de63dce0568da5";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+    // Encoded with the schema that omitted stable_placeholder. Keep these
+    // bytes fixed so the current encoder cannot hide a compatibility change.
+    const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -666,6 +672,23 @@ mod tests {
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {
         hex::decode(encoded).expect("checked-in legacy fixture must be valid hex")
+    }
+
+    #[test]
+    fn legacy_stored_profile_preserves_revision_scoped_credentials() {
+        let bytes = legacy_bytes(LEGACY_STATIC_PROFILE);
+        let stored = StoredProviderProfile::decode(bytes.as_slice())
+            .expect("legacy static profile must decode");
+        assert_eq!(stored.encode_to_vec(), bytes);
+        let profile = stored.profile.expect("profile");
+        assert_eq!(profile.id, "legacy-static");
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "api_key");
+        assert_eq!(credential.env_vars, ["SYNTHETIC_API_KEY"]);
+        assert!(credential.required);
+        assert_eq!(credential.auth_style, "bearer");
+        assert!(!credential.stable_placeholder);
     }
 
     #[test]
