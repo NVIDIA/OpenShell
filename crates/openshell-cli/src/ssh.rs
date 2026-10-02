@@ -2232,18 +2232,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn interactive_signal_workload_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_SIGNAL_WAIT_MARKER") else {
+            return;
+        };
+        // Only publish readiness after exec has reset the parent's caught
+        // signal dispositions. No external utility filename is assumed.
+        fs::write(marker, std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn interactive_signal_wait_child() {
         let Some(marker) = std::env::var_os("OPENSHELL_SIGNAL_WAIT_MARKER") else {
             return;
         };
         let mut command = Command::new("sh");
         command
+            .args(["-c", "ulimit -c 0; exec \"$@\"", "signal-probe"])
+            .arg(std::env::current_exe().unwrap())
             .args([
-                "-c",
-                "ulimit -c 0; printf '%s' $$ > \"$1\"; exec sleep 30",
-                "signal-probe",
+                "--exact",
+                "ssh::tests::interactive_signal_workload_child",
+                "--nocapture",
             ])
-            .arg(marker)
+            .env("OPENSHELL_SIGNAL_WAIT_MARKER", marker)
             .stdin(Stdio::inherit());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2287,8 +2301,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(pid) = fs::read_to_string(&marker)
-                    && let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe"))
-                    && executable.file_name().is_some_and(|name| name == "sleep")
+                    && pid.parse::<u32>().is_ok()
                 {
                     break;
                 }

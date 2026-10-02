@@ -232,6 +232,7 @@ fn apply_canonical_process_environment(
 
 static BOUNDARY_USER_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 pub(crate) fn install_boundary_user_environment(
     environment: HashMap<String, String>,
 ) -> Result<(), String> {
