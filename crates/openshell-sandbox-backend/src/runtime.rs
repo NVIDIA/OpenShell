@@ -165,6 +165,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             })?;
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
+        let direct_proxy = runtime_descriptor.direct_proxy.clone();
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
@@ -195,6 +196,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             sandbox_id: sandbox.sandbox_id,
             mediation: Arc::new(RemoteNetworkMediation { client }),
             host_gateway_ip,
+            direct_proxy,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
             identity: sandbox.identity,
@@ -264,6 +266,18 @@ fn validate_runtime_descriptor(
         }
     }
     validate_client_tls(&runtime_descriptor.tls)?;
+    if let Some(proxy) = &runtime_descriptor.direct_proxy
+        && (!proxy.bind_addr.ip().is_loopback()
+            || proxy.bind_addr.port() == 0
+            || proxy.authorization.trim().is_empty()
+            || proxy.authorization.contains(['\r', '\n'])
+            || !proxy.binary_identity.executable.path.is_absolute())
+    {
+        return Err(BackendError::Descriptor(
+            "direct proxy requires a loopback listener, a single-line authorization value, and an absolute binary identity"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -341,6 +355,7 @@ struct RemoteBound {
     sandbox_id: String,
     mediation: Arc<RemoteNetworkMediation>,
     host_gateway_ip: Option<std::net::IpAddr>,
+    direct_proxy: Option<openshell_isolation_interface::contract::DirectProxyConfiguration>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
@@ -358,6 +373,12 @@ impl BoundBoundary for RemoteBound {
 
     fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
         self.host_gateway_ip
+    }
+
+    fn direct_proxy_configuration(
+        &self,
+    ) -> Option<openshell_isolation_interface::contract::DirectProxyConfiguration> {
+        self.direct_proxy.clone()
     }
 
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
@@ -2839,6 +2860,7 @@ mod tests {
             },
             tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         }
@@ -3102,6 +3124,7 @@ mod tests {
             },
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3122,6 +3145,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3144,6 +3168,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3166,6 +3191,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3474,6 +3500,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
             },
@@ -3667,6 +3694,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
             },

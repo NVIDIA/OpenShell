@@ -9,8 +9,6 @@
 //! aggregate them.
 
 mod google_cloud_metadata;
-#[cfg(target_os = "windows")]
-pub mod host;
 pub mod identity;
 pub mod identity_source;
 pub mod l7;

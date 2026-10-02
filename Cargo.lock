@@ -4475,13 +4475,17 @@ dependencies = [
 name = "openshell-driver-mxc"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "futures",
  "noyalib",
  "openshell-core",
+ "openshell-isolation-interface",
+ "openshell-mxc-boundary",
  "openshell-ocsf",
  "openshell-policy",
- "openshell-supervisor-network",
+ "openshell-sandbox-backend",
+ "rand 0.9.4",
  "rustls",
  "serde",
  "serde_json",
@@ -4685,6 +4689,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-mxc-boundary"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "openshell-core",
+ "openshell-isolation-interface",
+ "openshell-ocsf",
+ "openshell-sandbox-backend",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "windows",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -4836,6 +4864,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -5012,6 +5041,7 @@ dependencies = [
  "openshell-core",
  "openshell-extension-core",
  "openshell-isolation-interface",
+ "openshell-mxc-boundary",
  "openshell-ocsf",
  "openshell-otel",
  "openshell-policy",

@@ -468,12 +468,21 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
+
+# Fail closed if the observed sandbox was replaced or changed
+openshell sandbox delete my-sandbox \
+  --expected-id <sandbox-id> \
+  --expected-resource-version <resource-version>
 ```
 
 `deletion accepted` means cleanup is still pending. Inspect the sandbox until
 it disappears before assuming completion. An already-absent sandbox succeeds;
 missing workspaces and authorization failures remain errors. Do not blindly
 retry by name if another process might have recreated that name.
+
+Identity preconditions are valid only for one named sandbox, and a resource
+version requires the immutable ID. A mismatch returns `ABORTED` before
+OpenShell mutates gateway state or calls the compute driver.
 
 ### Stop and start sandboxes
 
@@ -506,7 +515,7 @@ for verification behavior and release compatibility.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`, `ui`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload
@@ -521,6 +530,11 @@ configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
 wait timeout is separate from this gateway deadline. Follow the
 published [policy repair guidance](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
 and confirm current replacement/detach syntax with installed CLI help.
+
+UI capabilities require a driver/backend advertising complete UI-policy support.
+MXC's `process_container` backend enforces them at provisioning; changing UI
+capabilities after activation requires recreating the sandbox. Backends without
+UI-policy support reject an explicit UI section before provisioning.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -593,7 +607,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, `process`, or `ui` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in

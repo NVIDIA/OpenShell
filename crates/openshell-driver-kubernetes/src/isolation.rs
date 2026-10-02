@@ -289,6 +289,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 },
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
+                direct_proxy: None,
                 resource_claims,
                 outer_fence,
             },

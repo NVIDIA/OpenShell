@@ -758,6 +758,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn signaling_without_boundary_is_rejected() {
         let session = MainSession::inert();

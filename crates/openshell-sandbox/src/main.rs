@@ -1797,7 +1797,9 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
-    Err(miette::miette!("openshell-sandbox requires Linux"))
+    Err(miette::miette!(
+        "openshell-sandbox requires Linux; use openshell-windows-sandbox on Windows"
+    ))
 }
 
 fn main() -> Result<()> {

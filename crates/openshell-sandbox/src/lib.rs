@@ -51,11 +51,10 @@ pub struct RuntimeQualification {
     pub socket_loopback_confinement: bool,
 }
 
-/// Placeholder used when compiling the package on a non-Linux host.
+/// Linux runtime qualification is not used on other platforms.
 ///
-/// The sandbox binary rejects execution on those hosts before constructing a
-/// qualification, but retaining the type keeps the library API portable for
-/// workspace-wide checks.
+/// This executable's boundary mode requires Linux. Windows MXC uses the separate
+/// `openshell-windows-sandbox` executable and its platform-specific confirmation.
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeQualification;

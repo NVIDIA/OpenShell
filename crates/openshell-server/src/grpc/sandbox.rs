@@ -5805,6 +5805,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    ..Default::default()
                 }),
             )
             .await
