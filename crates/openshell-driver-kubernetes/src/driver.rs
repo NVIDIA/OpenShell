@@ -3719,7 +3719,12 @@ impl KubernetesComputeDriver {
             };
             let workload_may_run = sandbox_runtime_should_run(&object)
                 || sandbox_runtime_bootstrap_in_progress(&object);
+            // Preparing generations have not committed their fence identity yet.
+            // The expected fence was verified above; the bootstrap branch below
+            // retains the age limit until the creator publishes the binding.
             if workload_may_run
+                && sandbox_runtime_bootstrap_phase(&object)
+                    != Some(SandboxRuntimeBootstrapPhase::Preparing)
                 && !sandbox_runtime_namespace_fence_generation_matches(&fence, &object)
             {
                 warn!(
@@ -11747,5 +11752,170 @@ mod tests {
         assert!(!sandbox_runtime_should_run(&alpha));
         alpha.data = serde_json::json!({"spec": {"replicas": 1}});
         assert!(sandbox_runtime_should_run(&alpha));
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_reconciliation_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    // This is the real CR state between create_sandbox_inner and the identity
+    // publication in create_sandbox_runtime_companions. The creator owns this
+    // fresh, gated generation, but its fence binding is not published yet.
+    async fn reconcile_bootstrap_fixture(
+        phase: &str,
+        age: Duration,
+        alter_policy: bool,
+    ) -> Vec<serde_json::Value> {
+        let names = SandboxRuntimeNames::new("race-id");
+        let fences = workload_fence("openshell", &names, 5500);
+        let mut workload = fences.workload_policy;
+        workload.metadata.uid = Some("fence-uid".into());
+        workload.metadata.generation = Some(1);
+        if alter_policy {
+            workload.spec.as_mut().unwrap().policy_types = Some(vec!["Ingress".into()]);
+        }
+        let mut supervisor = fences.supervisor_policy;
+        supervisor.metadata.uid = Some("supervisor-fence-uid".into());
+        supervisor.metadata.generation = Some(1);
+        for (policy, component) in [
+            (&mut workload, "sandbox-workload-fence"),
+            (&mut supervisor, "sandbox-supervisor-egress"),
+        ] {
+            let labels = policy.metadata.labels.get_or_insert_default();
+            labels.insert(
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            );
+            labels.insert("openshell.ai/component".to_string(), component.to_string());
+        }
+        let sandbox = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+            "metadata": {
+                "name": "race-cr", "namespace": "openshell", "uid": "race-uid",
+                "resourceVersion": "42",
+                "labels": {LABEL_SANDBOX_ID: "race-id", LABEL_SANDBOX_WORKSPACE: "default"},
+                "annotations": {
+                    crate::resource_admission::CONFIG_USED: "false",
+                    crate::resource_admission::IDENTITIES: "{}",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: phase,
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "create",
+                    ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: (openshell_core::time::now_ms() - i64::try_from(age.as_millis()).unwrap()).to_string()
+                }
+            },
+            "spec": {"operatingMode": "Running", "podTemplate": {"spec": {
+                "automountServiceAccountToken": false,
+                "volumes": [{"name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
+                    "secret": {"secretName": "os-sandbox-race-id-generation"}}]
+            }}}
+        });
+        let mutations = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = mutations.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = seen.clone();
+            let sandbox = sandbox.clone();
+            let workload = workload.clone();
+            let supervisor = supervisor.clone();
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let (status, value) = if method == http::Method::PATCH {
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let mutation: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    seen.lock().unwrap().push(mutation);
+                    (http::StatusCode::OK, sandbox)
+                } else if method == http::Method::DELETE {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::json!({"delete": path}));
+                    (http::StatusCode::OK, sandbox)
+                } else if path.ends_with("/sandboxes") {
+                    (
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "SandboxList", "items": [sandbox]
+                        }),
+                    )
+                } else if path.ends_with("/openshell-sandbox-workloads") {
+                    (
+                        http::StatusCode::OK,
+                        serde_json::to_value(workload).unwrap(),
+                    )
+                } else if path.ends_with("/openshell-sandbox-supervisors") {
+                    (
+                        http::StatusCode::OK,
+                        serde_json::to_value(supervisor).unwrap(),
+                    )
+                } else {
+                    (
+                        http::StatusCode::NOT_FOUND,
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                            "message": "fixture object not present during bootstrap", "reason": "NotFound", "code": 404
+                        }),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(kube::client::Body::from(value.to_string().into_bytes()))
+                        .unwrap(),
+                )
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .unwrap();
+        driver.reconcile_sandbox_runtime_resources().await;
+        let mutations = mutations.lock().unwrap();
+        mutations.clone()
+    }
+
+    #[tokio::test]
+    async fn preparing_create_must_not_be_suspended_for_unpublished_fence_identity() {
+        let mutations = reconcile_bootstrap_fixture("preparing", Duration::ZERO, false).await;
+        assert!(
+            mutations.is_empty(),
+            "reconciler interfered with fresh gated preparation: {mutations:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn released_create_without_fence_binding_is_still_suspended() {
+        let mutations = reconcile_bootstrap_fixture("released", Duration::ZERO, false).await;
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0]["spec"]["operatingMode"], "Suspended");
+    }
+
+    #[tokio::test]
+    async fn preparing_create_with_altered_fence_is_still_suspended() {
+        let mutations = reconcile_bootstrap_fixture("preparing", Duration::ZERO, true).await;
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0]["spec"]["operatingMode"], "Suspended");
+    }
+
+    #[tokio::test]
+    async fn preparing_create_past_bootstrap_deadline_is_still_reaped() {
+        let mutations =
+            reconcile_bootstrap_fixture("preparing", Duration::from_mins(10), false).await;
+        assert_eq!(mutations.len(), 1);
+        assert!(
+            mutations[0]["delete"]
+                .as_str()
+                .unwrap()
+                .ends_with("/sandboxes/race-cr")
+        );
     }
 }

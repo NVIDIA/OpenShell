@@ -97,6 +97,11 @@ and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. The shared network fence remains for
 the lifetime of the namespace.
 
+While a generation is `preparing`, its creator has not yet published the fence
+identity binding. The background reconciler verifies the actual fence policy
+and expires abandoned preparation, but defers the binding comparison until
+the generation leaves `preparing`.
+
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
 must not create permissive policies, create Pods, read bootstrap Secrets, or
