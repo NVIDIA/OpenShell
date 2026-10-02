@@ -2720,7 +2720,7 @@ async fn run_async() -> Result<()> {
             command: Some(command),
         }) => match command {
             DoctorCommands::Check => {
-                run::doctor_check()?;
+                run::doctor_check().await?;
             }
         },
         Some(Commands::Doctor { command: None }) => {
