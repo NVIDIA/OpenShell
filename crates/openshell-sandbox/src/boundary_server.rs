@@ -5524,5 +5524,8 @@ pub fn run_boundary(
     _config_path: &Path,
     _qualification: crate::RuntimeQualification,
 ) -> Result<(), String> {
-    Err("boundary mode is supported only on Linux".to_string())
+    Err(
+        "openshell-sandbox boundary requires Linux; use openshell-windows-sandbox on Windows"
+            .to_string(),
+    )
 }

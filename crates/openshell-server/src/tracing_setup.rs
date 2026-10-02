@@ -93,7 +93,7 @@ pub fn install(
             )
         },
     );
-    let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer(gateway.compute_driver());
+    let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer();
 
     // Keep the audit sink independent from the operator's diagnostic log
     // level. An explicit JSONL opt-in must keep every OCSF event even when the
@@ -161,7 +161,7 @@ pub fn install(
 
 /// Build the OCSF JSONL audit layer for the gateway, plus the directory it
 /// writes into (for a one-line startup log). Returns `(None, None)` when
-/// the target is not Windows, the selected compute driver is not MXC, the sink
+/// the target is not Windows, the sink
 /// was not explicitly enabled through `OPENSHELL_OCSF_JSON`, or the target
 /// directory/appender cannot be opened.
 ///
@@ -172,26 +172,22 @@ pub fn install(
 /// can be force-killed by the harness, and we do not want to lose the tail of the
 /// audit trail.
 #[cfg(not(target_os = "windows"))]
-fn build_ocsf_jsonl_layer(
-    _compute_driver: Option<&str>,
-) -> (
+fn build_ocsf_jsonl_layer() -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
     Option<std::path::PathBuf>,
 ) {
-    // The gateway-local JSONL sink belongs to the Windows/MXC ETW path. A
+    // The gateway-local JSONL sink belongs to the Windows audit path. A
     // cross-platform sink needs an explicit storage and configuration contract.
     (None, None)
 }
 
 #[cfg(target_os = "windows")]
-fn build_ocsf_jsonl_layer(
-    compute_driver: Option<&str>,
-) -> (
+fn build_ocsf_jsonl_layer() -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
     Option<std::path::PathBuf>,
 ) {
     let requested = std::env::var("OPENSHELL_OCSF_JSON").ok();
-    if !mxc_ocsf_jsonl_requested(compute_driver, requested.as_deref()) {
+    if !ocsf_jsonl_requested(requested.as_deref()) {
         return (None, None);
     }
 
@@ -222,17 +218,16 @@ fn build_ocsf_jsonl_layer(
     }
 }
 
-/// Whether this gateway explicitly requested the Windows/MXC JSONL sink.
+/// Whether this gateway explicitly requested the Windows JSONL sink.
 /// Unknown values fail closed so a typo cannot unexpectedly retain audit data.
 #[cfg(any(target_os = "windows", test))]
-fn mxc_ocsf_jsonl_requested(compute_driver: Option<&str>, value: Option<&str>) -> bool {
-    compute_driver == Some("mxc")
-        && value.is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+fn ocsf_jsonl_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 /// Resolve the directory for the OCSF JSONL audit file.
@@ -264,7 +259,7 @@ mod tests {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
-    use super::mxc_ocsf_jsonl_requested;
+    use super::ocsf_jsonl_requested;
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -316,31 +311,18 @@ mod tests {
 
     #[test]
     fn gateway_ocsf_jsonl_requires_explicit_opt_in() {
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), None));
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some("")));
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some("enabled")));
+        assert!(!ocsf_jsonl_requested(None));
+        assert!(!ocsf_jsonl_requested(Some("")));
+        assert!(!ocsf_jsonl_requested(Some("enabled")));
         for value in ["0", "false", "FALSE", " off ", "no"] {
-            assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some(value)));
+            assert!(!ocsf_jsonl_requested(Some(value)));
         }
 
         for value in ["1", "true", "TRUE", " on ", "yes"] {
             assert!(
-                mxc_ocsf_jsonl_requested(Some("mxc"), Some(value)),
+                ocsf_jsonl_requested(Some(value)),
                 "expected {value:?} to opt in"
             );
-        }
-    }
-
-    #[test]
-    fn gateway_ocsf_jsonl_rejects_non_mxc_drivers() {
-        for driver in [
-            None,
-            Some("docker"),
-            Some("kubernetes"),
-            Some("podman"),
-            Some("vm"),
-        ] {
-            assert!(!mxc_ocsf_jsonl_requested(driver, Some("1")));
         }
     }
 }

@@ -73,6 +73,7 @@ fn begin_recovery_window(
 /// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
+    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -99,10 +100,21 @@ impl OpenShellRuntimeBackend {
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
+            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
         }
+    }
+
+    /// Select the platform implementation that validates opaque audit evidence.
+    #[must_use]
+    pub fn with_audit_validator(
+        mut self,
+        validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
+    ) -> Self {
+        self.audit_validator = validator;
+        self
     }
 }
 
@@ -123,6 +135,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             })?;
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
+        let direct_proxy = runtime_descriptor.direct_proxy.clone();
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
@@ -147,12 +160,14 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             ));
         }
         Ok(Box::new(RemoteBound {
+            audit_validator: self.audit_validator.clone(),
             client: client.clone(),
             agent: sandbox.agent,
             policy: sandbox.policy,
             sandbox_id: sandbox.sandbox_id,
             mediation: Arc::new(RemoteNetworkMediation { client }),
             host_gateway_ip,
+            direct_proxy,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
             identity: sandbox.identity,
@@ -222,6 +237,18 @@ fn validate_runtime_descriptor(
         }
     }
     validate_client_tls(&runtime_descriptor.tls)?;
+    if let Some(proxy) = &runtime_descriptor.direct_proxy
+        && (!proxy.bind_addr.ip().is_loopback()
+            || proxy.bind_addr.port() == 0
+            || proxy.authorization.trim().is_empty()
+            || proxy.authorization.contains(['\r', '\n'])
+            || !proxy.binary_identity.executable.path.is_absolute())
+    {
+        return Err(BackendError::Descriptor(
+            "direct proxy requires a loopback listener, a single-line authorization value, and an absolute binary identity"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -292,12 +319,14 @@ fn validate_control_port(port: u32) -> Result<(), BackendError> {
 }
 
 struct RemoteBound {
+    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
     mediation: Arc<RemoteNetworkMediation>,
     host_gateway_ip: Option<std::net::IpAddr>,
+    direct_proxy: Option<openshell_isolation_interface::contract::DirectProxyConfiguration>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
@@ -317,6 +346,12 @@ impl BoundBoundary for RemoteBound {
         self.host_gateway_ip
     }
 
+    fn direct_proxy_configuration(
+        &self,
+    ) -> Option<openshell_isolation_interface::contract::DirectProxyConfiguration> {
+        self.direct_proxy.clone()
+    }
+
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
         let Response::Confirmed { confirmation } = response else {
@@ -332,17 +367,10 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
-        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
-            serde_json::from_value(confirmation.backend_audit.clone()).map_err(|error| {
-                BackendError::Confirm(format!(
-                    "decode native Linux sandbox audit evidence: {error}"
-                ))
-            })?;
-        audit.validate()?;
-        if confirmation.properties != audit.properties() {
+        let properties = self.audit_validator.validate(&confirmation.backend_audit)?;
+        if confirmation.properties != properties {
             return Err(BackendError::Confirm(
-                "sandbox confirmation properties do not match native Linux audit evidence"
-                    .to_string(),
+                "sandbox confirmation properties do not match OpenShell audit evidence".to_string(),
             ));
         }
         let client = self.client.clone();
@@ -2783,6 +2811,7 @@ mod tests {
             },
             tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         }
@@ -2958,6 +2987,8 @@ mod tests {
             test_bearer(&expected_token),
         ));
         let bound = RemoteBound {
+            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
+            direct_proxy: None,
             client: client.clone(),
             agent: context.agent,
             policy: context.policy,
@@ -3047,6 +3078,7 @@ mod tests {
             },
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3067,6 +3099,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3089,6 +3122,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3111,6 +3145,7 @@ mod tests {
             },
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
+            direct_proxy: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
         };
@@ -3342,6 +3377,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
             },
@@ -3535,6 +3571,7 @@ mod tests {
                 },
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
+                direct_proxy: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
             },

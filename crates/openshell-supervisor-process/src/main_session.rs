@@ -4,14 +4,19 @@
 //! Retained I/O multiplexer for the canonical sandbox process.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
+#[cfg(unix)]
 use nix::pty::Winsize;
+#[cfg(unix)]
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -24,6 +29,7 @@ use openshell_isolation_interface::contract::{
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Canonical-process I/O retained by the supervisor session multiplexer.
+#[cfg(unix)]
 pub enum ProcessIo {
     Pty(std::fs::File),
     Pipes {
@@ -191,12 +197,14 @@ impl MainOutputCursor {
 }
 
 pub struct MainSession {
+    #[cfg(unix)]
     pid: u32,
     terminal: bool,
     input: tokio::sync::mpsc::Sender<Vec<u8>>,
     output: Arc<OutputLog>,
     input_owner: Mutex<Option<u64>>,
     next_owner: AtomicU64,
+    #[cfg(unix)]
     pty_master: Option<Arc<std::fs::File>>,
     boundary_process: Option<Arc<dyn BoundaryProcess>>,
     boundary_terminal: Option<Arc<dyn BoundaryTerminal>>,
@@ -218,12 +226,14 @@ impl MainSession {
     pub fn inert_with_input() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let (input, input_rx) = tokio::sync::mpsc::channel(64);
         let session = Arc::new(Self {
+            #[cfg(unix)]
             pid: 1,
             terminal: false,
             input,
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
+            #[cfg(unix)]
             pty_master: None,
             boundary_process: None,
             boundary_terminal: None,
@@ -240,7 +250,7 @@ impl MainSession {
         (session, input_rx)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn terminal_for_test() -> (Arc<Self>, std::fs::File) {
         let pty = nix::pty::openpty(None, None).expect("open test PTY");
         let slave = std::fs::File::from(pty.slave);
@@ -250,7 +260,7 @@ impl MainSession {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(unsafe_code)]
     pub fn terminal_size_for_test(&self) -> (u16, u16) {
         let master = self.pty_master.as_ref().expect("terminal PTY master");
@@ -261,6 +271,7 @@ impl MainSession {
     }
 
     #[must_use]
+    #[cfg(unix)]
     pub fn new(io: ProcessIo, pid: u32) -> Arc<Self> {
         let terminal = matches!(io, ProcessIo::Pty(_));
         let (input, input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -278,6 +289,7 @@ impl MainSession {
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
+            #[cfg(unix)]
             pty_master,
             boundary_process: None,
             boundary_terminal: None,
@@ -312,12 +324,14 @@ impl MainSession {
         let terminal_mode = terminal.is_some();
         let (input, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let session = Arc::new(Self {
+            #[cfg(unix)]
             pid: 0,
             terminal: terminal_mode,
             input,
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
+            #[cfg(unix)]
             pty_master: None,
             boundary_process: Some(process),
             boundary_terminal: terminal,
@@ -370,6 +384,7 @@ impl MainSession {
         session
     }
 
+    #[cfg(unix)]
     fn start_io(
         this: &Arc<Self>,
         io: ProcessIo,
@@ -655,38 +670,47 @@ impl MainSession {
                 .await;
             return;
         }
-        let Some(master) = self.pty_master.as_ref() else {
-            return;
-        };
-        let winsize = Winsize {
-            ws_row: u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
-            ws_col: u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
-            ws_xpixel: u16::try_from(pixel_width).unwrap_or(u16::MAX),
-            ws_ypixel: u16::try_from(pixel_height).unwrap_or(u16::MAX),
-        };
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+        #[cfg(not(unix))]
+        let _ = (columns, rows, pixel_width, pixel_height);
+        #[cfg(unix)]
+        {
+            let Some(master) = self.pty_master.as_ref() else {
+                return;
+            };
+            let winsize = Winsize {
+                ws_row: u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
+                ws_col: u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
+                ws_xpixel: u16::try_from(pixel_width).unwrap_or(u16::MAX),
+                ws_ypixel: u16::try_from(pixel_height).unwrap_or(u16::MAX),
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+            }
         }
     }
 
-    pub async fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+    pub async fn signal_group(&self, signal: BoundarySignal) -> Result<(), String> {
         if let Some(process) = self.boundary_process.as_ref() {
-            let signal = match signal {
-                nix::sys::signal::Signal::SIGHUP => BoundarySignal::Hup,
-                nix::sys::signal::Signal::SIGINT => BoundarySignal::Int,
-                nix::sys::signal::Signal::SIGKILL => BoundarySignal::Kill,
-                nix::sys::signal::Signal::SIGTERM => BoundarySignal::Term,
-                other => return Err(format!("boundary signal {other:?} is unsupported")),
-            };
             return process
                 .signal(signal)
                 .await
                 .map_err(|error| error.to_string());
         }
-        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
-            .map_err(|error| error.to_string())
+        #[cfg(unix)]
+        {
+            let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+            let signal = match signal {
+                BoundarySignal::Hup => nix::sys::signal::Signal::SIGHUP,
+                BoundarySignal::Int => nix::sys::signal::Signal::SIGINT,
+                BoundarySignal::Kill => nix::sys::signal::Signal::SIGKILL,
+                BoundarySignal::Term => nix::sys::signal::Signal::SIGTERM,
+            };
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(unix))]
+        Err("local process-group signaling is unsupported on Windows".to_string())
     }
 
     #[must_use]
@@ -700,6 +724,7 @@ impl MainSession {
     }
 }
 
+#[cfg(unix)]
 fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
     let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)?;
     let flags = OFlag::from_bits_truncate(flags);
@@ -784,10 +809,7 @@ mod tests {
 
         session.resize(120, 40, 0, 0).await;
         assert_eq!(*terminal.size.lock().unwrap(), Some((120, 40)));
-        session
-            .signal_group(nix::sys::signal::Signal::SIGINT)
-            .await
-            .unwrap();
+        session.signal_group(BoundarySignal::Int).await.unwrap();
         assert_eq!(*process.signals.lock().unwrap(), vec![BoundarySignal::Int]);
     }
 
@@ -955,6 +977,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_pump_reads_output_and_writes_input() {
         let (session, mut slave) = MainSession::terminal_for_test();

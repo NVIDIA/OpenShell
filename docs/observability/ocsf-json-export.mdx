@@ -63,7 +63,7 @@ $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
 openshell-gateway --drivers mxc --config gateway.toml
 ```
 
-The sink is available only when Windows selects the MXC driver. It rotates
+The sink is available on Windows independently of the selected compute driver. It rotates
 daily and retains the three most recent files. Diagnostic `--log-level` values
 do not suppress records in this explicitly enabled audit sink.
 

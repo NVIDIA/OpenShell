@@ -8,8 +8,6 @@
 //! owned by the orchestrator; this crate produces denials but does not
 //! aggregate them.
 
-#[cfg(target_os = "windows")]
-pub mod host;
 pub mod identity;
 pub mod identity_source;
 pub mod l7;
