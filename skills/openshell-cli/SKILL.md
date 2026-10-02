@@ -426,9 +426,6 @@ command exited successfully. A descendant that keeps an inherited output pipe
 open for more than 30 seconds after the command exits triggers that failure.
 Check whether the command ran before retrying work with side effects. Use
 `sandbox connect` to attach to the canonical main process.
-Exec has no lifetime request count limit. Startup transport recovery retries the
-same request for up to 30 seconds; an expired recovery deadline leaves the
-execution outcome uncertain and does not stop an already running command.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
