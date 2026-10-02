@@ -25,6 +25,7 @@ libc = "0.2"
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
+socket2 = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

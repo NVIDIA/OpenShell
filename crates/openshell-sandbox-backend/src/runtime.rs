@@ -2916,6 +2916,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         };
         openshell_isolation_interface::contract::BoundaryConfirmation {
             generation: "test-generation".to_string(),

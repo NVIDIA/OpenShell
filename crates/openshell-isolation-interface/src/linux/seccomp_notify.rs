@@ -430,7 +430,9 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
 ///
 /// The filter mediates every syscall that can create, select, or materially
 /// reconfigure an INET endpoint. Connected `send()`/null-destination
-/// `sendto()` retains the audited cBPF fast path.
+/// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
+/// natively: the broker binds every INET socket to loopback before injecting
+/// it, and accepted sockets inherit their listener's binding.
 pub fn install_workload_listener() -> io::Result<NotificationListener> {
     #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
     let mut syscalls = vec![
@@ -438,8 +440,6 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_connect,
         libc::SYS_bind,
         libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
         libc::SYS_sendto,
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,

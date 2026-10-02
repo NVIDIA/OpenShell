@@ -2406,6 +2406,7 @@ mod linux {
                 tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
+                socket_loopback_confinement: self.qualification.socket_loopback_confinement,
             };
             // The boundary reports mechanism evidence; the authenticated host
             // backend validates it before constructing a ConfirmedBoundary.
@@ -3216,7 +3217,7 @@ mod linux {
                     })
                 }
                 BoundaryListenerConfig::TlsTcp { address, tls } => {
-                    let listener = std::net::TcpListener::bind(address)?;
+                    let listener = Self::bind_tcp(*address)?;
                     listener.set_nonblocking(true)?;
                     let server_config = Arc::new(load_tls_server_config(tls)?);
                     Ok(Self::Tcp {
@@ -3225,6 +3226,33 @@ mod linux {
                     })
                 }
             }
+        }
+
+        /// Bind the TCP control listener.
+        ///
+        /// A listener on a non-loopback address serves a supervisor in another
+        /// network namespace, so it rejects all loopback-interface ingress
+        /// before it starts listening. Workload sockets are bound to loopback
+        /// and natively accepted ones are not registered with the broker, so
+        /// this standing filter, not the broker's port reservation, keeps the
+        /// workload from reaching the control endpoint through loopback or
+        /// the pod's own address.
+        fn bind_tcp(address: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_cloexec(true)?;
+            socket.set_reuse_address(true)?;
+            if !address.ip().is_loopback() {
+                openshell_isolation_interface::linux::socket_confinement::reject_loopback_ingress(
+                    socket.as_raw_fd(),
+                )?;
+            }
+            socket.bind(&address.into())?;
+            socket.listen(128)?;
+            Ok(socket.into())
         }
 
         fn bind_vsock(port: u32) -> io::Result<OwnedFd> {
@@ -4511,6 +4539,7 @@ mod linux {
                 tcp_dns_round_trip: true,
                 tcp_allow_round_trip: true,
                 tcp_deny_round_trip: true,
+                socket_loopback_confinement: true,
             }
         }
 
@@ -4765,6 +4794,35 @@ mod linux {
                     .expect("decode logical response");
             assert!(matches!(response.response, Response::Attached { .. }));
             server.abort();
+        }
+
+        #[test]
+        fn pod_control_listener_rejects_loopback_ingress() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "loopback");
+            let listener = ControlListener::bind(&BoundaryListenerConfig::TlsTcp {
+                address: "0.0.0.0:0".parse().expect("valid address"),
+                tls: server_tls,
+            })
+            .expect("bind TLS listener");
+            let port = listener
+                .tcp_local_addr()
+                .expect("TLS listener address")
+                .port();
+            // Loopback and the host's own address both arrive on `lo`; the
+            // dropped SYN never completes a handshake.
+            let result = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(300),
+            );
+            assert!(
+                result.is_err(),
+                "loopback client reached the control listener"
+            );
+            assert!(matches!(
+                listener.accept().map(|_| ()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
         }
 
         #[test]

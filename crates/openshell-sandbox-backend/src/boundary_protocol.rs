@@ -124,6 +124,10 @@ pub struct NativeLinuxSandboxAuditEvidence {
     pub tcp_dns_round_trip: bool,
     pub tcp_allow_round_trip: bool,
     pub tcp_deny_round_trip: bool,
+    /// Workload INET sockets are bound to loopback before injection, the
+    /// binding cannot be changed from sandbox credentials, and accepted
+    /// sockets inherit it. Native local `accept` depends on this property.
+    pub socket_loopback_confinement: bool,
 }
 
 impl NativeLinuxSandboxAuditEvidence {
@@ -150,7 +154,8 @@ impl NativeLinuxSandboxAuditEvidence {
             && self.udp_dns_round_trip
             && self.tcp_dns_round_trip
             && self.tcp_allow_round_trip
-            && self.tcp_deny_round_trip;
+            && self.tcp_deny_round_trip
+            && self.socket_loopback_confinement;
         if complete {
             Ok(())
         } else {
@@ -175,7 +180,8 @@ impl NativeLinuxSandboxAuditEvidence {
                     && self.udp_dns_round_trip
                     && self.tcp_dns_round_trip
                     && self.tcp_allow_round_trip
-                    && self.tcp_deny_round_trip,
+                    && self.tcp_deny_round_trip
+                    && self.socket_loopback_confinement,
                 "seccomp-notify",
             ),
             request_attribution: EnforcedProperty::new(
@@ -1465,6 +1471,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         }
     }
 
@@ -1486,6 +1493,24 @@ mod tests {
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());
         assert!(!audit.properties().egress_interception.enforced);
+    }
+
+    #[test]
+    fn audit_evidence_requires_socket_loopback_confinement() {
+        let mut audit = complete_audit_evidence();
+        audit.socket_loopback_confinement = false;
+        assert!(audit.validate().is_err());
+        assert!(!audit.properties().egress_interception.enforced);
+    }
+
+    #[test]
+    fn audit_evidence_rejects_missing_socket_loopback_confinement_field() {
+        let mut value = serde_json::to_value(complete_audit_evidence()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("socket_loopback_confinement");
+        assert!(serde_json::from_value::<NativeLinuxSandboxAuditEvidence>(value).is_err());
     }
 
     #[test]

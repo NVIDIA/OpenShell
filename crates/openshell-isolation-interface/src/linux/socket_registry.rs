@@ -76,8 +76,6 @@ pub enum SocketState {
     DnsTcp { relay: SocketAddr },
     /// Workload-owned listening socket.
     Listening { local: SocketAddr },
-    /// Stream accepted from a verified local peer.
-    AcceptedLocal { peer: SocketAddr },
     /// A committed relay failed after connection.
     Failed { errno: i32 },
 }
@@ -254,9 +252,8 @@ impl SocketRegistry {
 
     /// Publish a tentative socket in a caller-proven initial state.
     ///
-    /// Accepted sockets are created and classified by the trusted broker, so
-    /// they enter the registry directly as [`SocketState::AcceptedLocal`]
-    /// rather than pretending to be unconnected.
+    /// Used when the trusted broker has already established the socket's
+    /// state before publication, so the entry never appears unconnected.
     pub fn commit_with_state(
         &mut self,
         tentative: TentativeSocket,

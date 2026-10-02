@@ -29,6 +29,7 @@ const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 const CLOSE_RANGE_UNSHARE_FLAG: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC_FLAG: u32 = 1 << 2;
 const F_SETOWN_COMMAND: u32 = 8;
 const F_SETSIG_COMMAND: u32 = 10;
 const F_SETOWN_EX_COMMAND: u32 = 15;
@@ -53,6 +54,7 @@ impl ChildHardeningProgram {
     /// The caller must invoke this from the post-fork child after all
     /// sandbox-wide TSYNC work and the launcher's `NEW_LISTENER` filter.
     pub fn install(&mut self) -> io::Result<()> {
+        mark_inherited_descriptors_close_on_exec()?;
         set_no_new_privileges()?;
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
@@ -85,6 +87,35 @@ impl ChildHardeningProgram {
     #[must_use]
     pub fn instruction_count(&self) -> usize {
         self.instructions.len()
+    }
+}
+
+/// Mark every descriptor above stdio close-on-exec in the post-fork child.
+///
+/// Workloads receive INET sockets only through broker injection, which binds
+/// them to loopback first. A descriptor the sandbox process inherited from its
+/// container runtime, or opened without `O_CLOEXEC`, must never cross `exec`
+/// as an unconfined socket. The command's stdio is already installed on 0-2
+/// when `pre_exec` hooks run. This is a single async-signal-safe syscall.
+///
+/// # Errors
+///
+/// Returns the kernel error; kernels without `CLOSE_RANGE_CLOEXEC` (before
+/// Linux 5.11) fail closed.
+pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
+    // SAFETY: close_range takes scalar arguments and only sets FD_CLOEXEC.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            CLOSE_RANGE_CLOEXEC_FLAG,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -351,6 +382,36 @@ fn set_no_new_privileges() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn inherited_sockets_are_marked_close_on_exec_but_stdio_is_not() {
+        // SAFETY: scalar socket arguments; deliberately inheritable.
+        let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(socket > 2);
+        // SAFETY: the child performs only async-signal-safe syscalls and exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let swept = mark_inherited_descriptors_close_on_exec().is_ok();
+            // SAFETY: F_GETFD reads one descriptor flag word.
+            let socket_flags = unsafe { libc::fcntl(socket, libc::F_GETFD) };
+            // SAFETY: as above, for stderr.
+            let stderr_flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) };
+            let ok = swept
+                && socket_flags & libc::FD_CLOEXEC != 0
+                && stderr_flags >= 0
+                && stderr_flags & libc::FD_CLOEXEC == 0;
+            // SAFETY: terminate the forked child without running destructors.
+            unsafe { libc::_exit(i32::from(!ok)) };
+        }
+        let mut status = 0;
+        // SAFETY: wait for the child created above.
+        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+        // SAFETY: close the test-owned socket.
+        unsafe { libc::close(socket) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
 
     #[test]
     fn rejects_zero_sandbox_tgid() {

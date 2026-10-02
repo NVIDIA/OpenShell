@@ -95,6 +95,9 @@ struct QualificationReport {
     task_memory_copy: bool,
     connected_send_fast_path: bool,
     socket_virtualization: bool,
+    /// Workload INET sockets are bound to loopback, the binding cannot be
+    /// changed from sandbox credentials, and accepted sockets inherit it.
+    socket_loopback_confinement: bool,
     dns_relay_bind: bool,
     udp_dns_round_trip: bool,
     tcp_dns_round_trip: bool,
@@ -163,6 +166,9 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             .into_diagnostic()
             .wrap_err("seccomp notification probe")?;
     probe_socket_virtualization().wrap_err("socket virtualization probe")?;
+    openshell_isolation_interface::linux::socket_confinement::probe_loopback_confinement()
+        .into_diagnostic()
+        .wrap_err("socket loopback confinement probe")?;
     probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
     let landlock_abi = openshell_isolation_interface::linux::landlock::abi_version()
         .into_diagnostic()
@@ -196,6 +202,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         task_memory_copy,
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
+        socket_loopback_confinement: true,
         dns_relay_bind: true,
         udp_dns_round_trip: true,
         tcp_dns_round_trip: true,
@@ -230,6 +237,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_dns_round_trip: true,
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
+        socket_loopback_confinement: true,
     };
     Ok((qualification, report))
 }
