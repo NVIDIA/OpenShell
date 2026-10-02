@@ -6,6 +6,8 @@
 pub mod headers;
 mod remote;
 mod request;
+mod request_failure;
+pub use request_failure::HttpRequestFailureKind;
 mod response;
 mod websocket;
 
@@ -398,6 +400,8 @@ pub struct HttpRequestInput {
 
 #[derive(Debug, Clone)]
 pub struct ChainOutcome {
+    /// HTTP request failure cause, preserved independently of diagnostic text.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub allowed: bool,
     pub reason: String,
     pub body: Vec<u8>,
@@ -429,6 +433,8 @@ pub struct NamespacedFinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiddlewareInvocation {
+    /// HTTP request failure cause, preserved independently of diagnostic text.
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub name: String,
     pub implementation: String,
     pub decision: Decision,
@@ -1568,6 +1574,7 @@ impl ChainRunner {
 
             if !preflight.allowed {
                 applied.push(MiddlewareInvocation {
+                    failure_kind: preflight.failure_kind,
                     name: entry.entry.name.clone(),
                     implementation: entry.entry.implementation.clone(),
                     decision: Decision::Deny,
@@ -1575,6 +1582,7 @@ impl ChainRunner {
                     failed: preflight.denial.is_none(),
                 });
                 return Ok(ChainOutcome {
+                    failure_kind: preflight.failure_kind,
                     allowed: false,
                     reason: preflight.reason,
                     body,
@@ -1605,6 +1613,7 @@ impl ChainRunner {
                     findings.extend(error.diagnostics.findings);
                     metadata.extend(error.diagnostics.metadata);
                     applied.push(MiddlewareInvocation {
+                        failure_kind: error.kind,
                         name: entry.entry.name.clone(),
                         implementation: entry.entry.implementation.clone(),
                         decision: Decision::Deny,
@@ -1612,6 +1621,7 @@ impl ChainRunner {
                         failed: error.denial.is_none(),
                     });
                     return Ok(ChainOutcome {
+                        failure_kind: error.kind,
                         allowed: false,
                         reason: error.reason,
                         body: original_body,
@@ -1635,6 +1645,7 @@ impl ChainRunner {
                         findings.extend(error.diagnostics.findings);
                         metadata.extend(error.diagnostics.metadata);
                         applied.push(MiddlewareInvocation {
+                            failure_kind: error.kind,
                             name: entry.entry.name.clone(),
                             implementation: entry.entry.implementation.clone(),
                             decision: Decision::Deny,
@@ -1642,6 +1653,7 @@ impl ChainRunner {
                             failed: error.denial.is_none(),
                         });
                         return Ok(ChainOutcome {
+                            failure_kind: error.kind,
                             allowed: false,
                             reason: error.reason,
                             body: original_body,
@@ -1656,6 +1668,7 @@ impl ChainRunner {
             }
 
             applied.push(MiddlewareInvocation {
+                failure_kind: None,
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision: Decision::Allow,
@@ -1666,15 +1679,20 @@ impl ChainRunner {
             if body_transformed
                 && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
+                let mut policy_failure = None;
                 let denied = match validate(&body) {
                     Ok(reason) => reason,
-                    Err(error) => Some(format!(
-                        "transformed_body_policy_evaluation_failed: {}",
-                        safe_reason(&error.to_string())
-                    )),
+                    Err(error) => {
+                        policy_failure = Some(HttpRequestFailureKind::PolicyEvaluation);
+                        Some(format!(
+                            "transformed_body_policy_evaluation_failed: {}",
+                            safe_reason(&error.to_string())
+                        ))
+                    }
                 };
                 if let Some(reason) = denied {
                     return Ok(ChainOutcome {
+                        failure_kind: policy_failure,
                         allowed: false,
                         reason,
                         body,
@@ -1689,6 +1707,7 @@ impl ChainRunner {
         }
 
         Ok(ChainOutcome {
+            failure_kind: None,
             allowed: true,
             reason: String::new(),
             body,

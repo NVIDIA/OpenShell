@@ -23,6 +23,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "server", "tls-native-roots"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tokio-stream = { workspace = true, features = ["net"] }
 

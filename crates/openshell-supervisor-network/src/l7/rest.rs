@@ -47,8 +47,14 @@ const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 #[error("{reason}")]
-#[diagnostic(code(openshell::middleware::live_request_failed))]
+#[diagnostic(
+    code(openshell::middleware::live_request_failed),
+    help("local upstream delivery: {delivery:?}")
+)]
 struct LiveRequestMiddlewareError {
+    #[source]
+    kind: Option<openshell_supervisor_middleware::HttpRequestFailureKind>,
+    delivery: super::request_delivery::RequestDeliveryState,
     reason: String,
     denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     committed: bool,
@@ -1495,6 +1501,8 @@ where
     C: AsyncRead + Unpin,
     U: AsyncWrite + Unpin,
 {
+    let delivery = body.delivery.clone();
+    let delivery_for_write = delivery.clone();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
     let run = body.run_to(client, sender);
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1528,8 +1536,10 @@ where
                             headers.to_vec()
                         };
                         fixed_length = output_body_bytes.is_some();
-                        upstream_for_write
-                            .write_all(&outgoing)
+                        // A failed write can still deliver a prefix. Record the attempt
+                        // before awaiting it; the existing committed flag governs responses.
+                        delivery_for_write
+                            .write_all(upstream_for_write, &outgoing)
                             .await
                             .into_diagnostic()?;
                         upstream_for_write.flush().await.into_diagnostic()?;
@@ -1542,6 +1552,7 @@ where
                         Some(scanner) => scanner.push(&unit)?,
                         None => unit,
                     };
+                    delivery_for_write.start();
                     if fixed_length {
                         write_body_bytes(upstream_for_write, &output, options).await?;
                     } else {
@@ -1567,6 +1578,8 @@ where
                 error.downcast_ref::<crate::l7::middleware::RequestBodyMiddlewareError>()
             {
                 return Err(miette::Report::new(LiveRequestMiddlewareError {
+                    kind: failure.kind,
+                    delivery: delivery.state(),
                     reason: failure.reason.clone(),
                     denial: failure.denial.clone(),
                     committed: committed.load(std::sync::atomic::Ordering::Acquire),
@@ -1590,8 +1603,10 @@ where
                 "middleware output with Content-Length cannot include trailers"
             ));
         }
+        delivery.complete();
         return Ok(());
     }
+    delivery.start();
     write_body_bytes(upstream, b"0\r\n", options).await?;
     for trailer in finish.trailers {
         let encoded = format!("{}: {}", trailer.name, trailer.value);
@@ -1603,7 +1618,9 @@ where
         write_body_bytes(upstream, encoded.as_bytes(), options).await?;
         write_body_bytes(upstream, b"\r\n", options).await?;
     }
-    write_body_bytes(upstream, b"\r\n", options).await
+    write_body_bytes(upstream, b"\r\n", options).await?;
+    delivery.complete();
+    Ok(())
 }
 
 use openshell_core::secrets::body::{

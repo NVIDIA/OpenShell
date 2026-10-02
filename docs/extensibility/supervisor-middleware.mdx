@@ -273,3 +273,9 @@ The example includes a policy, local fixture, and smoke launcher.
 - Extension tokens and sandbox-to-gateway tokens are signed by the same key. They are separated by audience and by `typ`, but the extension credential path cannot yet be rotated or revoked independently of sandbox admission.
 - OpenShell does not track or revoke `jti`; bearer tokens can be replayed until expiry. Per-request replay resistance requires proof of possession or request binding.
 - mTLS client authentication, health checks, runtime registration, and overlapping signing-key rotation are not available.
+
+## HTTP request failure causes
+
+HTTP request outcomes preserve a platform-owned failure kind separately from sanitized diagnostic text. Callers can distinguish stage, chain and request-body deadlines from remote gRPC status codes, unavailable services, invalid results, capacity limits, header mutation failures, I/O failures and cancellation. An explicit middleware rejection has no platform failure kind. HTTP failures remain fail closed.
+
+The live request relay tracks whether upstream writing has been attempted and whether local forwarding completed. A failed write may have sent part of the request, so writing is marked as started before awaiting it. Local completion does not establish that the upstream processed the request. This observation does not change response selection or enable retries.

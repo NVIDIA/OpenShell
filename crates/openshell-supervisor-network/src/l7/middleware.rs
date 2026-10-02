@@ -3,6 +3,7 @@
 
 //! Supervisor middleware application for L7 requests.
 
+use super::request_delivery::RequestDelivery;
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
@@ -11,6 +12,7 @@ use openshell_ocsf::{
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
     ocsf_emit,
 };
+use openshell_supervisor_middleware::HttpRequestFailureKind;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -19,6 +21,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[error("{reason}")]
 #[diagnostic(code(openshell::middleware::request_body_rejected))]
 pub(super) struct RequestBodyMiddlewareError {
+    #[source]
+    pub(super) kind: Option<HttpRequestFailureKind>,
     pub(super) reason: String,
     pub(super) denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
 }
@@ -71,6 +75,7 @@ pub enum RequestBodyDelivery {
 }
 
 pub struct RequestBodyStream {
+    pub(crate) delivery: RequestDelivery,
     pub(crate) reader: crate::l7::rest::RequestBodyReader,
     session: Option<openshell_supervisor_middleware::HttpRequestSession>,
     preflight: openshell_supervisor_middleware::HttpRequestPreflightOutcome,
@@ -867,6 +872,7 @@ async fn apply_streaming_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             &req,
             false,
             &preflight.reason,
+            preflight.failure_kind,
             preflight.denial.as_ref(),
             &preflight.findings,
             &preflight.metadata,
@@ -886,6 +892,7 @@ async fn apply_streaming_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             &req,
             true,
             "",
+            None,
             None,
             &preflight.findings,
             &preflight.metadata,
@@ -922,6 +929,7 @@ async fn apply_streaming_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         return Ok(MiddlewareApplyResult::Streamed {
             request: rebuilt,
             body: MiddlewareRequestBody::Live(Box::new(RequestBodyStream {
+                delivery: RequestDelivery::default(),
                 reader: body_reader,
                 session: Some(session),
                 preflight,
@@ -1028,6 +1036,7 @@ async fn apply_streaming_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
                 &req,
                 false,
                 &error.reason,
+                error.kind,
                 error.denial.as_ref(),
                 &findings,
                 &metadata,
@@ -1060,6 +1069,7 @@ async fn apply_streaming_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         &req,
         true,
         "",
+        None,
         None,
         &findings,
         &metadata,
@@ -1163,24 +1173,28 @@ impl RequestBodyStream {
             Err(_) => {
                 self.emit_failure(
                     "middleware_failed: request_body_timeout",
+                    Some(HttpRequestFailureKind::RequestBodyTimeout),
                     None,
                     openshell_supervisor_middleware::HttpRequestDiagnostics::default(),
                 );
-                Err(miette!("request middleware body deadline exceeded"))
+                Err(miette!("request middleware body deadline exceeded")
+                    .wrap_err(HttpRequestFailureKind::RequestBodyTimeout))
             }
             Ok(Err(error)) => {
                 self.emit_failure(
                     "middleware_failed: request_body_io_failed",
+                    Some(HttpRequestFailureKind::Io),
                     None,
                     openshell_supervisor_middleware::HttpRequestDiagnostics::default(),
                 );
-                Err(error)
+                Err(error.wrap_err(HttpRequestFailureKind::Io))
             }
             Ok(Ok(Err(error))) => {
                 let reason = error.reason.clone();
                 let denial = error.denial.clone();
-                self.emit_failure(&reason, denial.as_ref(), *error.diagnostics);
+                self.emit_failure(&reason, error.kind, denial.as_ref(), *error.diagnostics);
                 Err(miette::Report::new(RequestBodyMiddlewareError {
+                    kind: error.kind,
                     reason,
                     denial,
                 }))
@@ -1215,7 +1229,12 @@ impl RequestBodyStream {
                 .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                 .await;
         }
-        self.emit_failure(reason, None, diagnostics);
+        self.emit_failure(
+            reason,
+            Some(HttpRequestFailureKind::Cancelled),
+            None,
+            diagnostics,
+        );
     }
 
     fn emit_success(&mut self, finish: &openshell_supervisor_middleware::HttpRequestFinish) {
@@ -1234,6 +1253,7 @@ impl RequestBodyStream {
             true,
             "",
             None,
+            None,
             &findings,
             &metadata,
             &invocations,
@@ -1245,6 +1265,7 @@ impl RequestBodyStream {
     fn emit_failure(
         &mut self,
         reason: &str,
+        failure_kind: Option<HttpRequestFailureKind>,
         denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
         diagnostics: openshell_supervisor_middleware::HttpRequestDiagnostics,
     ) {
@@ -1262,6 +1283,7 @@ impl RequestBodyStream {
             &self.request,
             false,
             reason,
+            failure_kind,
             denial,
             &findings,
             &metadata,
@@ -1289,6 +1311,7 @@ fn emit_request_body_timeout(
         req,
         false,
         "middleware_failed: request_body_timeout",
+        Some(HttpRequestFailureKind::RequestBodyTimeout),
         None,
         &findings,
         &metadata,
@@ -1303,12 +1326,39 @@ fn emit_streaming_middleware_events(
     req: &crate::l7::provider::L7Request,
     allowed: bool,
     reason: &str,
+    failure_kind: Option<HttpRequestFailureKind>,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     findings: &[openshell_supervisor_middleware::NamespacedFinding],
     metadata: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     invocations: &[openshell_supervisor_middleware::HttpRequestInvocation],
     transformed: bool,
 ) {
+    let outcome = streaming_middleware_outcome(
+        allowed,
+        reason,
+        failure_kind,
+        denial,
+        findings,
+        metadata,
+        invocations,
+        transformed,
+    );
+    emit_middleware_events(ctx, req, &outcome);
+}
+
+// A body deadline or cancellation need not belong to any stage. Preserve the
+// terminal cause independently of the successful preflight invocation records.
+#[allow(clippy::too_many_arguments)]
+fn streaming_middleware_outcome(
+    allowed: bool,
+    reason: &str,
+    failure_kind: Option<HttpRequestFailureKind>,
+    denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+    metadata: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    invocations: &[openshell_supervisor_middleware::HttpRequestInvocation],
+    transformed: bool,
+) -> openshell_supervisor_middleware::ChainOutcome {
     let mut applied = Vec::<openshell_supervisor_middleware::MiddlewareInvocation>::new();
     for invocation in invocations {
         if let Some(existing) = applied
@@ -1316,6 +1366,7 @@ fn emit_streaming_middleware_events(
             .find(|existing| existing.name == invocation.config_name)
         {
             existing.failed |= invocation.failed;
+            existing.failure_kind = invocation.failure_kind.or(existing.failure_kind);
             existing.transformed |= matches!(
                 invocation.outcome,
                 openshell_supervisor_middleware::HttpRequestInvocationOutcome::Replacement
@@ -1330,6 +1381,7 @@ fn emit_streaming_middleware_events(
             continue;
         }
         applied.push(openshell_supervisor_middleware::MiddlewareInvocation {
+            failure_kind: invocation.failure_kind,
             name: invocation.config_name.clone(),
             implementation: invocation.implementation.clone(),
             decision: if matches!(
@@ -1345,7 +1397,8 @@ fn emit_streaming_middleware_events(
             failed: invocation.failed,
         });
     }
-    let outcome = openshell_supervisor_middleware::ChainOutcome {
+    openshell_supervisor_middleware::ChainOutcome {
+        failure_kind,
         allowed,
         reason: reason.to_string(),
         body: Vec::new(),
@@ -1354,8 +1407,7 @@ fn emit_streaming_middleware_events(
         metadata: metadata.clone(),
         applied,
         denial: denial.cloned(),
-    };
-    emit_middleware_events(ctx, req, &outcome);
+    }
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -2054,6 +2106,48 @@ mod tests {
                 safe_middleware_headers(headers).is_err(),
                 "middleware must reject malformed header fields"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_cause_tests {
+    use super::*;
+    use openshell_supervisor_middleware::{HttpRequestInvocation, HttpRequestInvocationOutcome};
+
+    #[test]
+    fn outer_terminal_cause_survives_successful_preflight() {
+        let invocation = HttpRequestInvocation {
+            config_name: "guard".into(),
+            implementation: "test/guard".into(),
+            outcome: HttpRequestInvocationOutcome::Stream,
+            sequence: None,
+            input_size: 0,
+            output_size: None,
+            failed: false,
+            stage_disabled: false,
+            reason_code: None,
+            failure_kind: None,
+        };
+        for kind in [
+            HttpRequestFailureKind::RequestBodyTimeout,
+            HttpRequestFailureKind::Cancelled,
+        ] {
+            let outcome = streaming_middleware_outcome(
+                false,
+                "unchanged display text",
+                Some(kind),
+                None,
+                &[],
+                &std::collections::BTreeMap::new(),
+                std::slice::from_ref(&invocation),
+                false,
+            );
+            assert_eq!(outcome.failure_kind, Some(kind));
+            assert!(!outcome.allowed);
+            assert!(outcome.denial.is_none());
+            assert!(!outcome.applied[0].failed);
+            assert_eq!(outcome.applied[0].failure_kind, None);
         }
     }
 }

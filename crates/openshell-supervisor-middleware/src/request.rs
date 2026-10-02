@@ -28,7 +28,7 @@ use openshell_core::proto::{
 };
 
 use super::{
-    ChainEntry, ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL,
+    ChainEntry, ChainRunner, DescribedChainEntry, EXTERNAL_FINDING_LABEL, HttpRequestFailureKind,
     MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_FINDING_BYTES,
     MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_HEADER_BYTES, MAX_MIDDLEWARE_HEADERS,
     MAX_MIDDLEWARE_METADATA_BYTES, MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_REASON_BYTES,
@@ -40,6 +40,9 @@ use super::{
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_RECORDED_REQUEST_INVOCATIONS: usize = 1024;
+
+#[cfg(test)]
+mod failure_tests;
 
 /// Largest normalized STREAM chunk sent through the public contract.
 pub const MAX_HTTP_REQUEST_STREAM_UNIT_BYTES: usize = 64 * 1024;
@@ -81,10 +84,11 @@ pub struct HttpRequestInvocation {
     pub failed: bool,
     pub stage_disabled: bool,
     pub reason_code: Option<String>,
-    pub failure_category: Option<String>,
+    pub failure_kind: Option<HttpRequestFailureKind>,
 }
 
 pub struct HttpRequestPreflightOutcome {
+    pub failure_kind: Option<HttpRequestFailureKind>,
     pub allowed: bool,
     pub reason: String,
     pub denial: Option<super::MiddlewareDenial>,
@@ -99,6 +103,8 @@ pub struct HttpRequestPreflightOutcome {
 
 #[derive(Debug)]
 pub struct HttpRequestMiddlewareFailure {
+    /// The platform cause; explicit middleware denials have no failure kind.
+    pub kind: Option<HttpRequestFailureKind>,
     pub reason: String,
     pub denial: Option<super::MiddlewareDenial>,
     pub diagnostics: Box<HttpRequestDiagnostics>,
@@ -287,7 +293,11 @@ impl HttpRequestSession {
     ) -> Result<HttpRequestFinish, HttpRequestMiddlewareFailure> {
         let stage_count = self.stages.len();
         if stage_count == 0 {
-            return Err(failure("request_pipeline_without_stages", None));
+            return Err(failure(
+                HttpRequestFailureKind::InvalidResult,
+                "request_pipeline_without_stages",
+                None,
+            ));
         }
 
         let mut links = Vec::with_capacity(stage_count + 1);
@@ -307,34 +317,50 @@ impl HttpRequestSession {
                     output_body_bytes: source_declared,
                 })
                 .await
-                .map_err(|_| failure("request_pipeline_closed", None))?;
+                .map_err(|_| {
+                    failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None)
+                })?;
             let mut ended = false;
             while let Some(item) = input.recv().await {
                 match item {
                     HttpRequestBodyInput::Chunk(data) => {
                         if ended || data.is_empty() || data.len() > source_limit {
-                            return Err(failure("request_stream_chunk_invalid", None));
+                            return Err(failure(
+                                if data.len() > source_limit {
+                                    HttpRequestFailureKind::Capacity
+                                } else {
+                                    HttpRequestFailureKind::InvalidResult
+                                },
+                                "request_stream_chunk_invalid",
+                                None,
+                            ));
                         }
-                        source
-                            .send(StageFrame::Chunk(data))
-                            .await
-                            .map_err(|_| failure("request_pipeline_closed", None))?;
+                        source.send(StageFrame::Chunk(data)).await.map_err(|_| {
+                            failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None)
+                        })?;
                     }
                     HttpRequestBodyInput::End(trailers) => {
                         if ended {
-                            return Err(failure("request_input_end_duplicate", None));
+                            return Err(failure(
+                                HttpRequestFailureKind::InvalidResult,
+                                "request_input_end_duplicate",
+                                None,
+                            ));
                         }
                         ended = true;
-                        source
-                            .send(StageFrame::End(trailers))
-                            .await
-                            .map_err(|_| failure("request_pipeline_closed", None))?;
+                        source.send(StageFrame::End(trailers)).await.map_err(|_| {
+                            failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None)
+                        })?;
                         break;
                     }
                 }
             }
             if !ended {
-                return Err(failure("request_input_end_missing", None));
+                return Err(failure(
+                    HttpRequestFailureKind::InvalidResult,
+                    "request_input_end_missing",
+                    None,
+                ));
             }
             Ok::<(), HttpRequestMiddlewareFailure>(())
         });
@@ -376,13 +402,17 @@ impl HttpRequestSession {
                     output
                         .send(HttpRequestBodyOutput::Start { output_body_bytes })
                         .await
-                        .map_err(|_| failure("request_output_closed", None))?;
+                        .map_err(|_| {
+                            failure(HttpRequestFailureKind::Io, "request_output_closed", None)
+                        })?;
                 }
                 StageFrame::Chunk(data) if started && !ended => {
                     output
                         .send(HttpRequestBodyOutput::Chunk(data))
                         .await
-                        .map_err(|_| failure("request_output_closed", None))?;
+                        .map_err(|_| {
+                            failure(HttpRequestFailureKind::Io, "request_output_closed", None)
+                        })?;
                 }
                 StageFrame::End(value) if started && !ended => {
                     ended = true;
@@ -390,17 +420,29 @@ impl HttpRequestSession {
                     output
                         .send(HttpRequestBodyOutput::End { trailers: value })
                         .await
-                        .map_err(|_| failure("request_output_closed", None))?;
+                        .map_err(|_| {
+                            failure(HttpRequestFailureKind::Io, "request_output_closed", None)
+                        })?;
                     break;
                 }
-                _ => return Err(failure("request_pipeline_event_order_invalid", None)),
+                _ => {
+                    return Err(failure(
+                        HttpRequestFailureKind::InvalidResult,
+                        "request_pipeline_event_order_invalid",
+                        None,
+                    ));
+                }
             }
         }
         drop(output);
 
-        source_task
-            .await
-            .map_err(|_| failure("request_input_task_failed", None))??;
+        source_task.await.map_err(|_| {
+            failure(
+                HttpRequestFailureKind::InvalidResult,
+                "request_input_task_failed",
+                None,
+            )
+        })??;
 
         let mut body_transformed = false;
         let mut stage_tasks = stage_tasks.into_iter();
@@ -424,7 +466,11 @@ impl HttpRequestSession {
                         task.abort();
                         let _ = task.await;
                     }
-                    return Err(failure("request_stage_task_failed", None));
+                    return Err(failure(
+                        HttpRequestFailureKind::InvalidResult,
+                        "request_stage_task_failed",
+                        None,
+                    ));
                 }
             };
             body_transformed |= report.transformed;
@@ -433,7 +479,11 @@ impl HttpRequestSession {
             self.invocations.extend(report.invocations);
         }
         if !started || !ended {
-            return Err(failure("request_pipeline_incomplete", None));
+            return Err(failure(
+                HttpRequestFailureKind::InvalidResult,
+                "request_pipeline_incomplete",
+                None,
+            ));
         }
         self.session_admission.take();
         Ok(HttpRequestFinish {
@@ -453,7 +503,15 @@ impl HttpRequestSession {
         data: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, HttpRequestMiddlewareFailure> {
         if data.is_empty() || data.len() > self.stream_unit_limit() {
-            return Err(failure("request_stream_chunk_invalid", None));
+            return Err(failure(
+                if data.len() > self.stream_unit_limit() {
+                    HttpRequestFailureKind::Capacity
+                } else {
+                    HttpRequestFailureKind::InvalidResult
+                },
+                "request_stream_chunk_invalid",
+                None,
+            ));
         }
         self.pending_input.push(data);
         Ok(Vec::new())
@@ -472,12 +530,14 @@ impl HttpRequestSession {
                 body_tx
                     .send(HttpRequestBodyInput::Chunk(chunk))
                     .await
-                    .map_err(|_| failure("request_pipeline_closed", None))?;
+                    .map_err(|_| {
+                        failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None)
+                    })?;
             }
             body_tx
                 .send(HttpRequestBodyInput::End(trailers))
                 .await
-                .map_err(|_| failure("request_pipeline_closed", None))
+                .map_err(|_| failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None))
         };
         let collect = async move {
             let mut units = Vec::new();
@@ -486,7 +546,11 @@ impl HttpRequestSession {
                 if let HttpRequestBodyOutput::Chunk(data) = event {
                     retained = retained.saturating_add(data.len());
                     if retained > MAX_HTTP_REQUEST_DEFERRED_BYTES {
-                        return Err(failure("request_output_over_capacity", None));
+                        return Err(failure(
+                            HttpRequestFailureKind::Capacity,
+                            "request_output_over_capacity",
+                            None,
+                        ));
                     }
                     units.push(data);
                 }
@@ -515,20 +579,21 @@ impl HttpRequestSession {
                 body_tx
                     .send(HttpRequestBodyInput::Chunk(chunk))
                     .await
-                    .map_err(|_| failure("request_pipeline_closed", None))?;
+                    .map_err(|_| {
+                        failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None)
+                    })?;
             }
             body_tx
                 .send(HttpRequestBodyInput::End(trailers))
                 .await
-                .map_err(|_| failure("request_pipeline_closed", None))
+                .map_err(|_| failure(HttpRequestFailureKind::Io, "request_pipeline_closed", None))
         };
         let forward = async move {
             while let Some(event) = event_rx.recv().await {
                 if let HttpRequestBodyOutput::Chunk(data) = event {
-                    output
-                        .send(data)
-                        .await
-                        .map_err(|_| failure("request_output_closed", None))?;
+                    output.send(data).await.map_err(|_| {
+                        failure(HttpRequestFailureKind::Io, "request_output_closed", None)
+                    })?;
                 }
             }
             Ok::<(), HttpRequestMiddlewareFailure>(())
@@ -590,7 +655,11 @@ async fn run_buffered_stage(
             StageFrame::Start { .. } if !saw_start => saw_start = true,
             StageFrame::Chunk(data) if saw_start && trailers.is_none() => {
                 if body.len().saturating_add(data.len()) > max_body_bytes {
-                    return Err(stage_failure(stage, "buffered_input_over_capacity"));
+                    return Err(stage_failure(
+                        stage,
+                        HttpRequestFailureKind::Capacity,
+                        "buffered_input_over_capacity",
+                    ));
                 }
                 body.extend_from_slice(&data);
             }
@@ -598,11 +667,22 @@ async fn run_buffered_stage(
                 trailers = Some(value);
                 break;
             }
-            _ => return Err(stage_failure(stage, "buffered_input_order_invalid")),
+            _ => {
+                return Err(stage_failure(
+                    stage,
+                    HttpRequestFailureKind::InvalidResult,
+                    "buffered_input_order_invalid",
+                ));
+            }
         }
     }
-    let mut trailers =
-        trailers.ok_or_else(|| stage_failure(stage, "buffered_input_end_missing"))?;
+    let mut trailers = trailers.ok_or_else(|| {
+        stage_failure(
+            stage,
+            HttpRequestFailureKind::InvalidResult,
+            "buffered_input_end_missing",
+        )
+    })?;
     let original_len = body.len();
     let result = exchange(
         stage,
@@ -619,11 +699,21 @@ async fn run_buffered_stage(
         Some(http_result::Result::Reject(reject)) => {
             return Err(rejection(stage, reject.diagnostics));
         }
-        _ => return Err(stage_failure(stage, "buffered_result_expected")),
+        _ => {
+            return Err(stage_failure(
+                stage,
+                HttpRequestFailureKind::InvalidResult,
+                "buffered_result_expected",
+            ));
+        }
     };
     let diagnostics = validate_diagnostics_message(buffered.diagnostics.as_ref())?;
     if !buffered.header_mutations.is_empty() {
-        return Err(stage_failure(stage, "late_header_mutations_not_permitted"));
+        return Err(stage_failure(
+            stage,
+            HttpRequestFailureKind::InvalidResult,
+            "late_header_mutations_not_permitted",
+        ));
     }
     trailers = headers::apply(
         headers::HeaderAuthority::RequestTrailers,
@@ -638,28 +728,40 @@ async fn run_buffered_stage(
         }
         Some(http_buffered_result::Body::Replacement(replacement)) => {
             if replacement.len() > max_body_bytes {
-                return Err(stage_failure(stage, "buffered_output_over_capacity"));
+                return Err(stage_failure(
+                    stage,
+                    HttpRequestFailureKind::Capacity,
+                    "buffered_output_over_capacity",
+                ));
             }
             (replacement, HttpRequestInvocationOutcome::Replacement, true)
         }
-        None => return Err(stage_failure(stage, "buffered_body_result_missing")),
+        None => {
+            return Err(stage_failure(
+                stage,
+                HttpRequestFailureKind::InvalidResult,
+                "buffered_body_result_missing",
+            ));
+        }
     };
     output
         .send(StageFrame::Start {
             output_body_bytes: Some(body.len() as u64),
         })
         .await
-        .map_err(|_| stage_failure(stage, "request_output_closed"))?;
+        .map_err(|_| stage_failure(stage, HttpRequestFailureKind::Io, "request_output_closed"))?;
     for chunk in body.chunks(stage.output_unit_limit) {
         output
             .send(StageFrame::Chunk(chunk.to_vec()))
             .await
-            .map_err(|_| stage_failure(stage, "request_output_closed"))?;
+            .map_err(|_| {
+                stage_failure(stage, HttpRequestFailureKind::Io, "request_output_closed")
+            })?;
     }
     output
         .send(StageFrame::End(trailers))
         .await
-        .map_err(|_| stage_failure(stage, "request_output_closed"))?;
+        .map_err(|_| stage_failure(stage, HttpRequestFailureKind::Io, "request_output_closed"))?;
     Ok(report_from_diagnostics(
         stage,
         diagnostics,
@@ -702,6 +804,11 @@ async fn run_stream_stage(
                     {
                         return Err(failure_for_entry(
                             &input_entry,
+                            if data.is_empty() {
+                                HttpRequestFailureKind::InvalidResult
+                            } else {
+                                HttpRequestFailureKind::Capacity
+                            },
                             "stream_input_chunk_invalid",
                         ));
                     }
@@ -740,12 +847,17 @@ async fn run_stream_stage(
                 _ => {
                     return Err(failure_for_entry(
                         &input_entry,
+                        HttpRequestFailureKind::InvalidResult,
                         "stream_input_order_invalid",
                     ));
                 }
             }
         }
-        Err(failure_for_entry(&input_entry, "stream_input_end_missing"))
+        Err(failure_for_entry(
+            &input_entry,
+            HttpRequestFailureKind::InvalidResult,
+            "stream_input_end_missing",
+        ))
     };
 
     let entry = stage.entry.clone();
@@ -783,9 +895,7 @@ async fn run_stream_stage(
                     }
                     changed = input_delivered_rx.changed() => {
                         if changed.is_err() {
-                            return Err(failure_for_entry(
-                                &entry,
-                                "stream_input_end_missing",
+                            return Err(failure_for_entry(&entry, HttpRequestFailureKind::InvalidResult, "stream_input_end_missing"
                             ));
                         }
                     }
@@ -796,6 +906,7 @@ async fn run_stream_stage(
                     if !start.header_mutations.is_empty() {
                         return Err(failure_for_entry(
                             &entry,
+                            HttpRequestFailureKind::InvalidResult,
                             "late_header_mutations_not_permitted",
                         ));
                     }
@@ -806,7 +917,13 @@ async fn run_stream_stage(
                             output_body_bytes: declared_output,
                         })
                         .await
-                        .map_err(|_| failure_for_entry(&entry, "request_output_closed"))?;
+                        .map_err(|_| {
+                            failure_for_entry(
+                                &entry,
+                                HttpRequestFailureKind::Io,
+                                "request_output_closed",
+                            )
+                        })?;
                 }
                 Some(http_result::Result::OutputChunk(chunk)) if started => {
                     if chunk.data.is_empty()
@@ -815,35 +932,67 @@ async fn run_stream_stage(
                                 .max_payload_bytes()
                                 .min(MAX_HTTP_REQUEST_STREAM_UNIT_BYTES)
                     {
-                        return Err(failure_for_entry(&entry, "stream_output_chunk_invalid"));
+                        return Err(failure_for_entry(
+                            &entry,
+                            if chunk.data.is_empty() {
+                                HttpRequestFailureKind::InvalidResult
+                            } else {
+                                HttpRequestFailureKind::Capacity
+                            },
+                            "stream_output_chunk_invalid",
+                        ));
                     }
                     let total = output_bytes_for_pump
                         .fetch_add(chunk.data.len(), Ordering::Relaxed)
                         + chunk.data.len();
                     if declared_output.is_some_and(|declared| total as u64 > declared) {
-                        return Err(failure_for_entry(&entry, "stream_output_length_mismatch"));
+                        return Err(failure_for_entry(
+                            &entry,
+                            HttpRequestFailureKind::InvalidResult,
+                            "stream_output_length_mismatch",
+                        ));
                     }
                     for unit in chunk.data.chunks(output_unit_limit) {
                         output
                             .send(StageFrame::Chunk(unit.to_vec()))
                             .await
-                            .map_err(|_| failure_for_entry(&entry, "request_output_closed"))?;
+                            .map_err(|_| {
+                                failure_for_entry(
+                                    &entry,
+                                    HttpRequestFailureKind::Io,
+                                    "request_output_closed",
+                                )
+                            })?;
                     }
                 }
                 Some(http_result::Result::Finish(finish)) if started => {
                     if !input_ended.load(Ordering::Acquire) {
-                        return Err(failure_for_entry(&entry, "stream_finish_before_input_end"));
+                        return Err(failure_for_entry(
+                            &entry,
+                            HttpRequestFailureKind::InvalidResult,
+                            "stream_finish_before_input_end",
+                        ));
                     }
                     let total = output_bytes_for_pump.load(Ordering::Relaxed) as u64;
                     if declared_output.is_some_and(|declared| declared != total) {
-                        return Err(failure_for_entry(&entry, "stream_output_length_mismatch"));
+                        return Err(failure_for_entry(
+                            &entry,
+                            HttpRequestFailureKind::InvalidResult,
+                            "stream_output_length_mismatch",
+                        ));
                     }
                     let diagnostics = validate_diagnostics_message(finish.diagnostics.as_ref())?;
                     let trailers = input_trailers
                         .lock()
                         .expect("trailer lock poisoned")
                         .clone()
-                        .ok_or_else(|| failure_for_entry(&entry, "stream_input_end_missing"))?;
+                        .ok_or_else(|| {
+                            failure_for_entry(
+                                &entry,
+                                HttpRequestFailureKind::InvalidResult,
+                                "stream_input_end_missing",
+                            )
+                        })?;
                     let trailers = headers::apply(
                         headers::HeaderAuthority::RequestTrailers,
                         &trailers,
@@ -853,16 +1002,25 @@ async fn run_stream_stage(
                     .map_err(|error| {
                         mutation_failure_for_entry(&entry, diagnostic_policy, &error)
                     })?;
-                    output
-                        .send(StageFrame::End(trailers))
-                        .await
-                        .map_err(|_| failure_for_entry(&entry, "request_output_closed"))?;
+                    output.send(StageFrame::End(trailers)).await.map_err(|_| {
+                        failure_for_entry(
+                            &entry,
+                            HttpRequestFailureKind::Io,
+                            "request_output_closed",
+                        )
+                    })?;
                     return Ok::<MiddlewareDiagnostics, HttpRequestMiddlewareFailure>(diagnostics);
                 }
                 Some(http_result::Result::Reject(reject)) => {
                     return Err(rejection_for_entry(&entry, reject.diagnostics));
                 }
-                _ => return Err(failure_for_entry(&entry, "stream_result_order_invalid")),
+                _ => {
+                    return Err(failure_for_entry(
+                        &entry,
+                        HttpRequestFailureKind::InvalidResult,
+                        "stream_result_order_invalid",
+                    ));
+                }
             }
         }
     };
@@ -908,7 +1066,7 @@ impl ChainRunner {
                 BTreeMap::new(),
                 described
                     .iter()
-                    .map(|entry| failed_invocation(entry, "request_input_over_capacity"))
+                    .map(|entry| failed_invocation(entry, Some(HttpRequestFailureKind::Capacity)))
                     .collect(),
             ));
         }
@@ -929,7 +1087,10 @@ impl ChainRunner {
         for entry in described {
             if entry.on_error() == OnError::FailOpen {
                 end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                invocations.push(failed_invocation(&entry, "http_fail_open_unsupported"));
+                invocations.push(failed_invocation(
+                    &entry,
+                    Some(HttpRequestFailureKind::InvalidResult),
+                ));
                 return Ok(failed_preflight_outcome(
                     headers,
                     header_mutations,
@@ -941,7 +1102,10 @@ impl ChainRunner {
             }
             let Some(service) = entry.service.as_ref() else {
                 end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                invocations.push(failed_invocation(&entry, "binding_not_described"));
+                invocations.push(failed_invocation(
+                    &entry,
+                    Some(HttpRequestFailureKind::Unavailable),
+                ));
                 return Ok(failed_preflight_outcome(
                     headers,
                     header_mutations,
@@ -972,10 +1136,13 @@ impl ChainRunner {
             };
             let stage_timeout = Instant::now() + entry.timeout();
             let stage_deadline = chain_deadline.min(stage_timeout);
-            let timeout_reason = if chain_deadline <= stage_timeout {
-                "middleware_chain_timeout"
+            let (timeout_reason, timeout_kind) = if chain_deadline <= stage_timeout {
+                (
+                    "middleware_chain_timeout",
+                    HttpRequestFailureKind::ChainTimeout,
+                )
             } else {
-                "middleware_timeout"
+                ("middleware_timeout", HttpRequestFailureKind::StageTimeout)
             };
             let opened = tokio::time::timeout_at(stage_deadline, async {
                 sender
@@ -983,23 +1150,36 @@ impl ChainRunner {
                         event: Some(http_event::Event::Preflight(preflight)),
                     })
                     .await
-                    .map_err(|_| tonic::Status::unavailable("middleware request stream closed"))?;
+                    .map_err(|_| {
+                        (
+                            HttpRequestFailureKind::Io,
+                            tonic::Status::unavailable("middleware request stream closed"),
+                        )
+                    })?;
                 let mut responses = service
                     .service
                     .open_http_request_pre_credentials(receiver)
-                    .await?;
-                let result = responses.next().await.ok_or_else(|| {
-                    tonic::Status::unavailable("middleware result stream closed")
-                })??;
-                Ok::<_, tonic::Status>((responses, result))
+                    .await
+                    .map_err(|error| (HttpRequestFailureKind::RemoteStatus(error.code()), error))?;
+                let result = responses
+                    .next()
+                    .await
+                    .ok_or_else(|| {
+                        (
+                            HttpRequestFailureKind::Io,
+                            tonic::Status::unavailable("middleware result stream closed"),
+                        )
+                    })?
+                    .map_err(|error| (HttpRequestFailureKind::RemoteStatus(error.code()), error))?;
+                Ok::<_, (HttpRequestFailureKind, tonic::Status)>((responses, result))
             })
             .await;
             let (responses, result) = match opened {
                 Ok(Ok(value)) => value,
-                Ok(Err(error)) => {
+                Ok(Err((kind, error))) => {
                     let reason = service.diagnostic_policy.error_reason(&error);
                     end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    invocations.push(failed_invocation(&entry, &reason));
+                    invocations.push(failed_invocation(&entry, Some(kind)));
                     return Ok(failed_preflight_outcome(
                         headers,
                         header_mutations,
@@ -1011,7 +1191,7 @@ impl ChainRunner {
                 }
                 Err(_) => {
                     end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    invocations.push(failed_invocation(&entry, timeout_reason));
+                    invocations.push(failed_invocation(&entry, Some(timeout_kind)));
                     return Ok(failed_preflight_outcome(
                         headers,
                         header_mutations,
@@ -1049,7 +1229,7 @@ impl ChainRunner {
                                     MiddlewareSessionEndReason::MiddlewareFailure,
                                 )
                                 .await;
-                                invocations.push(failed_invocation(&entry, &error.reason));
+                                invocations.push(failed_invocation(&entry, error.kind));
                                 return Ok(failed_preflight_outcome(
                                     headers,
                                     header_mutations,
@@ -1077,7 +1257,10 @@ impl ChainRunner {
                                 .await;
                             end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
                                 .await;
-                            invocations.push(failed_invocation(&entry, &reason));
+                            invocations.push(failed_invocation(
+                                &entry,
+                                Some(HttpRequestFailureKind::HeaderMutation),
+                            ));
                             return Ok(failed_preflight_outcome(
                                 headers,
                                 header_mutations,
@@ -1121,7 +1304,10 @@ impl ChainRunner {
                                         MiddlewareSessionEndReason::MiddlewareFailure,
                                     )
                                     .await;
-                                    invocations.push(failed_invocation(&entry, reason));
+                                    invocations.push(failed_invocation(
+                                        &entry,
+                                        Some(HttpRequestFailureKind::InvalidResult),
+                                    ));
                                     return Ok(failed_preflight_outcome(
                                         headers,
                                         header_mutations,
@@ -1152,8 +1338,10 @@ impl ChainRunner {
                                 .await;
                             end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
                                 .await;
-                            invocations
-                                .push(failed_invocation(&entry, "preflight_decision_missing"));
+                            invocations.push(failed_invocation(
+                                &entry,
+                                Some(HttpRequestFailureKind::InvalidResult),
+                            ));
                             return Ok(failed_preflight_outcome(
                                 headers,
                                 header_mutations,
@@ -1179,7 +1367,7 @@ impl ChainRunner {
                                     MiddlewareSessionEndReason::MiddlewareFailure,
                                 )
                                 .await;
-                                invocations.push(failed_invocation(&entry, &error.reason));
+                                invocations.push(failed_invocation(&entry, error.kind));
                                 return Ok(failed_preflight_outcome(
                                     headers,
                                     header_mutations,
@@ -1207,6 +1395,7 @@ impl ChainRunner {
                         reason_code,
                     };
                     return Ok(HttpRequestPreflightOutcome {
+                        failure_kind: None,
                         allowed: false,
                         reason: middleware_denial_reason(
                             &denial.config_name,
@@ -1228,7 +1417,10 @@ impl ChainRunner {
                         .end(MiddlewareSessionEndReason::MiddlewareFailure)
                         .await;
                     end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    invocations.push(failed_invocation(&entry, "preflight_result_expected"));
+                    invocations.push(failed_invocation(
+                        &entry,
+                        Some(HttpRequestFailureKind::InvalidResult),
+                    ));
                     return Ok(failed_preflight_outcome(
                         headers,
                         header_mutations,
@@ -1251,6 +1443,7 @@ impl ChainRunner {
             pending_input: Vec::new(),
         });
         Ok(HttpRequestPreflightOutcome {
+            failure_kind: None,
             allowed: true,
             reason: String::new(),
             denial: None,
@@ -1272,15 +1465,29 @@ async fn send_event_for_entry(
     event: HttpEvent,
 ) -> Result<(), HttpRequestMiddlewareFailure> {
     let stage_deadline = Instant::now() + entry.timeout();
-    let (deadline, timeout_reason) = if chain_deadline <= stage_deadline {
-        (chain_deadline, "middleware_chain_timeout")
+    let (deadline, timeout_reason, timeout_kind) = if chain_deadline <= stage_deadline {
+        (
+            chain_deadline,
+            "middleware_chain_timeout",
+            HttpRequestFailureKind::ChainTimeout,
+        )
     } else {
-        (stage_deadline, "middleware_timeout")
+        (
+            stage_deadline,
+            "middleware_timeout",
+            HttpRequestFailureKind::StageTimeout,
+        )
     };
     tokio::time::timeout_at(deadline, sender.send(event))
         .await
-        .map_err(|_| failure_for_entry(entry, timeout_reason))?
-        .map_err(|_| failure_for_entry(entry, "middleware_stream_closed"))
+        .map_err(|_| failure_for_entry(entry, timeout_kind, timeout_reason))?
+        .map_err(|_| {
+            failure_for_entry(
+                entry,
+                HttpRequestFailureKind::Io,
+                "middleware_stream_closed",
+            )
+        })
 }
 
 async fn exchange(
@@ -1317,15 +1524,23 @@ async fn next_result_for_entry(
     responses: &mut super::HttpResultStream,
 ) -> Result<HttpResult, HttpRequestMiddlewareFailure> {
     let stage_deadline = Instant::now() + entry.timeout();
-    let (deadline, timeout_reason) = if chain_deadline <= stage_deadline {
-        (chain_deadline, "middleware_chain_timeout")
+    let (deadline, timeout_reason, timeout_kind) = if chain_deadline <= stage_deadline {
+        (
+            chain_deadline,
+            "middleware_chain_timeout",
+            HttpRequestFailureKind::ChainTimeout,
+        )
     } else {
-        (stage_deadline, "middleware_timeout")
+        (
+            stage_deadline,
+            "middleware_timeout",
+            HttpRequestFailureKind::StageTimeout,
+        )
     };
     tokio::time::timeout_at(deadline, responses.next())
         .await
         .map_or_else(
-            |_| Err(failure_for_entry(entry, timeout_reason)),
+            |_| Err(failure_for_entry(entry, timeout_kind, timeout_reason)),
             |result| validate_next_result_for_entry(entry, diagnostic_policy, result),
         )
 }
@@ -1339,9 +1554,14 @@ fn validate_next_result_for_entry(
         Some(Ok(result)) => Ok(result),
         Some(Err(error)) => Err(failure_for_entry(
             entry,
+            HttpRequestFailureKind::RemoteStatus(error.code()),
             &diagnostic_policy.error_reason(&error),
         )),
-        None => Err(failure_for_entry(entry, "middleware_result_stream_closed")),
+        None => Err(failure_for_entry(
+            entry,
+            HttpRequestFailureKind::Io,
+            "middleware_result_stream_closed",
+        )),
     }
 }
 
@@ -1445,6 +1665,7 @@ fn validate_diagnostics_message(
     let diagnostics = diagnostics.cloned().unwrap_or_default();
     if diagnostics.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
         return Err(failure(
+            HttpRequestFailureKind::Capacity,
             "middleware_failed: request_reason_over_capacity",
             None,
         ));
@@ -1454,6 +1675,7 @@ fn validate_diagnostics_message(
             || !is_stable_reason_code(&diagnostics.reason_code))
     {
         return Err(failure(
+            HttpRequestFailureKind::InvalidResult,
             "middleware_failed: request_reason_code_invalid",
             None,
         ));
@@ -1465,6 +1687,7 @@ fn validate_diagnostics_message(
             .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
     {
         return Err(failure(
+            HttpRequestFailureKind::Capacity,
             "middleware_failed: request_findings_over_capacity",
             None,
         ));
@@ -1478,6 +1701,7 @@ fn validate_diagnostics_message(
             > MAX_MIDDLEWARE_METADATA_BYTES
     {
         return Err(failure(
+            HttpRequestFailureKind::Capacity,
             "middleware_failed: request_metadata_over_capacity",
             None,
         ));
@@ -1551,7 +1775,7 @@ fn report_from_diagnostics(
             failed: false,
             stage_disabled: false,
             reason_code: nonempty(&diagnostics.reason_code),
-            failure_category: None,
+            failure_kind: None,
         },
     );
     report
@@ -1572,11 +1796,14 @@ fn preflight_invocation(
         failed: false,
         stage_disabled: false,
         reason_code,
-        failure_category: None,
+        failure_kind: None,
     }
 }
 
-fn failed_invocation(entry: &DescribedChainEntry, reason: &str) -> HttpRequestInvocation {
+fn failed_invocation(
+    entry: &DescribedChainEntry,
+    kind: Option<HttpRequestFailureKind>,
+) -> HttpRequestInvocation {
     HttpRequestInvocation {
         config_name: entry.entry.name.clone(),
         implementation: entry.entry.implementation.clone(),
@@ -1587,7 +1814,7 @@ fn failed_invocation(entry: &DescribedChainEntry, reason: &str) -> HttpRequestIn
         failed: true,
         stage_disabled: true,
         reason_code: None,
-        failure_category: Some(request_failure_category(reason).into()),
+        failure_kind: kind,
     }
 }
 
@@ -1607,6 +1834,7 @@ fn record_request_invocation(
             (left, right) => left.or(right),
         };
         existing.failed |= invocation.failed;
+        existing.failure_kind = invocation.failure_kind.or(existing.failure_kind);
         existing.outcome = invocation.outcome;
     }
 }
@@ -1645,9 +1873,10 @@ fn rejection_for_entry(
                 failed: false,
                 stage_disabled: false,
                 reason_code: nonempty(&diagnostics.reason_code),
-                failure_category: None,
+                failure_kind: None,
             });
             HttpRequestMiddlewareFailure {
+                kind: None,
                 reason: middleware_denial_reason(
                     &denial.config_name,
                     denial.reason_code.as_deref(),
@@ -1679,27 +1908,45 @@ fn mutation_failure_for_entry(
     policy: MiddlewareDiagnosticPolicy,
     error: &headers::HeaderMutationError,
 ) -> HttpRequestMiddlewareFailure {
-    failure_for_entry(entry, &policy.header_mutation_error_reason(error))
+    failure_for_entry(
+        entry,
+        HttpRequestFailureKind::HeaderMutation,
+        &policy.header_mutation_error_reason(error),
+    )
 }
 
-fn stage_failure(stage: &HttpRequestStage, reason: &str) -> HttpRequestMiddlewareFailure {
-    failure_for_entry(&stage.entry, reason)
+fn stage_failure(
+    stage: &HttpRequestStage,
+    kind: HttpRequestFailureKind,
+    reason: &str,
+) -> HttpRequestMiddlewareFailure {
+    failure_for_entry(&stage.entry, kind, reason)
 }
 
-fn failure_for_entry(entry: &DescribedChainEntry, reason: &str) -> HttpRequestMiddlewareFailure {
+fn failure_for_entry(
+    entry: &DescribedChainEntry,
+    kind: HttpRequestFailureKind,
+    reason: &str,
+) -> HttpRequestMiddlewareFailure {
     let mut diagnostics = HttpRequestDiagnostics::default();
     diagnostics
         .invocations
-        .push(failed_invocation(entry, reason));
+        .push(failed_invocation(entry, Some(kind)));
     HttpRequestMiddlewareFailure {
+        kind: Some(kind),
         reason: format!("middleware_failed: {reason}"),
         denial: None,
         diagnostics: Box::new(diagnostics),
     }
 }
 
-fn failure(reason: &str, denial: Option<super::MiddlewareDenial>) -> HttpRequestMiddlewareFailure {
+fn failure(
+    kind: HttpRequestFailureKind,
+    reason: &str,
+    denial: Option<super::MiddlewareDenial>,
+) -> HttpRequestMiddlewareFailure {
     HttpRequestMiddlewareFailure {
+        kind: Some(kind),
         reason: reason.into(),
         denial,
         diagnostics: Box::default(),
@@ -1712,6 +1959,7 @@ fn nonempty(value: &str) -> Option<String> {
 
 fn empty_preflight_outcome(headers: Vec<HttpHeader>) -> HttpRequestPreflightOutcome {
     HttpRequestPreflightOutcome {
+        failure_kind: None,
         allowed: true,
         reason: String::new(),
         denial: None,
@@ -1734,6 +1982,7 @@ fn failed_preflight_outcome(
     invocations: Vec<HttpRequestInvocation>,
 ) -> HttpRequestPreflightOutcome {
     HttpRequestPreflightOutcome {
+        failure_kind: invocations.iter().rev().find_map(|item| item.failure_kind),
         allowed: false,
         reason,
         denial: None,
@@ -1753,10 +2002,11 @@ fn session_capacity_exhausted(
 ) -> HttpRequestPreflightOutcome {
     let invocations = entries
         .iter()
-        .map(|entry| failed_invocation(entry, "session_capacity_exhausted"))
+        .map(|entry| failed_invocation(entry, Some(HttpRequestFailureKind::Capacity)))
         .collect();
     HttpRequestPreflightOutcome {
         session_capacity_exhausted: true,
+        failure_kind: Some(HttpRequestFailureKind::Capacity),
         invocations,
         ..failed_preflight_outcome(
             headers,
@@ -1772,25 +2022,6 @@ fn session_capacity_exhausted(
 async fn end_stages(stages: &mut [HttpRequestStage], reason: MiddlewareSessionEndReason) {
     for stage in stages {
         stage.transport.end(reason).await;
-    }
-}
-
-fn request_failure_category(reason: &str) -> &'static str {
-    if reason.contains("timeout") {
-        "timeout"
-    } else if reason.contains("capacity") {
-        "capacity"
-    } else if reason.contains("header") {
-        "header_mutation"
-    } else if reason.contains("order")
-        || reason.contains("result")
-        || reason.contains("protocol")
-        || reason.contains("mode")
-        || reason.contains("stream_")
-    {
-        "protocol"
-    } else {
-        "service"
     }
 }
 
