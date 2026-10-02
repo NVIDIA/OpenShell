@@ -82,6 +82,8 @@ If you run OpenShell for a team, start here.
 
 If you use OpenShell through the CLI, policies, APIs, or SDKs, review these changes.
 
+- **Git filtering failures stop uploads.** `sandbox upload` and `sandbox create --upload` now exit with an error when Git filtering fails or returns no files, instead of uploading the source unfiltered. This includes unavailable Git and broken or inaccessible repositories. Sources confirmed to be outside a Git work tree still upload without filtering, with a warning that `.gitignore` rules are not applied. Update scripts and CI to install Git and fix filtering errors, or pass `--no-git-ignore` when an unfiltered transfer is intended. A rejected creation-time upload leaves the sandbox running; retry with `sandbox upload` or remove it with `sandbox delete` ([PR #3957](https://github.com/NVIDIA/OpenShell/pull/3957)).
+
 - **Build local images before sandbox creation.** `openshell sandbox create --from` no longer builds a Dockerfile or directory. Build and tag with the gateway's container engine, then pass the image reference. Remote gateways need an image they can pull from a registry ([PR #3214](https://github.com/NVIDIA/OpenShell/pull/3214)).
 
   ```shell
