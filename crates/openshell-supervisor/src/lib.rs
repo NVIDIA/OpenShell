@@ -2465,6 +2465,7 @@ async fn load_policy_with_gateway(
                     &instance_id,
                     &snapshot,
                     &error.to_string(),
+                    None,
                 )
                 .await?;
                 reconciliation_attempts = 0;
@@ -6204,6 +6205,7 @@ network_policies:
                 None,
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
+                None,
                 Some(discovery),
                 &startup_gateway,
             )
@@ -6352,6 +6354,7 @@ network_policies:
                 None,
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
+                None,
                 Some(discovery),
                 &gateway,
             ),
@@ -6677,6 +6680,7 @@ network_policies:
                 None,
                 &openshell_extension_core::ExtensionCredentialStore::new(),
                 LocalPolicyIdentity::Required,
+                None,
                 Some(ImagePolicyDiscovery::Missing),
                 &gateway,
             ),
@@ -6771,6 +6775,7 @@ network_policies:
                         None,
                         &openshell_extension_core::ExtensionCredentialStore::new(),
                         LocalPolicyIdentity::Required,
+                        None,
                         Some(discovery.clone()),
                         &gateway,
                     ),
