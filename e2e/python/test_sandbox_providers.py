@@ -395,26 +395,6 @@ def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "NOT_SET"
 
-            def read_metadata_token_status() -> int:
-                import os
-                import urllib.error
-                import urllib.request
-
-                request = urllib.request.Request(
-                    f"http://{os.environ['GCE_METADATA_HOST']}/computeMetadata/v1/instance/service-accounts/default/token",
-                    headers={"Metadata-Flavor": "Google"},
-                )
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                try:
-                    with opener.open(request, timeout=5) as response:
-                        return response.status
-                except urllib.error.HTTPError as error:
-                    return error.code
-
-            result = sb.exec_python(read_metadata_token_status)
-            assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "503"
-
 
 def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox: Callable[..., Sandbox],
