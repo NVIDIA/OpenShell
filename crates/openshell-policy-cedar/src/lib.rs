@@ -3,7 +3,7 @@
 
 //! Cedar policy evaluation for `OpenShell` sandboxes.
 //!
-//! [`CedarNetworkEngine`] is the authoritative policy engine for a sandbox
+//! [`CedarEngine`] is the authoritative policy engine for a sandbox
 //! whose policy is authored in Cedar (`SandboxPolicy.cedar_policy_source`).
 //! It evaluates `NetworkConnect` and per-request `HttpRequest` decisions at
 //! request time, and derives Landlock grants, L7 inspection routing, and DNS
@@ -12,37 +12,26 @@
 //! enforce exactly; see [`analysis`](crate::analysis) for the accepted
 //! shapes.
 //!
-//! The crate also hosts a YAML-to-Cedar compiler ([`compile`],
-//! [`compile_l7`]) and offline filesystem verification helpers
-//! ([`filesystem`]), used for comparing policies rather than enforcing them.
-//!
 //! The schema itself lives in `openshell-policy-cedar-schema`, the single
 //! source of truth for Cedar entity/action names across every Cedar-aware
 //! consumer.
 
 mod analysis;
-pub mod compile;
-pub mod compile_l7;
 mod error;
-pub mod filesystem;
-pub mod glob;
 
 pub use analysis::L7Protocol;
-pub use compile::CompiledCedarPolicy;
-pub use compile_l7::CompiledL7Policy;
 pub use error::CedarEngineError;
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression, Schema,
+    Authorizer, Context, Entities, Entity, EntityId, EntityTypeName, EntityUid, PolicySet, Request,
+    RestrictedExpression, Schema,
 };
 use openshell_policy_cedar_schema::{actions, context_fields, endpoint_fields, entity_types};
 
 use analysis::PolicyAnalysis;
-use filesystem::FilesystemPolicyInput;
 
 /// Synthetic id for the single `Process` entity built per request.
 ///
@@ -59,8 +48,9 @@ const PROCESS_GROUP_ATTR: &str = "group";
 /// One network-connect authorization request.
 ///
 /// Mirrors the fields `openshell_supervisor_network::opa::NetworkInput`
-/// supplies to the Rego engine, narrowed to what the `Sandbox::NetworkConnect`
-/// Cedar action declares in its schema.
+/// supplies to the Rego engine. The schema's `method`, `path`, and `command`
+/// context fields are always `""` for `NetworkConnect`, since no request has
+/// been read at CONNECT time, so they are not part of this type.
 #[derive(Debug, Clone)]
 pub struct NetworkRequest {
     /// Sandbox process user identity (`Sandbox::User` entity id).
@@ -76,20 +66,11 @@ pub struct NetworkRequest {
     /// Absolute paths of the calling process's ancestors (parent,
     /// grandparent, ...). Excludes cmdline/argv0, which is spoofable.
     pub ancestors: Vec<String>,
-    /// HTTP method, when known; empty string when not applicable.
-    pub method: String,
-    /// REST request path, when known; empty string when not applicable.
-    pub path: String,
-    /// SQL command verb, when known; empty string when not applicable.
-    pub command: String,
 }
 
-/// Outcome of evaluating a [`NetworkRequest`] against a Cedar policy set.
-///
-/// Mirrors `openshell_supervisor_network::opa::NetworkAction` so either
-/// engine's decision can be returned through one type.
+/// Outcome of evaluating a request against a Cedar policy set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkDecision {
+pub enum Decision {
     /// A `permit` policy matched and no `forbid` overrode it.
     Allow {
         /// Ids of the policies that contributed to the decision.
@@ -100,14 +81,14 @@ pub enum NetworkDecision {
         /// Ids of the policies that contributed to the decision.
         matched_policies: Vec<String>,
     },
-    /// The matched endpoint's policy uses a rule shape the YAML-to-Cedar
-    /// compiler could not translate. Not a decision: callers must not treat
-    /// this as Allow or Deny, and comparisons must exclude it from
-    /// agreement/disagreement counting.
-    Unsupported {
-        /// Human-readable reason the endpoint's policy could not be compiled.
-        reason: String,
-    },
+}
+
+impl Decision {
+    /// Returns `true` for [`Decision::Allow`].
+    #[must_use]
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow { .. })
+    }
 }
 
 /// One per-request L7 evaluation within an already-permitted connection.
@@ -140,6 +121,15 @@ pub struct L7Request {
     pub command: String,
     /// JSON-RPC method name, when known; empty string when not applicable.
     pub jsonrpc_method: String,
+}
+
+/// Landlock path grants derived from a Cedar policy set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilesystemGrants {
+    /// Path subtrees granted read-only access.
+    pub read_only: Vec<String>,
+    /// Path subtrees granted read-write access.
+    pub read_write: Vec<String>,
 }
 
 /// One host a Cedar policy set permits `NetworkConnect` to, with its ports.
@@ -185,35 +175,15 @@ impl RequestUids {
 /// Loads a Cedar schema and policy set once, validates and analyzes them,
 /// then evaluates [`NetworkRequest`]s and [`L7Request`]s against them.
 #[derive(Debug)]
-pub struct CedarNetworkEngine {
+pub struct CedarEngine {
     schema: Schema,
     policies: PolicySet,
     authorizer: Authorizer,
-    /// Named policies [`compile::compile_normalized_data`] could not
-    /// represent in `policies`. Checked before trusting a Cedar `Deny`; see
-    /// [`compile::UncompiledPolicy`]. Empty for engines built from
-    /// hand-authored policy text.
-    uncompiled: Vec<compile::UncompiledPolicy>,
     analysis: PolicyAnalysis,
     uids: RequestUids,
 }
 
-impl CedarNetworkEngine {
-    /// Parses and validates a Cedar schema and policy set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CedarEngineError`] if either input fails to parse, the
-    /// policy set fails strict schema validation, or a policy uses a shape
-    /// this crate cannot enforce exactly.
-    pub fn from_cedar_str(schema_src: &str, policy_src: &str) -> Result<Self, CedarEngineError> {
-        let (schema, _warnings) = Schema::from_cedarschema_str(schema_src)
-            .map_err(|e| CedarEngineError::SchemaParse(Box::new(e)))?;
-        let policies = PolicySet::from_str(policy_src)
-            .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
-        Self::new(schema, policies, Vec::new())
-    }
-
+impl CedarEngine {
     /// Parses and validates a policy set against the canonical sandbox schema.
     ///
     /// The schema is [`openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC`].
@@ -224,37 +194,14 @@ impl CedarNetworkEngine {
     /// strict schema validation, or uses a shape this crate cannot enforce
     /// exactly.
     pub fn from_policy_str(policy_src: &str) -> Result<Self, CedarEngineError> {
-        Self::from_cedar_str(
-            openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC,
-            policy_src,
-        )
-    }
-
-    /// Builds an engine from the output of [`compile::compile_normalized_data`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CedarEngineError`] if the canonical schema fails to parse,
-    /// or the compiled policies fail validation. Either indicates a bug in
-    /// the compiler or schema, not a caller-input error.
-    pub fn from_compiled(compiled: CompiledCedarPolicy) -> Result<Self, CedarEngineError> {
-        let (schema, _warnings) =
-            Schema::from_cedarschema_str(openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC)
-                .map_err(|e| CedarEngineError::SchemaParse(Box::new(e)))?;
-        Self::new(schema, compiled.policies, compiled.uncompiled)
-    }
-
-    fn new(
-        schema: Schema,
-        policies: PolicySet,
-        uncompiled: Vec<compile::UncompiledPolicy>,
-    ) -> Result<Self, CedarEngineError> {
+        let schema = openshell_policy_cedar_schema::load_schema()?;
+        let policies = PolicySet::from_str(policy_src)
+            .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
         let analysis = analysis::analyze(&schema, &policies)?;
         Ok(Self {
             schema,
             policies,
             authorizer: Authorizer::new(),
-            uncompiled,
             analysis,
             uids: RequestUids::new()?,
         })
@@ -262,7 +209,7 @@ impl CedarNetworkEngine {
 
     /// Returns the Landlock path grants this policy set authorizes.
     #[must_use]
-    pub fn filesystem_grants(&self) -> &FilesystemPolicyInput {
+    pub fn filesystem_grants(&self) -> &FilesystemGrants {
         &self.analysis.filesystem
     }
 
@@ -291,27 +238,8 @@ impl CedarNetworkEngine {
     /// Returns [`CedarEngineError`] if the request cannot be represented in
     /// the loaded schema, or if Cedar reports an error while evaluating any
     /// policy.
-    pub fn evaluate_network(
-        &self,
-        request: &NetworkRequest,
-    ) -> Result<NetworkDecision, CedarEngineError> {
-        if let Some(uncompiled) = self.uncompiled.iter().find(|policy| {
-            policy.matches(
-                &request.host,
-                request.port,
-                &request.binary_path,
-                &request.ancestors,
-            )
-        }) {
-            return Ok(NetworkDecision::Unsupported {
-                reason: format!(
-                    "request matches named policy {:?}, which could not be compiled to Cedar: {}",
-                    uncompiled.name, uncompiled.reason
-                ),
-            });
-        }
-
-        let (allowed, matched_policies) = self.authorize(
+    pub fn evaluate_network(&self, request: &NetworkRequest) -> Result<Decision, CedarEngineError> {
+        self.authorize(
             &self.uids.network_connect,
             &Principal {
                 user: &request.user,
@@ -322,32 +250,21 @@ impl CedarNetworkEngine {
             [
                 (context_fields::BINARY_PATH, string(&request.binary_path)),
                 (context_fields::ANCESTORS, string_set(&request.ancestors)),
-                (context_fields::METHOD, string(&request.method)),
-                (context_fields::PATH, string(&request.path)),
-                (context_fields::COMMAND, string(&request.command)),
+                (context_fields::METHOD, string("")),
+                (context_fields::PATH, string("")),
+                (context_fields::COMMAND, string("")),
             ],
-        )?;
-        Ok(if allowed {
-            NetworkDecision::Allow { matched_policies }
-        } else {
-            NetworkDecision::Deny { matched_policies }
-        })
+        )
     }
 
     /// Evaluates one per-request `HttpRequest` within a permitted connection.
-    ///
-    /// Returns whether the request is allowed, and the ids of the policies
-    /// that determined the decision.
     ///
     /// # Errors
     ///
     /// Returns [`CedarEngineError`] if the request cannot be represented in
     /// the loaded schema, or if Cedar reports an error while evaluating any
     /// policy.
-    pub fn evaluate_l7(
-        &self,
-        request: &L7Request,
-    ) -> Result<(bool, Vec<String>), CedarEngineError> {
+    pub fn evaluate_l7(&self, request: &L7Request) -> Result<Decision, CedarEngineError> {
         self.authorize(
             &self.uids.http_request,
             &Principal {
@@ -370,7 +287,7 @@ impl CedarNetworkEngine {
         )
     }
 
-    /// Runs one authorization query and returns `(allowed, matched_policies)`.
+    /// Runs one authorization query.
     fn authorize<const N: usize>(
         &self,
         action: &EntityUid,
@@ -378,7 +295,7 @@ impl CedarNetworkEngine {
         host: &str,
         port: u16,
         context: [(&str, RestrictedExpression); N],
-    ) -> Result<(bool, Vec<String>), CedarEngineError> {
+    ) -> Result<Decision, CedarEngineError> {
         let host = normalize_host(host);
         let host_port = format!("{host}:{port}");
         let protocol = self
@@ -477,7 +394,10 @@ impl CedarNetworkEngine {
             .reason()
             .map(ToString::to_string)
             .collect();
-        Ok((response.decision() == Decision::Allow, matched_policies))
+        Ok(match response.decision() {
+            cedar_policy::Decision::Allow => Decision::Allow { matched_policies },
+            cedar_policy::Decision::Deny => Decision::Deny { matched_policies },
+        })
     }
 }
 
@@ -519,7 +439,7 @@ fn entity_id(id: &str) -> EntityId {
 }
 
 /// Builds an [`EntityUid`] from a Cedar entity type name and id.
-pub(crate) fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> {
+fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> {
     Ok(EntityUid::from_type_name_and_id(
         entity_type(type_name)?,
         entity_id(id),

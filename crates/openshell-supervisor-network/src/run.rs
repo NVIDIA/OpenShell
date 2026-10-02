@@ -203,7 +203,6 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
-    shadow_engine: Option<&Arc<crate::cedar_shadow::ShadowCedarEngine>>,
     cedar_network_engine: Option<&Arc<crate::cedar_only::CedarOnlyEngine>>,
 ) -> Result<Networking> {
     // The authoritative engine: Cedar for a Cedar-authored policy,
@@ -247,7 +246,6 @@ pub async fn run_networking(
     if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
         if process_enabled {
             let resolve_engine = engine.clone();
-            let resolve_shadow_engine = shadow_engine.cloned();
             let resolve_proto = proto.clone();
             let resolve_pid = entrypoint_pid.clone();
             tokio::spawn(async move {
@@ -300,15 +298,6 @@ pub async fn run_networking(
                                  (non-fatal, falling back to literal path matching): {e}"
                                 );
                             }
-                        }
-                        if let Some(shadow_engine) = &resolve_shadow_engine
-                            && let Err(e) =
-                                shadow_engine.rebuild_from_proto_with_pid(&resolve_proto, pid)
-                        {
-                            debug!(
-                                "Cedar shadow engine rebuild with symlink resolution failed \
-                                 (non-fatal, shadow mode only): {e}"
-                            );
                         }
                         let _ = engine_ready_tx.send(true);
                         return;
@@ -560,7 +549,6 @@ pub async fn run_networking(
             activity_tx,
             upstream_proxy_args,
             transparent_engine_ready_rx,
-            shadow_engine.cloned(),
         )?;
         (Some(dns), Some(transparent))
     } else {

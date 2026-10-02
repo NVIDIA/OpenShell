@@ -1445,14 +1445,11 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
             reason: "network_middlewares are not supported for Cedar policies".to_string(),
         });
     }
-    match openshell_policy_cedar::CedarNetworkEngine::from_policy_str(&policy.cedar_policy_source) {
-        Ok(engine) => {
-            let grants = engine.filesystem_grants();
-            validate_filesystem_paths(&grants.read_only, &grants.read_write, violations);
+    match load_cedar_grants(&policy.cedar_policy_source) {
+        Ok((read_only, read_write)) => {
+            validate_filesystem_paths(&read_only, &read_write, violations);
         }
-        Err(error) => violations.push(PolicyViolation::InvalidCedarPolicy {
-            reason: error.to_string(),
-        }),
+        Err(reason) => violations.push(PolicyViolation::InvalidCedarPolicy { reason }),
     }
 }
 
@@ -1463,14 +1460,31 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
 /// Returns `None` if the source does not load; validation reports why.
 #[must_use]
 pub fn cedar_filesystem_grants(cedar_policy_source: &str) -> Option<FilesystemPolicy> {
-    let engine =
-        openshell_policy_cedar::CedarNetworkEngine::from_policy_str(cedar_policy_source).ok()?;
-    let grants = engine.filesystem_grants();
+    let (read_only, read_write) = load_cedar_grants(cedar_policy_source).ok()?;
     Some(FilesystemPolicy {
         include_workdir: false,
-        read_only: grants.read_only.clone(),
-        read_write: grants.read_write.clone(),
+        read_only,
+        read_write,
     })
+}
+
+/// Loads a Cedar policy and returns its `(read_only, read_write)` grants.
+#[cfg(feature = "cedar")]
+fn load_cedar_grants(
+    cedar_policy_source: &str,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let engine = openshell_policy_cedar::CedarEngine::from_policy_str(cedar_policy_source)
+        .map_err(|error| error.to_string())?;
+    let grants = engine.filesystem_grants();
+    Ok((grants.read_only.clone(), grants.read_write.clone()))
+}
+
+/// Rejects every Cedar policy in builds without the `cedar` feature.
+#[cfg(not(feature = "cedar"))]
+fn load_cedar_grants(
+    _cedar_policy_source: &str,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    Err("Cedar policy support is not enabled in this build".to_string())
 }
 
 /// Checks filesystem grant paths for safety, appending any violations.
@@ -2060,6 +2074,7 @@ pub use openshell_policy_schema::normalize_path;
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn parse_sandbox_policy_file_auto_dispatches_cedar_extension() {
         let dir = std::env::temp_dir().join(format!(
@@ -2090,6 +2105,7 @@ when { context.binary_path == "/usr/bin/curl" };
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn parse_sandbox_policy_file_auto_dispatches_uppercase_cedar_extension() {
         let dir = std::env::temp_dir().join(format!(
@@ -2189,6 +2205,23 @@ when { context.binary_path == "/usr/bin/curl" };
         );
     }
 
+    #[cfg(not(feature = "cedar"))]
+    #[test]
+    fn cedar_policy_source_is_rejected_without_the_cedar_feature() {
+        let policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[cfg(feature = "cedar")]
     #[test]
     fn cedar_policy_source_passes_validation() {
         let policy = cedar_sourced_policy(
@@ -2237,6 +2270,7 @@ when { resource == Sandbox::FilesystemPath::"/etc/shadow" };
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn cedar_policy_source_applies_filesystem_path_checks_to_grants() {
         let policy = cedar_sourced_policy(

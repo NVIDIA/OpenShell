@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typed errors for [`crate::CedarNetworkEngine`].
+//! Typed errors for [`crate::CedarEngine`].
 
 use miette::Diagnostic;
 use thiserror::Error;
 
-/// Errors produced while loading or evaluating Cedar policy for the sandbox
-/// `NetworkConnect` action.
+/// Errors produced while loading or evaluating a sandbox Cedar policy.
 #[derive(Debug, Error, Diagnostic)]
 pub enum CedarEngineError {
-    /// The `.cedarschema` source failed to parse.
-    #[error("Cedar schema parse error: {0}")]
-    #[diagnostic(code(openshell::policy_cedar::schema_parse))]
-    SchemaParse(#[source] Box<cedar_policy::CedarSchemaError>),
+    /// The canonical schema failed to load. Indicates a broken build, not a
+    /// caller-input error.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    SchemaLoad(#[from] openshell_policy_cedar_schema::CedarSchemaLoadError),
 
     /// The Cedar policy set source failed to parse.
     #[error("Cedar policy parse error: {0}")]

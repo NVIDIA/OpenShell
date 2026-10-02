@@ -3,18 +3,16 @@
 
 //! Cedar as the sole, authoritative network policy engine for a sandbox.
 //!
-//! Unlike [`crate::cedar_shadow`] (which *compiles* Cedar from an existing
-//! YAML/proto policy, purely for comparison), [`CedarOnlyEngine`] parses an
-//! **authored** `.cedar` policy directly — no YAML, no OPA, no compiler.
-//! It's selected instead of [`crate::opa::OpaEngine`], never alongside it:
+//! [`CedarOnlyEngine`] evaluates an authored `.cedar` policy directly. It is
+//! selected instead of [`crate::opa::OpaEngine`], never alongside it:
 //! a sandbox's `SandboxPolicy.cedar_policy_source` being non-empty is what
 //! makes a sandbox use this engine instead of OPA, decided once at policy
 //! load (see `crates/openshell-supervisor/src/lib.rs::load_policy`).
 //!
 //! CONNECT-time matching (host/binary/ancestor) is covered directly by
-//! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_network`].
+//! [`openshell_policy_cedar::CedarEngine::evaluate_network`].
 //! Per-request L7 enforcement is covered by
-//! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_l7`] via
+//! [`openshell_policy_cedar::CedarEngine::evaluate_l7`] via
 //! [`CedarL7TunnelEngine`], the handle each inspected tunnel's
 //! [`crate::opa::TunnelPolicyEngine`] delegates to. [`l7_endpoint_configs_for`] populates
 //! `EgressAuthorization::endpoint_configs` for every endpoint an
@@ -35,14 +33,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use miette::Result;
-use openshell_policy_cedar::{CedarNetworkEngine, L7Request, NetworkDecision};
+use openshell_policy_cedar::{CedarEngine, Decision, L7Request, NetworkRequest};
 use tokio::sync::watch;
 
-use crate::cedar_shadow::{PLACEHOLDER_IDENTITY, network_request_from_input};
 use crate::opa::{
     EgressAuthorization, MatchedEndpoint, NetworkAction, NetworkInput, PolicyDnsEligibilitySnapshot,
 };
 use crate::opa::{PolicyGenerationGuard, generation_guard_for};
+
+/// User and group entity id sent with every Cedar request.
+///
+/// Process identity is fixed per sandbox and enforced by the runtime, not
+/// by network policy, so requests carry a constant identity that satisfies
+/// the schema's `Process` shape. Policies that test `principal.user` see
+/// this value.
+const PLACEHOLDER_IDENTITY: &str = "sandbox";
+
+/// Builds the Cedar CONNECT request for one egress attempt.
+fn network_request_from_input(input: &NetworkInput) -> NetworkRequest {
+    NetworkRequest {
+        user: PLACEHOLDER_IDENTITY.to_string(),
+        group: PLACEHOLDER_IDENTITY.to_string(),
+        host: input.host.clone(),
+        port: input.port,
+        binary_path: input.binary_path.to_string_lossy().into_owned(),
+        ancestors: input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    }
+}
 
 /// Cedar-backed, fully authoritative network policy evaluator.
 ///
@@ -53,7 +74,7 @@ use crate::opa::{PolicyGenerationGuard, generation_guard_for};
 pub struct CedarOnlyEngine {
     /// Shared with every [`CedarL7TunnelEngine`] handed out by
     /// [`Self::l7_handle`].
-    engine: Arc<RwLock<CedarNetworkEngine>>,
+    engine: Arc<RwLock<CedarEngine>>,
     /// The currently-loaded policy source, so [`Self::reload_from_policy_str`]
     /// can no-op on an unchanged reload instead of unconditionally advancing
     /// the generation. An unconditional bump here would invalidate every
@@ -74,7 +95,7 @@ impl CedarOnlyEngine {
     /// validation, or uses a policy shape Cedar cannot enforce exactly.
     pub fn from_policy_str(policy_src: &str) -> Result<Self> {
         let engine =
-            CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
+            CedarEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
@@ -134,7 +155,7 @@ impl CedarOnlyEngine {
         Ok(Some(operation(current_generation)))
     }
 
-    fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, CedarNetworkEngine>> {
+    fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, CedarEngine>> {
         self.engine
             .read()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))
@@ -179,7 +200,7 @@ impl CedarOnlyEngine {
             return Ok(StagedCedarPolicy(None));
         }
         let engine =
-            CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
+            CedarEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
         Ok(StagedCedarPolicy(Some((engine, policy_src.to_string()))))
     }
 
@@ -213,14 +234,12 @@ impl CedarOnlyEngine {
 
     /// Returns the Landlock path grants the loaded policy authorizes.
     ///
-    /// See [`openshell_policy_cedar::CedarNetworkEngine::filesystem_grants`].
+    /// See [`openshell_policy_cedar::CedarEngine::filesystem_grants`].
     ///
     /// # Errors
     ///
     /// Returns an error if the engine lock is poisoned.
-    pub fn filesystem_grants(
-        &self,
-    ) -> Result<openshell_policy_cedar::filesystem::FilesystemPolicyInput> {
+    pub fn filesystem_grants(&self) -> Result<openshell_policy_cedar::FilesystemGrants> {
         Ok(self.read_engine()?.filesystem_grants().clone())
     }
 }
@@ -229,7 +248,7 @@ impl CedarOnlyEngine {
 ///
 /// Empty when the staged source matched the active policy.
 #[derive(Debug)]
-pub struct StagedCedarPolicy(Option<(CedarNetworkEngine, String)>);
+pub struct StagedCedarPolicy(Option<(CedarEngine, String)>);
 
 /// Value of an L7 endpoint config's `enforcement` key that makes the relay
 /// deny requests the policy does not allow. Any other value means audit-only
@@ -249,7 +268,7 @@ const ENFORCEMENT_ENFORCE: &str = "enforce";
 /// Returns an error if the config cannot be built. The caller fails the
 /// CONNECT rather than letting it pass through uninspected.
 fn l7_endpoint_configs_for(
-    guard: &CedarNetworkEngine,
+    guard: &CedarEngine,
     host: &str,
     port: u16,
 ) -> Result<Vec<regorus::Value>> {
@@ -281,17 +300,16 @@ impl CedarOnlyEngine {
             .map_err(|e| miette::miette!("{e}"))?;
 
         let action = match decision {
-            NetworkDecision::Allow { matched_policies } => NetworkAction::Allow {
+            Decision::Allow { matched_policies } => NetworkAction::Allow {
                 matched_policy: matched_policies.into_iter().next(),
             },
-            NetworkDecision::Deny { matched_policies } => NetworkAction::Deny {
+            Decision::Deny { matched_policies } => NetworkAction::Deny {
                 reason: if matched_policies.is_empty() {
                     "no Cedar policy permits this endpoint/binary".to_string()
                 } else {
                     format!("denied by Cedar policy (forbid matched: {matched_policies:?})")
                 },
             },
-            NetworkDecision::Unsupported { reason } => NetworkAction::Deny { reason },
         };
 
         let endpoint_configs = if matches!(action, NetworkAction::Allow { .. }) {
@@ -353,7 +371,7 @@ impl CedarOnlyEngine {
 /// per-tunnel state.
 #[derive(Debug)]
 pub(crate) struct CedarL7TunnelEngine {
-    engine: Arc<RwLock<CedarNetworkEngine>>,
+    engine: Arc<RwLock<CedarEngine>>,
     generation: Arc<AtomicU64>,
     captured_generation: u64,
 }
@@ -412,9 +430,10 @@ impl CedarL7TunnelEngine {
             jsonrpc_method,
         };
 
-        let (allowed, _matched) = guard
+        let allowed = guard
             .evaluate_l7(&l7_request)
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|e| miette::miette!("{e}"))?
+            .is_allow();
         let reason = if allowed {
             String::new()
         } else {

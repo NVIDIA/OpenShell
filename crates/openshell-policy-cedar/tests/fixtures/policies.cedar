@@ -48,7 +48,7 @@ when {
 
 // Network: Allow PyPI access so pip can install dependencies
 // inside the sandbox
-// endpoint: pypi.org:443 (REST, enforce, read-only)
+// endpoint: pypi.org:443
 // binary:   /sandbox/.venv/bin/python3.
 
 @enforcement("enforce")
@@ -57,14 +57,11 @@ permit (
     action    == Sandbox::Action::"NetworkConnect",
     resource  == Sandbox::NetworkEndpoint::"pypi.org:443"
 )
-when {
-    context.binary_path == "/sandbox/.venv/bin/python3"
-    && context.method == "GET"          // access: read-only → GET only
-};
+when { context.binary_path == "/sandbox/.venv/bin/python3" };
 
 // Network: Allow PyPI access so pip can install dependencies
 // inside the sandbox
-// endpoint: files.pythonhosted.org:443 (REST, enforce, read-only)
+// endpoint: files.pythonhosted.org:443
 // binary:   /sandbox/.venv/bin/python3.
 
 @enforcement("enforce")
@@ -73,13 +70,10 @@ permit (
     action    == Sandbox::Action::"NetworkConnect",
     resource  == Sandbox::NetworkEndpoint::"files.pythonhosted.org:443"
 )
-when {
-    context.binary_path == "/sandbox/.venv/bin/python3"
-    && context.method == "GET"          // access: read-only → GET only
-};
+when { context.binary_path == "/sandbox/.venv/bin/python3" };
 
 // Network: NVIDIA API (L7 intercept)
-// endpoint: integrate.api.nvidia.com:443 (REST, enforce, read-only)
+// endpoint: integrate.api.nvidia.com:443
 // binary:   /sandbox/.venv/bin/python3.
 
 @enforcement("enforce")
@@ -88,11 +82,7 @@ permit (
     action    == Sandbox::Action::"NetworkConnect",
     resource  == Sandbox::NetworkEndpoint::"integrate.api.nvidia.com:443"
 )
-when {
-    context.binary_path == "/sandbox/.venv/bin/python3"
-    && (context.method == "GET"
-        || context.method == "POST")
-};
+when { context.binary_path == "/sandbox/.venv/bin/python3" };
 
 // Network: NVIDIA API (L7 per-request enforcement)
 // Only the chat completions endpoint may be POSTed to; anything else on

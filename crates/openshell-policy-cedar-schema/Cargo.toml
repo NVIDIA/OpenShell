@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-cedar-policy = "4.13"
+cedar-policy = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 

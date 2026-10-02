@@ -41,8 +41,7 @@ use cedar_policy::{
 use openshell_policy_cedar_schema::{actions, entity_types};
 use serde_json::Value;
 
-use crate::filesystem::FilesystemPolicyInput;
-use crate::{AuthorizedNetworkEndpoint, CedarEngineError};
+use crate::{AuthorizedNetworkEndpoint, CedarEngineError, FilesystemGrants};
 
 /// Annotation that declares the wire protocol of an `HttpRequest` endpoint.
 ///
@@ -100,7 +99,7 @@ impl fmt::Display for L7Protocol {
 #[derive(Debug, Clone, Default)]
 pub struct PolicyAnalysis {
     /// Landlock path grants.
-    pub(crate) filesystem: FilesystemPolicyInput,
+    pub(crate) filesystem: FilesystemGrants,
     /// Exact `NetworkConnect` endpoints eligible for policy DNS, by host.
     pub(crate) dns_endpoints: Vec<AuthorizedNetworkEndpoint>,
     /// Endpoints routed into L7 inspection, keyed by `(host, port)`.
@@ -209,7 +208,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
     }
 
     Ok(PolicyAnalysis {
-        filesystem: FilesystemPolicyInput {
+        filesystem: FilesystemGrants {
             read_only: read_only.into_iter().collect(),
             read_write: read_write.into_iter().collect(),
         },

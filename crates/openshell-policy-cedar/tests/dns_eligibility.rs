@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Checks that [`CedarNetworkEngine::dns_endpoints`] lists exactly the
+//! Checks that [`CedarEngine::dns_endpoints`] lists exactly the
 //! `NetworkEndpoint`s named in `NetworkConnect` permit scopes, for DNS
 //! eligibility. Uses the same fixture `tests/network.rs` uses for
 //! CONNECT-time evaluation.
 
-use openshell_policy_cedar::{AuthorizedNetworkEndpoint, CedarEngineError, CedarNetworkEngine};
+use openshell_policy_cedar::{AuthorizedNetworkEndpoint, CedarEngine, CedarEngineError};
 
 const POLICIES: &str = include_str!("fixtures/policies.cedar");
 
 fn dns_endpoints(policy: &str) -> Vec<AuthorizedNetworkEndpoint> {
-    CedarNetworkEngine::from_policy_str(policy)
+    CedarEngine::from_policy_str(policy)
         .expect("policy must load")
         .dns_endpoints()
         .to_vec()
@@ -120,7 +120,7 @@ fn rejects_invalid_endpoint_literals() {
             r#"permit(principal, action == Sandbox::Action::"NetworkConnect",
                       resource == Sandbox::NetworkEndpoint::"{endpoint}");"#
         );
-        let error = CedarNetworkEngine::from_policy_str(&policy)
+        let error = CedarEngine::from_policy_str(&policy)
             .expect_err(&format!("{endpoint} must be rejected"));
         assert!(
             matches!(error, CedarEngineError::InvalidEndpoint { .. }),

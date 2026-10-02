@@ -99,10 +99,7 @@ pub struct NetworkInput {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
-pub(crate) fn inject_runtime_policy_data(
-    data: &mut serde_json::Value,
-    require_binary_identity: bool,
-) {
+fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
     let Some(obj) = data.as_object_mut() else {
         return;
     };
@@ -2304,7 +2301,7 @@ fn l7_matchers_to_json(
 /// user-specified symlink paths (e.g., `/usr/bin/python3`) match the
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
-pub(crate) fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
     let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {

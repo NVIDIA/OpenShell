@@ -9,7 +9,6 @@
 //! aggregate them.
 
 pub mod cedar_only;
-pub mod cedar_shadow;
 #[cfg(target_os = "windows")]
 pub mod host;
 pub mod identity;

@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Checks which `NetworkEndpoint`s [`CedarNetworkEngine::l7_protocol`]
+//! Checks which `NetworkEndpoint`s [`CedarEngine::l7_protocol`]
 //! routes into L7 inspection, how the `@protocol(...)` annotation is read,
 //! and that `HttpRequest` policies the proxy could not route are rejected.
 
-use openshell_policy_cedar::{CedarEngineError, CedarNetworkEngine, L7Protocol};
+use openshell_policy_cedar::{CedarEngine, CedarEngineError, L7Protocol};
 
-fn engine(policy: &str) -> CedarNetworkEngine {
-    CedarNetworkEngine::from_policy_str(policy).expect("policy must load")
+fn engine(policy: &str) -> CedarEngine {
+    CedarEngine::from_policy_str(policy).expect("policy must load")
 }
 
 fn rejection(policy: &str) -> CedarEngineError {
-    CedarNetworkEngine::from_policy_str(policy).expect_err("policy must be rejected")
+    CedarEngine::from_policy_str(policy).expect_err("policy must be rejected")
 }
 
 #[test]
