@@ -827,6 +827,9 @@ async fn open_target(
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
+            if ssh_socket_path.as_os_str().is_empty() {
+                return Err("SSH access is not configured for this supervisor".into());
+            }
             #[cfg(not(unix))]
             return Err("SSH relay targets are unsupported by the Windows supervisor".into());
             #[cfg(unix)]
@@ -952,10 +955,8 @@ mod target_tests {
 mod ocsf_event_tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     struct UnusedLoopbackConnector;
 
-    #[cfg(target_os = "linux")]
     #[async_trait::async_trait]
     impl BoundaryLoopbackConnector for UnusedLoopbackConnector {
         async fn connect(
@@ -980,6 +981,22 @@ mod ocsf_event_tests {
             proxy_port: 3128,
             origin: openshell_ocsf::EventOrigin::Supervisor,
         }
+    }
+
+    #[tokio::test]
+    async fn ssh_relay_without_adapter_is_rejected_on_every_host() {
+        let connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(UnusedLoopbackConnector);
+        let result = open_target(
+            &ssh_relay_open("no-ssh"),
+            std::path::Path::new(""),
+            &connector,
+            None,
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("missing SSH adapter must fail explicitly");
+        assert!(error.to_string().contains("not configured"));
     }
 
     #[test]

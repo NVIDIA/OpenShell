@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `wxc-exec` ProcessContainer launcher and request types.
+//! `wxc-exec` `ProcessContainer` launcher and request types.
 
 use base64::Engine as _;
 use serde::Serialize;
@@ -34,7 +34,7 @@ fn mock_normalize(s: &str) -> String {
 
 /// Filesystem shares for the sandbox.
 ///
-/// ProcessContainer honors `readwrite`/`readonly` grants and `denied_paths`.
+/// `ProcessContainer` honors `readwrite`/`readonly` grants and `denied_paths`.
 #[derive(Debug, Default)]
 #[allow(clippy::struct_field_names)]
 pub struct MxcFilesystem {
@@ -244,7 +244,7 @@ pub enum InvokerError {
 
 // ── Invoker ───────────────────────────────────────────────────────────────────
 
-/// Wraps the one-shot `wxc-exec` ProcessContainer invocation.
+/// Wraps the one-shot `wxc-exec` `ProcessContainer` invocation.
 #[derive(Debug, Clone)]
 pub struct WxcExecInvoker {
     exec_path: PathBuf,

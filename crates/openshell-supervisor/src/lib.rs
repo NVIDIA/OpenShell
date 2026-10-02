@@ -100,24 +100,40 @@ enum ReadinessEndpoint {
     Tcp(u16),
 }
 
-#[cfg(unix)]
 enum ReadinessListener {
+    #[cfg(unix)]
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
 }
 
-#[cfg(unix)]
 impl ReadinessEndpoint {
+    fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Unix(path) => prepare_control_readiness_path(path),
+            Self::Tcp(_) => Ok(()),
+        }
+    }
+
     fn bind(&self) -> Result<ReadinessListener> {
         match self {
             Self::Unix(path) => {
-                prepare_control_readiness_path(path)?;
-                tokio::net::UnixListener::bind(path)
-                    .map(ReadinessListener::Unix)
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("bind supervisor readiness socket on {}", path.display())
-                    })
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(miette::miette!(
+                        "Unix readiness sockets are unsupported on this host"
+                    ))
+                }
+                #[cfg(unix)]
+                {
+                    prepare_control_readiness_path(path)?;
+                    tokio::net::UnixListener::bind(path)
+                        .map(ReadinessListener::Unix)
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!("bind supervisor readiness socket on {}", path.display())
+                        })
+                }
             }
             Self::Tcp(port) => bind_readiness_tcp(*port)
                 .and_then(tokio::net::TcpListener::from_std)
@@ -129,13 +145,15 @@ impl ReadinessEndpoint {
 
     fn remove(&self) {
         if let Self::Unix(path) = self {
+            #[cfg(unix)]
             let _ = std::fs::remove_file(path);
+            #[cfg(not(unix))]
+            let _ = path; // Unix endpoints are rejected before binding on this host.
         }
     }
 }
 
 /// Falls back to IPv4 when the network namespace has IPv6 disabled.
-#[cfg(unix)]
 fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
 
@@ -154,31 +172,27 @@ fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
         .or_else(|_| bind(Domain::IPV4, (std::net::Ipv4Addr::UNSPECIFIED, port).into()))
 }
 
-#[cfg(unix)]
 impl ReadinessListener {
     async fn accept(&self) -> std::io::Result<()> {
         match self {
+            #[cfg(unix)]
             Self::Unix(listener) => listener.accept().await.map(drop),
             Self::Tcp(listener) => listener.accept().await.map(drop),
         }
     }
 }
 
-#[cfg(unix)]
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
     endpoint: ReadinessEndpoint,
 }
 
-#[cfg(unix)]
 impl ControlReadiness {
     fn start(
         endpoint: ReadinessEndpoint,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if let ReadinessEndpoint::Unix(path) = &endpoint {
-            prepare_control_readiness_path(path)?;
-        }
+        endpoint.prepare()?;
         let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
@@ -288,26 +302,17 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(not(unix))]
+fn prepare_control_readiness_path(_path: &std::path::Path) -> Result<()> {
+    Err(miette::miette!(
+        "Unix readiness sockets are unsupported on this host"
+    ))
+}
+
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
         self.endpoint.remove();
-    }
-}
-
-#[cfg(not(unix))]
-struct ControlReadiness;
-
-#[cfg(not(unix))]
-impl ControlReadiness {
-    fn start(
-        _endpoint: ReadinessEndpoint,
-        _session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Self> {
-        Err(miette::miette!(
-            "supervisor readiness sockets require a Unix host"
-        ))
     }
 }
 
@@ -5058,7 +5063,6 @@ mod tests {
         .expect("replacement session restores readiness socket");
     }
 
-    #[cfg(unix)]
     #[test]
     fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -5079,7 +5083,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
     async fn tcp_control_readiness_tracks_supervisor_session() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|reserved| reserved.local_addr())
@@ -5088,12 +5091,19 @@ mod tests {
         let (session_tx, session_rx) = tokio::sync::watch::channel(true);
         let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(session_rx))
             .expect("start TCP readiness listener");
-        let connects = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
-        assert!(connects(), "accepted session is ready");
+        let connects = || async {
+            timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        };
+        assert!(connects().await, "accepted session is ready");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -5102,7 +5112,7 @@ mod tests {
 
         session_tx.send_replace(true);
         timeout(Duration::from_secs(1), async {
-            while !connects() {
+            while !connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -5111,12 +5121,65 @@ mod tests {
 
         drop(readiness);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("dropped guard closes readiness listener");
+    }
+
+    #[tokio::test]
+    async fn tcp_readiness_waits_for_initial_session_acceptance() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(rx)).unwrap();
+        assert!(
+            !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        );
+        tx.send_replace(true);
+        timeout(Duration::from_secs(2), async {
+            while !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted session opens TCP readiness");
+        drop(readiness);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unix_readiness_is_rejected_without_disabling_tcp() {
+        let result = ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), None);
+        assert!(
+            result
+                .err()
+                .expect("Unix sockets unsupported")
+                .to_string()
+                .contains("unsupported")
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(
+            ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), Some(rx))
+                .is_err(),
+            "invalid adapter must fail even before session acceptance"
+        );
     }
 
     #[test]

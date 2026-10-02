@@ -879,9 +879,11 @@ administrator or belong to the Windows Performance Log Users group. Workload
 commands and working directories remain sandbox-scoped and must be supplied in
 the `mxc` driver configuration when creating a sandbox.
 
-On Windows, `OPENSHELL_OCSF_JSON=1` enables the gateway's durable JSONL audit
+`OPENSHELL_OCSF_JSON=1` enables the gateway's JSONL audit
 sink independently of the selected compute driver. Set `OPENSHELL_OCSF_LOG_DIR`
-to override the default `%PROGRAMDATA%\OpenShell\logs` directory.
+to override the default `%PROGRAMDATA%\OpenShell\logs` directory on Windows
+or `$XDG_STATE_HOME/openshell/logs` on Unix. Prefer the gateway's configured
+`ocsf_log` output for retention controls and loss metrics.
 
 The driver records executable identity in process audit events and omits raw
 command arguments because they can contain credentials or personal data. See

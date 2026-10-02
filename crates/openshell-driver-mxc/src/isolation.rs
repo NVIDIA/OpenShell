@@ -18,6 +18,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 use serde::Serialize;
 
 #[derive(Serialize)]
+#[allow(clippy::struct_excessive_bools)] // separately serialized enforcement properties, not state flags
 struct MxcOuterFenceEvidence<'a> {
     generation: &'a str,
     containment: &'a str,
@@ -27,7 +28,7 @@ struct MxcOuterFenceEvidence<'a> {
     controller_loss_fails_closed: bool,
 }
 
-pub(crate) struct MxcBoundarySpec {
+pub struct MxcBoundarySpec {
     pub boundary_id: String,
     pub generation: String,
     pub session_id: openshell_core::SandboxSessionId,
@@ -45,7 +46,7 @@ pub(crate) struct MxcBoundarySpec {
     pub child_env: HashMap<String, String>,
 }
 
-pub(crate) struct MxcBoundaryProvisioning {
+pub struct MxcBoundaryProvisioning {
     pub boundary_config: BoundaryConfig,
     pub runtime_descriptor: SandboxRuntimeDescriptor,
 }

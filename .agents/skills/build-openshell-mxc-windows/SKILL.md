@@ -36,8 +36,13 @@ Register its `MxcRuntimeBackend` under `openshell-mxc` at supervisor composition
 it reuses the shared authenticated Sandbox Protocol, whose default Linux
 backend remains separate. Shared protocol code
 must not interpret MXC evidence. Do not reintroduce driver-owned proxy startup
-or gateway create-time credential snapshots. Windows gateway JSONL audit output
-is an explicit operator opt-in, independent of the selected driver.
+or gateway create-time credential snapshots. Gateway JSONL audit output
+is portable and an explicit operator opt-in, independent of the selected driver.
+Keep platform directory conventions in shared path utilities and ETW capture
+in the MXC driver. Gateway composition supplies generic connection inputs; the
+driver resolves its endpoint defaults and TLS server name. Supervisor gateway
+sessions and main attachment must work without SSH on any host. Gate only the
+Unix socket adapter, not TCP readiness or authenticated session retries.
 
 Adopt the shared protocol's authenticated policy discovery and monotonic
 provider-publication generations. Do not order opaque credential revisions

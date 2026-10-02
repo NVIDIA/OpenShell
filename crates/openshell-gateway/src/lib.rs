@@ -149,44 +149,22 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let mut config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        config.validate_configuration()?;
-        if config.grpc_endpoint.trim().is_empty() {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        Ok(())
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        config.validate_configuration()
     }
 
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
         require_guest_tls_for_local_driver(&context, "mxc")?;
-        let use_internal_tls_server_name =
-            config.grpc_endpoint.trim().is_empty() && context.gateway_tls_enabled();
-        if config.grpc_endpoint.trim().is_empty() {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        let tls = context.guest_tls_ca().map(std::path::Path::to_path_buf);
-        let endpoint = config.grpc_endpoint.clone();
-        let tls_server_name = use_internal_tls_server_name.then(|| "localhost".to_string());
-        let backend = openshell_driver_mxc::MxcComputeBackend::new_with_gateway(
+        let backend = openshell_driver_mxc::MxcComputeBackend::for_gateway(
             context.gateway_name(),
             config,
-            endpoint,
-            tls,
-            tls_server_name,
+            context.gateway_port(),
+            context.gateway_tls_enabled(),
+            context.guest_tls_ca().map(std::path::Path::to_path_buf),
         );
         let driver = openshell_driver_mxc::ComputeDriverService::new(backend);
         Ok(openshell_server::ComputeDriverInstance::InProcess(

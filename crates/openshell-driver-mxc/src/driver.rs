@@ -65,6 +65,7 @@ impl MxcBackend {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // independent operator options in the existing TOML schema
 pub struct MxcComputeConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
@@ -92,8 +93,7 @@ pub struct MxcComputeConfig {
 impl Default for MxcComputeConfig {
     fn default() -> Self {
         let state_dir = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, PathBuf::from)
             .join("OpenShell")
             .join("mxc");
         let executable_dir = std::env::current_exe()
@@ -205,6 +205,26 @@ impl std::fmt::Debug for MxcComputeBackend {
 }
 
 impl MxcComputeBackend {
+    /// Compose the driver's host connection from generic gateway inputs.
+    /// MXC endpoint defaults and TLS server-name selection stay in the driver.
+    pub fn for_gateway(
+        gateway_name: &str,
+        mut config: MxcComputeConfig,
+        gateway_port: u16,
+        gateway_tls_enabled: bool,
+        tls_ca: Option<PathBuf>,
+    ) -> Self {
+        let use_internal_endpoint = config.grpc_endpoint.trim().is_empty();
+        if use_internal_endpoint {
+            let scheme = if gateway_tls_enabled { "https" } else { "http" };
+            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{gateway_port}");
+        }
+        let endpoint = config.grpc_endpoint.clone();
+        let tls_server_name =
+            (use_internal_endpoint && gateway_tls_enabled).then(|| "localhost".to_string());
+        Self::new_with_gateway(gateway_name, config, endpoint, tls_ca, tls_server_name)
+    }
+
     pub fn new(gateway_name: &str, config: MxcComputeConfig) -> Self {
         let endpoint = config.grpc_endpoint.clone();
         Self::new_with_gateway(gateway_name, config, endpoint, None, None)
@@ -1033,7 +1053,7 @@ fn cleanup_runtime_directory(path: &Path) {
 }
 
 /// Create a state directory whose DACL grants access only to the gateway's
-/// Windows identity until MXC applies any explicit ProcessContainer grant.
+/// Windows identity until MXC applies any explicit `ProcessContainer` grant.
 /// Secret-bearing state must not inherit permissive ACLs from its parent.
 fn create_restricted_state_dir(path: &Path, kind: &str) -> Result<(), String> {
     std::fs::create_dir_all(path)
@@ -1213,6 +1233,40 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_connection_defaults_are_driver_owned() {
+        for (tls_enabled, scheme, server_name) in
+            [(false, "http", None), (true, "https", Some("localhost"))]
+        {
+            let ca = PathBuf::from("C:\\gateway\\ca.pem");
+            let backend = MxcComputeBackend::for_gateway(
+                "test",
+                MxcComputeConfig::default(),
+                9000,
+                tls_enabled,
+                Some(ca.clone()),
+            );
+            assert_eq!(
+                backend.gateway.endpoint,
+                format!("{scheme}://127.0.0.1:9000")
+            );
+            assert_eq!(backend.gateway.tls_server_name.as_deref(), server_name);
+            assert_eq!(backend.gateway.tls, Some(ca));
+            assert_eq!(backend.config.grpc_endpoint, backend.gateway.endpoint);
+        }
+    }
+
+    #[test]
+    fn gateway_connection_preserves_explicit_endpoint() {
+        let config = MxcComputeConfig {
+            grpc_endpoint: "https://gateway.example:9443".to_string(),
+            ..Default::default()
+        };
+        let backend = MxcComputeBackend::for_gateway("test", config, 9000, true, None);
+        assert_eq!(backend.gateway.endpoint, "https://gateway.example:9443");
+        assert_eq!(backend.gateway.tls_server_name, None);
+    }
 
     fn host_grants_config() -> MxcComputeConfig {
         MxcComputeConfig {
