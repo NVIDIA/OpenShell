@@ -1021,6 +1021,20 @@ pub(super) fn validate_static_fields_unchanged(
     baseline: &ProtoSandboxPolicy,
     new: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
+    // Checked first so a format switch is reported as such rather than as
+    // whichever static field happens to differ between the two formats.
+    // The supervisor picks its authoritative policy engine (OPA or Cedar)
+    // once at startup from whether cedar_policy_source was set; a live
+    // reload only ever re-evaluates within that same engine. Flipping
+    // formats via update would leave the originally-chosen engine stale
+    // (silently evaluating against the old policy) while the other engine's
+    // reload is simply never consulted.
+    if baseline.cedar_policy_source.is_empty() != new.cedar_policy_source.is_empty() {
+        return Err(Status::invalid_argument(
+            "cannot switch a live sandbox between YAML and Cedar policy formats; \
+             recreate the sandbox instead",
+        ));
+    }
     // Filesystem: allow additive changes (new paths can be added, but
     // existing paths cannot be removed and include_workdir cannot change).
     // This supports the supervisor's baseline path enrichment at startup.
@@ -1037,18 +1051,6 @@ pub(super) fn validate_static_fields_unchanged(
     if baseline.process != new.process {
         return Err(Status::invalid_argument(
             "process policy cannot be changed on a live sandbox (applied at startup)",
-        ));
-    }
-    // The supervisor picks its authoritative policy engine (OPA or Cedar)
-    // once at startup from whether cedar_policy_source was set; a live
-    // reload only ever re-evaluates within that same engine. Flipping
-    // formats via update would leave the originally-chosen engine stale
-    // (silently evaluating against the old policy) while the other engine's
-    // reload is simply never consulted.
-    if baseline.cedar_policy_source.is_empty() != new.cedar_policy_source.is_empty() {
-        return Err(Status::invalid_argument(
-            "cannot switch a live sandbox between YAML and Cedar policy formats; \
-             recreate the sandbox instead",
         ));
     }
     // A Cedar policy's Landlock grants come from its text. Apply the same
@@ -2273,6 +2275,27 @@ mod tests {
         };
         let result = validate_static_fields_unchanged(&baseline, &new);
         assert!(result.is_err(), "format flip must be rejected");
+    }
+
+    #[test]
+    fn validate_static_fields_reports_a_format_switch_before_other_static_fields() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy {
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".into(),
+            }),
+            ..Default::default()
+        };
+        let error = validate_static_fields_unchanged(&baseline, &new)
+            .expect_err("format flip must be rejected");
+        assert!(
+            error.message().contains("YAML and Cedar"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]
