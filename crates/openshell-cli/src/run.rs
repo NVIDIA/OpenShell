@@ -409,7 +409,17 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+    if let Err(err) = sandbox_delete(
+        server,
+        &names,
+        false,
+        workspace,
+        tls,
+        gateway,
+        SandboxDeleteOptions::default(),
+    )
+    .await
+    {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3702,6 +3712,24 @@ fn labels_display(labels: &HashMap<String, String>) -> String {
     pairs.join(", ")
 }
 
+/// Controls whether sandbox deletion waits for durable absence.
+#[derive(Debug, Clone, Copy)]
+pub struct SandboxDeleteOptions {
+    /// Wait for terminal absence after deletion is acknowledged.
+    pub wait: bool,
+    /// Override the per-sandbox lifecycle timeout. The environment/default applies when unset.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for SandboxDeleteOptions {
+    fn default() -> Self {
+        Self {
+            wait: true,
+            timeout: None,
+        }
+    }
+}
+
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
 pub async fn sandbox_delete(
     server: &str,
@@ -3710,6 +3738,7 @@ pub async fn sandbox_delete(
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
+    options: SandboxDeleteOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -3779,12 +3808,35 @@ pub async fn sandbox_delete(
             }
         };
 
-        match response.into_inner().outcome() {
+        let deletion = response.into_inner();
+        if deletion.outcome() != DeletionOutcome::Unspecified {
+            clear_last_sandbox_if_matches(gateway, workspace, name);
+        }
+        match deletion.outcome() {
             DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
-            DeletionOutcome::Accepted => println!(
+            DeletionOutcome::Accepted if !options.wait => println!(
                 "{} Sandbox {name} deletion accepted; cleanup is pending",
                 "✓".green().bold()
             ),
+            DeletionOutcome::Accepted => {
+                if let Err(err) = wait_for_sandbox_deleted(
+                    &mut client,
+                    name,
+                    workspace,
+                    &deletion.sandbox_id,
+                    options.timeout,
+                )
+                .await
+                {
+                    eprintln!(
+                        "{} Failed to verify sandbox {name} deletion: {err}",
+                        "!".red().bold()
+                    );
+                    failures.push(format!("{name}: {err}"));
+                    continue;
+                }
+                println!("{} Deleted sandbox {name}", "✓".green().bold());
+            }
             DeletionOutcome::AlreadyAbsent => {
                 println!("{} Sandbox {name} already deleted", "✓".green().bold());
             }
@@ -3794,13 +3846,85 @@ pub async fn sandbox_delete(
                     "!".red().bold()
                 );
                 failures.push(name.clone());
-                continue;
             }
         }
-        clear_last_sandbox_if_matches(gateway, workspace, name);
     }
 
     aggregate_delete_failures("sandbox", &failures)
+}
+
+fn lifecycle_timeout(explicit: Option<Duration>) -> Duration {
+    explicit.unwrap_or_else(|| {
+        Duration::from_secs(
+            std::env::var("OPENSHELL_LIFECYCLE_TIMEOUT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        )
+    })
+}
+
+async fn wait_for_sandbox_deleted(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+    workspace: &str,
+    expected_sandbox_id: &str,
+    timeout_override: Option<Duration>,
+) -> Result<()> {
+    const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    let timeout = lifecycle_timeout(timeout_override);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| miette!("sandbox deletion timeout is too large"))?;
+    let timeout_error = || {
+        miette!(
+            "timed out after {}s waiting for sandbox {name} deletion to complete; deletion continues asynchronously",
+            timeout.as_secs()
+        )
+    };
+    let mut poll_interval = INITIAL_POLL_INTERVAL;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+
+        match tokio::time::timeout(
+            remaining,
+            client.get_sandbox(GetSandboxRequest {
+                name: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            }),
+        )
+        .await
+        {
+            Ok(Ok(response))
+                if response.get_ref().sandbox.as_ref().is_some_and(|sandbox| {
+                    !expected_sandbox_id.is_empty() && sandbox.object_id() != expected_sandbox_id
+                }) =>
+            {
+                return Ok(());
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(status)) if status.code() == Code::NotFound => return Ok(()),
+            Ok(Err(status)) => {
+                return Err(miette!(
+                    "failed to verify deletion of sandbox {name}: {status}"
+                ));
+            }
+            Err(_) => return Err(timeout_error()),
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+        poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
+    }
 }
 
 /// Stop a sandbox while retaining its persistent workspace.

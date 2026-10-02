@@ -107,10 +107,16 @@ allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
 
 ## Delete
 
-Deletes a sandbox by name.
+Requests sandbox deletion by name. `Delete` returns when the gateway accepts
+the request; it does not wait for durable absence. Call `WaitDeleted` when the
+next operation depends on terminal deletion.
 
 ```go
 deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox", v1.DeleteOptions{AllowMissing: true})
+if err == nil && deletion.Outcome == v1.DeletionAccepted {
+    err = client.Sandboxes().WaitDeleted(ctx, "default", "my-sandbox",
+        v1.WaitOptions{ExpectedSandboxID: deletion.SandboxID})
+}
 ```
 
 Missing targets return `NotFound` unless `AllowMissing` is true. Inspect
@@ -118,6 +124,7 @@ Missing targets return `NotFound` unless `AllowMissing` is true. Inspect
 `DeletionCompleted` and `DeletionAlreadyAbsent` establish logical completion.
 Unknown values do not establish completion. `deletion.SandboxID` identifies the
 original sandbox; do not confuse a same-name replacement with that target.
+Use a context deadline to bound `WaitDeleted` and `PollInterval` to adjust polling.
 Allowing absence does not make a retry safe if names can be reused.
 
 ## AttachProvider

@@ -63,6 +63,10 @@ struct SandboxState {
     /// so a catalog lookup failure can be told apart from an empty catalog.
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
+    deletion_polls_remaining: Arc<AtomicUsize>,
+    deletion_get_error: Arc<AtomicBool>,
+    deletion_get_replacement: Arc<AtomicBool>,
+    deletion_get_requests: Arc<AtomicUsize>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
@@ -221,9 +225,43 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
         let name = request.name;
+        let deletion_requested = self
+            .state
+            .deleted_names
+            .lock()
+            .await
+            .iter()
+            .flatten()
+            .any(|deleted| deleted == &name);
+        if deletion_requested {
+            self.state
+                .deletion_get_requests
+                .fetch_add(1, Ordering::SeqCst);
+            if self.state.deletion_get_error.load(Ordering::SeqCst) {
+                return Err(Status::internal("deletion lookup failed"));
+            }
+            let remains_present = self
+                .state
+                .deletion_polls_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+            if !remains_present {
+                return Err(Status::not_found("sandbox deletion complete"));
+            }
+        }
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: format!("id-{name}"),
+                id: if self.state.deletion_get_replacement.load(Ordering::SeqCst) {
+                    format!("replacement-id-{name}")
+                } else {
+                    format!("id-{name}")
+                },
                 name,
                 created_time: None,
                 labels: HashMap::new(),
@@ -380,8 +418,8 @@ impl OpenShell for TestOpenShell {
             return Err(Status::internal(message));
         }
         Ok(Response::new(DeleteSandboxResponse {
-            sandbox_id: String::new(),
-            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+            sandbox_id: format!("id-{}", request.name),
+            outcome: openshell_core::proto::DeletionOutcome::Accepted.into(),
         }))
     }
 
@@ -1577,6 +1615,179 @@ async fn add_provider(server: &TestServer, name: &str, provider_type: &str) {
         });
 }
 
+#[tokio::test]
+async fn sandbox_delete_waits_for_terminal_absence() {
+    let server = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    server
+        .openshell
+        .state
+        .deletion_polls_remaining
+        .store(2, Ordering::SeqCst);
+
+    run::sandbox_delete(
+        &server.endpoint,
+        &["terminal-delete".to_string()],
+        false,
+        "default",
+        &test_tls(&server),
+        "openshell",
+        run::SandboxDeleteOptions {
+            wait: true,
+            timeout: Some(Duration::from_secs(2)),
+        },
+    )
+    .await
+    .expect("delete should wait until GetSandbox returns NotFound");
+
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .deletion_get_requests
+            .load(Ordering::SeqCst),
+        3
+    );
+}
+
+#[tokio::test]
+async fn sandbox_delete_wait_stops_at_same_name_replacement() {
+    let server = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    server
+        .openshell
+        .state
+        .deletion_get_replacement
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .deletion_polls_remaining
+        .store(usize::MAX, Ordering::SeqCst);
+
+    run::sandbox_delete(
+        &server.endpoint,
+        &["replacement".to_string()],
+        false,
+        "default",
+        &test_tls(&server),
+        "openshell",
+        run::SandboxDeleteOptions {
+            wait: true,
+            timeout: Some(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("a new sandbox with the same name is not the deleted sandbox");
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .deletion_get_requests
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn sandbox_delete_wait_false_returns_without_polling() {
+    let server = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    server
+        .openshell
+        .state
+        .deletion_polls_remaining
+        .store(usize::MAX, Ordering::SeqCst);
+
+    run::sandbox_delete(
+        &server.endpoint,
+        &["async-delete".to_string()],
+        false,
+        "default",
+        &test_tls(&server),
+        "openshell",
+        run::SandboxDeleteOptions {
+            wait: false,
+            timeout: Some(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("--wait=false behavior should return after acknowledgment");
+
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .deletion_get_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn sandbox_delete_reports_timeout_and_unexpected_lookup_errors() {
+    let server = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    server
+        .openshell
+        .state
+        .deletion_polls_remaining
+        .store(usize::MAX, Ordering::SeqCst);
+
+    let timeout_error = run::sandbox_delete(
+        &server.endpoint,
+        &["timeout-delete".to_string()],
+        false,
+        "default",
+        &test_tls(&server),
+        "openshell",
+        run::SandboxDeleteOptions {
+            wait: true,
+            timeout: Some(Duration::from_millis(150)),
+        },
+    )
+    .await
+    .expect_err("delete should report a terminal wait timeout");
+    assert!(
+        timeout_error
+            .to_string()
+            .contains("continues asynchronously")
+    );
+
+    server
+        .openshell
+        .state
+        .deletion_get_error
+        .store(true, Ordering::SeqCst);
+    let lookup_error = run::sandbox_delete(
+        &server.endpoint,
+        &["error-delete".to_string()],
+        false,
+        "default",
+        &test_tls(&server),
+        "openshell",
+        run::SandboxDeleteOptions {
+            wait: true,
+            timeout: Some(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect_err("unexpected GetSandbox errors should fail deletion verification");
+    assert!(
+        lookup_error
+            .to_string()
+            .contains("failed to verify deletion")
+    );
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -1616,6 +1827,7 @@ async fn sandbox_delete_continues_after_entry_failure() {
         "default",
         &tls,
         "openshell",
+        run::SandboxDeleteOptions::default(),
     )
     .await
     .expect_err("sandbox delete should report aggregate failure");

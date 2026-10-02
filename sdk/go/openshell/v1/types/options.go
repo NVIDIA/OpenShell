@@ -33,6 +33,9 @@ type WatchOptions struct {
 // WaitOptions configures wait behavior. Use context for timeout control.
 type WaitOptions struct {
 	PollInterval time.Duration
+	// ExpectedSandboxID lets WaitDeleted complete when the original sandbox
+	// has been replaced by another sandbox with the same name.
+	ExpectedSandboxID string
 }
 
 // ExecOptions configures command execution.
