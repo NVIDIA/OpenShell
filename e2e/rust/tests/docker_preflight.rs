@@ -169,3 +169,72 @@ async fn doctor_check_passes_with_docker() {
         "doctor check should show 'ok' for Docker:\n{clean}"
     );
 }
+
+// -------------------------------------------------------------------
+// doctor check: falls back to Podman when Docker is absent
+// -------------------------------------------------------------------
+
+/// Run `openshell <args>` where only a fake `podman` is on `PATH`,
+/// guaranteeing Docker cannot be found so the Podman check runs instead.
+async fn run_podman_only(args: &[&str], podman_ok: bool) -> (String, i32) {
+    let tmpdir = tempfile::tempdir().expect("create isolated config dir");
+    let bin_dir = tmpdir.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create fake bin dir");
+    let fake_podman = bin_dir.join("podman");
+    let script = if podman_ok {
+        "#!/bin/sh\necho '5.0.0'\n"
+    } else {
+        "#!/bin/sh\necho 'Cannot connect to Podman socket.' >&2\nexit 1\n"
+    };
+    fs::write(&fake_podman, script).expect("write fake podman");
+    #[cfg(unix)]
+    fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o755))
+        .expect("chmod fake podman");
+
+    let mut cmd = openshell_cmd();
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("HOME", tmpdir.path())
+        .env("PATH", &bin_dir)
+        .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (format!("{stdout}{stderr}"), code)
+}
+
+/// `openshell doctor check` should validate Podman, not Docker, when
+/// Docker is entirely absent from `PATH`.
+#[tokio::test]
+async fn doctor_check_falls_back_to_podman_label() {
+    let (output, _) = run_podman_only(&["doctor", "check"], true).await;
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("Podman"),
+        "doctor check output should include 'Podman' label:\n{clean}"
+    );
+    assert!(
+        !clean.contains("Docker"),
+        "doctor check should not mention Docker when it is absent:\n{clean}"
+    );
+}
+
+/// `openshell doctor check` with Podman unreachable should fail and
+/// mention the Podman socket env var.
+#[tokio::test]
+async fn doctor_check_podman_failure_includes_guidance() {
+    let (output, code) = run_podman_only(&["doctor", "check"], false).await;
+
+    assert_ne!(code, 0, "doctor check should fail:\n{output}");
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("OPENSHELL_PODMAN_SOCKET"),
+        "doctor check error should mention OPENSHELL_PODMAN_SOCKET:\n{clean}"
+    );
+}

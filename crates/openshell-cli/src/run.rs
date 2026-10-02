@@ -208,36 +208,101 @@ fn current_user_to_json(view: &CurrentUserView) -> serde_json::Value {
     })
 }
 
+/// Container runtime checked by `doctor check`.
+enum ComputeRuntime {
+    Docker,
+    Podman,
+}
+
+impl ComputeRuntime {
+    /// Prefer Docker when it is installed, since it is the default driver.
+    /// Fall back to Podman only when Docker is absent and Podman is present.
+    fn detect() -> Self {
+        if command_exists("docker") || !command_exists("podman") {
+            Self::Docker
+        } else {
+            Self::Podman
+        }
+    }
+
+    /// Left-aligned label line, padded to match the existing check style.
+    fn label_line(&self) -> &'static str {
+        match self {
+            Self::Docker => "  Docker ............. ",
+            Self::Podman => "  Podman ............. ",
+        }
+    }
+
+    fn info_command(&self) -> (&'static str, [&'static str; 3]) {
+        match self {
+            Self::Docker => ("docker", ["info", "--format", "{{.ServerVersion}}"]),
+            Self::Podman => ("podman", ["info", "--format", "{{.Version.Version}}"]),
+        }
+    }
+
+    /// Env var name and current value shown after a successful check.
+    fn host_env(&self) -> (&'static str, Option<String>) {
+        match self {
+            Self::Docker => ("DOCKER_HOST", std::env::var("DOCKER_HOST").ok()),
+            Self::Podman => (
+                "OPENSHELL_PODMAN_SOCKET",
+                std::env::var("OPENSHELL_PODMAN_SOCKET").ok(),
+            ),
+        }
+    }
+
+    /// Guidance appended to the error when the check fails.
+    fn failure_hint(&self) -> &'static str {
+        match self {
+            Self::Docker => "check DOCKER_HOST and run docker info",
+            Self::Podman => "check OPENSHELL_PODMAN_SOCKET (or CONTAINER_HOST) and run podman info",
+        }
+    }
+}
+
+/// Return true if `bin` can be spawned at all, regardless of its exit code.
+fn command_exists(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
 /// Validate system prerequisites for running a gateway.
 ///
-/// Checks Docker connectivity and reports the result. Returns exit code 0
-/// if all checks pass, 1 otherwise.
+/// Checks connectivity for the detected compute runtime (Docker, or Podman
+/// when Docker is absent) and reports the result. Returns exit code 0 if all
+/// checks pass, 1 otherwise.
 pub fn doctor_check() -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
 
     writeln!(stdout, "Checking system prerequisites...\n").into_diagnostic()?;
 
-    // --- Docker connectivity ---
-    write!(stdout, "  Docker ............. ").into_diagnostic()?;
+    let runtime = ComputeRuntime::detect();
+    let (program, args) = runtime.info_command();
+
+    write!(stdout, "{}", runtime.label_line()).into_diagnostic()?;
     stdout.flush().into_diagnostic()?;
 
-    let output = Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
+    let output = Command::new(program)
+        .args(args)
         .output()
         .into_diagnostic()
-        .wrap_err("failed to execute docker info")?;
+        .wrap_err(format!("failed to execute {program} info"))?;
 
     if output.status.success() {
         let version = String::from_utf8_lossy(&output.stdout);
         let version_str = version.trim();
         writeln!(stdout, "ok (version {version_str})").into_diagnostic()?;
 
-        // --- DOCKER_HOST ---
-        write!(stdout, "  DOCKER_HOST ........ ").into_diagnostic()?;
-        match std::env::var("DOCKER_HOST") {
-            Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
-            Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
+        let (env_name, env_value) = runtime.host_env();
+        write!(stdout, "  {env_name} ........ ").into_diagnostic()?;
+        match env_value {
+            Some(val) => writeln!(stdout, "{val}").into_diagnostic()?,
+            None => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
         }
 
         writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
@@ -247,7 +312,13 @@ pub fn doctor_check() -> Result<()> {
     writeln!(stdout, "FAILED").into_diagnostic()?;
     writeln!(stdout).into_diagnostic()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(miette::miette!("docker info failed: {}", stderr.trim()))
+    let stderr = stderr.trim();
+    let hint = runtime.failure_hint();
+    if stderr.is_empty() {
+        Err(miette::miette!("{program} info failed: {hint}"))
+    } else {
+        Err(miette::miette!("{program} info failed: {stderr}; {hint}"))
+    }
 }
 
 fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
