@@ -117,30 +117,50 @@ The snap installs the standalone policy prover as `openshell.prover`. The
 The prover reads local policy files through the `home` interface and does not
 connect to the gateway.
 
-The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
+The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
 
 ```shell
-d=~/snap/openshell/common/.local/state/openshell/tls
-mkdir -p -m 700 "$d" "$d/client"
-sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
-sudo install -o "$USER" -m 600 -t "$d/client" \
-  /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
+snap services openshell.user-gateway
 openshell gateway add https://127.0.0.1:17670 --local --name openshell
 openshell status
 ```
 
-Keep the client key private.
+Existing installations upgraded from older revisions retain their state under `/var/snap/openshell/common` through the compatibility service `openshell.system-gateway`. The installer preserves that service model and updates the installing user's registration when required.
 
-To install a locally built snap, connect its interfaces manually. The gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart the gateway after connecting the interfaces:
+An automatic refresh or direct `snap refresh` cannot enroll a particular local user. If `snap get openshell gateway-mode` reports `system`, wait for the compatibility service to be active, then copy its client credentials into each trusted user's Snap state and replace that user's old HTTP registration:
+
+```shell
+snap services openshell.system-gateway
+d=~/snap/openshell/common/.local/state/openshell/tls
+mkdir -p -m 700 "$d" "$d/client"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/ca.crt "$d/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.crt "$d/client/"
+sudo install -o "$USER" -g "$(id -gn)" -m 600 \
+  /var/snap/openshell/common/tls/client/tls.key "$d/client/"
+openshell gateway list
+openshell gateway remove <old-http-registration>
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
+```
+
+Use the name shown by `openshell gateway list` for `<old-http-registration>`. Older direct Snap instructions may have used `openshell-gateway`, while the install script uses `openshell`.
+
+Switch between the user-owned and compatibility services with `sudo snap set openshell gateway-mode=user` or `sudo snap set openshell gateway-mode=system`.
+
+To install a locally built snap, connect its interfaces manually. The user gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart it from the affected user session after connecting the interfaces:
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
-sudo systemctl reset-failed snap.openshell.gateway.service
-sudo snap restart openshell.gateway
+systemctl --user reset-failed snap.openshell.user-gateway.service
+snap start openshell.user-gateway
 ```
+
+For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
 
 ## Kubernetes
 

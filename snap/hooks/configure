@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Apply the configured gateway service model. This hook also makes
+# `snap set openshell gateway-mode=<user|system>` switch services.
+
+set -eu
+
+gateway_mode=$(snapctl get gateway-mode)
+case "$gateway_mode" in
+	user)
+		snapctl stop --disable "${SNAP_INSTANCE_NAME}.system-gateway"
+		snapctl start --enable "${SNAP_INSTANCE_NAME}.user-gateway"
+		;;
+	system)
+		snapctl stop --disable "${SNAP_INSTANCE_NAME}.user-gateway"
+		snapctl start --enable "${SNAP_INSTANCE_NAME}.system-gateway"
+		;;
+	'')
+		echo "openshell: gateway-mode is not configured" >&2
+		exit 1
+		;;
+	*)
+		echo "openshell: unsupported gateway-mode: ${gateway_mode}" >&2
+		exit 1
+		;;
+esac

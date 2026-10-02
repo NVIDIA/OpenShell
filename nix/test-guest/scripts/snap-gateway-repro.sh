@@ -85,12 +85,16 @@ diagnostics() {
 		sudo journalctl -b -u docker.service --no-pager -n 300 >&2 || true
 	fi
 	sudo snap services openshell >&2 || true
+	snap services openshell.user-gateway >&2 || true
 	sudo snap connections openshell >&2 || true
 	sudo snap changes >&2 || true
-	sudo systemctl status snap.openshell.gateway.service --no-pager >&2 || true
-	sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300 >&2 || true
+	sudo systemctl status snap.openshell.system-gateway.service --no-pager >&2 || true
+	sudo journalctl -b -u snap.openshell.system-gateway.service --no-pager -n 300 >&2 || true
+	systemctl --user status snap.openshell.user-gateway.service --no-pager >&2 || true
+	journalctl --user -u snap.openshell.user-gateway.service --no-pager -n 300 >&2 || true
 	sudo journalctl -b -u snapd.service --no-pager -n 300 >&2 || true
-	sudo snap logs openshell.gateway -n=300 >&2 || true
+	sudo snap logs openshell.system-gateway -n=300 >&2 || true
+	snap logs openshell.user-gateway -n=300 >&2 || true
 	sudo ss -ltnp '( sport = :17670 )' >&2 || true
 }
 

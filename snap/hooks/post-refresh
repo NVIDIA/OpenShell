@@ -2,29 +2,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Remove insecure gateway configs on refresh, then restart the gateway so the
-# default config takes effect even when the previous revision used
-# refresh-mode: endure and kept its plaintext gateway running.
+# One-time migration for installations that predate per-user snap gateways.
+# Existing installations retain the system gateway; fresh installations record
+# gateway-mode=user in the install hook and skip this migration. The configure
+# hook applies the selected service after this transaction commits.
 
 set -eu
+
+gateway_mode=$(snapctl get gateway-mode)
+case "$gateway_mode" in
+	user | system)
+		exit 0
+		;;
+	'')
+		;;
+	*)
+		echo "openshell: unsupported gateway-mode: ${gateway_mode}" >&2
+		exit 1
+		;;
+esac
 
 config_file="${SNAP_COMMON}/gateway.toml"
 insecure='^[[:space:]]*(allow_unauthenticated_users|disable_tls)[[:space:]]*=[[:space:]]*true([[:space:]#]|$)'
 
-# Keep secure operator configs, symlinks, and directories. Remove a config
-# that explicitly allows plaintext or anonymous access, even if it has other
-# edits.
-if [ ! -e "$config_file" ]; then
-	exit 0
-elif [ -L "$config_file" ]; then
-	exit 0
-elif [ -f "$config_file" ]; then
-	grep -Eq "$insecure" "$config_file" || exit 0
+# Keep secure operator configs and directories. Remove a regular config, or
+# only the symlink to one, when it explicitly allows plaintext or anonymous
+# access. Never modify a symlink target.
+if [ -f "$config_file" ] && grep -Eq "$insecure" "$config_file"; then
 	echo "openshell: removing insecure gateway config to use the mTLS default" >&2
-elif [ -e "$config_file" ]; then
-	exit 0
+	rm -f "$config_file"
 fi
 
-rm -f "$config_file"
-
-snapctl restart "${SNAP_INSTANCE_NAME}.gateway"
+snapctl set gateway-mode=system
