@@ -3725,7 +3725,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 36))
             .expect("test terminal");
         terminal
-            .draw(|frame| crate::ui::create_provider::draw_detail(frame, app, frame.size()))
+            .draw(|frame| crate::ui::create_provider::draw_detail(frame, app, frame.area()))
             .expect("provider detail renders");
         terminal
             .backend()

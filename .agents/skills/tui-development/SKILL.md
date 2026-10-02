@@ -16,7 +16,7 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 - **Launched via:** `openshell term` or `mise run term`
 - **Crate:** `crates/openshell-tui/`
 - **Key dependencies:**
-  - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
+  - `ratatui` (workspace version) — uses `frame.area()` for the drawable terminal area
   - `crossterm` (workspace version) — terminal backend and event polling
   - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
