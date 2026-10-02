@@ -13,7 +13,7 @@ Create pull requests on GitHub using the `gh` CLI.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must have commits on a branch that's pushed to the remote
-- Every PR must close an existing issue. The branch should follow `<type>/<issue-id>-<short-description>/<github-username>`.
+- Every PR must close an existing issue, except automated dependency updates as described in `CONTRIBUTING.md`. Follow Branch Names in `CONTRIBUTING.md` for contributor branch names.
 
 ## Before Creating a PR
 
@@ -47,10 +47,10 @@ Before creating a PR, verify:
    git branch --show-current
    ```
 
-2. **Branch follows naming convention** - Use `<type>/<issue-id>-<short-description>/<github-username>`, where `<type>` is a Conventional Commits type.
+2. **Branch follows naming convention** - Follow Branch Names in `CONTRIBUTING.md`, including the exceptions for generated branches and private security work.
 
    ```bash
-   # Example: feat/1234-add-pagination/johntmyers
+   # Example: feat/1234-add-pagination/octocat
    git branch --show-current
    ```
 
@@ -106,7 +106,7 @@ gh pr create --title "PR title" --body "PR description"
 
 ### Link to an Issue
 
-Every PR must close its own issue. Verify that the issue exists, remains open, and covers the PR scope. Use `Closes #<issue-number>` in the body so merge closes it:
+Every PR except an automated dependency update must close its own issue. Verify that the issue exists, remains open, and covers the PR scope. Automated dependency updates follow the exception in `CONTRIBUTING.md`. Use `Closes #<issue-number>` in the body so merge closes it:
 
 ```bash
 gh pr create \

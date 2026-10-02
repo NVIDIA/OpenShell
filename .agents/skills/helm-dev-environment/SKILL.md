@@ -38,8 +38,8 @@ and preloads the default sandbox image into k3d so the first sandbox create
 does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
-current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
-`openshell-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
+current git branch (e.g. branch `chore/1234-local-dev/octocat` → cluster
+`openshell-dev-octocat`). Each worktree therefore gets its own isolated cluster and its
 own `kubeconfig` file. Override with `HELM_K3S_CLUSTER_NAME` to force a specific name
 or share one cluster across worktrees.
 
