@@ -293,6 +293,14 @@ mod tests {
         value.repeat(32).parse().unwrap()
     }
 
+    fn native_identity_path(path: &str) -> PathBuf {
+        if cfg!(target_os = "windows") && path.starts_with('/') {
+            PathBuf::from(format!("C:{path}"))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     fn supplied_identity(
         executable_path: &str,
         executable_digest: Option<&str>,
@@ -300,13 +308,13 @@ mod tests {
     ) -> BinaryIdentity {
         BinaryIdentity {
             executable: ExecutableIdentity {
-                path: PathBuf::from(executable_path),
+                path: native_identity_path(executable_path),
                 digest: executable_digest.map(digest),
             },
             ancestors: ancestors
                 .iter()
                 .map(|(path, digest_value)| ExecutableIdentity {
-                    path: PathBuf::from(path),
+                    path: native_identity_path(path),
                     digest: digest_value.map(digest),
                 })
                 .collect(),
@@ -450,7 +458,7 @@ mod tests {
                 .hashes
                 .lock()
                 .unwrap()
-                .contains_key(Path::new("/sandbox/other"))
+                .contains_key(&native_identity_path("/sandbox/other"))
         );
     }
 
@@ -480,8 +488,8 @@ mod tests {
         assert!(error.contains("capacity"));
         let hashes = cache.hashes.lock().unwrap();
         assert_eq!(hashes.len(), 4095);
-        assert!(!hashes.contains_key(Path::new("/sandbox/new-leaf")));
-        assert!(!hashes.contains_key(Path::new("/sandbox/new-ancestor")));
+        assert!(!hashes.contains_key(&native_identity_path("/sandbox/new-leaf")));
+        assert!(!hashes.contains_key(&native_identity_path("/sandbox/new-ancestor")));
     }
 
     #[test]

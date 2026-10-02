@@ -5,15 +5,19 @@
 
 #[cfg(target_os = "linux")]
 mod accept_interrupt;
+#[cfg(target_os = "linux")]
 pub mod boundary_exec;
+#[cfg(target_os = "linux")]
 pub mod boundary_io;
 mod boundary_server;
+#[cfg(target_os = "linux")]
 pub mod child_env;
 pub mod container_log;
 #[cfg(target_os = "linux")]
 pub(crate) mod delegated;
 #[cfg(target_os = "linux")]
 pub mod main_session;
+#[cfg(target_os = "linux")]
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
@@ -23,7 +27,9 @@ pub mod perf;
 pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
+#[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;
@@ -46,11 +52,10 @@ pub struct RuntimeQualification {
     pub tcp_deny_round_trip: bool,
 }
 
-/// Placeholder used when compiling the package on a non-Linux host.
+/// Linux runtime qualification is not used on other platforms.
 ///
-/// The sandbox binary rejects execution on those hosts before constructing a
-/// qualification, but retaining the type keeps the library API portable for
-/// workspace-wide checks.
+/// This executable's boundary mode requires Linux. Windows MXC uses the separate
+/// `openshell-windows-sandbox` executable and its platform-specific confirmation.
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeQualification;

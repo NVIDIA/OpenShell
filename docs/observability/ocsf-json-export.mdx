@@ -63,9 +63,13 @@ $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
 openshell-gateway --drivers mxc --config gateway.toml
 ```
 
-The sink is available only when Windows selects the MXC driver. It rotates
+This environment-configured sink is available on all platforms independently of
+the selected compute driver. On Unix hosts its default directory is
+`$XDG_STATE_HOME/openshell/logs` (or `$HOME/.local/state/openshell/logs`). It rotates
 daily and retains the three most recent files. Diagnostic `--log-level` values
 do not suppress records in this explicitly enabled audit sink.
+Prefer the `gateway.toml` output above for configured retention and loss metrics;
+enabling both sinks writes to both independently.
 
 ## Output Location
 

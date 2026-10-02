@@ -83,6 +83,11 @@ impl ContainmentEndpoint for Endpoint {
 pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyError> {
     let document = openshell_policy_schema::parse_policy(source)
         .map_err(|error| ParsePolicyError(format!("invalid policy: {error:#}")))?;
+    if document.ui.is_some() {
+        return Err(ParsePolicyError(
+            "UI policy containment is not supported".to_string(),
+        ));
+    }
     let mut filesystem_policy = document.effective_filesystem_policy();
     normalize_filesystem_paths(&mut filesystem_policy)?;
     let PolicyDocument {
@@ -92,6 +97,7 @@ pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyEr
         landlock,
         process,
         network_middlewares,
+        ui: _,
     } = document;
     Ok(ContainmentPolicy {
         filesystem_policy,
@@ -2223,6 +2229,17 @@ mod tests {
 
     fn parse(value: &str) -> ContainmentPolicy {
         parse_policy_str(value).expect("valid policy")
+    }
+
+    #[test]
+    fn ui_policy_is_not_silently_omitted_from_containment_checks() {
+        let error = parse_policy_str("version: 1\nui:\n  allow_graphical_ui: false\n")
+            .expect_err("unmodeled UI authority must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("UI policy containment is not supported")
+        );
     }
 
     fn options() -> CheckOptions {

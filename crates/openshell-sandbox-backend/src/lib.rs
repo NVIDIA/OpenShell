@@ -8,6 +8,7 @@
 //! runtime serves the same protocol using the generated server and shared wire
 //! types in this crate.
 
+pub mod audit;
 pub mod boundary_protocol;
 pub mod mediation;
 mod runtime;
