@@ -256,6 +256,14 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- Non-secret gateway application configuration. Top-level keys name TOML
+# tables and are rendered into the mounted gateway.toml file. Kubernetes
+# resource inputs remain outside this map; template expressions derive the
+# corresponding runtime values from their resource owner.
+gatewayConfig:
+  openshell:
+    version: 2
+
 # Server configuration
 server:
   # -- Operator-facing gateway name. Defaults to the chart fullname so all
@@ -531,6 +539,14 @@ server:
     # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
     # for verifying the OIDC issuer's TLS certificate. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
+    caConfigMapName: ""
+
+# Kubernetes resource references for external credential drivers. Runtime
+# driver settings remain in gatewayConfig.
+credentialDrivers:
+  vault:
+    # -- ConfigMap containing the private Vault/OpenBao CA certificate under
+    # the ca.crt key. Helm mounts it only when the Vault driver is selected.
     caConfigMapName: ""
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.

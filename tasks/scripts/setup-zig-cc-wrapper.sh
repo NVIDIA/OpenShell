@@ -23,8 +23,9 @@ if [[ $bare_cargo_target =~ ^(.+)\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 # cargo-zigbuild accepts Rust target triples with glibc suffixes, for example
-# x86_64-unknown-linux-gnu.2.28. Zig's C/C++ driver expects the vendorless form.
-zig_cc_target=${zig_target/-unknown-linux-/-linux-}
+# x86_64-unknown-linux-gnu.2.28. Zig's C/C++ driver expects a vendorless
+# target without that Rust-only suffix.
+zig_cc_target=${bare_cargo_target/-unknown-linux-/-linux-}
 
 if [[ -n ${ZIG:-} ]]; then
   zig=$ZIG
