@@ -50,7 +50,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -889,6 +890,13 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
+
+    async fn peer_notify_config_update(
+        &self,
+        request: Request<PeerConfigUpdateHintRequest>,
+    ) -> Result<Response<PeerConfigUpdateHintResponse>, Status> {
+        crate::config_delivery::handle_peer_config_update_hint(&self.state, request).await
+    }
 }
 
 fn public_extension_info(extension: &NegotiatedExtension) -> NegotiatedExtensionInfo {
@@ -951,7 +959,75 @@ pub mod test_support {
     use crate::supervisor_session::SupervisorSessionRegistry;
     use crate::tracing_bus::TracingLogBus;
     use openshell_core::Config;
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use openshell_core::proto::open_shell_server::OpenShellServer;
+    use openshell_core::proto::{
+        GatewayMessage, SupervisorHello, SupervisorMessage, supervisor_message,
+    };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
     use tonic::Request;
+
+    /// A live `ConnectSupervisor` stream against an in-process gateway.
+    pub struct SupervisorStreamHarness {
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        /// Held so the supervisor side of the stream stays open.
+        _outbound: mpsc::Sender<SupervisorMessage>,
+        pub inbound: tonic::Streaming<GatewayMessage>,
+    }
+
+    impl Drop for SupervisorStreamHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream whose hello
+    /// carries the given protocol revision. Returns the gRPC status when the
+    /// gateway rejects the stream before accepting it.
+    pub async fn connect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        protocol_revision: u32,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::new(super::OpenShellService::new(
+                    Arc::clone(state),
+                )))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (outbound, rx) = mpsc::channel(4);
+        outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: sandbox_id.into(),
+                    instance_id: "instance".into(),
+                    protocol_revision,
+                    connection_epoch: 0,
+                    supports_provider_readiness: false,
+                })),
+            })
+            .await
+            .unwrap();
+        let inbound = match client.connect_supervisor(ReceiverStream::new(rx)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                server.abort();
+                return Err(status);
+            }
+        };
+        Ok(SupervisorStreamHarness {
+            server,
+            _outbound: outbound,
+            inbound,
+        })
+    }
 
     /// Wrap a proto message in a `Request` with a dev principal injected.
     ///

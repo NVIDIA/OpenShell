@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use metrics::counter;
+use prost::Message;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -16,17 +18,25 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
+    ConfigUpdate, GatewayMessage, GetSandboxProviderStatusRequest,
+    GetSandboxProviderStatusResponse, PeerConfigUpdateHintRequest, PeerConfigUpdateHintResponse,
     PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
     ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
     Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
-    gateway_message, open_shell_client, peer_relay_frame, relay_open, supervisor_message,
+    config_update, gateway_message, open_shell_client, peer_relay_frame, relay_open,
+    supervisor_message,
 };
+use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::config_delivery::{
+    DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, SupervisorConfigMessage,
+};
+#[cfg(test)]
+use crate::config_delivery::{LocalSupervisorConfigRouter, SupervisorConfigRouter};
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
@@ -273,7 +283,9 @@ struct LiveSession {
     /// Uniquely identifies this session instance. Used by cleanup to avoid
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
+    config_push_capable: bool,
     tx: mpsc::Sender<GatewayMessage>,
+    config_sequences: ConfigSequences,
     /// Fires when this session is superseded by a reconnect so the old session
     /// task can exit promptly — dropping its own `tx` clone and closing the
     /// outbound stream. Without this, a concurrent `open_relay` that grabbed
@@ -297,6 +309,12 @@ struct LiveSession {
     provider_readiness: Option<ProviderReadinessEvidence>,
     #[allow(dead_code)]
     connected_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ConfigSequences {
+    sandbox_config: u64,
+    provider_environment: u64,
 }
 
 /// Idempotency state for tool server endpoint-status reports from one live supervisor.
@@ -404,6 +422,17 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
+        self.register_with_config_push(sandbox_id, session_id, tx, shutdown, true)
+    }
+
+    pub fn register_with_config_push(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+        config_push_capable: bool,
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
         sessions.insert(
@@ -411,7 +440,9 @@ impl SupervisorSessionRegistry {
             LiveSession {
                 sandbox_id,
                 session_id,
+                config_push_capable,
                 tx,
+                config_sequences: ConfigSequences::default(),
                 shutdown,
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
@@ -525,6 +556,82 @@ impl SupervisorSessionRegistry {
         };
         session.terminal_delivery_finalized = true;
         true
+    }
+
+    pub(crate) fn connected_sandbox_ids(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, session)| session.config_push_capable)
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn is_config_push_capable(&self, sandbox_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.config_push_capable)
+    }
+
+    pub(crate) fn deliver_config(
+        &self,
+        sandbox_id: &str,
+        message: SupervisorConfigMessage,
+    ) -> DeliveryDisposition {
+        let component_name = message.component_name();
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return DeliveryDisposition::NoActiveSession;
+        };
+        if !session.config_push_capable {
+            return DeliveryDisposition::UnsupportedSession;
+        }
+        let sequence = match &message {
+            SupervisorConfigMessage::SandboxConfig(_) => {
+                &mut session.config_sequences.sandbox_config
+            }
+            SupervisorConfigMessage::ProviderEnvironment(_) => {
+                &mut session.config_sequences.provider_environment
+            }
+        };
+        *sequence = sequence.saturating_add(1);
+        let component_sequence = *sequence;
+
+        let component = match message {
+            SupervisorConfigMessage::SandboxConfig(snapshot) => {
+                config_update::Component::SandboxConfig(*snapshot)
+            }
+            SupervisorConfigMessage::ProviderEnvironment(snapshot) => {
+                config_update::Component::ProviderEnvironment(snapshot)
+            }
+        };
+        let gateway_message = GatewayMessage {
+            payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
+                update_id: Uuid::new_v4().to_string(),
+                component_sequence,
+                component: Some(component),
+            })),
+        };
+
+        if gateway_message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+            return DeliveryDisposition::PayloadTooLarge;
+        }
+
+        match session.tx.try_send(gateway_message) {
+            Ok(()) => DeliveryDisposition::Enqueued,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    component = component_name,
+                    "supervisor configuration queue is full"
+                );
+                DeliveryDisposition::QueueFull
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => DeliveryDisposition::SessionClosed,
+        }
     }
 
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
@@ -1049,17 +1156,13 @@ fn owner_error_to_status(err: OwnerError) -> Status {
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
-) -> Result<(), Status> {
+) -> Result<Sandbox, Status> {
     let sandbox = store
         .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|err| Status::internal(format!("failed to load sandbox: {err}")))?;
 
-    if sandbox.is_none() {
-        return Err(Status::not_found("sandbox not found"));
-    }
-
-    Ok(())
+    sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1449,19 @@ async fn peer_rpc_client(
         channel,
         interceptor,
     ))
+}
+
+pub(crate) async fn forward_config_hint_to_peer(
+    state: &Arc<ServerState>,
+    endpoint: &str,
+    request: PeerConfigUpdateHintRequest,
+) -> Result<PeerConfigUpdateHintResponse, Status> {
+    let mut client = peer_rpc_client(state, endpoint).await?;
+    client
+        .peer_notify_config_update(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| state.peer_routes.evict_channel(endpoint))
 }
 
 pub(crate) async fn remote_supervisor_owner(
@@ -1869,10 +1985,42 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
+    validate_protocol_revision(&sandbox_id, hello.protocol_revision)?;
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
-    require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
+
+    let bootstrap = if state.config.config_delivery_mode
+        == openshell_core::config::ConfigDeliveryMode::Poll
+        || hello.protocol_revision == LEGACY_SUPERVISOR_PROTOCOL_REVISION
+    {
+        None
+    } else {
+        match crate::config_delivery::build_config_bootstrap(state, &sandbox).await {
+            Ok(bootstrap) => {
+                counter!(
+                    "openshell_supervisor_config_bootstrap_total",
+                    "outcome" => "built"
+                )
+                .increment(1);
+                Some(bootstrap)
+            }
+            Err(error) => {
+                counter!(
+                    "openshell_supervisor_config_bootstrap_total",
+                    "outcome" => "build_failed"
+                )
+                .increment(1);
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error_code = ?error.code(),
+                    "failed to build supervisor configuration bootstrap"
+                );
+                None
+            }
+        }
+    };
     // Validate readiness identities before replacing a healthy session. Older
     // supervisors remain usable but cannot assert provider installation.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
@@ -1885,6 +2033,7 @@ pub async fn handle_connect_supervisor(
         state,
         inbound,
         hello,
+        bootstrap,
         provider_readiness,
         session_lifetime,
     ))
@@ -1896,6 +2045,7 @@ async fn establish_supervisor_session(
     state: Arc<ServerState>,
     mut inbound: tonic::Streaming<SupervisorMessage>,
     hello: SupervisorHello,
+    bootstrap: Option<openshell_core::proto::ConfigBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
     session_lifetime: OwnedRwLockReadGuard<()>,
 ) -> Result<
@@ -1931,14 +2081,47 @@ async fn establish_supervisor_session(
         "supervisor session: accepted"
     );
 
-    // Step 2: Create and register the outbound channel.
+    // Step 2: Queue SessionAccepted before the session becomes routable. This
+    // keeps a concurrent ConfigUpdate from becoming the first stream message.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let superseded = state.supervisor_sessions.register(
+    let mut accepted = GatewayMessage {
+        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+            session_id: session_id.clone(),
+            bootstrap,
+            protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+            heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
+                u64::from(HEARTBEAT_INTERVAL_SECS),
+            ))
+            .ok(),
+        })),
+    };
+    if accepted.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+        counter!(
+            "openshell_supervisor_config_bootstrap_total",
+            "outcome" => "payload_too_large"
+        )
+        .increment(1);
+        let Some(gateway_message::Payload::SessionAccepted(accepted_payload)) =
+            accepted.payload.as_mut()
+        else {
+            unreachable!("constructed SessionAccepted payload")
+        };
+        accepted_payload.bootstrap = None;
+    }
+    if tx.send(accepted).await.is_err() {
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %err, "supervisor session: failed to release owner after accept queue failure");
+        }
+        return Err(Status::internal("failed to send session accepted"));
+    }
+
+    let superseded = state.supervisor_sessions.register_with_config_push(
         sandbox_id.clone(),
         session_id.clone(),
         tx.clone(),
         shutdown_tx,
+        hello.protocol_revision == SUPERVISOR_PROTOCOL_REVISION,
     );
     if superseded {
         info!(
@@ -1989,28 +2172,6 @@ async fn establish_supervisor_session(
             warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after provider readiness initialization failure");
         }
         return Err(error);
-    }
-
-    // Step 3: Send SessionAccepted.
-    let accepted = GatewayMessage {
-        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
-            session_id: session_id.clone(),
-            heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
-                u64::from(HEARTBEAT_INTERVAL_SECS),
-            ))
-            .ok(),
-        })),
-    };
-    if tx.send(accepted).await.is_err() {
-        // Only evict ourselves — a faster reconnect may already have
-        // superseded this registration.
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
-            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %err, "supervisor session: failed to release owner after accept send failure");
-        }
-        return Err(Status::internal("failed to send session accepted"));
     }
 
     if let Err(err) = state
@@ -2109,6 +2270,23 @@ async fn establish_supervisor_session(
     > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
 
     Ok(Response::new(stream))
+}
+
+fn validate_protocol_revision(sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
+    match supervisor_revision {
+        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
+        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
+            counter!("openshell_supervisor_protocol_legacy_sessions_total").increment(1);
+            warn!(
+                sandbox_id = %sandbox_id,
+                "supervisor session: supervisor predates the protocol handshake; recreate the sandbox before the next gateway upgrade"
+            );
+            Ok(())
+        }
+        other => Err(Status::failed_precondition(format!(
+            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {other}"
+        ))),
+    }
 }
 
 pub async fn handle_report_main_process_exit(
@@ -2339,6 +2517,22 @@ async fn handle_supervisor_message(
                 "supervisor session: relay closed by supervisor"
             );
         }
+        Some(supervisor_message::Payload::ConfigUpdateResult(result)) => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                component_sequence = result.component_sequence,
+                "supervisor session: ignoring configuration result while polling remains authoritative"
+            );
+        }
+        Some(supervisor_message::Payload::ConfigBootstrapResult(result)) => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                result_count = result.results.len(),
+                "supervisor session: ignoring bootstrap result while polling remains authoritative"
+            );
+        }
         _ => {
             warn!(
                 sandbox_id = %sandbox_id,
@@ -2360,6 +2554,327 @@ mod tests {
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
     use crate::persistence::Store;
+    use openshell_core::proto::{
+        ProviderEnvironmentSnapshot, ProviderEnvironmentValue, SandboxConfigRevision,
+        SandboxConfigSnapshot,
+    };
+    use prost::Message;
+
+    #[test]
+    fn configuration_stream_messages_round_trip() {
+        let bootstrap = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                session_id: "session-1".into(),
+                heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
+                    15,
+                ))
+                .ok(),
+                bootstrap: Some(openshell_core::proto::ConfigBootstrap {
+                    sandbox_config: Some(SandboxConfigSnapshot::default()),
+                    provider_environment: Some(ProviderEnvironmentSnapshot::default()),
+                }),
+                protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
+            })),
+        };
+        let updates = [
+            config_update::Component::SandboxConfig(SandboxConfigSnapshot::default()),
+            config_update::Component::ProviderEnvironment(ProviderEnvironmentSnapshot::default()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, component)| GatewayMessage {
+            payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
+                update_id: format!("update-{index}"),
+                component_sequence: u64::try_from(index + 1).unwrap(),
+                component: Some(component),
+            })),
+        });
+
+        for original in std::iter::once(bootstrap).chain(updates) {
+            let decoded = GatewayMessage::decode(original.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, original);
+        }
+
+        let result = SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                openshell_core::proto::ConfigUpdateResult {
+                    update_id: "update-1".into(),
+                    component_sequence: 4,
+                    result: Some(openshell_core::proto::ConfigComponentApplyResult {
+                        component: openshell_core::proto::ConfigComponent::SandboxConfig.into(),
+                        requested_revision: Some(openshell_core::proto::ConfigSnapshotRevision {
+                            component: Some(
+                                openshell_core::proto::config_snapshot_revision::Component::SandboxConfig(
+                                    SandboxConfigRevision {
+                                        config_revision: 7,
+                                        policy_version: 3,
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                        }),
+                        applied_revision: Some(openshell_core::proto::ConfigSnapshotRevision {
+                            component: Some(
+                                openshell_core::proto::config_snapshot_revision::Component::SandboxConfig(
+                                    SandboxConfigRevision {
+                                        config_revision: 7,
+                                        policy_version: 3,
+                                        ..Default::default()
+                                    },
+                                ),
+                            ),
+                        }),
+                        outcome: openshell_core::proto::ConfigApplyOutcome::Applied.into(),
+                        failure: None,
+                    }),
+                },
+            )),
+        };
+        let decoded = SupervisorMessage::decode(result.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn supervisor_protocol_revision_accepts_current_and_legacy_peers() {
+        assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_protocol_revision("sb-1", LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+    }
+
+    async fn state_with_sandbox(sandbox_id: &str) -> Arc<ServerState> {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&sandbox_record(sandbox_id, sandbox_id))
+            .await
+            .unwrap();
+        state
+    }
+
+    async fn first_gateway_message(
+        harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
+    ) -> GatewayMessage {
+        tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
+            .await
+            .expect("gateway response before timeout")
+            .expect("stream open")
+            .expect("gateway message")
+    }
+
+    #[tokio::test]
+    async fn legacy_supervisor_without_protocol_revision_is_accepted() {
+        let state = state_with_sandbox("sb-legacy").await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-legacy",
+            LEGACY_SUPERVISOR_PROTOCOL_REVISION,
+        )
+        .await
+        .expect("legacy supervisor must connect");
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert_eq!(accepted.protocol_revision, SUPERVISOR_PROTOCOL_REVISION);
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-legacy", &accepted.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_supervisor_protocol_revision_is_rejected() {
+        let state = state_with_sandbox("sb-future").await;
+        let Err(status) = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-future",
+            SUPERVISOR_PROTOCOL_REVISION + 1,
+        )
+        .await
+        else {
+            panic!("mismatched revision must be rejected");
+        };
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("revision mismatch"));
+        assert!(state.supervisor_sessions.connected_sandbox_ids().is_empty());
+    }
+
+    #[test]
+    fn supervisor_protocol_revision_rejects_unknown_peers() {
+        let error =
+            validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION + 1).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("revision mismatch"));
+    }
+
+    #[tokio::test]
+    async fn config_router_reports_missing_session() {
+        let router = LocalSupervisorConfigRouter::new(Arc::new(SupervisorSessionRegistry::new()));
+        assert_eq!(
+            router
+                .deliver(
+                    "missing",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::NoActiveSession
+        );
+    }
+
+    #[tokio::test]
+    async fn config_router_assigns_sequences_per_component() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::Enqueued
+        );
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::Enqueued
+        );
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::ProviderEnvironment(
+                        ProviderEnvironmentSnapshot::default(),
+                    ),
+                )
+                .await,
+            DeliveryDisposition::Enqueued
+        );
+
+        let first = rx.recv().await.expect("first config update");
+        let second = rx.recv().await.expect("second config update");
+        let third = rx.recv().await.expect("provider config update");
+        let sequence = |message: GatewayMessage| match message.payload {
+            Some(gateway_message::Payload::ConfigUpdate(update)) => update.component_sequence,
+            other => panic!("expected config update, got {other:?}"),
+        };
+        assert_eq!(sequence(first), 1);
+        assert_eq!(sequence(second), 2);
+        assert_eq!(sequence(third), 1);
+    }
+
+    #[tokio::test]
+    async fn config_router_uses_replacement_session() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let (old_tx, mut old_rx) = mpsc::channel(2);
+        let (old_shutdown_tx, _old_shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "old-session".into(), old_tx, old_shutdown_tx);
+
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::Enqueued
+        );
+        let old_update = old_rx.recv().await.expect("old-session config update");
+        let Some(gateway_message::Payload::ConfigUpdate(old_update)) = old_update.payload else {
+            panic!("expected config update");
+        };
+        assert_eq!(old_update.component_sequence, 1);
+
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let (new_shutdown_tx, _new_shutdown_rx) = oneshot::channel();
+        assert!(registry.register("sb-1".into(), "new-session".into(), new_tx, new_shutdown_tx,));
+
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::Enqueued
+        );
+        assert!(old_rx.try_recv().is_err());
+        let new_update = new_rx.try_recv().expect("new-session config update");
+        let Some(gateway_message::Payload::ConfigUpdate(new_update)) = new_update.payload else {
+            panic!("expected config update");
+        };
+        assert_eq!(new_update.component_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn config_router_reports_full_and_closed_queues() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(GatewayMessage::default()).unwrap();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::QueueFull
+        );
+
+        drop(rx);
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::default()),
+                )
+                .await,
+            DeliveryDisposition::SessionClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn config_router_rejects_oversized_messages() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sb-1".into(), "session-1".into(), tx, shutdown_tx);
+
+        let snapshot = ProviderEnvironmentSnapshot {
+            values: vec![ProviderEnvironmentValue {
+                name: "TOKEN".into(),
+                value: "x".repeat(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    SupervisorConfigMessage::ProviderEnvironment(snapshot),
+                )
+                .await,
+            DeliveryDisposition::PayloadTooLarge
+        );
+        assert!(rx.try_recv().is_err());
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_store() -> Arc<Store> {

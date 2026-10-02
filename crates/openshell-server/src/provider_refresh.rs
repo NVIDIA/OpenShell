@@ -1918,14 +1918,25 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(workspaces) => {
+                    for workspace in workspaces {
+                        crate::config_delivery::publish_workspace_components(
+                            &state,
+                            &workspace,
+                            crate::config_delivery::ConfigComponents::ALL,
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
@@ -1935,7 +1946,8 @@ async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<std::collections::HashSet<String>, Status> {
+    let changed_workspaces = std::collections::HashSet::new();
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -1955,7 +1967,7 @@ async fn run_refresh_worker_tick(
         .iter()
         .any(|state| refresh_state_has_work(state, now_ms))
     {
-        return Ok(());
+        return Ok(changed_workspaces);
     }
     let span = tracing::info_span!(
         "refresh",
@@ -1963,8 +1975,10 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span)).await;
-    Ok(())
+    Ok(
+        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
+            .await,
+    )
 }
 
 fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
@@ -1984,7 +1998,8 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
-) {
+) -> std::collections::HashSet<String> {
+    let mut changed_workspaces = std::collections::HashSet::new();
     for state in states {
         if state
             .metadata
@@ -2014,6 +2029,8 @@ async fn refresh_states(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                changed_workspaces.insert(state.object_workspace().to_string());
             }
             continue;
         }
@@ -2097,8 +2114,11 @@ async fn refresh_states(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            changed_workspaces.insert(state.object_workspace().to_string());
         }
     }
+    changed_workspaces
 }
 
 #[cfg(test)]
