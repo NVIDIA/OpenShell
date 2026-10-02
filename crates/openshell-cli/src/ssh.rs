@@ -1078,6 +1078,9 @@ enum UploadSource {
 
 fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()> {
     let mut archive = tar::Builder::new(writer);
+    // Sparse detection trusts `st_blocks`. Filesystems that report zero blocks
+    // (such as WSL2 drive mounts) would upload every file as NUL bytes.
+    archive.sparse(false);
     match source {
         UploadSource::SinglePath {
             local_path,
@@ -3002,6 +3005,7 @@ mod tests {
         entry_type: tar::EntryType,
         #[cfg_attr(not(unix), allow(dead_code))]
         link_name: Option<String>,
+        contents: Vec<u8>,
     }
 
     fn upload_archive_entries(source: UploadSource) -> Vec<UploadArchiveEntry> {
@@ -3011,7 +3015,7 @@ mod tests {
         let entries = archive.entries().expect("read archive entries");
         let mut entries = entries
             .map(|entry| {
-                let entry = entry.expect("read archive entry");
+                let mut entry = entry.expect("read archive entry");
                 let path = entry
                     .path()
                     .expect("read archive path")
@@ -3022,11 +3026,15 @@ mod tests {
                     .link_name()
                     .expect("read archive link")
                     .map(|link| link.to_string_lossy().into_owned());
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut contents)
+                    .expect("read archive contents");
 
                 UploadArchiveEntry {
                     path,
                     entry_type,
                     link_name,
+                    contents,
                 }
             })
             .collect::<Vec<_>>();
@@ -3041,6 +3049,33 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn upload_archive_stores_files_with_holes_as_regular_entries() {
+        use std::io::{Seek, SeekFrom};
+
+        // tar writes sparse entries by default and treats a file that reports
+        // zero blocks (as WSL2 drive mounts do) as all holes, so the sandbox
+        // receives NUL bytes. Uploads must always carry the file contents.
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let path = tmpdir.path().join("holes.bin");
+        let mut file = fs::File::create(&path).expect("create file");
+        file.write_all(b"head").expect("write head");
+        file.seek(SeekFrom::Start(1 << 20)).expect("seek past hole");
+        file.write_all(b"tail").expect("write tail");
+        drop(file);
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: path,
+            tar_name: "holes.bin".into(),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        assert_eq!(entries[0].entry_type, tar::EntryType::Regular);
+        assert_eq!(entries[0].contents.len(), (1 << 20) + 4);
+        assert_eq!(&entries[0].contents[..4], b"head");
+        assert_eq!(&entries[0].contents[1 << 20..], b"tail");
     }
 
     #[test]
