@@ -3,4 +3,33 @@
 
 [workspace]
 resolver = "2"
-members = ["cli"]
+members = ["cli", "support"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Allow certain pedantic lints that are too noisy
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Allow noisy nursery lints
+significant_drop_tightening = "allow"  # Often gives incorrect suggestions
+missing_const_for_fn = "allow"  # Too noisy for async code patterns
+
+# Allow noisy pedantic lints
+too_many_lines = "allow"  # Function length limits are subjective
+needless_pass_by_value = "allow"  # Common pattern in async handlers
+ref_option = "allow"  # Common pattern for optional references
+missing_fields_in_debug = "allow"  # Manual Debug impls often intentionally omit fields

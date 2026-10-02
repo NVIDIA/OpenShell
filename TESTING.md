@@ -210,6 +210,11 @@ When more than one test needs this behavior, put the transport in the shared
 Rust e2e harness and require callers to use it instead of duplicating DNS,
 HTTP `Host`, TLS SNI, and mTLS handling.
 
+The [conformance suite guide](tests/suites/conformance/README.md) describes its
+layout, authoring, and execution. Shared runner code lives under
+`tests/suites/conformance/support`, alongside the CLI entry points. Run
+`mise run test:conformance-support` to validate the harness without a gateway.
+
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
