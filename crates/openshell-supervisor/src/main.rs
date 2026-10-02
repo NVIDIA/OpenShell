@@ -564,6 +564,7 @@ mod tests {
     #[test]
     fn completion_marker_must_be_absolute() {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
-        assert!(validate_main_exit_marker(Some(Path::new("/run/openshell/main-exit"))).is_ok());
+        let absolute = std::env::temp_dir().join("openshell-main-exit");
+        assert!(validate_main_exit_marker(Some(&absolute)).is_ok());
     }
 }
