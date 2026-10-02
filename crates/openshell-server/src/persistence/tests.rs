@@ -1458,6 +1458,20 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
     );
     assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
     assert!(after.spec.as_ref().unwrap().policy.is_none());
+    let latest = store
+        .get_latest_policy("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version, 1);
+    assert_eq!(latest.id, "existing-policy");
+    assert!(
+        store
+            .get("sandbox_policy", "conflicting-policy")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1497,6 +1511,314 @@ async fn policy_atomic_write_persists_workspace() {
         .unwrap()
         .unwrap();
     assert_eq!(record.workspace, "my-workspace");
+}
+
+/// A committed revision must invalidate the caller's optimistic-concurrency
+/// precondition even when it changes nothing on the sandbox. Policy revision
+/// numbers are independent of the sandbox resource version, so a writer that
+/// skips the version bump lets a second writer holding the previous value
+/// commit policy content derived from a read that is now stale.
+#[tokio::test]
+async fn policy_atomic_write_advances_resource_version_without_projection_change() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-noop", "noop"))
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-noop")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+
+    let updated = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-noop-1".to_string(),
+            sandbox_id: "sandbox-noop".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-noop-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.metadata.as_ref().unwrap().resource_version,
+        before_version + 1
+    );
+
+    let row = store.get("sandbox", "sandbox-noop").await.unwrap().unwrap();
+    assert_eq!(row.resource_version, before_version + 1);
+    let stored = Sandbox::decode(row.payload.as_slice()).unwrap();
+    assert!(stored.spec.as_ref().unwrap().policy.is_none());
+    assert!(stored.metadata.as_ref().unwrap().annotations.is_empty());
+
+    // The transaction rewrites the sandbox row, so its modification time is the
+    // revision's own creation time rather than the sandbox's original one.
+    let revision = store
+        .get_latest_policy("sandbox-noop")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.updated_at_ms, revision.created_at_ms);
+}
+
+/// Backfilling a policy that already matches is the common no-op projection:
+/// the gateway discovers the policy the sandbox is already running and
+/// re-submits it. It is still a new revision, so it still has to advance the
+/// version.
+#[tokio::test]
+async fn policy_atomic_write_advances_resource_version_with_identical_backfill_policy() {
+    let store = test_store().await;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+    let mut sandbox = policy_test_sandbox("sandbox-identical", "identical");
+    sandbox.spec = Some(SandboxSpec {
+        policy: Some(policy.clone()),
+        ..Default::default()
+    });
+    store.put_message(&sandbox).await.unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-identical")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-identical-1".to_string(),
+            sandbox_id: "sandbox-identical".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-identical-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: Some(policy.clone()),
+        })
+        .await
+        .unwrap();
+
+    let row = store
+        .get("sandbox", "sandbox-identical")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.resource_version, before_version + 1);
+    let stored = Sandbox::decode(row.payload.as_slice()).unwrap();
+    assert_eq!(stored.spec.as_ref().unwrap().policy.as_ref(), Some(&policy));
+}
+
+#[tokio::test]
+async fn policy_atomic_write_rejects_stale_expected_resource_version() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-stale", "stale"))
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-stale")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-stale-1".to_string(),
+            sandbox_id: "sandbox-stale".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-stale-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let error = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-stale-2".to_string(),
+            sandbox_id: "sandbox-stale".to_string(),
+            workspace: "default".to_string(),
+            version: 2,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-stale-2".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PersistenceError::Conflict {
+                current_resource_version: Some(version)
+            } if version == before_version + 1
+        ),
+        "{error:?}"
+    );
+
+    let latest = store
+        .get_latest_policy("sandbox-stale")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version, 1);
+    let after = store
+        .get_message::<Sandbox>("sandbox-stale")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.metadata.as_ref().unwrap().resource_version,
+        before_version + 1
+    );
+}
+
+#[tokio::test]
+async fn policy_atomic_write_succeeds_after_rereading_resource_version() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-retry", "retry"))
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-retry")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-retry-1".to_string(),
+            sandbox_id: "sandbox-retry".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-retry-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let reread = store
+        .get_message::<Sandbox>("sandbox-retry")
+        .await
+        .unwrap()
+        .unwrap();
+    let reread_version = reread.metadata.as_ref().unwrap().resource_version;
+    assert_eq!(reread_version, before_version + 1);
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-retry-2".to_string(),
+            sandbox_id: "sandbox-retry".to_string(),
+            workspace: "default".to_string(),
+            version: 2,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-retry-2".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: reread_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let latest = store
+        .get_latest_policy("sandbox-retry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version, 2);
+    let after = store
+        .get_message::<Sandbox>("sandbox-retry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.metadata.as_ref().unwrap().resource_version,
+        before_version + 2
+    );
+}
+
+/// An unconditional write still has to advance the version. Otherwise a client
+/// that never reads a sandbox would keep submitting the same `0` precondition
+/// forever while other writers' revisions went unnoticed.
+#[tokio::test]
+async fn policy_atomic_write_with_zero_expected_version_still_advances() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox(
+            "sandbox-unconditional",
+            "unconditional",
+        ))
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-unconditional")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-unconditional-1".to_string(),
+            sandbox_id: "sandbox-unconditional".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-unconditional-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: 0,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let row = store
+        .get("sandbox", "sandbox-unconditional")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.resource_version, before_version + 1);
 }
 
 #[tokio::test]

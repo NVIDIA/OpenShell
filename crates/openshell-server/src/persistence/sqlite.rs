@@ -1304,33 +1304,33 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1
         let sandbox_payload: Vec<u8> = row.get("payload");
         let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
         let current_version = current_version.max(1).cast_unsigned();
-        let (mut sandbox, sandbox_changed) =
+        // Every committed revision advances the sandbox version, even when the
+        // projection is a no-op. Callers use the version as their optimistic
+        // concurrency precondition, so a revision that left it untouched would let
+        // a second writer holding the previous value overwrite a newer policy.
+        let (mut sandbox, _projection_changed) =
             project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
 
-        let resulting_version = if sandbox_changed {
-            let result = sqlx::query(
-                r#"
+        let update = sqlx::query(
+            r#"
 UPDATE "objects"
 SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1
 WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4
 "#,
-            )
-            .bind(&write.sandbox_id)
-            .bind(sandbox.encode_to_vec())
-            .bind(now_ms)
-            .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-            if result.rows_affected() != 1 {
-                return Err(PersistenceError::Conflict {
-                    current_resource_version: Some(current_version),
-                });
-            }
-            current_version.saturating_add(1)
-        } else {
-            current_version
-        };
+        )
+        .bind(&write.sandbox_id)
+        .bind(sandbox.encode_to_vec())
+        .bind(now_ms)
+        .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        if update.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                current_resource_version: Some(current_version),
+            });
+        }
+        let resulting_version = current_version.saturating_add(1);
 
         sqlx::query(
             r#"
