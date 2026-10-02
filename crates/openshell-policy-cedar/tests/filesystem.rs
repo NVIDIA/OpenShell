@@ -1,18 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-30
+//! Checks Landlock grant derivation from authored Cedar policies, and that
+//! filesystem policy verification catches the authoring mistakes it's meant
+//! to catch while staying quiet on clean policies.
 
-//! Checks that filesystem policy verification catches the authoring
-//! mistakes it's meant to catch, and stays quiet on clean policies.
-
-use std::str::FromStr as _;
-
-use cedar_policy::PolicySet;
 use openshell_policy_cedar::filesystem::{
     FilesystemAccess, FilesystemFinding, FilesystemPolicyInput, compile_filesystem_entities,
-    extract_authorized_paths, verify_filesystem_policy,
+    verify_filesystem_policy,
 };
+use openshell_policy_cedar::{CedarEngineError, CedarNetworkEngine};
 
 #[test]
 fn clean_policy_has_no_findings() {
@@ -118,54 +115,76 @@ fn compiles_entities_for_a_clean_policy() {
     );
 }
 
+fn grants(policy: &str) -> FilesystemPolicyInput {
+    CedarNetworkEngine::from_policy_str(policy)
+        .expect("policy must load")
+        .filesystem_grants()
+        .clone()
+}
+
+fn rejection(policy: &str) -> CedarEngineError {
+    CedarNetworkEngine::from_policy_str(policy).expect_err("policy must be rejected")
+}
+
 #[test]
-fn extracts_read_only_and_read_write_from_authored_permits() {
-    let policies = PolicySet::from_str(
+fn derives_read_only_and_read_write_from_when_clause_permits() {
+    let extracted = grants(
         r#"
         permit(
             principal is Sandbox::Process,
             action == Sandbox::Action::"ReadFile",
             resource is Sandbox::FilesystemPath
         )
-        when { resource in Sandbox::FilesystemPath::"/usr" };
+        when {
+            resource in Sandbox::FilesystemPath::"/usr"
+            || resource in Sandbox::FilesystemPath::"/etc"
+        };
 
         permit(
             principal is Sandbox::Process,
             action in [Sandbox::Action::"ReadFile", Sandbox::Action::"WriteFile"],
             resource is Sandbox::FilesystemPath
         )
-        when { resource == Sandbox::FilesystemPath::"/sandbox" };
+        when { resource in Sandbox::FilesystemPath::"/sandbox" };
         "#,
-    )
-    .expect("policy text must parse");
+    );
+    assert_eq!(extracted.read_only, vec!["/etc", "/usr"]);
+    assert_eq!(extracted.read_write, vec!["/sandbox"]);
+}
 
-    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
-    assert_eq!(extracted.read_only, vec!["/usr".to_string()]);
-    assert_eq!(extracted.read_write, vec!["/sandbox".to_string()]);
+#[test]
+fn derives_grants_from_scope_paths() {
+    let extracted = grants(
+        r#"
+        permit(
+            principal,
+            action == Sandbox::Action::"ReadFile",
+            resource in Sandbox::FilesystemPath::"/opt"
+        );
+        "#,
+    );
+    assert_eq!(extracted.read_only, vec!["/opt"]);
+    assert!(extracted.read_write.is_empty());
 }
 
 #[test]
 fn write_only_action_still_counts_as_read_write() {
-    let policies = PolicySet::from_str(
+    let extracted = grants(
         r#"
         permit(
             principal is Sandbox::Process,
             action == Sandbox::Action::"WriteFile",
-            resource is Sandbox::FilesystemPath
-        )
-        when { resource == Sandbox::FilesystemPath::"/tmp" };
+            resource in Sandbox::FilesystemPath::"/tmp"
+        );
         "#,
-    )
-    .expect("policy text must parse");
-
-    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
+    );
     assert!(extracted.read_only.is_empty());
-    assert_eq!(extracted.read_write, vec!["/tmp".to_string()]);
+    assert_eq!(extracted.read_write, vec!["/tmp"]);
 }
 
 #[test]
-fn ignores_policies_unrelated_to_filesystem_path() {
-    let policies = PolicySet::from_str(
+fn network_policies_grant_no_paths() {
+    let extracted = grants(
         r#"
         permit(
             principal is Sandbox::Process,
@@ -174,39 +193,118 @@ fn ignores_policies_unrelated_to_filesystem_path() {
         )
         when { resource.host_port == "pypi.org:443" };
         "#,
-    )
-    .expect("policy text must parse");
-
-    let extracted = extract_authorized_paths(&policies).expect("extraction must succeed");
+    );
     assert!(extracted.read_only.is_empty());
     assert!(extracted.read_write.is_empty());
 }
 
 #[test]
-fn forbid_on_filesystem_path_is_rejected() {
-    let policies = PolicySet::from_str(
+fn rejects_forbid_on_a_filesystem_path() {
+    let error = rejection(
         r#"
         permit(
             principal is Sandbox::Process,
             action == Sandbox::Action::"ReadFile",
-            resource is Sandbox::FilesystemPath
-        )
-        when { resource in Sandbox::FilesystemPath::"/usr" };
+            resource in Sandbox::FilesystemPath::"/usr"
+        );
 
         forbid(
             principal is Sandbox::Process,
             action == Sandbox::Action::"ReadFile",
-            resource is Sandbox::FilesystemPath
-        )
-        when { resource == Sandbox::FilesystemPath::"/usr/secret" };
+            resource in Sandbox::FilesystemPath::"/usr/secret"
+        );
         "#,
-    )
-    .expect("policy text must parse");
-
-    let error = extract_authorized_paths(&policies)
-        .expect_err("forbid targeting FilesystemPath must be rejected");
+    );
     assert!(
-        error.to_string().contains("forbid"),
-        "error should mention the forbid policy: {error}"
+        matches!(error, CedarEngineError::FilesystemForbidUnsupported { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_forbid_without_a_path_literal() {
+    // Previously undetected: no FilesystemPath literal, yet it forbids all
+    // writes, which Landlock would not enforce.
+    let error = rejection(
+        r#"
+        permit(
+            principal,
+            action == Sandbox::Action::"WriteFile",
+            resource in Sandbox::FilesystemPath::"/data"
+        );
+        forbid(principal, action == Sandbox::Action::"WriteFile", resource);
+        "#,
+    );
+    assert!(
+        matches!(error, CedarEngineError::FilesystemForbidUnsupported { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_unsupported_filesystem_policy_shapes() {
+    let cases = [
+        (
+            "unless clause naming the path",
+            r#"permit(principal, action == Sandbox::Action::"ReadFile", resource)
+               unless { resource in Sandbox::FilesystemPath::"/secret" };"#,
+        ),
+        (
+            "condition that never holds",
+            r#"permit(principal, action == Sandbox::Action::"ReadFile",
+                      resource in Sandbox::FilesystemPath::"/etc")
+               when { false };"#,
+        ),
+        (
+            "write literal only inside a condition",
+            r#"permit(principal, action, resource in Sandbox::FilesystemPath::"/data")
+               when { action != Sandbox::Action::"WriteFile" };"#,
+        ),
+        (
+            "principal constraint",
+            r#"permit(principal == Sandbox::Process::"nobody",
+                      action == Sandbox::Action::"WriteFile",
+                      resource in Sandbox::FilesystemPath::"/");"#,
+        ),
+        (
+            "exact path match",
+            r#"permit(principal, action == Sandbox::Action::"ReadFile",
+                      resource == Sandbox::FilesystemPath::"/");"#,
+        ),
+        (
+            "unconstrained action",
+            r#"permit(principal, action, resource in Sandbox::FilesystemPath::"/data");"#,
+        ),
+        (
+            "binary-scoped condition",
+            r#"permit(principal, action == Sandbox::Action::"WriteFile", resource)
+               when { resource in Sandbox::FilesystemPath::"/etc"
+                      && principal.user == Sandbox::User::"root" };"#,
+        ),
+        (
+            "unbounded resource",
+            r#"permit(principal, action == Sandbox::Action::"ReadFile",
+                      resource is Sandbox::FilesystemPath);"#,
+        ),
+    ];
+    for (name, policy) in cases {
+        let error = CedarNetworkEngine::from_policy_str(policy)
+            .expect_err(&format!("{name} must be rejected"));
+        assert!(
+            matches!(error, CedarEngineError::UnsupportedPolicy { .. }),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_misspelled_action() {
+    let error = rejection(
+        r#"permit(principal, action == Sandbox::Action::"Writefile",
+                  resource in Sandbox::FilesystemPath::"/data");"#,
+    );
+    assert!(
+        matches!(error, CedarEngineError::PolicyValidation { .. }),
+        "{error}"
     );
 }

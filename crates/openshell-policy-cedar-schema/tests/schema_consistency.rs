@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-19
-
 //! Asserts that every constant in [`entity_types`]/[`actions`] names an
 //! entity type or action actually declared in [`SANDBOX_SCHEMA_SRC`], so the
 //! hand-written constants cannot silently drift from the schema they

@@ -857,12 +857,20 @@ pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 
 /// Parses a sandbox policy file, dispatching on extension.
 ///
-/// `.cedar` builds a Cedar-sourced policy via
+/// `.cedar` (any case) builds a Cedar-sourced policy via
 /// [`parse_cedar_sandbox_policy_file`]; anything else (`.yaml`, `.yml`,
 /// extensionless) uses the existing YAML path via
 /// [`parse_sandbox_policy_file`], byte-for-byte unchanged.
+///
+/// # Errors
+///
+/// Returns an error if the selected parser fails.
 pub fn parse_sandbox_policy_file_auto(path: &Path) -> Result<SandboxPolicy> {
-    if path.extension().and_then(std::ffi::OsStr::to_str) == Some("cedar") {
+    let is_cedar = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cedar"));
+    if is_cedar {
         parse_cedar_sandbox_policy_file(path)
     } else {
         parse_sandbox_policy_file(path)
@@ -872,19 +880,26 @@ pub fn parse_sandbox_policy_file_auto(path: &Path) -> Result<SandboxPolicy> {
 /// Reads and validates a `.cedar` policy file, building a [`SandboxPolicy`]
 /// with `cedar_policy_source` set and every other field at default.
 ///
-/// Runs the same checks the gateway runs at submission time (schema/parse
-/// validity, no `forbid` on a `FilesystemPath`) so a malformed Cedar policy
-/// is rejected locally with a fast, actionable error instead of a round
-/// trip to the gateway.
+/// Runs the same checks the gateway runs at submission time so a malformed
+/// Cedar policy is rejected locally with a fast, actionable error instead of
+/// a round trip to the gateway.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read, or if the policy fails
-/// validation (see [`validate_sandbox_policy`]).
+/// Returns an error if the file cannot be read, contains no policy text, or
+/// fails validation (see [`validate_sandbox_policy`]).
 pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
     let cedar_policy_source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read Cedar policy file {}", path.display()))?;
+    // An empty `cedar_policy_source` selects the YAML path, so an empty file
+    // would silently become an empty YAML policy.
+    if cedar_policy_source.trim().is_empty() {
+        return Err(miette::miette!(
+            "Cedar policy file {} is empty",
+            path.display()
+        ));
+    }
     let policy = SandboxPolicy {
         version: 1,
         cedar_policy_source,
@@ -1131,12 +1146,9 @@ pub enum PolicyViolation {
     /// `cedar_policy_source` is set alongside `network_policies`. Exactly
     /// one policy format may be authored per sandbox.
     CedarMutuallyExclusiveWithNetworkPolicies,
-    /// `cedar_policy_source` failed to parse against the canonical schema.
+    /// `cedar_policy_source` failed to parse or validate, or uses a policy
+    /// shape Cedar cannot enforce exactly.
     InvalidCedarPolicy { reason: String },
-    /// A `cedar_policy_source` policy `forbid`s a `FilesystemPath`.
-    /// Landlock's flat allow-list can't express forbid-over-permit
-    /// carve-outs.
-    CedarForbidsFilesystemPath { reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1350,14 +1362,7 @@ impl fmt::Display for PolicyViolation {
                 )
             }
             Self::InvalidCedarPolicy { reason } => {
-                write!(f, "cedar_policy_source failed to parse: {reason}")
-            }
-            Self::CedarForbidsFilesystemPath { reason } => {
-                write!(
-                    f,
-                    "cedar_policy_source forbids a FilesystemPath, which Landlock cannot \
-                     express: {reason}"
-                )
+                write!(f, "cedar_policy_source is invalid: {reason}")
             }
         }
     }
@@ -1395,10 +1400,13 @@ enum McpVersionPresence {
     AllowDefaultable,
 }
 
-/// Validates `policy.cedar_policy_source`, when non-empty: mutual
-/// exclusivity with `network_policies`, schema/parse validity, and that no
-/// policy `forbid`s a `FilesystemPath`. A no-op when `cedar_policy_source`
-/// is empty (the YAML-sourced path, unaffected).
+/// Validates `policy.cedar_policy_source`, when non-empty.
+///
+/// Checks mutual exclusivity with `network_policies`, that the Cedar engine
+/// accepts the policy (parse, strict schema validation, and supported
+/// shapes), and that the derived Landlock grants pass the same path checks
+/// as YAML `filesystem` paths. A no-op when `cedar_policy_source` is empty
+/// (the YAML-sourced path, unaffected).
 fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<PolicyViolation>) {
     if policy.cedar_policy_source.is_empty() {
         return;
@@ -1406,21 +1414,68 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
     if !policy.network_policies.is_empty() {
         violations.push(PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies);
     }
-    let engine = match openshell_policy_cedar::CedarNetworkEngine::from_policy_str(
-        &policy.cedar_policy_source,
-    ) {
-        Ok(engine) => engine,
-        Err(error) => {
-            violations.push(PolicyViolation::InvalidCedarPolicy {
-                reason: error.to_string(),
-            });
-            return;
+    match openshell_policy_cedar::CedarNetworkEngine::from_policy_str(&policy.cedar_policy_source) {
+        Ok(engine) => {
+            let grants = engine.filesystem_grants();
+            validate_filesystem_paths(&grants.read_only, &grants.read_write, violations);
         }
-    };
-    if let Err(error) = engine.extract_authorized_paths() {
-        violations.push(PolicyViolation::CedarForbidsFilesystemPath {
+        Err(error) => violations.push(PolicyViolation::InvalidCedarPolicy {
             reason: error.to_string(),
-        });
+        }),
+    }
+}
+
+/// Checks filesystem grant paths for safety, appending any violations.
+///
+/// Paths must be absolute, free of `..` components, within
+/// [`MAX_PATH_LENGTH`], and at most [`MAX_FILESYSTEM_PATHS`] in total. `/`
+/// may not be granted read-write.
+fn validate_filesystem_paths(
+    read_only: &[String],
+    read_write: &[String],
+    violations: &mut Vec<PolicyViolation>,
+) {
+    let total_paths = read_only.len() + read_write.len();
+    if total_paths > MAX_FILESYSTEM_PATHS {
+        violations.push(PolicyViolation::TooManyPaths { count: total_paths });
+    }
+
+    for path_str in read_only.iter().chain(read_write.iter()) {
+        if path_str.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::FieldTooLong {
+                path: truncate_for_display(path_str),
+                length: path_str.len(),
+            });
+            continue;
+        }
+
+        let path = Path::new(path_str);
+
+        if !path.has_root() {
+            violations.push(PolicyViolation::RelativePath {
+                path: path_str.clone(),
+            });
+        }
+
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::PathTraversal {
+                path: path_str.clone(),
+            });
+        }
+    }
+
+    // Only reject "/" as read-write (overly broad)
+    for path_str in read_write {
+        let normalized = path_str.trim_end_matches('/');
+        if normalized.is_empty() {
+            // Path is "/" or "///" etc.
+            violations.push(PolicyViolation::OverlyBroadPath {
+                path: path_str.clone(),
+            });
+        }
     }
 }
 
@@ -1463,48 +1518,7 @@ fn validate_sandbox_policy_with_mcp_presence(
 
     // Check filesystem paths
     if let Some(ref fs) = policy.filesystem {
-        let total_paths = fs.read_only.len() + fs.read_write.len();
-        if total_paths > MAX_FILESYSTEM_PATHS {
-            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
-        }
-
-        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
-            if path_str.len() > MAX_PATH_LENGTH {
-                violations.push(PolicyViolation::FieldTooLong {
-                    path: truncate_for_display(path_str),
-                    length: path_str.len(),
-                });
-                continue;
-            }
-
-            let path = Path::new(path_str);
-
-            if !path.has_root() {
-                violations.push(PolicyViolation::RelativePath {
-                    path: path_str.clone(),
-                });
-            }
-
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                violations.push(PolicyViolation::PathTraversal {
-                    path: path_str.clone(),
-                });
-            }
-        }
-
-        // Only reject "/" as read-write (overly broad)
-        for path_str in &fs.read_write {
-            let normalized = path_str.trim_end_matches('/');
-            if normalized.is_empty() {
-                // Path is "/" or "///" etc.
-                violations.push(PolicyViolation::OverlyBroadPath {
-                    path: path_str.clone(),
-                });
-            }
-        }
+        validate_filesystem_paths(&fs.read_only, &fs.read_write, &mut violations);
     }
 
     // Protobuf maps do not preserve iteration order. Sort rule keys so callers
@@ -2029,6 +2043,45 @@ when { context.binary_path == "/usr/bin/curl" };
     }
 
     #[test]
+    fn parse_sandbox_policy_file_auto_dispatches_uppercase_cedar_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_uppercase_extension",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.CEDAR");
+        std::fs::write(
+            &path,
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        )
+        .expect("write policy file");
+
+        let policy = parse_sandbox_policy_file_auto(&path).expect("Cedar policy must parse");
+        assert!(!policy.cedar_policy_source.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_cedar_sandbox_policy_file_rejects_empty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{}",
+            std::process::id(),
+            "cedar_empty_file",
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("policy.cedar");
+        std::fs::write(&path, " \n\t\n").expect("write policy file");
+
+        let result = parse_cedar_sandbox_policy_file(&path);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn parse_cedar_sandbox_policy_file_rejects_invalid_syntax() {
         let dir = std::env::temp_dir().join(format!(
             "openshell-policy-test-{}-{}",
@@ -2115,7 +2168,40 @@ when { resource == Sandbox::FilesystemPath::"/etc/shadow" };
         assert!(
             violations
                 .iter()
-                .any(|v| matches!(v, PolicyViolation::CedarForbidsFilesystemPath { .. })),
+                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn cedar_policy_source_applies_filesystem_path_checks_to_grants() {
+        let policy = cedar_sourced_policy(
+            r#"
+permit (principal, action == Sandbox::Action::"WriteFile",
+        resource in Sandbox::FilesystemPath::"/");
+permit (principal, action == Sandbox::Action::"ReadFile",
+        resource in Sandbox::FilesystemPath::"/usr/../etc");
+permit (principal, action == Sandbox::Action::"ReadFile",
+        resource in Sandbox::FilesystemPath::"relative/dir");
+"#,
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("must reject");
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::PathTraversal { .. })),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::RelativePath { .. })),
             "{violations:?}"
         );
     }

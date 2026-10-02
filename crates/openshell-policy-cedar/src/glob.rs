@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-30
-
 //! Segment-aware glob classification and matching.
 //!
 //! Mirrors Rego's `glob.match(pattern, delimiters, string)` semantics

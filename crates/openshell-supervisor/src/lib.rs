@@ -2422,7 +2422,7 @@ async fn load_policy(
             }
         };
         if let Some(ref cedar) = cedar_engine {
-            let extracted = match cedar.extract_authorized_paths() {
+            let extracted = match cedar.filesystem_grants() {
                 Ok(extracted) => extracted,
                 Err(e) => {
                     report_initial_policy_failure(

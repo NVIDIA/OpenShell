@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-10-01
-
 //! Cedar as the sole, authoritative network policy engine for a sandbox.
 //!
 //! Unlike [`crate::cedar_shadow`] (which *compiles* Cedar from an existing
@@ -19,13 +17,13 @@
 //! [`openshell_policy_cedar::CedarNetworkEngine::evaluate_l7`] via
 //! [`CedarL7TunnelEngine`], this engine's [`crate::opa::L7PolicyEngine`]
 //! handle. [`l7_endpoint_configs_for`] populates
-//! `EgressAuthorization::endpoint_configs` from `HttpRequest` permits (via
-//! [`openshell_policy_cedar::extract_l7_endpoints`]) so the proxy actually
-//! routes an allowed CONNECT into L7 inspection instead of unconditional
-//! passthrough. `EgressAuthorization::matched_endpoints` stays always
-//! empty — that feeds the not-yet-landed transparent-TCP policy-DNS
-//! adapter (dead code for every current driver), out of scope here. DNS
-//! eligibility is a separate concern, covered independently by
+//! `EgressAuthorization::endpoint_configs` for every endpoint an
+//! `HttpRequest` policy names, so the proxy routes an allowed CONNECT into
+//! L7 inspection instead of unconditional passthrough. The Cedar engine
+//! rejects at load any `HttpRequest` policy it could not route this way.
+//! `EgressAuthorization::matched_endpoints` stays empty; that feeds the
+//! transparent-TCP policy-DNS adapter, which no current driver uses. DNS
+//! eligibility is covered separately by
 //! [`crate::opa::NetworkPolicyEngine::policy_dns_eligibility_snapshot`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,12 +63,12 @@ pub struct CedarOnlyEngine {
 }
 
 impl CedarOnlyEngine {
-    /// Parses `policy_src` (`.cedar` syntax) against the canonical schema
-    /// and builds the engine.
+    /// Parses and validates `policy_src` (`.cedar` syntax) and builds the engine.
     ///
     /// # Errors
     ///
-    /// Returns an error if `policy_src` fails to parse.
+    /// Returns an error if `policy_src` fails to parse, fails schema
+    /// validation, or uses a policy shape Cedar cannot enforce exactly.
     pub fn from_policy_str(policy_src: &str) -> Result<Self> {
         let engine =
             CedarNetworkEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
@@ -102,7 +100,8 @@ impl CedarOnlyEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if `policy_src` fails to parse. On error, the
+    /// Returns an error if `policy_src` fails to load (see
+    /// [`Self::from_policy_str`]). On error, the
     /// previous policy and generation stay active (last-known-good,
     /// matching `OpaEngine`'s reload failure behavior).
     pub fn reload_from_policy_str(&self, policy_src: &str) -> Result<()> {
@@ -131,26 +130,28 @@ impl CedarOnlyEngine {
         Ok(())
     }
 
-    /// Extracts the filesystem paths this engine's policy set permits for
-    /// reading and/or writing, for building the domain `FilesystemPolicy`
-    /// consumed by Landlock. See
-    /// [`openshell_policy_cedar::CedarNetworkEngine::extract_authorized_paths`].
+    /// Returns the Landlock path grants the loaded policy authorizes.
+    ///
+    /// See [`openshell_policy_cedar::CedarNetworkEngine::filesystem_grants`].
     ///
     /// # Errors
     ///
-    /// Returns an error if any policy `forbid`s a `FilesystemPath`.
-    pub fn extract_authorized_paths(
+    /// Returns an error if the engine lock is poisoned.
+    pub fn filesystem_grants(
         &self,
     ) -> Result<openshell_policy_cedar::filesystem::FilesystemPolicyInput> {
         let guard = self
             .engine
             .read()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
-        guard
-            .extract_authorized_paths()
-            .map_err(|e| miette::miette!("{e}"))
+        Ok(guard.filesystem_grants().clone())
     }
 }
+
+/// Value of an L7 endpoint config's `enforcement` key that makes the relay
+/// deny requests the policy does not allow. Any other value means audit-only
+/// (see `crate::l7::parse_l7_config`). Cedar decisions are always enforced.
+const ENFORCEMENT_ENFORCE: &str = "enforce";
 
 /// Builds the `endpoint_configs` the proxy's `query_l7_route_snapshot`
 /// needs to select L7 inspection over passthrough for `(host, port)`.
@@ -159,24 +160,26 @@ impl CedarOnlyEngine {
 /// consulted: `query_l7_route_snapshot` only inspects when
 /// `EgressAuthorization::endpoint_configs` is non-empty, and every allowed
 /// CONNECT would otherwise fall through to unconditional passthrough.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be built. The caller fails the
+/// CONNECT rather than letting it pass through uninspected.
 fn l7_endpoint_configs_for(
     guard: &CedarNetworkEngine,
     host: &str,
     port: u16,
-) -> Vec<regorus::Value> {
-    let normalized_host = openshell_policy_cedar::normalize_host(host);
-    guard
-        .extract_l7_endpoints()
-        .into_iter()
-        .filter(|endpoint| endpoint.host == normalized_host && endpoint.port == port)
-        .filter_map(|endpoint| {
-            let json = serde_json::json!({
-                "protocol": endpoint.protocol,
-                "enforcement": "enforce",
-            });
-            serde_json::from_value::<regorus::Value>(json).ok()
-        })
-        .collect()
+) -> Result<Vec<regorus::Value>> {
+    let Some(protocol) = guard.l7_protocol(host, port) else {
+        return Ok(Vec::new());
+    };
+    let json = serde_json::json!({
+        "protocol": protocol.as_str(),
+        "enforcement": ENFORCEMENT_ENFORCE,
+    });
+    let config = serde_json::from_value::<regorus::Value>(json)
+        .map_err(|e| miette::miette!("failed to build Cedar L7 endpoint config: {e}"))?;
+    Ok(vec![config])
 }
 
 impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
@@ -207,7 +210,7 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
         };
 
         let endpoint_configs = if matches!(action, NetworkAction::Allow { .. }) {
-            l7_endpoint_configs_for(&guard, &request.host, request.port)
+            l7_endpoint_configs_for(&guard, &request.host, request.port)?
         } else {
             Vec::new()
         };
@@ -257,10 +260,9 @@ impl crate::opa::NetworkPolicyEngine for CedarOnlyEngine {
             .engine
             .read()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
-        let authorized = guard.extract_authorized_network_endpoints();
-
-        let endpoints = authorized
-            .into_iter()
+        let endpoints = guard
+            .dns_endpoints()
+            .iter()
             .enumerate()
             .filter_map(|(endpoint_index, authorized)| {
                 let value = serde_json::json!({

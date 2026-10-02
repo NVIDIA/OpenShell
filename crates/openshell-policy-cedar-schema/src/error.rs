@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-19
-
 //! Typed error for [`crate::load_schema`].
 
 use miette::Diagnostic;

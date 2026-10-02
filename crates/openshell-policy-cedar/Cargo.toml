@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-policy-cedar"
-description = "Experimental Cedar-based network policy evaluation engine for OpenShell (proof of concept, not wired into the gateway)"
+description = "Cedar policy validation and evaluation for Cedar-authored OpenShell sandbox policies"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

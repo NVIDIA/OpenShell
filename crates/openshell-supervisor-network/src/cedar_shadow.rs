@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-30
-
 //! Shadow-mode Cedar network policy evaluator.
 //!
 //! Wraps [`openshell_policy_cedar::CedarNetworkEngine`], built from the same
@@ -154,7 +152,6 @@ pub(crate) fn network_request_from_input(input: &NetworkInput) -> NetworkRequest
         group: PLACEHOLDER_IDENTITY.to_string(),
         host: input.host.clone(),
         port: input.port,
-        protocol: String::new(),
         binary_path: input.binary_path.to_string_lossy().into_owned(),
         ancestors: input
             .ancestors

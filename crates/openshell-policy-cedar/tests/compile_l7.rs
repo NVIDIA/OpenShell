@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-10-01
-
 //! Checks that [`compile_l7`] translates the `rules`/`deny_rules` subset of
 //! normalized `data.sandbox.*` JSON into `HttpRequest` Cedar decisions
 //! matching Rego's `allow_request`/`deny_request`, and correctly reports

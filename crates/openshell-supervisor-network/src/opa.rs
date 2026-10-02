@@ -153,11 +153,11 @@ pub trait NetworkPolicyEngine: Send + Sync {
     ///
     /// Consulted by `policy_dns` before any CONNECT decision: a DNS query
     /// for a host not covered here is refused outright. `OpaEngine` reads
-    /// `network_policies` directly; `CedarOnlyEngine` extracts exact
-    /// `NetworkEndpoint` literals from `NetworkConnect` permits (see
-    /// [`openshell_policy_cedar::extract_authorized_network_endpoints`]) —
-    /// glob-only hosts are a documented, narrow gap there, not a security
-    /// issue (fails closed).
+    /// `network_policies` directly; `CedarOnlyEngine` uses the endpoints
+    /// named in `NetworkConnect` permit scopes (see
+    /// [`openshell_policy_cedar::CedarNetworkEngine::dns_endpoints`]).
+    /// Hosts reachable only through a glob condition are not eligible,
+    /// which fails closed.
     ///
     /// # Errors
     ///
@@ -1759,9 +1759,6 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
             "cedar_policy_source combined with network_policies"
         }
         PolicyViolation::InvalidCedarPolicy { .. } => "invalid Cedar policy",
-        PolicyViolation::CedarForbidsFilesystemPath { .. } => {
-            "Cedar policy forbids a filesystem path"
-        }
     }
 }
 

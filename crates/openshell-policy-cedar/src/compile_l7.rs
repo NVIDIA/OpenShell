@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-10-01
-
 //! Compiles normalized sandbox network-policy JSON's `rules`/`deny_rules`
 //! (per-request L7 enforcement) into a generated Cedar `PolicySet` for the
 //! `HttpRequest` action.

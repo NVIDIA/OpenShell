@@ -1,54 +1,60 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-19
-
-//! Experimental Cedar-based policy tooling for `OpenShell`.
+//! Cedar policy evaluation for `OpenShell` sandboxes.
 //!
-//! Two distinct roles, scoped separately because they have different risk
-//! profiles (see `architecture/plans/cedar-policy-engine-rfc-draft.md`):
+//! [`CedarNetworkEngine`] is the authoritative policy engine for a sandbox
+//! whose policy is authored in Cedar (`SandboxPolicy.cedar_policy_source`).
+//! It evaluates `NetworkConnect` and per-request `HttpRequest` decisions at
+//! request time, and derives Landlock grants, L7 inspection routing, and DNS
+//! eligibility from the policy text once, at construction. Construction
+//! rejects any policy whose meaning those derived artifacts could not
+//! enforce exactly; see [`analysis`](crate::analysis) for the accepted
+//! shapes.
 //!
-//! - **Network** (crate root, this module): a proof of concept exploring
-//!   Cedar as an alternative to the Rego-based `OpaEngine` in
-//!   `openshell-supervisor-network` — evaluating `NetworkConnect`
-//!   authorization decisions against a Cedar schema and policy set instead
-//!   of YAML compiled to Rego. Not wired into the gateway or supervisor.
-//! - **Filesystem** ([`filesystem`]): advisory-only. Landlock remains the
-//!   sole runtime enforcer of filesystem policy; this module compiles the
-//!   authored allow-list into Cedar entities purely for offline
-//!   inspection/verification (conflicting or redundant grants). It is never
-//!   a runtime decision point and nothing depends on it at request time.
-//!
-//! Process/syscall policy has no authored surface to represent and is out
-//! of scope entirely.
+//! The crate also hosts a YAML-to-Cedar compiler ([`compile`],
+//! [`compile_l7`]) and offline filesystem verification helpers
+//! ([`filesystem`]), used for comparing policies rather than enforcing them.
 //!
 //! The schema itself lives in `openshell-policy-cedar-schema`, the single
 //! source of truth for Cedar entity/action names across every Cedar-aware
 //! consumer.
 
+mod analysis;
 pub mod compile;
 pub mod compile_l7;
 mod error;
 pub mod filesystem;
 pub mod glob;
 
+pub use analysis::L7Protocol;
 pub use compile::CompiledCedarPolicy;
 pub use compile_l7::CompiledL7Policy;
 pub use error::CedarEngineError;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
+    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
     PolicySet, Request, RestrictedExpression, Schema,
 };
 use openshell_policy_cedar_schema::{actions, context_fields, endpoint_fields, entity_types};
 
-/// Synthetic id for the single `Process` entity built per request; this
-/// proof of concept evaluates one request at a time and never
-/// cross-references processes, so a fixed id is sufficient.
+use analysis::PolicyAnalysis;
+use filesystem::FilesystemPolicyInput;
+
+/// Synthetic id for the single `Process` entity built per request.
+///
+/// Each request is evaluated on its own and never cross-references other
+/// processes, so a fixed id is sufficient.
 const CURRENT_PROCESS: &str = "current";
+
+/// `Process` attribute holding the process's `User` entity.
+const PROCESS_USER_ATTR: &str = "user";
+
+/// `Process` attribute holding the process's `Group` entity.
+const PROCESS_GROUP_ATTR: &str = "group";
 
 /// One network-connect authorization request.
 ///
@@ -65,8 +71,6 @@ pub struct NetworkRequest {
     pub host: String,
     /// Destination port.
     pub port: u16,
-    /// L7 protocol label recorded on the `NetworkEndpoint` entity (e.g. `"rest"`).
-    pub protocol: String,
     /// Absolute path of the binary making the connection.
     pub binary_path: String,
     /// Absolute paths of the calling process's ancestors (parent,
@@ -82,8 +86,8 @@ pub struct NetworkRequest {
 
 /// Outcome of evaluating a [`NetworkRequest`] against a Cedar policy set.
 ///
-/// Mirrors `openshell_supervisor_network::opa::NetworkAction` so a future
-/// integration can return either engine's decision through one type.
+/// Mirrors `openshell_supervisor_network::opa::NetworkAction` so either
+/// engine's decision can be returned through one type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkDecision {
     /// A `permit` policy matched and no `forbid` overrode it.
@@ -96,10 +100,9 @@ pub enum NetworkDecision {
         /// Ids of the policies that contributed to the decision.
         matched_policies: Vec<String>,
     },
-    /// The matched endpoint's policy uses a rule shape not yet translatable
-    /// to Cedar (planned: a policy compiler from normalized policy data,
-    /// tracked separately). Not a decision: callers must not treat this as
-    /// Allow or Deny, and shadow-mode comparisons must exclude it from
+    /// The matched endpoint's policy uses a rule shape the YAML-to-Cedar
+    /// compiler could not translate. Not a decision: callers must not treat
+    /// this as Allow or Deny, and comparisons must exclude it from
     /// agreement/disagreement counting.
     Unsupported {
         /// Human-readable reason the endpoint's policy could not be compiled.
@@ -107,10 +110,81 @@ pub enum NetworkDecision {
     },
 }
 
-/// Cedar-backed network policy evaluator.
+/// One per-request L7 evaluation within an already-permitted connection.
 ///
-/// Loads a Cedar schema and policy set once, then evaluates
-/// [`NetworkRequest`]s against them.
+/// Mirrors the fields `openshell_supervisor_network::l7::relay::L7EvalContext`
+/// / `L7RequestInfo` supply, narrowed to what the `Sandbox::HttpRequest`
+/// Cedar action declares in its schema.
+#[derive(Debug, Clone)]
+pub struct L7Request {
+    /// Sandbox process user identity (`Sandbox::User` entity id), same as
+    /// the connection's `NetworkConnect` request. Identity doesn't change
+    /// within a connection, but policies may still guard every action
+    /// (including `HttpRequest`) on it, e.g. a top-level identity `forbid`.
+    pub user: String,
+    /// Sandbox process group identity (`Sandbox::Group` entity id).
+    pub group: String,
+    /// Absolute path of the binary that owns this connection.
+    pub binary_path: String,
+    /// Absolute paths of the connection-owning process's ancestors.
+    pub ancestors: Vec<String>,
+    /// Destination host (same endpoint the `NetworkConnect` matched).
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// HTTP method, when known; empty string when not applicable.
+    pub method: String,
+    /// REST request path, when known; empty string when not applicable.
+    pub path: String,
+    /// SQL command verb, when known; empty string when not applicable.
+    pub command: String,
+    /// JSON-RPC method name, when known; empty string when not applicable.
+    pub jsonrpc_method: String,
+}
+
+/// One host a Cedar policy set permits `NetworkConnect` to, with its ports.
+///
+/// Used for DNS eligibility, not CONNECT-time matching: only endpoints named
+/// literally in a `permit` scope are included. A host reachable only through
+/// a condition such as `resource.host like "*.example.com"` is not, so DNS
+/// resolution for it fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedNetworkEndpoint {
+    /// Destination host, lowercased.
+    pub host: String,
+    /// Ports this host is permitted on.
+    pub ports: Vec<u16>,
+}
+
+/// Entity type names and ids every request needs, built once per engine.
+#[derive(Debug, Clone)]
+struct RequestUids {
+    user_type: EntityTypeName,
+    group_type: EntityTypeName,
+    endpoint_type: EntityTypeName,
+    process: EntityUid,
+    network_connect: EntityUid,
+    http_request: EntityUid,
+}
+
+impl RequestUids {
+    fn new() -> Result<Self, CedarEngineError> {
+        Ok(Self {
+            user_type: entity_type(entity_types::USER)?,
+            group_type: entity_type(entity_types::GROUP)?,
+            endpoint_type: entity_type(entity_types::NETWORK_ENDPOINT)?,
+            process: entity_uid(entity_types::PROCESS, CURRENT_PROCESS)?,
+            network_connect: entity_uid(actions::ACTION_TYPE, actions::NETWORK_CONNECT)?,
+            http_request: entity_uid(actions::ACTION_TYPE, actions::HTTP_REQUEST)?,
+        })
+    }
+}
+
+/// Cedar-backed sandbox policy evaluator.
+///
+/// Loads a Cedar schema and policy set once, validates and analyzes them,
+/// then evaluates [`NetworkRequest`]s and [`L7Request`]s against them.
+#[derive(Debug)]
 pub struct CedarNetworkEngine {
     schema: Schema,
     policies: PolicySet,
@@ -118,37 +192,37 @@ pub struct CedarNetworkEngine {
     /// Named policies [`compile::compile_normalized_data`] could not
     /// represent in `policies`. Checked before trusting a Cedar `Deny`; see
     /// [`compile::UncompiledPolicy`]. Empty for engines built from
-    /// hand-authored policy text ([`Self::from_cedar_str`],
-    /// [`Self::from_policy_str`]).
+    /// hand-authored policy text.
     uncompiled: Vec<compile::UncompiledPolicy>,
+    analysis: PolicyAnalysis,
+    uids: RequestUids,
 }
 
 impl CedarNetworkEngine {
-    /// Parses a Cedar schema and policy set from their human-readable
-    /// (`.cedarschema` / `.cedar`) syntax.
+    /// Parses and validates a Cedar schema and policy set.
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if either input fails to parse.
+    /// Returns [`CedarEngineError`] if either input fails to parse, the
+    /// policy set fails strict schema validation, or a policy uses a shape
+    /// this crate cannot enforce exactly.
     pub fn from_cedar_str(schema_src: &str, policy_src: &str) -> Result<Self, CedarEngineError> {
         let (schema, _warnings) = Schema::from_cedarschema_str(schema_src)
             .map_err(|e| CedarEngineError::SchemaParse(Box::new(e)))?;
         let policies = PolicySet::from_str(policy_src)
             .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
-        Ok(Self {
-            schema,
-            policies,
-            authorizer: Authorizer::new(),
-            uncompiled: Vec::new(),
-        })
+        Self::new(schema, policies, Vec::new())
     }
 
-    /// Parses a Cedar policy set against the canonical
-    /// [`openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC`] schema.
+    /// Parses and validates a policy set against the canonical sandbox schema.
+    ///
+    /// The schema is [`openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC`].
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if the policy set source fails to parse.
+    /// Returns [`CedarEngineError`] if the policy set fails to parse, fails
+    /// strict schema validation, or uses a shape this crate cannot enforce
+    /// exactly.
     pub fn from_policy_str(policy_src: &str) -> Result<Self, CedarEngineError> {
         Self::from_cedar_str(
             openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC,
@@ -156,53 +230,58 @@ impl CedarNetworkEngine {
         )
     }
 
-    /// Builds an engine from a [`CompiledCedarPolicy`] produced by
-    /// [`compile::compile_normalized_data`].
+    /// Builds an engine from the output of [`compile::compile_normalized_data`].
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if the canonical schema fails to parse
-    /// (should not happen; the schema is fixed and tested in
-    /// `openshell-policy-cedar-schema`).
+    /// Returns [`CedarEngineError`] if the canonical schema fails to parse,
+    /// or the compiled policies fail validation. Either indicates a bug in
+    /// the compiler or schema, not a caller-input error.
     pub fn from_compiled(compiled: CompiledCedarPolicy) -> Result<Self, CedarEngineError> {
         let (schema, _warnings) =
             Schema::from_cedarschema_str(openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC)
                 .map_err(|e| CedarEngineError::SchemaParse(Box::new(e)))?;
+        Self::new(schema, compiled.policies, compiled.uncompiled)
+    }
+
+    fn new(
+        schema: Schema,
+        policies: PolicySet,
+        uncompiled: Vec<compile::UncompiledPolicy>,
+    ) -> Result<Self, CedarEngineError> {
+        let analysis = analysis::analyze(&schema, &policies)?;
         Ok(Self {
             schema,
-            policies: compiled.policies,
+            policies,
             authorizer: Authorizer::new(),
-            uncompiled: compiled.uncompiled,
+            uncompiled,
+            analysis,
+            uids: RequestUids::new()?,
         })
     }
 
-    /// Extracts the filesystem paths this engine's policy set permits for
-    /// reading and/or writing. See [`filesystem::extract_authorized_paths`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CedarEngineError`] if any policy `forbid`s a
-    /// `FilesystemPath` — Landlock's flat allow-list can't express
-    /// forbid-over-permit carve-outs.
-    pub fn extract_authorized_paths(
-        &self,
-    ) -> Result<filesystem::FilesystemPolicyInput, CedarEngineError> {
-        filesystem::extract_authorized_paths(&self.policies)
+    /// Returns the Landlock path grants this policy set authorizes.
+    #[must_use]
+    pub fn filesystem_grants(&self) -> &FilesystemPolicyInput {
+        &self.analysis.filesystem
     }
 
-    /// Extracts the exact `NetworkEndpoint` literals this engine's policy
-    /// set permits for `NetworkConnect`. See
-    /// [`extract_authorized_network_endpoints`].
+    /// Returns the exact `NetworkConnect` endpoints eligible for policy DNS.
     #[must_use]
-    pub fn extract_authorized_network_endpoints(&self) -> Vec<AuthorizedNetworkEndpoint> {
-        extract_authorized_network_endpoints(&self.policies)
+    pub fn dns_endpoints(&self) -> &[AuthorizedNetworkEndpoint] {
+        &self.analysis.dns_endpoints
     }
 
-    /// Extracts the `NetworkEndpoint`s this engine's policy set designates
-    /// for L7 inspection. See [`extract_l7_endpoints`].
+    /// Returns the L7 protocol to inspect `host:port` with, if any.
+    ///
+    /// `None` means no `HttpRequest` policy names this endpoint, so an
+    /// allowed connection to it is relayed without per-request checks.
     #[must_use]
-    pub fn extract_l7_endpoints(&self) -> Vec<AuthorizedL7Endpoint> {
-        extract_l7_endpoints(&self.policies)
+    pub fn l7_protocol(&self, host: &str, port: u16) -> Option<L7Protocol> {
+        self.analysis
+            .l7_endpoints
+            .get(&(normalize_host(host), port))
+            .copied()
     }
 
     /// Evaluates one network-connect request against the loaded policy set.
@@ -210,8 +289,8 @@ impl CedarNetworkEngine {
     /// # Errors
     ///
     /// Returns [`CedarEngineError`] if the request cannot be represented in
-    /// the loaded schema: invalid entity type names, attribute evaluation
-    /// failures, or a request shape the schema rejects.
+    /// the loaded schema, or if Cedar reports an error while evaluating any
+    /// policy.
     pub fn evaluate_network(
         &self,
         request: &NetworkRequest,
@@ -232,151 +311,104 @@ impl CedarNetworkEngine {
             });
         }
 
-        let host_lower = normalize_host(&request.host);
-        let host_port = format!("{host_lower}:{}", request.port);
-
-        let user_uid = entity_uid(entity_types::USER, &request.user)?;
-        let group_uid = entity_uid(entity_types::GROUP, &request.group)?;
-        let process_uid = entity_uid(entity_types::PROCESS, CURRENT_PROCESS)?;
-        let endpoint_uid = entity_uid(entity_types::NETWORK_ENDPOINT, &host_port)?;
-        let action_uid = entity_uid(actions::ACTION_TYPE, actions::NETWORK_CONNECT)?;
-
-        let process = Entity::new(
-            process_uid.clone(),
-            HashMap::from([
-                (
-                    "user".to_string(),
-                    RestrictedExpression::new_entity_uid(user_uid.clone()),
-                ),
-                (
-                    "group".to_string(),
-                    RestrictedExpression::new_entity_uid(group_uid.clone()),
-                ),
-            ]),
-            HashSet::new(),
-        )
-        .map_err(|e| CedarEngineError::EntityBuild(Box::new(e)))?;
-        let user = Entity::new_no_attrs(user_uid, HashSet::new());
-        let group = Entity::new_no_attrs(group_uid, HashSet::new());
-        let endpoint = Entity::new(
-            endpoint_uid.clone(),
-            HashMap::from([
-                (
-                    endpoint_fields::HOST.to_string(),
-                    RestrictedExpression::new_string(host_lower),
-                ),
-                (
-                    endpoint_fields::PORT.to_string(),
-                    RestrictedExpression::new_long(i64::from(request.port)),
-                ),
-                (
-                    endpoint_fields::PROTOCOL.to_string(),
-                    RestrictedExpression::new_string(request.protocol.clone()),
-                ),
-                (
-                    endpoint_fields::HOST_PORT.to_string(),
-                    RestrictedExpression::new_string(host_port),
-                ),
-            ]),
-            HashSet::new(),
-        )
-        .map_err(|e| CedarEngineError::EntityBuild(Box::new(e)))?;
-
-        let entities =
-            Entities::from_entities([process, user, group, endpoint], Some(&self.schema))
-                .map_err(|e| CedarEngineError::EntitiesBuild(Box::new(e)))?;
-
-        let context = Context::from_pairs([
-            (
-                context_fields::BINARY_PATH.to_string(),
-                RestrictedExpression::new_string(request.binary_path.clone()),
-            ),
-            (
-                context_fields::ANCESTORS.to_string(),
-                RestrictedExpression::new_set(
-                    request
-                        .ancestors
-                        .iter()
-                        .map(|a| RestrictedExpression::new_string(a.clone())),
-                ),
-            ),
-            (
-                context_fields::METHOD.to_string(),
-                RestrictedExpression::new_string(request.method.clone()),
-            ),
-            (
-                context_fields::PATH.to_string(),
-                RestrictedExpression::new_string(request.path.clone()),
-            ),
-            (
-                context_fields::COMMAND.to_string(),
-                RestrictedExpression::new_string(request.command.clone()),
-            ),
-        ])
-        .map_err(|e| CedarEngineError::ContextBuild(Box::new(e)))?;
-
-        let cedar_request = Request::new(
-            process_uid,
-            action_uid,
-            endpoint_uid,
-            context,
-            Some(&self.schema),
-        )
-        .map_err(|e| CedarEngineError::RequestBuild(Box::new(e)))?;
-
-        let response = self
-            .authorizer
-            .is_authorized(&cedar_request, &self.policies, &entities);
-
-        let matched_policies: Vec<String> = response
-            .diagnostics()
-            .reason()
-            .map(ToString::to_string)
-            .collect();
-
-        Ok(match response.decision() {
-            Decision::Allow => NetworkDecision::Allow { matched_policies },
-            Decision::Deny => NetworkDecision::Deny { matched_policies },
+        let (allowed, matched_policies) = self.authorize(
+            &self.uids.network_connect,
+            &Principal {
+                user: &request.user,
+                group: &request.group,
+            },
+            &request.host,
+            request.port,
+            [
+                (context_fields::BINARY_PATH, string(&request.binary_path)),
+                (context_fields::ANCESTORS, string_set(&request.ancestors)),
+                (context_fields::METHOD, string(&request.method)),
+                (context_fields::PATH, string(&request.path)),
+                (context_fields::COMMAND, string(&request.command)),
+            ],
+        )?;
+        Ok(if allowed {
+            NetworkDecision::Allow { matched_policies }
+        } else {
+            NetworkDecision::Deny { matched_policies }
         })
     }
 
-    /// Evaluates one per-request `HttpRequest` within an already-permitted
-    /// `NetworkConnect` tunnel.
+    /// Evaluates one per-request `HttpRequest` within a permitted connection.
     ///
-    /// Unlike [`Self::evaluate_network`], there is no `uncompiled`
-    /// short-circuit: this engine's `policies` may come from hand-authored
-    /// `.cedar` text (which either contains `HttpRequest` policies or
-    /// doesn't — nothing to compile), or from [`compile_l7::compile_l7`]
-    /// (whose own `CompiledL7Policy::uncompiled` list is the caller's
-    /// responsibility to check before trusting a `Deny` here, same as
-    /// [`compile::UncompiledPolicy`] for CONNECT).
+    /// Returns whether the request is allowed, and the ids of the policies
+    /// that determined the decision.
     ///
     /// # Errors
     ///
     /// Returns [`CedarEngineError`] if the request cannot be represented in
-    /// the loaded schema.
+    /// the loaded schema, or if Cedar reports an error while evaluating any
+    /// policy.
     pub fn evaluate_l7(
         &self,
         request: &L7Request,
     ) -> Result<(bool, Vec<String>), CedarEngineError> {
-        let host_lower = normalize_host(&request.host);
-        let host_port = format!("{host_lower}:{}", request.port);
+        self.authorize(
+            &self.uids.http_request,
+            &Principal {
+                user: &request.user,
+                group: &request.group,
+            },
+            &request.host,
+            request.port,
+            [
+                (context_fields::BINARY_PATH, string(&request.binary_path)),
+                (context_fields::ANCESTORS, string_set(&request.ancestors)),
+                (context_fields::METHOD, string(&request.method)),
+                (context_fields::PATH, string(&request.path)),
+                (context_fields::COMMAND, string(&request.command)),
+                (
+                    context_fields::JSONRPC_METHOD,
+                    string(&request.jsonrpc_method),
+                ),
+            ],
+        )
+    }
 
-        let user_uid = entity_uid(entity_types::USER, &request.user)?;
-        let group_uid = entity_uid(entity_types::GROUP, &request.group)?;
-        let process_uid = entity_uid(entity_types::PROCESS, CURRENT_PROCESS)?;
-        let endpoint_uid = entity_uid(entity_types::NETWORK_ENDPOINT, &host_port)?;
-        let action_uid = entity_uid(actions::ACTION_TYPE, actions::HTTP_REQUEST)?;
+    /// Runs one authorization query and returns `(allowed, matched_policies)`.
+    fn authorize<const N: usize>(
+        &self,
+        action: &EntityUid,
+        principal: &Principal<'_>,
+        host: &str,
+        port: u16,
+        context: [(&str, RestrictedExpression); N],
+    ) -> Result<(bool, Vec<String>), CedarEngineError> {
+        let host = normalize_host(host);
+        let host_port = format!("{host}:{port}");
+        let protocol = self
+            .analysis
+            .l7_endpoints
+            .get(&(host.clone(), port))
+            .map_or("", |protocol| protocol.as_str());
+
+        let user_uid = EntityUid::from_type_name_and_id(
+            self.uids.user_type.clone(),
+            entity_id(principal.user),
+        );
+        let group_uid = EntityUid::from_type_name_and_id(
+            self.uids.group_type.clone(),
+            entity_id(principal.group),
+        );
+        let endpoint_uid = EntityUid::from_type_name_and_id(
+            self.uids.endpoint_type.clone(),
+            entity_id(&host_port),
+        );
 
         let process = Entity::new(
-            process_uid.clone(),
+            self.uids.process.clone(),
             HashMap::from([
                 (
-                    "user".to_string(),
+                    PROCESS_USER_ATTR.to_string(),
                     RestrictedExpression::new_entity_uid(user_uid.clone()),
                 ),
                 (
-                    "group".to_string(),
+                    PROCESS_GROUP_ATTR.to_string(),
                     RestrictedExpression::new_entity_uid(group_uid.clone()),
                 ),
             ]),
@@ -390,15 +422,15 @@ impl CedarNetworkEngine {
             HashMap::from([
                 (
                     endpoint_fields::HOST.to_string(),
-                    RestrictedExpression::new_string(host_lower),
+                    RestrictedExpression::new_string(host),
                 ),
                 (
                     endpoint_fields::PORT.to_string(),
-                    RestrictedExpression::new_long(i64::from(request.port)),
+                    RestrictedExpression::new_long(i64::from(port)),
                 ),
                 (
                     endpoint_fields::PROTOCOL.to_string(),
-                    RestrictedExpression::new_string(String::new()),
+                    RestrictedExpression::new_string(protocol.to_string()),
                 ),
                 (
                     endpoint_fields::HOST_PORT.to_string(),
@@ -412,43 +444,15 @@ impl CedarNetworkEngine {
         let entities =
             Entities::from_entities([process, user, group, endpoint], Some(&self.schema))
                 .map_err(|e| CedarEngineError::EntitiesBuild(Box::new(e)))?;
-
-        let context = Context::from_pairs([
-            (
-                context_fields::BINARY_PATH.to_string(),
-                RestrictedExpression::new_string(request.binary_path.clone()),
-            ),
-            (
-                context_fields::ANCESTORS.to_string(),
-                RestrictedExpression::new_set(
-                    request
-                        .ancestors
-                        .iter()
-                        .map(|a| RestrictedExpression::new_string(a.clone())),
-                ),
-            ),
-            (
-                context_fields::METHOD.to_string(),
-                RestrictedExpression::new_string(request.method.clone()),
-            ),
-            (
-                context_fields::PATH.to_string(),
-                RestrictedExpression::new_string(request.path.clone()),
-            ),
-            (
-                context_fields::COMMAND.to_string(),
-                RestrictedExpression::new_string(request.command.clone()),
-            ),
-            (
-                context_fields::JSONRPC_METHOD.to_string(),
-                RestrictedExpression::new_string(request.jsonrpc_method.clone()),
-            ),
-        ])
+        let context = Context::from_pairs(
+            context
+                .into_iter()
+                .map(|(field, value)| (field.to_string(), value)),
+        )
         .map_err(|e| CedarEngineError::ContextBuild(Box::new(e)))?;
-
-        let cedar_request = Request::new(
-            process_uid,
-            action_uid,
+        let request = Request::new(
+            self.uids.process.clone(),
+            action.clone(),
             endpoint_uid,
             context,
             Some(&self.schema),
@@ -457,126 +461,38 @@ impl CedarNetworkEngine {
 
         let response = self
             .authorizer
-            .is_authorized(&cedar_request, &self.policies, &entities);
-
-        let matched_policies: Vec<String> = response
+            .is_authorized(&request, &self.policies, &entities);
+        let errors: Vec<String> = response
+            .diagnostics()
+            .errors()
+            .map(ToString::to_string)
+            .collect();
+        if !errors.is_empty() {
+            return Err(CedarEngineError::Evaluation {
+                reason: errors.join("; "),
+            });
+        }
+        let matched_policies = response
             .diagnostics()
             .reason()
             .map(ToString::to_string)
             .collect();
-
         Ok((response.decision() == Decision::Allow, matched_policies))
     }
 }
 
-/// One per-request L7 evaluation within an already-permitted
-/// `NetworkConnect` tunnel.
-///
-/// Mirrors the fields `openshell_supervisor_network::l7::relay::L7EvalContext`
-/// / `L7RequestInfo` supply, narrowed to what the `Sandbox::HttpRequest`
-/// Cedar action declares in its schema.
-#[derive(Debug, Clone)]
-pub struct L7Request {
-    /// Sandbox process user identity (`Sandbox::User` entity id), same as
-    /// the tunnel's `NetworkConnect` request — identity doesn't change
-    /// within a tunnel, but policies may still guard every action
-    /// (including `HttpRequest`) on it, e.g. a top-level identity `forbid`.
-    pub user: String,
-    /// Sandbox process group identity (`Sandbox::Group` entity id).
-    pub group: String,
-    /// Absolute path of the binary that owns this tunnel.
-    pub binary_path: String,
-    /// Absolute paths of the tunnel-owning process's ancestors.
-    pub ancestors: Vec<String>,
-    /// Destination host (same endpoint the tunnel's `NetworkConnect` matched).
-    pub host: String,
-    /// Destination port.
-    pub port: u16,
-    /// HTTP method, when known; empty string when not applicable.
-    pub method: String,
-    /// REST request path, when known; empty string when not applicable.
-    pub path: String,
-    /// SQL command verb, when known; empty string when not applicable.
-    pub command: String,
-    /// JSON-RPC method name, when known; empty string when not applicable.
-    pub jsonrpc_method: String,
+/// The user and group a request is evaluated as.
+struct Principal<'a> {
+    user: &'a str,
+    group: &'a str,
 }
 
-/// One network endpoint an authored Cedar policy set permits a
-/// `NetworkConnect`, grouped by host.
-///
-/// For DNS eligibility purposes, not CONNECT-time matching: only exact
-/// `NetworkEndpoint` literals (`resource == NetworkEndpoint::"host:port"` or
-/// `resource in [...]`) are extracted. A host expressed only through a
-/// `resource.host like "pattern"` condition has no entity literal and is not
-/// covered — see [`extract_authorized_network_endpoints`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedNetworkEndpoint {
-    /// Destination host, lowercased.
-    pub host: String,
-    /// Ports this host is permitted on.
-    pub ports: Vec<u16>,
+fn string(value: &str) -> RestrictedExpression {
+    RestrictedExpression::new_string(value.to_string())
 }
 
-/// Extracts the exact `NetworkEndpoint` literals an authored Cedar policy
-/// set permits for `NetworkConnect`, grouped by host.
-///
-/// Feeds DNS eligibility checks for a Cedar-sourced sandbox: a DNS query for
-/// a host not covered here is refused before the CONNECT-time decision ever
-/// runs, matching the YAML/OPA path's `policy_dns_eligible_endpoint_records`
-/// semantics as closely as Cedar's literal-only extraction allows.
-///
-/// A host reachable only through a `like` glob condition (not a literal
-/// equality/`in` comparison) is **not** included — DNS resolution for such a
-/// host fails even though the CONNECT-time Cedar decision would correctly
-/// evaluate the glob. This is a known, documented gap (not a security
-/// issue: it only makes some policies that should work fail closed), kept
-/// narrow deliberately rather than guessed. `forbid` policies never grant
-/// eligibility and are ignored here.
-#[must_use]
-pub fn extract_authorized_network_endpoints(
-    policies: &PolicySet,
-) -> Vec<AuthorizedNetworkEndpoint> {
-    let mut by_host: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
-
-    for policy in policies.policies() {
-        if policy.effect() != Effect::Permit {
-            continue;
-        }
-        let literals = policy.entity_literals();
-        let targets_network_connect = literals.iter().any(|uid| {
-            uid.type_name().to_string() == actions::ACTION_TYPE
-                && uid.id().unescaped() == actions::NETWORK_CONNECT
-        });
-        if !targets_network_connect {
-            continue;
-        }
-
-        for uid in &literals {
-            if uid.type_name().to_string() != entity_types::NETWORK_ENDPOINT {
-                continue;
-            }
-            let id = uid.id().unescaped();
-            let Some((host, port_str)) = id.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            by_host
-                .entry(host.to_ascii_lowercase())
-                .or_default()
-                .insert(port);
-        }
-    }
-
-    by_host
-        .into_iter()
-        .map(|(host, ports)| AuthorizedNetworkEndpoint {
-            host,
-            ports: ports.into_iter().collect(),
-        })
-        .collect()
+fn string_set(values: &[String]) -> RestrictedExpression {
+    RestrictedExpression::new_set(values.iter().map(|value| string(value)))
 }
 
 /// Lowercases `host` and strips one trailing `.`.
@@ -584,93 +500,28 @@ pub fn extract_authorized_network_endpoints(
 /// DNS-resolved hostnames (as published by `policy_dns` and read back via
 /// `ResolvedEndpointStore::lookup`) are absolute FQDNs with a trailing dot
 /// (see `NormalizedName::parse`); authored Cedar policy host literals never
-/// have one. Without this, every CONNECT/L7 request whose host came from a
-/// DNS resolution would fail to match an otherwise-identical policy host.
+/// have one. Without this, every request whose host came from a DNS
+/// resolution would fail to match an otherwise-identical policy host.
+/// Lowercasing is ASCII-only, matching how endpoint literals are checked at
+/// load.
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
-    host.strip_suffix('.').unwrap_or(host).to_lowercase()
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
-/// One network endpoint an authored Cedar policy set designates for L7
-/// (per-request) inspection, and the protocol to parse it as.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedL7Endpoint {
-    /// Destination host, lowercased.
-    pub host: String,
-    /// Destination port.
-    pub port: u16,
-    /// L7 protocol label (`"rest"`, `"sql"`, `"json-rpc"`), determining
-    /// which wire parser the relay uses. Defaults to `"rest"` when the
-    /// granting policy carries no `@protocol(...)` annotation.
-    pub protocol: String,
+fn entity_type(type_name: &str) -> Result<EntityTypeName, CedarEngineError> {
+    EntityTypeName::from_str(type_name).map_err(|e| CedarEngineError::EntityTypeParse(Box::new(e)))
 }
 
-/// Extracts the exact `NetworkEndpoint` literals an authored Cedar policy
-/// set designates for L7 inspection, by the presence of an `HttpRequest`
-/// permit targeting them.
-///
-/// Unlike CONNECT-time authorization (a yes/no decision), per-request L7
-/// inspection needs to know *which wire parser* to use before any request
-/// has been read — information Cedar's schema has no entity-literal
-/// equivalent for (it isn't part of the allow/deny decision at all, any
-/// more than OPA's YAML `protocol:` field is). Author a `@protocol("sql")`
-/// (or `"json-rpc"`) annotation on the granting `HttpRequest` permit to
-/// declare it; absent an annotation, `"rest"` is assumed — the common case,
-/// and the only protocol `compile_l7` targets without one.
-///
-/// A host reachable only through a `like` glob condition is **not**
-/// included, same limitation and rationale as
-/// [`extract_authorized_network_endpoints`]. `forbid` policies are ignored.
-#[must_use]
-pub fn extract_l7_endpoints(policies: &PolicySet) -> Vec<AuthorizedL7Endpoint> {
-    let mut by_endpoint: BTreeMap<(String, u16), String> = BTreeMap::new();
-
-    for policy in policies.policies() {
-        if policy.effect() != Effect::Permit {
-            continue;
-        }
-        let literals = policy.entity_literals();
-        let targets_http_request = literals.iter().any(|uid| {
-            uid.type_name().to_string() == actions::ACTION_TYPE
-                && uid.id().unescaped() == actions::HTTP_REQUEST
-        });
-        if !targets_http_request {
-            continue;
-        }
-        let protocol = policy
-            .annotation("protocol")
-            .map_or_else(|| "rest".to_string(), ToString::to_string);
-
-        for uid in &literals {
-            if uid.type_name().to_string() != entity_types::NETWORK_ENDPOINT {
-                continue;
-            }
-            let id = uid.id().unescaped();
-            let Some((host, port_str)) = id.rsplit_once(':') else {
-                continue;
-            };
-            let Ok(port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            by_endpoint.insert((host.to_ascii_lowercase(), port), protocol.clone());
-        }
-    }
-
-    by_endpoint
-        .into_iter()
-        .map(|((host, port), protocol)| AuthorizedL7Endpoint {
-            host,
-            port,
-            protocol,
-        })
-        .collect()
+fn entity_id(id: &str) -> EntityId {
+    // `EntityId::from_str` is infallible: any string is a valid entity id.
+    EntityId::from_str(id).unwrap_or_else(|never| match never {})
 }
 
 /// Builds an [`EntityUid`] from a Cedar entity type name and id.
 pub(crate) fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> {
-    let type_name = EntityTypeName::from_str(type_name)
-        .map_err(|e| CedarEngineError::EntityTypeParse(Box::new(e)))?;
-    // `EntityId::from_str` is infallible: any string is a valid entity id.
-    let entity_id = EntityId::from_str(id).unwrap_or_else(|never| match never {});
-    Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
+    Ok(EntityUid::from_type_name_and_id(
+        entity_type(type_name)?,
+        entity_id(id),
+    ))
 }

@@ -1,9 +1,12 @@
 // Identity guard
 // run_as_user: sandbox / run_as_group: sandbox
-// All actions are denied unless the process runs as sandbox:sandbox.
+// Connections are denied unless the process runs as sandbox:sandbox.
 // Placed as a top-level forbid so it cannot be bypassed by any permit.
+// Scoped to NetworkConnect: every HttpRequest happens on a connection
+// whose CONNECT was already checked, and Landlock grants cannot be
+// conditioned on identity.
 
-forbid (principal is Sandbox::Process, action, resource)
+forbid (principal is Sandbox::Process, action == Sandbox::Action::"NetworkConnect", resource)
 unless {
     principal.user  == Sandbox::User::"sandbox"
     && principal.group == Sandbox::Group::"sandbox"
@@ -25,7 +28,7 @@ when {
     || resource in Sandbox::FilesystemPath::"/app"
     || resource in Sandbox::FilesystemPath::"/var/log"
     || resource in Sandbox::FilesystemPath::"/proc/self"
-    || resource == Sandbox::FilesystemPath::"/dev/urandom"   // leaf, not dir
+    || resource in Sandbox::FilesystemPath::"/dev/urandom"   // leaf, not dir
 };
 
 // Filesystem: read-write paths
@@ -40,7 +43,7 @@ permit (
 when {
     resource in Sandbox::FilesystemPath::"/sandbox"
     || resource in Sandbox::FilesystemPath::"/tmp"
-    || resource == Sandbox::FilesystemPath::"/dev/null"      // leaf, not dir
+    || resource in Sandbox::FilesystemPath::"/dev/null"      // leaf, not dir
 };
 
 // Network: Allow PyPI access so pip can install dependencies

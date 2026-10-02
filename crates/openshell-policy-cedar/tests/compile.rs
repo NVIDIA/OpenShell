@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-09-30
-
 //! Checks that [`compile_normalized_data`] translates the CONNECT-time
 //! subset of normalized `data.sandbox.*` JSON (the same shape
 //! `openshell_supervisor_network::opa::proto_to_opa_data_json` produces)
@@ -20,7 +18,6 @@ fn request(host: &str, port: u16, binary_path: &str, ancestors: &[&str]) -> Netw
         group: "sandbox".to_string(),
         host: host.to_string(),
         port,
-        protocol: "rest".to_string(),
         binary_path: binary_path.to_string(),
         ancestors: ancestors.iter().map(ToString::to_string).collect(),
         method: String::new(),

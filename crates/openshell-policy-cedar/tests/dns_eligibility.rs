@@ -1,27 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Rust guideline compliant 2026-10-01
+//! Checks that [`CedarNetworkEngine::dns_endpoints`] lists exactly the
+//! `NetworkEndpoint`s named in `NetworkConnect` permit scopes, for DNS
+//! eligibility. Uses the same fixture `tests/network.rs` uses for
+//! CONNECT-time evaluation.
 
-//! Checks that [`extract_authorized_network_endpoints`] pulls the exact
-//! `NetworkEndpoint` literals an authored policy permits, for DNS
-//! eligibility — the same fixture `tests/network.rs` uses for CONNECT-time
-//! evaluation.
-
-use cedar_policy::PolicySet;
-use openshell_policy_cedar::{AuthorizedNetworkEndpoint, extract_authorized_network_endpoints};
-use std::str::FromStr;
+use openshell_policy_cedar::{AuthorizedNetworkEndpoint, CedarEngineError, CedarNetworkEngine};
 
 const POLICIES: &str = include_str!("fixtures/policies.cedar");
 
-#[test]
-fn extracts_every_permitted_endpoint_grouped_by_host() {
-    let policies = PolicySet::from_str(POLICIES).expect("fixture policy set must parse");
-    let mut endpoints = extract_authorized_network_endpoints(&policies);
-    endpoints.sort_by(|a, b| a.host.cmp(&b.host));
+fn dns_endpoints(policy: &str) -> Vec<AuthorizedNetworkEndpoint> {
+    CedarNetworkEngine::from_policy_str(policy)
+        .expect("policy must load")
+        .dns_endpoints()
+        .to_vec()
+}
 
+#[test]
+fn lists_every_permitted_endpoint_grouped_by_host() {
     assert_eq!(
-        endpoints,
+        dns_endpoints(POLICIES),
         vec![
             AuthorizedNetworkEndpoint {
                 host: "files.pythonhosted.org".to_string(),
@@ -41,23 +40,21 @@ fn extracts_every_permitted_endpoint_grouped_by_host() {
 
 #[test]
 fn ignores_filesystem_only_policies() {
-    let policies = PolicySet::from_str(
+    let endpoints = dns_endpoints(
         r#"
 permit (
     principal is Sandbox::Process,
     action    == Sandbox::Action::"ReadFile",
-    resource  is Sandbox::FilesystemPath
-)
-when { resource in Sandbox::FilesystemPath::"/usr" };
+    resource  in Sandbox::FilesystemPath::"/usr"
+);
 "#,
-    )
-    .expect("policy must parse");
-    assert!(extract_authorized_network_endpoints(&policies).is_empty());
+    );
+    assert!(endpoints.is_empty());
 }
 
 #[test]
 fn forbid_grants_no_eligibility() {
-    let policies = PolicySet::from_str(
+    let endpoints = dns_endpoints(
         r#"
 forbid (
     principal is Sandbox::Process,
@@ -65,30 +62,69 @@ forbid (
     resource  == Sandbox::NetworkEndpoint::"evil.example.com:443"
 );
 "#,
-    )
-    .expect("policy must parse");
-    assert!(extract_authorized_network_endpoints(&policies).is_empty());
+    );
+    assert!(endpoints.is_empty());
 }
 
 #[test]
-fn groups_multiple_ports_for_the_same_host() {
-    let policies = PolicySet::from_str(
+fn endpoints_named_only_in_conditions_are_not_eligible() {
+    // An `unless` clause naming an endpoint excludes it; reading literals
+    // out of conditions would have made it eligible.
+    let endpoints = dns_endpoints(
         r#"
 permit (
     principal is Sandbox::Process,
     action    == Sandbox::Action::"NetworkConnect",
     resource  is Sandbox::NetworkEndpoint
 )
-when {
-    (resource == Sandbox::NetworkEndpoint::"example.com:443"
-        || resource == Sandbox::NetworkEndpoint::"example.com:8443")
-    && context.binary_path == "/usr/bin/curl"
-};
+unless { resource == Sandbox::NetworkEndpoint::"evil.example.com:443" };
 "#,
-    )
-    .expect("policy must parse");
-    let endpoints = extract_authorized_network_endpoints(&policies);
-    assert_eq!(endpoints.len(), 1);
-    assert_eq!(endpoints[0].host, "example.com");
-    assert_eq!(endpoints[0].ports, vec![443, 8443]);
+    );
+    assert!(endpoints.is_empty());
+}
+
+#[test]
+fn groups_multiple_ports_for_the_same_host() {
+    let endpoints = dns_endpoints(
+        r#"
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"example.com:443"
+);
+permit (
+    principal is Sandbox::Process,
+    action    == Sandbox::Action::"NetworkConnect",
+    resource  == Sandbox::NetworkEndpoint::"example.com:8443"
+);
+"#,
+    );
+    assert_eq!(
+        endpoints,
+        vec![AuthorizedNetworkEndpoint {
+            host: "example.com".to_string(),
+            ports: vec![443, 8443],
+        }]
+    );
+}
+
+#[test]
+fn rejects_invalid_endpoint_literals() {
+    for endpoint in [
+        "API.example.com:443",
+        "example.com.:443",
+        "example.com",
+        "example.com:0",
+    ] {
+        let policy = format!(
+            r#"permit(principal, action == Sandbox::Action::"NetworkConnect",
+                      resource == Sandbox::NetworkEndpoint::"{endpoint}");"#
+        );
+        let error = CedarNetworkEngine::from_policy_str(&policy)
+            .expect_err(&format!("{endpoint} must be rejected"));
+        assert!(
+            matches!(error, CedarEngineError::InvalidEndpoint { .. }),
+            "{endpoint}: {error}"
+        );
+    }
 }
