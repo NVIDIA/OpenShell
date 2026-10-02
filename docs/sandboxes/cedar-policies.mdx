@@ -1,0 +1,118 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Write Sandbox Policies in Cedar"
+sidebar-title: "Cedar Policies"
+description: "Author an OpenShell sandbox policy in Cedar instead of YAML and understand which Cedar policy shapes OpenShell accepts."
+keywords: "Generative AI, Cybersecurity, Policy, Cedar, Network Policy, Landlock, Sandbox, Security"
+position: 7
+---
+
+A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead of YAML. Cedar then decides every network connection, every inspected HTTP or JSON-RPC request, and the filesystem paths Landlock allows. A sandbox uses one format for its whole lifetime: YAML policies are evaluated by the built-in Rego engine, and Cedar policies by Cedar.
+
+Cedar's restricted language makes policies easier to analyze, for example to check that a revision grants no more access than the one it replaces. OpenShell accepts only Cedar policy shapes it can enforce exactly as written, and rejects the rest when you submit the policy.
+
+## Apply a Cedar Policy
+
+OpenShell treats a policy file as Cedar when its extension is `.cedar`, in any case. Any other extension is parsed as YAML.
+
+Create a sandbox with a Cedar policy:
+
+```shell
+openshell sandbox create --policy ./policy.cedar -- claude
+```
+
+Replace the policy on a running sandbox:
+
+```shell
+openshell policy set <name> --policy ./policy.cedar --wait
+```
+
+The CLI validates the file before sending it, and the gateway validates it again. `openshell policy get <name>` prints the Cedar source of a Cedar sandbox's policy.
+
+## Policy Model
+
+Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`.
+
+| Action | Resource | Context fields | Decides |
+|---|---|---|---|
+| `ReadFile`, `WriteFile` | `FilesystemPath` | none | Landlock grants, fixed at sandbox start. |
+| `NetworkConnect` | `NetworkEndpoint` | `binary_path`, `ancestors` | Whether a process may open a connection. |
+| `HttpRequest` | `NetworkEndpoint` | `binary_path`, `ancestors`, `method`, `path`, `jsonrpc_method` | Each request on an inspected connection. |
+
+A `NetworkEndpoint` id is `"host:port"`, with a lowercase host. `NetworkConnect` also declares `method`, `path`, and `command`, but they are always empty because no request has been read at connect time. Put method and path conditions on `HttpRequest`.
+
+This example grants filesystem access, allows `curl` to connect to the GitHub API, and inspects each request on that connection:
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action in [Sandbox::Action::"ReadFile", Sandbox::Action::"WriteFile"],
+    resource is Sandbox::FilesystemPath
+)
+when { resource in Sandbox::FilesystemPath::"/sandbox" || resource in Sandbox::FilesystemPath::"/tmp" };
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"ReadFile",
+    resource in Sandbox::FilesystemPath::"/usr"
+);
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.binary_path == "/usr/bin/curl" };
+
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"HttpRequest",
+    resource == Sandbox::NetworkEndpoint::"api.github.com:443"
+)
+when { context.method == "GET" && context.path like "/repos/*" };
+```
+
+## Filesystem Rules
+
+Landlock applies a flat allow-list of path subtrees when the sandbox starts, so OpenShell accepts only filesystem policies that mean exactly that. A policy that can apply to `ReadFile` or `WriteFile` must:
+
+- Be a `permit`. A `forbid` that can apply to files is rejected.
+- List only `ReadFile` and `WriteFile` in its action scope.
+- Use `principal` or `principal is Sandbox::Process`.
+- Name paths with `resource in Sandbox::FilesystemPath::"/path"`, either in the scope or in a single `when` clause that only joins such tests with `||`.
+
+`resource ==` is rejected because Landlock grants the whole subtree under a directory. Paths must be absolute, must not contain `..`, and `/` cannot be granted write access. A policy that lists `WriteFile` grants read-write access to its paths.
+
+The supervisor adds the same baseline runtime paths it adds for YAML policies. On a running sandbox, a policy update can add filesystem paths but cannot remove them, because Landlock cannot revoke access from a running process.
+
+## Network Rules
+
+Cedar evaluates `NetworkConnect` for every outbound connection, with the calling binary in `context.binary_path` and its ancestors in `context.ancestors`. Conditions on these actions are evaluated by Cedar as written.
+
+<Warning>
+Cedar compares binary paths exactly. Use the resolved executable path, such as `/usr/bin/python3.12`, rather than a symlink such as `/usr/bin/python3`.
+</Warning>
+
+Policy DNS only resolves hosts named in a `NetworkConnect` permit scope, such as `resource == Sandbox::NetworkEndpoint::"pypi.org:443"`. A host matched only through a condition, such as `resource.host like "*.example.com"`, is not resolvable, so the connection fails closed.
+
+## Request Rules
+
+The proxy decides at connect time whether to inspect a connection request by request. It inspects every endpoint that an `HttpRequest` policy names in its scope, whether the policy is a `permit` or a `forbid`. An `HttpRequest` policy without an endpoint in its scope is rejected, because the proxy could not tell which connections it applies to.
+
+Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each request to that endpoint needs a matching `permit`.
+
+Endpoints are parsed as REST by default. Add `@protocol("json-rpc")` to an `HttpRequest` policy to inspect JSON-RPC and match on `context.jsonrpc_method`. All policies that declare a protocol for one endpoint must agree. SQL, GraphQL, and MCP inspection need request details the schema does not carry, so those protocols are rejected.
+
+## Limitations
+
+- A sandbox cannot switch between YAML and Cedar after creation. Recreate the sandbox to change formats.
+- Global policies must be YAML.
+- Providers with network policies cannot be attached to a Cedar sandbox. Grant the provider's endpoints in the Cedar policy instead.
+- `network_middlewares` and incremental `openshell policy update` merges are not available for Cedar policies. Use `openshell policy set` with the full Cedar file.
+- Policy templates are not supported.
+
+## Next Steps
+
+- [Customize Sandbox Policies](/sandboxes/policies) covers the YAML policy format.
+- [Policy Schema Reference](/reference/policy-schema) lists every YAML field.

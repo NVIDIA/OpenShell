@@ -41,6 +41,30 @@ before any consumer-specific projection runs. There is no permissive parsing
 profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
 parameter names are open user-data maps rather than schema extensions.
 
+### Cedar-authored policies
+
+A policy is either YAML or Cedar for the life of a sandbox. A non-empty
+`SandboxPolicy.cedar_policy_source` selects Cedar; it is mutually exclusive
+with `network_policies` and `network_middlewares`. The supervisor chooses the
+engine once at startup and rejects any reload that would switch formats, and
+the gateway rejects format switches on update, Cedar global policies, and
+provider network layers on Cedar sandboxes.
+
+`openshell-policy-cedar` validates the Cedar text against the canonical
+schema in `openshell-policy-cedar-schema` and derives three artifacts that
+Cedar does not decide at request time: Landlock grants, which endpoints the
+proxy inspects per request, and policy DNS eligibility. It accepts only policy
+shapes whose meaning those artifacts can enforce exactly and rejects the rest
+at the CLI, the gateway, and the supervisor. Cedar evaluation errors fail the
+request instead of being skipped.
+
+In `openshell-supervisor-network`, `PolicyEngine` is either the OPA engine or
+the Cedar engine and is the only engine network decision points receive. A
+Cedar sandbox keeps an OPA engine with no network policies for middleware and
+per-tunnel plumbing; inspected tunnels are pinned to Cedar's generation and
+delegate L7 decisions to Cedar. Cedar-derived Landlock grants pass the same
+path checks as YAML paths and receive the same baseline enrichment.
+
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
 does not weaken the whole ruleset. When GPU devices are present, GPU baseline

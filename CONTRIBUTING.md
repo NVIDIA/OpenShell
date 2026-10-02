@@ -461,6 +461,8 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
