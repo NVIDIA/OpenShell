@@ -208,7 +208,7 @@ The library is injected with `LD_PRELOAD`, so it interposes library symbols
 rather than system calls. It reaches runtimes that reach `accept` through libc
 and does not reach runtimes that issue the system call directly.
 
-| Runtime | Address-bearing `accept` | `getpeername` |
+| Runtime | Address-bearing `accept` | `getpeername` on directly connected sockets |
 | --- | --- | --- |
 | Node.js | Not needed — libuv passes a null address | Supported |
 | Bun | Supported | Supported |
@@ -216,8 +216,10 @@ and does not reach runtimes that issue the system call directly.
 | Go | Not supported — `net` issues the system call directly | Supported |
 | Statically linked binaries | Not supported — no dynamic loader | Supported |
 
-`getpeername` is supported everywhere because the kernel answers it, with no
-dependence on the preload.
+For directly connected sockets, including accepted sockets, `getpeername` works
+across runtimes without the preload. Relayed outbound sockets still require the
+broker to write the original peer address into workload memory, so `getpeername`
+returns `EOPNOTSUPP` for those sockets in legacy read-only mode.
 
 A workload that sets its own `LD_PRELOAD` keeps it; the sandbox composes its
 entry with the existing value rather than replacing it. The library is a
