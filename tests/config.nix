@@ -98,7 +98,6 @@ let
         name = "k3s-ha-tls";
         use_galaxy = false;
         playbooks = [ "ansible/playbooks/openshell-k3s-ha-tls.yaml" ];
-        prepare_playbooks = [ "ansible/playbooks/openshell-k3s-ha-tls-ready.yaml" ];
         inputs = {
           openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
           agent_sandbox_version = "0.5.0";
