@@ -7,7 +7,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-openshell-conformance = { path = "../../../../../crates/openshell-conformance" }
+openshell-conformance = { path = "../../../conformance/support" }
 openshell-e2e = { path = "../../../../../e2e/rust" }
 serde_json = "1"
 tempfile = "3"

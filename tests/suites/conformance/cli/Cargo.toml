@@ -10,5 +10,5 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [dependencies]
-openshell-conformance = { path = "../../../../crates/openshell-conformance" }
+openshell-conformance = { path = "../support" }
 tokio = { version = "1.43", features = ["macros", "rt"] }

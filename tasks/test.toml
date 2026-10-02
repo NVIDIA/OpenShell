@@ -7,6 +7,7 @@
 description = "Run all tests (Rust + Python + TypeScript SDK)"
 depends = [
   "test:rust",
+  "test:conformance-support",
   "test:python",
   "sdk:ts:test",
   "test:sbom",
@@ -274,3 +275,7 @@ description = "Test generated local gateway TOML without starting a runtime"
 run = "bash tasks/scripts/test-gateway-config.sh"
 run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
 hide = true
+
+["test:conformance-support"]
+description = "Run conformance harness unit tests without a gateway"
+run = "cargo test --locked --manifest-path tests/suites/conformance/Cargo.toml --package openshell-conformance"

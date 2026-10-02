@@ -27,8 +27,8 @@ async fn path_safety() {
 }
 
 async fn run(scenario: Scenario) {
-    let mut runner = OpenShellRunner::from_env(scenario.name)
-        .expect("candidate openshell CLI is available");
+    let mut runner =
+        OpenShellRunner::from_env(scenario.name).expect("candidate openshell CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         scenario.run(&mut runner).await
