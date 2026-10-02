@@ -49,6 +49,23 @@ The installer sets up the CLI and a local gateway. The default sandbox image is 
 - [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
 
+### Test the gRPC API with grpcurl
+
+The gateway serves the gRPC reflection v1 protocol. After starting a local
+plaintext gateway, use `grpcurl` without checking out or supplying the proto
+files:
+
+```shell
+grpcurl -plaintext localhost:18080 list
+grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
+grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
+```
+
+The service list contains the public `openshell.v1.OpenShell` API. Reflection
+does not advertise the gateway's internal compute-driver, credential-driver,
+interceptor, or middleware services. For a TLS gateway, omit `-plaintext` and
+supply the CA and client certificate options required by the deployment.
+
 ## Agent Skills
 
 Install the public OpenShell skills for your coding agent:
