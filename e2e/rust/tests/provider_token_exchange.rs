@@ -11,20 +11,20 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use futures_util::future::BoxFuture;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, UnixListener};
-use tokio::process::Command;
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
 use tonic::body::Body as TonicBody;
 use tonic::codegen::{Body, http};
@@ -38,6 +38,30 @@ const INTERMEDIATE_TOKEN: &str = "intermediate-token";
 const FINAL_ACCESS_TOKEN: &str = "final-access-token";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
+const IDENTITY_AUDIENCE: &str = "identity-proxy";
+const IDENTITY_JWT_AUDIENCE: &str = "https://identity.openshell-e2e.test";
+const IDENTITY_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+#[derive(Default)]
+struct GrantObservations {
+    service_issued: [AtomicUsize; 2],
+    identity_issued: [AtomicUsize; 2],
+    service_denied: AtomicUsize,
+    identity_denied: AtomicUsize,
+    target_requests: AtomicUsize,
+    target_rejected: AtomicUsize,
+}
+
+impl GrantObservations {
+    fn issued(&self) -> [(usize, usize); 2] {
+        std::array::from_fn(|index| {
+            (
+                self.service_issued[index].load(Ordering::SeqCst),
+                self.identity_issued[index].load(Ordering::SeqCst),
+            )
+        })
+    }
+}
 
 const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCvCoZ0mVHpCHsF
@@ -118,7 +142,7 @@ struct SpiffeWorkloadApi {
 }
 
 impl SpiffeWorkloadApi {
-    fn jwt_svid(&self, audience: Vec<String>) -> Result<String, Status> {
+    fn jwt_svid(&self, audience: &[String]) -> Result<String, Status> {
         let now = unix_timestamp();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(KEY_ID.to_string());
@@ -173,7 +197,7 @@ where
                         let inner = Arc::clone(&self.0);
                         Box::pin(async move {
                             let request = request.into_inner();
-                            let svid = inner.jwt_svid(request.audience)?;
+                            let svid = inner.jwt_svid(&request.audience)?;
                             Ok(Response::new(JwtsvidResponse {
                                 svids: vec![Jwtsvid {
                                     spiffe_id: inner.subject.to_string(),
@@ -326,7 +350,81 @@ async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle 
     FixtureHandle { task }
 }
 
-async fn start_gateway_token_endpoint(port: u16) -> FixtureHandle {
+// Forms and JWT headers can span TCP reads. Read the bounded, Content-Length
+// framed request completely so packet boundaries cannot change fixture results.
+async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let length = stream.read(&mut buffer).await.ok()?;
+            if length == 0 || request.len() + length > 32 * 1024 {
+                return None;
+            }
+            request.extend_from_slice(&buffer[..length]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).ok()?;
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map_or(Some(0), |(_, value)| value.trim().parse::<usize>().ok())?;
+                if request.len() >= end.checked_add(4)?.checked_add(content_length)? {
+                    return String::from_utf8(request).ok();
+                }
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn verifies_jwt_svid(token: &str, instance: &str) -> bool {
+    let keys: jsonwebtoken::jwk::JwkSet =
+        serde_json::from_slice(&jwks()).expect("fixture JWKS should parse");
+    let key = DecodingKey::from_jwk(keys.find(KEY_ID).expect("fixture signing key exists"))
+        .expect("fixture verification key should parse");
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[format!("{IDENTITY_JWT_AUDIENCE}/{instance}")]);
+    validation.sub = Some(format!("spiffe://{TRUST_DOMAIN}/openshell/sandbox/e2e"));
+    validation.set_required_spec_claims(&["exp", "iat", "iss", "sub", "aud"]);
+    jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+        .is_ok_and(|verified| verified.header.kid.as_deref() == Some(KEY_ID))
+}
+
+fn token_form(request: &str) -> HashMap<String, String> {
+    let (_, body) = request.split_once("\r\n\r\n").unwrap_or_default();
+    url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+async fn write_token_response(stream: &mut TcpStream, access_token: Option<&str>, ttl: u64) {
+    let (status, body) = if let Some(access_token) = access_token {
+        (
+            "HTTP/1.1 200 OK",
+            json!({"access_token": access_token, "token_type": "Bearer", "expires_in": ttl})
+                .to_string(),
+        )
+    } else {
+        (
+            "HTTP/1.1 400 Bad Request",
+            json!({"error": "invalid_grant"}).to_string(),
+        )
+    };
+    let response = format!(
+        "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+async fn start_gateway_token_endpoint(
+    port: u16,
+    observations: Arc<GrantObservations>,
+) -> FixtureHandle {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
         .expect("bind gateway token endpoint");
@@ -335,51 +433,91 @@ async fn start_gateway_token_endpoint(port: u16) -> FixtureHandle {
             let Ok((mut stream, _peer)) = listener.accept().await else {
                 break;
             };
+            let observations = Arc::clone(&observations);
             tokio::spawn(async move {
-                let mut buf = vec![0_u8; 8192];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let access_token = if request.starts_with("POST /token ")
-                    && request.contains("subject_token=stored-user-token")
-                    && request.contains("client_assertion=")
-                {
-                    Some(INTERMEDIATE_TOKEN)
-                } else if request.starts_with("POST /token ")
-                    && request.contains("subject_token=intermediate-token")
-                    && request.contains("client_assertion=")
-                {
-                    Some(FINAL_ACCESS_TOKEN)
-                } else {
-                    None
+                let Some(request) = read_http_request(&mut stream).await else {
+                    return;
                 };
-                let (status, body) = if let Some(access_token) = access_token {
-                    (
-                        "HTTP/1.1 200 OK",
-                        json!({
-                            "access_token": access_token,
-                            "token_type": "Bearer",
-                            "expires_in": 300
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    (
-                        "HTTP/1.1 400 Bad Request",
-                        json!({"error": "unexpected_token_exchange"}).to_string(),
-                    )
-                };
-                let response = format!(
-                    "{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+                let form = token_form(&request);
+                let field = |name: &str| form.get(name).map_or("", String::as_str);
+                let valid = request.starts_with("POST /token ")
+                    && field("grant_type") == "urn:ietf:params:oauth:grant-type:token-exchange"
+                    && field("client_assertion_type") == CLIENT_ASSERTION_TYPE
+                    && field("subject_token_type") == TOKEN_TYPE_ACCESS_TOKEN
+                    && field("requested_token_type") == TOKEN_TYPE_ACCESS_TOKEN
+                    && !field("client_assertion").is_empty();
+                let mut access_token = None;
+                for (index, instance) in ["a", "b"].into_iter().enumerate() {
+                    if valid
+                        && field("subject_token") == format!("{USER_SUBJECT_TOKEN}-{instance}")
+                        && field("audience")
+                            == format!("spiffe://{TRUST_DOMAIN}/openshell/sandbox/e2e")
+                        && field("scope").is_empty()
+                    {
+                        access_token = Some(format!("{INTERMEDIATE_TOKEN}-{instance}"));
+                    } else if valid
+                        && field("subject_token") == format!("{INTERMEDIATE_TOKEN}-{instance}")
+                        && field("scope") == "service.read"
+                    {
+                        if field("audience") == format!("service-{instance}") {
+                            observations.service_issued[index].fetch_add(1, Ordering::SeqCst);
+                            access_token = Some(format!("{FINAL_ACCESS_TOKEN}-{instance}"));
+                        } else if field("audience") == format!("denied-service-{instance}") {
+                            observations.service_denied.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                write_token_response(&mut stream, access_token.as_deref(), 600).await;
             });
         }
     });
     FixtureHandle { task }
 }
 
-async fn start_protected_target(port: u16) -> FixtureHandle {
+// This issuer returns the actual Workload API JWT-SVID after checking its
+// signature and audience. No new production grant type or sandbox-visible
+// credential is needed to exercise custom-header injection.
+async fn start_identity_token_endpoint(
+    port: u16,
+    observations: Arc<GrantObservations>,
+) -> FixtureHandle {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        .await
+        .expect("bind identity token endpoint");
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let observations = Arc::clone(&observations);
+            tokio::spawn(async move {
+                let Some(request) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let form = token_form(&request);
+                let field = |name: &str| form.get(name).map_or("", String::as_str);
+                let mut access_token = None;
+                for (index, instance) in ["a", "b"].into_iter().enumerate() {
+                    let valid = request.starts_with("POST /identity-token ")
+                        && field("grant_type") == "client_credentials"
+                        && field("client_assertion_type") == IDENTITY_ASSERTION_TYPE
+                        && field("scope") == "identity.read"
+                        && verifies_jwt_svid(field("client_assertion"), instance);
+                    if valid && field("audience") == format!("{IDENTITY_AUDIENCE}-{instance}") {
+                        observations.identity_issued[index].fetch_add(1, Ordering::SeqCst);
+                        access_token = Some(field("client_assertion"));
+                    } else if valid && field("audience") == format!("denied-identity-{instance}") {
+                        observations.identity_denied.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                write_token_response(&mut stream, access_token, 900).await;
+            });
+        }
+    });
+    FixtureHandle { task }
+}
+
+async fn start_protected_target(port: u16, observations: Arc<GrantObservations>) -> FixtureHandle {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
         .await
         .expect("bind protected target");
@@ -388,19 +526,49 @@ async fn start_protected_target(port: u16) -> FixtureHandle {
             let Ok((mut stream, _peer)) = listener.accept().await else {
                 break;
             };
+            let observations = Arc::clone(&observations);
             tokio::spawn(async move {
-                let mut buf = vec![0_u8; 8192];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let ok = request.lines().any(|line| {
-                    line.eq_ignore_ascii_case(&format!(
-                        "authorization: Bearer {FINAL_ACCESS_TOKEN}"
-                    ))
+                // Count any request bytes, including an incomplete header. A
+                // failed grant may open a TCP stream but must send no request.
+                let mut byte = [0_u8; 1];
+                if !matches!(
+                    tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut byte)).await,
+                    Ok(Ok(1))
+                ) {
+                    return;
+                }
+                observations.target_requests.fetch_add(1, Ordering::SeqCst);
+                let Some(request) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                let headers = request.split("\r\n\r\n").next().unwrap_or_default();
+                let header_values = |name: &str| {
+                    headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.trim())
+                        .collect::<Vec<_>>()
+                };
+                let bearer = header_values("authorization");
+                let identity = header_values("x-workload-jwt");
+                let ok = ["a", "b"].into_iter().any(|instance| {
+                    request.starts_with(&format!("GET /resource/{instance} "))
+                        && bearer.len() == 1
+                        && bearer[0] == format!("Bearer {FINAL_ACCESS_TOKEN}-{instance}")
+                        && identity.len() == 1
+                        && verifies_jwt_svid(identity[0], instance)
                 });
                 let (status, body) = if ok {
-                    ("HTTP/1.1 200 OK", "token-exchange-ok")
+                    ("HTTP/1.1 200 OK", "independent-grants-ok")
                 } else {
-                    ("HTTP/1.1 401 Unauthorized", "missing-final-token")
+                    // Keep rejection evidence even if the workload retries and
+                    // a later request happens to receive the correct credentials.
+                    observations.target_rejected.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "HTTP/1.1 401 Unauthorized",
+                        "credential-verification-failed",
+                    )
                 };
                 let response = format!(
                     "{status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -413,21 +581,19 @@ async fn start_protected_target(port: u16) -> FixtureHandle {
     FixtureHandle { task }
 }
 
-async fn run_cli(args: &[&str]) -> Result<String, String> {
+async fn run_cli(args: &[&str]) -> Result<(), String> {
     let output = openshell_cmd()
         .args(args)
         .output()
         .await
-        .map_err(|err| format!("spawn openshell: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
+        .map_err(|_| "could not spawn openshell CLI".to_string())?;
     if output.status.success() {
-        Ok(combined)
+        Ok(())
     } else {
+        // Provider creation arguments contain the stored subject token.
+        // Keep command arguments and raw diagnostics out of test failures.
         Err(format!(
-            "openshell {:?} failed with {:?}:\n{combined}",
-            args,
+            "openshell command failed; exit={:?}",
             output.status.code()
         ))
     }
@@ -437,104 +603,13 @@ async fn run_cli_ignore_error(args: &[&str]) {
     let _ = openshell_cmd().args(args).output().await;
 }
 
-async fn sandbox_logs(sandbox_name: &str) -> String {
-    run_cli(&["logs", sandbox_name])
-        .await
-        .unwrap_or_else(|err| format!("failed to collect sandbox logs: {err}"))
-}
-
-async fn podman_exec_capture(container_name: &str, args: &[&str]) -> String {
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return "OPENSHELL_PODMAN_SOCKET is not set".to_string();
-    };
-    let mut cmd = Command::new("podman");
-    cmd.arg("--url")
-        .arg(format!("unix://{socket}"))
-        .arg("exec")
-        .arg(container_name)
-        .args(args);
-    apply_podman_config_env(&mut cmd);
-    match cmd.output().await {
-        Ok(output) => format!(
-            "exit={:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(err) => format!("failed to run podman exec {:?}: {err}", args),
-    }
-}
-
-async fn podman_logs_capture(container_name: &str) -> String {
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return "OPENSHELL_PODMAN_SOCKET is not set".to_string();
-    };
-    let mut cmd = Command::new("podman");
-    cmd.arg("--url").arg(format!("unix://{socket}")).args([
-        "logs",
-        "--tail",
-        "200",
-        container_name,
-    ]);
-    apply_podman_config_env(&mut cmd);
-    match cmd.output().await {
-        Ok(output) => format!(
-            "exit={:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(err) => format!("failed to run podman logs: {err}"),
-    }
-}
-
-async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
-    let sandbox_logs = sandbox_logs(sandbox_name).await;
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return format!("Sandbox logs:\n{sandbox_logs}\nOPENSHELL_PODMAN_SOCKET is not set");
-    };
-    let container_name = match podman_container_name_for_sandbox(&socket, sandbox_name).await {
-        Ok(name) => name,
-        Err(err) => return format!("Sandbox logs:\n{sandbox_logs}\n{err}"),
-    };
-    let env = podman_exec_capture(&container_name, &["env"]).await;
-    let hosts = podman_exec_capture(&container_name, &["cat", "/etc/hosts"]).await;
-    let processes = podman_exec_capture(&container_name, &["ps", "-ef"]).await;
-    let resolve_host = podman_exec_capture(
-        &container_name,
-        &[
-            "python3",
-            "-c",
-            "import socket; print(socket.getaddrinfo('host.openshell.internal', 0, type=socket.SOCK_STREAM))",
-        ],
-    )
-    .await;
-    let target_probe = podman_exec_capture(
-        &container_name,
-        &[
-            "python3",
-            "-c",
-            &format!(
-                "import socket; s=socket.create_connection(('host.openshell.internal', {target_port}), 2); print('connected', s.getpeername()); s.close()"
-            ),
-        ],
-    )
-    .await;
-    let container_logs = podman_logs_capture(&container_name).await;
-
-    format!(
-        "Sandbox logs:\n{sandbox_logs}\n\
-         Container: {container_name}\n\
-         --- podman env ---\n{env}\n\
-         --- /etc/hosts ---\n{hosts}\n\
-         --- ps -ef ---\n{processes}\n\
-         --- resolve host.openshell.internal ---\n{resolve_host}\n\
-         --- protected target TCP probe ---\n{target_probe}\n\
-         --- podman logs ---\n{container_logs}"
-    )
-}
-
-fn write_profile(profile_type: &str, token_port: u16, target_port: u16) -> NamedTempFile {
+fn write_profile(
+    profile_type: &str,
+    token_port: u16,
+    identity_port: u16,
+    target_port: u16,
+    instance: &str,
+) -> NamedTempFile {
     let token_endpoint = format!("http://127.0.0.1:{token_port}/token");
     let mut file = tempfile::Builder::new()
         .suffix(".yaml")
@@ -543,7 +618,7 @@ fn write_profile(profile_type: &str, token_port: u16, target_port: u16) -> Named
     let profile = format!(
         r"id: {profile_type}
 display_name: Podman token exchange e2e
-description: Podman e2e provider profile for two-stage token exchange
+description: Independent bearer and JWT-SVID grants for one request
 category: other
 credentials:
   - name: subject_token
@@ -557,18 +632,39 @@ credentials:
     token_grant:
       grant_type: token_exchange
       token_endpoint: {token_endpoint}
-      audience: final-audience
+      audience: service-{instance}
+      scopes: [service.read]
       jwt_svid_audience: {token_endpoint}
       client_assertion_type: {CLIENT_ASSERTION_TYPE}
       requested_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
-      cache_ttl_seconds: 30
+      cache_ttl_seconds: 300
+      audience_overrides:
+        - path: /deny-service/{instance}
+          audience: denied-service-{instance}
       subject_token:
         source: provider_credential
         credential: subject_token
         subject_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
+  - name: workload_identity
+    description: Signed workload identity for the identity proxy
+    required: false
+    auth_style: header
+    header_name: X-Workload-Jwt
+    token_grant:
+      grant_type: client_credentials
+      token_endpoint: http://127.0.0.1:{identity_port}/identity-token
+      audience: {IDENTITY_AUDIENCE}-{instance}
+      scopes: [identity.read]
+      jwt_svid_audience: {IDENTITY_JWT_AUDIENCE}/{instance}
+      client_assertion_type: {IDENTITY_ASSERTION_TYPE}
+      cache_ttl_seconds: 600
+      audience_overrides:
+        - path: /deny-identity/{instance}
+          audience: denied-identity-{instance}
 endpoints:
   - host: host.openshell.internal
     port: {target_port}
+    path: /**
     protocol: rest
     access: read-write
     enforcement: enforce
@@ -595,64 +691,56 @@ while true; do sleep 60; done
     .to_string()
 }
 
-async fn podman_container_name_for_sandbox(
-    socket: &str,
+async fn sandbox_exec_http(
     sandbox_name: &str,
+    target_port: u16,
+    path: &str,
+    expect_denied: bool,
 ) -> Result<String, String> {
-    let mut cmd = Command::new("podman");
-    cmd.arg("--url")
-        .arg(format!("unix://{socket}"))
-        .arg("ps")
-        .arg("--filter")
-        .arg(format!("label=openshell.ai/sandbox-name={sandbox_name}"))
-        .arg("--filter")
-        .arg("label=openshell.io/isolation-role=sandbox")
-        .arg("--format")
-        .arg("{{.Names}}");
-    apply_podman_config_env(&mut cmd);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|err| format!("spawn podman ps for sandbox container: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "podman ps for sandbox container failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let names = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    match names.as_slice() {
-        [name] => Ok(name.clone()),
-        [] => Err(format!(
-            "no running Podman container found for sandbox '{sandbox_name}'"
-        )),
-        _ => Err(format!(
-            "multiple running Podman containers found for sandbox '{sandbox_name}': {}",
-            names.join(", ")
-        )),
-    }
-}
-
-fn apply_podman_config_env(cmd: &mut Command) {
-    if std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME").is_some() {
-        cmd.env_remove("XDG_CONFIG_HOME");
-    } else if let Some(value) = std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
-        cmd.env("XDG_CONFIG_HOME", value);
-    }
-}
-
-async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<String, String> {
-    let url = format!("http://host.openshell.internal:{target_port}/resource");
+    let url = format!("http://host.openshell.internal:{target_port}{path}");
+    let expect_denied_python = if expect_denied { "True" } else { "False" };
     let script = format!(
-        "import urllib.request; print(urllib.request.urlopen({url:?}, timeout=5).read().decode())"
+        r#"import base64, json, os, re, urllib.error, urllib.request
+
+def contains_credential(value):
+    if any(marker in value for marker in (
+        "stored-user-token", "intermediate-token", "final-access-token", "openshell:resolve:"
+    )):
+        return True
+    for token in re.findall(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value):
+        try:
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            if claims.get("iss") == "{ISSUER}":
+                return True
+        except (ValueError, UnicodeError):
+            pass
+    return False
+
+if any(contains_credential(value) for value in os.environ.values()):
+    raise RuntimeError("provider credential material reached the workload environment")
+request = urllib.request.Request({url:?}, headers={{
+    "Authorization": "Bearer agent-supplied",
+    "X-Workload-Jwt": "agent-supplied",
+}})
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode()
+    if contains_credential(body):
+        raise RuntimeError("provider credential material reached the workload response")
+    if {expect_denied_python}:
+        raise RuntimeError("failed grant unexpectedly reached the target")
+    print(body)
+except urllib.error.HTTPError as error:
+    body = error.read().decode()
+    if contains_credential(body):
+        raise RuntimeError("provider credential material reached the workload error")
+    if not {expect_denied_python} or error.code != 502:
+        raise RuntimeError("unexpected HTTP response") from None
+    print("grant-denied")
+"#
     );
-    let mut last_output = String::new();
+    let mut last_status = None;
     for _ in 0..20 {
         let output = openshell_cmd()
             .args([
@@ -668,26 +756,61 @@ async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<Strin
             ])
             .output()
             .await
-            .map_err(|err| format!("spawn openshell sandbox exec: {err}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}{stderr}");
+            .map_err(|_| "could not spawn sandbox HTTP probe".to_string())?;
         if output.status.success() {
-            return Ok(combined);
+            // The child emits fixed markers only. Never return raw stderr:
+            // runtime failures can include request or credential diagnostics.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let expected = if expect_denied {
+                "grant-denied"
+            } else {
+                "independent-grants-ok"
+            };
+            if stdout.trim() == expected {
+                return Ok(expected.to_string());
+            }
+            return Err("sandbox probe returned unexpected output".to_string());
         }
-        last_output = format!(
-            "exit={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status.code()
-        );
+        last_status = output.status.code();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(format!(
-        "HTTP request to protected target did not succeed at {url}; last attempt:\n{last_output}"
-    ))
+    Err(format!("sandbox HTTP probe failed; exit={last_status:?}"))
+}
+
+async fn create_provider_instance(
+    token_port: u16,
+    identity_port: u16,
+    target_port: u16,
+    instance: &str,
+) -> String {
+    let name = format!("podman-grants-{instance}-{}", std::process::id());
+    run_cli_ignore_error(&["provider", "delete", &name, "--yes"]).await;
+    run_cli_ignore_error(&["profile", "delete", &name, "--yes"]).await;
+    let profile = write_profile(&name, token_port, identity_port, target_port, instance);
+    let profile_path = profile
+        .path()
+        .to_str()
+        .expect("profile path should be UTF-8");
+    run_cli(&["profile", "import", "-f", profile_path])
+        .await
+        .expect("import independent-grant profile");
+    run_cli(&[
+        "provider",
+        "create",
+        "--name",
+        &name,
+        "--type",
+        &name,
+        "--credential",
+        &format!("subject_token={USER_SUBJECT_TOKEN}-{instance}"),
+    ])
+    .await
+    .expect("create provider instance");
+    name
 }
 
 #[tokio::test]
-async fn podman_provider_token_exchange_injects_bearer_header() {
+async fn podman_provider_token_exchange_injects_independent_grants_across_sandboxes() {
     let gateway_socket = PathBuf::from(
         std::env::var("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET")
             .expect("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET must be set by e2e-podman.sh"),
@@ -696,71 +819,102 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
         std::env::var("OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET")
             .expect("OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET must be set by e2e-podman.sh"),
     );
-
-    let profile_type = format!("podman-token-exchange-e2e-{}", std::process::id());
-    let provider_name = format!("podman-token-exchange-e2e-{}", std::process::id());
     let token_port = find_free_port();
+    let identity_port = find_free_port();
     let target_port = find_free_port();
-    let token_endpoint = format!("http://127.0.0.1:{token_port}/token");
     let gateway_subject = format!("spiffe://{TRUST_DOMAIN}/openshell/gateway");
+    // The mock shares a workload subject. Distinct providers and JWT audiences
+    // test cross-sandbox credential isolation, not production SPIRE attestation.
     let supervisor_subject = format!("spiffe://{TRUST_DOMAIN}/openshell/sandbox/e2e");
-
+    let observations = Arc::new(GrantObservations::default());
     let _gateway_spiffe = start_spiffe_workload_api(&gateway_socket, &gateway_subject).await;
     let _provider_spiffe = start_spiffe_workload_api(&provider_socket, &supervisor_subject).await;
-    let _gateway_token = start_gateway_token_endpoint(token_port).await;
-    let _target = start_protected_target(target_port).await;
+    let _gateway_token = start_gateway_token_endpoint(token_port, Arc::clone(&observations)).await;
+    let _identity_token =
+        start_identity_token_endpoint(identity_port, Arc::clone(&observations)).await;
+    let _target = start_protected_target(target_port, Arc::clone(&observations)).await;
 
-    run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
-
-    let profile = write_profile(&profile_type, token_port, target_port);
-    let profile_path = profile
-        .path()
-        .to_str()
-        .expect("profile path should be UTF-8");
-    run_cli(&["profile", "import", "-f", profile_path])
-        .await
-        .expect("import provider profile");
-    run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        &provider_name,
-        "--type",
-        &profile_type,
-        "--credential",
-        &format!("subject_token={USER_SUBJECT_TOKEN}"),
-    ])
-    .await
-    .expect("create provider");
+    let mut provider_names = Vec::new();
+    for instance in ["a", "b"] {
+        provider_names
+            .push(create_provider_instance(token_port, identity_port, target_port, instance).await);
+    }
 
     let script = sandbox_script();
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--provider", &provider_name],
+    let mut sandbox_a = SandboxGuard::create_keep_with_args(
+        &["--provider", &provider_names[0]],
         &["sh", "-lc", &script],
         "token-server-ready",
     )
     .await
-    .unwrap_or_else(|err| {
-        panic!(
-            "sandbox should complete token exchange against {token_endpoint} and protected target port {target_port}:\n{err}"
-        )
-    });
-    let request_output = match sandbox_exec_http(&sandbox.name, target_port).await {
-        Ok(output) => output,
-        Err(err) => {
-            let debug = provider_token_debug(&sandbox.name, target_port).await;
-            panic!("request protected target from kept sandbox: {err}\n{debug}");
-        }
-    };
+    .expect("create sandbox A");
+    let mut sandbox_b = SandboxGuard::create_keep_with_args(
+        &["--provider", &provider_names[1]],
+        &["sh", "-lc", &script],
+        "token-server-ready",
+    )
+    .await
+    .expect("create sandbox B");
 
-    run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
-    sandbox.cleanup().await;
+    // Both supervisors request the same host/port concurrently. The target
+    // verifies each path's distinct bearer and signed JWT audience together.
+    let initial = tokio::join!(
+        sandbox_exec_http(&sandbox_a.name, target_port, "/resource/a", false),
+        sandbox_exec_http(&sandbox_b.name, target_port, "/resource/b", false),
+    );
+    let before_cache = observations.issued();
+    let cached = tokio::join!(
+        sandbox_exec_http(&sandbox_a.name, target_port, "/resource/a", false),
+        sandbox_exec_http(&sandbox_b.name, target_port, "/resource/b", false),
+    );
+    let after_cache = observations.issued();
+    let target_requests = observations.target_requests.load(Ordering::SeqCst);
+    // An audience override forces acquisition of only the failing credential;
+    // the other credential remains cached from the successful request.
+    let denied = tokio::join!(
+        sandbox_exec_http(&sandbox_a.name, target_port, "/deny-service/a", true),
+        sandbox_exec_http(&sandbox_b.name, target_port, "/deny-identity/b", true),
+    );
 
+    sandbox_a.cleanup().await;
+    sandbox_b.cleanup().await;
+    for name in &provider_names {
+        run_cli_ignore_error(&["provider", "delete", name, "--yes"]).await;
+        run_cli_ignore_error(&["profile", "delete", name, "--yes"]).await;
+    }
+
+    for outcome in [initial.0, initial.1, cached.0, cached.1] {
+        assert_eq!(
+            outcome.expect("independent grant request should succeed"),
+            "independent-grants-ok"
+        );
+    }
+    assert_eq!(
+        observations.target_rejected.load(Ordering::SeqCst),
+        0,
+        "no request may present mismatched or untrusted credentials, even before a retry"
+    );
     assert!(
-        request_output.contains("token-exchange-ok"),
-        "protected target should receive the final exchanged bearer token:\n{}",
-        request_output
+        before_cache
+            .iter()
+            .all(|(service, identity)| *service > 0 && *identity > 0),
+        "each provider instance must acquire both credentials"
+    );
+    assert_eq!(
+        after_cache, before_cache,
+        "repeat requests should use both caches"
+    );
+    for outcome in [denied.0, denied.1] {
+        assert_eq!(
+            outcome.expect("failed grant should return 502"),
+            "grant-denied"
+        );
+    }
+    assert!(observations.service_denied.load(Ordering::SeqCst) > 0);
+    assert!(observations.identity_denied.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        observations.target_requests.load(Ordering::SeqCst),
+        target_requests,
+        "neither failed grant may forward any request bytes"
     );
 }
