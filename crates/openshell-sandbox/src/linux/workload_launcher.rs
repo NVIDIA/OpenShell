@@ -117,7 +117,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
 #[allow(unsafe_code)]
 mod tests {
     use std::mem::size_of;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::AsRawFd as _;
 
     use super::*;
 
@@ -163,11 +163,8 @@ mod tests {
             std::path::Path::new(&format!("/proc/{}/task/{}", child.id(), notification.tid))
                 .exists()
         );
-        // SAFETY: eventfd returns one newly owned descriptor on success.
-        let eventfd = unsafe { libc::eventfd(7, libc::EFD_CLOEXEC) };
-        assert!(eventfd >= 0, "eventfd: {}", io::Error::last_os_error());
-        // SAFETY: successful eventfd returned one owned descriptor.
-        let eventfd = unsafe { OwnedFd::from_raw_fd(eventfd) };
+        let eventfd = rustix::event::eventfd(7, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create eventfd");
         listener
             .add_fd_and_send(notification.id, eventfd.as_raw_fd(), true)
             .expect("inject child descriptor");

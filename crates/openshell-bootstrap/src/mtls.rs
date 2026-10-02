@@ -106,28 +106,19 @@ fn validate_cli_mtls_bundle_dir(dir: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce(&std::path::Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(|| {
+                let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                f(&root);
+            });
     }
 
     #[test]
     fn store_pki_bundle_rejects_multi_component_gateway_names() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let bundle = PkiBundle {
                 ca_cert_pem: "ca".to_string(),
                 ca_key_pem: "cakey".to_string(),

@@ -3,6 +3,8 @@
 
 //! `OpenShell` CLI - command-line interface for `OpenShell`.
 
+#![forbid(unsafe_code)]
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
@@ -2613,22 +2615,12 @@ async fn run_async() -> Result<()> {
         )
         .init();
 
-    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
-    // Only set the env var when it hasn't been explicitly overridden by the
-    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
-    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
-        let ssh_log_level = match cli.verbose {
-            0 => "ERROR",
-            1 => "INFO",
-            _ => "DEBUG",
-        };
-        // SAFETY: Called early in main() before spawning async tasks that
-        // read the environment, so no concurrent readers exist.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
-        }
-    }
+    // SSH commands read an explicit environment override themselves.
+    openshell_cli::ssh::set_default_ssh_log_level(match cli.verbose {
+        0 => "ERROR",
+        1 => "INFO",
+        _ => "DEBUG",
+    });
 
     match cli.command {
         // -----------------------------------------------------------
@@ -4339,29 +4331,10 @@ mod tests {
         ));
     }
 
-    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
-    // A static mutex serialises them so concurrent threads don't clobber
-    // each other's environment.
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
-    /// then restore the original value.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce()) {
+        test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(f);
     }
 
     fn edge_metadata(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -7057,3 +7030,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

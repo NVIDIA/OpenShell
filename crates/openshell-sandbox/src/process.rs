@@ -20,8 +20,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
@@ -230,7 +230,21 @@ fn apply_canonical_process_environment(
     }
 }
 
-fn configured_user_environment() -> HashMap<String, String> {
+static BOUNDARY_USER_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_boundary_user_environment(
+    environment: HashMap<String, String>,
+) -> Result<(), String> {
+    BOUNDARY_USER_ENVIRONMENT
+        .set(environment)
+        .map_err(|_| "boundary workload environment already installed".to_string())
+}
+
+pub(crate) fn configured_user_environment() -> HashMap<String, String> {
+    if let Some(environment) = BOUNDARY_USER_ENVIRONMENT.get() {
+        return environment.clone();
+    }
     std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
@@ -340,7 +354,7 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
 
 #[cfg(target_os = "linux")]
 pub fn spawn_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: Command,
 ) -> std::io::Result<Child> {
     let runtime = tokio::runtime::Handle::current();
@@ -352,7 +366,7 @@ pub fn spawn_command_with_workload_launcher(
 
 #[cfg(target_os = "linux")]
 pub fn spawn_std_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     launcher.execute(move || cmd.spawn())?
@@ -389,7 +403,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -440,7 +454,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -518,11 +532,8 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| {
-                    miette::miette!("prepare child self-protection filter: {error}")
-                })?;
+        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -1179,38 +1190,33 @@ mod tests {
     fn probe_hardened_child(probe: unsafe fn() -> i64) -> i64 {
         const HARDEN_FAILED: i64 = -2;
 
-        let mut fds = [0; 2];
-        let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(
-            pipe_rc,
-            0,
-            "pipe failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
 
         match unsafe { fork() }.expect("fork should succeed") {
             ForkResult::Child => {
-                unsafe { libc::close(fds[0]) };
+                drop(read_fd);
                 let value = match harden_child_process() {
                     Ok(()) => unsafe { probe() },
                     Err(_) => HARDEN_FAILED,
                 };
                 let bytes = value.to_ne_bytes();
-                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                let written = rustix::io::write(&write_fd, &bytes);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without running inherited
+                // parent destructors; the write wrapper performs one syscall.
                 unsafe {
-                    libc::close(fds[1]);
-                    libc::_exit(i32::from(written != bytes.len().cast_signed()));
+                    libc::_exit(i32::from(written != Ok(bytes.len())));
                 }
             }
             ForkResult::Parent { child } => {
-                unsafe { libc::close(fds[1]) };
+                drop(write_fd);
                 let mut bytes = [0u8; size_of::<i64>()];
-                let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
-                unsafe { libc::close(fds[0]) };
+                let read = rustix::io::read(&read_fd, &mut bytes[..]);
+                drop(read_fd);
                 assert_eq!(
-                    read.cast_unsigned(),
-                    bytes.len(),
-                    "expected {} probe bytes, got {}",
+                    read,
+                    Ok(bytes.len()),
+                    "expected {} probe bytes, got {:?}",
                     bytes.len(),
                     read
                 );
@@ -1226,15 +1232,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[allow(unsafe_code)]
-    unsafe fn core_dump_limit_is_zero_probe() -> i64 {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) };
-        if rc != 0 {
-            return -1;
+    fn core_dump_limit_is_zero_probe() -> i64 {
+        match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE) {
+            Ok((current, maximum)) => i64::from(current == 0 && maximum == 0),
+            Err(_) => -1,
         }
-        let limit = unsafe { limit.assume_init() };
-        i64::from(limit.rlim_cur == 0 && limit.rlim_max == 0)
     }
 
     #[test]

@@ -93,3 +93,7 @@ mod build_version;
 /// Used by tests in `openshell-server` to enumerate every RPC and verify that
 /// each one has an `#[rpc_auth(...)]` declaration on its handler.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

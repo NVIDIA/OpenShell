@@ -62,6 +62,7 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tonic = { workspace = true }
@@ -74,7 +75,11 @@ tokio-stream = { workspace = true, features = ["net"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["socket", "net"] }
+
 [target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true }
 
 [lints]
 workspace = true
