@@ -1588,8 +1588,14 @@ fn get_peer_name(
     let peer = match entry.state() {
         // The relay path leaves the workload's descriptor connected to a
         // loopback relay, so the kernel's peer is the relay address rather
-        // than the destination the workload asked for. The broker must keep
-        // writing `original_peer` itself.
+        // than the destination the workload asked for. Legacy mode cannot
+        // safely substitute the original destination in workload memory.
+        // Return the kernel's relay address instead of failing the query;
+        // connection authorization does not depend on this reported address.
+        SocketState::Connected { .. } if listener.writes_disabled() => {
+            return listener.respond_continue(notification.id);
+        }
+        // Modern listeners can safely preserve transparent peer reporting.
         SocketState::Connected { original_peer } => *original_peer,
         // These descriptors really are connected to the recorded peer, so the
         // kernel's own answer is identical to the broker's. Letting the kernel
@@ -2082,14 +2088,14 @@ mod tests {
 
     /// A `NotificationListener` whose descriptor is not a seccomp listener, so
     /// any ioctl fails. Only useful for discriminating *which* path was taken.
-    fn fake_legacy_listener() -> NotificationListener {
+    fn fake_listener(mode: ListenerMode) -> NotificationListener {
         // SAFETY: dup returns a new descriptor or a negative error.
         let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
         assert!(dup >= 0, "dup stderr");
         NotificationListener::from_fd_with_mode(
             // SAFETY: successful dup returned a new owned descriptor.
             unsafe { OwnedFd::from_raw_fd(dup) },
-            ListenerMode::LegacyReadOnly,
+            mode,
         )
     }
 
@@ -2115,7 +2121,7 @@ mod tests {
             ("Local", SocketState::Local { peer }),
         ] {
             let (registry, installed) = registry_with_state(state);
-            let listener = fake_legacy_listener();
+            let listener = fake_listener(ListenerMode::LegacyReadOnly);
             let error = get_peer_name(
                 &registry,
                 &listener,
@@ -2131,23 +2137,134 @@ mod tests {
     }
 
     #[test]
-    fn legacy_getpeername_still_substitutes_the_original_peer_for_relayed_sockets() {
+    fn legacy_getpeername_continues_for_relayed_outbound_sockets() {
         // A `Connected` descriptor is connected to a loopback relay, not to
         // the destination the workload asked for. CONTINUE here would hand the
-        // workload the relay's ephemeral address, so the broker must keep
-        // writing `original_peer` itself -- and keep failing closed when it
-        // cannot.
+        // workload the relay's ephemeral address. Legacy mode accepts that
+        // compatibility tradeoff rather than failing the query altogether.
         let (registry, installed) = registry_with_state(SocketState::Connected {
             original_peer: "203.0.113.7:443".parse().unwrap(),
         });
-        let listener = fake_legacy_listener();
+        let listener = fake_listener(ListenerMode::LegacyReadOnly);
         let error = get_peer_name(
             &registry,
             &listener,
             getpeername_notification(installed.as_raw_fd()),
         )
-        .expect_err("legacy listener must reject socket-address writes");
-        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        .expect_err("the fake listener cannot complete the CONTINUE ioctl");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
+    }
+
+    #[test]
+    fn killable_getpeername_still_substitutes_the_original_outbound_peer() {
+        let (registry, installed) = registry_with_state(SocketState::Connected {
+            original_peer: "203.0.113.7:443".parse().unwrap(),
+        });
+        let listener = fake_listener(ListenerMode::Killable);
+        // The notification's invalid output-length pointer must be read on
+        // the substitution path. CONTINUE would instead fail with ENOTTY on
+        // this fake listener, so EFAULT proves modern mode keeps emulating.
+        let error = get_peer_name(
+            &registry,
+            &listener,
+            getpeername_notification(installed.as_raw_fd()),
+        )
+        .expect_err("invalid workload output-length pointer");
+        assert_eq!(error.raw_os_error(), Some(libc::EFAULT));
+    }
+
+    #[test]
+    fn legacy_getpeername_rejects_unconnected_sockets() {
+        let (registry, installed) = registry_with_state(SocketState::Created);
+        let listener = fake_listener(ListenerMode::LegacyReadOnly);
+        let error = get_peer_name(
+            &registry,
+            &listener,
+            getpeername_notification(installed.as_raw_fd()),
+        )
+        .expect_err("unconnected socket has no peer");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTCONN));
+    }
+
+    fn mediated_outbound_peer(mode: ListenerMode) -> io::Result<SocketAddr> {
+        use openshell_isolation_interface::linux::seccomp_notify::install_listener;
+
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(relay.local_addr().unwrap()).unwrap();
+        let (_upstream, _) = relay.accept().unwrap();
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry
+            .stage(
+                stream.try_clone().unwrap().into(),
+                SocketMetadata {
+                    family: InetFamily::V4,
+                    kind: InetKind::Tcp,
+                    close_on_exec: true,
+                    nonblocking: false,
+                    creator_generation: 1,
+                },
+            )
+            .unwrap();
+        registry
+            .commit_with_state(
+                tentative,
+                SocketState::Connected {
+                    original_peer: "203.0.113.7:443".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let workload = std::thread::spawn(move || {
+            let listener = install_listener(&[libc::SYS_getpeername]).unwrap();
+            if mode == ListenerMode::Killable && listener.writes_disabled() {
+                sender.send(None).unwrap();
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel lacks WAIT_KILLABLE_RECV",
+                ));
+            }
+            sender.send(Some(listener)).unwrap();
+            stream.peer_addr()
+        });
+        let Some(installed) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            return workload.join().unwrap();
+        };
+        // SAFETY: installed owns a live descriptor; dup returns a distinct fd.
+        let fd = unsafe { libc::dup(installed.as_raw_fd()) };
+        assert!(fd >= 0);
+        let listener = NotificationListener::from_fd_with_mode(
+            // SAFETY: successful dup returned one new owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd) },
+            mode,
+        );
+        let notification = listener.receive().unwrap();
+        if let Err(error) = get_peer_name(&Mutex::new(registry), &listener, notification) {
+            listener
+                .respond_errno(notification.id, error_to_errno(&error))
+                .unwrap();
+        }
+        workload.join().unwrap()
+    }
+
+    #[test]
+    fn legacy_outbound_getpeername_returns_the_kernel_relay_address() {
+        let peer = mediated_outbound_peer(ListenerMode::LegacyReadOnly)
+            .expect("legacy outbound getpeername succeeds");
+        assert!(peer.ip().is_loopback());
+        assert_ne!(peer.port(), 0);
+    }
+
+    #[test]
+    fn killable_outbound_getpeername_returns_the_original_destination() {
+        let result = mediated_outbound_peer(ListenerMode::Killable);
+        if let Err(error) = &result {
+            if error.kind() == io::ErrorKind::Unsupported {
+                eprintln!("skipping modern peer substitution: {error}");
+                return;
+            }
+        }
+        let peer = result.expect("modern outbound getpeername succeeds");
+        assert_eq!(peer, "203.0.113.7:443".parse().unwrap());
     }
 
     #[test]

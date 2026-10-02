@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: Pod
+metadata:
+  name: echo
+  namespace: openshell-outbound-test
+  labels:
+    app: outbound-tcp-echo
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: echo
+      image: ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+      command: [python3, -u, -c]
+      args:
+        - |
+          import socket, threading
+          def echo(conn, peer):
+              total = 0
+              with conn:
+                  while data := conn.recv(65536):
+                      total += len(data)
+                      conn.sendall(data)
+              print(f"peer={peer} echoed_bytes={total}", flush=True)
+          with socket.socket() as server:
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind(("0.0.0.0", 5432))
+              server.listen()
+              print("READY", flush=True)
+              while True:
+                  conn, peer = server.accept()
+                  threading.Thread(target=echo, args=(conn, peer), daemon=True).start()
+      readinessProbe:
+        tcpSocket:
+          port: 5432
+        periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: openshell-outbound-test
+spec:
+  selector:
+    app: outbound-tcp-echo
+  ports:
+    - port: 5432
+      targetPort: 5432

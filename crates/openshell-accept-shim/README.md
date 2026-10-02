@@ -61,8 +61,13 @@ This is why the library's location on disk carries no privilege weight.
 | Go | Not covered | `net` issues the syscall instruction directly |
 | Static / `AT_SECURE` binaries | Not covered | No dynamic loader, or the preload is ignored |
 
-`getpeername` is fixed for every runtime, including Go, because the kernel
-answers it.
+On directly connected sockets, `getpeername` reports the true peer for every
+runtime, including Go, because the kernel answers it. In legacy mode the
+broker also continues `getpeername` on relayed outbound sockets, allowing the
+query to succeed with the loopback relay's address rather than the upstream
+destination. This fallback does not need the shim and does not change outbound
+authorization. Modern listeners still substitute the original upstream address
+through the broker's safe task-memory write path.
 
 ## Build invariants
 

@@ -30,7 +30,10 @@ memory.
 `getpeername` and peer-address `accept`/`accept4` are compensated for, so Node,
 Bun, and CPython servers read the correct peer address on this kernel. Go
 servers and statically linked binaries still receive `EOPNOTSUPP` from an
-address-bearing `accept`, and `sendmmsg` per-message length write-backs still
+address-bearing `accept`. For relayed outbound connections, `getpeername`
+succeeds but reports the loopback relay's address and port instead of the
+upstream destination. Clients that depend on the upstream peer address may
+still be incompatible. `sendmmsg` per-message length write-backs still
 fail closed. See the
 [support matrix](/about/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
 for the full behavior and the per-runtime coverage table; the selected mode is

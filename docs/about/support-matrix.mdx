@@ -217,9 +217,14 @@ and does not reach runtimes that issue the system call directly.
 | Statically linked binaries | Not supported — no dynamic loader | Supported |
 
 For directly connected sockets, including accepted sockets, `getpeername` works
-across runtimes without the preload. Relayed outbound sockets still require the
-broker to write the original peer address into workload memory, so `getpeername`
-returns `EOPNOTSUPP` for those sockets in legacy read-only mode.
+across runtimes without the preload. In legacy read-only mode, `getpeername`
+also succeeds on relayed outbound sockets, but returns the loopback relay's
+address and port rather than the original upstream destination. The kernel
+writes this result into the caller's buffer; the broker does not write into
+workload memory. Clients that require the upstream address may still be
+incompatible. Connection authorization remains based on the requested
+destination. On kernels with `WAIT_KILLABLE_RECV`, the broker continues to
+report the original upstream destination.
 
 A workload that sets its own `LD_PRELOAD` keeps it; the sandbox composes its
 entry with the existing value rather than replacing it. The library is a
