@@ -18,3 +18,23 @@ service IsolationBoundary {
 message BoundaryChunk {
   bytes data = 1;
 }
+
+// Draft stream entrypoint for a shared out-of-process Isolation Backend.
+// Each client stream starts with a boundary_id frame. The backend checks that
+// handle against the authenticated sandbox and generation before accepting any
+// data. Subsequent data fragments carry the existing Sandbox Protocol bytes.
+// This service does not change the first-party IsolationBoundary RPCs.
+service DelegatedIsolationBoundary {
+  rpc Exchange(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
+  rpc Mediate(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
+}
+
+message DelegatedBoundaryChunk {
+  oneof payload {
+    // Required as the first client frame; forbidden on later frames.
+    string boundary_id = 1;
+    // Ordered fragment of the existing Sandbox Protocol. Response frames only
+    // use data. Empty data is allowed and does not bind a stream.
+    bytes data = 2;
+  }
+}

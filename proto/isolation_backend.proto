@@ -1,0 +1,105 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.isolation.backend.v1;
+
+import "extension.proto";
+import "options.proto";
+
+// Draft external Isolation Backend control contract. The supervisor uses this
+// service on an operator-configured, authenticated endpoint. Workload control,
+// network mediation, and byte streams remain on the Sandbox Protocol.
+// PeerMetadata negotiates the base, boundary-routing, and suspend/resume
+// capabilities independently; suspend/resume is optional for a backend.
+service IsolationBackend {
+  // Negotiate the isolation contract before opening a boundary. This call
+  // conveys no sandbox credentials or driver descriptor.
+  rpc GetCapabilities(GetIsolationCapabilitiesRequest) returns (GetIsolationCapabilitiesResponse);
+
+  // Bind a driver-provisioned resource to one fresh sandbox launch. The
+  // caller credential must match sandbox_id and generation_id. This call must
+  // not run untrusted workload code. The subsequent Sandbox Protocol attach,
+  // confirm, and start sequence remains mandatory.
+  rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
+
+  // Freeze the workload, retain its state, and fence the old generation before
+  // returning. The caller credential must match the active boundary. The
+  // compute driver owns storage and handoff of the reference.
+  rpc SuspendBoundary(SuspendBoundaryRequest) returns (SuspendBoundaryResponse);
+
+  // Restore a suspended boundary into a fresh launch session and generation.
+  // The restored workload remains frozen until attach, confirm, and start
+  // complete under the new supervisor. A permitted cold start is reported.
+  rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
+}
+
+message GetIsolationCapabilitiesRequest {
+  openshell.extension.v1.PeerMetadata supervisor = 1;
+}
+
+message GetIsolationCapabilitiesResponse {
+  openshell.extension.v1.PeerMetadata backend = 1;
+}
+
+message OpenBoundaryRequest {
+  // Stable gateway-assigned sandbox identity, not a public resource name.
+  string sandbox_id = 1;
+  // Fresh for each launch and unchanged for retries of that launch.
+  string session_id = 2;
+  // Fresh runtime generation bound to the supervisor's launch credential.
+  string generation_id = 3;
+  // Must match trusted admission and the configured endpoint registration.
+  string backend_name = 4;
+  // Opaque descriptor from the trusted compute driver. The backend validates
+  // its resource binding; workload-controlled input must not select it.
+  bytes driver_descriptor = 5 [(openshell.options.v1.secret) = true];
+  // Stable idempotency key for this launch transition.
+  string request_id = 6;
+}
+
+message OpenBoundaryResponse {
+  // Opaque handle scoped to this sandbox and runtime generation. The supervisor
+  // presents it when opening Sandbox Protocol streams.
+  string boundary_id = 1;
+
+  enum LaunchOutcome {
+    LAUNCH_OUTCOME_UNSPECIFIED = 0;
+    LAUNCH_OUTCOME_FRESH = 1;
+    LAUNCH_OUTCOME_RESTORED = 2;
+    LAUNCH_OUTCOME_COLD_START_FALLBACK = 3;
+  }
+
+  // Required. A restoration result remains frozen until the new supervisor
+  // authenticates, confirms enforcement, installs current policy and secrets,
+  // and explicitly starts the boundary. Fallback must be visible to callers.
+  LaunchOutcome outcome = 2;
+}
+
+message SuspendBoundaryRequest {
+  string boundary_id = 1;
+  string session_id = 2;
+  string generation_id = 3;
+  // Replays of this request return the same reference or a terminal error.
+  string request_id = 4;
+}
+
+message SuspendBoundaryResponse {
+  // Opaque protected state reference. It may be used only with an authorized
+  // ResumeBoundary request for the same sandbox and a fresh generation.
+  bytes restore_reference = 1 [(openshell.options.v1.secret) = true];
+}
+
+message ResumeBoundaryRequest {
+  // Fresh launch identity and trusted driver descriptor. Replays reuse the
+  // same launch request; the old session and generation are never reused.
+  OpenBoundaryRequest launch = 1;
+  // Reference returned by SuspendBoundary for this sandbox. It carries no
+  // authority without the new authenticated launch credential.
+  bytes restore_reference = 2 [(openshell.options.v1.secret) = true];
+  // If false, fail when the memory image cannot be restored. If true, a clean
+  // boot from the image and persistent volumes is permitted and reported as
+  // LAUNCH_OUTCOME_COLD_START_FALLBACK.
+  bool allow_cold_start_fallback = 3;
+}
