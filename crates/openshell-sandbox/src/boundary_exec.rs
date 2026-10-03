@@ -156,7 +156,10 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         let (session_user, session_home) =
             crate::process::session_user_and_home(&self.policy, effective_workdir);
-        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        // Use a fixed, safe PATH for sandboxed processes instead of inheriting
+        // the supervisor's PATH, which may expose sensitive host-only tool
+        // directories and weaken sandbox isolation (CVE-worthy: sandbox escape aid).
+        let path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string();
         command
             .env_clear()
             .env(openshell_core::sandbox_env::SANDBOX, "1")
@@ -172,6 +175,16 @@ impl LocalBoundaryExec {
                 command.env(key, value);
             }
         }
+        // Apply user-requested environment BEFORE admin-controlled security
+        // settings. This ordering ensures that admin TLS certificates and
+        // proxy stripping always take precedence: a user cannot override
+        // SSL_CERT_FILE to trust an attacker CA, or re-inject HTTP_PROXY
+        // after the admin strips it.
+        for (key, value) in &spec.env {
+            if !key.starts_with("OPENSHELL_") {
+                command.env(key, value);
+            }
+        }
         if let Some((ca_cert_path, combined_bundle_path)) = self.ca_file_paths.as_deref() {
             for (key, value) in crate::child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
                 command.env(key, value);
@@ -183,11 +196,13 @@ impl LocalBoundaryExec {
             }
         }
         crate::process::strip_proxy_env_std(&mut command);
-        for (key, value) in &spec.env {
-            if !key.starts_with("OPENSHELL_") {
-                command.env(key, value);
-            }
-        }
+        // Strip dynamic-linker injection variables that could hijack sandbox
+        // process execution. The VM driver (build_guest_environment) and the
+        // Podman driver (unsetenv) already sanitise these; apply the same
+        // defence to the local-sandbox boundary.
+        command.env_remove("LD_PRELOAD");
+        command.env_remove("LD_LIBRARY_PATH");
+        command.env_remove("LD_AUDIT");
         if let Some(workdir) = spec.workdir.as_deref().or(self.base_workdir.as_deref()) {
             command.current_dir(workdir);
         }
@@ -1060,5 +1075,191 @@ mod tests {
             session.process.wait().await.unwrap(),
             BoundaryExitStatus::Exited(7)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Security regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sandbox_path_does_not_leak_supervisor_path() {
+        // Regression: the supervisor's PATH (which may contain host-only
+        // tool directories) must never reach the sandboxed child.
+        let executor = executor();
+        let command = executor
+            .command(&ExecSpec {
+                program: "/usr/bin/env".to_string(),
+                args: vec![],
+                shell: None,
+                runtime_helper: None,
+                env: vec![],
+                workdir: None,
+                pty: false,
+            })
+            .expect("build command");
+        let path = command
+            .get_envs()
+            .find(|(key, _)| key == "PATH")
+            .and_then(|(_, value)| value)
+            .expect("PATH must be set");
+        assert_eq!(
+            path,
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "sandbox PATH must be the fixed safe value, not the supervisor's PATH"
+        );
+    }
+
+    #[test]
+    fn user_env_cannot_override_admin_tls_cert_paths() {
+        // Regression: user-supplied spec.env must not override admin-
+        // controlled TLS certificate environment variables. The admin
+        // sets SSL_CERT_FILE via ca_file_paths; a user attempting to
+        // override it with an attacker-controlled CA must be blocked.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start test workload launcher");
+        std::thread::spawn(move || {
+            while let Ok(notification) = listener.receive() {
+                let _ = listener.respond_continue(notification.id);
+            }
+        });
+
+        let ca_dir = tempfile::tempdir().expect("create temp dir for test certs");
+        let ca_cert = ca_dir.path().join("openshell-ca.pem");
+        let ca_bundle = ca_dir.path().join("ca-bundle.pem");
+        std::fs::write(&ca_cert, "admin-ca-cert").expect("write test cert");
+        std::fs::write(&ca_bundle, "admin-ca-bundle").expect("write test bundle");
+
+        let executor = LocalBoundaryExec::new(
+            SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            },
+            None,
+            Some((ca_cert.clone(), ca_bundle.clone())),
+            ProviderCredentialState::from_environment(
+                0,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+            HashMap::new(),
+            crate::boundary_io::BoundaryRuntimeState::new(),
+            launcher,
+        );
+
+        let command = executor
+            .command(&ExecSpec {
+                program: "/usr/bin/env".to_string(),
+                args: vec![],
+                shell: None,
+                runtime_helper: None,
+                env: vec![
+                    ("SSL_CERT_FILE".to_string(), "/attacker/evil-ca.pem".to_string()),
+                    ("REQUESTS_CA_BUNDLE".to_string(), "/attacker/evil-ca.pem".to_string()),
+                    ("CURL_CA_BUNDLE".to_string(), "/attacker/evil-ca.pem".to_string()),
+                    ("NODE_EXTRA_CA_CERTS".to_string(), "/attacker/evil-ca.pem".to_string()),
+                    ("GIT_SSL_CAINFO".to_string(), "/attacker/evil-ca.pem".to_string()),
+                ],
+                workdir: None,
+                pty: false,
+            })
+            .expect("build command");
+
+        let envs: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+
+        let admin_bundle = ca_bundle.display().to_string();
+        let admin_cert = ca_cert.display().to_string();
+        assert_eq!(
+            envs.get("SSL_CERT_FILE").map(String::as_str),
+            Some(admin_bundle.as_str()),
+            "admin TLS cert must override user-supplied SSL_CERT_FILE"
+        );
+        assert_eq!(
+            envs.get("REQUESTS_CA_BUNDLE").map(String::as_str),
+            Some(admin_bundle.as_str()),
+            "admin TLS cert must override user-supplied REQUESTS_CA_BUNDLE"
+        );
+        assert_eq!(
+            envs.get("NODE_EXTRA_CA_CERTS").map(String::as_str),
+            Some(admin_cert.as_str()),
+            "admin TLS cert must override user-supplied NODE_EXTRA_CA_CERTS"
+        );
+    }
+
+    #[test]
+    fn user_env_cannot_reintroduce_stripped_proxy_variables() {
+        // Regression: proxy variables are stripped to ensure transparent
+        // network mediation. User spec.env must not re-inject them.
+        let executor = executor();
+        let command = executor
+            .command(&ExecSpec {
+                program: "/usr/bin/env".to_string(),
+                args: vec![],
+                shell: None,
+                runtime_helper: None,
+                env: vec![
+                    ("HTTP_PROXY".to_string(), "http://attacker:8080".to_string()),
+                    ("HTTPS_PROXY".to_string(), "http://attacker:8443".to_string()),
+                    ("ALL_PROXY".to_string(), "socks5://attacker:1080".to_string()),
+                    ("http_proxy".to_string(), "http://attacker:8080".to_string()),
+                    ("https_proxy".to_string(), "http://attacker:8443".to_string()),
+                ],
+                workdir: None,
+                pty: false,
+            })
+            .expect("build command");
+
+        let envs: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+
+        for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"] {
+            assert!(
+                !envs.contains_key(var),
+                "proxy variable {var} must be stripped even when user sets it in spec.env"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_linker_injection_variables_are_always_stripped() {
+        // Regression: LD_PRELOAD, LD_LIBRARY_PATH, and LD_AUDIT must
+        // never reach a sandboxed child process. The VM and Podman drivers
+        // already sanitise these; the local sandbox must match.
+        let executor = executor();
+        let command = executor
+            .command(&ExecSpec {
+                program: "/usr/bin/env".to_string(),
+                args: vec![],
+                shell: None,
+                runtime_helper: None,
+                env: vec![
+                    ("LD_PRELOAD".to_string(), "/workspace/evil.so".to_string()),
+                    ("LD_LIBRARY_PATH".to_string(), "/workspace/lib".to_string()),
+                    ("LD_AUDIT".to_string(), "/workspace/audit.so".to_string()),
+                ],
+                workdir: None,
+                pty: false,
+            })
+            .expect("build command");
+
+        let envs: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+
+        for var in ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"] {
+            assert!(
+                !envs.contains_key(var),
+                "{var} must be stripped from sandbox child environment"
+            );
+        }
     }
 }

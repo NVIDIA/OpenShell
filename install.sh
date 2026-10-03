@@ -859,9 +859,13 @@ install_rpm_packages() {
   elif has_cmd yum; then
     as_root yum install -y "$@"
   elif has_cmd zypper; then
-    as_root zypper --non-interactive install --allow-unsigned-rpm "$@"
+    # Do not pass --allow-unsigned-rpm: let zypper enforce GPG signature
+    # verification so a compromised download cannot silently install
+    # malicious packages as root.
+    as_root zypper --non-interactive install "$@"
   elif has_cmd rpm; then
     warn "installing with rpm directly; dependencies must already be installed"
+    warn "rpm cannot verify repository GPG signatures for local files; ensure the download was authentic"
     as_root rpm -Uvh --replacepkgs "$@"
   else
     error "'dnf', 'yum', 'zypper', or 'rpm' is required to install RPM packages"
@@ -1138,7 +1142,10 @@ install_linux_deb() {
 
   _arch="$(get_deb_arch)"
   _tmpdir="$(mktemp -d)"
-  chmod 0755 "$_tmpdir"
+  # Keep the default 0700 mode from mktemp -d. The previous chmod 0755
+  # allowed other local users to read downloaded packages during the
+  # verify-to-install window; the package manager (running as root via
+  # as_root) can already access the user-owned 0700 directory.
   trap 'rm -rf "$_tmpdir"' EXIT
   prepare_prerelease_assets "$_tmpdir"
   info "downloading ${RELEASE_TAG} release checksums..."
@@ -1176,7 +1183,6 @@ install_linux_rpm() {
 
   _arch="$(get_rpm_arch)"
   _tmpdir="$(mktemp -d)"
-  chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
   prepare_prerelease_assets "$_tmpdir"
   info "downloading ${RELEASE_TAG} release checksums..."
