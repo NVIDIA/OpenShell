@@ -131,10 +131,13 @@ mod tests {
     // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Driver-operation ownership adds pending and a retained operation ID to
+    // SandboxProvisioning in both closures. Old rows decode false and empty;
+    // decoding or deadline updates cannot claim an existing attempt.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "581125d215f2a1967eb73826c411c1e72a53fb3a30a20e85c51d96bbb518e078";
+        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
     const DURABLE_SCHEMA_SHA256: &str =
-        "c1e49c80c52a5c7458952b333e7ca9da2dd24478b41756b710ba29a5217b67d7";
+        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

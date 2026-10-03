@@ -260,6 +260,15 @@ pub fn timed_out(sandbox: &openshell_core::proto::Sandbox) -> bool {
         .is_some_and(|record| record.timeout_time.is_some())
 }
 
+/// A submitted operation still owns the possibility of a later backend commit.
+pub(super) fn driver_operation_pending(sandbox: &openshell_core::proto::Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        .is_some_and(|record| record.driver_operation_pending)
+}
+
 /// Adopt an existing untimed attempt without granting it a new preparation phase.
 /// New create/start operations use `new_preparation_record` instead.
 pub fn new_record(now_ms: i64) -> SandboxProvisioning {
@@ -647,6 +656,10 @@ impl super::ComputeRuntime {
         if record.timeout_time.is_none() || record.cleanup_completed_time.is_some() {
             return Ok(());
         }
+        // A stop can observe NotFound before an in-flight create materializes
+        // compute. Even if that create finishes before the final read below,
+        // only a later stop issued after settlement can complete cleanup.
+        let pending_before_stop = record.driver_operation_pending;
         let now_ms = openshell_core::time::now_ms();
         if record
             .cleanup_retry_time
@@ -700,8 +713,9 @@ impl super::ComputeRuntime {
             ),
         )
         .await;
-        let reclaimed = matches!(&result, Ok(Ok(_)))
-            || matches!(&result, Ok(Err(error)) if error.code() == tonic::Code::NotFound);
+        let reclaimed = !pending_before_stop
+            && (matches!(&result, Ok(Ok(_)))
+                || matches!(&result, Ok(Err(error)) if error.code() == tonic::Code::NotFound));
         let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
         let Some(current) = self
             .store
@@ -721,6 +735,7 @@ impl super::ComputeRuntime {
         {
             return Ok(());
         }
+        let reclaimed = reclaimed && !driver_operation_pending(&current);
         let completed_at_ms = openshell_core::time::now_ms();
         let updated = self
             .store
@@ -768,6 +783,8 @@ mod tests {
         // configuration at epoch 0, and an admission deadline at 300 seconds.
         let bytes = [0x0a, 1, b'a', 0x12, 1, b'c', 0x1a, 0, 0x2a, 3, 8, 0xac, 2];
         let mut record = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
+        assert!(!record.driver_operation_pending);
+        assert!(record.driver_operation_id.is_empty());
         let before = record.clone();
         record_admission_start(&mut record, 299_999).unwrap();
         assert_eq!(record, before);
@@ -798,6 +815,8 @@ mod tests {
     fn preparation_config_changes_and_restart_preserve_the_absolute_ceiling() {
         use prost::Message;
         let mut record = new_preparation_record(0, 1800);
+        record.driver_operation_pending = true;
+        record.driver_operation_id = "operation-1".into();
         let mut timer = ProvisioningDeadline::from_record(&record).unwrap();
         let attempt = record.attempt_id.clone();
         assert!(timer.configuration_changed(&attempt, change("first", 600_000)));
@@ -807,6 +826,8 @@ mod tests {
         timer.write_record(&mut record);
         let bytes = record.encode_to_vec();
         let restored = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
+        assert!(restored.driver_operation_pending);
+        assert_eq!(restored.driver_operation_id, "operation-1");
         let mut timer = ProvisioningDeadline::from_record(&restored).unwrap();
         assert_eq!(timer.deadline_at_ms(), Some(1_800_000));
         assert!(!timer.start_admission("previous-attempt", 1_799_999));

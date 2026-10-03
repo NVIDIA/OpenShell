@@ -2942,6 +2942,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
             "cleanup_error": record.cleanup_error,
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
@@ -8180,6 +8182,28 @@ mod tests {
             assert!(!message.contains("image_preparation_timeout_seconds"));
             assert!(
                 message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
             );
         }
     }

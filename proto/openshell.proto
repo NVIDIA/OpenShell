@@ -3789,6 +3789,16 @@ message SandboxProvisioning {
   // Starts the admission repair window. Absent while preparing, including
   // after a preparation timeout. Duplicate reports never change this value.
   google.protobuf.Timestamp admission_start_time = 13;
+  // An owned driver create/start future is still pending. Claimed before
+  // dispatch and cleared on its actual success or error response. Monitor
+  // interruption, owner loss, and StopSandbox/NotFound do not clear it.
+  // While set, cleanup cannot complete and retry/deletion remain blocked.
+  // This does not strengthen a driver's transport-error settlement contract.
+  bool driver_operation_pending = 14;
+  // Unique for each claimed driver operation, including recovery and automatic
+  // restart. Retained after settlement to reject delayed callbacks from an
+  // earlier operation on the same attempt and runtime generation.
+  string driver_operation_id = 15;
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.

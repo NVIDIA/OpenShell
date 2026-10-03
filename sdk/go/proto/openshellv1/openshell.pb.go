@@ -17657,8 +17657,18 @@ type SandboxProvisioning struct {
 	// Starts the admission repair window. Absent while preparing, including
 	// after a preparation timeout. Duplicate reports never change this value.
 	AdmissionStartTime *timestamppb.Timestamp `protobuf:"bytes,13,opt,name=admission_start_time,json=admissionStartTime,proto3" json:"admission_start_time,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// An owned driver create/start future is still pending. Claimed before
+	// dispatch and cleared on its actual success or error response. Monitor
+	// interruption, owner loss, and StopSandbox/NotFound do not clear it.
+	// While set, cleanup cannot complete and retry/deletion remain blocked.
+	// This does not strengthen a driver's transport-error settlement contract.
+	DriverOperationPending bool `protobuf:"varint,14,opt,name=driver_operation_pending,json=driverOperationPending,proto3" json:"driver_operation_pending,omitempty"`
+	// Unique for each claimed driver operation, including recovery and automatic
+	// restart. Retained after settlement to reject delayed callbacks from an
+	// earlier operation on the same attempt and runtime generation.
+	DriverOperationId string `protobuf:"bytes,15,opt,name=driver_operation_id,json=driverOperationId,proto3" json:"driver_operation_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *SandboxProvisioning) Reset() {
@@ -17780,6 +17790,20 @@ func (x *SandboxProvisioning) GetAdmissionStartTime() *timestamppb.Timestamp {
 		return x.AdmissionStartTime
 	}
 	return nil
+}
+
+func (x *SandboxProvisioning) GetDriverOperationPending() bool {
+	if x != nil {
+		return x.DriverOperationPending
+	}
+	return false
+}
+
+func (x *SandboxProvisioning) GetDriverOperationId() string {
+	if x != nil {
+		return x.DriverOperationId
+	}
+	return ""
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.
@@ -19163,7 +19187,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04path\x18\x04 \x01(\tR\x04path\x12=\n" +
 	"\vlast_result\x18\x05 \x01(\x0e2\x1c.openshell.v1.EndpointResultR\n" +
 	"lastResult\x12H\n" +
-	"\x12last_reported_time\x18j \x01(\v2\x1a.google.protobuf.TimestampR\x10lastReportedTimeJ\x04\b\x06\x10\aR\x10last_reported_at\"\xeb\x06\n" +
+	"\x12last_reported_time\x18j \x01(\v2\x1a.google.protobuf.TimestampR\x10lastReportedTimeJ\x04\b\x06\x10\aR\x10last_reported_at\"\xd5\a\n" +
 	"\x13SandboxProvisioning\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\x01 \x01(\tR\tattemptId\x126\n" +
@@ -19179,7 +19203,9 @@ const file_openshell_proto_rawDesc = "" +
 	" \x01(\tR\x12attachmentChangeId\x12P\n" +
 	"\x16attachment_change_time\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\x14attachmentChangeTime\x12M\n" +
 	"\x14preparation_deadline\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\x13preparationDeadline\x12L\n" +
-	"\x14admission_start_time\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\x12admissionStartTime\"\xaa\x01\n" +
+	"\x14admission_start_time\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\x12admissionStartTime\x128\n" +
+	"\x18driver_operation_pending\x18\x0e \x01(\bR\x16driverOperationPending\x12.\n" +
+	"\x13driver_operation_id\x18\x0f \x01(\tR\x11driverOperationId\"\xaa\x01\n" +
 	"\x16SandboxServiceExposure\x12\x18\n" +
 	"\aservice\x18\x01 \x01(\tR\aservice\x12\x1f\n" +
 	"\vtarget_port\x18\x02 \x01(\rR\n" +
