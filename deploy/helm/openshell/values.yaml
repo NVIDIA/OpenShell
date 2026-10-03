@@ -291,6 +291,114 @@ server:
     queueCapacity: 10000
     # -- Maximum encoded bytes waiting for the file writer.
     queueMaxBytes: 16777216
+  # -- Operator-run supervisor middleware registrations, rendered as
+  # `[[openshell.supervisor.middleware]]`. `name`, `grpcEndpoint`, and
+  # `maxPayloadBytes` are required; the remaining fields are optional and
+  # omitted when unset. `maxPayloadBytes` must be greater than zero, no larger
+  # than the service's advertised capability, and at most 4 MiB. The endpoint
+  # must be reachable from both the gateway and sandbox supervisors, so Unix
+  # sockets are not supported. Mount a private CA with server.extraVolumes and
+  # server.extraVolumeMounts. See the commented example below for every
+  # supported field.
+  middleware: []
+  # middleware:
+  #   # Name that policies use to attach this middleware. Must be unique and
+  #   # cannot use the reserved `openshell/` prefix.
+  #   - name: content-guard
+  #     # gRPC endpoint of the service. Must be resolvable from the gateway and
+  #     # from sandbox supervisors.
+  #     grpcEndpoint: https://content-guard.openshell.svc:50051
+  #     # PEM bundle used to verify the service's TLS certificate. Needed only
+  #     # for a private CA; public roots are trusted by default. The gateway
+  #     # also hands it to supervisors, so supply certificates only.
+  #     tlsCaCertPath: /etc/openshell-extensions/ca.crt
+  #     # Audience placed in the short-lived tokens OpenShell sends the
+  #     # service, so it can reject tokens minted for a different service.
+  #     # Defaults to urn:openshell:extension:middleware:<name>.
+  #     audience: urn:openshell:extension:middleware:content-guard
+  #     # Largest request, response, or WebSocket text payload sent to the
+  #     # service. Bounds memory and latency; oversized values are rejected at
+  #     # startup rather than clamped.
+  #     maxPayloadBytes: 262144
+  #     # Deadline for each call to the service (10ms to 30s). A slow service
+  #     # then fails per its policy instead of stalling sandbox traffic.
+  #     # Defaults to 500ms.
+  #     timeout: 500ms
+  #     # Allow plaintext http:// with no credential. Development or already
+  #     # authenticated networks only; the gateway warns at every startup.
+  #     allowInsecureTransport: false
+  # -- Gateway interceptor registrations, rendered as
+  # `[[openshell.gateway.interceptors]]`. `name` and `grpcEndpoint` are
+  # required; the remaining fields are optional and omitted when unset. Prefer
+  # `bindingPolicy: allowlist` with explicit `bindings` so the service cannot
+  # widen the RPCs it intercepts. Each interceptor must be reachable and
+  # complete `Describe` before the gateway starts. Mount a private CA with
+  # server.extraVolumes and server.extraVolumeMounts. See the commented example
+  # below for every supported field.
+  interceptors: []
+  # interceptors:
+  #   # Unique name for this registration. It identifies the service in logs,
+  #   # derives the default audience, breaks ties in run order, and is how
+  #   # providerProfileSources selects it.
+  #   - name: governance
+  #     # gRPC endpoint of the service, called by the gateway only.
+  #     grpcEndpoint: https://governance.openshell.svc:50052
+  #     # PEM bundle used to verify the service's TLS certificate. Needed only
+  #     # for a private CA.
+  #     tlsCaCertPath: /etc/openshell-extensions/ca.crt
+  #     # Audience placed in the short-lived tokens OpenShell sends the
+  #     # service, so it can reject tokens minted for a different service.
+  #     # Defaults to urn:openshell:extension:interceptor:<name>.
+  #     audience: urn:openshell:extension:interceptor:governance
+  #     # Allow plaintext http:// with no credential. Development or already
+  #     # authenticated networks only; the gateway warns at every startup.
+  #     allowInsecureTransport: false
+  #     # Run order across interceptors; lower runs first, ties break by name.
+  #     # Set it when one interceptor must see another's changes. Defaults
+  #     # to 0.
+  #     order: 0
+  #     # What happens when the service is unreachable, slow, or returns an
+  #     # invalid result. fail_closed rejects the operation; fail_open lets it
+  #     # proceed. Bindings inherit this unless they set their own.
+  #     failurePolicy: fail_closed
+  #     # Who decides which RPCs the service intercepts. allowlist enables only
+  #     # the bindings below and ignores extra manifest declarations; exact
+  #     # requires the manifest to match the bindings; dynamic (the default)
+  #     # lets the service choose and logs a warning.
+  #     bindingPolicy: allowlist
+  #     # Deadline for each call to the service. Keeps a slow interceptor from
+  #     # stalling the operation it guards. Defaults to 500ms.
+  #     timeout: 500ms
+  #     # Largest response the gateway accepts from the service. Defaults to
+  #     # 1048576.
+  #     maxResponseBytes: 1048576
+  #     # Most JSON patches the gateway applies from one result, limiting how
+  #     # much a service can rewrite a request. Defaults to 32.
+  #     maxPatches: 32
+  #     bindings:
+  #       # RPC to intercept (`service` plus `method` also works). Only
+  #       # gateway mutation RPCs on the built-in interceptable list qualify.
+  #       - rpc: openshell.v1.OpenShell/CreateSandbox
+  #         # When the service runs. modify_operation can patch the request
+  #         # before it executes; validate can reject it; post_commit observes
+  #         # the committed result and requires failurePolicy: fail_open.
+  #         phases: [modify_operation, validate]
+  #         # Overrides the interceptor's failurePolicy for this binding.
+  #         failurePolicy: fail_closed
+  # -- Exact ordered provider-profile source set, rendered as
+  # `provider_profile_sources`. Entries are `{type: user}` or
+  # `{type: interceptor, name: <interceptor name>}`. Empty keeps the gateway
+  # default of imported profiles only.
+  providerProfileSources: []
+  # providerProfileSources:
+  #   # Profiles imported with `openshell provider profile import`. Include it
+  #   # to keep imported profiles alongside an interceptor's catalog.
+  #   - type: user
+  #   # Profiles supplied by a configured interceptor whose manifest
+  #   # advertises provider_profiles. Listing it alone makes that catalog
+  #   # authoritative.
+  #   - type: interceptor
+  #     name: governance
   # -- Additional volumes for the gateway pod.
   extraVolumes: []
   # -- Additional volume mounts for the gateway container.
