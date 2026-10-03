@@ -574,6 +574,7 @@ async fn handle_create_sandbox_inner(
     let now_ms = current_time_ms();
 
     let mut sandbox = Sandbox {
+        host_key_fingerprint: String::new(),
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: name.clone(),
@@ -1745,7 +1746,7 @@ async fn handle_start_sandbox_inner(
     }))
 }
 
-pub fn mint_persisted_authentication(
+pub async fn mint_persisted_authentication(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
@@ -1760,7 +1761,13 @@ pub fn mint_persisted_authentication(
     let identity =
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    authority.mint_persisted_launch(sandbox.object_id(), &identity)
+    let mut authentication = authority.mint_persisted_launch(sandbox.object_id(), &identity)?;
+    let mut with_identity = sandbox.clone();
+    state
+        .compute
+        .prepare_ssh_identity(&mut with_identity, &mut authentication)
+        .await?;
+    Ok(authentication)
 }
 
 async fn providers_for_sandbox(
@@ -3117,7 +3124,7 @@ pub(super) async fn handle_create_ssh_session(
         gateway_host,
         gateway_port: gateway_port.into(),
         gateway_scheme: scheme.to_string(),
-        host_key_fingerprint: String::new(),
+        host_key_fingerprint: sandbox.host_key_fingerprint.clone(),
         expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
             .map_err(|error| Status::internal(error.to_string()))?,
     }))
@@ -8342,11 +8349,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_create_ssh_session_prevents_duplicate_tokens() {
         let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_sandbox("work", Vec::new()))
-            .await
-            .unwrap();
+        let mut sandbox = test_sandbox("work", Vec::new());
+        sandbox.host_key_fingerprint = "SHA256:public-host-identity".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
 
         // Both requests try to create sessions for the same sandbox
         // The token generation is random, so we can't force a collision,
@@ -8386,8 +8391,12 @@ mod tests {
         assert!(result1.is_ok(), "first create should succeed");
         assert!(result2.is_ok(), "second create should succeed");
 
-        let token1 = result1.unwrap().into_inner().token;
-        let token2 = result2.unwrap().into_inner().token;
+        let response1 = result1.unwrap().into_inner();
+        let response2 = result2.unwrap().into_inner();
+        assert_eq!(response1.host_key_fingerprint, sandbox.host_key_fingerprint);
+        assert_eq!(response2.host_key_fingerprint, sandbox.host_key_fingerprint);
+        let token1 = response1.token;
+        let token2 = response2.token;
 
         // Tokens must be different
         assert_ne!(token1, token2, "tokens should be unique");

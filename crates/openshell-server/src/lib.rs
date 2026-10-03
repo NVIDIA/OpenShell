@@ -38,6 +38,7 @@ mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
@@ -414,6 +415,7 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
@@ -970,6 +972,7 @@ pub(crate) async fn run_server(
                         return Ok(Vec::new());
                     }
                     let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .await
                         .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&authentication)
                         .map_err(|error| format!("encode launch authentication: {error}"))

@@ -65,6 +65,24 @@ function readySandbox(
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
+describe('sandbox SSH host identity', () => {
+  it('exposes the fingerprint from get and list, and accepts legacy responses', async () => {
+    let fingerprint = 'SHA256:expected';
+    const sandbox = client({
+      getSandbox: () => ({
+        sandbox: { metadata: { id: 'id', name: 'work', workspace: 'default' }, hostKeyFingerprint: fingerprint },
+      }),
+      listSandboxes: () => ({
+        sandboxes: [{ metadata: { id: 'id', name: 'work', workspace: 'default' }, hostKeyFingerprint: fingerprint }],
+      }),
+    });
+    expect((await sandbox.get('work')).hostKeyFingerprint).toBe(fingerprint);
+    expect((await sandbox.list().all())[0]?.hostKeyFingerprint).toBe(fingerprint);
+    fingerprint = '';
+    expect((await sandbox.get('work')).hostKeyFingerprint).toBeUndefined();
+  });
+});
+
 describe('deletion outcomes', () => {
   it('defaults to strict deletion and preserves accepted identity and unknown values', async () => {
     const flags: boolean[] = [];

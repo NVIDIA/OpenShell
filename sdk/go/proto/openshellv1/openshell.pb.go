@@ -2270,6 +2270,10 @@ type Sandbox struct {
 	Spec *SandboxSpec `protobuf:"bytes,2,opt,name=spec,proto3" json:"spec,omitempty"`
 	// Latest user-facing observed status derived by the gateway.
 	Status *SandboxStatus `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
+	// Read-only SSH host identity in OpenSSH SHA256:<base64> form. Stable for
+	// this sandbox's lifetime, including runtime restarts. Empty on legacy
+	// runtimes that do not provide a gateway-managed SSH identity.
+	HostKeyFingerprint string `protobuf:"bytes,6,opt,name=host_key_fingerprint,json=hostKeyFingerprint,proto3" json:"host_key_fingerprint,omitempty"`
 	// Read-only provenance for sandboxes created from a reusable workload template.
 	CreatedFromWorkloadTemplate *SandboxWorkloadTemplateProvenance `protobuf:"bytes,20,opt,name=created_from_workload_template,json=createdFromWorkloadTemplate,proto3" json:"created_from_workload_template,omitempty"`
 	unknownFields               protoimpl.UnknownFields
@@ -2325,6 +2329,13 @@ func (x *Sandbox) GetStatus() *SandboxStatus {
 		return x.Status
 	}
 	return nil
+}
+
+func (x *Sandbox) GetHostKeyFingerprint() string {
+	if x != nil {
+		return x.HostKeyFingerprint
+	}
+	return ""
 }
 
 func (x *Sandbox) GetCreatedFromWorkloadTemplate() *SandboxWorkloadTemplateProvenance {
@@ -6060,7 +6071,8 @@ type CreateSshSessionResponse struct {
 	GatewayPort uint32 `protobuf:"varint,4,opt,name=gateway_port,json=gatewayPort,proto3" json:"gateway_port,omitempty"`
 	// Gateway scheme. Must be exactly "http" or "https".
 	GatewayScheme string `protobuf:"bytes,5,opt,name=gateway_scheme,json=gatewayScheme,proto3" json:"gateway_scheme,omitempty"`
-	// Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
+	// Expected sandbox SSH host identity in OpenSSH SHA256:<base64> form.
+	// Stable for the sandbox's lifetime. Empty only for legacy runtimes.
 	HostKeyFingerprint string `protobuf:"bytes,7,opt,name=host_key_fingerprint,json=hostKeyFingerprint,proto3" json:"host_key_fingerprint,omitempty"`
 	// Absolute expiry. Absence means no expiry.
 	ExpirationTime *timestamppb.Timestamp `protobuf:"bytes,108,opt,name=expiration_time,json=expirationTime,proto3" json:"expiration_time,omitempty"`
@@ -17890,11 +17902,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0flimit_supported\x18\x01 \x01(\bR\x0elimitSupported\"\x95\x01\n" +
 	"\x17GpuResourceCapabilities\x12>\n" +
 	"\x1bdefault_selection_supported\x18\x01 \x01(\bR\x19defaultSelectionSupported\x12:\n" +
-	"\x19count_selection_supported\x18\x02 \x01(\bR\x17countSelectionSupported\"\xce\x02\n" +
+	"\x19count_selection_supported\x18\x02 \x01(\bR\x17countSelectionSupported\"\x80\x03\n" +
 	"\aSandbox\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12-\n" +
 	"\x04spec\x18\x02 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x123\n" +
-	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06status\x12t\n" +
+	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06status\x120\n" +
+	"\x14host_key_fingerprint\x18\x06 \x01(\tR\x12hostKeyFingerprint\x12t\n" +
 	"\x1ecreated_from_workload_template\x18\x14 \x01(\v2/.openshell.v1.SandboxWorkloadTemplateProvenanceR\x1bcreatedFromWorkloadTemplateJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\x8a\x05\n" +
 	"\vSandboxSpec\x12\x1b\n" +
 	"\tlog_level\x18\x01 \x01(\tR\blogLevel\x12L\n" +
