@@ -161,7 +161,7 @@ shell provides a static Z3 library.
 
 ```bash
 # macOS
-brew install z3
+brew install z3 pkg-config
 
 # Ubuntu / Debian
 sudo apt install libz3-dev
