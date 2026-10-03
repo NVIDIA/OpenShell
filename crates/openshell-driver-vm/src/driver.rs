@@ -10226,6 +10226,7 @@ mod tests {
                 state_dir: state_dir.clone(),
                 process: None,
                 provisioning_task: None,
+                preparation: None,
                 gpu_bdf: None,
                 deleting: false,
             },
