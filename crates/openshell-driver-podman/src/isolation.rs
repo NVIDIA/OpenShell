@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::contract::{
-    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    IdentityComponentOrigin, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    root_identity_rejection_message,
 };
 use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -178,6 +179,39 @@ pub fn resolve_identity(
     } else {
         "policy"
     };
+    // Where each numeric component came from, for an actionable rejection
+    // message. This does not change which identity is resolved or enforced.
+    let uid_origin = if requested_user.is_empty() {
+        IdentityComponentOrigin::ImageUser
+    } else {
+        IdentityComponentOrigin::Policy
+    };
+    let gid_origin = if !requested_group.is_empty() {
+        IdentityComponentOrigin::Policy
+    } else if !group.is_empty() {
+        // The group came from the image's `USER` in its `user:group` form.
+        IdentityComponentOrigin::ImageUser
+    } else {
+        // The group was inherited from the user's `/etc/passwd` entry.
+        IdentityComponentOrigin::ImagePasswd
+    };
+    let image_reference = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .map(|template| template.image.trim())
+        .filter(|reference| !reference.is_empty())
+        .unwrap_or(image_id);
+    if let Some(message) = root_identity_rejection_message(
+        image_reference,
+        uid,
+        uid_origin,
+        gid,
+        gid_origin,
+        &supplemental,
+    ) {
+        return Err(invalid(message));
+    }
     ResolvedWorkloadIdentity::new(uid, gid, supplemental, source.into(), image_id.into())
         .map_err(invalid)
 }
@@ -464,7 +498,14 @@ mod tests {
         assert_eq!((identity.uid, identity.gid), (1000, 1001));
         assert_eq!(identity.supplementary_gids, vec![2000]);
         assert_eq!(identity.resource_digest, "sha256:pinned");
-        assert!(resolve_identity(&sandbox, "sha256:pinned", "root", passwd, groups).is_err());
+        let error = resolve_identity(&sandbox, "sha256:pinned", "root", passwd, groups)
+            .expect_err("a root image USER is rejected");
+        let message = error.to_string();
+        assert!(message.contains("sha256:pinned"));
+        assert!(message.contains("the image's `USER`"));
+        assert!(message.contains("UID 0"));
+        assert!(message.contains("process.run_as_user"));
+        assert!(!message.contains("descriptor error"));
         assert!(resolve_identity(&sandbox, "sha256:pinned", "2000", passwd, groups).is_err());
     }
 
