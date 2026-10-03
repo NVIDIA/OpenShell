@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway database persistence
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: requests 1Gi from the cluster default StorageClass by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: openshell-data
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 1Gi
+      - notExists:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+
+  - it: renders an explicitly set database storage size and StorageClass
+    template: templates/statefulset.yaml
+    set:
+      server.databaseStorageSize: 20Gi
+      server.databaseStorageClass: fast-ssd
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 20Gi
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: fast-ssd
