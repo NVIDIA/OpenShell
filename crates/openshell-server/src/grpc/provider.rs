@@ -1558,6 +1558,7 @@ fn resolve_dynamic_credentials_from_records(
             &mut dynamic_creds,
             &profile.to_proto(),
             &record.name,
+            &record.object_id,
         );
     }
     dynamic_creds
@@ -1567,12 +1568,21 @@ fn insert_dynamic_credentials_for_profile(
     dynamic_creds: &mut HashMap<String, ProviderProfileCredential>,
     profile: &ProviderProfile,
     provider_name: &str,
+    provider_id: &str,
 ) {
+    // Build the same profile rule used by policy composition. Display names and
+    // collision suffixes never participate in credential ownership.
+    let rule = openshell_core::proto::NetworkPolicyRule {
+        endpoints: profile.endpoints.clone(),
+        binaries: profile.binaries.clone(),
+        ..Default::default()
+    };
+    let owners = openshell_core::policy_identity::provider_token_grant_owners(provider_id, &rule);
     for credential in &profile.credentials {
         if credential.token_grant.is_none() {
             continue;
         }
-        for endpoint in &profile.endpoints {
+        for (endpoint, owner) in profile.endpoints.iter().zip(&owners) {
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
                 insert_dynamic_credentials_for_endpoint(
                     dynamic_creds,
@@ -1582,6 +1592,7 @@ fn insert_dynamic_credentials_for_profile(
                     provider_name,
                     &credential.name,
                     credential,
+                    owner,
                 );
             }
         }
@@ -1602,9 +1613,10 @@ fn dynamic_credential_key(
     path: &str,
     provider_name: &str,
     credential_name: &str,
+    owner: &str,
 ) -> String {
     format!(
-        "{}\t{port}\t{}\t{}:{}",
+        "{}\t{port}\t{}\t{owner}\t{}:{}",
         host.to_ascii_lowercase(),
         path,
         provider_name,
@@ -1620,6 +1632,7 @@ fn insert_dynamic_credentials_for_endpoint(
     provider_name: &str,
     credential_name: &str,
     credential: &ProviderProfileCredential,
+    owner: &str,
 ) {
     let default_key = dynamic_credential_key(
         endpoint_host,
@@ -1627,8 +1640,12 @@ fn insert_dynamic_credentials_for_endpoint(
         endpoint_path,
         provider_name,
         credential_name,
+        owner,
     );
-    dynamic_creds.insert(default_key, resolved_dynamic_credential(credential, None));
+    dynamic_creds.insert(
+        default_key,
+        resolved_dynamic_credential(credential, None, owner),
+    );
 
     let Some(token_grant) = credential.token_grant.as_ref() else {
         return;
@@ -1660,10 +1677,11 @@ fn insert_dynamic_credentials_for_endpoint(
             override_path,
             provider_name,
             credential_name,
+            owner,
         );
         dynamic_creds.insert(
             override_key,
-            resolved_dynamic_credential(credential, Some(override_config)),
+            resolved_dynamic_credential(credential, Some(override_config), owner),
         );
     }
 }
@@ -1671,8 +1689,11 @@ fn insert_dynamic_credentials_for_endpoint(
 fn resolved_dynamic_credential(
     credential: &ProviderProfileCredential,
     override_config: Option<&ProviderCredentialTokenGrantAudienceOverride>,
+    owner: &str,
 ) -> ProviderProfileCredential {
     let mut credential = credential.clone();
+    // Authored profile metadata cannot nominate its own policy authority.
+    credential.token_grant_owners = vec![owner.to_string()];
     if let Some(token_grant) = credential.token_grant.as_mut() {
         if let Some(override_config) = override_config {
             if !override_config.audience.is_empty() {
@@ -5387,6 +5408,7 @@ mod tests {
             query_param: String::new(),
             refresh: None,
             path_template: String::new(),
+            token_grant_owners: vec!["untrusted-profile-owner".to_string()],
             token_grant: Some(ProviderCredentialTokenGrant {
                 grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
@@ -5438,16 +5460,69 @@ mod tests {
         };
 
         let mut dynamic_creds = HashMap::new();
-        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak");
+        insert_dynamic_credentials_for_profile(
+            &mut dynamic_creds,
+            &profile,
+            "keycloak",
+            "provider-uid",
+        );
 
         assert_eq!(dynamic_creds.len(), 4);
         for (host, audience) in service_audiences {
-            let key = dynamic_credential_key(host, 80, "", "keycloak", "access_token");
-            let grant = dynamic_creds[&key].token_grant.as_ref().unwrap();
+            let (key, credential) = dynamic_creds
+                .iter()
+                .find(|(key, _)| key.starts_with(host))
+                .unwrap();
+            assert_eq!(credential.token_grant_owners.len(), 1);
+            assert_ne!(credential.token_grant_owners[0], "untrusted-profile-owner");
+            assert!(key.contains(&credential.token_grant_owners[0]));
+            let grant = credential.token_grant.as_ref().unwrap();
             assert_eq!(grant.audience, audience);
             assert_eq!(grant.scopes, vec![audience.to_string()]);
             assert!(grant.audience_overrides.is_empty());
         }
+    }
+
+    #[test]
+    fn overlapping_override_selectors_preserve_their_original_endpoint_owners() {
+        let mut credential = token_grant_credential("access_token");
+        credential.token_grant.as_mut().unwrap().audience_overrides =
+            vec![ProviderCredentialTokenGrantAudienceOverride {
+                path: "/api/private/**".into(),
+                audience: "private-resource".into(),
+                ..Default::default()
+            }];
+        let profile = ProviderProfile {
+            credentials: vec![credential],
+            endpoints: ["/api/**", "/api/private/**"]
+                .into_iter()
+                .map(|path| NetworkEndpoint {
+                    host: "api.example.test".into(),
+                    port: 443,
+                    path: path.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut credentials = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut credentials, &profile, "api", "provider-uid");
+        let private: Vec<_> = credentials
+            .iter()
+            .filter(|(key, _)| key.starts_with("api.example.test\t443\t/api/private/**\t"))
+            .collect();
+        assert_eq!(
+            private.len(),
+            2,
+            "identical override selectors cannot erase an owner"
+        );
+        assert_ne!(
+            private[0].1.token_grant_owners,
+            private[1].1.token_grant_owners
+        );
+        assert!(private.iter().all(|(_, credential)| {
+            credential.token_grant.as_ref().unwrap().audience == "private-resource"
+        }));
     }
 
     async fn import_token_grant_profile(
@@ -6225,6 +6300,7 @@ mod tests {
 
     fn refreshable_credential(name: &str, env_var: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
+            token_grant_owners: Vec::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: vec![env_var.to_string()],
@@ -6294,6 +6370,7 @@ mod tests {
 
     fn static_credential(name: &str, env_var: &str, required: bool) -> ProviderProfileCredential {
         ProviderProfileCredential {
+            token_grant_owners: Vec::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: vec![env_var.to_string()],
@@ -6309,6 +6386,7 @@ mod tests {
 
     fn token_grant_credential(name: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
+            token_grant_owners: Vec::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: Vec::new(),
@@ -10422,6 +10500,7 @@ mod tests {
                             name: "access_token".to_string(),
                             description: String::new(),
                             env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
+                            token_grant_owners: Vec::new(),
                             required: true,
                             auth_style: "bearer".to_string(),
                             header_name: "authorization".to_string(),

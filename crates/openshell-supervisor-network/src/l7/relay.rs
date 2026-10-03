@@ -31,9 +31,13 @@ use openshell_ocsf::{
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
+
+#[cfg(test)]
+mod token_grant_ownership_tests;
 
 const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
@@ -67,6 +71,10 @@ pub struct L7EvalContext {
     /// resolver. Used to reject a request if credentials change again before
     /// its first upstream write.
     pub(crate) provider_credential_revision: Option<u64>,
+    /// Installation that supplied an inspected request's dynamic credentials.
+    /// Repairs may retain the revision, so keep this identity across the grant
+    /// await and the final static-credential scoping before the upstream write.
+    pub(crate) provider_credential_installation_id: Option<String>,
     pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
@@ -106,7 +114,11 @@ fn scoped_context_for_request(
         // signing attempt fail closed before an upstream write.
         scoped.secret_resolver = None;
         scoped.body_classifier = None;
-        scoped.provider_credential_revision = None;
+        // A dynamic grant may already be installed on this request. Keep its
+        // generation pin across body buffering even without static authority.
+        if scoped.provider_credential_installation_id.is_none() {
+            scoped.provider_credential_revision = None;
+        }
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
@@ -121,10 +133,74 @@ fn scoped_context_for_request(
 fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
-    Some(crate::l7::rest::CredentialGenerationGuard::new(
-        ctx.provider_credentials.as_ref()?,
-        ctx.provider_credential_revision?,
-    ))
+    Some(
+        crate::l7::rest::CredentialGenerationGuard::new(
+            ctx.provider_credentials.as_ref()?,
+            ctx.provider_credential_revision?,
+        )
+        .with_installation_id(ctx.provider_credential_installation_id.as_deref()),
+    )
+}
+
+/// Resolve a grant from the provider installation and policy owners admitted
+/// for this request. Provider refresh is independent of tunnel lifetime: the
+/// connection's original dynamic map cannot authorize a later request.
+async fn inject_inspected_request_grant(
+    req: crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    engine: &TunnelPolicyEngine,
+    config: &L7EndpointConfig,
+    request_info: &L7RequestInfo,
+) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
+    let mut scoped = ctx.clone();
+    if let Some(state) = &ctx.provider_credentials {
+        let snapshot = state.snapshot();
+        scoped.provider_credential_revision = Some(snapshot.revision);
+        scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+        scoped.dynamic_credentials = Some(Arc::new(std::sync::RwLock::new(
+            crate::proxy::revision_scoped_dynamic_credentials(&snapshot),
+        )));
+    }
+
+    // Middleware can replace an inspected body. Recompute owner admission for
+    // the body that will be sent, even when another endpoint allowed both the
+    // original and transformed requests. Request method/path/query are immutable.
+    let mut current_info = request_info.clone();
+    match config.protocol {
+        L7Protocol::Graphql => {
+            let body = req
+                .raw_header
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .and_then(|end| req.raw_header.get(end + 4..))
+                .unwrap_or_default();
+            current_info.graphql = Some(crate::l7::graphql::classify_request(&req, body));
+        }
+        L7Protocol::JsonRpc | L7Protocol::Mcp => {
+            let mut options = crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+            if let Some(revision) = request_info
+                .jsonrpc
+                .as_ref()
+                .and_then(|info| info.mcp_revision)
+            {
+                options = options.with_mcp_revision(revision);
+            }
+            current_info.jsonrpc = Some(crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+                &req, options,
+            )?);
+        }
+        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
+    }
+    let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+    let req =
+        crate::l7::token_grant_injection::inject_for_admitted_owners(req, &scoped, &owners).await?;
+    if engine.is_stale() {
+        return Err(miette!("policy changed during token grant resolution"));
+    }
+    if let Some(guard) = credential_generation_guard(&scoped) {
+        guard.ensure_current()?;
+    }
+    Ok((req, scoped))
 }
 
 fn request_authority_matches_endpoint(
@@ -1257,18 +1333,6 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            // Credential scoping can acquire a newer revision after middleware.
-            // Bind its actual snapshot to the original authority, never a fresh
-            // epoch; the earlier handle served only pre-forward local decisions.
-            let observer = EndpointObserver::begin_captured(
-                ctx.endpoint_observation_tx.as_ref(),
-                config,
-                observation_context.as_ref(),
-                ctx.provider_credential_revision,
-                Some(engine.generation_guard()),
-            );
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -1302,6 +1366,39 @@ where
             } else {
                 None
             };
+            let (req, grant_ctx) = match inject_inspected_request_grant(
+                req,
+                ctx,
+                &engine,
+                config,
+                &request_info,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(error = %error, "Token grant failed in route-selected relay");
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                            .await;
+                    }
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+            };
+            // Static revocation can retain the provider revision. Scope static
+            // material after the grant await and retain the pinned installation
+            // through the first upstream write.
+            let scoped_ctx = scoped_context_for_request(&grant_ctx, &req);
+            let ctx = scoped_ctx.as_ref().unwrap_or(&grant_ctx);
+            let observer = EndpointObserver::begin_captured(
+                ctx.endpoint_observation_tx.as_ref(),
+                config,
+                observation_context.as_ref(),
+                ctx.provider_credential_revision,
+                Some(engine.generation_guard()),
+            );
             let outcome_result = relay_http_request_with_credential_rejection_observed(
                 &req,
                 client,
@@ -2068,9 +2165,10 @@ where
             } else {
                 None
             };
-            let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
-                    Ok(req) => req,
+            let (req_with_auth, grant_ctx) =
+                match inject_inspected_request_grant(req, ctx, engine, config, &request_info).await
+                {
+                    Ok(result) => result,
                     Err(e) => {
                         warn!(
                             host = %ctx.host,
@@ -2078,12 +2176,19 @@ where
                             error = %e,
                             "Token grant failed in L7 relay"
                         );
+                        if let Some(session) = middleware_session.take() {
+                            session
+                                .end(
+                                    openshell_core::proto::MiddlewareSessionEndReason::Cancellation,
+                                )
+                                .await;
+                        }
                         write_bad_gateway_response(client).await?;
                         return Ok(());
                     }
                 };
-            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+            let scoped_ctx = scoped_context_for_request(&grant_ctx, &req_with_auth);
+            let ctx = scoped_ctx.as_ref().unwrap_or(&grant_ctx);
 
             // Forward request to upstream and relay response
             let outcome_result = relay_http_request_with_credential_rejection(
@@ -3248,6 +3353,85 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
     })
 }
 
+/// A batch may be allowed by several endpoints, but one credential owner must
+/// admit every member before its token can authenticate the combined request.
+fn admitted_token_grant_owners(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if let Some(jsonrpc) = &request.jsonrpc
+        && jsonrpc.is_batch
+        && !jsonrpc.calls.is_empty()
+    {
+        let mut owners = if jsonrpc.has_response {
+            Some(admitted_token_grant_owners_once(engine, ctx, request)?)
+        } else {
+            None
+        };
+        for call in &jsonrpc.calls {
+            let admitted = admitted_token_grant_owners_once(
+                engine,
+                ctx,
+                &jsonrpc_request_for_call(request, call),
+            )?;
+            if let Some(owners) = &mut owners {
+                owners.retain(|owner| admitted.contains(owner));
+            } else {
+                owners = Some(admitted);
+            }
+        }
+        return Ok(owners.unwrap_or_default());
+    }
+    admitted_token_grant_owners_once(engine, ctx, request)
+}
+
+fn admitted_token_grant_owners_once(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if engine.is_stale() {
+        return Err(miette!("policy changed before token grant selection"));
+    }
+    let mut engine = engine
+        .engine()
+        .lock()
+        .map_err(|_| miette!("OPA engine lock poisoned"))?;
+    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    let owners = engine
+        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+        .map_err(|error| miette!("{error}"))?;
+    let regorus::Value::Array(owners) = owners else {
+        return Err(miette!("invalid credential owner admission result"));
+    };
+    owners
+        .iter()
+        .map(|owner| match owner {
+            regorus::Value::String(owner) => Ok(owner.to_string()),
+            _ => Err(miette!("invalid credential owner identity")),
+        })
+        .collect()
+}
+
+fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+    serde_json::json!({
+        "network": { "host": ctx.host, "port": ctx.port },
+        "exec": {
+            "path": ctx.binary_path,
+            "ancestors": ctx.ancestors,
+            "cmdline_paths": ctx.cmdline_paths,
+        },
+        "request": {
+            "method": request.action,
+            "path": request.target,
+            "query_params": request.query_params.clone(),
+            "graphql": request.graphql.clone(),
+            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
+        }
+    })
+}
+
 fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -3261,24 +3445,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = serde_json::json!({
-        "network": {
-            "host": ctx.host,
-            "port": ctx.port,
-        },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    });
+    let input = l7_request_policy_input(ctx, request);
 
     let mut engine = engine
         .engine()
@@ -4189,6 +4356,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
@@ -4564,6 +4732,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:

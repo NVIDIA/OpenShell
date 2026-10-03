@@ -213,7 +213,7 @@ pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.docker.internal",
 ];
 
-fn revision_scoped_dynamic_credentials(
+pub(crate) fn revision_scoped_dynamic_credentials(
     snapshot: &ProviderCredentialSnapshot,
 ) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
     snapshot
@@ -221,11 +221,16 @@ fn revision_scoped_dynamic_credentials(
         .iter()
         .map(|(key, credential)| {
             let scoped_key = key.rsplit_once('\t').map_or_else(
-                || format!("rev:{}\t{key}", snapshot.revision),
+                || {
+                    format!(
+                        "rev:{}\tinstallation:{}\t{key}",
+                        snapshot.revision, snapshot.installation_id
+                    )
+                },
                 |(endpoint_selector, provider_credential)| {
                     format!(
-                        "{endpoint_selector}\trev:{}\t{provider_credential}",
-                        snapshot.revision
+                        "{endpoint_selector}\trev:{}\tinstallation:{}\t{provider_credential}",
+                        snapshot.revision, snapshot.installation_id
                     )
                 },
             );
@@ -10176,7 +10181,7 @@ network_policies:
             },
         );
         let snapshot = ProviderCredentialSnapshot {
-            installation_id: String::new(),
+            installation_id: "fixture-installation".to_string(),
             revision: 42,
             child_env: std::collections::HashMap::new(),
             dynamic_credentials,
@@ -10185,7 +10190,7 @@ network_policies:
         let scoped = revision_scoped_dynamic_credentials(&snapshot);
 
         assert!(
-            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tprovider:access_token")
+            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tinstallation:fixture-installation\tprovider:access_token")
         );
     }
 

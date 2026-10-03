@@ -246,6 +246,25 @@ allow_request if {
 	not deny_request
 }
 
+# Credentials require the admission of their own endpoint. A sibling endpoint's
+# allow can authorize forwarding, but cannot authorize this endpoint's grant.
+# Keep every admitting owner so overlapping allows retain union semantics, and
+# preserve the global deny decision before any caller selects a credential.
+# Missing owner metadata grants no credential authority. Sorting a set gives
+# consumers a deterministic array without duplicate owner identifiers.
+allowed_token_grant_owners := sort({owner |
+	some name
+	policy := data.network_policies[name]
+	binary_allowed(policy, input.exec)
+	some endpoint in policy.endpoints
+	endpoint_matches_l7_request(endpoint, input.network, input.request)
+	request_allowed_for_endpoint(input.request, endpoint)
+	owner := object.get(endpoint, "token_grant_owner", "")
+	is_string(owner)
+	owner != ""
+	not deny_request
+})
+
 # --- L7 deny rules ---
 #
 # Deny rules are evaluated after allow rules and take precedence.

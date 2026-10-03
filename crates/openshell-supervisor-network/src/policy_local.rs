@@ -1191,6 +1191,7 @@ fn network_endpoint_from_json(
         .collect();
 
     Ok(NetworkEndpoint {
+        token_grant_owner: String::new(),
         host: endpoint.host,
         port,
         protocol: endpoint.protocol,

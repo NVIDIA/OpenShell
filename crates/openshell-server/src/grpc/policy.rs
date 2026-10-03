@@ -12,6 +12,8 @@
 
 mod endpoint_status;
 mod provisioning_clock;
+#[cfg(test)]
+mod token_grant_owners_tests;
 pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::{
@@ -1921,7 +1923,9 @@ async fn current_effective_policy_for_sandbox(
         &provider_names,
     )
     .await?;
-    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records).await
+    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records)
+        .await
+        .map(|(policy, _)| policy)
 }
 
 async fn current_effective_policy_from_records(
@@ -1930,7 +1934,7 @@ async fn current_effective_policy_from_records(
     sandbox: &Sandbox,
     sandbox_id: &str,
     records: &[super::provider::ProviderEnvironmentRecord],
-) -> Result<ProtoSandboxPolicy, Status> {
+) -> Result<(ProtoSandboxPolicy, PolicySource), Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
         // A global policy is the complete effective policy. Dormant sandbox
@@ -1940,7 +1944,8 @@ async fn current_effective_policy_from_records(
             provider_policy_context_from_records(catalog, records),
             global_policy,
             PolicySource::Global,
-        );
+        )
+        .map(|policy| (policy, PolicySource::Global));
     }
 
     let policy = if let Some(record) = state
@@ -1964,6 +1969,7 @@ async fn current_effective_policy_from_records(
         policy,
         PolicySource::Sandbox,
     )
+    .map(|policy| (policy, PolicySource::Sandbox))
 }
 
 async fn effective_policy_for_source(
@@ -2027,6 +2033,9 @@ fn apply_captured_policy_context(
         &provider_context.endpointless_provider_names,
     );
     stamp_provider_credentialed_endpoints(&mut policy, &provider_context.credentialed_scopes);
+    if matches!(policy_source, PolicySource::Global) {
+        openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
+    }
 
     Ok(policy)
 }
@@ -2936,6 +2945,9 @@ pub(super) async fn load_sandbox_config(
             effective_policy,
             &provider_policy_context.credentialed_scopes,
         );
+        if matches!(policy_source, PolicySource::Global) {
+            openshell_core::policy_identity::stamp_global_token_grant_owners(effective_policy);
+        }
         if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
             configuration_error = bounded_configuration_diagnostic(error.message());
         }
@@ -2976,6 +2988,9 @@ pub(super) async fn load_sandbox_config(
         &provider_profile_catalog,
         &provider_records,
         &policy_credential_bindings,
+        policy
+            .as_ref()
+            .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
     Ok(GetSandboxConfigResponse {
@@ -3113,6 +3128,7 @@ fn compute_provider_env_revision_from_records(
         catalog,
         records,
         &HashMap::new(),
+        None,
     )
 }
 
@@ -3120,6 +3136,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[super::provider::ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    global_policy: Option<&ProtoSandboxPolicy>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-env-revision-v4");
@@ -3155,6 +3172,13 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     }
 
     hash_policy_credential_bindings(policy_bindings, &mut hasher);
+
+    if let Some(policy) = global_policy {
+        // Global policy replaces the grant owner list. Its changes must trigger
+        // a provider refetch even when the attached provider records are unchanged.
+        hasher.update(b"global-token-grant-authority");
+        hasher.update(deterministic_policy_hash(policy).as_bytes());
+    }
 
     let digest = hasher.finalize();
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
@@ -3310,6 +3334,11 @@ fn provider_policy_context_from_records(
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
         let mut rule = profile.network_policy_rule(&rule_name);
+        let owners =
+            openshell_core::policy_identity::provider_token_grant_owners(&record.object_id, &rule);
+        for (endpoint, owner) in rule.endpoints.iter_mut().zip(owners) {
+            endpoint.token_grant_owner = owner;
+        }
         if rule.endpoints.is_empty() {
             endpointless_provider_names.insert(name.clone());
         }
@@ -3397,6 +3426,7 @@ pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolic
     for rule in policy.network_policies.values_mut() {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
+            endpoint.token_grant_owner.clear();
         }
     }
 }
@@ -3548,7 +3578,7 @@ pub(super) async fn load_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_from_records(
+    let (effective_policy, policy_source) = current_effective_policy_from_records(
         state.as_ref(),
         &provider_profile_catalog,
         sandbox,
@@ -3568,6 +3598,7 @@ pub(super) async fn load_sandbox_provider_environment(
         &provider_profile_catalog,
         &provider_records,
         &policy_credential_bindings,
+        matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
     )?;
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
@@ -3579,6 +3610,25 @@ pub(super) async fn load_sandbox_provider_environment(
             Some(&sandbox_id),
         )
         .await?;
+
+    if matches!(policy_source, PolicySource::Global) {
+        // A global policy replaces provider ACLs. Grants retain their profile
+        // destination selectors, but only the selected global endpoint may
+        // authorize their use. Keeping every global owner avoids reimplementing
+        // host/path intersection here; the relay checks both selectors.
+        let mut owners: Vec<_> = effective_policy
+            .network_policies
+            .values()
+            .flat_map(|rule| &rule.endpoints)
+            .map(|endpoint| endpoint.token_grant_owner.clone())
+            .filter(|owner| !owner.is_empty())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        for credential in provider_environment.dynamic_credentials.values_mut() {
+            credential.token_grant_owners.clone_from(&owners);
+        }
+    }
 
     let mut readiness_reason = provider_environment.readiness_reason;
 
@@ -11072,7 +11122,7 @@ mod tests {
         assert!(loaded.spec.unwrap().policy.is_none());
     }
 
-    fn test_provider(name: &str, provider_type: &str) -> Provider {
+    pub(super) fn test_provider(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),

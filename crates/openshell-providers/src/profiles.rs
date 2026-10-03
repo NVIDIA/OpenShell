@@ -997,6 +997,7 @@ impl ProviderTypeProfile {
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                     path_template: credential.path_template.clone(),
                     token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
+                    token_grant_owners: Vec::new(),
                 })
                 .collect(),
             files: self
@@ -1660,6 +1661,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
         allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
         provider_credentialed: false,
+        token_grant_owner: String::new(),
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
