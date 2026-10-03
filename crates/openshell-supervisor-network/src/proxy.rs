@@ -2400,7 +2400,8 @@ async fn handle_mediated_connection(
     // connect and before `200 Connection Established`.
     hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
-    let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
+    let credential_guard =
+        query_endpoint_credential_guard(&network_engine, &decision, &host_lc, port)?;
     // Route materialization is safe before destination dialing and lets an
     // unambiguous MCP authority report local fail-closed outcomes that occur
     // before the HTTP request path becomes available.
@@ -3572,7 +3573,7 @@ fn query_tls_mode(decision: &EgressDecision, _host: &str, _port: u16) -> crate::
 }
 
 fn query_endpoint_credential_guard(
-    engine: &OpaEngine,
+    engine: &PolicyEngine,
     decision: &EgressDecision,
     host: &str,
     port: u16,
@@ -3593,7 +3594,7 @@ fn query_endpoint_credential_guard(
         ancestors: decision.ancestors.clone(),
         cmdline_paths: decision.cmdline_paths.clone(),
     };
-    let values = engine.query_endpoint_credential_guards(&input)?;
+    let values = engine.endpoint_credential_guards(&input)?;
     let credentialed: Vec<_> = values
         .iter()
         .map(crate::l7::parse_endpoint_credential_guard)

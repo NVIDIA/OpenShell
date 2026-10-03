@@ -137,6 +137,15 @@ impl McpWireProfile {
 #[serde(deny_unknown_fields)]
 pub struct PolicyDocument {
     pub version: u32,
+    /// Cedar policy text. When present, Cedar decides network, per-request,
+    /// and filesystem access, and `network_policies` and `filesystem_policy`
+    /// must be absent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cedar_policy: Option<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_optional_field",
@@ -657,6 +666,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
         "",
         &[
             "version",
+            "cedar_policy",
             "filesystem_policy",
             "landlock",
             "process",

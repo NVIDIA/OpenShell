@@ -24,6 +24,14 @@
 //! eligibility is covered separately by
 //! [`CedarOnlyEngine::policy_dns_eligibility_snapshot`].
 //!
+//! Provider credentials work the same way as for YAML sandboxes, except that
+//! providers never grant access: the gateway delivers attached providers'
+//! rules in `SandboxPolicy.provider_credential_rules`, and for a connection
+//! Cedar allows, each matching provider endpoint contributes its credential
+//! settings (credential marker, rewrite options, request signing) to
+//! `endpoint_configs` and to the credential guard. Whether the connection is
+//! inspected per request is still Cedar's decision.
+//!
 //! Every read of the generation counter happens under the engine lock, and
 //! [`CedarOnlyEngine::commit`] advances it under the write lock, so a
 //! decision is always reported against the generation of the policy that
@@ -33,7 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use miette::Result;
-use openshell_policy_cedar::{CedarEngine, Decision, L7Request, NetworkRequest};
+use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
+use openshell_policy_cedar::{CedarEngine, Decision, L7Request, NetworkRequest, normalize_host};
 use tokio::sync::watch;
 
 use crate::opa::{
@@ -65,6 +74,186 @@ fn network_request_from_input(input: &NetworkInput) -> NetworkRequest {
     }
 }
 
+/// The active Cedar policy and the provider settings delivered with it.
+///
+/// Swapped as one unit on reload so a decision never pairs one revision's
+/// Cedar policy with another revision's provider settings.
+#[derive(Debug)]
+struct LoadedPolicy {
+    cedar: CedarEngine,
+    providers: Vec<ProviderEndpoint>,
+}
+
+impl LoadedPolicy {
+    fn from_proto(policy: &ProtoSandboxPolicy) -> Result<Self> {
+        let cedar = CedarEngine::from_policy_str(&policy.cedar_policy_source)
+            .map_err(|e| miette::miette!("{e}"))?;
+        let mut providers = Vec::new();
+        for rule in policy.provider_credential_rules.values() {
+            for endpoint in &rule.endpoints {
+                providers.push(ProviderEndpoint::from_proto(endpoint));
+            }
+        }
+        Ok(Self { cedar, providers })
+    }
+
+    /// Builds the endpoint configs for an allowed connection to `host:port`.
+    ///
+    /// Each matching provider endpoint contributes its settings, with its
+    /// own L7 rules removed and its protocol replaced by Cedar's inspection
+    /// decision. When Cedar inspects the endpoint and no provider endpoint
+    /// covers every path, a path-less config keeps the remaining paths
+    /// inspected.
+    fn endpoint_configs(&self, host: &str, port: u16) -> Result<Vec<regorus::Value>> {
+        let protocol = self
+            .cedar
+            .l7_protocol(host, port)
+            .map(openshell_policy_cedar::L7Protocol::as_str);
+        let host = normalize_host(host);
+        let mut configs: Vec<serde_json::Value> = self
+            .providers
+            .iter()
+            .filter(|endpoint| endpoint.matches(&host, port))
+            .map(|endpoint| with_cedar_inspection(endpoint.config.clone(), protocol))
+            .collect();
+        let covers_every_path = configs.iter().any(|config| config.get("path").is_none());
+        if let Some(protocol) = protocol
+            && !covers_every_path
+        {
+            configs.push(serde_json::json!({
+                "protocol": protocol,
+                "enforcement": ENFORCEMENT_ENFORCE,
+            }));
+        }
+        configs
+            .into_iter()
+            .map(|config| {
+                serde_json::from_value::<regorus::Value>(config)
+                    .map_err(|e| miette::miette!("failed to build Cedar L7 endpoint config: {e}"))
+            })
+            .collect()
+    }
+}
+
+/// One attached provider endpoint, used only for its credential settings.
+#[derive(Debug, Clone)]
+struct ProviderEndpoint {
+    /// Lowercased host or host glob; empty for a host-less `allowed_ips` endpoint.
+    host: String,
+    ports: Vec<u16>,
+    /// The endpoint in the shape the L7 config parser reads.
+    config: serde_json::Value,
+}
+
+impl ProviderEndpoint {
+    fn from_proto(endpoint: &openshell_core::proto::NetworkEndpoint) -> Self {
+        let ports = if endpoint.ports.is_empty() {
+            vec![endpoint.port]
+        } else {
+            endpoint.ports.clone()
+        };
+        Self {
+            host: endpoint.host.to_ascii_lowercase(),
+            ports: ports
+                .into_iter()
+                .filter_map(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .collect(),
+            // MCP endpoint identity is irrelevant here: Cedar never selects
+            // MCP inspection, so no policy hash is needed.
+            config: crate::opa::endpoint_policy_value(endpoint, ""),
+        }
+    }
+
+    /// Matches like the Rego `endpoint_matches_request` rule.
+    fn matches(&self, host: &str, port: u16) -> bool {
+        if !self.ports.contains(&port) {
+            return false;
+        }
+        if self.host.is_empty() {
+            return self
+                .config
+                .get("allowed_ips")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ips| !ips.is_empty());
+        }
+        if self.host.contains('*') {
+            openshell_core::host_pattern::host_matches(&self.host, host).unwrap_or(false)
+        } else {
+            self.host == host
+        }
+    }
+}
+
+/// Endpoint settings that describe per-request rules or inspection mode.
+///
+/// Removed from provider endpoints: on a Cedar sandbox, Cedar's
+/// `HttpRequest` policies are the per-request rules and decide inspection.
+const PROVIDER_RULE_KEYS: &[&str] = &[
+    "protocol",
+    "enforcement",
+    "access",
+    "rules",
+    "deny_rules",
+    "persisted_queries",
+    "graphql_persisted_queries",
+    "mcp_versions",
+    "mcp_strict_tool_names",
+    "mcp_allow_all_known_mcp_methods",
+    "endpoint_id",
+    "policy_hash",
+];
+
+/// Replaces a provider endpoint's rules and protocol with Cedar's decision.
+fn with_cedar_inspection(
+    mut config: serde_json::Value,
+    protocol: Option<&str>,
+) -> serde_json::Value {
+    if let Some(fields) = config.as_object_mut() {
+        for key in PROVIDER_RULE_KEYS {
+            fields.remove(*key);
+        }
+        if let Some(protocol) = protocol {
+            fields.insert("protocol".to_string(), protocol.into());
+            fields.insert("enforcement".to_string(), ENFORCEMENT_ENFORCE.into());
+        }
+    }
+    config
+}
+
+/// The Cedar text and provider rules a [`LoadedPolicy`] was built from.
+///
+/// Compared on reload so an unchanged policy keeps the current generation.
+#[derive(Debug, Clone, PartialEq)]
+struct PolicyInputs {
+    source: String,
+    /// Provider rules sorted by key; protobuf maps have no stable order.
+    provider_rules: Vec<(String, openshell_core::proto::NetworkPolicyRule)>,
+}
+
+impl PolicyInputs {
+    fn from_proto(policy: &ProtoSandboxPolicy) -> Self {
+        let mut provider_rules: Vec<_> = policy
+            .provider_credential_rules
+            .iter()
+            .map(|(key, rule)| (key.clone(), rule.clone()))
+            .collect();
+        provider_rules.sort_by(|left, right| left.0.cmp(&right.0));
+        Self {
+            source: policy.cedar_policy_source.clone(),
+            provider_rules,
+        }
+    }
+}
+
+/// Builds a policy holding only Cedar text, for callers without provider rules.
+fn policy_from_source(policy_src: &str) -> ProtoSandboxPolicy {
+    ProtoSandboxPolicy {
+        cedar_policy_source: policy_src.to_string(),
+        ..Default::default()
+    }
+}
+
 /// Cedar-backed, fully authoritative network policy evaluator.
 ///
 /// No hidden fallback to OPA: a sandbox either uses this engine for every
@@ -74,35 +263,41 @@ fn network_request_from_input(input: &NetworkInput) -> NetworkRequest {
 pub struct CedarOnlyEngine {
     /// Shared with every [`CedarL7TunnelEngine`] handed out by
     /// [`Self::l7_handle`].
-    engine: Arc<RwLock<CedarEngine>>,
-    /// The currently-loaded policy source, so [`Self::reload_from_policy_str`]
-    /// can no-op on an unchanged reload instead of unconditionally advancing
-    /// the generation. An unconditional bump here would invalidate every
-    /// in-flight L7 tunnel on every policy-poll reconciliation pass — even
-    /// one triggered by something unrelated to this sandbox's Cedar policy
-    /// (e.g. middleware registry reconciliation) — not just a real change.
-    source: RwLock<String>,
+    engine: Arc<RwLock<LoadedPolicy>>,
+    /// What the active policy was built from, so a reload with unchanged
+    /// inputs keeps the generation. Advancing it would close every inspected
+    /// tunnel on each policy-poll reconciliation, even one unrelated to this
+    /// sandbox's policy (for example a middleware registry change).
+    inputs: RwLock<PolicyInputs>,
     generation: Arc<AtomicU64>,
     generation_tx: watch::Sender<u64>,
 }
 
 impl CedarOnlyEngine {
-    /// Parses and validates `policy_src` (`.cedar` syntax) and builds the engine.
+    /// Builds the engine from a policy's Cedar text and provider rules.
     ///
     /// # Errors
     ///
-    /// Returns an error if `policy_src` fails to parse, fails schema
+    /// Returns an error if the Cedar text fails to parse, fails schema
     /// validation, or uses a policy shape Cedar cannot enforce exactly.
-    pub fn from_policy_str(policy_src: &str) -> Result<Self> {
-        let engine =
-            CedarEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
+    pub fn from_proto(policy: &ProtoSandboxPolicy) -> Result<Self> {
+        let loaded = LoadedPolicy::from_proto(policy)?;
         let (generation_tx, _) = watch::channel(0);
         Ok(Self {
-            engine: Arc::new(RwLock::new(engine)),
-            source: RwLock::new(policy_src.to_string()),
+            engine: Arc::new(RwLock::new(loaded)),
+            inputs: RwLock::new(PolicyInputs::from_proto(policy)),
             generation: Arc::new(AtomicU64::new(0)),
             generation_tx,
         })
+    }
+
+    /// Builds the engine from Cedar text alone, with no provider rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `policy_src` fails to load (see [`Self::from_proto`]).
+    pub fn from_policy_str(policy_src: &str) -> Result<Self> {
+        Self::from_proto(&policy_from_source(policy_src))
     }
 
     /// Returns the active policy generation, advanced by each committed reload.
@@ -155,7 +350,7 @@ impl CedarOnlyEngine {
         Ok(Some(operation(current_generation)))
     }
 
-    fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, CedarEngine>> {
+    fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, LoadedPolicy>> {
         self.engine
             .read()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))
@@ -175,11 +370,11 @@ impl CedarOnlyEngine {
     /// previous policy and generation stay active (last-known-good,
     /// matching `OpaEngine`'s reload failure behavior).
     pub fn reload_from_policy_str(&self, policy_src: &str) -> Result<()> {
-        let staged = self.stage(policy_src)?;
+        let staged = self.stage(&policy_from_source(policy_src))?;
         self.commit(staged)
     }
 
-    /// Parses and validates `policy_src` without activating it.
+    /// Parses and validates `policy` without activating it.
     ///
     /// Lets a caller validate the Cedar policy before committing any other
     /// engine's reload, so a rejected Cedar policy leaves every engine on
@@ -187,21 +382,20 @@ impl CedarOnlyEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if `policy_src` fails to load (see
-    /// [`Self::from_policy_str`]), or the engine lock is poisoned.
-    pub fn stage(&self, policy_src: &str) -> Result<StagedCedarPolicy> {
-        let unchanged = self
-            .source
+    /// Returns an error if `policy` fails to load (see [`Self::from_proto`]),
+    /// or the engine lock is poisoned.
+    pub fn stage(&self, policy: &ProtoSandboxPolicy) -> Result<StagedCedarPolicy> {
+        let inputs = PolicyInputs::from_proto(policy);
+        let unchanged = *self
+            .inputs
             .read()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?
-            .as_str()
-            == policy_src;
+            == inputs;
         if unchanged {
             return Ok(StagedCedarPolicy(None));
         }
-        let engine =
-            CedarEngine::from_policy_str(policy_src).map_err(|e| miette::miette!("{e}"))?;
-        Ok(StagedCedarPolicy(Some((engine, policy_src.to_string()))))
+        let loaded = LoadedPolicy::from_proto(policy)?;
+        Ok(StagedCedarPolicy(Some((loaded, inputs))))
     }
 
     /// Activates a policy returned by [`Self::stage`] and advances the generation.
@@ -212,18 +406,18 @@ impl CedarOnlyEngine {
     ///
     /// Returns an error if the engine lock is poisoned.
     pub fn commit(&self, staged: StagedCedarPolicy) -> Result<()> {
-        let Some((engine, source)) = staged.0 else {
+        let Some((loaded, inputs)) = staged.0 else {
             return Ok(());
         };
         let mut guard = self
             .engine
             .write()
             .map_err(|_| miette::miette!("Cedar engine lock poisoned"))?;
-        *guard = engine;
+        *guard = loaded;
         *self
-            .source
+            .inputs
             .write()
-            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))? = source;
+            .map_err(|_| miette::miette!("Cedar engine lock poisoned"))? = inputs;
         // Advanced while the engine write lock is held, so a reader that
         // observes the new generation under the read lock also sees the new
         // policy.
@@ -240,7 +434,7 @@ impl CedarOnlyEngine {
     ///
     /// Returns an error if the engine lock is poisoned.
     pub fn filesystem_grants(&self) -> Result<openshell_policy_cedar::FilesystemGrants> {
-        Ok(self.read_engine()?.filesystem_grants().clone())
+        Ok(self.read_engine()?.cedar.filesystem_grants().clone())
     }
 }
 
@@ -248,41 +442,12 @@ impl CedarOnlyEngine {
 ///
 /// Empty when the staged source matched the active policy.
 #[derive(Debug)]
-pub struct StagedCedarPolicy(Option<(CedarEngine, String)>);
+pub struct StagedCedarPolicy(Option<(LoadedPolicy, PolicyInputs)>);
 
 /// Value of an L7 endpoint config's `enforcement` key that makes the relay
 /// deny requests the policy does not allow. Any other value means audit-only
 /// (see `crate::l7::parse_l7_config`). Cedar decisions are always enforced.
 const ENFORCEMENT_ENFORCE: &str = "enforce";
-
-/// Builds the `endpoint_configs` the proxy's `query_l7_route_snapshot`
-/// needs to select L7 inspection over passthrough for `(host, port)`.
-///
-/// Without this, a Cedar-sourced sandbox's `HttpRequest` policies are never
-/// consulted: `query_l7_route_snapshot` only inspects when
-/// `EgressAuthorization::endpoint_configs` is non-empty, and every allowed
-/// CONNECT would otherwise fall through to unconditional passthrough.
-///
-/// # Errors
-///
-/// Returns an error if the config cannot be built. The caller fails the
-/// CONNECT rather than letting it pass through uninspected.
-fn l7_endpoint_configs_for(
-    guard: &CedarEngine,
-    host: &str,
-    port: u16,
-) -> Result<Vec<regorus::Value>> {
-    let Some(protocol) = guard.l7_protocol(host, port) else {
-        return Ok(Vec::new());
-    };
-    let json = serde_json::json!({
-        "protocol": protocol.as_str(),
-        "enforcement": ENFORCEMENT_ENFORCE,
-    });
-    let config = serde_json::from_value::<regorus::Value>(json)
-        .map_err(|e| miette::miette!("failed to build Cedar L7 endpoint config: {e}"))?;
-    Ok(vec![config])
-}
 
 impl CedarOnlyEngine {
     /// Authorizes one egress request against the active Cedar policy.
@@ -296,6 +461,7 @@ impl CedarOnlyEngine {
         let guard = self.read_engine()?;
         let generation = self.current_generation();
         let decision = guard
+            .cedar
             .evaluate_network(&request)
             .map_err(|e| miette::miette!("{e}"))?;
 
@@ -312,8 +478,10 @@ impl CedarOnlyEngine {
             },
         };
 
+        // Without these, an allowed CONNECT is relayed without inspection
+        // and without provider credential settings.
         let endpoint_configs = if matches!(action, NetworkAction::Allow { .. }) {
-            l7_endpoint_configs_for(&guard, &request.host, request.port)?
+            guard.endpoint_configs(&request.host, request.port)?
         } else {
             Vec::new()
         };
@@ -329,6 +497,18 @@ impl CedarOnlyEngine {
         })
     }
 
+    /// Returns the endpoint settings the credential guard checks for `host:port`.
+    ///
+    /// The same configs [`Self::authorize_egress`] returns for an allowed
+    /// connection, including every path-scoped provider endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine lock is poisoned or a config cannot be built.
+    pub fn credential_guards(&self, host: &str, port: u16) -> Result<Vec<regorus::Value>> {
+        self.read_engine()?.endpoint_configs(host, port)
+    }
+
     /// Returns the endpoints eligible for policy-gated DNS resolution.
     ///
     /// # Errors
@@ -338,6 +518,7 @@ impl CedarOnlyEngine {
         let guard = self.read_engine()?;
         let generation = self.current_generation();
         let endpoints = guard
+            .cedar
             .dns_endpoints()
             .iter()
             .enumerate()
@@ -371,7 +552,7 @@ impl CedarOnlyEngine {
 /// per-tunnel state.
 #[derive(Debug)]
 pub(crate) struct CedarL7TunnelEngine {
-    engine: Arc<RwLock<CedarEngine>>,
+    engine: Arc<RwLock<LoadedPolicy>>,
     generation: Arc<AtomicU64>,
     captured_generation: u64,
 }
@@ -431,6 +612,7 @@ impl CedarL7TunnelEngine {
         };
 
         let allowed = guard
+            .cedar
             .evaluate_l7(&l7_request)
             .map_err(|e| miette::miette!("{e}"))?
             .is_allow();
@@ -672,5 +854,147 @@ when { context.binary_path == "/usr/bin/curl" };
             .expect("reload");
 
         assert!(engine.tunnel_engine(&plumbing, decided_at).is_err());
+    }
+
+    const CONNECT_ONLY: &str = r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443");
+"#;
+
+    fn provider_policy(
+        cedar: &str,
+        endpoints: Vec<openshell_core::proto::NetworkEndpoint>,
+    ) -> ProtoSandboxPolicy {
+        let mut policy = policy_from_source(cedar);
+        policy.provider_credential_rules.insert(
+            "_provider_work".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work".to_string(),
+                endpoints,
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn credentialed_endpoint() -> openshell_core::proto::NetworkEndpoint {
+        openshell_core::proto::NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            access: "read-only".to_string(),
+            provider_credentialed: true,
+            request_body_credential_rewrite: true,
+            ..Default::default()
+        }
+    }
+
+    fn curl_input(host: &str) -> NetworkInput {
+        NetworkInput {
+            host: host.to_string(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: String::new(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_settings_apply_with_cedar_inspection() {
+        let engine =
+            CedarOnlyEngine::from_proto(&provider_policy(POLICY, vec![credentialed_endpoint()]))
+                .expect("policy loads");
+        let authorization = engine
+            .authorize_egress(&curl_input("api.example.com"))
+            .expect("request evaluates");
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        let config = crate::l7::parse_l7_config(&authorization.endpoint_configs[0])
+            .expect("config must parse");
+        assert_eq!(config.protocol, openshell_policy::L7Protocol::Rest);
+        assert!(config.provider_credentialed);
+        assert!(config.request_body_credential_rewrite);
+        let raw = serde_json::to_value(&authorization.endpoint_configs[0]).expect("serialize");
+        assert!(
+            raw.get("access").is_none(),
+            "provider L7 rules must not apply on a Cedar sandbox"
+        );
+    }
+
+    #[test]
+    fn uninspected_credentialed_endpoint_is_refused_at_connect() {
+        // Cedar allows the connection but has no HttpRequest policy for it,
+        // so it would be relayed without inspection.
+        let engine = CedarOnlyEngine::from_proto(&provider_policy(
+            CONNECT_ONLY,
+            vec![credentialed_endpoint()],
+        ))
+        .expect("policy loads");
+        let guards = engine
+            .credential_guards("api.example.com", 443)
+            .expect("guards evaluate");
+        assert_eq!(guards.len(), 1);
+        let guard = crate::l7::parse_endpoint_credential_guard(&guards[0]);
+        assert!(guard.provider_credentialed);
+        assert!(guard.blocks_connect());
+    }
+
+    #[test]
+    fn provider_rules_grant_no_access() {
+        let mut other = credentialed_endpoint();
+        other.host = "other.example.com".to_string();
+        let engine = CedarOnlyEngine::from_proto(&provider_policy(POLICY, vec![other]))
+            .expect("policy loads");
+        let authorization = engine
+            .authorize_egress(&curl_input("other.example.com"))
+            .expect("request evaluates");
+        assert!(
+            matches!(authorization.action, NetworkAction::Deny { .. }),
+            "{:?}",
+            authorization.action
+        );
+        assert!(authorization.endpoint_configs.is_empty());
+    }
+
+    #[test]
+    fn path_scoped_provider_endpoint_keeps_other_paths_inspected() {
+        let mut scoped = credentialed_endpoint();
+        scoped.path = "/v1/**".to_string();
+        let engine = CedarOnlyEngine::from_proto(&provider_policy(POLICY, vec![scoped]))
+            .expect("policy loads");
+        let configs = engine
+            .credential_guards("api.example.com", 443)
+            .expect("configs build");
+        assert_eq!(configs.len(), 2, "path-scoped config plus a path-less one");
+        assert!(configs.iter().all(|config| {
+            crate::l7::parse_l7_config(config)
+                .is_some_and(|config| config.protocol == openshell_policy::L7Protocol::Rest)
+        }));
+    }
+
+    #[test]
+    fn reload_tracks_provider_rule_changes() {
+        let engine =
+            CedarOnlyEngine::from_proto(&provider_policy(POLICY, vec![credentialed_endpoint()]))
+                .expect("policy loads");
+        let generation = engine.current_generation();
+
+        let unchanged = engine
+            .stage(&provider_policy(POLICY, vec![credentialed_endpoint()]))
+            .expect("stage");
+        engine.commit(unchanged).expect("commit");
+        assert_eq!(engine.current_generation(), generation);
+
+        let changed = engine.stage(&policy_from_source(POLICY)).expect("stage");
+        engine.commit(changed).expect("commit");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert_eq!(
+            engine
+                .credential_guards("api.example.com", 443)
+                .expect("configs")
+                .len(),
+            1,
+            "only Cedar's own inspection config remains"
+        );
     }
 }

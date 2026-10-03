@@ -135,6 +135,10 @@ type SandboxPolicy struct {
 	// enforces network, per-request, and filesystem access, and NetworkPolicies
 	// must be empty. Filesystem and Landlock are ignored.
 	CedarPolicySource string
+	// ProviderCredentialRules is set by the gateway for Cedar policies: the
+	// network rules of attached providers, used only for credential injection
+	// settings. They never grant access. Do not set it when writing a policy.
+	ProviderCredentialRules map[string]NetworkPolicyRule
 }
 
 // NetworkMiddlewareConfig configures a supervisor middleware pipeline for

@@ -1818,12 +1818,7 @@ async fn apply_effective_policy_context(
         provider_names,
     )
     .await?;
-    // Provider layers are YAML rules and never apply to a Cedar policy; see
-    // `validate_candidate_effective_policy`.
-    if !matches!(policy_source, PolicySource::Global)
-        && policy.cedar_policy_source.is_empty()
-        && !provider_context.layers.is_empty()
-    {
+    if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
     let policy_credential_bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
@@ -1856,16 +1851,6 @@ pub(super) fn validate_candidate_effective_policy(
     base_policy: &ProtoSandboxPolicy,
     provider_layers: &[ProviderPolicyLayer],
 ) -> Result<(), Status> {
-    // Provider layers are YAML network rules. Composing them into a Cedar
-    // policy would give the sandbox both formats, and the Cedar engine would
-    // ignore them, so provider endpoints and credential injection would
-    // silently not work.
-    if !base_policy.cedar_policy_source.is_empty() && !provider_layers.is_empty() {
-        return Err(Status::failed_precondition(
-            "providers with network policies cannot be attached to a sandbox whose policy is \
-             written in Cedar; grant the provider's endpoints in the Cedar policy instead",
-        ));
-    }
     let effective_policy = if provider_layers.is_empty() {
         base_policy.clone()
     } else {
@@ -3137,7 +3122,11 @@ fn canonical_endpoint_path(path: &str) -> String {
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
         }
@@ -3148,7 +3137,11 @@ fn stamp_provider_credentialed_endpoints(
     policy: &mut ProtoSandboxPolicy,
     scopes: &[CredentialedEndpointScope],
 ) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = scopes
                 .iter()
@@ -10630,6 +10623,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-cedar-provider").await;
+
+        assert!(
+            effective_policy.network_policies.is_empty(),
+            "provider rules must not be composed into a Cedar policy"
+        );
+        let rule = effective_policy
+            .provider_credential_rules
+            .get("_provider_work_github")
+            .expect("provider rules travel in provider_credential_rules");
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_credentialed),
+            "credentialed endpoints must be stamped"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
@@ -10714,30 +10757,6 @@ mod tests {
             response.policy_hash,
             deterministic_policy_hash(&effective_policy)
         );
-    }
-
-    #[test]
-    fn candidate_effective_policy_rejects_providers_on_a_cedar_policy() {
-        let base = ProtoSandboxPolicy {
-            cedar_policy_source:
-                "permit(principal, action == Sandbox::Action::\"NetworkConnect\", \
-                                  resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
-                    .to_string(),
-            ..Default::default()
-        };
-        let provider_rule = test_policy_with_rule("provider", "api.example.com")
-            .network_policies
-            .remove("provider")
-            .unwrap();
-        let layers = [ProviderPolicyLayer {
-            rule_name: "_provider_test".to_string(),
-            rule: provider_rule,
-        }];
-
-        let error = validate_candidate_effective_policy(&base, &layers)
-            .expect_err("provider layers must not compose into a Cedar policy");
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(validate_candidate_effective_policy(&base, &[]).is_ok());
     }
 
     #[test]
@@ -11752,6 +11771,62 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-env",
+                "cedar-env",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-cedar-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .expect("provider environment must resolve for a Cedar sandbox")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        let binding = response
+            .static_credential_bindings
+            .get("GITHUB_TOKEN")
+            .expect("credential must stay bound to the provider's endpoints");
+        assert!(
+            binding
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
     }
 
     #[tokio::test]

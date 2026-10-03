@@ -1012,6 +1012,11 @@ pub(super) fn validate_no_reserved_provider_policy_keys(
             "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
         )));
     }
+    if !policy.provider_credential_rules.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider_credential_rules is managed by the gateway from attached providers; use 'openshell policy get <sandbox> --base' for a round-trippable base policy",
+        ));
+    }
     Ok(())
 }
 
@@ -2226,6 +2231,23 @@ mod tests {
     }
 
     #[test]
+    fn validate_no_reserved_provider_policy_keys_rejects_provider_credential_rules() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        policy
+            .provider_credential_rules
+            .insert("_provider_work".into(), NetworkPolicyRule::default());
+
+        let error = validate_no_reserved_provider_policy_keys(&policy)
+            .expect_err("user-submitted provider_credential_rules must be rejected");
+        assert!(error.message().contains("provider_credential_rules"));
+    }
+
+    #[test]
     fn validate_no_reserved_provider_policy_keys_accepts_user_key() {
         use openshell_core::proto::NetworkPolicyRule;
 
@@ -2271,6 +2293,7 @@ mod tests {
         let baseline = ProtoSandboxPolicy::default();
         let new = ProtoSandboxPolicy {
             cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let result = validate_static_fields_unchanged(&baseline, &new);
@@ -2281,6 +2304,7 @@ mod tests {
     fn validate_static_fields_reports_a_format_switch_before_other_static_fields() {
         let baseline = ProtoSandboxPolicy {
             cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let new = ProtoSandboxPolicy {
@@ -2302,6 +2326,7 @@ mod tests {
     fn validate_static_fields_rejects_switching_from_cedar_to_yaml() {
         let baseline = ProtoSandboxPolicy {
             cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let new = ProtoSandboxPolicy::default();
@@ -2313,10 +2338,12 @@ mod tests {
     fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
         let baseline = ProtoSandboxPolicy {
             cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let new = ProtoSandboxPolicy {
             cedar_policy_source: "forbid(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
@@ -2335,6 +2362,7 @@ mod tests {
             .join("\n");
         ProtoSandboxPolicy {
             cedar_policy_source,
+            provider_credential_rules: HashMap::default(),
             ..Default::default()
         }
     }

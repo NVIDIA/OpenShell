@@ -264,6 +264,9 @@ pub fn parse_policy(path: &Path) -> miette::Result<PolicyModel> {
 /// Parse a policy YAML string into a `PolicyModel`.
 pub fn parse_policy_str(yaml: &str) -> miette::Result<PolicyModel> {
     let document = openshell_policy_schema::parse_policy(yaml)?;
+    if document.cedar_policy.is_some() {
+        miette::bail!("Cedar policies are not supported by the policy prover");
+    }
     Ok(project_policy(document))
 }
 

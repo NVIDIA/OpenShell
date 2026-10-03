@@ -127,6 +127,14 @@ func SandboxPolicyFromProto(p *sbv1.SandboxPolicy) *types.SandboxPolicy {
 			}
 		}
 	}
+	if rules := p.GetProviderCredentialRules(); rules != nil {
+		result.ProviderCredentialRules = make(map[string]types.NetworkPolicyRule, len(rules))
+		for k, v := range rules {
+			if converted := NetworkPolicyRuleFromProto(v); converted != nil {
+				result.ProviderCredentialRules[k] = *converted
+			}
+		}
+	}
 	if mw := p.GetNetworkMiddlewares(); mw != nil {
 		result.NetworkMiddlewares = make(map[string]types.NetworkMiddlewareConfig, len(mw))
 		for k, v := range mw {
@@ -155,6 +163,12 @@ func SandboxPolicyToProto(p *types.SandboxPolicy) *sbv1.SandboxPolicy {
 		result.NetworkPolicies = make(map[string]*sbv1.NetworkPolicyRule, len(p.NetworkPolicies))
 		for k, v := range p.NetworkPolicies {
 			result.NetworkPolicies[k] = NetworkPolicyRuleToProto(&v)
+		}
+	}
+	if p.ProviderCredentialRules != nil {
+		result.ProviderCredentialRules = make(map[string]*sbv1.NetworkPolicyRule, len(p.ProviderCredentialRules))
+		for k, v := range p.ProviderCredentialRules {
+			result.ProviderCredentialRules[k] = NetworkPolicyRuleToProto(&v)
 		}
 	}
 	if p.NetworkMiddlewares != nil {

@@ -2381,8 +2381,8 @@ async fn load_policy(
         let cedar_engine = if proto_policy.cedar_policy_source.is_empty() {
             None
         } else {
-            match openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_policy_str(
-                &proto_policy.cedar_policy_source,
+            match openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_proto(
+                &proto_policy,
             ) {
                 Ok(engine) => Some(Arc::new(engine)),
                 Err(e) => {
@@ -2676,7 +2676,7 @@ async fn reload_gateway_policy_runtime(
         }
         (Some(cedar_engine), Some(policy)) => Some(
             cedar_engine
-                .stage(&policy.cedar_policy_source)
+                .stage(policy)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)?,
         ),
         _ => None,
@@ -6356,6 +6356,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         openshell_core::proto::SandboxPolicy {
             version: 1,
             cedar_policy_source: source.to_string(),
+            provider_credential_rules: std::collections::HashMap::default(),
             ..Default::default()
         }
     }

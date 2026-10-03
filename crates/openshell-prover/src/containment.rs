@@ -88,7 +88,14 @@ pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyEr
         landlock,
         process,
         network_middlewares,
+        cedar_policy,
     } = document;
+    if cedar_policy.is_some() {
+        return Err(ParsePolicyError(
+            "invalid policy: Cedar policies are not supported by the containment checker"
+                .to_string(),
+        ));
+    }
     Ok(ContainmentPolicy {
         filesystem_policy,
         network_policies,

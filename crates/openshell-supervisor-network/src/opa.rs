@@ -2301,6 +2301,215 @@ fn l7_matchers_to_json(
 /// user-specified symlink paths (e.g., `/usr/bin/python3`) match the
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
+/// Converts one policy endpoint into the JSON shape the L7 config parser reads.
+///
+/// Shared by the Rego data builder and the Cedar engine, which emits provider
+/// endpoint settings for connections it allows. `policy_hash` identifies the
+/// policy for MCP endpoint observation.
+pub(crate) fn endpoint_policy_value(
+    e: &openshell_core::proto::NetworkEndpoint,
+    policy_hash: &str,
+) -> serde_json::Value {
+    // Normalize port/ports: ports takes precedence, then
+    // single port promoted to array. Rego always sees "ports".
+    let ports: Vec<u32> = if !e.ports.is_empty() {
+        e.ports.clone()
+    } else if e.port > 0 {
+        vec![e.port]
+    } else {
+        vec![]
+    };
+    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
+    if !e.path.is_empty() {
+        ep["path"] = e.path.clone().into();
+    }
+    if !e.protocol.is_empty() {
+        ep["protocol"] = e.protocol.clone().into();
+    }
+    if !e.tls.is_empty() {
+        ep["tls"] = e.tls.clone().into();
+    }
+    if !e.enforcement.is_empty() {
+        ep["enforcement"] = e.enforcement.clone().into();
+    }
+    if !e.access.is_empty() {
+        ep["access"] = e.access.clone().into();
+    }
+    if !e.rules.is_empty() {
+        let rules: Vec<serde_json::Value> = e
+            .rules
+            .iter()
+            .map(|r| {
+                let a = r.allow.as_ref();
+                let mut allow = serde_json::Map::new();
+                if let Some(a) = a {
+                    // Proto3 represents absent scalar selectors as empty
+                    // strings. Omit them so protobuf and YAML rules expose
+                    // the same selector families to runtime validation.
+                    if !a.method.is_empty() {
+                        allow.insert("method".to_string(), a.method.clone().into());
+                    }
+                    if !a.path.is_empty() {
+                        allow.insert("path".to_string(), a.path.clone().into());
+                    }
+                    if !a.command.is_empty() {
+                        allow.insert("command".to_string(), a.command.clone().into());
+                    }
+                    if !a.operation_type.is_empty() {
+                        allow.insert(
+                            "operation_type".to_string(),
+                            a.operation_type.clone().into(),
+                        );
+                    }
+                    if !a.operation_name.is_empty() {
+                        allow.insert(
+                            "operation_name".to_string(),
+                            a.operation_name.clone().into(),
+                        );
+                    }
+                    if !a.fields.is_empty() {
+                        allow.insert("fields".to_string(), a.fields.clone().into());
+                    }
+                }
+                let query = a.map_or_else(serde_json::Map::new, |allow| {
+                    l7_matchers_to_json(&allow.query)
+                });
+                if !query.is_empty() {
+                    allow.insert("query".to_string(), query.into());
+                }
+                let params = a.map_or_else(serde_json::Map::new, |allow| {
+                    l7_matchers_to_json(&allow.params)
+                });
+                if !params.is_empty() {
+                    allow.insert("params".to_string(), params.into());
+                }
+                serde_json::json!({ "allow": allow })
+            })
+            .collect();
+        ep["rules"] = rules.into();
+    }
+    if !e.allowed_ips.is_empty() {
+        ep["allowed_ips"] = e.allowed_ips.clone().into();
+    }
+    if e.advisor_proposed {
+        ep["advisor_proposed"] = true.into();
+    }
+    if !e.deny_rules.is_empty() {
+        let deny_rules: Vec<serde_json::Value> = e
+            .deny_rules
+            .iter()
+            .map(|d| {
+                let mut deny = serde_json::json!({});
+                if !d.method.is_empty() {
+                    deny["method"] = d.method.clone().into();
+                }
+                if !d.path.is_empty() {
+                    deny["path"] = d.path.clone().into();
+                }
+                if !d.command.is_empty() {
+                    deny["command"] = d.command.clone().into();
+                }
+                if !d.operation_type.is_empty() {
+                    deny["operation_type"] = d.operation_type.clone().into();
+                }
+                if !d.operation_name.is_empty() {
+                    deny["operation_name"] = d.operation_name.clone().into();
+                }
+                if !d.fields.is_empty() {
+                    deny["fields"] = d.fields.clone().into();
+                }
+                let query = l7_matchers_to_json(&d.query);
+                if !query.is_empty() {
+                    deny["query"] = query.into();
+                }
+                let params = l7_matchers_to_json(&d.params);
+                if !params.is_empty() {
+                    deny["params"] = params.into();
+                }
+                deny
+            })
+            .collect();
+        ep["deny_rules"] = deny_rules.into();
+    }
+    if e.allow_encoded_slash {
+        ep["allow_encoded_slash"] = true.into();
+    }
+    if e.websocket_credential_rewrite {
+        ep["websocket_credential_rewrite"] = true.into();
+    }
+    if e.request_body_credential_rewrite {
+        ep["request_body_credential_rewrite"] = true.into();
+    }
+    if e.allow_uninspected_credentials {
+        ep["allow_uninspected_credentials"] = true.into();
+    }
+    if e.provider_credentialed {
+        ep["provider_credentialed"] = true.into();
+    }
+    if is_mcp_protocol(&e.protocol) {
+        // Derive endpoint identity from the policy endpoint while
+        // it is still available. Request handling carries this
+        // opaque value through exact path selection and never
+        // recomputes identity from a concrete request host.
+        ep["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(e).into();
+        // The selected endpoint must retain its policy identity
+        // so it cannot bind to a replacement observation inventory.
+        ep["policy_hash"] = policy_hash.into();
+    }
+    if !e.credential_signing.is_empty() {
+        ep["credential_signing"] = e.credential_signing.clone().into();
+    }
+    if !e.signing_service.is_empty() {
+        ep["signing_service"] = e.signing_service.clone().into();
+    }
+    if !e.signing_region.is_empty() {
+        ep["signing_region"] = e.signing_region.clone().into();
+    }
+    if let Some(binding) = &e.credential_binding {
+        ep["credential_binding"] = serde_json::json!({
+            "provider": binding.provider.clone(),
+        });
+    }
+    if !e.persisted_queries.is_empty() {
+        ep["persisted_queries"] = e.persisted_queries.clone().into();
+    }
+    if !e.graphql_persisted_queries.is_empty() {
+        let persisted: serde_json::Map<String, serde_json::Value> = e
+            .graphql_persisted_queries
+            .iter()
+            .map(|(key, op)| {
+                (
+                    key.clone(),
+                    serde_json::json!({
+                        "operation_type": op.operation_type,
+                        "operation_name": op.operation_name,
+                        "fields": op.fields,
+                    }),
+                )
+            })
+            .collect();
+        ep["graphql_persisted_queries"] = persisted.into();
+    }
+    if e.graphql_max_body_bytes > 0 {
+        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
+    }
+    if e.json_rpc_max_body_bytes > 0 {
+        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
+    }
+    if let Some(mcp) = &e.mcp {
+        if e.protocol.eq_ignore_ascii_case("mcp") {
+            ep["mcp_versions"] = mcp.versions.clone().into();
+        }
+        if let Some(strict_tool_names) = mcp.strict_tool_names {
+            ep["mcp_strict_tool_names"] = strict_tool_names.into();
+        }
+        if let Some(allow_all_known_mcp_methods) = mcp.allow_all_known_mcp_methods {
+            ep["mcp_allow_all_known_mcp_methods"] = allow_all_known_mcp_methods.into();
+        }
+    }
+    ep
+}
+
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
     let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
@@ -2347,209 +2556,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             let endpoints: Vec<serde_json::Value> = rule
                 .endpoints
                 .iter()
-                .map(|e| {
-                    // Normalize port/ports: ports takes precedence, then
-                    // single port promoted to array. Rego always sees "ports".
-                    let ports: Vec<u32> = if !e.ports.is_empty() {
-                        e.ports.clone()
-                    } else if e.port > 0 {
-                        vec![e.port]
-                    } else {
-                        vec![]
-                    };
-                    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
-                    if !e.path.is_empty() {
-                        ep["path"] = e.path.clone().into();
-                    }
-                    if !e.protocol.is_empty() {
-                        ep["protocol"] = e.protocol.clone().into();
-                    }
-                    if !e.tls.is_empty() {
-                        ep["tls"] = e.tls.clone().into();
-                    }
-                    if !e.enforcement.is_empty() {
-                        ep["enforcement"] = e.enforcement.clone().into();
-                    }
-                    if !e.access.is_empty() {
-                        ep["access"] = e.access.clone().into();
-                    }
-                    if !e.rules.is_empty() {
-                        let rules: Vec<serde_json::Value> = e
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                let a = r.allow.as_ref();
-                                let mut allow = serde_json::Map::new();
-                                if let Some(a) = a {
-                                    // Proto3 represents absent scalar selectors as empty
-                                    // strings. Omit them so protobuf and YAML rules expose
-                                    // the same selector families to runtime validation.
-                                    if !a.method.is_empty() {
-                                        allow.insert("method".to_string(), a.method.clone().into());
-                                    }
-                                    if !a.path.is_empty() {
-                                        allow.insert("path".to_string(), a.path.clone().into());
-                                    }
-                                    if !a.command.is_empty() {
-                                        allow
-                                            .insert("command".to_string(), a.command.clone().into());
-                                    }
-                                    if !a.operation_type.is_empty() {
-                                        allow.insert(
-                                            "operation_type".to_string(),
-                                            a.operation_type.clone().into(),
-                                        );
-                                    }
-                                    if !a.operation_name.is_empty() {
-                                        allow.insert(
-                                            "operation_name".to_string(),
-                                            a.operation_name.clone().into(),
-                                        );
-                                    }
-                                    if !a.fields.is_empty() {
-                                        allow.insert("fields".to_string(), a.fields.clone().into());
-                                    }
-                                }
-                                let query = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.query)
-                                });
-                                if !query.is_empty() {
-                                    allow.insert("query".to_string(), query.into());
-                                }
-                                let params = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.params)
-                                });
-                                if !params.is_empty() {
-                                    allow.insert("params".to_string(), params.into());
-                                }
-                                serde_json::json!({ "allow": allow })
-                            })
-                            .collect();
-                        ep["rules"] = rules.into();
-                    }
-                    if !e.allowed_ips.is_empty() {
-                        ep["allowed_ips"] = e.allowed_ips.clone().into();
-                    }
-                    if e.advisor_proposed {
-                        ep["advisor_proposed"] = true.into();
-                    }
-                    if !e.deny_rules.is_empty() {
-                        let deny_rules: Vec<serde_json::Value> = e
-                            .deny_rules
-                            .iter()
-                            .map(|d| {
-                                let mut deny = serde_json::json!({});
-                                if !d.method.is_empty() {
-                                    deny["method"] = d.method.clone().into();
-                                }
-                                if !d.path.is_empty() {
-                                    deny["path"] = d.path.clone().into();
-                                }
-                                if !d.command.is_empty() {
-                                    deny["command"] = d.command.clone().into();
-                                }
-                                if !d.operation_type.is_empty() {
-                                    deny["operation_type"] = d.operation_type.clone().into();
-                                }
-                                if !d.operation_name.is_empty() {
-                                    deny["operation_name"] = d.operation_name.clone().into();
-                                }
-                                if !d.fields.is_empty() {
-                                    deny["fields"] = d.fields.clone().into();
-                                }
-                                let query = l7_matchers_to_json(&d.query);
-                                if !query.is_empty() {
-                                    deny["query"] = query.into();
-                                }
-                                let params = l7_matchers_to_json(&d.params);
-                                if !params.is_empty() {
-                                    deny["params"] = params.into();
-                                }
-                                deny
-                            })
-                            .collect();
-                        ep["deny_rules"] = deny_rules.into();
-                    }
-                    if e.allow_encoded_slash {
-                        ep["allow_encoded_slash"] = true.into();
-                    }
-                    if e.websocket_credential_rewrite {
-                        ep["websocket_credential_rewrite"] = true.into();
-                    }
-                    if e.request_body_credential_rewrite {
-                        ep["request_body_credential_rewrite"] = true.into();
-                    }
-                    if e.allow_uninspected_credentials {
-                        ep["allow_uninspected_credentials"] = true.into();
-                    }
-                    if e.provider_credentialed {
-                        ep["provider_credentialed"] = true.into();
-                    }
-                    if is_mcp_protocol(&e.protocol) {
-                        // Derive endpoint identity from the policy endpoint while
-                        // it is still available. Request handling carries this
-                        // opaque value through exact path selection and never
-                        // recomputes identity from a concrete request host.
-                        ep["endpoint_id"] =
-                            openshell_core::endpoint_status::endpoint_id(e).into();
-                        // The selected endpoint must retain its policy identity
-                        // so it cannot bind to a replacement observation inventory.
-                        ep["policy_hash"] = policy_hash.clone().into();
-                    }
-                    if !e.credential_signing.is_empty() {
-                        ep["credential_signing"] = e.credential_signing.clone().into();
-                    }
-                    if !e.signing_service.is_empty() {
-                        ep["signing_service"] = e.signing_service.clone().into();
-                    }
-                    if !e.signing_region.is_empty() {
-                        ep["signing_region"] = e.signing_region.clone().into();
-                    }
-                    if let Some(binding) = &e.credential_binding {
-                        ep["credential_binding"] = serde_json::json!({
-                            "provider": binding.provider.clone(),
-                        });
-                    }
-                    if !e.persisted_queries.is_empty() {
-                        ep["persisted_queries"] = e.persisted_queries.clone().into();
-                    }
-                    if !e.graphql_persisted_queries.is_empty() {
-                        let persisted: serde_json::Map<String, serde_json::Value> = e
-                            .graphql_persisted_queries
-                            .iter()
-                            .map(|(key, op)| {
-                                (
-                                    key.clone(),
-                                    serde_json::json!({
-                                        "operation_type": op.operation_type,
-                                        "operation_name": op.operation_name,
-                                        "fields": op.fields,
-                                    }),
-                                )
-                            })
-                            .collect();
-                        ep["graphql_persisted_queries"] = persisted.into();
-                    }
-                    if e.graphql_max_body_bytes > 0 {
-                        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
-                    }
-                    if e.json_rpc_max_body_bytes > 0 {
-                        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
-                    }
-                    if let Some(mcp) = &e.mcp {
-                        if e.protocol.eq_ignore_ascii_case("mcp") {
-                            ep["mcp_versions"] = mcp.versions.clone().into();
-                        }
-                        if let Some(strict_tool_names) = mcp.strict_tool_names {
-                            ep["mcp_strict_tool_names"] = strict_tool_names.into();
-                        }
-                        if let Some(allow_all_known_mcp_methods) = mcp.allow_all_known_mcp_methods {
-                            ep["mcp_allow_all_known_mcp_methods"] =
-                                allow_all_known_mcp_methods.into();
-                        }
-                    }
-                    ep
-                })
+                .map(|e| endpoint_policy_value(e, &policy_hash))
                 .collect();
             let binaries: Vec<serde_json::Value> = rule
                 .binaries
@@ -3391,6 +3398,7 @@ mod tests {
         );
         ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5096,6 +5104,7 @@ process:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5635,6 +5644,7 @@ network_policies:
 
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5707,6 +5717,7 @@ network_policies:
 
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -5784,6 +5795,7 @@ network_policies:
 
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7326,6 +7338,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7384,6 +7397,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7443,6 +7457,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7504,6 +7519,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7564,6 +7580,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -9076,6 +9093,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -9147,6 +9165,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -9378,6 +9397,7 @@ network_policies:
         );
         let proto = ProtoSandboxPolicy {
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10362,6 +10382,7 @@ network_policies:
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
         };
 
         let pid = std::process::id(); // accessible root, leaf paths absent
@@ -11008,6 +11029,7 @@ network_policies:
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -11172,6 +11194,7 @@ process:
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
             cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
         };
 
         // Initial load at pid=0 — no symlink expansion

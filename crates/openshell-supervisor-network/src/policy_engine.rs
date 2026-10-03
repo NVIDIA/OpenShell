@@ -123,6 +123,21 @@ impl PolicyEngine {
         }
     }
 
+    /// Returns the endpoint settings the credential guard checks for a request.
+    ///
+    /// The guard refuses an uninspected connection to an endpoint that
+    /// carries provider credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for an evaluator-internal failure.
+    pub fn endpoint_credential_guards(&self, input: &NetworkInput) -> Result<Vec<regorus::Value>> {
+        match self {
+            Self::Opa(engine) => engine.query_endpoint_credential_guards(input),
+            Self::Cedar(engine) => engine.credential_guards(&input.host, input.port),
+        }
+    }
+
     /// Builds the per-tunnel L7 evaluator for a decision at `expected_generation`.
     ///
     /// For a YAML policy, `plumbing` is this engine, and the tunnel is
