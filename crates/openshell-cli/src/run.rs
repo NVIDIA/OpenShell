@@ -1868,7 +1868,7 @@ enum PipedStdin {
 /// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
 /// read error, or when the receiver is dropped.
 fn spawn_piped_stdin_reader(
-    mut reader: impl Read + Send + 'static,
+    mut reader: impl PipedInput,
 ) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
     std::thread::spawn(move || {
@@ -1877,6 +1877,16 @@ fn spawn_piped_stdin_reader(
             match reader.read(&mut buf) {
                 Ok(0) => return,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                // Processes that inherit the same stdin share its open file
+                // description, so another process may have made it
+                // nonblocking. Wait for input instead of failing.
+                #[cfg(unix)]
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Err(error) = wait_until_readable(&reader) {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
+                }
                 Err(error) => {
                     let _ = tx.blocking_send(Err(error));
                     return;
@@ -1890,6 +1900,30 @@ fn spawn_piped_stdin_reader(
         }
     });
     rx
+}
+
+/// Input the piped-stdin reader accepts. On Unix it must expose a descriptor
+/// so a nonblocking stream can be waited on.
+#[cfg(unix)]
+trait PipedInput: Read + std::os::fd::AsFd + Send + 'static {}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd + Send + 'static> PipedInput for T {}
+#[cfg(not(unix))]
+trait PipedInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> PipedInput for T {}
+
+/// Block until `reader` has input or reaches end of file.
+#[cfg(unix)]
+fn wait_until_readable(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(nix::errno::Errno::EINTR) => {}
+            result => return result.map(drop).map_err(std::io::Error::from),
+        }
+    }
 }
 
 /// Collect piped stdin until EOF or until `grace` elapses, whichever comes
@@ -8572,6 +8606,42 @@ mod tests {
         };
         assert_eq!(prefix, b"early");
         // The remainder keeps flowing after the command has started.
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_stdin_left_nonblocking_by_another_process_still_streams() {
+        // Processes that inherit the same stdin share one open file
+        // description, so any of them can make it nonblocking for all. A
+        // read with no input yet then fails with EAGAIN instead of waiting.
+        use std::os::fd::AsRawFd as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        nix::fcntl::fcntl(
+            reader.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("make the shared pipe nonblocking");
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_millis(100),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert!(prefix.is_empty());
         writer.write_all(b"late").unwrap();
         drop(writer);
         let next = runtime
