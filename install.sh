@@ -1015,6 +1015,33 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+# True when the gateway runs under systemd as a user service, i.e. the deb/rpm
+# installs. Snap and macOS manage the gateway differently and are left alone.
+gateway_uses_systemd_user_service() {
+  [ "${PLATFORM:-}" = "linux" ] && [ "${LINUX_INSTALL_METHOD:-}" != "snap" ]
+}
+
+# True when the openshell-gateway user service has failed or is stuck in its
+# auto-restart loop. systemd keeps restarting the unit (Restart=on-failure,
+# RestartSec=5s) without reaching a terminal `failed` state, so a crash on
+# startup otherwise only surfaces as the full listener timeout. A unit that is
+# still starting or already running returns non-zero here, including when it
+# carried stale failure metadata from before this install restarted it.
+local_gateway_service_failed() {
+  has_cmd systemctl || return 1
+
+  _svc_active="$(as_target_user systemctl --user show openshell-gateway -p ActiveState --value 2>/dev/null || true)"
+  _svc_sub="$(as_target_user systemctl --user show openshell-gateway -p SubState --value 2>/dev/null || true)"
+
+  case "$_svc_active" in
+    failed) return 0 ;;
+  esac
+  case "$_svc_sub" in
+    auto-restart | failed) return 0 ;;
+  esac
+  return 1
+}
+
 wait_for_local_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
@@ -1029,6 +1056,11 @@ wait_for_local_gateway_listener() {
     elif _last_output="$(as_target_user curl -sS --max-time 2 --cacert "${_mtls_dir}/ca.crt" --cert "${_mtls_dir}/tls.crt" --key "${_mtls_dir}/tls.key" -o /dev/null "$_probe_url" 2>&1)"; then
       info "local gateway listener is reachable"
       return 0
+    fi
+    if gateway_uses_systemd_user_service && local_gateway_service_failed; then
+      [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+      dump_local_gateway_diagnostics
+      error "openshell-gateway user service failed to start; see the diagnostics above for the cause, then retry with: systemctl --user restart openshell-gateway"
     fi
     sleep 1
     _elapsed=$((_elapsed + 1))
