@@ -444,6 +444,30 @@ pub(super) fn cache_lock(cache_root: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Publish a complete staged image without replacing a ready cache entry.
+/// Preparation stays outside this lock; only the readiness recheck and atomic
+/// rename are serialized across workers. Call from a blocking task so the
+/// lock remains owned until publication finishes even if its waiter is dropped.
+pub(super) fn publish_cache_file(
+    cache_root: &Path,
+    staged: &Path,
+    destination: &Path,
+    expected_size: Option<u64>,
+) -> io::Result<()> {
+    let _lease = cache_lock(cache_root)?;
+    match fs::metadata(destination) {
+        Ok(metadata)
+            if expected_size.is_none_or(|size| metadata.is_file() && metadata.len() == size) =>
+        {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(staged, destination)
+}
+
 pub(super) fn read_request(path: &Path) -> Result<(Request, PathBuf), String> {
     use std::os::unix::fs::MetadataExt;
     let file = OpenOptions::new()
@@ -859,6 +883,122 @@ mod tests {
             .unwrap()
             .unwrap();
         second.await.unwrap();
+    }
+
+    #[test]
+    fn cache_lock_child_process_helper() {
+        let Some(root) = std::env::var_os("OPENSHELL_TEST_PUBLICATION_LOCK_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let name = std::env::var("OPENSHELL_TEST_PUBLICATION_LOCK_NAME").unwrap();
+        fs::write(root.join(format!("{name}.waiting")), b"waiting").unwrap();
+        if name == "second" {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("preparation.lock"))
+                .unwrap();
+            assert!(
+                !lock(&probe, true).unwrap(),
+                "first process must own the kernel lock"
+            );
+            fs::write(root.join("second.contended"), b"contended").unwrap();
+        }
+        if name == "second" {
+            publish_cache_file(
+                &root,
+                &root.join("second.staged"),
+                &root.join("committed"),
+                Some(5),
+            )
+            .unwrap();
+            fs::write(root.join("second.acquired"), b"published").unwrap();
+            return;
+        }
+        let _lock = cache_lock(&root).unwrap();
+        fs::write(root.join(format!("{name}.acquired")), b"acquired").unwrap();
+        let mut release = [0_u8; 1];
+        io::stdin().read_exact(&mut release).unwrap();
+    }
+
+    struct LockHelper(std::process::Child);
+
+    impl Drop for LockHelper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn publication_lock_is_exclusive_across_processes_and_released_on_death() {
+        let root = tempfile::tempdir().unwrap();
+        let spawn = |name: &str| {
+            LockHelper(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "driver::preparation::tests::cache_lock_child_process_helper",
+                        "--nocapture",
+                    ])
+                    .env("OPENSHELL_TEST_PUBLICATION_LOCK_ROOT", root.path())
+                    .env("OPENSHELL_TEST_PUBLICATION_LOCK_NAME", name)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let wait_for = |name: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !root.path().join(name).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "helper did not reach {name}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        fs::write(root.path().join("second.staged"), b"later").unwrap();
+        let mut first = spawn("first");
+        wait_for("first.acquired");
+        let mut second = spawn("second");
+        wait_for("second.contended");
+        assert!(
+            !root.path().join("second.acquired").exists(),
+            "second process bypassed lock"
+        );
+        // The lock holder commits before dying. The queued publisher must read
+        // readiness only after it owns the lock and preserve this complete image.
+        fs::write(root.path().join("committed"), b"first").unwrap();
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        wait_for("second.acquired");
+        assert!(second.0.wait().unwrap().success());
+        assert_eq!(fs::read(root.path().join("committed")).unwrap(), b"first");
+        assert!(root.path().join("second.staged").exists());
+        assert!(root.path().join("preparation.lock").exists());
+        // An invalid-sized template can be replaced; a valid rootfs cannot.
+        fs::write(root.path().join("second.staged"), b"new!").unwrap();
+        publish_cache_file(
+            root.path(),
+            &root.path().join("second.staged"),
+            &root.path().join("committed"),
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("committed")).unwrap(), b"new!");
+        fs::write(root.path().join("third.staged"), b"third").unwrap();
+        publish_cache_file(
+            root.path(),
+            &root.path().join("third.staged"),
+            &root.path().join("committed"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("committed")).unwrap(), b"new!");
     }
 
     #[test]
