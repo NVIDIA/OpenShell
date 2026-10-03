@@ -116,10 +116,6 @@ let
     "podman_corporate_proxy"
     "podman_gateway_start"
     "podman_oci_identity"
-    # This validates the standalone driver binary's daemon-unavailable path and
-    # belongs in the Podman driver crate's integration tests. The E2E archive
-    # does not contain `openshell-driver-podman`.
-    "podman_preflight"
     "provider_auto_create"
     # The provider-refresh feature suite covers revoked Keycloak grants. This
     # binary instead covers stable workload handles across repeated rotations

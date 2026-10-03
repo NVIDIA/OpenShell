@@ -262,8 +262,6 @@ version = 2
 bind_address = "127.0.0.1:${HOST_PORT}"
 compute_driver = "vm"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
-guest_tls_cert = "${PKI_DIR}/client/tls.crt"
-guest_tls_key = "${PKI_DIR}/client/tls.key"
 
 [openshell.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"
@@ -301,8 +299,6 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
-    --guest-tls-cert "${PKI_DIR}/client/tls.crt" \
-    --guest-tls-key "${PKI_DIR}/client/tls.key" \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -411,6 +407,7 @@ run_e2e_test() {
 if [ -n "${E2E_TEST_OVERRIDE}" ]; then
   run_e2e_test "${E2E_TEST_OVERRIDE}"
 else
+  run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start

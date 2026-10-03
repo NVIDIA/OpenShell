@@ -157,10 +157,6 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 #[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 #[allow(dead_code)]
-const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
-#[allow(dead_code)]
-const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
-#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
@@ -215,8 +211,6 @@ static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -497,15 +491,16 @@ impl VmDriverConfig {
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
-        let provided = [
-            self.guest_tls_ca.as_ref(),
-            self.guest_tls_cert.as_ref(),
-            self.guest_tls_key.as_ref(),
-        ];
-        if provided.iter().all(Option::is_none) {
+        if self.guest_tls_cert.is_some() || self.guest_tls_key.is_some() {
+            return Err(
+                "sandbox client certificates are no longer supported; remove OPENSHELL_VM_TLS_CERT and OPENSHELL_VM_TLS_KEY"
+                    .to_string(),
+            );
+        }
+        if self.guest_tls_ca.is_none() {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA so the host supervisor can authenticate the gateway"
                         .to_string(),
                 )
             } else {
@@ -518,18 +513,7 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.guest_tls_cert.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
-            );
-        };
-        let Some(key) = self.guest_tls_key.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
-            );
-        };
-
-        for path in [&ca, &cert, &key] {
+        for path in [&ca] {
             if !path.is_file() {
                 return Err(format!(
                     "TLS material '{}' does not exist or is not a file",
@@ -538,7 +522,7 @@ impl VmDriverConfig {
             }
         }
 
-        Ok(Some(VmDriverTlsPaths { ca, cert, key }))
+        Ok(Some(VmDriverTlsPaths { ca }))
     }
 }
 
@@ -983,10 +967,7 @@ impl VmDriver {
         }
         configure_main_exit_marker(&mut command, state_dir);
         if let Some(tls) = tls_paths {
-            command
-                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
-                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
-                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+            command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
         #[cfg(unix)]
         let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
@@ -4190,16 +4171,6 @@ impl VmDriver {
                     || format!("{component} process exited"),
                     |code| format!("{component} process exited with status {code}"),
                 );
-                if component == "VM"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
-                        .expect("writing to String cannot fail");
-                }
                 if component == "host supervisor"
                     && let Some(state_dir) = state_dir.as_deref()
                     && let Some(stderr) = read_vm_console_tail(
@@ -4208,16 +4179,6 @@ impl VmDriver {
                     )
                 {
                     write!(message, "; supervisor stderr tail:\n{stderr}")
-                        .expect("writing to String cannot fail");
-                }
-                if component == "host supervisor"
-                    && let Some(state_dir) = state_dir.as_deref()
-                    && let Some(console) = read_vm_console_tail(
-                        &state_dir.join("rootfs-console.log"),
-                        VM_CONSOLE_DIAGNOSTIC_BYTES,
-                    )
-                {
-                    write!(message, "; guest console tail:\n{console}")
                         .expect("writing to String cannot fail");
                 }
                 if let Some(snapshot) = self
@@ -7537,6 +7498,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_exit_status_omits_guest_console_output() {
+        let running_child = || {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        for (component, child) in [
+            ("VM", spawn_exited_child()),
+            ("host supervisor", running_child()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("rootfs-console.log"), "agent output\n").unwrap();
+            std::fs::write(temp.path().join("supervisor.err.log"), "supervisor error\n").unwrap();
+            let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+            let mut events = driver.events.subscribe();
+            insert_test_record(&driver, "sb-exit", temp.path().to_path_buf(), child).await;
+
+            driver.monitor_sandbox("sb-exit".to_string()).await;
+
+            let condition = driver.registry.lock().await["sb-exit"]
+                .snapshot
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .find(|condition| condition.reason == "ProcessExited")
+                        .cloned()
+                })
+                .expect("ProcessExited condition");
+            let mut event_message = None;
+            while let Ok(event) = events.try_recv() {
+                if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload
+                    && let Some(event) = platform.event
+                    && event.reason == "ProcessExited"
+                {
+                    event_message = Some(event.message);
+                }
+            }
+            let event_message = event_message.expect("ProcessExited platform event");
+            for message in [&condition.message, &event_message] {
+                assert!(message.starts_with(&format!("{component} process exited")));
+                assert!(!message.contains("agent output"), "{component}: {message}");
+            }
+            if component == "host supervisor" {
+                assert!(condition.message.contains("supervisor error"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn background_provisioning_does_not_extend_the_rpc_span_lifetime() {
         let traced = TestTracing::new();
         let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
@@ -9758,8 +9776,6 @@ mod tests {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {

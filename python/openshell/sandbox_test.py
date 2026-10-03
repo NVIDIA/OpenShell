@@ -32,6 +32,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     SandboxTemplateClient,
+    ServiceAuthorizationMode,
     ServiceExposure,
     TlsConfig,
     _atomic_replace,
@@ -2219,15 +2220,26 @@ def test_create_forwards_service_exposures() -> None:
         name="app-server",
         service_exposures=[
             ServiceExposure(target_port=4500),
-            ServiceExposure(service="metrics", target_port=9090),
+            ServiceExposure(
+                service="metrics",
+                target_port=9090,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+            ),
         ],
     )
 
     assert stub.create_request is not None
     assert [
-        (exposure.service, exposure.target_port)
+        (exposure.service, exposure.target_port, exposure.authorization_mode)
         for exposure in stub.create_request.service_exposures
-    ] == [("", 4500), ("metrics", 9090)]
+    ] == [
+        ("", 4500, openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP),
+        (
+            "metrics",
+            9090,
+            openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
+        ),
+    ]
     assert dict(ref.service_urls) == {
         "": "https://.example.test/",
         "metrics": "https://metrics.example.test/",

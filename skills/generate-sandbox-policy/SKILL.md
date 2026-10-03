@@ -342,7 +342,9 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
-Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** regardless of `allowed_ips`.
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
+
+The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
 
 ```yaml
 # Example: Pin an internal service to a known private IP range

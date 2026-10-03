@@ -2566,7 +2566,8 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
         let access = match network_access_preset_to_str(endpoint.access) {
             Some("") if !endpoint.rules.is_empty() => "custom rules".to_string(),
             Some("") if is_mcp && allow_all_known_mcp_methods == Some(true) => {
-                "all known MCP methods (subject to tool and deny rules)".to_string()
+                "core MCP methods for the selected revision (subject to tool and deny rules)"
+                    .to_string()
             }
             Some("") => "not specified".to_string(),
             Some(access) => access.to_string(),
@@ -2601,9 +2602,26 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
                     || "not specified".to_string(),
                     |options| options.versions.join(", "),
                 );
-            let _ = writeln!(rendered, "    Allow all known MCP methods: {methods}");
+            let _ = writeln!(
+                rendered,
+                "    Allow core MCP methods for the selected revision: {methods}"
+            );
+            if allow_all_known_mcp_methods == Some(true) {
+                rendered
+                    .push_str("      Tool restrictions still apply; deny rules take precedence.\n");
+                rendered.push_str(
+                    "      Without tool-specific allow rules, all tool names are allowed.\n",
+                );
+            }
+            rendered.push_str("    Extension methods: require an exact allow rule\n");
             let _ = writeln!(rendered, "    Strict MCP tool names: {strict_names}");
             let _ = writeln!(rendered, "    MCP versions (declared): {versions}");
+            rendered.push_str(
+                "    Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n",
+            );
+            rendered.push_str(
+                "      Legacy initialize requests negotiate their revision in the body.\n",
+            );
         }
         if !endpoint.allowed_ips.is_empty() {
             let _ = writeln!(
@@ -3143,11 +3161,39 @@ binaries: [/usr/bin/curl]
             let rendered = format_provider_profile_details(&proto);
             assert!(
                 rendered
-                    .contains("Access: all known MCP methods (subject to tool and deny rules)\n")
+                    .contains("Access: core MCP methods for the selected revision (subject to tool and deny rules)\n")
             );
-            assert!(rendered.contains("Allow all known MCP methods: true\n"));
+            assert!(rendered.contains("Allow core MCP methods for the selected revision: true\n"));
+            assert!(
+                rendered.contains("Tool restrictions still apply; deny rules take precedence.")
+            );
+            assert!(
+                rendered.contains("Without tool-specific allow rules, all tool names are allowed.")
+            );
+            assert!(rendered.contains("Extension methods: require an exact allow rule\n"));
             assert!(rendered.contains("Strict MCP tool names: true (default)\n"));
             assert!(rendered.contains("MCP versions (declared): 2025-11-25\n"));
+            assert!(rendered.contains(
+                "Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n"
+            ));
+            assert!(
+                rendered
+                    .contains("Legacy initialize requests negotiate their revision in the body.\n")
+            );
+
+            for output in ["json", "yaml"] {
+                let structured = format_provider_profile_description(&proto, output)
+                    .expect("structured description renders");
+                let roundtrip = if output == "json" {
+                    parse_profile_json(&structured)
+                } else {
+                    parse_profile_yaml(&structured)
+                }
+                .expect("structured description is a full profile document");
+                assert_eq!(roundtrip, ProviderTypeProfile::from_proto(&proto));
+                assert!(structured.contains("allow_all_known_mcp_methods"));
+                assert!(!structured.contains("Allow core MCP methods"));
+            }
 
             // Explicit rules remain relevant when the method default is enabled,
             // and independent tool-name validation must not disappear from view.
@@ -3163,7 +3209,13 @@ binaries: [/usr/bin/curl]
                 options.strict_tool_names = Some(false);
                 let rendered = format_provider_profile_details(&proto);
                 assert!(rendered.contains("Access: custom rules\n    Rules: 1 allow, 0 deny\n"));
-                assert!(rendered.contains(&format!("Allow all known MCP methods: {allow_all}\n")));
+                assert!(rendered.contains(&format!(
+                    "Allow core MCP methods for the selected revision: {allow_all}\n"
+                )));
+                assert_eq!(
+                    rendered.contains("Tool restrictions still apply"),
+                    allow_all
+                );
                 assert!(rendered.contains("Strict MCP tool names: false\n"));
             }
         }

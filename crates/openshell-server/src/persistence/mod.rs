@@ -360,6 +360,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
     )]
@@ -394,6 +395,7 @@ impl Store {
     /// anything must use [`Self::put_if`], which is always durable.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.create_relaxed", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
     )]
@@ -429,6 +431,7 @@ impl Store {
     /// * `Err(Conflict)` - Resource version mismatch
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -445,6 +448,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put_scoped", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
     )]
@@ -477,6 +481,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.create_scoped", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
     )]
@@ -510,6 +515,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
     )]
@@ -537,6 +543,7 @@ impl Store {
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.get", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -551,6 +558,7 @@ impl Store {
     /// Fetch an object by name within an object type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty,
@@ -571,6 +579,7 @@ impl Store {
     /// Delete an object by id.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
     )]
@@ -581,6 +590,7 @@ impl Store {
     /// Delete objects of one type by id in bounded, set-based statements.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.delete_many",
@@ -597,6 +607,7 @@ impl Store {
     /// Count objects of a given type within a workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.count_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -611,6 +622,7 @@ impl Store {
     /// Delete all objects of a given type within a workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_all_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -625,6 +637,7 @@ impl Store {
     /// Delete all objects of a given type with a matching scope.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
     )]
@@ -635,6 +648,7 @@ impl Store {
     /// Delete an object by name within an object type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.delete_by_name", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace, object.name = %name)
     )]
@@ -650,6 +664,7 @@ impl Store {
     /// List objects by type and workspace.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
     )]
@@ -666,6 +681,7 @@ impl Store {
     /// List objects by type across all workspaces.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_by_type", otel.status_code = tracing::field::Empty,  object_type = %object_type)
     )]
@@ -681,6 +697,7 @@ impl Store {
     /// List workspace objects after a stable cursor, without offset drift.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_after",
@@ -702,6 +719,7 @@ impl Store {
     /// List objects across workspaces after a stable cursor, without offset drift.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_by_type_after",
@@ -827,6 +845,7 @@ impl Store {
     /// UUIDs which are globally unique. Revisit if non-UUID scopes are introduced.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
     )]
@@ -844,6 +863,7 @@ impl Store {
     /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(
             otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty,
@@ -912,6 +932,7 @@ impl Store {
     /// List objects by type across all workspaces with label selector filtering.
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.list_all_with_selector", otel.status_code = tracing::field::Empty,  object_type = %object_type, label_selector = %label_selector)
     )]
@@ -1310,6 +1331,7 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
 impl Store {
     #[tracing::instrument(
         name = "store",
+        level = "debug",
         skip_all,
         fields(otel.name = "store.put", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
     )]

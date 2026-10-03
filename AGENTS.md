@@ -17,26 +17,13 @@ OpenShell has two skill collections:
 
 Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
-## Workflow Chains
-
-These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
-
-- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
-  - Triage establishes facts and marks technically valid issues `state:validated`. A human signals that the project should pursue the work by applying `state:accepted` or placing the issue on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase even when the expected lifecycle or workflow labels are missing or incomplete; the agent warns about the discrepancies and continues without changing the labels.
-- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
-  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or roadmap placement, or declines it, and optionally queues it through the `agent:*` workflow or directs an agent to it. A direct request proceeds after warning about missing or incomplete expected labels.
-- **Security:** `review-security-issue` → `fix-security-issue`
-  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. On direct requests to the specialized skills, missing workflow labels produce a warning rather than blocking the requested phase.
-- **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
-  - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
-
 ## Architecture Overview
 
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
+| `crates/openshell-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
@@ -87,30 +74,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
 the canonical source for entity-reference naming, workspace selectors, field
 design, and schema evolution.
-
-## Vouch System
-
-- First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
-- Org members and collaborators bypass the vouch gate automatically.
-- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
-- Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
-
-## Issue and PR Conventions
-
-- **Bug reports and feature requests** must include a User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. The impact should explain the consequences of the current behavior, the current workaround, and why that workaround is insufficient. Bug reports additionally require reproduction steps and environment details and may include concise, redacted logs.
-- **Feature requests** must also include a Proposed Design and Alternatives Considered. The design should define the user-facing workflow and externally observable behavior while leaving internal implementation choices open. Agent investigation is optional.
-- **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
-- **Issue triage** establishes technical validity and impact evidence. Agents never decide acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work; `state:accepted` or roadmap placement records acceptance, and roadmap association additionally carries sequencing. Lifecycle and request labels gate unattended queue pickup. An explicit user instruction authorizes an agent to plan or implement the specified issue even when expected labels are missing or incomplete; the agent warns the user and continues without changing those labels. OpenShell has no `priority:*` labels.
-- **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist. Contributors should use their agent to investigate the current code and behavior for accepted issue-backed work, verify any diagnostics already on the issue, understand the change they submit, and report the resulting implementation and verification—not paste an earlier issue-filing diagnostic.
-- **PRs for features, user-visible behavior, public APIs, architecture, or multi-PR efforts** must link an accepted issue. Small docs fixes, mechanical maintenance, and obvious localized bug fixes may state why no issue is required.
-- **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
-- **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
-- Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
-
-## Plans
-
-- Store plan documents in `plans/`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
-- When asked to write a plan, write it there without asking for the location.
 
 ## Sandbox Logging (OCSF)
 
@@ -216,18 +179,6 @@ ocsf_emit!(event);
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
 
-## Pre-commit
-
-- Run `mise run pre-commit` before committing.
-- Install the git hook when working locally: `mise generate git-pre-commit --write --task=pre-commit`
-
-## Testing
-
-- `mise run pre-commit` — Lint, format, license headers. Run before every commit.
-- `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
-- `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
-
 ## Go SDK (`sdk/go/`)
 
 - The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
@@ -263,8 +214,8 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Documentation
 
-- Put crate-specific implementation details in the relevant crate `README.md`, design proposals in `rfc/`, and temporary plans in the ignored `plans/` directory.
-- When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
+- Put crate-specific implementation details in the relevant crate `README.md` and design proposals in `rfc/`.
+- When changes affect user-facing behavior, make the smallest necessary changes to the relevant published docs pages under `docs/` and navigation in `docs/index.yml`. Explain exactly what users need to know; avoid repeating information across pages or exhaustively describing internals that do not affect users.
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.

@@ -22,6 +22,7 @@ source "${ROOT}/e2e/support/conformance.sh"
 # stabilized and can be added here.
 PODMAN_CI_TESTS=(
   bypass_detection
+  ephemeral_cleanup
   core_dump_hardening
   credential_gating
   default_image

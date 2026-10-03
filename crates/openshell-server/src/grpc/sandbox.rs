@@ -680,6 +680,11 @@ async fn handle_create_sandbox_inner(
             &sandbox,
             &exposure.service,
             exposure.target_port,
+            super::service::validate_service_exposure_request(
+                &exposure.service,
+                exposure.target_port,
+                exposure.authorization_mode,
+            )?,
         )
         .await
         {
@@ -741,7 +746,11 @@ fn validate_create_sandbox_request_pre_io(
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
-        super::service::validate_service_exposure_request(&exposure.service, exposure.target_port)?;
+        super::service::validate_service_exposure_request(
+            &exposure.service,
+            exposure.target_port,
+            exposure.authorization_mode,
+        )?;
         if !service_names.insert(exposure.service.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "duplicate service exposure name: '{}'",
@@ -3736,7 +3745,7 @@ impl russh::client::Handler for SandboxSshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -3924,7 +3933,9 @@ mod tests {
         test_server_state_with_driver,
     };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
+    use openshell_core::proto::{
+        GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
+    };
 
     // ---- shell_escape ----
 
@@ -6720,10 +6731,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: String::new(),
                         target_port: 4500,
+                        authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                     },
                 ],
                 ..Default::default()
@@ -6756,7 +6769,44 @@ mod tests {
             assert_eq!(endpoint.name, service);
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
+            let expected_mode = if service.is_empty() {
+                ServiceAuthorizationMode::Strip
+            } else {
+                ServiceAuthorizationMode::BearerPassthrough
+            };
+            assert_eq!(endpoint.authorization_mode(), expected_mode);
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_unknown_service_authorization_mode_before_persisting() {
+        let state = test_server_state().await;
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "invalid-service-authorization".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: vec![SandboxServiceExposure {
+                    service: String::new(),
+                    target_port: 4500,
+                    authorization_mode: 99,
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("unknown service authorization mode should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "invalid-service-authorization")
+                .await
+                .expect("sandbox lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6788,10 +6838,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -6875,10 +6927,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8081,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()

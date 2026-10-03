@@ -24,6 +24,31 @@ use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[test]
+fn startup_error_log_tails_fit_grpc_header_budget() {
+    // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
+    // percent encoding. Preserve the supervisor's final diagnostic.
+    let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
+    let message = format!(
+        "Docker supervisor exited before becoming ready{}",
+        format_log_tail(&logs),
+    );
+    assert_eq!(message.matches("[truncated]").count(), 1);
+    assert_eq!(message.matches("startup timed out").count(), 1);
+    let response = Status::unavailable(message).into_http::<()>();
+    let header_bytes: usize = response
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    assert!(
+        header_bytes < 16 * 1024,
+        "status headers: {header_bytes} bytes"
+    );
+    assert_eq!(format_log_tail("small error"), "; log tail: small error");
+    assert!(format_log_tail("").is_empty());
+}
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
@@ -188,8 +213,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
-            cert: PathBuf::from("/tmp/tls.crt"),
-            key: PathBuf::from("/tmp/tls.key"),
         }),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
@@ -3237,18 +3260,19 @@ fn workload_mounts_only_the_shared_channel_volume() {
 }
 
 #[test]
-fn docker_guest_tls_paths_require_all_files_for_https() {
+fn docker_guest_tls_paths_accept_ca_only_for_https() {
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(&DockerComputeConfig {
+    let paths = docker_guest_tls_paths(&DockerComputeConfig {
         grpc_endpoint: "https://localhost:8443".to_string(),
-        guest_tls_ca: Some(ca),
+        guest_tls_ca: Some(ca.clone()),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(err.to_string().contains("guest_tls_cert"));
+    .unwrap()
+    .expect("CA-only TLS paths");
+    assert_eq!(paths.ca, ca.canonicalize().unwrap());
 }
 
 #[test]
