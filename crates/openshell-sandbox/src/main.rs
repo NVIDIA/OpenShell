@@ -103,9 +103,6 @@ struct QualificationReport {
     tcp_dns_round_trip: bool,
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
-    /// Whether notified syscalls wait killably (Linux 5.19+). Informational:
-    /// the broker never writes workload memory, so mediation is identical.
-    wait_killable_recv: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -205,7 +202,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_dns_round_trip: true,
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
-        wait_killable_recv: notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {

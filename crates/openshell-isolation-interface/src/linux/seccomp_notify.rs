@@ -20,7 +20,6 @@ use std::time::Duration;
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
-const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_ulong = 1 << 5;
 
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
@@ -141,8 +140,6 @@ pub struct Notification {
 /// kernel, outer seccomp profile, and LSM posture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationProbeReport {
-    /// Whether `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` was accepted.
-    pub wait_killable_recv: bool,
     features: NotificationProbeFeatures,
 }
 
@@ -171,9 +168,13 @@ impl NotificationProbeReport {
 }
 
 /// Owned listener returned by `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+///
+/// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
+/// same on every kernel. A signal can interrupt a notified syscall and the
+/// kernel then restarts it; broker handlers check the notification is still
+/// live before acting and answer a repeated operation as the kernel would.
 pub struct NotificationListener {
     fd: OwnedFd,
-    wait_killable_recv: bool,
 }
 
 impl NotificationListener {
@@ -181,17 +182,6 @@ impl NotificationListener {
     #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-
-    /// Whether the listener was installed with killable receive waits.
-    ///
-    /// The broker never writes workload memory, so no mediation decision
-    /// depends on this. It only changes signal behavior: with killable waits a
-    /// non-fatal signal cannot interrupt a syscall that is waiting for the
-    /// broker or supervisor.
-    #[must_use]
-    pub fn wait_killable_recv(&self) -> bool {
-        self.wait_killable_recv
     }
 
     /// Receive the next kernel notification.
@@ -328,19 +318,7 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    // WAIT_KILLABLE_RECV (Linux 5.19+) keeps the notified workload thread in a
-    // kill-only wait while the broker services its syscall, so a non-fatal
-    // signal cannot interrupt a syscall waiting on a supervisor decision.
-    // Kernels older than 5.19 (for example RHEL 9.x / 5.14) reject the flag
-    // with EINVAL; fall back to a plain listener there. The broker never
-    // writes workload memory, so mediation is identical with either listener.
-    match install_listener_with_flags(syscalls, true) {
-        Ok(listener) => Ok(listener),
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-            install_listener_with_flags(syscalls, false)
-        }
-        Err(error) => Err(error),
-    }
+    install_notification_filter(syscalls)
 }
 
 /// Install the capability-free workload networking listener on the calling
@@ -379,30 +357,28 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
 /// one dedicated thread and moved to an unfiltered broker thread through an
 /// in-process channel.
 pub fn probe_notification_api() -> io::Result<NotificationProbeReport> {
-    let wait_killable_recv = probe_scalar_round_trip()?;
+    probe_scalar_round_trip()?;
     probe_addfd_send()?;
     probe_connected_sendto_fast_path()?;
     Ok(NotificationProbeReport {
-        wait_killable_recv,
         features: NotificationProbeFeatures(1 | 2 | 4),
     })
 }
 
-fn probe_scalar_round_trip() -> io::Result<bool> {
+fn probe_scalar_round_trip() -> io::Result<()> {
     const PROBE_VALUE: libc::c_long = 0x5a17;
     let (sender, receiver) = mpsc::sync_channel(1);
     let launcher = thread::spawn(move || -> io::Result<libc::c_long> {
         let listener = install_listener(&[libc::SYS_getppid])?;
-        let wait_killable = listener.wait_killable_recv();
         sender
-            .send((listener, wait_killable))
+            .send(listener)
             .map_err(|_| io::Error::other("notification broker disappeared"))?;
         // SAFETY: getppid has no pointer arguments. The installed filter causes
         // the kernel to block here until the broker validates and responds.
         Ok(unsafe { libc::syscall(libc::SYS_getppid) })
     });
 
-    let (listener, wait_killable) = receiver
+    let listener = receiver
         .recv()
         .map_err(|_| io::Error::other("notification launcher disappeared"))?;
     let notification = match receive_probe_notification(&listener) {
@@ -422,7 +398,7 @@ fn probe_scalar_round_trip() -> io::Result<bool> {
     if observed != PROBE_VALUE {
         return Err(io::Error::other("seccomp response value was not delivered"));
     }
-    Ok(wait_killable)
+    Ok(())
 }
 
 fn probe_addfd_send() -> io::Result<()> {
@@ -676,10 +652,7 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
     listener.receive()
 }
 
-fn install_listener_with_flags(
-    syscalls: &[i64],
-    wait_killable_recv: bool,
-) -> io::Result<NotificationListener> {
+fn install_notification_filter(syscalls: &[i64]) -> io::Result<NotificationListener> {
     let mut program = build_filter(syscalls)?;
     let length = u16::try_from(program.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large"))?;
@@ -687,12 +660,7 @@ fn install_listener_with_flags(
         len: length,
         filter: program.as_mut_ptr(),
     };
-    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER
-        | if wait_killable_recv {
-            SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
-        } else {
-            0
-        };
+    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
     // SAFETY: `fprog` points to a live classic-BPF program for the duration of
     // the syscall. The returned nonnegative value is a newly owned FD.
     let result = unsafe {
@@ -710,10 +678,7 @@ fn install_listener_with_flags(
         .map_err(|_| io::Error::other("seccomp listener FD does not fit RawFd"))?;
     // SAFETY: successful NEW_LISTENER returns one newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(NotificationListener {
-        fd,
-        wait_killable_recv,
-    })
+    Ok(NotificationListener { fd })
 }
 
 fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
@@ -994,19 +959,10 @@ mod tests {
         let listener = NotificationListener {
             // SAFETY: successful dup returned a new owned descriptor.
             fd: unsafe { OwnedFd::from_raw_fd(duplicated) },
-            wait_killable_recv: false,
         };
         let error = listener
             .respond_errno(1, 0)
             .expect_err("zero errno must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn listener_records_killable_receive_waits() {
-        set_no_new_privileges().expect("no_new_privs for listener install");
-        let plain = install_listener_with_flags(&[libc::SYS_getppid], false)
-            .expect("install plain listener");
-        assert!(!plain.wait_killable_recv());
     }
 }

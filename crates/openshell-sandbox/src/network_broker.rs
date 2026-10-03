@@ -761,15 +761,21 @@ fn connect_socket(
     let destination =
         read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
     reject_protected_control_destination(destination, protected_control_port)?;
-    let (kind, socket_identity, nonblocking) = {
+    let (kind, socket_identity, nonblocking, repeated) = {
         let registry = lock(&registry);
         let entry = registry.resolve(notification.tid, fd)?;
         (
             entry.metadata().kind,
             entry.identity(),
             entry.metadata().nonblocking,
+            repeated_connect_outcome(entry.state(), entry.metadata().kind, destination),
         )
     };
+    match repeated {
+        Some(0) => return listener.respond_value(notification.id, 0),
+        Some(errno) => return Err(io::Error::from_raw_os_error(errno)),
+        None => {}
+    }
     if kind == InetKind::DnsUdp && destination.port() == 0 {
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
@@ -786,6 +792,7 @@ fn connect_socket(
         if entry.metadata().family != destination_family {
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
         }
+        listener.validate_id(notification.id)?;
         // glibc and uv use UDP connect(..., port 0), getsockname(), and an
         // AF_UNSPEC disconnect to rank resolved addresses. Bind only to the
         // matching loopback family and report success; never connect the
@@ -808,6 +815,7 @@ fn connect_socket(
             return Err(io::Error::from_raw_os_error(libc::EISCONN));
         }
         let source_fd = entry.retained_preconnect()?.as_raw_fd();
+        listener.validate_id(notification.id)?;
         let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
         let admissions = match kind {
             InetKind::Tcp => &dns_relay.tcp_admissions,
@@ -832,6 +840,7 @@ fn connect_socket(
     {
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
+        listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
         entry.set_state(SocketState::Local { peer: destination });
         entry.release_preconnect();
@@ -914,6 +923,29 @@ fn connect_socket(
         })
         .map_err(|error| io::Error::other(format!("start network-open worker: {error}")))?;
     Ok(())
+}
+
+/// Result for a `connect` on a socket the broker already connected, as the
+/// kernel would report it: `Some(0)` for success, `Some(errno)` for an error,
+/// `None` when the socket is not yet connected.
+///
+/// A notified syscall interrupted by a signal is restarted after the broker
+/// may already have completed it, so a repeat must not depend on the broker's
+/// released pre-connect descriptor.
+fn repeated_connect_outcome(
+    state: &SocketState,
+    kind: InetKind,
+    destination: SocketAddr,
+) -> Option<i32> {
+    match state {
+        SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. } => None,
+        SocketState::Failed { errno } => Some(*errno),
+        // UDP connect replaces the association; repeating the same one succeeds.
+        SocketState::DnsUdp { relay } if *relay == destination => Some(0),
+        SocketState::Local { peer } if kind == InetKind::DnsUdp && *peer == destination => Some(0),
+        _ if kind == InetKind::Tcp => Some(libc::EISCONN),
+        _ => None,
+    }
 }
 
 const fn tcp_denial_errno(reason: TcpOpenDenial) -> i32 {
@@ -1025,6 +1057,12 @@ fn bind_socket(
     let bind_result = {
         let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
+        // A native bind is never restarted, but a notified one can be after a
+        // signal. Report a repeat of the bind the broker completed as success.
+        if entry.state() == &(SocketState::Bound { local }) {
+            return listener.respond_value(notification.id, 0);
+        }
+        listener.validate_id(notification.id)?;
         bind_exact(entry.retained_preconnect()?.as_raw_fd(), local)
     };
     if bind_result
@@ -1070,6 +1108,8 @@ fn listen_socket(
     let Ok(entry) = registry.resolve_mut(notification.tid, fd) else {
         return listener.respond_continue(notification.id);
     };
+    // listen(2) may be repeated natively, so a restart needs no special case.
+    listener.validate_id(notification.id)?;
     // SAFETY: retained descriptor is the exact registered socket OFD.
     if unsafe { libc::listen(entry.retained_preconnect()?.as_raw_fd(), backlog) } < 0 {
         return Err(io::Error::last_os_error());
@@ -1165,6 +1205,7 @@ fn classify_send(
         {
             let entry = registry.resolve_mut(notification.tid, fd)?;
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
+            listener.validate_id(notification.id)?;
             let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
             register_dns_socket(&dns_relay.udp_admissions, peer, entry.identity())?;
             if let Err(error) = connect_exact(source_fd, dns_relay.address) {
@@ -2259,6 +2300,94 @@ mod tests {
                 Err(Some(libc::EAFNOSUPPORT))
             ]
         );
+    }
+
+    #[test]
+    fn repeated_connects_report_what_the_kernel_would() {
+        let relay: SocketAddr = "127.0.0.53:53".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        for (state, kind, destination, expected) in [
+            (SocketState::Created, InetKind::Tcp, peer, None),
+            (
+                SocketState::Bound { local: peer },
+                InetKind::Tcp,
+                peer,
+                None,
+            ),
+            (
+                SocketState::Local { peer },
+                InetKind::Tcp,
+                peer,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::Connected {
+                    original_peer: "203.0.113.7:443".parse().unwrap(),
+                },
+                InetKind::Tcp,
+                peer,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::DnsTcp { relay },
+                InetKind::Tcp,
+                relay,
+                Some(libc::EISCONN),
+            ),
+            (
+                SocketState::DnsUdp { relay },
+                InetKind::DnsUdp,
+                relay,
+                Some(0),
+            ),
+            (SocketState::DnsUdp { relay }, InetKind::DnsUdp, other, None),
+            (SocketState::Local { peer }, InetKind::DnsUdp, peer, Some(0)),
+            (
+                SocketState::Failed {
+                    errno: libc::ECONNRESET,
+                },
+                InetKind::Tcp,
+                peer,
+                Some(libc::ECONNRESET),
+            ),
+        ] {
+            assert_eq!(
+                repeated_connect_outcome(&state, kind, destination),
+                expected,
+                "{state:?} {kind:?} {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn restarted_bind_and_connect_are_answered_consistently() {
+        // Without killable notification waits a signal can restart a
+        // syscall the broker already completed. A repeat must not fail on
+        // the broker's released pre-connect descriptor.
+        let service = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = service.local_addr().unwrap();
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (bind_again, connect_again) = launcher
+            .execute(move || -> io::Result<(io::Result<()>, Option<i32>)> {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                socket.bind(&local.into())?;
+                let bind_again = socket.bind(&local.into());
+                socket.connect(&address.into())?;
+                let connect_again = socket
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                Ok((bind_again, connect_again))
+            })
+            .expect("launcher result")
+            .expect("workload socket");
+        bind_again.expect("repeated bind of the same address");
+        assert_eq!(connect_again, Some(libc::EISCONN));
     }
 
     #[test]
