@@ -176,12 +176,16 @@ let
   };
 
   # Reports how many of the e2e-podman-eligible targets the archive actually
-  # selects, so a narrow CI run cannot be mistaken for full coverage (#3712).
-  # Computes the eligible count the same way podmanE2eCiTests does (a real
-  # `cargo nextest list`, not a hand-maintained number) and compares it
-  # against podmanE2eFollowUpBinaries, the single declarative exclusion list
-  # that also drives the archive filter above — so this can't drift from what
-  # actually runs.
+  # selects and executes, so a narrow CI run cannot be mistaken for full
+  # coverage (#3712). Computes the eligible set the same way podmanE2eCiTests
+  # does (a real `cargo nextest list`, not a hand-maintained number) and
+  # compares it against podmanE2eFollowUpBinaries, the single declarative
+  # exclusion list that also drives the archive filter above — so this can't
+  # drift from what actually runs. Uses the full (not binaries-only) listing
+  # so per-test `#[ignore]` status is visible: a selected binary whose only
+  # test is a manual-only benchmark (see the two perf targets elsewhere in
+  # this file) is archive-scoped but never actually executes, and reporting
+  # it as "selected" without that distinction would itself be misleading.
   podmanE2eCoverageSummary = pkgs.writeShellApplication {
     name = "podman-e2e-coverage-summary";
     runtimeInputs = [
@@ -195,21 +199,48 @@ let
       root=$(git rev-parse --show-toplevel)
       cd "$root"
 
-      eligible=$(cargo nextest list \
+      counts=$(cargo nextest list \
         --manifest-path e2e/rust/Cargo.toml \
         --target ${muslToolchain.target} \
         -p openshell-e2e \
         --features e2e-podman \
-        --list-type binaries-only \
         --message-format json \
-        | jq '[.["rust-binaries"] | to_entries[] | select(.value.kind == "test")] | length')
+        | jq --argjson excluded ${pkgs.lib.escapeShellArg (builtins.toJSON podmanE2eFollowUpBinaries)} '
+          [
+            .["rust-suites"][]
+            | select(.kind == "test")
+            | {
+                name: .["binary-name"],
+                selected: (.["binary-name"] as $name | $excluded | index($name) | not),
+                all_ignored: ((.testcases | length) > 0 and (.testcases | to_entries | all(.value.ignored == true)))
+              }
+          ] as $targets
+          | ($targets | map(select(.selected))) as $selected
+          | {
+              eligible: ($targets | length),
+              excluded_count: ($excluded | length),
+              selected: ($selected | length),
+              manual_only: [$selected[] | select(.all_ignored) | .name]
+            }
+        ')
 
-      excluded=${toString (builtins.length podmanE2eFollowUpBinaries)}
-      selected=$((eligible - excluded))
+      eligible=$(jq -r '.eligible' <<<"$counts")
+      excluded_count=$(jq -r '.excluded_count' <<<"$counts")
+      selected=$(jq -r '.selected' <<<"$counts")
+      manual_only_count=$(jq -r '.manual_only | length' <<<"$counts")
+      manual_only_names=$(jq -r '.manual_only | join(", ")' <<<"$counts")
+      executing=$((selected - manual_only_count))
 
       echo "### Podman \`e2e-podman\` archive coverage"
       echo
-      echo "**$selected of $eligible** eligible targets selected ($excluded excluded — see \`podmanE2eFollowUpBinaries\` in \`tests/artifacts.nix\` for the documented reason behind each one)."
+      echo "- **$eligible** targets eligible under the \`e2e-podman\` feature"
+      echo "- **$excluded_count** excluded — see \`podmanE2eFollowUpBinaries\` in \`tests/artifacts.nix\` for the documented reason behind each one"
+      if [ "$manual_only_count" -gt 0 ]; then
+        echo "- **$selected** selected into the archive, of which **$manual_only_count** are manual-only benchmarks (\`#[ignore]\`) that don't run automatically: $manual_only_names"
+      else
+        echo "- **$selected** selected into the archive"
+      fi
+      echo "- **$executing** actually execute in this run"
     '';
   };
 

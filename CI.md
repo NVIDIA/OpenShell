@@ -82,6 +82,12 @@ retain the binary installer because their fixtures configure its system service,
 local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
+The `e2e-podman` driver-specific run posts a job summary reporting how many of
+the `e2e-podman`-eligible targets the archive actually selects and executes,
+naming any selected manual-only benchmarks separately, so a narrow run cannot
+be mistaken for full Podman coverage. See `nix run .#podman-e2e-coverage-summary`
+in TESTING.md.
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
