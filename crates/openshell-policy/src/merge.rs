@@ -872,6 +872,10 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
+        && flag_covers(
+            loaded.allow_uninspected_credentials,
+            proposed.allow_uninspected_credentials,
+        )
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -3355,6 +3359,47 @@ mod tests {
         ));
     }
 
+    /// `allow_uninspected_credentials` is a widened authorization rather than a
+    /// field the merge carries over, so a declaration that omits it does not
+    /// claim the exception the endpoint already grants. A binary joining the
+    /// rule has to name it like any other authorization it will receive.
+    #[test]
+    fn new_binary_cannot_inherit_an_undeclared_uninspected_credentials_exception() {
+        let existing_endpoint = NetworkEndpoint {
+            allow_uninspected_credentials: true,
+            ..endpoint("api.vendor.example", 443)
+        };
+        let existing =
+            rule_with_authorizations("realtime", vec![existing_endpoint], &["/usr/bin/tool-a"]);
+        let incoming = rule_with_authorizations(
+            "realtime",
+            vec![endpoint("api.vendor.example", 443)],
+            &["/usr/bin/tool-b"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("realtime", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the new binary did not declare the uninspected-credentials exception");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index: 0,
+                binary_scope,
+                host,
+                ports,
+                ..
+            } if binary_scope == "binary '/usr/bin/tool-b'"
+                && host == "api.vendor.example"
+                && ports == vec![443]
+        ));
+    }
+
     #[test]
     fn new_binary_must_declare_every_existing_mcp_endpoint() {
         let endpoint_a = mcp_endpoint(
@@ -4264,6 +4309,88 @@ mod tests {
         .expect("merge should succeed");
 
         let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.allow_uninspected_credentials);
+    }
+
+    /// `merge_endpoint` widens `allow_uninspected_credentials` onto the shared
+    /// endpoint, so every binary already on the rule receives the exception.
+    /// That is authorization the operation did not declare, and it has to be
+    /// rejected like the other widened credential flags rather than granted
+    /// silently to the binaries the operation left unnamed.
+    #[test]
+    fn add_rule_rejects_enabling_allow_uninspected_credentials_for_undeclared_binary() {
+        let policy = policy_with_rule(
+            "realtime",
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![endpoint("api.vendor.example", 443)],
+                binaries: vec![
+                    binary("/usr/local/bin/tool-a"),
+                    binary("/usr/local/bin/tool-b"),
+                ],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "realtime".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        allow_uninspected_credentials: true,
+                        ..endpoint("api.vendor.example", 443)
+                    }],
+                    binaries: vec![binary("/usr/local/bin/tool-a")],
+                },
+            }],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                undeclared_binaries,
+                ..
+            }) if undeclared_binaries == ["/usr/local/bin/tool-b"]
+        ));
+    }
+
+    /// The same operation naming every binary on the rule declares the whole
+    /// scope the flag reaches, so it is accepted and the flag lands.
+    #[test]
+    fn add_rule_enables_allow_uninspected_credentials_when_every_binary_is_declared() {
+        let policy = policy_with_rule(
+            "realtime",
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![endpoint("api.vendor.example", 443)],
+                binaries: vec![
+                    binary("/usr/local/bin/tool-a"),
+                    binary("/usr/local/bin/tool-b"),
+                ],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "realtime".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "realtime".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        allow_uninspected_credentials: true,
+                        ..endpoint("api.vendor.example", 443)
+                    }],
+                    binaries: vec![
+                        binary("/usr/local/bin/tool-a"),
+                        binary("/usr/local/bin/tool-b"),
+                    ],
+                },
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
         assert!(endpoint.allow_uninspected_credentials);
     }
 
