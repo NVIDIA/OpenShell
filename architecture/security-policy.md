@@ -44,10 +44,11 @@ parameter names are open user-data maps rather than schema extensions.
 ### Cedar-authored policies
 
 A policy is either YAML or Cedar for the life of a sandbox. A non-empty
-`SandboxPolicy.cedar_policy_source` (authored as a `.cedar` file or the YAML
-`cedar_policy` field) selects Cedar; it is mutually exclusive with
-`network_policies` and filesystem paths, and combines with
-`network_middlewares`, `landlock`, and `process`. The supervisor chooses the
+`SandboxPolicy.cedar_policy_source`, authored as a `.cedar` file, selects
+Cedar; it is mutually exclusive with `network_policies` and filesystem paths.
+Middleware is configuration rather than policy, so for a Cedar sandbox it is
+supplied in a separate middleware file (`--middleware`) and carried in
+`network_middlewares`. The supervisor chooses the
 engine once at startup and rejects any reload that would switch formats, and
 the gateway rejects format switches on update and Cedar global policies.
 

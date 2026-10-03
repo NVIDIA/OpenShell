@@ -137,6 +137,8 @@ Matching configs run once each by ascending `order`; lower values run first. Ord
 
 See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
 
+You can also keep middleware in its own file that contains only the `network_middlewares` section, and pass it with `--middleware` to `openshell sandbox create` or `openshell policy set`. This is how middleware is supplied for a [Cedar policy](/sandboxes/cedar-policies#add-middleware). The policy itself must not also define `network_middlewares`.
+
 ## Configure Failure Behavior
 
 `on_error` controls what happens after an operation binding is selected and middleware is unavailable, rejects its configuration, returns an invalid result, or exceeds the selected binding's payload limit. It does not turn an unadvertised operation or an unsupported WebSocket message class into a middleware failure.

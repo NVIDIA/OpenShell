@@ -30,17 +30,13 @@ openshell policy set <name> --policy ./policy.cedar --wait
 
 The CLI validates the file before sending it, and the gateway validates it again.
 
-To combine Cedar with middleware or other YAML policy sections, put the Cedar text in the `cedar_policy` field of a YAML policy file. The file can also set `network_middlewares`, `landlock`, and `process`. It cannot set `network_policies` or filesystem paths, which Cedar replaces.
+`openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
+
+## Add Middleware
+
+Middleware is configuration, not access control, so it is supplied separately from the Cedar file. Write a middleware file that contains only a `network_middlewares` section, in the same format as the section of a YAML policy:
 
 ```yaml
-version: 1
-cedar_policy: |
-  permit (
-      principal is Sandbox::Process,
-      action == Sandbox::Action::"NetworkConnect",
-      resource == Sandbox::NetworkEndpoint::"api.github.com:443"
-  )
-  when { context.binary_path == "/usr/bin/curl" };
 network_middlewares:
   regex-redactor:
     name: Redact API tokens
@@ -53,7 +49,14 @@ network_middlewares:
       include: ["api.github.com"]
 ```
 
-`openshell policy get <name> --base` prints a Cedar sandbox's policy in this YAML form, which you can edit and pass back to `openshell policy set`.
+Pass it with `--middleware` when you create the sandbox or set its policy:
+
+```shell
+openshell sandbox create --policy ./policy.cedar --middleware ./middleware.yaml -- claude
+openshell policy set <name> --policy ./policy.cedar --middleware ./middleware.yaml --wait
+```
+
+`openshell policy get <name>` prints the middleware as a separate section after the Cedar text. The Landlock compatibility mode and process identity of a Cedar sandbox use their defaults.
 
 ## Policy Model
 
