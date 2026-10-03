@@ -82,6 +82,20 @@ retain the binary installer because their fixtures configure its system service,
 local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
+The `e2e-podman` driver-specific run posts a job summary reporting how many of
+the `e2e-podman`-eligible targets the archive actually selects and executes,
+naming any selected manual-only benchmarks separately, so a narrow run cannot
+be mistaken for full Podman coverage. See `nix run .#podman-e2e-coverage-summary`
+in TESTING.md.
+
+The `driver-podman` testsuite runs both rootful and rootless Fedora Podman;
+`e2e-podman` runs rootless only. This is deliberate, not an oversight: see the
+comment on `podmanE2eArchive` in `tests/artifacts.nix` for which targets would
+and would not benefit from a rootful leg. Only `podman_resource_limits` does,
+but nextest archive filters select whole binaries, so closing that gap (tracked
+in #4163) means running this entire archive rootful too, not just that one
+target.
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
