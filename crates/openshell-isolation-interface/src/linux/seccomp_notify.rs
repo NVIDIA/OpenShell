@@ -342,6 +342,8 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_setsockopt,
         libc::SYS_kill,
         libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_rt_tgsigqueueinfo,
         libc::SYS_rt_sigqueueinfo,
         libc::SYS_openat,
         libc::SYS_openat2,

@@ -168,6 +168,7 @@ fn register_dns_socket(
 #[derive(Clone)]
 struct NotificationQueues {
     provider_files: crate::provider_files::ProviderFiles,
+    workload_frozen: Arc<AtomicBool>,
     protected_control_port: Option<u16>,
     identity_resolver: ProcfsIdentityResolver,
     pending: mpsc::Sender<PendingTcpOpen>,
@@ -181,6 +182,7 @@ struct NotificationQueues {
 #[derive(Clone)]
 pub struct NetworkBroker {
     provider_files: crate::provider_files::ProviderFiles,
+    workload_frozen: Arc<AtomicBool>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
     dns_address: SocketAddr,
@@ -232,8 +234,10 @@ impl NetworkBroker {
         let retained_socket_capacity = retained_socket_capacity()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let provider_files = crate::provider_files::ProviderFiles::default();
+        let workload_frozen = Arc::new(AtomicBool::new(false));
         let queues = NotificationQueues {
             provider_files: provider_files.clone(),
+            workload_frozen: workload_frozen.clone(),
             protected_control_port,
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
             pending: pending_tx,
@@ -283,11 +287,20 @@ impl NetworkBroker {
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
             provider_files,
+            workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
             dns_address,
             healthy,
         })
+    }
+
+    /// Record whether the boundary has stopped the workload for supervisor
+    /// recovery. While frozen, workload requests to send `SIGCONT` are refused
+    /// so a process that was not yet stopped cannot resume the others. Set
+    /// this before stopping the workload and clear it after resuming it.
+    pub(crate) fn set_workload_frozen(&self, frozen: bool) {
+        self.workload_frozen.store(frozen, Ordering::Release);
     }
 
     pub(crate) async fn accept(&self) -> io::Result<PendingTcpOpen> {
@@ -515,13 +528,18 @@ fn dispatch_notification(
             &listener,
             notification,
             std::process::id(),
+            queues.workload_frozen.load(Ordering::Acquire),
         );
     }
-    if syscall == libc::SYS_tkill {
+    if matches!(
+        syscall,
+        libc::SYS_tkill | libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo
+    ) {
         return openshell_isolation_interface::linux::process_signal::mediate_thread_signal(
             &listener,
             notification,
             std::process::id(),
+            queues.workload_frozen.load(Ordering::Acquire),
         );
     }
     if syscall == libc::SYS_socket {
@@ -2388,6 +2406,68 @@ mod tests {
             .expect("workload socket");
         bind_again.expect("repeated bind of the same address");
         assert_eq!(connect_again, Some(libc::EISCONN));
+    }
+
+    #[test]
+    fn frozen_workload_cannot_resume_processes_with_sigcont() {
+        // A workload process that is not yet stopped when the boundary
+        // freezes must not resume the others, through process-directed
+        // (kill) or thread-directed (tgkill) signals.
+        const CHILD_MARKER: &str = "OPENSHELL_FROZEN_SIGCONT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let errno = |result: nix::Result<()>| result.err().map_or(0, |error| error as i32);
+            let kill = errno(nix::sys::signal::kill(
+                nix::unistd::getpid(),
+                nix::sys::signal::Signal::SIGCONT,
+            ));
+            // SAFETY: tgkill takes scalar arguments naming this thread.
+            let tgkill = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::gettid(),
+                    libc::SIGCONT,
+                )
+            };
+            let tgkill = if tgkill < 0 {
+                io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                0
+            };
+            println!("kill={kill} tgkill={tgkill}");
+            return;
+        }
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let run_workload = |launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher| {
+            let output = launcher
+                .execute(|| {
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "network_broker::tests::frozen_workload_cannot_resume_processes_with_sigcont",
+                            "--nocapture",
+                            "--quiet",
+                        ])
+                        .env(CHILD_MARKER, "1")
+                        .output()
+                })
+                .unwrap()
+                .expect("run workload child");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find(|line| line.starts_with("kill="))
+                .expect("workload child result")
+                .to_string()
+        };
+        broker.set_workload_frozen(true);
+        assert_eq!(
+            run_workload(&launcher),
+            format!("kill={} tgkill={}", libc::EPERM, libc::EPERM)
+        );
+        broker.set_workload_frozen(false);
+        assert_eq!(run_workload(&launcher), "kill=0 tgkill=0");
     }
 
     #[test]

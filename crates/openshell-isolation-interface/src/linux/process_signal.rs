@@ -27,6 +27,7 @@ pub fn mediate_process_signal(
     listener: &NotificationListener,
     notification: Notification,
     sandbox_tgid: u32,
+    workload_frozen: bool,
 ) -> io::Result<()> {
     listener.validate_id(notification.id)?;
     let target = scalar_int(notification.args[0]);
@@ -38,6 +39,7 @@ pub fn mediate_process_signal(
             libc::EINVAL
         }));
     }
+    refuse_resume_while_frozen(signal, workload_frozen)?;
     let target = u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     let retained = retain_signal_target(target, sandbox_tgid)?;
     // SAFETY: all-zero siginfo consists of valid integer/pointer fields. A
@@ -92,24 +94,51 @@ pub fn mediate_thread_signal(
     listener: &NotificationListener,
     notification: Notification,
     sandbox_tgid: u32,
+    workload_frozen: bool,
 ) -> io::Result<()> {
     listener.validate_id(notification.id)?;
-    let target = scalar_int(notification.args[0]);
-    let signal = scalar_int(notification.args[1]);
-    if target <= 0 || !(0..=64).contains(&signal) {
-        return Err(io::Error::from_raw_os_error(if target <= 0 {
-            libc::EPERM
-        } else {
-            libc::EINVAL
-        }));
+    // tkill(tid, sig); tgkill(tgid, tid, sig); rt_tgsigqueueinfo(tgid, tid,
+    // sig, info). The kernel itself validates a queued siginfo's code.
+    let (claimed_group, target, signal) = match i64::from(notification.syscall) {
+        libc::SYS_tkill => (
+            None,
+            scalar_int(notification.args[0]),
+            scalar_int(notification.args[1]),
+        ),
+        libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo => (
+            Some(scalar_int(notification.args[0])),
+            scalar_int(notification.args[1]),
+            scalar_int(notification.args[2]),
+        ),
+        _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+    };
+    if target <= 0 || claimed_group.is_some_and(|group| group <= 0) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
+    if !(0..=64).contains(&signal) {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    refuse_resume_while_frozen(signal, workload_frozen)?;
     let target = u32::try_from(target).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     let target_group = thread_group_id(target)?;
     if target_group == sandbox_tgid || target_group == 0 {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
+    if claimed_group.is_some_and(|group| u32::try_from(group).ok() != Some(target_group)) {
+        // The kernel reports a thread outside the named group as missing.
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
     listener.validate_id(notification.id)?;
     listener.respond_continue(notification.id)
+}
+
+/// While the boundary has stopped the workload for supervisor recovery, a
+/// workload process that was not yet stopped must not resume the others.
+fn refuse_resume_while_frozen(signal: i32, workload_frozen: bool) -> io::Result<()> {
+    if workload_frozen && signal == libc::SIGCONT {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
 }
 
 fn scalar_int(value: u64) -> i32 {
@@ -177,7 +206,7 @@ mod tests {
             .unwrap();
         let notification = listener.receive().unwrap();
         let error =
-            mediate_process_signal(&listener, notification, std::process::id()).unwrap_err();
+            mediate_process_signal(&listener, notification, std::process::id(), false).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         listener
             .respond_errno(notification.id, libc::EPERM)

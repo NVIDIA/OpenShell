@@ -1716,6 +1716,7 @@ mod linux {
                             "frozen workload could not be resumed".to_string(),
                         ));
                     }
+                    self.network_broker.set_workload_frozen(false);
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
                         "Sandbox Protocol connection recovered; workload resumed"
@@ -1772,6 +1773,7 @@ mod linux {
                     return;
                 }
                 if let Some(process) = &process {
+                    self.network_broker.set_workload_frozen(true);
                     let _ = process.boundary_runtime.freeze();
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
