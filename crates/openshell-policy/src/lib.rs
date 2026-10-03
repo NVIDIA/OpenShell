@@ -601,7 +601,9 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         network_policies,
         network_middlewares,
-        cedar_policy_source: raw.cedar_policy.unwrap_or_default(),
+        // YAML-authored policies never set this; Cedar policies are authored
+        // as `.cedar` files (see `parse_cedar_sandbox_policy_file`).
+        cedar_policy_source: String::new(),
         provider_credential_rules: HashMap::default(),
     })
 }
@@ -784,8 +786,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         process,
         network_policies,
         network_middlewares,
-        cedar_policy: (!policy.cedar_policy_source.is_empty())
-            .then(|| policy.cedar_policy_source.clone()),
     })
 }
 
@@ -922,7 +922,9 @@ pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 ///
-/// A Cedar-authored policy serializes with its Cedar text in `cedar_policy`.
+/// A Cedar-authored policy serializes to its Cedar text, which round-trips
+/// through [`parse_cedar_sandbox_policy_file`]. Its middleware is not part
+/// of the policy text; see [`serialize_network_middlewares`].
 ///
 /// # Errors
 ///
@@ -930,6 +932,9 @@ pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// invalid.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     validate_proto_version_for_authored_serialization(policy)?;
+    if !policy.cedar_policy_source.is_empty() {
+        return Ok(policy.cedar_policy_source.clone());
+    }
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let yaml_repr = from_proto(&canonical)?;
@@ -941,7 +946,8 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 ///
-/// A Cedar-authored policy includes its Cedar text in `cedar_policy`.
+/// A Cedar-authored policy renders as its Cedar text in
+/// `cedar_policy_source`, plus `network_middlewares` when it has any.
 ///
 /// # Errors
 ///
@@ -952,7 +958,101 @@ pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
-    openshell_policy_schema::policy_to_json_value(&json_repr)
+    let json = openshell_policy_schema::policy_to_json_value(&json_repr)?;
+    if canonical.cedar_policy_source.is_empty() {
+        return Ok(json);
+    }
+    let mut cedar = serde_json::json!({
+        "version": 1,
+        "cedar_policy_source": canonical.cedar_policy_source,
+    });
+    if let Some(middlewares) = json.get("network_middlewares") {
+        cedar["network_middlewares"] = middlewares.clone();
+    }
+    Ok(cedar)
+}
+
+/// Serializes a policy's `network_middlewares` as a middleware file.
+///
+/// The output has a single top-level `network_middlewares` section and
+/// round-trips through [`parse_middleware_file`]. Returns `None` when the
+/// policy has no middleware.
+///
+/// # Errors
+///
+/// Returns an error if the middleware configuration is invalid.
+pub fn serialize_network_middlewares(policy: &SandboxPolicy) -> Result<Option<String>> {
+    if policy.network_middlewares.is_empty() {
+        return Ok(None);
+    }
+    let middleware_only = SandboxPolicy {
+        version: 1,
+        network_middlewares: policy.network_middlewares.clone(),
+        ..Default::default()
+    };
+    let yaml = serialize_sandbox_policy(&middleware_only)?;
+    // The policy serializer always leads with the version line, which a
+    // middleware file does not carry.
+    Ok(Some(
+        yaml.strip_prefix("version: 1\n")
+            .unwrap_or(&yaml)
+            .to_string(),
+    ))
+}
+
+/// Reads a middleware file: YAML with only a top-level `network_middlewares` section.
+///
+/// Middleware is configuration, not access control, so it is supplied
+/// separately from the policy file. It uses the same format and validation as
+/// the `network_middlewares` section of a YAML policy and applies to YAML and
+/// Cedar policies alike.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, is not valid middleware
+/// configuration, or contains anything besides `network_middlewares`.
+pub fn parse_middleware_file(
+    path: &Path,
+) -> Result<HashMap<String, openshell_core::proto::NetworkMiddlewareConfig>> {
+    let content = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read middleware file {}", path.display()))?;
+    let invalid = || {
+        format!(
+            "invalid middleware file {}; expected YAML with only a top-level \
+             network_middlewares section",
+            path.display()
+        )
+    };
+    // Parse with the policy parser so the format and validation match the
+    // `network_middlewares` section of a YAML policy exactly.
+    let parsed = parse_sandbox_policy(&format!("version: 1\n{content}")).wrap_err_with(invalid)?;
+    let only_middleware = SandboxPolicy {
+        version: 1,
+        network_middlewares: parsed.network_middlewares.clone(),
+        ..Default::default()
+    };
+    if parsed != only_middleware {
+        return Err(miette::miette!("{}", invalid()));
+    }
+    Ok(parsed.network_middlewares)
+}
+
+/// Sets `policy`'s middleware from a middleware file.
+///
+/// # Errors
+///
+/// Returns an error if the file is invalid (see [`parse_middleware_file`]),
+/// or the policy already defines `network_middlewares`.
+pub fn apply_middleware_file(policy: &mut SandboxPolicy, path: &Path) -> Result<()> {
+    if !policy.network_middlewares.is_empty() {
+        return Err(miette::miette!(
+            "the policy already defines network_middlewares; remove them from the policy or \
+             omit --middleware"
+        ));
+    }
+    policy.network_middlewares = parse_middleware_file(path)?;
+    Ok(())
 }
 
 fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
@@ -2189,13 +2289,7 @@ when { context.binary_path == "/usr/bin/curl" };
         }
     }
 
-    #[test]
-    fn cedar_policy_round_trips_through_yaml_with_middleware() {
-        let yaml = r#"version: 1
-cedar_policy: |
-  permit (principal, action == Sandbox::Action::"NetworkConnect",
-          resource == Sandbox::NetworkEndpoint::"pypi.org:443");
-network_middlewares:
+    const MIDDLEWARE_FILE: &str = r#"network_middlewares:
   guard:
     middleware: openshell/regex
     order: 10
@@ -2205,19 +2299,72 @@ network_middlewares:
     endpoints:
       include: ["pypi.org"]
 "#;
-        let policy = parse_sandbox_policy(yaml).expect("YAML with cedar_policy must parse");
-        assert!(policy.cedar_policy_source.contains("pypi.org:443"));
-        assert!(policy.network_middlewares.contains_key("guard"));
-        assert!(policy.network_policies.is_empty());
 
-        let serialized = serialize_sandbox_policy(&policy).expect("serialize");
-        assert!(serialized.contains("cedar_policy:"), "{serialized}");
-        let reparsed = parse_sandbox_policy(&serialized).expect("serialized policy must parse");
-        assert_eq!(reparsed, policy);
+    fn write_temp_file(name: &str, contents: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "openshell-policy-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write file");
+        (dir, path)
+    }
+
+    #[test]
+    fn middleware_file_applies_to_a_cedar_policy_and_round_trips() {
+        let (dir, path) = write_temp_file("cedar-middleware.yaml", MIDDLEWARE_FILE);
+        let source = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#;
+        let mut policy = cedar_sourced_policy(source);
+
+        apply_middleware_file(&mut policy, &path).expect("middleware file must apply");
+        assert!(policy.network_middlewares.contains_key("guard"));
         assert_eq!(
-            sandbox_policy_to_json_value(&policy).expect("json")["cedar_policy"],
-            policy.cedar_policy_source
+            serialize_sandbox_policy(&policy).expect("serialize"),
+            source,
+            "a Cedar policy serializes to its Cedar text alone"
         );
+
+        let middleware = serialize_network_middlewares(&policy)
+            .expect("serialize middleware")
+            .expect("policy has middleware");
+        assert!(
+            middleware.starts_with("network_middlewares:"),
+            "{middleware}"
+        );
+        let (roundtrip_dir, reserialized) = write_temp_file("roundtrip.yaml", &middleware);
+        assert_eq!(
+            parse_middleware_file(&reserialized).expect("serialized middleware must parse"),
+            policy.network_middlewares
+        );
+
+        let json = sandbox_policy_to_json_value(&policy).expect("json");
+        assert_eq!(json["cedar_policy_source"], source);
+        assert!(json["network_middlewares"].get("guard").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&roundtrip_dir).ok();
+    }
+
+    #[test]
+    fn middleware_file_rejects_other_sections() {
+        let (dir, path) = write_temp_file(
+            "with-policies.yaml",
+            &format!("{MIDDLEWARE_FILE}network_policies:\n  x: {{ endpoints: [] }}\n"),
+        );
+        assert!(parse_middleware_file(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn middleware_file_does_not_replace_policy_middleware() {
+        let (dir, path) = write_temp_file("existing-middleware.yaml", MIDDLEWARE_FILE);
+        let mut policy = restrictive_default_policy();
+        policy.network_middlewares =
+            parse_middleware_file(&path).expect("middleware file must parse");
+        assert!(apply_middleware_file(&mut policy, &path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(feature = "cedar")]

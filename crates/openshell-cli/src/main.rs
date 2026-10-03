@@ -1358,6 +1358,12 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Path to a middleware file: YAML with only a `network_middlewares` section.
+        /// Adds supervisor middleware to the policy; required to use middleware with a
+        /// Cedar policy.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        middleware: Option<String>,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -1910,6 +1916,12 @@ enum PolicyCommands {
         /// Global policies must be YAML.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
+
+        /// Path to a middleware file: YAML with only a `network_middlewares` section.
+        /// Adds supervisor middleware to the policy; required to use middleware with a
+        /// Cedar policy.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        middleware: Option<String>,
 
         /// Apply as a gateway-global policy for all sandboxes.
         #[arg(long)]
@@ -2795,6 +2807,7 @@ async fn run_async() -> Result<()> {
                 PolicyCommands::Set {
                     name,
                     policy,
+                    middleware,
                     global,
                     yes,
                     wait,
@@ -2809,7 +2822,10 @@ async fn run_async() -> Result<()> {
                         }
                         run::sandbox_policy_set_global(
                             &ctx.endpoint,
-                            &policy,
+                            run::PolicyFiles {
+                                policy: &policy,
+                                middleware: middleware.as_deref(),
+                            },
                             yes,
                             wait,
                             timeout,
@@ -2822,7 +2838,10 @@ async fn run_async() -> Result<()> {
                         run::sandbox_policy_set(
                             &ctx.endpoint,
                             &name,
-                            &policy,
+                            run::PolicyFiles {
+                                policy: &policy,
+                                middleware: middleware.as_deref(),
+                            },
                             wait,
                             timeout,
                             &cli.workspace,
@@ -3114,6 +3133,7 @@ async fn run_async() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    middleware,
                     forward,
                     tty,
                     no_tty,
@@ -3206,6 +3226,7 @@ async fn run_async() -> Result<()> {
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
+                            middleware: middleware.as_deref(),
                             forward,
                             command: &command,
                             tty_override,

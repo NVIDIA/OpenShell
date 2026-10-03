@@ -106,11 +106,3 @@ fn external_callers_read_reason_evidence_and_authorize_only_within() {
     }
     assert_eq!(evidence.scope().policy_version, 1);
 }
-
-#[test]
-fn cedar_policies_are_rejected() {
-    let error =
-        parse_policy_str("version: 1\ncedar_policy: |\n  permit (principal, action, resource);\n")
-            .expect_err("the containment checker must not ignore Cedar text");
-    assert!(error.to_string().contains("Cedar"), "{error}");
-}

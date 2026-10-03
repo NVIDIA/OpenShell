@@ -439,6 +439,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub middleware: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
@@ -465,6 +466,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            middleware: None,
             forward: None,
             command: &[],
             tty_override: None,
@@ -499,6 +501,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        middleware,
         forward,
         command,
         tty_override,
@@ -586,7 +589,7 @@ pub async fn sandbox_create(
     )
     .await?;
 
-    let policy = load_sandbox_policy(policy)?;
+    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -1451,6 +1454,61 @@ fn merge_rootfs_tar_driver_config(
 /// to apply its own default.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     openshell_policy::load_sandbox_policy(cli_path)
+}
+
+/// Renders a policy for `policy get`.
+///
+/// A YAML policy renders as YAML. A Cedar policy renders as its Cedar text,
+/// followed by its middleware as a separate section, since middleware is
+/// configuration supplied with `--middleware` rather than part of the policy.
+fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
+    let mut text = openshell_policy::serialize_sandbox_policy(policy)
+        .wrap_err("failed to serialize policy")?;
+    if policy.cedar_policy_source.is_empty() {
+        return Ok(text);
+    }
+    if let Some(middleware) = openshell_policy::serialize_network_middlewares(policy)
+        .wrap_err("failed to serialize middleware")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("---\n# Middleware (set with --middleware)\n");
+        text.push_str(&middleware);
+    }
+    Ok(text)
+}
+
+/// The files `policy set` reads: a policy file and an optional middleware file.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyFiles<'a> {
+    /// Path to a YAML or `.cedar` policy file.
+    pub policy: &'a str,
+    /// Path to a middleware file, if any.
+    pub middleware: Option<&'a str>,
+}
+
+impl PolicyFiles<'_> {
+    /// Loads the policy and adds the middleware file, if any.
+    fn load(self) -> Result<SandboxPolicy> {
+        load_sandbox_policy_with_middleware(Some(self.policy), self.middleware)?
+            .ok_or_else(|| miette::miette!("No policy loaded from {}", self.policy))
+    }
+}
+
+/// Loads the policy and adds the middleware from `middleware_path`, if given.
+fn load_sandbox_policy_with_middleware(
+    policy_path: Option<&str>,
+    middleware_path: Option<&str>,
+) -> Result<Option<SandboxPolicy>> {
+    let mut policy = load_sandbox_policy(policy_path)?;
+    if let Some(middleware_path) = middleware_path {
+        let policy = policy.as_mut().ok_or_else(|| {
+            miette::miette!("--middleware requires a policy (--policy or OPENSHELL_SANDBOX_POLICY)")
+        })?;
+        openshell_policy::apply_middleware_file(policy, Path::new(middleware_path))?;
+    }
+    Ok(policy)
 }
 
 /// Sync files to or from a sandbox.
@@ -4419,7 +4477,7 @@ pub async fn sandbox_upload(
 
 pub async fn sandbox_policy_set_global(
     server: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
@@ -4434,8 +4492,7 @@ pub async fn sandbox_policy_set_global(
 
     confirm_global_setting_takeover("policy", yes)?;
 
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
@@ -4771,14 +4828,13 @@ pub async fn sandbox_setting_delete(
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     wait: bool,
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
 
@@ -5187,8 +5243,7 @@ where
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
                 writeln!(stderr, "Policy payload not available for this version")
@@ -5307,8 +5362,7 @@ where
             if view.includes_policy() {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
         }
@@ -5369,8 +5423,7 @@ pub async fn sandbox_policy_get_global(
             if let Some(ref policy) = rev.policy {
                 println!("---");
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 print!("{yaml_str}");
             } else {
                 eprintln!("Policy payload not available for this version");
@@ -6119,9 +6172,9 @@ mod tests {
         parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
-        service_url_for_gateway, workspace_member_to_json,
+        render_policy_text, resolve_from, rootfs_tar_sources_supported_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
     };
 
     #[test]
@@ -7701,5 +7754,33 @@ mod tests {
         let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
         let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
         assert!(format_log_line(&log).ends_with(message));
+    }
+
+    #[test]
+    fn render_policy_text_shows_cedar_text_then_middleware() {
+        let source = "permit (principal, action == Sandbox::Action::\"NetworkConnect\", \
+                      resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");";
+        let mut policy = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: source.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(render_policy_text(&policy).expect("render"), source);
+
+        policy.network_middlewares.insert(
+            "guard".to_string(),
+            openshell_core::proto::NetworkMiddlewareConfig {
+                middleware: "openshell/regex".to_string(),
+                order: 10,
+                ..Default::default()
+            },
+        );
+        let rendered = render_policy_text(&policy).expect("render");
+        let (cedar, middleware) = rendered
+            .split_once("---\n")
+            .expect("middleware is a separate section");
+        assert_eq!(cedar.trim_end(), source);
+        assert!(middleware.contains("network_middlewares:"), "{middleware}");
+        assert!(middleware.contains("guard"), "{middleware}");
     }
 }
