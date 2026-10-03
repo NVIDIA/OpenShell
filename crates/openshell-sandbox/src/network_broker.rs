@@ -860,15 +860,24 @@ fn connect_socket(
     if destination.ip().is_loopback()
         && !openshell_core::google_cloud::is_metadata_destination(destination)
     {
+        if kind == InetKind::Tcp {
+            return connect_local_tcp(
+                &registry,
+                &listener,
+                notification,
+                fd,
+                socket_identity,
+                destination,
+                &active_opens,
+            );
+        }
+        // A UDP connect completes immediately.
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
         entry.set_state(SocketState::Local { peer: destination });
-        // Loopback UDP sends are also broker-sent; keep the copy for them.
-        if kind == InetKind::Tcp {
-            entry.release_preconnect();
-        }
+        // Loopback UDP sends are broker-sent; keep the copy for them.
         return listener.respond_value(notification.id, 0);
     }
     if kind != InetKind::Tcp {
@@ -948,6 +957,102 @@ fn connect_socket(
         })
         .map_err(|error| io::Error::other(format!("start network-open worker: {error}")))?;
     Ok(())
+}
+
+/// Connect a workload TCP socket to a loopback endpoint without blocking the
+/// notification dispatcher.
+///
+/// The broker connects a duplicate of its retained socket, which shares the
+/// workload's open file, and never holds the registry lock while waiting. A
+/// nonblocking socket gets the native `EINPROGRESS` and the kernel completes
+/// the handshake on the shared socket; a blocking socket waits on a bounded
+/// worker thread. A slow or full local listener therefore cannot stall
+/// mediation of unrelated syscalls.
+fn connect_local_tcp(
+    registry: &Arc<Mutex<SocketRegistry>>,
+    listener: &Arc<NotificationListener>,
+    notification: Notification,
+    fd: RawFd,
+    socket_identity: SocketIdentity,
+    destination: SocketAddr,
+    active_opens: &Arc<AtomicUsize>,
+) -> io::Result<()> {
+    let connector = {
+        let registry = lock(registry);
+        let entry = registry.resolve(notification.tid, fd)?;
+        rustix::io::fcntl_dupfd_cloexec(entry.retained_preconnect()?, 3)?
+    };
+    listener.validate_id(notification.id)?;
+    // SAFETY: F_GETFL reads the flags of the live shared open file.
+    let flags = unsafe { libc::fcntl(connector.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        let started = with_sockaddr(destination, |pointer, length| {
+            // SAFETY: pointer/length describe a live sockaddr; the connector
+            // is a live duplicate of the workload's socket.
+            if unsafe { libc::connect(connector.as_raw_fd(), pointer, length) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+        let in_progress = started
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EINPROGRESS));
+        if started.is_ok() || in_progress {
+            commit_local_connect(registry, notification.tid, fd, socket_identity, destination);
+        }
+        return match started {
+            Ok(()) => listener.respond_value(notification.id, 0),
+            Err(error) => Err(error),
+        };
+    }
+    let slot = acquire_pending_open_slot(active_opens)?;
+    let registry = Arc::clone(registry);
+    let worker_listener = Arc::clone(listener);
+    std::thread::Builder::new()
+        .name("openshell-local-connect".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            let result = connect_exact(connector.as_raw_fd(), destination);
+            if result.is_ok() {
+                commit_local_connect(
+                    &registry,
+                    notification.tid,
+                    fd,
+                    socket_identity,
+                    destination,
+                );
+            }
+            let _ = match result {
+                Ok(()) => worker_listener.respond_value(notification.id, 0),
+                Err(error) => {
+                    worker_listener.respond_errno(notification.id, error_to_errno(&error))
+                }
+            };
+        })
+        .map_err(|error| io::Error::other(format!("start local-connect worker: {error}")))?;
+    Ok(())
+}
+
+/// Record a completed or in-progress loopback TCP connect, unless the
+/// descriptor now names a different socket.
+fn commit_local_connect(
+    registry: &Mutex<SocketRegistry>,
+    tid: u32,
+    fd: RawFd,
+    socket_identity: SocketIdentity,
+    destination: SocketAddr,
+) {
+    let mut registry = lock(registry);
+    if let Ok(entry) = registry.resolve_mut(tid, fd)
+        && entry.identity() == socket_identity
+    {
+        entry.set_state(SocketState::Local { peer: destination });
+        entry.release_preconnect();
+    }
 }
 
 /// Result for a `connect` on a socket the broker already connected, as the
@@ -2565,6 +2670,53 @@ mod tests {
         );
         broker.set_workload_frozen(false);
         assert_eq!(run_workload(&launcher), "kill=0 tgkill=0");
+    }
+
+    #[test]
+    fn slow_loopback_connect_does_not_stall_other_mediation() {
+        // A listener that never accepts, with a full backlog, makes further
+        // connects wait. Other mediated syscalls must not wait behind them,
+        // whether the pending connect is blocking or nonblocking.
+        let saturated =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        saturated
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        saturated.listen(0).unwrap();
+        let address = saturated.local_addr().unwrap().as_socket().unwrap();
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (blocking_wait, nonblocking_result) = launcher
+            .execute(move || {
+                // Fill the accept queue; later connects to it stall.
+                let filled = TcpStream::connect(address).expect("fill accept queue");
+                let pending = std::thread::spawn(move || TcpStream::connect(address));
+                std::thread::sleep(Duration::from_millis(500));
+                let started = Instant::now();
+                drop(UdpSocket::bind("127.0.0.1:0"));
+                let blocking_wait = started.elapsed();
+                // A nonblocking connect reports progress immediately.
+                let nonblocking = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM.nonblocking(),
+                    None,
+                )
+                .unwrap();
+                let nonblocking_result = nonblocking
+                    .connect(&address.into())
+                    .err()
+                    .and_then(|error| error.raw_os_error());
+                drop(pending.join());
+                drop(filled);
+                (blocking_wait, nonblocking_result)
+            })
+            .expect("launcher result");
+        assert!(
+            blocking_wait < Duration::from_secs(2),
+            "mediated socket creation waited {blocking_wait:?} behind a slow connect"
+        );
+        assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
     }
 
     #[test]
