@@ -1240,22 +1240,7 @@ changing it:
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
-Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`.
-Otherwise, it validates an existing XDG gateway config when one is discovered.
-When neither source selects a config, preflight succeeds. An explicit missing path,
-a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails.
-Preflight merges the selected file with the current `OPENSHELL_*` environment and
-applies the daemon's read-only startup checks. These checks include selector and
-socket normalization, registered-driver selection and configuration, rate-limit
-pairs, TLS and mTLS relationships, interceptor registrations, and supervisor
-middleware registrations. When a selected file omits `compute_driver`, preflight
-validates each configured table for an auto-detectable driver without running the
-runtime detection probes, which can connect local sockets or launch discovery
-commands. It validates complete guest TLS path sets without requiring
-package-generated certificates to exist before certificate generation. It does
-not construct a compute driver or connect to a transport. A failed
-preflight always preserves the file; it never migrates, replaces, or rewrites
-configuration.
+Without `--path`, the command validates a nonempty `OPENSHELL_GATEWAY_CONFIG`. Otherwise, it validates an existing XDG gateway config when one is discovered. When neither source selects a config, preflight validates the effective daemon arguments. An explicit missing path, a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails. Preflight merges the selected file with the current `OPENSHELL_*` environment and applies the daemon's read-only startup checks. These checks include selector and socket normalization, registered-driver selection and configuration, rate-limit pairs, TLS and mTLS relationships, interceptor registrations, and supervisor middleware registrations. When a selected file omits `compute_driver`, preflight validates each configured table for an auto-detectable driver without running the runtime detection probes, which can connect local sockets or launch discovery commands. It validates configured driver TLS requirements, including the gateway CA, without requiring package-generated certificate files to exist before certificate generation. It does not construct a compute driver or connect to a transport. A failed preflight always preserves the file; it never migrates, replaces, or rewrites configuration.
 
 To validate the exact daemon arguments that a wrapper will pass, place them after
 `--` instead of using `--path`:
@@ -1282,3 +1267,26 @@ $EDITOR ~/.config/openshell/gateway.toml
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 systemctl --user restart openshell-gateway
 ```
+
+### Check local VM host tools
+
+For an explicitly selected local `vm` driver, preflight also checks a formatter (`mke2fs` or `mkfs.ext4`), `debugfs`, and `e2fsck`. Install e2fsprogs 1.43 or newer with your operating system's package manager. OpenShell does not install or manage these host dependencies.
+
+For example, on macOS:
+
+```shell
+brew install e2fsprogs
+openshell-gateway config preflight -- --config ~/.config/openshell/gateway.toml --compute-driver vm
+```
+
+Run preflight with the account, configuration, working directory, and environment intended for the gateway. A successful check in an interactive shell does not check a service with a different `PATH`. For a service whose environment uses a private installation, reproduce its configured path explicitly:
+
+```shell
+env PATH=/opt/company/e2fsprogs/sbin:/opt/company/e2fsprogs/bin:/usr/bin:/bin /usr/local/bin/openshell-gateway config preflight -- --config ~/.config/openshell/gateway.toml --compute-driver vm
+```
+
+Replace the executable and configuration paths with your installation's paths, and run this command as the service account. Preflight and VM image operations search inherited `PATH` entries, then the existing e2fsprogs `sbin` and `bin` directories under `/opt/homebrew/opt/e2fsprogs` and `/usr/local/opt/e2fsprogs`. They prefer `mke2fs` and try `mkfs.ext4` only when `mke2fs` is absent. A selected file that cannot run is an error; fix that installation or the service's `PATH` before rerunning the command.
+
+The command reports each selected executable path and version. Each tool receives only `-V`, with a five-second deadline and an 8 KiB output limit per stream. Missing, non-executable, outdated, or failing tools return a nonzero exit status with corrective guidance and the selected tool's error. The checks create no gateway state or images and do not start a driver or VM. Version checks confirm the installation; they do not test image creation or filesystem recovery.
+
+Other drivers do not require these VM tools. A VM configuration table alone does not select the VM driver. When a remote driver socket is configured, preflight reports that host tool checks were not performed; run the check on that host in the driver service's environment with a local VM configuration.

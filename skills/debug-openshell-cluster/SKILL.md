@@ -910,8 +910,7 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.

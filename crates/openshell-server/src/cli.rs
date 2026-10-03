@@ -286,7 +286,12 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
         Some(Commands::Config(args)) => match args.command {
             ConfigCommand::Preflight(args) => {
-                run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)
+                let driver =
+                    run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)?;
+                for report in preflight_host_tools(driver).await? {
+                    println!("{report}");
+                }
+                Ok(())
             }
         },
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
@@ -751,7 +756,7 @@ fn run_config_preflight(
         Some(detect_preflight_test_driver),
         PreflightTestFactory,
     )?)?;
-    run_config_preflight_with_drivers(args, run, matches, &registry)
+    run_config_preflight_with_drivers(args, run, matches, &registry).map(|_| ())
 }
 
 fn run_config_preflight_with_drivers(
@@ -759,7 +764,7 @@ fn run_config_preflight_with_drivers(
     run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     if args.gateway_args.is_empty() {
         return run_effective_config_preflight(args.path, run, matches, compute_drivers);
     }
@@ -774,7 +779,7 @@ fn run_config_preflight_with_drivers(
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(error) => return Err(miette::miette!("{error}")),
     };
@@ -783,7 +788,7 @@ fn run_config_preflight_with_drivers(
     if replay.command.is_some() {
         // A valid non-daemon action does not consume gateway startup
         // configuration. Let the immediately following invocation perform it.
-        return Ok(());
+        return Ok(None);
     }
     run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
 }
@@ -793,7 +798,7 @@ fn run_effective_config_preflight(
     mut run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     let path = if path_override.is_some() {
         path_override
     } else {
@@ -838,8 +843,9 @@ fn run_effective_config_preflight(
             gateway_tls_enabled: !run.disable_tls,
             endpoint_overrides: &endpoint_overrides,
         };
+        let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
-            crate::validate_compute_driver_config(
+            selected_driver = Some(crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
                 run.name.trim(),
@@ -847,7 +853,7 @@ fn run_effective_config_preflight(
                 &run.log_level,
                 driver_startup,
                 true,
-            )?;
+            )?);
         } else if file.is_some() {
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
@@ -869,16 +875,66 @@ fn run_effective_config_preflight(
                 )?;
             }
         }
-        Ok(())
+        Ok(selected_driver)
     })();
 
     match (validation, path.as_ref()) {
-        (Ok(()), _) => Ok(()),
+        (Ok(driver), _) => Ok(driver),
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
             config_file::ConfigPreflightError::invalid_current(path)
         )),
         (Err(error), None) => Err(error),
+    }
+}
+
+/// Run executable probes outside the pure configuration-validation context.
+async fn preflight_host_tools(
+    driver: Option<crate::ConfiguredComputeDriver>,
+) -> Result<Vec<String>> {
+    match driver {
+        Some(crate::ConfiguredComputeDriver::Registered(registration)) => {
+            let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                // Register before polling the hook: a probe owns a separate
+                // process group, so default CLI termination cannot clean it up.
+                let mut interrupt = signal(SignalKind::interrupt())
+                    .map_err(|error| miette::miette!("register preflight SIGINT: {error}"))?;
+                let mut terminate = signal(SignalKind::terminate())
+                    .map_err(|error| miette::miette!("register preflight SIGTERM: {error}"))?;
+                let check = registration.factory.preflight_host_tools(cancellation_rx);
+                tokio::pin!(check);
+                let reason = tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                    result = &mut check => return result.map_err(|error| miette::miette!("{error}")),
+                };
+                cancellation_tx.send_replace(true);
+                // The hook owns its children. Await its cancellation cleanup
+                // before the short-lived CLI shuts down the Tokio runtime.
+                let _ = check.await;
+                Err(miette::miette!(
+                    "host tool preflight interrupted by {reason}"
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                let _cancellation_tx = cancellation_tx;
+                registration
+                    .factory
+                    .preflight_host_tools(cancellation_rx)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))
+            }
+        }
+        Some(crate::ConfiguredComputeDriver::Remote { name }) => Ok(vec![format!(
+            "compute driver '{name}': host tool checks not performed for a remote endpoint; run preflight on the driver host with its service account and environment"
+        )]),
+        None => Ok(Vec::new()),
     }
 }
 

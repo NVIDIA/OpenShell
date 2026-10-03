@@ -381,6 +381,15 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         true
     }
 
+    async fn preflight_host_tools(
+        &self,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> openshell_core::Result<Vec<String>> {
+        openshell_core::e2fsprogs::preflight(cancellation)
+            .await
+            .map_err(openshell_core::Error::config)
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
