@@ -57,6 +57,22 @@ impl SeverityId {
         }
     }
 
+    /// Returns the bracketed tag used in shorthand logs.
+    ///
+    /// `Unknown` and `Other` share `[UNKN]` so they never read as `[INFO]`.
+    #[must_use]
+    pub fn shorthand_tag(self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Other => "[UNKN]",
+            Self::Informational => "[INFO]",
+            Self::Low => "[LOW]",
+            Self::Medium => "[MED]",
+            Self::High => "[HIGH]",
+            Self::Critical => "[CRIT]",
+            Self::Fatal => "[FATAL]",
+        }
+    }
+
     /// Returns the integer value for JSON serialization.
     #[must_use]
     pub fn as_u8(self) -> u8 {
@@ -90,6 +106,18 @@ mod tests {
         assert_eq!(SeverityId::Critical.shorthand_char(), 'C');
         assert_eq!(SeverityId::Fatal.shorthand_char(), 'F');
         assert_eq!(SeverityId::Other.shorthand_char(), ' ');
+    }
+
+    #[test]
+    fn test_severity_shorthand_tags() {
+        assert_eq!(SeverityId::Unknown.shorthand_tag(), "[UNKN]");
+        assert_eq!(SeverityId::Informational.shorthand_tag(), "[INFO]");
+        assert_eq!(SeverityId::Low.shorthand_tag(), "[LOW]");
+        assert_eq!(SeverityId::Medium.shorthand_tag(), "[MED]");
+        assert_eq!(SeverityId::High.shorthand_tag(), "[HIGH]");
+        assert_eq!(SeverityId::Critical.shorthand_tag(), "[CRIT]");
+        assert_eq!(SeverityId::Fatal.shorthand_tag(), "[FATAL]");
+        assert_eq!(SeverityId::Other.shorthand_tag(), "[UNKN]");
     }
 
     #[test]
