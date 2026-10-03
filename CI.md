@@ -156,6 +156,12 @@ naming any selected manual-only benchmarks separately, so a narrow run cannot
 be mistaken for full Podman coverage. See `nix run .#podman-e2e-coverage-summary`
 in TESTING.md.
 
+The `driver-podman` testsuite runs both rootful and rootless Fedora Podman;
+`e2e-podman` runs rootless only, by decision: rootful Podman is covered by
+conformance, `driver-podman`, `oci-image` and `provider-refresh`, and the
+reasoning is recorded on #4163 and #3712. Nextest archive filters select whole
+binaries, so a rootful leg would mean running this entire archive rootful.
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
