@@ -99,3 +99,12 @@ jobs:
           path: artifacts/tmachine-diagnostics
           if-no-files-found: ignore
           retention-days: 7
+
+      # The e2e-podman archive is a curated subset of everything eligible
+      # under the e2e-podman feature (see podmanE2eFollowUpBinaries in
+      # tests/artifacts.nix) -- report the selected-vs-eligible split here so
+      # this narrow run can't be mistaken for full Podman coverage (#3712).
+      # Runs regardless of pass/fail so the scope is visible either way.
+      - name: Report Podman e2e-podman archive coverage
+        if: always() && matrix.testsuite == 'e2e-podman'
+        run: nix run .#podman-e2e-coverage-summary >> "$GITHUB_STEP_SUMMARY"
