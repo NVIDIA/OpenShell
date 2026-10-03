@@ -45,6 +45,25 @@ workspace. The workload starts before the supervisor so its user namespace exist
 when the supervisor joins it; a stopped supervisor resolves that namespace again
 on its next start.
 
+Lifecycle changes and workload containment share a per-sandbox mutex across
+all clones of the driver. Restart holds it until both container starts finish
+(or fail). Watch events, initial reconciliation, and running-sandbox get/list
+inspections wait for that operation and re-inspect before deciding whether to
+stop a workload. An exited supervisor during the workload-first restart window
+therefore cannot stop the new workload. Genuine supervisor loss still stops the
+workload once the lifecycle operation finishes. Cancellation drops the guard;
+there is no persistent restart exemption to clear before retrying. This
+coordination is local to one driver instance and its clones. Periodic resource
+admission reconciliation also holds the gate across fresh ownership checks,
+validation, and both containment stops. Reused container IDs are not treated as
+run identities: containment uses current state read under the gate. Exit-event
+fences separately protect published observations from a previous run.
+
+Independent driver processes and external Podman commands do not share this
+gate. Cancelling a future releases the local guard but cannot retract an HTTP
+mutation already accepted by Podman; fencing those remote operations requires
+a separate runtime ownership or cancellation-completion contract.
+
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
 closed; do not switch to an unconfined profile or add capabilities.

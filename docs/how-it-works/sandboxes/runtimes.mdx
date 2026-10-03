@@ -178,6 +178,11 @@ On macOS, set `host_gateway_ip` only if your Podman machine uses a non-standard 
 
 For networks that require a corporate proxy, set `https_proxy`, `no_proxy`, and related `proxy_*` options. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
 
+Podman starts the workload before its companion supervisor to establish their
+shared user namespace. During restart, health reconciliation waits for both
+container starts to finish. After restart completes or fails, a running workload
+with a missing or exited supervisor is stopped.
+
 ### Podman Mounts
 
 Podman supports the same `volume`, `tmpfs`, and `bind` mounts as [Docker](#docker-mounts), using the `podman` key in driver config, and the same bind-mount warning applies. Podman `volume` mounts do not support `subpath`.
