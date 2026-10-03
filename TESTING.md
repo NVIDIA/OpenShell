@@ -300,6 +300,14 @@ Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
 nix run .#generate-podman-e2e-ci-tests
 ```
 
+Print how many of the `e2e-podman`-eligible targets the archive actually
+selects, so a narrow run cannot be mistaken for full Podman coverage — CI
+reports this in the job summary for every `e2e-podman` run:
+
+```shell
+nix run .#podman-e2e-coverage-summary
+```
+
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct

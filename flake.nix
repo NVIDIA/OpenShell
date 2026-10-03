@@ -169,6 +169,10 @@
             type = "app";
             program = "${artifacts.podmanE2eCiTests}/bin/generate-podman-e2e-ci-tests";
           };
+          podman-e2e-coverage-summary = {
+            type = "app";
+            program = "${artifacts.podmanE2eCoverageSummary}/bin/podman-e2e-coverage-summary";
+          };
           build-artifacts-helm = {
             type = "app";
             program = "${artifacts.helm}/bin/build-artifacts-helm";

@@ -175,6 +175,44 @@ let
     '';
   };
 
+  # Reports how many of the e2e-podman-eligible targets the archive actually
+  # selects, so a narrow CI run cannot be mistaken for full coverage (#3712).
+  # Computes the eligible count the same way podmanE2eCiTests does (a real
+  # `cargo nextest list`, not a hand-maintained number) and compares it
+  # against podmanE2eFollowUpBinaries, the single declarative exclusion list
+  # that also drives the archive filter above — so this can't drift from what
+  # actually runs.
+  podmanE2eCoverageSummary = pkgs.writeShellApplication {
+    name = "podman-e2e-coverage-summary";
+    runtimeInputs = [
+      pkgs.cargo-nextest
+      pkgs.git
+      pkgs.jq
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      eligible=$(cargo nextest list \
+        --manifest-path e2e/rust/Cargo.toml \
+        --target ${muslToolchain.target} \
+        -p openshell-e2e \
+        --features e2e-podman \
+        --list-type binaries-only \
+        --message-format json \
+        | jq '[.["rust-binaries"] | to_entries[] | select(.value.kind == "test")] | length')
+
+      excluded=${toString (builtins.length podmanE2eFollowUpBinaries)}
+      selected=$((eligible - excluded))
+
+      echo "### Podman \`e2e-podman\` archive coverage"
+      echo
+      echo "**$selected of $eligible** eligible targets selected ($excluded excluded — see \`podmanE2eFollowUpBinaries\` in \`tests/artifacts.nix\` for the documented reason behind each one)."
+    '';
+  };
+
   podmanDriverArchive = mkTestArchive {
     name = "podman-driver";
     workspacePath = "tests/suites/drivers";
@@ -201,6 +239,7 @@ rec {
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
+    podmanE2eCoverageSummary
     ;
 
   binaries = pkgs.writeShellApplication {

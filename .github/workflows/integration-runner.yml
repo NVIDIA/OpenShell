@@ -89,3 +89,12 @@ jobs:
           # Retry dependency preparation, then execute the test suite once.
           nix build --no-link .#tmachine || nix build --no-link .#tmachine
           nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"
+
+      # The e2e-podman archive is a curated subset of everything eligible
+      # under the e2e-podman feature (see podmanE2eFollowUpBinaries in
+      # tests/artifacts.nix) -- report the selected-vs-eligible split here so
+      # this narrow run can't be mistaken for full Podman coverage (#3712).
+      # Runs regardless of pass/fail so the scope is visible either way.
+      - name: Report Podman e2e-podman archive coverage
+        if: always() && matrix.testsuite == 'e2e-podman'
+        run: nix run .#podman-e2e-coverage-summary >> "$GITHUB_STEP_SUMMARY"
