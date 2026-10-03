@@ -848,7 +848,11 @@ fn connect_socket(
             InetKind::Tcp => SocketState::DnsTcp { relay: destination },
             InetKind::DnsUdp => SocketState::DnsUdp { relay: destination },
         });
-        entry.release_preconnect();
+        // UDP DNS sockets keep the broker's copy: the broker sends their
+        // datagrams so ancillary data in workload memory never reaches them.
+        if kind == InetKind::Tcp {
+            entry.release_preconnect();
+        }
         return listener.respond_value(notification.id, 0);
     }
     // The metadata service lives in the supervisor, even though SDKs address
@@ -861,7 +865,10 @@ fn connect_socket(
         listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
         entry.set_state(SocketState::Local { peer: destination });
-        entry.release_preconnect();
+        // Loopback UDP sends are also broker-sent; keep the copy for them.
+        if kind == InetKind::Tcp {
+            entry.release_preconnect();
+        }
         return listener.respond_value(notification.id, 0);
     }
     if kind != InetKind::Tcp {
@@ -2714,6 +2721,82 @@ mod tests {
         assert_eq!(
             client.join().expect("join client").expect("DNS client"),
             dns_address
+        );
+    }
+
+    #[test]
+    fn udp_dns_after_connect_sends_with_sendmmsg() {
+        // glibc connects the resolver socket to the nameserver, then sends A
+        // and AAAA together with sendmmsg and no destination. sendmmsg is
+        // mediated, so the broker must still hold its copy of the socket.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let dns_address = broker.dns_address();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(move || -> io::Result<Vec<Vec<u8>>> {
+                    let socket = UdpSocket::bind("0.0.0.0:0")?;
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    socket.connect(dns_address)?;
+                    let queries = [&b"dns-query-a"[..], &b"dns-query-aaaa"[..]];
+                    let iovecs = queries.map(|query| [io::IoSlice::new(query)]);
+                    let mut controls = [
+                        rustix::net::SendAncillaryBuffer::default(),
+                        rustix::net::SendAncillaryBuffer::default(),
+                    ];
+                    let [first, second] = &mut controls;
+                    let mut messages = [
+                        rustix::net::MMsgHdr::new(&iovecs[0], first),
+                        rustix::net::MMsgHdr::new(&iovecs[1], second),
+                    ];
+                    let sent = rustix::net::sendmmsg(
+                        &socket,
+                        &mut messages,
+                        rustix::net::SendFlags::empty(),
+                    )?;
+                    if sent != 2 {
+                        return Err(io::Error::other("sendmmsg sent too few"));
+                    }
+                    let mut responses = Vec::new();
+                    for _ in 0..2 {
+                        let mut response = [0_u8; 32];
+                        let length = socket.recv(&mut response)?;
+                        responses.push(response[..length].to_vec());
+                    }
+                    responses.sort();
+                    Ok(responses)
+                })
+                .expect("launcher result")
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        for _ in 0..2 {
+            // Bound the wait so a broken send path fails instead of hanging.
+            let Ok(query) = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), broker.accept_dns()).await
+            }) else {
+                let error = client
+                    .join()
+                    .expect("join client")
+                    .expect_err("client must fail when no query arrives");
+                panic!("DNS query never reached the relay: {error}");
+            };
+            let query = query.expect("DNS query");
+            let response = if query.request == b"dns-query-a" {
+                b"dns-response-a".to_vec()
+            } else if query.request == b"dns-query-aaaa" {
+                b"dns-response-aaaa".to_vec()
+            } else {
+                panic!("unexpected DNS query: {:?}", query.request);
+            };
+            query.complete(Ok(response)).unwrap();
+        }
+        assert_eq!(
+            client.join().expect("join client").expect("DNS client"),
+            vec![b"dns-response-a".to_vec(), b"dns-response-aaaa".to_vec()]
         );
     }
 
