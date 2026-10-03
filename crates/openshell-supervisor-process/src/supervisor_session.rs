@@ -1309,6 +1309,42 @@ mod ocsf_event_tests {
             .expect("bridge should finish cleanly when target closes first");
     }
 
+    /// A target that half-closes its output must still receive client data.
+    #[tokio::test]
+    async fn bridge_forwards_client_data_after_target_half_close() {
+        let (target, mut remote) = tokio::io::duplex(4096);
+        let (target_r, target_w) = tokio::io::split(target);
+
+        let (out_tx, mut out_rx) = mpsc::channel::<RelayFrame>(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Result<RelayFrame, tonic::Status>>(16);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+
+        let terminating = AtomicBool::new(false);
+        let bridge = tokio::spawn(async move {
+            bridge_relay_bytes("chan-3", target_r, target_w, out_tx, inbound, &terminating).await
+        });
+
+        remote.write_all(b"ready").await.unwrap();
+        remote.shutdown().await.unwrap();
+        assert!(out_rx.recv().await.is_some(), "greeting frame expected");
+        assert!(out_rx.recv().await.is_none(), "outbound should close");
+
+        inbound_tx
+            .send(Ok(RelayFrame {
+                payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                    b"upload".to_vec(),
+                )),
+            }))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 6];
+        remote.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"upload");
+
+        drop(inbound_tx);
+        bridge.await.unwrap().expect("bridge should finish cleanly");
+    }
+
     /// A well-behaved round trip: bytes flow both directions and the bridge
     /// ends cleanly when the client closes its side.
     #[tokio::test]

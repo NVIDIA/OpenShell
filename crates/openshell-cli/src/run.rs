@@ -2228,7 +2228,6 @@ async fn forward_one_tcp_connection(
     service_id: String,
     authorization_token: String,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
@@ -2249,7 +2248,7 @@ async fn forward_one_tcp_connection(
     .await
     .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+    let response = match client.forward_tcp(ReceiverStream::new(rx)).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let err = ForwardTcpConnectionError::from_status(status);
@@ -2258,7 +2257,27 @@ async fn forward_one_tcp_connection(
         }
     };
 
-    let (mut local_read, mut local_write) = socket.into_split();
+    let (local_read, local_write) = socket.into_split();
+    relay_local_socket(local_read, local_write, tx, response).await
+}
+
+/// Relay bytes between a local socket and a forward stream.
+///
+/// When the target closes first, half-close the local socket but keep sending
+/// client data until the client closes, so a target that only half-closes
+/// still receives the rest of the request.
+async fn relay_local_socket<R, W, S>(
+    mut local_read: R,
+    mut local_write: W,
+    tx: tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    mut response: S,
+) -> std::result::Result<(), ForwardTcpConnectionError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+    S: tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let to_gateway = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -2283,8 +2302,9 @@ async fn forward_one_tcp_connection(
     });
 
     while let Some(frame) = response
-        .message()
+        .next()
         .await
+        .transpose()
         .map_err(ForwardTcpConnectionError::from_status)?
     {
         let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
@@ -2301,7 +2321,7 @@ async fn forward_one_tcp_connection(
     }
 
     let _ = local_write.shutdown().await;
-    to_gateway.abort();
+    let _ = to_gateway.await;
     Ok(())
 }
 
@@ -6480,15 +6500,16 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
+        ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        format_endpoint, format_log_line, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
-        service_url_for_gateway, workspace_member_to_json,
+        relay_local_socket, resolve_from, rootfs_tar_sources_supported_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
     };
+    use openshell_core::proto::TcpForwardFrame;
 
     #[test]
     fn zero_exec_timeout_is_omitted() {
@@ -8175,5 +8196,86 @@ mod tests {
         let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
         let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
         assert!(format_log_line(&log).ends_with(message));
+    }
+
+    fn forward_data(bytes: &[u8]) -> TcpForwardFrame {
+        TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                bytes.to_vec(),
+            )),
+        }
+    }
+
+    struct Relay {
+        client: tokio::io::DuplexStream,
+        to_gateway: tokio::sync::mpsc::Receiver<TcpForwardFrame>,
+        response: tokio::sync::mpsc::Sender<Result<TcpForwardFrame, Status>>,
+        task: tokio::task::JoinHandle<Result<(), ForwardTcpConnectionError>>,
+    }
+
+    fn start_relay() -> Relay {
+        let (client, local) = tokio::io::duplex(4096);
+        let (local_read, local_write) = tokio::io::split(local);
+        let (tx, to_gateway) = tokio::sync::mpsc::channel(16);
+        let (response, resp_rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(relay_local_socket(
+            local_read,
+            local_write,
+            tx,
+            tokio_stream::wrappers::ReceiverStream::new(resp_rx),
+        ));
+        Relay {
+            client,
+            to_gateway,
+            response,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_keeps_client_upload_after_target_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut relay = start_relay();
+        relay
+            .response
+            .send(Ok(forward_data(b"ready")))
+            .await
+            .unwrap();
+        drop(relay.response);
+
+        let mut greeting = [0u8; 5];
+        relay.client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"ready");
+
+        relay.client.write_all(b"upload").await.unwrap();
+        relay.client.shutdown().await.unwrap();
+
+        let mut uploaded = Vec::new();
+        while let Some(frame) = relay.to_gateway.recv().await {
+            if let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                frame.payload
+            {
+                uploaded.extend(data);
+            }
+        }
+        assert_eq!(uploaded, b"upload");
+        relay.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_half_closes_local_socket_when_target_closes() {
+        use tokio::io::AsyncReadExt;
+
+        let mut relay = start_relay();
+        relay.response.send(Ok(forward_data(b"bye"))).await.unwrap();
+        drop(relay.response);
+
+        let mut received = Vec::new();
+        relay.client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"bye");
+
+        drop(relay.client);
+        relay.task.await.unwrap().unwrap();
     }
 }
