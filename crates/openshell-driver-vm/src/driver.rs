@@ -2170,38 +2170,41 @@ impl VmDriver {
                 continue;
             }
 
-            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+            let inactive_condition = if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok()
             {
-                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
-                let mut registry = self.registry.lock().await;
-                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
-                    snapshot: snapshot.clone(),
-                    state_dir: state_dir.clone(),
-                    process: None,
-                    provisioning_task: None,
-                    gpu_bdf: None,
-                    deleting: false,
-                });
-                drop(registry);
-                self.publish_snapshot(snapshot);
-                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
-                continue;
-            }
-
-            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                Some(stopped_condition())
+            } else if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
                 .await
                 .unwrap_or(false)
             {
-                let snapshot = sandbox_snapshot(
-                    &sandbox,
-                    error_condition(
-                        "ProcessExited",
-                        "Canonical main process exited before VM driver restart",
-                    ),
-                    false,
-                );
+                Some(error_condition(
+                    "ProcessExited",
+                    "Canonical main process exited before VM driver restart",
+                ))
+            } else {
+                None
+            };
+            if let Some(condition) = inactive_condition {
+                // These sandboxes do not run the launch path that publishes
+                // identity. Recover it from the same validated owner marker
+                // before either GetSandbox or WatchSandboxes can observe them.
+                let identity = match read_persisted_workload_identity(&state_dir).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(sandbox_id = %sandbox.id, %error, "vm driver: ignoring invalid persisted workload identity");
+                        // Keep inactive resources manageable even when their
+                        // identity cannot be trusted. Explicit deletion still
+                        // needs this registry entry to remove persisted state.
+                        None
+                    }
+                };
+                let mut snapshot = sandbox_snapshot(&sandbox, condition, false);
+                snapshot
+                    .status
+                    .get_or_insert_with(SandboxStatus::default)
+                    .resolved_identity = identity;
                 let mut registry = self.registry.lock().await;
                 registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
                     snapshot: snapshot.clone(),
@@ -2215,7 +2218,7 @@ impl VmDriver {
                 self.publish_snapshot(snapshot);
                 info!(
                     sandbox_id = %sandbox.id,
-                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                    "vm driver: restored inactive sandbox without launching compute"
                 );
                 continue;
             }
@@ -5790,6 +5793,35 @@ async fn persisted_sandbox_owner_identity(
     Ok(None)
 }
 
+/// Reconstruct status from the owner chosen during preparation, never from a
+/// new driver default or a status embedded in the persisted create request.
+/// Missing or v1 markers do not contain an identity to report. Invalid owner
+/// data must not be published as a resolved identity.
+async fn read_persisted_workload_identity(
+    state_dir: &Path,
+) -> Result<Option<ResolvedWorkloadIdentity>, String> {
+    let contents = match tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE)).await {
+        Ok(contents) if contents.trim() == SANDBOX_OWNER_STATE_V1 => return Ok(None),
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read sandbox owner state: {error}")),
+    };
+    let owner = parse_sandbox_owner_state(&contents)
+        .map_err(|error| format!("invalid sandbox owner state: {error}"))?;
+    let resource_digest = match read_persisted_image_identity(state_dir).await {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read persisted VM image identity: {error}")),
+    };
+    Ok(Some(ResolvedWorkloadIdentity {
+        uid: owner.uid,
+        gid: owner.gid,
+        supplementary_gids: Vec::new(),
+        source: "vm-config".into(),
+        resource_digest,
+    }))
+}
+
 async fn sandbox_owner_identity_from_image(
     image_path: &Path,
 ) -> Result<SandboxOwnerIdentity, String> {
@@ -7504,6 +7536,172 @@ mod tests {
         }
     }
 
+    async fn assert_inactive_restore_retains_identity(marker: &str, reason: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        // Current driver defaults and serialized status are not evidence of
+        // the identity that owns an already prepared overlay.
+        driver.config.sandbox_uid = Some(9000);
+        driver.config.sandbox_gid = Some(9001);
+        let sandbox = Sandbox {
+            id: "sb-inactive-identity".into(),
+            name: "inactive-identity".into(),
+            status: Some(SandboxStatus {
+                resolved_identity: Some(ResolvedWorkloadIdentity {
+                    uid: 8000,
+                    gid: 8001,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_sandbox_owner_state(
+            &state_dir,
+            SandboxOwnerIdentity {
+                uid: 4242,
+                gid: 4343,
+            },
+        )
+        .await
+        .unwrap();
+        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
+            .await
+            .unwrap();
+        tokio::fs::write(state_dir.join(marker), b"inactive\n")
+            .await
+            .unwrap();
+        let mut events = driver.events.subscribe();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = restored.status.as_ref().unwrap();
+        assert_eq!(status.conditions[0].reason, reason);
+        let identity = status
+            .resolved_identity
+            .as_ref()
+            .expect("restored overlay owner");
+        assert_eq!((identity.uid, identity.gid), (4242, 4343));
+        assert!(identity.supplementary_gids.is_empty());
+        assert_eq!(identity.source, "vm-config");
+        assert_eq!(identity.resource_digest, "sha256:original-image");
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).unwrap();
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        drop(registry);
+        let event = events.try_recv().expect("restored snapshot event");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected sandbox snapshot event");
+        };
+        assert_eq!(event.sandbox.as_ref(), Some(&restored));
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                .await
+                .unwrap(),
+            "sandbox-owner-v2:4242:4343\n"
+        );
+        assert!(state_dir.join(marker).exists());
+    }
+
+    #[tokio::test]
+    async fn stopped_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(SANDBOX_STOPPED_FILE, "ComputeStopped").await;
+    }
+
+    #[tokio::test]
+    async fn terminal_restore_retains_persisted_workload_identity() {
+        assert_inactive_restore_retains_identity(MAIN_PROCESS_EXITED_FILE, "ProcessExited").await;
+    }
+
+    #[tokio::test]
+    async fn inactive_restore_keeps_invalid_metadata_manageable() {
+        for (marker, reason) in [
+            (SANDBOX_STOPPED_FILE, "ComputeStopped"),
+            (MAIN_PROCESS_EXITED_FILE, "ProcessExited"),
+        ] {
+            for invalid_owner in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+                driver.config.state_dir = temp.path().to_path_buf();
+                let sandbox = Sandbox {
+                    id: "sb-invalid-owner".into(),
+                    name: "invalid-owner".into(),
+                    ..Default::default()
+                };
+                let state_dir = sandboxes_root_dir(temp.path()).join(&sandbox.id);
+                tokio::fs::create_dir_all(&state_dir).await.unwrap();
+                write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+                tokio::fs::write(state_dir.join(marker), b"inactive\n")
+                    .await
+                    .unwrap();
+                let owner = if invalid_owner {
+                    "sandbox-owner-v2:0:4343\n"
+                } else {
+                    "sandbox-owner-v2:4242:4343\n"
+                };
+                tokio::fs::write(state_dir.join(SANDBOX_OWNER_STATE_FILE), owner)
+                    .await
+                    .unwrap();
+                if !invalid_owner {
+                    // A directory deterministically fails read_to_string on every test host.
+                    tokio::fs::create_dir(state_dir.join(IMAGE_IDENTITY_FILE))
+                        .await
+                        .unwrap();
+                }
+                let mut events = driver.events.subscribe();
+
+                driver.restore_persisted_sandboxes().await;
+
+                let restored = driver
+                    .get_sandbox(&sandbox.id, &sandbox.name)
+                    .await
+                    .unwrap()
+                    .expect("inactive sandbox remains manageable");
+                let status = restored.status.as_ref().unwrap();
+                assert_eq!(status.conditions[0].reason, reason);
+                assert!(status.resolved_identity.is_none());
+                let registry = driver.registry.lock().await;
+                let record = registry.get(&sandbox.id).unwrap();
+                assert!(record.process.is_none());
+                assert!(record.provisioning_task.is_none());
+                drop(registry);
+                let event = events.try_recv().expect("inactive snapshot event");
+                let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+                    panic!("expected sandbox snapshot");
+                };
+                assert_eq!(event.sandbox.as_ref(), Some(&restored));
+                assert!(state_dir.join(marker).exists());
+                assert_eq!(
+                    tokio::fs::read_to_string(state_dir.join(SANDBOX_OWNER_STATE_FILE))
+                        .await
+                        .unwrap(),
+                    owner
+                );
+                assert!(
+                    driver
+                        .delete_sandbox(&sandbox.id, &sandbox.name)
+                        .await
+                        .unwrap()
+                        .deleted
+                );
+                assert!(
+                    !state_dir.exists(),
+                    "explicit delete removes retained state"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn startup_does_not_restore_terminal_canonical_process() {
         let temp = tempfile::tempdir().unwrap();
@@ -7538,6 +7736,10 @@ mod tests {
         assert!(record.process.is_none());
         assert!(record.provisioning_task.is_none());
         let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(
+            status.resolved_identity.is_none(),
+            "an absent owner marker must not invent an identity"
+        );
         assert!(status.conditions.iter().any(|condition| {
             condition.reason == "ProcessExited" && condition.status == "False"
         }));
