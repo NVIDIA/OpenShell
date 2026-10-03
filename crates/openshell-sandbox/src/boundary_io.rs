@@ -220,6 +220,25 @@ impl BoundaryRuntimeState {
             .is_ok_and(|groups| !groups.is_empty())
     }
 
+    /// Whether any workload process remains, registered or not.
+    ///
+    /// A registered root is unregistered once it is reaped, but descendants
+    /// that ignored `SIGTERM` may outlive it. When the sandbox owns the
+    /// process tree (PID 1 or a child subreaper), every live descendant is
+    /// counted so termination is not reported complete while one survives.
+    #[must_use]
+    pub fn has_owned_processes(&self) -> bool {
+        if self.has_registered_processes() {
+            return true;
+        }
+        // An unreadable /proc fails closed: processes may remain.
+        #[cfg(target_os = "linux")]
+        return owned_processes(&[], self.exclusive_pid_namespace)
+            .map_or(true, |owned| !owned.is_empty());
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// End the boundary because required standing enforcement was lost.
     ///
     /// Returns `true` only to the caller that won the active-to-terminated
@@ -265,13 +284,11 @@ impl BoundaryRuntimeState {
             // requiring ptrace or a capability.
             let mut previous = Vec::new();
             for _ in 0..4 {
-                let owned = owned_process_ids(&roots, self.exclusive_pid_namespace);
-                for pid in &owned {
-                    if roots.contains(pid) {
-                        continue;
-                    }
-                    if let Ok(pid) = i32::try_from(*pid) {
-                        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal);
+                let owned =
+                    owned_processes(&roots, self.exclusive_pid_namespace).unwrap_or_default();
+                for process in &owned {
+                    if !roots.contains(&process.pid) {
+                        signal_owned_process(*process, signal);
                     }
                 }
                 if owned == previous {
@@ -283,13 +300,54 @@ impl BoundaryRuntimeState {
     }
 }
 
+/// One scanned workload process, identified by PID and kernel start time so a
+/// reused PID is never mistaken for it.
 #[cfg(target_os = "linux")]
-fn owned_process_ids(roots: &[u32], exclusive_pid_namespace: bool) -> Vec<u32> {
-    let mut parents = HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return roots.to_vec();
-    };
-    for entry in entries.flatten() {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OwnedProcess {
+    pid: u32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct ProcStat {
+    parent: u32,
+    start_time: u64,
+    live: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> Option<ProcStat> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may contain spaces or parentheses; fields resume after
+    // the final ") ". Field 3 is the state, 4 the parent, 22 the start time.
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(ProcStat {
+        parent: fields.get(1)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+        live: !matches!(*fields.first()?, "Z" | "X" | "x"),
+    })
+}
+
+/// Whether orphaned descendants are reparented to this sandbox process.
+#[cfg(target_os = "linux")]
+fn sandbox_owns_process_tree() -> bool {
+    std::process::id() == 1
+        || rustix::process::child_subreaper().is_ok_and(|subreaper| subreaper.is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn owned_processes(
+    roots: &[u32],
+    exclusive_pid_namespace: bool,
+) -> std::io::Result<Vec<OwnedProcess>> {
+    let mut stats = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in std::fs::read_dir("/proc")?.flatten() {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -297,52 +355,65 @@ fn owned_process_ids(roots: &[u32], exclusive_pid_namespace: bool) -> Vec<u32> {
         else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some(after_name) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
-            continue;
-        };
-        let Some(parent) = after_name
-            .split_whitespace()
-            .nth(1)
-            .and_then(|field| field.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        parents.insert(pid, parent);
-    }
-
-    // When openshell-sandbox is PID 1, every other process in its exclusive
-    // namespace is workload-owned, including an orphan reparented during the
-    // scan. Outside that deployment shape, restrict the walk to registered
-    // roots so unit tests and development runs cannot affect sibling tasks.
-    if exclusive_pid_namespace && std::process::id() == 1 {
-        let mut owned = parents
-            .keys()
-            .copied()
-            .filter(|pid| *pid != 1)
-            .collect::<Vec<_>>();
-        owned.sort_unstable();
-        return owned;
-    }
-
-    let mut owned = roots.to_vec();
-    loop {
-        let mut changed = false;
-        for (&pid, &parent) in &parents {
-            if !owned.contains(&pid) && owned.contains(&parent) {
-                owned.push(pid);
-                changed = true;
-            }
+        if let Some(stat) = read_proc_stat(pid) {
+            children.entry(stat.parent).or_default().push(pid);
+            stats.insert(pid, stat);
         }
-        if !changed {
-            break;
+    }
+
+    // When the sandbox is PID 1 of its exclusive namespace or a child
+    // subreaper, orphans are reparented to it, so its descendants are exactly
+    // the workload tree. Otherwise walk only from registered roots so unit
+    // tests and development runs cannot affect sibling tasks.
+    let sandbox = std::process::id();
+    let mut pending = if exclusive_pid_namespace && sandbox_owns_process_tree() {
+        vec![sandbox]
+    } else {
+        roots.to_vec()
+    };
+    let mut visited = std::collections::HashSet::new();
+    let mut owned = Vec::new();
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(descendants) = children.get(&pid) {
+            pending.extend(descendants);
+        }
+        if let Some(stat) = stats.get(&pid)
+            && pid != sandbox
+            && stat.live
+        {
+            owned.push(OwnedProcess {
+                pid,
+                start_time: stat.start_time,
+            });
         }
     }
     owned.sort_unstable();
-    owned.dedup();
-    owned
+    Ok(owned)
+}
+
+/// Signal one scanned process through a pidfd, after confirming the pidfd
+/// refers to the scanned process rather than a later process with its PID.
+#[cfg(target_os = "linux")]
+fn signal_owned_process(process: OwnedProcess, signal: nix::sys::signal::Signal) {
+    let Some(pid) = i32::try_from(process.pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let Some(signal) = rustix::process::Signal::from_named_raw(signal as i32) else {
+        return;
+    };
+    let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
+        return;
+    };
+    if read_proc_stat(process.pid).map(|stat| stat.start_time) != Some(process.start_time) {
+        return;
+    }
+    let _ = rustix::process::pidfd_send_signal(&pidfd, signal);
 }
 
 #[derive(Clone)]
@@ -507,6 +578,73 @@ mod tests {
             runtime.ensure_active(),
             Err(BackendError::Terminated(_))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn termination_waits_for_descendants_that_outlive_their_root() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        // Becoming a subreaper changes this whole process, so run the
+        // scenario in a fresh copy of the test binary.
+        const CHILD_MARKER: &str = "OPENSHELL_SUBREAPER_TEARDOWN_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "boundary_io::tests::termination_waits_for_descendants_that_outlive_their_root",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .expect("run isolated teardown test");
+            assert!(status.success(), "isolated teardown test failed");
+            return;
+        }
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+            .expect("become child subreaper");
+        let runtime = BoundaryRuntimeState::new_exclusive_pid_namespace();
+        // The grandchild inherits an ignored SIGTERM; the root restores the
+        // default disposition and exits on SIGTERM.
+        let mut root = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; sleep 600 & trap - TERM; echo ready; wait",
+            ])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn root");
+        let mut line = String::new();
+        std::io::BufReader::new(root.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime
+            .register_process_group(root.id(), terminal.clone(), Arc::new(Mutex::new(())))
+            .expect("register root");
+
+        assert!(runtime.begin_termination());
+        root.wait().expect("root exits on SIGTERM");
+        terminal.store(true, Ordering::Release);
+        runtime.unregister_process_group(root.id(), &terminal);
+        assert!(!runtime.has_registered_processes());
+        assert!(
+            runtime.has_owned_processes(),
+            "a SIGTERM-ignoring grandchild must keep termination incomplete"
+        );
+
+        runtime.force_kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.has_owned_processes() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "forced termination left a descendant alive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]

@@ -86,16 +86,15 @@ mod linux {
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
-    // CUDA opens device nodes read-write and writes thread names through
-    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
-    // to the launcher's inodes, not those of its workload children.
+    // CUDA opens device nodes read-write. Its thread-name writes through
+    // /proc/<pid>/task/<tid>/comm are served by open mediation, so /proc
+    // stays read-only.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
         "/dev/nvidia-uvm-tools",
         "/dev/nvidia-modeset",
         "/dev/dxg",
-        "/proc",
     ];
 
     fn duration_micros(duration: Duration) -> u64 {
@@ -154,13 +153,7 @@ mod linux {
                 continue;
             }
             if policy.filesystem.read_only.contains(&path) {
-                if path != Path::new("/proc") {
-                    continue;
-                }
-                policy
-                    .filesystem
-                    .read_only
-                    .retain(|allowed| allowed != &path);
+                continue;
             }
             policy.filesystem.read_write.push(path);
             modified = true;
@@ -223,10 +216,15 @@ mod linux {
         }
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
-        if nix::unistd::getpid().as_raw() == 1 {
-            crate::managed_children::start_orphan_reaper()
-                .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
+        // Keep orphaned workload descendants in this process tree so
+        // termination can find and kill them, then reap the adopted ones.
+        // PID 1 already receives orphans; elsewhere become a child subreaper.
+        if nix::unistd::getpid().as_raw() != 1 {
+            rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+                .map_err(|error| format!("become child subreaper: {error}"))?;
         }
+        crate::managed_children::start_orphan_reaper()
+            .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
@@ -340,6 +338,16 @@ mod linux {
             {
                 return Err(
                     "boundary TLS listener requires a nonzero port and absolute certificate paths"
+                        .to_string(),
+                );
+            }
+            // Workload sockets share the loopback interface with a loopback
+            // listener.
+            BoundaryListenerConfig::TlsTcp { address, .. }
+                if address.ip().to_canonical().is_loopback() =>
+            {
+                return Err(
+                    "boundary TLS listener must not bind a loopback address; workloads share the loopback interface"
                         .to_string(),
                 );
             }
@@ -1736,6 +1744,7 @@ mod linux {
                             "frozen workload could not be resumed".to_string(),
                         ));
                     }
+                    self.network_broker.set_workload_frozen(false);
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
                         "Sandbox Protocol connection recovered; workload resumed"
@@ -1792,6 +1801,7 @@ mod linux {
                     return;
                 }
                 if let Some(process) = &process {
+                    self.network_broker.set_workload_frozen(true);
                     let _ = process.boundary_runtime.freeze();
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
@@ -1918,12 +1928,12 @@ mod linux {
 
         async fn wait_for_process_tree_exit(process: &ManagedProcess, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
-            while process.boundary_runtime.has_registered_processes()
+            while process.boundary_runtime.has_owned_processes()
                 && tokio::time::Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            !process.boundary_runtime.has_registered_processes()
+            !process.boundary_runtime.has_owned_processes()
         }
 
         fn shutdown(&self) {
@@ -2446,6 +2456,7 @@ mod linux {
                 tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
                 tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
                 tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
+                socket_loopback_confinement: self.qualification.socket_loopback_confinement,
             };
             // The boundary reports mechanism evidence; the authenticated host
             // backend validates it before constructing a ConfirmedBoundary.
@@ -3256,7 +3267,7 @@ mod linux {
                     })
                 }
                 BoundaryListenerConfig::TlsTcp { address, tls } => {
-                    let listener = std::net::TcpListener::bind(address)?;
+                    let listener = Self::bind_tcp(*address)?;
                     listener.set_nonblocking(true)?;
                     let server_config = Arc::new(load_tls_server_config(tls)?);
                     Ok(Self::Tcp {
@@ -3265,6 +3276,28 @@ mod linux {
                     })
                 }
             }
+        }
+
+        /// Bind the TCP control listener, dropping loopback-interface ingress
+        /// before it listens so workload sockets cannot reach it through
+        /// loopback or the pod's own address. Configuration rejects loopback
+        /// addresses; tests bind them without the filter.
+        fn bind_tcp(address: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_cloexec(true)?;
+            socket.set_reuse_address(true)?;
+            if !address.ip().is_loopback() {
+                openshell_isolation_interface::linux::socket_confinement::reject_loopback_ingress(
+                    &socket,
+                )?;
+            }
+            socket.bind(&address.into())?;
+            socket.listen(128)?;
+            Ok(socket.into())
         }
 
         fn bind_vsock(port: u32) -> io::Result<OwnedFd> {
@@ -4568,9 +4601,6 @@ mod linux {
                     retained_socket_operation: true,
                     proc_fd_identity: true,
                     task_memory_read: true,
-                    task_memory_write: true,
-                    cancellation: true,
-                    task_memory_writes_disabled: false,
                 },
                 landlock_abi: 6,
                 landlock_allow_deny: true,
@@ -4578,6 +4608,7 @@ mod linux {
                 tcp_dns_round_trip: true,
                 tcp_allow_round_trip: true,
                 tcp_deny_round_trip: true,
+                socket_loopback_confinement: true,
             }
         }
 
@@ -4713,6 +4744,46 @@ mod linux {
         }
 
         #[test]
+        fn tcp_control_listener_rejects_loopback_addresses() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "validate");
+            let config = |address: &str| BoundaryConfig {
+                boundary_id: "sandbox-1".to_string(),
+                generation: "generation-1".to_string(),
+                session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_id: "test-gateway".to_string(),
+                verification_keys: vec![test_verification_key()],
+                listener: BoundaryListenerConfig::TlsTcp {
+                    address: address.parse().expect("valid address"),
+                    tls: server_tls.clone(),
+                },
+                resource_claims: std::collections::BTreeMap::new(),
+                resource_claim_files: std::collections::BTreeMap::new(),
+                workload_identity: test_workload_identity(),
+                outer_fence: test_outer_fence(),
+                child_env: std::collections::HashMap::new(),
+            };
+            for address in [
+                "127.0.0.1:5500",
+                "127.0.0.2:5500",
+                "[::1]:5500",
+                "[::ffff:127.0.0.1]:5500",
+            ] {
+                assert!(
+                    validate_config(&config(address)).is_err(),
+                    "{address} must be rejected"
+                );
+            }
+            for address in ["0.0.0.0:5500", "[::]:5500", "10.42.0.7:5500"] {
+                validate_config(&config(address))
+                    .unwrap_or_else(|error| panic!("{address} must be accepted: {error}"));
+            }
+        }
+
+        #[test]
         fn runtime_resource_claim_file_must_match_admitted_claim() {
             let directory = tempfile::tempdir().expect("temporary directory");
             let pod_uid_path = directory.path().join("pod-uid");
@@ -4832,6 +4903,35 @@ mod linux {
                     .expect("decode logical response");
             assert!(matches!(response.response, Response::Attached { .. }));
             server.abort();
+        }
+
+        #[test]
+        fn pod_control_listener_rejects_loopback_ingress() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "loopback");
+            let listener = ControlListener::bind(&BoundaryListenerConfig::TlsTcp {
+                address: "0.0.0.0:0".parse().expect("valid address"),
+                tls: server_tls,
+            })
+            .expect("bind TLS listener");
+            let port = listener
+                .tcp_local_addr()
+                .expect("TLS listener address")
+                .port();
+            // Loopback and the host's own address both arrive on `lo`; the
+            // dropped SYN never completes a handshake.
+            let result = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(300),
+            );
+            assert!(
+                result.is_err(),
+                "loopback client reached the control listener"
+            );
+            assert!(matches!(
+                listener.accept().map(|_| ()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
         }
 
         #[test]
