@@ -129,10 +129,13 @@ fn reject_ingress_interface(fd: RawFd, index: u32) -> io::Result<()> {
 
 /// Actively prove loopback confinement under the current runtime profile.
 ///
-/// For each supported workload socket type this installs the binding, proves
-/// that the sandbox credentials cannot clear or replace it, and proves that a
-/// stream accepted from a confined listener inherits it. IPv6 is skipped only
-/// when the kernel does not provide the address family.
+/// For each supported workload socket type this installs the binding and
+/// proves that the sandbox credentials cannot clear or replace it. For IPv4
+/// and IPv6 it proves that a stream accepted from a confined listener inherits
+/// the binding and keeps it after an `AF_UNSPEC` disconnect. IPv6 is skipped
+/// only when the kernel or namespace does not provide it. Routed ingress and
+/// egress cannot be exercised without a non-loopback route, so those
+/// guarantees rest on the kernel behavior verified per target kernel.
 ///
 /// # Errors
 ///
@@ -189,20 +192,68 @@ fn probe_binding_is_immutable(fd: RawFd) -> io::Result<()> {
 }
 
 fn probe_accept_inherits_binding() -> io::Result<()> {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    confine_to_loopback(listener.as_raw_fd())
-        .map_err(|error| probe_error("confine probe listener", &error))?;
-    let client = std::net::TcpStream::connect(listener.local_addr()?)?;
-    let (accepted, peer) = listener.accept()?;
-    if peer != client.local_addr()? {
-        return Err(io::Error::other("accepted probe peer mismatch"));
-    }
-    if bound_device(accepted.as_raw_fd())?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
-        return Err(io::Error::other(
-            "accepted socket did not inherit the loopback binding",
-        ));
+    for loopback in [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        let listener = match std::net::TcpListener::bind((loopback, 0)) {
+            Ok(listener) => listener,
+            // Kernels or namespaces without IPv6 have no ::1 to bind.
+            Err(error)
+                if loopback.is_ipv6()
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+                    ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        confine_to_loopback(listener.as_raw_fd())
+            .map_err(|error| probe_error("confine probe listener", &error))?;
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (accepted, peer) = listener.accept()?;
+        if peer != client.local_addr()? {
+            return Err(io::Error::other("accepted probe peer mismatch"));
+        }
+        if bound_device(accepted.as_raw_fd())?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
+            return Err(io::Error::other(
+                "accepted socket did not inherit the loopback binding",
+            ));
+        }
+        // Natively accepted sockets are not tracked by the broker, so a
+        // workload can disconnect and reconnect them. The binding must
+        // survive that transition.
+        disconnect(accepted.as_raw_fd())
+            .map_err(|error| probe_error("disconnect accepted probe socket", &error))?;
+        if bound_device(accepted.as_raw_fd())?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
+            return Err(io::Error::other(
+                "accepted socket lost the loopback binding after disconnect",
+            ));
+        }
     }
     Ok(())
+}
+
+fn disconnect(fd: RawFd) -> io::Result<()> {
+    // SAFETY: zeroed sockaddr storage with AF_UNSPEC is the documented
+    // disconnect request; the buffer is live for the call.
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    address.ss_family = libc::sa_family_t::try_from(libc::AF_UNSPEC).map_err(io::Error::other)?;
+    // SAFETY: `address` is a live sockaddr_storage of the given length.
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&raw const address).cast(),
+            socklen(size_of::<libc::sockaddr_storage>())?,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn probe_error(context: &str, error: &io::Error) -> io::Error {
@@ -317,6 +368,59 @@ mod tests {
         let mut buffer = [0_u8; 4];
         accepted.read_exact(&mut buffer).unwrap();
         assert_eq!(&buffer, b"ping");
+    }
+
+    /// Return a local non-loopback address, if this namespace has one.
+    fn local_non_loopback_address() -> Option<Ipv4Addr> {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+        match probe.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(address) if !address.is_loopback() => Some(address),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn confined_listener_peers_are_limited_to_this_network_namespace() {
+        // Packets that arrive on another interface never match a listener
+        // bound to loopback. The only non-loopback peer address it can see is
+        // a client in the same namespace that binds its source to a local
+        // non-loopback address and connects to loopback; that client could
+        // equally connect from 127.0.0.1. Workload sockets cannot bind such a
+        // source, because the broker only permits loopback or unspecified
+        // binds.
+        let Some(local) = local_non_loopback_address() else {
+            eprintln!("skipping: no non-loopback IPv4 address in this namespace");
+            return;
+        };
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        confine_to_loopback(listener.as_raw_fd()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let connect_from = |source: Ipv4Addr, destination: Ipv4Addr| {
+            let client =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            client.bind(&SocketAddr::from((source, 0)).into()).unwrap();
+            client
+                .connect_timeout(
+                    &SocketAddr::from((destination, port)).into(),
+                    Duration::from_millis(300),
+                )
+                .map(|()| client)
+        };
+
+        // The host's own address is matched against its real interface.
+        assert!(connect_from(local, local).is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let client = connect_from(local, Ipv4Addr::LOCALHOST).expect("same-namespace client");
+        let (_, peer) = listener.accept().unwrap();
+        assert_eq!(peer, client.local_addr().unwrap().as_socket().unwrap());
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(local));
     }
 
     #[test]

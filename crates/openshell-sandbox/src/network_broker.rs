@@ -2519,6 +2519,26 @@ mod tests {
     }
 
     #[test]
+    fn workload_cannot_bind_a_non_loopback_source_address() {
+        // Workload sockets can only present loopback source addresses. A
+        // non-loopback peer on a loopback-bound workload listener is therefore
+        // a non-workload process in the same network namespace.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let errors = launcher
+            .execute(|| {
+                ["192.0.2.10:0", "[2001:db8::10]:0"].map(|address| {
+                    UdpSocket::bind(address)
+                        .err()
+                        .and_then(|error| error.raw_os_error())
+                })
+            })
+            .expect("launcher result");
+        assert_eq!(errors, [Some(libc::EACCES), Some(libc::EACCES)]);
+    }
+
+    #[test]
     fn interface_selection_options_are_denied() {
         for (level, option) in [
             (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
