@@ -8435,7 +8435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_compensation_deletes_backend_when_delete_transition_cannot_be_stored() {
+    async fn create_compensation_retains_backend_when_delete_transition_cannot_be_stored() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
         let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
@@ -8478,14 +8478,10 @@ mod tests {
                 .message()
                 .contains("could not claim the sandbox record")
         );
-        assert_eq!(driver.delete_calls(), 1);
-        assert_eq!(
-            driver.delete_requests(),
-            vec![(
-                sandbox.object_id().to_string(),
-                sandbox.object_name().to_string()
-            )]
-        );
+        // A rejected durable claim leaves cleanup ownership unknown. An
+        // unclaimed DELETE could destroy newer compute with the same ID.
+        assert_eq!(driver.delete_calls(), 0);
+        assert!(driver.delete_requests().is_empty());
         let retained = runtime
             .store
             .get_message::<Sandbox>(sandbox.object_id())

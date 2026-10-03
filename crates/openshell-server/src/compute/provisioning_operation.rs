@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use openshell_core::{ObjectId, proto::Sandbox};
 use tonic::Status;
+use tracing::Instrument as _;
 
 use super::{
     ComputeRuntime, provisioning_deadline, sandbox_provisioning_attempt_id,
@@ -127,7 +128,7 @@ impl ComputeRuntime {
         let owned_attempt = starting.clone();
         // Dropping a JoinHandle detaches its task. Do not abort it on a monitor
         // error or deadline: the remote side may still commit the request.
-        let mut worker = tokio::spawn(async move {
+        let worker = async move {
             let result = operation.await;
             let settled = if tracked {
                 let settled = runtime
@@ -155,7 +156,10 @@ impl ComputeRuntime {
                     settled: Box::new(settled),
                 }),
             }
-        });
+        };
+        // Retain the request span so detaching ownership preserves the driver
+        // call's parent trace, including when the caller stops waiting.
+        let mut worker = tokio::spawn(worker.in_current_span());
         loop {
             tokio::select! {
                 result = &mut worker => return result.map_err(|error| {
