@@ -598,7 +598,13 @@ fn create_socket(
     let domain = i32::try_from(notification.args[0])
         .map_err(|_| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?;
     if !matches!(domain, libc::AF_INET | libc::AF_INET6) {
-        return listener.respond_continue(notification.id);
+        // The workload filter already refuses other families. Repeat the
+        // decision here so a filter change cannot let a kernel transport
+        // socket bypass loopback confinement; the domain is a scalar argument.
+        if matches!(domain, libc::AF_UNIX | libc::AF_NETLINK) {
+            return listener.respond_continue(notification.id);
+        }
+        return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
     }
     let raw_kind = i32::try_from(notification.args[1])
         .map_err(|_| io::Error::from_raw_os_error(libc::EPROTONOSUPPORT))?;
@@ -2422,6 +2428,37 @@ mod tests {
         assert_eq!(
             send_flags(libc::SYS_sendmmsg, [0, 0, 0, flags | (1 << 32), 0, 0]),
             libc::MSG_FASTOPEN
+        );
+    }
+
+    #[test]
+    fn broker_refuses_socket_families_it_cannot_confine() {
+        // Independent of the static workload filter: the broker continues
+        // only Unix and netlink sockets and creates INET sockets itself.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let results = launcher
+            .execute(|| {
+                [
+                    (libc::AF_UNIX, socket2::Type::STREAM),
+                    (libc::AF_RXRPC, socket2::Type::DGRAM),
+                    (libc::AF_ALG, socket2::Type::SEQPACKET),
+                ]
+                .map(|(domain, kind)| {
+                    socket2::Socket::new(socket2::Domain::from(domain), kind, None)
+                        .map(drop)
+                        .map_err(|error| error.raw_os_error())
+                })
+            })
+            .expect("launcher result");
+        assert_eq!(
+            results,
+            [
+                Ok(()),
+                Err(Some(libc::EAFNOSUPPORT)),
+                Err(Some(libc::EAFNOSUPPORT))
+            ]
         );
     }
 
