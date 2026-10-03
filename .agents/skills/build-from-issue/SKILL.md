@@ -377,7 +377,7 @@ Read the relevant source files before making changes. Implement step by step per
 
 ### Step 9: Write Tests
 
-Write tests as specified in the plan's Test Plan section. Follow the project's existing test conventions.
+Write tests as specified in the plan's Test Plan section. Follow the project's existing test conventions. Before adding or changing a test, apply the `test-audit` skill's authoring gate so new coverage protects an independent contract instead of re-asserting the implementation.
 
 #### Unit tests
 

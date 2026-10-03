@@ -32,6 +32,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 - After adding, removing, or renaming a crate in `crates/`
 - After changing workflow chain relationships between skills
 - After changing which product or development areas a skill covers
+- After changing test-authoring or test-audit guidance
 - After modifying issue or PR templates
 - Before opening a PR that touches any of the above
 
@@ -56,6 +57,7 @@ Use this map when product behavior, commands, or development workflows change. I
 | Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
 | RFC template, numbering, or lifecycle | `create-rfc` |
 | Documentation structure, navigation, or doc-update workflow | `update-docs-from-commits` |
+| Test authoring, test-quality gating, or junk-test patterns | `build-from-issue`, `review-github-pr` |
 | Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
 
 ## Prerequisites
@@ -142,6 +144,7 @@ For each file in the table above, check for the following inconsistencies:
 4. **`create-spike`** — Reference to `build-from-issue` as next step must be accurate.
 5. **`review-security-issue`** / **`fix-security-issue`** — Cross-references between the two must be accurate.
 6. **PR creation and review checks** — The `create-github-pr`, `review-github-pr`, `build-from-issue`, and `principal-engineer-reviewer` references to `sync-agent-infra` must exist and use trigger conditions aligned with this skill.
+7. **Test-audit routing** — `build-from-issue` and `review-github-pr` must route test authoring and review to the `test-audit` skill's authoring gate and junk-pattern checks without copying its detailed criteria.
 
 ### Skill Layout, Metadata, and Portability
 
