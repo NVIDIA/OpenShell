@@ -85,16 +85,15 @@ mod linux {
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
-    // CUDA opens device nodes read-write and writes thread names through
-    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
-    // to the launcher's inodes, not those of its workload children.
+    // CUDA opens device nodes read-write. Its thread-name writes through
+    // /proc/<pid>/task/<tid>/comm are served by open mediation, so /proc
+    // stays read-only.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
         "/dev/nvidia-uvm-tools",
         "/dev/nvidia-modeset",
         "/dev/dxg",
-        "/proc",
     ];
 
     fn duration_micros(duration: Duration) -> u64 {
@@ -153,13 +152,7 @@ mod linux {
                 continue;
             }
             if policy.filesystem.read_only.contains(&path) {
-                if path != Path::new("/proc") {
-                    continue;
-                }
-                policy
-                    .filesystem
-                    .read_only
-                    .retain(|allowed| allowed != &path);
+                continue;
             }
             policy.filesystem.read_write.push(path);
             modified = true;
