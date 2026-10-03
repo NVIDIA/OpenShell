@@ -384,33 +384,45 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(unsafe_code)]
     fn inherited_sockets_are_marked_close_on_exec_but_stdio_is_not() {
-        // SAFETY: scalar socket arguments; deliberately inheritable.
-        let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(socket > 2);
-        // SAFETY: the child performs only async-signal-safe syscalls and exits.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            let swept = mark_inherited_descriptors_close_on_exec().is_ok();
-            // SAFETY: F_GETFD reads one descriptor flag word.
-            let socket_flags = unsafe { libc::fcntl(socket, libc::F_GETFD) };
-            // SAFETY: as above, for stderr.
-            let stderr_flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) };
-            let ok = swept
-                && socket_flags & libc::FD_CLOEXEC != 0
-                && stderr_flags >= 0
-                && stderr_flags & libc::FD_CLOEXEC == 0;
-            // SAFETY: terminate the forked child without running destructors.
-            unsafe { libc::_exit(i32::from(!ok)) };
+        // The sweep changes every descriptor in the calling process, so run
+        // it in a fresh copy of this test binary rather than the harness.
+        const CHILD_MARKER: &str = "OPENSHELL_CLOEXEC_SWEEP_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let socket = rustix::net::socket(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::STREAM,
+                None,
+            )
+            .expect("inheritable socket");
+            assert!(
+                !rustix::io::fcntl_getfd(&socket)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            mark_inherited_descriptors_close_on_exec().expect("sweep descriptors");
+            assert!(
+                rustix::io::fcntl_getfd(&socket)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            assert!(
+                !rustix::io::fcntl_getfd(io::stderr())
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            return;
         }
-        let mut status = 0;
-        // SAFETY: wait for the child created above.
-        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
-        // SAFETY: close the test-owned socket.
-        unsafe { libc::close(socket) };
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "linux::child_seccomp::tests::inherited_sockets_are_marked_close_on_exec_but_stdio_is_not",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated sweep test");
+        assert!(status.success(), "isolated sweep test failed");
     }
 
     #[test]

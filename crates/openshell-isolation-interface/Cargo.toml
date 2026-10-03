@@ -22,10 +22,10 @@ tokio = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "net", "process"] }
+socket2 = { workspace = true, features = ["all"] }
 
 [dev-dependencies]
-socket2 = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

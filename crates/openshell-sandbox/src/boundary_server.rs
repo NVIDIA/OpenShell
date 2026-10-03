@@ -3259,7 +3259,7 @@ mod linux {
             socket.set_reuse_address(true)?;
             if !address.ip().is_loopback() {
                 openshell_isolation_interface::linux::socket_confinement::reject_loopback_ingress(
-                    socket.as_raw_fd(),
+                    &socket,
                 )?;
             }
             socket.bind(&address.into())?;

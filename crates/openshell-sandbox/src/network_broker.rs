@@ -638,9 +638,7 @@ fn create_socket(
     // Confinement is standing kernel state that must exist before the workload
     // can observe the descriptor. Natively accepted children inherit it, so
     // local accept needs no per-connection broker inspection.
-    openshell_isolation_interface::linux::socket_confinement::confine_to_loopback(
-        source.as_raw_fd(),
-    )?;
+    openshell_isolation_interface::linux::socket_confinement::confine_to_loopback(&source)?;
     let metadata = SocketMetadata {
         family,
         kind,
@@ -1825,17 +1823,6 @@ mod tests {
         )));
     }
 
-    fn duplicate_close_on_exec(fd: RawFd) -> io::Result<OwnedFd> {
-        // SAFETY: F_DUPFD_CLOEXEC returns an independent owned descriptor for
-        // the same open-file description.
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if duplicate < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fcntl returned one newly owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-    }
-
     #[test]
     fn legacy_listener_rejects_socket_addr_write() {
         // Relayed getpeername routes through write_socket_addr; on a
@@ -1866,11 +1853,10 @@ mod tests {
         };
         let mut registry = SocketRegistry::new(1, 2).unwrap();
         let mut create = || {
-            // SAFETY: a successful socket call returns a new owned descriptor.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-            assert!(fd >= 0);
-            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-            let installed = duplicate_close_on_exec(fd).unwrap();
+            let socket = OwnedFd::from(
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap(),
+            );
+            let installed = rustix::io::fcntl_dupfd_cloexec(&socket, 3).unwrap();
             let tentative = registry.stage(socket, metadata).unwrap();
             let identity = registry.commit(tentative).unwrap();
             (installed, identity)
@@ -2211,27 +2197,18 @@ mod tests {
                         // reports it directly from the kernel.
                         let (stream, accepted_peer) = listener.accept()?;
                         let peer = stream.peer_addr()?;
-                        let device = socket_confinement::bound_device(stream.as_raw_fd())?;
+                        let device = socket_confinement::bound_device(&stream)?;
+                        // sendmsg with no destination is notified and must
+                        // continue for an untracked accepted stream.
                         let payload = b"accepted";
-                        let iov = libc::iovec {
-                            iov_base: payload.as_ptr().cast_mut().cast(),
-                            iov_len: payload.len(),
-                        };
-                        let message = libc::msghdr {
-                            msg_name: std::ptr::null_mut(),
-                            msg_namelen: 0,
-                            msg_iov: (&raw const iov).cast_mut(),
-                            msg_iovlen: 1,
-                            msg_control: std::ptr::null_mut(),
-                            msg_controllen: 0,
-                            msg_flags: 0,
-                        };
-                        // SAFETY: message references one live immutable payload;
-                        // the accepted stream remains open for the call.
-                        let sent =
-                            unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, 0) };
-                        if sent != isize::try_from(payload.len()).expect("payload fits isize") {
-                            return Err(io::Error::last_os_error());
+                        let sent = rustix::net::sendmsg(
+                            &stream,
+                            &[io::IoSlice::new(payload)],
+                            &mut rustix::net::SendAncillaryBuffer::default(),
+                            rustix::net::SendFlags::empty(),
+                        )?;
+                        if sent != payload.len() {
+                            return Err(io::Error::from_raw_os_error(libc::EIO));
                         }
                         Ok((accepted_peer, peer, device))
                     },
@@ -2279,50 +2256,16 @@ mod tests {
                     ready_tx
                         .send(listener.local_addr()?)
                         .map_err(|_| io::Error::other("test client disappeared"))?;
-                    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-                    let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
-                        .expect("sockaddr_storage fits socklen_t");
-                    // SAFETY: storage and length are live, writable outputs.
-                    let accepted = unsafe {
-                        libc::syscall(
-                            libc::SYS_accept4,
-                            listener.as_raw_fd(),
-                            storage.as_mut_ptr(),
-                            &raw mut length,
-                            libc::SOCK_CLOEXEC,
-                        )
+                    // rustix issues accept4 and getpeername as raw syscalls.
+                    let (accepted, accepted_peer) =
+                        rustix::net::acceptfrom_with(&listener, rustix::net::SocketFlags::CLOEXEC)?;
+                    let as_socket_addr = |address: Option<rustix::net::SocketAddrAny>| {
+                        address
+                            .and_then(|address| SocketAddr::try_from(address).ok())
+                            .ok_or_else(|| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
                     };
-                    if accepted < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let accepted = RawFd::try_from(accepted).map_err(io::Error::other)?;
-                    // SAFETY: successful accept4 returned one owned descriptor.
-                    let accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
-                    // SAFETY: accept4 initialized the reported address prefix.
-                    let accepted_peer = decode_sockaddr(
-                        unsafe { storage.assume_init() },
-                        usize::try_from(length).unwrap_or(0),
-                    )?;
-                    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-                    let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
-                        .expect("sockaddr_storage fits socklen_t");
-                    // SAFETY: storage and length are live, writable outputs.
-                    if unsafe {
-                        libc::syscall(
-                            libc::SYS_getpeername,
-                            accepted.as_raw_fd(),
-                            storage.as_mut_ptr(),
-                            &raw mut length,
-                        )
-                    } < 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // SAFETY: getpeername initialized the reported prefix.
-                    let peer = decode_sockaddr(
-                        unsafe { storage.assume_init() },
-                        usize::try_from(length).unwrap_or(0),
-                    )?;
+                    let accepted_peer = as_socket_addr(accepted_peer)?;
+                    let peer = as_socket_addr(rustix::net::getpeername(&accepted)?)?;
                     Ok((accepted_peer, peer))
                 })
                 .expect("launcher result")
@@ -2418,32 +2361,16 @@ mod tests {
             .execute(|| -> io::Result<Vec<ConfinementObservation>> {
                 let mut results = Vec::new();
                 for (domain, kind) in [
-                    (libc::AF_INET, libc::SOCK_STREAM),
-                    (libc::AF_INET, libc::SOCK_DGRAM),
-                    (libc::AF_INET6, libc::SOCK_STREAM),
+                    (socket2::Domain::IPV4, socket2::Type::STREAM),
+                    (socket2::Domain::IPV4, socket2::Type::DGRAM),
+                    (socket2::Domain::IPV6, socket2::Type::STREAM),
                 ] {
-                    // SAFETY: scalar socket arguments; success returns one fd.
-                    let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
-                    if fd < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // SAFETY: successful socket returned one owned descriptor.
-                    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-                    let device = socket_confinement::bound_device(socket.as_raw_fd())?;
-                    let name = c"eth0".to_bytes_with_nul();
-                    // SAFETY: name is a live NUL-terminated buffer.
-                    let rebind = unsafe {
-                        libc::setsockopt(
-                            socket.as_raw_fd(),
-                            libc::SOL_SOCKET,
-                            libc::SO_BINDTODEVICE,
-                            name.as_ptr().cast(),
-                            libc::socklen_t::try_from(name.len()).expect("name fits socklen_t"),
-                        )
-                    };
-                    let rebind_error = (rebind < 0)
-                        .then(|| io::Error::last_os_error().raw_os_error())
-                        .flatten();
+                    let socket = socket2::Socket::new(domain, kind, None)?;
+                    let device = socket_confinement::bound_device(&socket)?;
+                    let rebind_error = socket
+                        .bind_device(Some(b"eth0"))
+                        .err()
+                        .and_then(|error| error.raw_os_error());
                     results.push((device, rebind_error));
                 }
                 Ok(results)
@@ -2466,31 +2393,11 @@ mod tests {
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         let error = launcher
             .execute(move || -> io::Result<()> {
-                // SAFETY: scalar socket arguments; success returns one fd.
-                let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: successful socket returned one owned descriptor.
-                let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-                with_sockaddr(address, |native, length| {
-                    // SAFETY: payload and native address are live for the call.
-                    let sent = unsafe {
-                        libc::sendto(
-                            socket.as_raw_fd(),
-                            b"x".as_ptr().cast(),
-                            1,
-                            libc::MSG_FASTOPEN,
-                            native,
-                            length,
-                        )
-                    };
-                    if sent < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                })
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                socket
+                    .send_to_with_flags(b"x", &address.into(), libc::MSG_FASTOPEN)
+                    .map(drop)
             })
             .unwrap()
             .unwrap_err();

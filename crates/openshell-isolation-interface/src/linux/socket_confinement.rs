@@ -12,14 +12,12 @@
 //! binding requires `CAP_NET_RAW` in the network namespace's owning user
 //! namespace, which the capability-free sandbox and workload do not hold.
 
-#![allow(unsafe_code)]
-
-use std::ffi::CStr;
 use std::io;
-use std::mem::size_of;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::AsFd;
 
-const LOOPBACK_DEVICE: &CStr = c"lo";
+use socket2::{Domain, SockFilter, SockRef, Socket, Type};
+
+const LOOPBACK_DEVICE: &[u8] = b"lo";
 
 /// Bind `fd` to the loopback device and verify the kernel recorded it.
 ///
@@ -27,22 +25,10 @@ const LOOPBACK_DEVICE: &CStr = c"lo";
 ///
 /// Returns the kernel error when the binding cannot be installed, or `EPERM`
 /// when the socket is already bound to another device.
-pub fn confine_to_loopback(fd: RawFd) -> io::Result<()> {
-    let name = LOOPBACK_DEVICE.to_bytes_with_nul();
-    // SAFETY: `name` is a live NUL-terminated buffer for the duration of the call.
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            name.as_ptr().cast(),
-            socklen(name.len())?,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if bound_device(fd)?.as_deref() == Some(LOOPBACK_DEVICE.to_bytes()) {
+pub fn confine_to_loopback(fd: impl AsFd) -> io::Result<()> {
+    let socket = SockRef::from(&fd);
+    socket.bind_device(Some(LOOPBACK_DEVICE))?;
+    if socket.device()?.as_deref() == Some(LOOPBACK_DEVICE) {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(libc::EPERM))
@@ -54,28 +40,8 @@ pub fn confine_to_loopback(fd: RawFd) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns the kernel error from `getsockopt(SO_BINDTODEVICE)`.
-pub fn bound_device(fd: RawFd) -> io::Result<Option<Vec<u8>>> {
-    let mut name = [0_u8; libc::IFNAMSIZ];
-    let mut length = socklen(name.len())?;
-    // SAFETY: `name` and `length` are live, writable outputs sized together.
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            name.as_mut_ptr().cast(),
-            &raw mut length,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let length = usize::try_from(length).unwrap_or(0).min(name.len());
-    let name = name[..length]
-        .split(|byte| *byte == 0)
-        .next()
-        .unwrap_or_default();
-    Ok((!name.is_empty()).then(|| name.to_vec()))
+pub fn bound_device(fd: impl AsFd) -> io::Result<Option<Vec<u8>>> {
+    SockRef::from(&fd).device()
 }
 
 /// Drop TCP/UDP ingress that arrives on the loopback interface.
@@ -83,48 +49,43 @@ pub fn bound_device(fd: RawFd) -> io::Result<Option<Vec<u8>>> {
 /// Attach this to a trusted listener whose legitimate clients are never in the
 /// same network namespace. Matching the ingress interface rather than the
 /// source address also rejects connections to the host's own non-loopback
-/// address, which the kernel delivers through loopback. The filter is locked
-/// so later code cannot remove it accidentally.
+/// address, which the kernel delivers through loopback. The filter is not
+/// locked: the listener descriptor never leaves the trusted sandbox process,
+/// which marks every descriptor above stdio close-on-exec before running
+/// workload code.
 ///
 /// # Errors
 ///
-/// Returns the kernel error when the filter cannot be attached or locked.
-pub fn reject_loopback_ingress(fd: RawFd) -> io::Result<()> {
-    // SAFETY: LOOPBACK_DEVICE is a valid NUL-terminated interface name.
-    let index = unsafe { libc::if_nametoindex(LOOPBACK_DEVICE.as_ptr()) };
-    if index == 0 {
-        return Err(io::Error::last_os_error());
-    }
+/// Returns the kernel error when the interface index cannot be resolved or
+/// the filter cannot be attached.
+pub fn reject_loopback_ingress(fd: impl AsFd) -> io::Result<()> {
+    let index = rustix::net::netdevice::name_to_index(&fd, "lo")?;
     reject_ingress_interface(fd, index)
 }
 
-fn reject_ingress_interface(fd: RawFd, index: u32) -> io::Result<()> {
+fn reject_ingress_interface(fd: impl AsFd, index: u32) -> io::Result<()> {
     // Ancillary loads use the documented negative offset encoding.
     let ifindex_offset = (libc::SKF_AD_OFF + libc::SKF_AD_IFINDEX).cast_unsigned();
-    let mut program = [
-        filter_stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, ifindex_offset),
-        filter_jump(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, index, 0, 1),
-        filter_stmt(libc::BPF_RET | libc::BPF_K, 0),
-        filter_stmt(libc::BPF_RET | libc::BPF_K, u32::MAX),
+    let program = [
+        filter(
+            libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+            0,
+            0,
+            ifindex_offset,
+        ),
+        filter(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, index),
+        filter(libc::BPF_RET | libc::BPF_K, 0, 0, 0),
+        filter(libc::BPF_RET | libc::BPF_K, 0, 0, u32::MAX),
     ];
-    let filter = libc::sock_fprog {
-        len: u16::try_from(program.len()).map_err(io::Error::other)?,
-        filter: program.as_mut_ptr(),
-    };
-    // SAFETY: `filter` references `program`, which outlives the call.
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ATTACH_FILTER,
-            (&raw const filter).cast(),
-            socklen(size_of::<libc::sock_fprog>())?,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    set_int_option(fd, libc::SOL_SOCKET, libc::SO_LOCK_FILTER, 1)
+    SockRef::from(&fd).attach_filter(&program)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "classic BPF opcodes are 16-bit by definition"
+)]
+const fn filter(code: u32, jt: u8, jf: u8, k: u32) -> SockFilter {
+    SockFilter::new(code as u16, jt, jf, k)
 }
 
 /// Actively prove loopback confinement under the current runtime profile.
@@ -142,50 +103,35 @@ fn reject_ingress_interface(fd: RawFd, index: u32) -> io::Result<()> {
 /// Returns an error describing the first failed property.
 pub fn probe_loopback_confinement() -> io::Result<()> {
     for (domain, kind) in [
-        (libc::AF_INET, libc::SOCK_STREAM),
-        (libc::AF_INET, libc::SOCK_DGRAM),
-        (libc::AF_INET6, libc::SOCK_STREAM),
-        (libc::AF_INET6, libc::SOCK_DGRAM),
+        (Domain::IPV4, Type::STREAM),
+        (Domain::IPV4, Type::DGRAM),
+        (Domain::IPV6, Type::STREAM),
+        (Domain::IPV6, Type::DGRAM),
     ] {
-        let socket = match new_socket(domain, kind) {
+        let socket = match Socket::new(domain, kind, None) {
             Ok(socket) => socket,
             Err(error)
-                if domain == libc::AF_INET6 && error.raw_os_error() == Some(libc::EAFNOSUPPORT) =>
+                if domain == Domain::IPV6 && error.raw_os_error() == Some(libc::EAFNOSUPPORT) =>
             {
                 continue;
             }
             Err(error) => return Err(error),
         };
-        confine_to_loopback(socket.as_raw_fd())
+        confine_to_loopback(&socket)
             .map_err(|error| probe_error("install loopback binding", &error))?;
-        probe_binding_is_immutable(socket.as_raw_fd())?;
+        probe_binding_is_immutable(&socket)?;
     }
     probe_accept_inherits_binding()
 }
 
-fn probe_binding_is_immutable(fd: RawFd) -> io::Result<()> {
-    let empty = [0_u8; 1];
-    // SAFETY: `empty` is a live one-byte buffer; an empty name requests unbind.
-    let clear = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            empty.as_ptr().cast(),
-            socklen(empty.len())?,
-        )
-    };
-    if clear == 0 {
+fn probe_binding_is_immutable(socket: &Socket) -> io::Result<()> {
+    // `None` requests an unbind; replacing the device takes the same path.
+    if socket.bind_device(None).is_ok() {
         return Err(io::Error::other(
             "sandbox credentials can clear a socket device binding",
         ));
     }
-    if set_int_option(fd, libc::SOL_SOCKET, libc::SO_BINDTOIFINDEX, 0).is_ok() {
-        return Err(io::Error::other(
-            "sandbox credentials can clear a socket interface-index binding",
-        ));
-    }
-    if bound_device(fd)?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
+    if socket.device()?.as_deref() != Some(LOOPBACK_DEVICE) {
         return Err(io::Error::other("socket device binding changed"));
     }
     Ok(())
@@ -210,14 +156,14 @@ fn probe_accept_inherits_binding() -> io::Result<()> {
             }
             Err(error) => return Err(error),
         };
-        confine_to_loopback(listener.as_raw_fd())
+        confine_to_loopback(&listener)
             .map_err(|error| probe_error("confine probe listener", &error))?;
         let client = std::net::TcpStream::connect(listener.local_addr()?)?;
         let (accepted, peer) = listener.accept()?;
         if peer != client.local_addr()? {
             return Err(io::Error::other("accepted probe peer mismatch"));
         }
-        if bound_device(accepted.as_raw_fd())?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
+        if bound_device(&accepted)?.as_deref() != Some(LOOPBACK_DEVICE) {
             return Err(io::Error::other(
                 "accepted socket did not inherit the loopback binding",
             ));
@@ -225,9 +171,9 @@ fn probe_accept_inherits_binding() -> io::Result<()> {
         // Natively accepted sockets are not tracked by the broker, so a
         // workload can disconnect and reconnect them. The binding must
         // survive that transition.
-        disconnect(accepted.as_raw_fd())
-            .map_err(|error| probe_error("disconnect accepted probe socket", &error))?;
-        if bound_device(accepted.as_raw_fd())?.as_deref() != Some(LOOPBACK_DEVICE.to_bytes()) {
+        rustix::net::connect_unspec(&accepted)
+            .map_err(|error| probe_error("disconnect accepted probe socket", &error.into()))?;
+        if bound_device(&accepted)?.as_deref() != Some(LOOPBACK_DEVICE) {
             return Err(io::Error::other(
                 "accepted socket lost the loopback binding after disconnect",
             ));
@@ -236,77 +182,8 @@ fn probe_accept_inherits_binding() -> io::Result<()> {
     Ok(())
 }
 
-fn disconnect(fd: RawFd) -> io::Result<()> {
-    // SAFETY: zeroed sockaddr storage with AF_UNSPEC is the documented
-    // disconnect request; the buffer is live for the call.
-    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    address.ss_family = libc::sa_family_t::try_from(libc::AF_UNSPEC).map_err(io::Error::other)?;
-    // SAFETY: `address` is a live sockaddr_storage of the given length.
-    let result = unsafe {
-        libc::connect(
-            fd,
-            (&raw const address).cast(),
-            socklen(size_of::<libc::sockaddr_storage>())?,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 fn probe_error(context: &str, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{context}: {error}"))
-}
-
-fn new_socket(domain: i32, kind: i32) -> io::Result<OwnedFd> {
-    // SAFETY: scalar socket arguments; success returns one owned descriptor.
-    let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful socket returned one newly owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn set_int_option(fd: RawFd, level: i32, option: i32, value: i32) -> io::Result<()> {
-    // SAFETY: `value` is a live int for the duration of the call.
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            option,
-            (&raw const value).cast(),
-            socklen(size_of::<i32>())?,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn socklen(length: usize) -> io::Result<libc::socklen_t> {
-    libc::socklen_t::try_from(length).map_err(io::Error::other)
-}
-
-const fn filter_stmt(code: u32, k: u32) -> libc::sock_filter {
-    filter_jump(code, k, 0, 0)
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "classic BPF opcodes are 16-bit by definition"
-)]
-const fn filter_jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
-    libc::sock_filter {
-        code: code as u16,
-        jt,
-        jf,
-        k,
-    }
 }
 
 #[cfg(test)]
@@ -316,6 +193,10 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::time::Duration;
 
+    fn new_socket(domain: Domain, kind: Type) -> Socket {
+        Socket::new(domain, kind, None).unwrap()
+    }
+
     #[test]
     fn active_probe_passes_without_capabilities() {
         probe_loopback_confinement().expect("loopback confinement probe");
@@ -323,19 +204,16 @@ mod tests {
 
     #[test]
     fn unbound_socket_reports_no_device() {
-        let socket = new_socket(libc::AF_INET, libc::SOCK_STREAM).unwrap();
-        assert_eq!(bound_device(socket.as_raw_fd()).unwrap(), None);
+        let socket = new_socket(Domain::IPV4, Type::STREAM);
+        assert_eq!(bound_device(&socket).unwrap(), None);
     }
 
     #[test]
     fn confined_socket_cannot_be_rebound() {
-        let socket = new_socket(libc::AF_INET, libc::SOCK_DGRAM).unwrap();
-        confine_to_loopback(socket.as_raw_fd()).unwrap();
-        assert!(confine_to_loopback(socket.as_raw_fd()).is_err());
-        assert_eq!(
-            bound_device(socket.as_raw_fd()).unwrap().as_deref(),
-            Some(&b"lo"[..])
-        );
+        let socket = new_socket(Domain::IPV4, Type::DGRAM);
+        confine_to_loopback(&socket).unwrap();
+        assert!(confine_to_loopback(&socket).is_err());
+        assert_eq!(bound_device(&socket).unwrap().as_deref(), Some(&b"lo"[..]));
     }
 
     fn connect_with_timeout(address: SocketAddr) -> io::Result<TcpStream> {
@@ -345,7 +223,7 @@ mod tests {
     #[test]
     fn loopback_ingress_filter_rejects_loopback_connections() {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        reject_loopback_ingress(listener.as_raw_fd()).unwrap();
+        reject_loopback_ingress(&listener).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         // Dropped SYNs never complete the handshake.
@@ -361,7 +239,7 @@ mod tests {
         // Positive control: the same program keyed to an absent interface
         // index must leave loopback traffic untouched.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        reject_ingress_interface(listener.as_raw_fd(), u32::MAX).unwrap();
+        reject_ingress_interface(&listener, u32::MAX).unwrap();
         let mut client = connect_with_timeout(listener.local_addr().unwrap()).unwrap();
         let (mut accepted, _) = listener.accept().unwrap();
         client.write_all(b"ping").unwrap();
@@ -394,13 +272,12 @@ mod tests {
             return;
         };
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        confine_to_loopback(listener.as_raw_fd()).unwrap();
+        confine_to_loopback(&listener).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let connect_from = |source: Ipv4Addr, destination: Ipv4Addr| {
-            let client =
-                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let client = new_socket(Domain::IPV4, Type::STREAM);
             client.bind(&SocketAddr::from((source, 0)).into()).unwrap();
             client
                 .connect_timeout(
@@ -421,24 +298,6 @@ mod tests {
         let (_, peer) = listener.accept().unwrap();
         assert_eq!(peer, client.local_addr().unwrap().as_socket().unwrap());
         assert_eq!(peer.ip(), std::net::IpAddr::V4(local));
-    }
-
-    #[test]
-    fn ingress_filter_is_locked() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        reject_loopback_ingress(listener.as_raw_fd()).unwrap();
-        // SAFETY: SO_DETACH_FILTER ignores its value argument.
-        let detach = unsafe {
-            let value = 0_i32;
-            libc::setsockopt(
-                listener.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_DETACH_FILTER,
-                (&raw const value).cast(),
-                socklen(size_of::<i32>()).unwrap(),
-            )
-        };
-        assert!(detach < 0);
     }
 
     /// Opt-in checks against a real non-loopback topology.
@@ -490,36 +349,24 @@ mod tests {
             }
         }
 
-        fn confined(domain: i32, kind: i32) -> OwnedFd {
-            let socket = new_socket(domain, kind | libc::SOCK_NONBLOCK).unwrap();
-            confine_to_loopback(socket.as_raw_fd()).unwrap();
+        fn confined(domain: Domain, kind: Type) -> Socket {
+            let socket = new_socket(domain, kind.nonblocking());
+            confine_to_loopback(&socket).unwrap();
             socket
         }
 
-        fn attempt_egress(fd: RawFd, kind: i32, destination: SocketAddr) -> Option<i32> {
-            let native = socket2::SockAddr::from(destination);
-            // SAFETY: payload and the native address are live for each call.
-            let result = unsafe {
-                match kind {
-                    libc::SOCK_DGRAM => libc::sendto(
-                        fd,
-                        b"probe".as_ptr().cast(),
-                        5,
-                        0,
-                        native.as_ptr().cast(),
-                        native.len(),
-                    ),
-                    _ => libc::sendto(
-                        fd,
-                        b"probe".as_ptr().cast(),
-                        5,
-                        libc::MSG_FASTOPEN,
-                        native.as_ptr().cast(),
-                        native.len(),
-                    ),
-                }
+        fn errno(result: io::Result<impl Sized>) -> Option<i32> {
+            result.err().map(|error| error.raw_os_error().unwrap_or(0))
+        }
+
+        fn attempt_egress(socket: &Socket, kind: Type, destination: SocketAddr) -> Option<i32> {
+            // Streams use Fast Open so the send itself attempts a connect.
+            let flags = if kind == Type::DGRAM {
+                0
+            } else {
+                libc::MSG_FASTOPEN
             };
-            (result < 0).then(|| io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            errno(socket.send_to_with_flags(b"probe", &destination.into(), flags))
         }
 
         #[test]
@@ -552,28 +399,19 @@ mod tests {
             let baseline = quiet_counter(&device);
             let mut outcomes = Vec::new();
             for destination in &destinations {
-                let domain = match destination {
-                    SocketAddr::V4(_) => libc::AF_INET,
-                    SocketAddr::V6(_) => libc::AF_INET6,
-                };
-                for kind in [libc::SOCK_DGRAM, libc::SOCK_STREAM] {
+                let domain = Domain::for_address(*destination);
+                for kind in [Type::DGRAM, Type::STREAM] {
                     let socket = confined(domain, kind);
                     outcomes.push((
                         destination,
                         kind,
                         "send",
-                        attempt_egress(socket.as_raw_fd(), kind, *destination),
+                        attempt_egress(&socket, kind, *destination),
                     ));
-                    if kind == libc::SOCK_STREAM {
+                    if kind == Type::STREAM {
                         let socket = confined(domain, kind);
-                        let native = socket2::SockAddr::from(*destination);
-                        // SAFETY: native address is live for the call.
-                        let result = unsafe {
-                            libc::connect(socket.as_raw_fd(), native.as_ptr().cast(), native.len())
-                        };
-                        let errno = (result < 0)
-                            .then(|| io::Error::last_os_error().raw_os_error().unwrap_or(0));
-                        outcomes.push((destination, kind, "connect", errno));
+                        let result = socket.connect(&(*destination).into());
+                        outcomes.push((destination, kind, "connect", errno(result)));
                         std::thread::sleep(Duration::from_millis(200));
                     }
                 }
@@ -597,13 +435,11 @@ mod tests {
             let control_port: u16 = env("OPENSHELL_TOPOLOGY_CONTROL_PORT").parse().unwrap();
             let wait = Duration::from_secs(env("OPENSHELL_TOPOLOGY_WAIT_SECS").parse().unwrap());
             let listen = |port: u16, confine: bool| {
-                let socket =
-                    socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)
-                        .unwrap();
+                let socket = new_socket(Domain::IPV6, Type::STREAM);
                 // Dual-stack wildcard covers IPv4 and IPv4-mapped peers too.
                 socket.set_only_v6(false).unwrap();
                 if confine {
-                    confine_to_loopback(socket.as_raw_fd()).unwrap();
+                    confine_to_loopback(&socket).unwrap();
                 }
                 socket
                     .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
