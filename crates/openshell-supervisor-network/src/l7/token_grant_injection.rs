@@ -3,6 +3,7 @@
 
 //! Endpoint-bound dynamic token grant injection for HTTP relay paths.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,22 +72,57 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// Checks for endpoint-bound token grant credentials and injects an
 /// Authorization header before forwarding the request upstream.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
+    inject(req, ctx, None).await
+}
+
+/// Inject only grants owned by endpoints that admitted the inspected request.
+/// An empty owner set permits no acquisition, including audit-only forwarding.
+/// L4-only forwarding continues to use `inject_if_needed` with its existing
+/// endpoint-selector contract; it has no per-request L7 admission decision.
+pub(crate) async fn inject_for_admitted_owners(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    admitted_owners: &HashSet<String>,
+) -> Result<L7Request> {
+    inject(req, ctx, Some(admitted_owners)).await
+}
+
+async fn inject(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    admitted_owners: Option<&HashSet<String>>,
+) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
-        dyn_creds.read().map_or(None, |creds_guard| {
-            creds_guard
-                .iter()
-                .filter_map(|(key, cred)| {
-                    let score =
-                        dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-                    cred.token_grant
-                        .is_some()
-                        .then(|| (score, key.clone(), cred.clone()))
-                })
-                .max_by_key(|(score, key, _)| (*score, key.clone()))
-                .map(|(_, key, cred)| (key, cred))
-        })
-    });
+    let token_grant_credential = if let Some(dyn_creds) = ctx.dynamic_credentials.as_ref() {
+        let creds_guard = dyn_creds
+            .read()
+            .map_err(|_| miette!("dynamic credential state unavailable"))?;
+        creds_guard
+            .iter()
+            .filter_map(|(key, cred)| {
+                // Admission filters candidates before specificity ranks them.
+                // A narrower sibling cannot lend its grant to an allow from
+                // another endpoint, while an admitted broader owner remains
+                // eligible for its own credential.
+                if admitted_owners.is_some_and(|owners| {
+                    !cred
+                        .token_grant_owners
+                        .iter()
+                        .any(|owner| owners.contains(owner))
+                }) {
+                    return None;
+                }
+                let score =
+                    dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
+                cred.token_grant
+                    .is_some()
+                    .then(|| (score, key.clone(), cred.clone()))
+            })
+            .max_by_key(|(score, key, _)| (*score, key.clone()))
+            .map(|(_, key, cred)| (key, cred))
+    } else {
+        None
+    };
 
     if let Some((provider_key, cred)) = token_grant_credential
         && let Some(ref token_grant) = cred.token_grant
@@ -429,6 +465,7 @@ pub mod test_support {
             dynamic_credentials.insert(
                 key.to_string(),
                 ProviderProfileCredential {
+                    token_grant_owners: vec!["test-owner".to_string()],
                     name: "access_token".to_string(),
                     auth_style: "bearer".to_string(),
                     header_name: "Authorization".to_string(),

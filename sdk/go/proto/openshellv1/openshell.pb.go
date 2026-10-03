@@ -9097,19 +9097,24 @@ func (x *ProviderCredentialTokenGrant) GetRequestedTokenType() string {
 
 // Provider credential declaration.
 type ProviderProfileCredential struct {
-	state         protoimpl.MessageState        `protogen:"open.v1"`
-	Name          string                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Description   string                        `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
-	EnvVars       []string                      `protobuf:"bytes,3,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty"`
-	Required      bool                          `protobuf:"varint,4,opt,name=required,proto3" json:"required,omitempty"`
-	AuthStyle     string                        `protobuf:"bytes,5,opt,name=auth_style,json=authStyle,proto3" json:"auth_style,omitempty"`
-	HeaderName    string                        `protobuf:"bytes,6,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
-	QueryParam    string                        `protobuf:"bytes,7,opt,name=query_param,json=queryParam,proto3" json:"query_param,omitempty"`
-	Refresh       *ProviderCredentialRefresh    `protobuf:"bytes,8,opt,name=refresh,proto3" json:"refresh,omitempty"`
-	PathTemplate  string                        `protobuf:"bytes,9,opt,name=path_template,json=pathTemplate,proto3" json:"path_template,omitempty"`
-	TokenGrant    *ProviderCredentialTokenGrant `protobuf:"bytes,10,opt,name=token_grant,json=tokenGrant,proto3" json:"token_grant,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState        `protogen:"open.v1"`
+	Name         string                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Description  string                        `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
+	EnvVars      []string                      `protobuf:"bytes,3,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty"`
+	Required     bool                          `protobuf:"varint,4,opt,name=required,proto3" json:"required,omitempty"`
+	AuthStyle    string                        `protobuf:"bytes,5,opt,name=auth_style,json=authStyle,proto3" json:"auth_style,omitempty"`
+	HeaderName   string                        `protobuf:"bytes,6,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
+	QueryParam   string                        `protobuf:"bytes,7,opt,name=query_param,json=queryParam,proto3" json:"query_param,omitempty"`
+	Refresh      *ProviderCredentialRefresh    `protobuf:"bytes,8,opt,name=refresh,proto3" json:"refresh,omitempty"`
+	PathTemplate string                        `protobuf:"bytes,9,opt,name=path_template,json=pathTemplate,proto3" json:"path_template,omitempty"`
+	TokenGrant   *ProviderCredentialTokenGrant `protobuf:"bytes,10,opt,name=token_grant,json=tokenGrant,proto3" json:"token_grant,omitempty"`
+	// Output-only gateway-derived endpoint authorities for resolved token grants.
+	// Empty means no endpoint may obtain this grant. Profile-authored values are
+	// ignored; normal policies name the originating provider endpoint, while a
+	// global policy replaces those authorities with its own endpoints.
+	TokenGrantOwners []string `protobuf:"bytes,11,rep,name=token_grant_owners,json=tokenGrantOwners,proto3" json:"token_grant_owners,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ProviderProfileCredential) Reset() {
@@ -9208,6 +9213,13 @@ func (x *ProviderProfileCredential) GetPathTemplate() string {
 func (x *ProviderProfileCredential) GetTokenGrant() *ProviderCredentialTokenGrant {
 	if x != nil {
 		return x.TokenGrant
+	}
+	return nil
+}
+
+func (x *ProviderProfileCredential) GetTokenGrantOwners() []string {
+	if x != nil {
+		return x.TokenGrantOwners
 	}
 	return nil
 }
@@ -18456,7 +18468,7 @@ const file_openshell_proto_rawDesc = "" +
 	"grant_type\x18\b \x01(\x0e2..openshell.v1.ProviderCredentialTokenGrantTypeR\tgrantType\x12[\n" +
 	"\rsubject_token\x18\t \x01(\v26.openshell.v1.ProviderCredentialTokenGrantSubjectTokenR\fsubjectToken\x120\n" +
 	"\x14requested_token_type\x18\n" +
-	" \x01(\tR\x12requestedTokenTypeJ\x04\b\x04\x10\x05R\x11cache_ttl_seconds\"\x9e\x03\n" +
+	" \x01(\tR\x12requestedTokenTypeJ\x04\b\x04\x10\x05R\x11cache_ttl_seconds\"\xcc\x03\n" +
 	"\x19ProviderProfileCredential\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x19\n" +
@@ -18472,7 +18484,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\rpath_template\x18\t \x01(\tR\fpathTemplate\x12K\n" +
 	"\vtoken_grant\x18\n" +
 	" \x01(\v2*.openshell.v1.ProviderCredentialTokenGrantR\n" +
-	"tokenGrant\"\x8d\x01\n" +
+	"tokenGrant\x12,\n" +
+	"\x12token_grant_owners\x18\v \x03(\tR\x10tokenGrantOwners\"\x8d\x01\n" +
 	"!ProviderCredentialRefreshMaterial\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x1a\n" +

@@ -203,7 +203,7 @@ The following provider profile design items are not part of the current behavior
 | Roadmap item | Current behavior |
 |---|---|
 | General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
-| Binary-scoped credential injection | Provider profile binaries affect policy composition but do not yet restrict placeholder resolution by calling binary. Static and dynamic credentials are endpoint-scoped. |
+| Binary-scoped credential injection | Static placeholder resolution is endpoint-scoped. Dynamic grants in single-route REST and multi-route inspection also require admission by their owning endpoint's policy, including its binary restrictions. L4-only credential forwarding retains endpoint-selector matching. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
 | Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
@@ -556,6 +556,10 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 ### Dynamic Token Grants
 
 `token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credential, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+Multi-route inspection supports endpoints sharing a host and port while using different paths, including requests on one persistent connection. In this path and single-route REST, the supervisor selects grants only from endpoints whose policy admits the current request and calling binary. An overlapping endpoint's allow rule cannot authorize another endpoint's grant. Requests forwarded solely because enforcement is `audit` receive no grant from an endpoint that denies them. A gateway-global policy supplies the effective authorization rules when it replaces provider policies; profile host, port and path selectors still limit each credential's destination. Native single-route MCP, JSON-RPC and GraphQL inspection do not yet inject dynamic grants.
+
+Later requests use the latest installed provider credentials. If provider state or policy changes while a grant is being obtained, the supervisor rejects the request before sending it upstream. Reconnect and retry after the new configuration is ready. A token-service failure also closes the request without forwarding it; a later connection can retry the grant.
 
 OpenShell supports two dynamic grant types:
 
