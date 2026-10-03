@@ -7148,7 +7148,7 @@ network_policies:
             static_provider_environment(1, Some("initial")),
             &readiness,
         );
-        let (revision, child_env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
+        let (revision, child_env) = state.child_env_snapshot_with_non_secret_resolved().unwrap();
         let reference = &child_env["EXTERNAL_TOKEN"];
         assert_eq!(revision, 1);
         assert_eq!(reference, "openshell:resolve:env:v1_EXTERNAL_TOKEN");

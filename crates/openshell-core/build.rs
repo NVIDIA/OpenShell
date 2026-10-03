@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")
+        // Profile snapshots hash their protobuf encoding. Keep environment
+        // maps ordered across storage round trips so revisions remain stable.
+        .btree_map(".openshell.v1.ProviderProfileEnvironment")
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)

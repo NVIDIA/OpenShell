@@ -461,6 +461,35 @@ func TestProfileDiagnosticFromProto_Nil(t *testing.T) {
 
 // --- ProviderProfile ---
 
+func TestProviderProfileEnvironmentRoundTripAndCopies(t *testing.T) {
+	profile := &v1.ProviderProfile{
+		ID:                      "custom",
+		RequiredPlatformAdapter: "gcp-metadata",
+		Environment: &v1.ProfileEnvironment{
+			Config: map[string]string{"CUSTOM_PROJECT": "project"},
+			Fixed:  map[string]string{"CUSTOM_MODE": "native"},
+		},
+		Discovery: v1.ProfileDiscovery{ConfigEnvVars: []string{"CUSTOM_PROJECT"}},
+	}
+	wire := ProviderProfileToProto(profile)
+	restored := ProviderProfileFromProto(wire)
+	assert.Equal(t, profile.Environment, restored.Environment)
+	assert.Equal(t, profile.Discovery, restored.Discovery)
+	assert.Equal(t, profile.RequiredPlatformAdapter, restored.RequiredPlatformAdapter)
+	profile.Environment.Config["CUSTOM_PROJECT"] = "changed-source"
+	profile.Environment.Fixed["CUSTOM_MODE"] = "changed-source"
+	profile.Discovery.ConfigEnvVars[0] = "CHANGED_SOURCE"
+	assert.Equal(t, "project", wire.Environment.Config["CUSTOM_PROJECT"])
+	assert.Equal(t, "native", wire.Environment.Fixed["CUSTOM_MODE"])
+	assert.Equal(t, "CUSTOM_PROJECT", wire.Discovery.ConfigEnvVars[0])
+	wire.Environment.Config["CUSTOM_PROJECT"] = "changed-wire"
+	wire.Environment.Fixed["CUSTOM_MODE"] = "changed-wire"
+	wire.Discovery.ConfigEnvVars[0] = "CHANGED_WIRE"
+	assert.Equal(t, "project", restored.Environment.Config["CUSTOM_PROJECT"])
+	assert.Equal(t, "native", restored.Environment.Fixed["CUSTOM_MODE"])
+	assert.Equal(t, "CUSTOM_PROJECT", restored.Discovery.ConfigEnvVars[0])
+}
+
 func TestProviderProfileFromProto(t *testing.T) {
 	proto := &pb.ProviderProfile{
 		Id:          "prof-1",

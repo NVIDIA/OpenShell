@@ -13,7 +13,8 @@ use openshell_core::proto::{
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileEnvironment,
+    ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
@@ -23,7 +24,7 @@ use openshell_policy::{
     validate_l7_endpoint_semantics,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
@@ -318,6 +319,47 @@ pub struct CredentialRefreshOutputProfile {
 pub struct DiscoveryProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_env_vars: Vec<String>,
+}
+
+/// Literal, non-secret workload environment defaults.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentProfile {
+    /// Destination environment key -> provider config key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Destination environment key -> literal value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fixed: BTreeMap<String, String>,
+}
+
+impl EnvironmentProfile {
+    fn is_empty(&self) -> bool {
+        self.config.is_empty() && self.fixed.is_empty()
+    }
+
+    /// Fill missing values only. Projection never changes a caller's value,
+    /// including an explicitly empty value.
+    pub fn inject(&self, config: &HashMap<String, String>, env: &mut HashMap<String, String>) {
+        for (key, config_key) in &self.config {
+            if key == crate::LEGACY_VERTEX_PRIVATE_KEY_ENV {
+                continue;
+            }
+            if let Some(value) = config.get(config_key).map(|value| value.trim())
+                && !value.is_empty()
+            {
+                env.entry(key.clone()).or_insert_with(|| value.to_string());
+            }
+        }
+        for (key, value) in &self.fixed {
+            if key == crate::LEGACY_VERTEX_PRIVATE_KEY_ENV {
+                continue;
+            }
+            env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
 }
 
 // These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
@@ -709,6 +751,10 @@ pub struct ProviderTypeProfile {
     pub inference_capable: bool,
     #[serde(default, skip_serializing_if = "discovery_is_empty")]
     pub discovery: DiscoveryProfile,
+    #[serde(default, skip_serializing_if = "EnvironmentProfile::is_empty")]
+    pub environment: EnvironmentProfile,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub required_platform_adapter: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -795,6 +841,18 @@ fn valid_file_config_key(key: &str) -> bool {
 // narrower shape; direct gRPC imports and CLI YAML imports must preserve the
 // same policy intent through storage and JIT composition.
 impl ProviderTypeProfile {
+    /// Check runtime capability separately from schema lint. The supervisor
+    /// provides GCP metadata for non-Windows sandbox runtimes.
+    pub fn ensure_platform_adapter_available(&self) -> Result<(), crate::ProviderError> {
+        match self.required_platform_adapter.as_str() {
+            "gcp-metadata" if cfg!(windows) => {
+                Err(crate::ProviderError::UnavailableGcpMetadataAdapter)
+            }
+            "" | "gcp-metadata" => Ok(()),
+            _ => Err(crate::ProviderError::UnknownPlatformAdapter),
+        }
+    }
+
     #[must_use]
     pub fn from_proto(profile: &ProviderProfile) -> Self {
         Self {
@@ -843,6 +901,14 @@ impl ProviderTypeProfile {
                 .unwrap_or_default(),
             source: profile.source.clone(),
             scope: profile.scope.clone(),
+            environment: profile.environment.as_ref().map_or_else(
+                EnvironmentProfile::default,
+                |environment| EnvironmentProfile {
+                    config: environment.config.clone(),
+                    fixed: environment.fixed.clone(),
+                },
+            ),
+            required_platform_adapter: profile.required_platform_adapter.clone(),
         }
     }
 
@@ -1015,6 +1081,11 @@ impl ProviderTypeProfile {
                 .then(|| discovery_to_proto(&self.discovery)),
             source: self.source.clone(),
             scope: self.scope.clone(),
+            environment: (!self.environment.is_empty()).then(|| ProviderProfileEnvironment {
+                config: self.environment.config.clone(),
+                fixed: self.environment.fixed.clone(),
+            }),
+            required_platform_adapter: self.required_platform_adapter.clone(),
         }
     }
 
@@ -1206,7 +1277,7 @@ pub fn strategy_output_env_key(
 }
 
 fn discovery_is_empty(discovery: &DiscoveryProfile) -> bool {
-    discovery.credentials.is_empty()
+    discovery.credentials.is_empty() && discovery.config_env_vars.is_empty()
 }
 
 impl Serialize for BinaryProfile {
@@ -1621,12 +1692,14 @@ fn token_grant_audience_override_to_proto(
 fn discovery_from_proto(discovery: &ProviderProfileDiscovery) -> DiscoveryProfile {
     DiscoveryProfile {
         credentials: discovery.credentials.clone(),
+        config_env_vars: discovery.config_env_vars.clone(),
     }
 }
 
 fn discovery_to_proto(discovery: &DiscoveryProfile) -> ProviderProfileDiscovery {
     ProviderProfileDiscovery {
         credentials: discovery.credentials.clone(),
+        config_env_vars: discovery.config_env_vars.clone(),
     }
 }
 
@@ -2109,6 +2182,7 @@ pub fn validate_profile_set(
     let mut diagnostics = Vec::new();
     let mut ids = HashSet::new();
     for (source, profile) in profiles {
+        collect_environment_diagnostics(source, profile, &mut diagnostics);
         let raw_profile_id = profile.id.as_str();
         let profile_id = raw_profile_id.trim();
         if profile_id.is_empty() {
@@ -3043,6 +3117,134 @@ pub fn validate_profile_set(
     diagnostics
 }
 
+// Keep this declaration surface bounded and data-only. These limits apply to
+// both YAML and protobuf imports through the shared profile validator.
+const MAX_ENVIRONMENT_ENTRIES: usize = 64;
+const MAX_ENVIRONMENT_KEY_BYTES: usize = 128;
+const MAX_FIXED_ENVIRONMENT_VALUE_BYTES: usize = 4096;
+
+fn valid_environment_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    key.len() <= MAX_ENVIRONMENT_KEY_BYTES
+        && bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        && !uses_reserved_revision_namespace(key)
+}
+
+fn collect_environment_diagnostics(
+    source: &str,
+    profile: &ProviderTypeProfile,
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+) {
+    let mut error = |field: &str, message: &str| {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            &profile.id,
+            field,
+            message,
+        ));
+    };
+    if !matches!(
+        profile.required_platform_adapter.as_str(),
+        "" | "gcp-metadata"
+    ) {
+        error(
+            "required_platform_adapter",
+            "unknown platform adapter; the only recognized adapter is gcp-metadata",
+        );
+    }
+    let environment = &profile.environment;
+    if environment.config.len() + environment.fixed.len() > MAX_ENVIRONMENT_ENTRIES {
+        error("environment", "at most 64 environment defaults are allowed");
+    }
+    let credential_keys = profile.credential_env_vars();
+    for key in environment
+        .config
+        .keys()
+        .chain(environment.fixed.keys())
+        .take(MAX_ENVIRONMENT_ENTRIES)
+    {
+        if key == crate::LEGACY_VERTEX_PRIVATE_KEY_ENV {
+            error(
+                "environment",
+                "GOOGLE_SERVICE_ACCOUNT_KEY contains private key material and cannot be a non-secret environment default",
+            );
+        }
+        if !valid_environment_key(key) {
+            error(
+                "environment",
+                "environment keys must be valid non-reserved variable names of at most 128 bytes",
+            );
+        }
+        if credential_keys.contains(&key.as_str()) {
+            error(
+                "environment",
+                "non-secret environment defaults must not collide with credential env_vars",
+            );
+        }
+    }
+    for (key, config_key) in environment.config.iter().take(MAX_ENVIRONMENT_ENTRIES) {
+        if config_key.is_empty()
+            || config_key.trim() != config_key
+            || config_key.len() > MAX_ENVIRONMENT_KEY_BYTES
+            || config_key.contains('\0')
+        {
+            error(
+                "environment.config",
+                "config keys must be nonempty, unpadded strings of at most 128 bytes without NUL",
+            );
+        }
+        if environment.fixed.contains_key(key) {
+            error(
+                "environment",
+                "an environment key cannot have both config and fixed defaults",
+            );
+        }
+    }
+    for value in environment.fixed.values().take(MAX_ENVIRONMENT_ENTRIES) {
+        if value.len() > MAX_FIXED_ENVIRONMENT_VALUE_BYTES || value.contains('\0') {
+            error(
+                "environment.fixed",
+                "fixed values must contain at most 4096 bytes and no NUL",
+            );
+        }
+    }
+    if profile.discovery.config_env_vars.len() > MAX_ENVIRONMENT_ENTRIES {
+        error(
+            "discovery.config_env_vars",
+            "at most 64 discovery config keys are allowed",
+        );
+    }
+    let mut discovered = HashSet::new();
+    for key in profile
+        .discovery
+        .config_env_vars
+        .iter()
+        .take(MAX_ENVIRONMENT_ENTRIES)
+    {
+        if !valid_environment_key(key) {
+            error(
+                "discovery.config_env_vars",
+                "discovery config keys must be valid non-reserved variable names of at most 128 bytes",
+            );
+        }
+        if !discovered.insert(key) {
+            error(
+                "discovery.config_env_vars",
+                "duplicate discovery config key",
+            );
+        }
+        if credential_keys.contains(&key.as_str()) {
+            error(
+                "discovery.config_env_vars",
+                "non-secret discovery config must not collide with credential env_vars",
+            );
+        }
+    }
+}
+
 fn collect_mcp_profile_diagnostics(
     source: &str,
     profile_id: &str,
@@ -3616,12 +3818,12 @@ mod tests {
     use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
-        profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
-        profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
-        validate_profile_set,
+        DiscoveryProfile, EndpointProfile, EnvironmentProfile, L7AllowProfile,
+        L7QueryMatcherProfile, ProfileDurationWkt, ProfileError, ProviderTypeProfile,
+        is_mcp_diagnostic_field, normalize_profile_id, parse_profile_catalog_yamls,
+        parse_profile_json, parse_profile_yaml, profile_duration_to_proto, profile_to_json,
+        profile_to_yaml, profiles_to_json, profiles_to_yaml, token_grant_from_proto,
+        token_grant_to_proto, validate_profile_duration, validate_profile_set,
     };
 
     /// The example profiles in `providers/`, parsed once per test binary.
@@ -5919,6 +6121,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    environment: EnvironmentProfile::default(),
+                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },
@@ -5938,6 +6142,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    environment: EnvironmentProfile::default(),
+                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },
@@ -5957,6 +6163,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    environment: EnvironmentProfile::default(),
+                    required_platform_adapter: String::new(),
                     source: String::new(),
                     scope: String::new(),
                 },
