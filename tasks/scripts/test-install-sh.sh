@@ -705,4 +705,44 @@ done
 
 unset -f gh uname linux_package_method
 
+# The installer must look for gateway entries and client certs where the CLI
+# keeps them, which is $XDG_CONFIG_HOME/openshell when that variable is set.
+assert_target_config_dir() {
+  local name=$1
+  local expected=$2
+  local actual
+  actual="$(target_openshell_config_dir)"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+TARGET_HOME="${tmpdir}/target-home"
+TARGET_USER="$(id -un)"
+TARGET_UID="$(id -u)"
+PLATFORM=linux
+TARGET_RUNTIME_DIR="${tmpdir}/runtime"
+
+saved_xdg_config_home="${XDG_CONFIG_HOME-}"
+saved_xdg_config_home_set="${XDG_CONFIG_HOME+set}"
+
+unset XDG_CONFIG_HOME
+assert_target_config_dir "unset XDG_CONFIG_HOME uses the target home" \
+  "${TARGET_HOME}/.config/openshell"
+
+export XDG_CONFIG_HOME="${tmpdir}/xdg-config"
+assert_target_config_dir "XDG_CONFIG_HOME is honored" \
+  "${tmpdir}/xdg-config/openshell"
+
+export XDG_CONFIG_HOME=""
+assert_target_config_dir "empty XDG_CONFIG_HOME falls back per the XDG spec" \
+  "${TARGET_HOME}/.config/openshell"
+
+if [ "$saved_xdg_config_home_set" = "set" ]; then
+  export XDG_CONFIG_HOME="$saved_xdg_config_home"
+else
+  unset XDG_CONFIG_HOME
+fi
+
 echo "install.sh focused tests passed"
