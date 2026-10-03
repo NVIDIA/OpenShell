@@ -106,7 +106,7 @@ pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) 
 }
 
 /// Prefix of environment variable names reserved for `OpenShell`.
-const RESERVED_ENV_PREFIX: &str = "OPENSHELL_";
+pub(crate) const RESERVED_ENV_PREFIX: &str = "OPENSHELL_";
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::OCI_IMAGE_USER,
@@ -213,7 +213,7 @@ fn apply_canonical_process_environment(
     // reserved OPENSHELL_ namespace inherited from the sandbox itself, which
     // carries its own control state (for example the serialized user
     // environment and log level), then restore the one marker the workload is
-    // meant to see. Declared variables cannot use this namespace.
+    // meant to see. The gateway rejects declared variables in this namespace.
     for (key, _) in std::env::vars_os() {
         if key
             .to_str()
@@ -468,9 +468,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -633,9 +631,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;

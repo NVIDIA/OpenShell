@@ -1495,16 +1495,6 @@ mod tests {
     }
 
     #[test]
-    fn audit_evidence_rejects_missing_socket_loopback_confinement_field() {
-        let mut value = serde_json::to_value(complete_audit_evidence()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("socket_loopback_confinement");
-        assert!(serde_json::from_value::<NativeLinuxSandboxAuditEvidence>(value).is_err());
-    }
-
-    #[test]
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
         for encoded in [
             r#"{"result":"resolved","ancestors":[],"cmdline_paths":[]}"#,

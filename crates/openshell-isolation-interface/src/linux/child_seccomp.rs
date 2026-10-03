@@ -124,8 +124,9 @@ pub fn mark_inherited_descriptors_close_on_exec() -> io::Result<()> {
 /// `sandbox_tgid` is the sandbox PID as visible from its workload namespace.
 /// The filter blocks thread-targeting operations that name the trusted sandbox
 /// leader and blocks process-directed operations with the same target. The
-/// ordinary workload listener additionally mediates `kill`, `tkill`, and
-/// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
+/// ordinary workload listener additionally mediates `kill`, `tkill`,
+/// `rt_sigqueueinfo`, and `SIGCONT` sent with `tgkill` or
+/// `rt_tgsigqueueinfo`: Linux accepts nonleader TIDs for these operations, so a
 /// static TGID comparison alone cannot protect future sandbox worker threads.
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {

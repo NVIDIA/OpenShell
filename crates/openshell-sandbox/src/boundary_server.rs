@@ -340,10 +340,8 @@ mod linux {
                         .to_string(),
                 );
             }
-            // The TCP control listener rejects loopback-interface ingress
-            // only when it serves a supervisor in another network namespace.
-            // A loopback listener would be reachable from workload sockets
-            // that the broker does not track, such as natively accepted ones.
+            // Workload sockets share the loopback interface with a loopback
+            // listener.
             BoundaryListenerConfig::TlsTcp { address, .. }
                 if address.ip().to_canonical().is_loopback() =>
             {
@@ -3240,15 +3238,10 @@ mod linux {
             }
         }
 
-        /// Bind the TCP control listener.
-        ///
-        /// A listener on a non-loopback address serves a supervisor in another
-        /// network namespace, so it rejects all loopback-interface ingress
-        /// before it starts listening. Workload sockets are bound to loopback
-        /// and natively accepted ones are not registered with the broker, so
-        /// this standing filter, not the broker's port reservation, keeps the
-        /// workload from reaching the control endpoint through loopback or
-        /// the pod's own address.
+        /// Bind the TCP control listener, dropping loopback-interface ingress
+        /// before it listens so workload sockets cannot reach it through
+        /// loopback or the pod's own address. Configuration rejects loopback
+        /// addresses; tests bind them without the filter.
         fn bind_tcp(address: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
             let socket = socket2::Socket::new(
                 socket2::Domain::for_address(address),

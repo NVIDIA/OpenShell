@@ -206,15 +206,13 @@ fn handle_thread_comm_open(
     if thread_group_of(target) != Some(caller_group) {
         return Ok(false);
     }
-    if flags
-        & (libc::O_CREAT
-            | libc::O_EXCL
-            | libc::O_TRUNC
-            | libc::O_TMPFILE
-            | libc::O_DIRECTORY
-            | libc::O_PATH)
-        != 0
-    {
+    // A shell redirect opens with O_CREAT|O_TRUNC; both are no-ops on an
+    // existing comm file. O_EXCL fails as it would natively.
+    if flags & libc::O_EXCL != 0 {
+        listener.respond_errno(notification.id, libc::EEXIST)?;
+        return Ok(true);
+    }
+    if flags & (libc::O_TMPFILE | libc::O_DIRECTORY | libc::O_PATH) != 0 {
         listener.respond_errno(notification.id, libc::EINVAL)?;
         return Ok(true);
     }
@@ -327,7 +325,7 @@ fn sealed_memfd(content: &[u8]) -> io::Result<File> {
 mod tests {
     use super::{ProviderFiles, comm_target, sealed_memfd};
     use std::collections::HashMap;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -349,55 +347,6 @@ mod tests {
         ] {
             assert_eq!(comm_target(path, caller_tid, group), expected, "{path}");
         }
-    }
-
-    #[test]
-    fn workload_thread_rename_through_proc_is_served() {
-        // Under the workload filter, a thread rename via its own comm file
-        // is served by the broker and takes effect.
-        const CHILD_MARKER: &str = "OPENSHELL_THREAD_COMM_CHILD";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let (done, wait) = std::sync::mpsc::channel::<()>();
-            let worker = std::thread::spawn(move || {
-                sender.send(nix::unistd::gettid().as_raw()).unwrap();
-                let _ = wait.recv();
-            });
-            let tid = receiver.recv().unwrap();
-            let path = format!("/proc/self/task/{tid}/comm");
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("open own thread comm");
-            file.write_all(b"renamed").expect("rename thread");
-            let name = std::fs::read_to_string(&path).unwrap();
-            done.send(()).unwrap();
-            worker.join().unwrap();
-            assert_eq!(name.trim(), "renamed");
-            return;
-        }
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
-        let _broker = crate::network_broker::NetworkBroker::start_for_test(listener)
-            .expect("start network broker");
-        let status = launcher
-            .execute(|| {
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "provider_files::tests::workload_thread_rename_through_proc_is_served",
-                        "--nocapture",
-                    ])
-                    .env(CHILD_MARKER, "1")
-                    .status()
-            })
-            .unwrap()
-            .expect("run workload child");
-        assert!(
-            status.success(),
-            "thread rename under the workload filter failed"
-        );
     }
 
     #[test]

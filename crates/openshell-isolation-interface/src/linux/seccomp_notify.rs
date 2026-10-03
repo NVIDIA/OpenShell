@@ -170,9 +170,10 @@ impl NotificationProbeReport {
 /// Owned listener returned by `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
 /// The listener is installed without `WAIT_KILLABLE_RECV`, so mediation is the
-/// same on every kernel. A signal can interrupt a notified syscall and the
-/// kernel then restarts it; broker handlers check the notification is still
-/// live before acting and answer a repeated operation as the kernel would.
+/// same on every kernel. A signal can interrupt a notified syscall, which the
+/// kernel then restarts or fails with `EINTR`; broker handlers check the
+/// notification is still live before acting and answer a repeated operation
+/// as the kernel would.
 pub struct NotificationListener {
     fd: OwnedFd,
 }
@@ -705,6 +706,10 @@ fn build_filter(syscalls: &[i64]) -> io::Result<Vec<libc::sock_filter>> {
             append_sendto_filter(&mut program)?;
             continue;
         }
+        if matches!(syscall, libc::SYS_tgkill | libc::SYS_rt_tgsigqueueinfo) {
+            append_resume_signal_filter(&mut program, syscall)?;
+            continue;
+        }
         let syscall = u32::try_from(syscall)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
         program.extend([
@@ -739,6 +744,27 @@ fn append_sendto_filter(program: &mut Vec<libc::sock_filter>) -> io::Result<()> 
         stmt(BPF_LD_W_ABS, argument_word_offset(3, 0)),
         stmt(BPF_ALU_AND_K, !CONNECTED_SEND_FLAGS),
         jump(BPF_JMP_JEQ_K, 0, 1, 0),
+        stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
+        stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+    ]);
+    Ok(())
+}
+
+/// Notify a thread-group signal only when it sends `SIGCONT`, which the broker
+/// refuses while the workload is frozen. Every other signal (for example Go's
+/// preemption signal) stays in the kernel.
+fn append_resume_signal_filter(
+    program: &mut Vec<libc::sock_filter>,
+    syscall: i64,
+) -> io::Result<()> {
+    let syscall = u32::try_from(syscall)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative syscall number"))?;
+    let resume = u32::try_from(libc::SIGCONT)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative signal number"))?;
+    program.extend([
+        jump(BPF_JMP_JEQ_K, syscall, 0, 4),
+        stmt(BPF_LD_W_ABS, argument_word_offset(2, 0)),
+        jump(BPF_JMP_JEQ_K, resume, 0, 1),
         stmt(BPF_RET_K, SECCOMP_RET_USER_NOTIF),
         stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
     ]);

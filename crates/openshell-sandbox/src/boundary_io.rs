@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, LoopbackTarget,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -231,10 +231,11 @@ impl BoundaryRuntimeState {
         if self.has_registered_processes() {
             return true;
         }
+        // An unreadable /proc fails closed: processes may remain.
         #[cfg(target_os = "linux")]
-        if self.exclusive_pid_namespace && sandbox_owns_process_tree() {
-            return !owned_processes(&[], true).is_empty();
-        }
+        return owned_processes(&[], self.exclusive_pid_namespace)
+            .map_or(true, |owned| !owned.is_empty());
+        #[cfg(not(target_os = "linux"))]
         false
     }
 
@@ -283,7 +284,8 @@ impl BoundaryRuntimeState {
             // requiring ptrace or a capability.
             let mut previous = Vec::new();
             for _ in 0..4 {
-                let owned = owned_processes(&roots, self.exclusive_pid_namespace);
+                let owned =
+                    owned_processes(&roots, self.exclusive_pid_namespace).unwrap_or_default();
                 for process in &owned {
                     if !roots.contains(&process.pid) {
                         signal_owned_process(*process, signal);
@@ -339,12 +341,13 @@ fn sandbox_owns_process_tree() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn owned_processes(roots: &[u32], exclusive_pid_namespace: bool) -> Vec<OwnedProcess> {
+fn owned_processes(
+    roots: &[u32],
+    exclusive_pid_namespace: bool,
+) -> std::io::Result<Vec<OwnedProcess>> {
     let mut stats = HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in std::fs::read_dir("/proc")?.flatten() {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -353,47 +356,42 @@ fn owned_processes(roots: &[u32], exclusive_pid_namespace: bool) -> Vec<OwnedPro
             continue;
         };
         if let Some(stat) = read_proc_stat(pid) {
+            children.entry(stat.parent).or_default().push(pid);
             stats.insert(pid, stat);
         }
     }
 
     // When the sandbox is PID 1 of its exclusive namespace or a child
     // subreaper, orphans are reparented to it, so its descendants are exactly
-    // the workload tree, including an orphan reparented during the scan.
-    // Otherwise restrict the walk to registered roots so unit tests and
-    // development runs cannot affect sibling tasks.
-    let mut owned = if exclusive_pid_namespace && sandbox_owns_process_tree() {
-        vec![std::process::id()]
+    // the workload tree. Otherwise walk only from registered roots so unit
+    // tests and development runs cannot affect sibling tasks.
+    let sandbox = std::process::id();
+    let mut pending = if exclusive_pid_namespace && sandbox_owns_process_tree() {
+        vec![sandbox]
     } else {
         roots.to_vec()
     };
-    loop {
-        let mut changed = false;
-        for (&pid, stat) in &stats {
-            if !owned.contains(&pid) && owned.contains(&stat.parent) {
-                owned.push(pid);
-                changed = true;
-            }
+    let mut visited = HashSet::new();
+    let mut owned = Vec::new();
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
         }
-        if !changed {
-            break;
+        if let Some(descendants) = children.get(&pid) {
+            pending.extend(descendants);
         }
-    }
-    let sandbox = std::process::id();
-    let mut owned = owned
-        .into_iter()
-        .filter(|pid| *pid != sandbox)
-        .filter_map(|pid| {
-            let stat = stats.get(&pid)?;
-            stat.live.then_some(OwnedProcess {
+        if let Some(stat) = stats.get(&pid)
+            && pid != sandbox
+            && stat.live
+        {
+            owned.push(OwnedProcess {
                 pid,
                 start_time: stat.start_time,
-            })
-        })
-        .collect::<Vec<_>>();
+            });
+        }
+    }
     owned.sort_unstable();
-    owned.dedup();
-    owned
+    Ok(owned)
 }
 
 /// Signal one scanned process through a pidfd, after confirming the pidfd

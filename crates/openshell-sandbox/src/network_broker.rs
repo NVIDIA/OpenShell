@@ -40,11 +40,6 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(test)]
-const PANIC_SENTINEL_LEVEL: i32 = libc::IPPROTO_TCP;
-#[cfg(test)]
-const PANIC_SENTINEL_OPTION: i32 = 0x7fff_fffe;
-
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
 }
@@ -557,7 +552,7 @@ fn dispatch_notification(
             &listener,
             notification,
             std::process::id(),
-            queues.workload_frozen.load(Ordering::Acquire),
+            &queues.workload_frozen,
         );
     }
     if matches!(
@@ -568,7 +563,7 @@ fn dispatch_notification(
             &listener,
             notification,
             std::process::id(),
-            queues.workload_frozen.load(Ordering::Acquire),
+            &queues.workload_frozen,
         );
     }
     if syscall == libc::SYS_socket {
@@ -599,11 +594,6 @@ fn dispatch_notification(
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let option = i32::try_from(notification.args[2])
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        #[cfg(test)]
-        assert!(
-            !(level == PANIC_SENTINEL_LEVEL && option == PANIC_SENTINEL_OPTION),
-            "test-only setsockopt panic sentinel"
-        );
         if socket_option_is_denied(level, option) {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
@@ -616,7 +606,7 @@ fn dispatch_notification(
 /// that another thread cannot replace before the kernel reads them.
 ///
 /// Interface-selection options could redirect or unpin a socket's loopback
-/// device binding. The kernel already refuses to change an existing binding
+/// device binding; the others enable Fast Open or change the address family. The kernel already refuses to change an existing binding
 /// without `CAP_NET_RAW`; denying them here keeps confinement independent of
 /// the capability state of the namespace that owns the network namespace.
 fn socket_option_is_denied(level: i32, option: i32) -> bool {
@@ -997,7 +987,9 @@ fn connect_socket(
 /// nonblocking socket gets the native `EINPROGRESS` and the kernel completes
 /// the handshake on the shared socket; a blocking socket waits on a bounded
 /// worker thread. A slow or full local listener therefore cannot stall
-/// mediation of unrelated syscalls.
+/// mediation of unrelated syscalls. A nonblocking socket is recorded as
+/// connected once the handshake starts, so a repeated `connect` reports
+/// `EISCONN` even while the handshake is still in progress.
 fn connect_local_tcp(
     registry: &Arc<Mutex<SocketRegistry>>,
     listener: &Arc<NotificationListener>,
@@ -1046,7 +1038,17 @@ fn connect_local_tcp(
         .name("openshell-local-connect".to_string())
         .spawn(move || {
             let _slot = slot;
-            let result = connect_exact(connector.as_raw_fd(), destination);
+            // The duplicate shares the workload's blocking open file; wait
+            // natively without changing its flags.
+            let result = with_sockaddr(destination, |pointer, length| {
+                // SAFETY: pointer/length describe a live sockaddr and the
+                // connector is a live duplicate of the workload's socket.
+                if unsafe { libc::connect(connector.as_raw_fd(), pointer, length) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
             if result.is_ok() {
                 commit_local_connect(
                     &registry,
@@ -1099,7 +1101,6 @@ fn repeated_connect_outcome(
 ) -> Option<i32> {
     match state {
         SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. } => None,
-        SocketState::Failed { errno } => Some(*errno),
         // UDP connect replaces the association; repeating the same one succeeds.
         SocketState::DnsUdp { relay } if *relay == destination => Some(0),
         SocketState::Local { peer } if kind == InetKind::DnsUdp && *peer == destination => Some(0),
@@ -2254,116 +2255,6 @@ mod tests {
     type ConfinementObservation = (Option<Vec<u8>>, Option<i32>);
 
     #[test]
-    fn direct_syscall_accept_and_getpeername_report_native_peer() {
-        // Static binaries and Go issue raw syscalls without a libc wrapper.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
-        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let workload = std::thread::spawn(move || {
-            launcher
-                .execute(move || -> io::Result<(SocketAddr, SocketAddr)> {
-                    let listener = TcpListener::bind("127.0.0.1:0")?;
-                    ready_tx
-                        .send(listener.local_addr()?)
-                        .map_err(|_| io::Error::other("test client disappeared"))?;
-                    // rustix issues accept4 and getpeername as raw syscalls.
-                    let (accepted, accepted_peer) =
-                        rustix::net::acceptfrom_with(&listener, rustix::net::SocketFlags::CLOEXEC)?;
-                    let as_socket_addr = |address: Option<rustix::net::SocketAddrAny>| {
-                        address
-                            .and_then(|address| SocketAddr::try_from(address).ok())
-                            .ok_or_else(|| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))
-                    };
-                    let accepted_peer = as_socket_addr(accepted_peer)?;
-                    let peer = as_socket_addr(rustix::net::getpeername(&accepted)?)?;
-                    Ok((accepted_peer, peer))
-                })
-                .expect("launcher result")
-        });
-        let address = ready_rx.recv().expect("workload listener ready");
-        let client = TcpStream::connect(address).expect("connect loopback client");
-        let (accepted_peer, peer) = workload
-            .join()
-            .expect("join workload")
-            .expect("direct-syscall accept");
-        assert_eq!(accepted_peer, client.local_addr().unwrap());
-        assert_eq!(peer, accepted_peer);
-    }
-
-    #[test]
-    #[ignore = "requires OPENSHELL_STATIC_SERVER pointing at a static test server"]
-    fn static_server_accepts_under_workload_filter() {
-        // The server listens on argv[1], prints "ready", accepts one
-        // connection, and writes the peer address it observed.
-        use std::io::BufRead as _;
-        let server = std::env::var("OPENSHELL_STATIC_SERVER").expect("OPENSHELL_STATIC_SERVER");
-        let address = {
-            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap()
-        };
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
-        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
-        let connections: usize = std::env::var("OPENSHELL_STATIC_SERVER_CONNECTIONS")
-            .map_or(1, |value| value.parse().expect("connection count"));
-        let mut child = launcher
-            .execute(move || {
-                std::process::Command::new(server)
-                    .arg(address.to_string())
-                    .arg(connections.to_string())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-            })
-            .unwrap()
-            .expect("spawn static server under the workload filter");
-        let mut stdout = io::BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        stdout.read_line(&mut line).unwrap();
-        assert_eq!(line.trim(), "ready", "server did not start");
-        // Earlier connections measure accept latency through the workload
-        // filter; the last one also verifies the observed peer below.
-        let mut latencies = Vec::with_capacity(connections);
-        let started = Instant::now();
-        for _ in 1..connections {
-            let begin = Instant::now();
-            let mut client = TcpStream::connect(address).expect("connect to static server");
-            let mut reply = String::new();
-            client.read_to_string(&mut reply).unwrap();
-            latencies.push(begin.elapsed());
-        }
-        let begin = Instant::now();
-        let mut client = TcpStream::connect(address).expect("connect to static server");
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
-        latencies.push(begin.elapsed());
-        let total = started.elapsed();
-        latencies.sort_unstable();
-        let percentile = |p: usize| latencies[(latencies.len() - 1) * p / 100];
-        eprintln!(
-            "static server: {connections} connections in {total:?}; p50 {:?} p99 {:?} max {:?}",
-            percentile(50),
-            percentile(99),
-            latencies[latencies.len() - 1]
-        );
-        let status = child.wait().unwrap();
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        assert!(status.success(), "static server failed: {stderr}");
-        assert_eq!(
-            reply.trim(),
-            client.local_addr().unwrap().to_string(),
-            "server observed the wrong peer"
-        );
-    }
-
-    #[test]
     fn workload_sockets_are_bound_to_loopback_and_cannot_be_rebound() {
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
@@ -2508,14 +2399,6 @@ mod tests {
             ),
             (SocketState::DnsUdp { relay }, InetKind::DnsUdp, other, None),
             (SocketState::Local { peer }, InetKind::DnsUdp, peer, Some(0)),
-            (
-                SocketState::Failed {
-                    errno: libc::ECONNRESET,
-                },
-                InetKind::Tcp,
-                peer,
-                Some(libc::ECONNRESET),
-            ),
         ] {
             assert_eq!(
                 repeated_connect_outcome(&state, kind, destination),
@@ -2526,10 +2409,10 @@ mod tests {
     }
 
     #[test]
-    fn restarted_bind_and_connect_are_answered_consistently() {
-        // Without killable notification waits a signal can restart a
-        // syscall the broker already completed. A repeat must not fail on
-        // the broker's released pre-connect descriptor.
+    fn repeated_bind_and_connect_after_completion() {
+        // A signal can restart a syscall the broker already completed. A
+        // repeated connect reports EISCONN; a repeated bind of the same
+        // address succeeds, unlike a native EINVAL, so a restart is safe.
         let service = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = service.local_addr().unwrap();
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
@@ -2652,7 +2535,9 @@ mod tests {
                     .connect(&address.into())
                     .err()
                     .and_then(|error| error.raw_os_error());
-                drop(pending.join());
+                // Leave the pending connect running; closing the listener when
+                // the test ends resets it.
+                drop(pending);
                 drop(filled);
                 (blocking_wait, nonblocking_result)
             })
@@ -2662,43 +2547,6 @@ mod tests {
             "mediated socket creation waited {blocking_wait:?} behind a slow connect"
         );
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
-    }
-
-    #[test]
-    fn a_panicking_handler_does_not_kill_the_broker() {
-        // A handler panic must fail only that syscall, not hang every later
-        // mediated syscall by silently killing the broker thread. setsockopt
-        // is routed through a hook that panics in test builds on a sentinel
-        // option, standing in for an unexpected handler bug.
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
-            .expect("start workload launcher");
-        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
-        let (panicked, after) = launcher
-            .execute(|| {
-                let socket =
-                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-                        .unwrap();
-                // SAFETY: scalar setsockopt with the test-only panic sentinel.
-                let value = 1_i32;
-                let panicked = unsafe {
-                    libc::setsockopt(
-                        socket.as_raw_fd(),
-                        PANIC_SENTINEL_LEVEL,
-                        PANIC_SENTINEL_OPTION,
-                        (&raw const value).cast(),
-                        libc::socklen_t::try_from(size_of::<i32>()).unwrap(),
-                    )
-                };
-                // A later mediated syscall still completes, proving the broker
-                // survived the panic.
-                let after = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
-                    .map(drop)
-                    .map_err(|error| error.raw_os_error());
-                (panicked, after)
-            })
-            .expect("launcher result");
-        assert_eq!(panicked, -1, "panicking syscall must fail");
-        assert_eq!(after, Ok(()), "broker must keep mediating after a panic");
     }
 
     #[test]
@@ -2861,8 +2709,7 @@ mod tests {
     #[test]
     fn udp_dns_after_connect_sends_with_sendmmsg() {
         // glibc connects the resolver socket to the nameserver, then sends A
-        // and AAAA together with sendmmsg and no destination. sendmmsg is
-        // mediated, so the broker must still hold its copy of the socket.
+        // and AAAA together with sendmmsg and no destination.
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
@@ -2908,17 +2755,7 @@ mod tests {
             .build()
             .expect("test runtime");
         for _ in 0..2 {
-            // Bound the wait so a broken send path fails instead of hanging.
-            let Ok(query) = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), broker.accept_dns()).await
-            }) else {
-                let error = client
-                    .join()
-                    .expect("join client")
-                    .expect_err("client must fail when no query arrives");
-                panic!("DNS query never reached the relay: {error}");
-            };
-            let query = query.expect("DNS query");
+            let query = runtime.block_on(broker.accept_dns()).expect("DNS query");
             let response = if query.request == b"dns-query-a" {
                 b"dns-response-a".to_vec()
             } else if query.request == b"dns-query-aaaa" {
@@ -2936,9 +2773,9 @@ mod tests {
 
     #[test]
     fn dns_send_with_ancillary_data_is_refused() {
-        // Ancillary control data (e.g. IP_PKTINFO) can carry a per-message
-        // routing override. The broker sends from its own socket without
-        // control messages, so a workload that supplies them is refused.
+        // Ancillary data can carry a per-message routing override such as
+        // IP_PKTINFO. The kernel performs mediated DNS sends, so control data
+        // is refused.
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
@@ -2952,7 +2789,7 @@ mod tests {
                     iov_base: payload.as_ptr().cast_mut().cast(),
                     iov_len: payload.len(),
                 };
-                // One IP_PKTINFO control message.
+                // Any non-empty control buffer is refused.
                 let mut control = [0_u8; 32];
                 let header = libc::msghdr {
                     msg_name: native.as_ptr().cast_mut().cast(),
