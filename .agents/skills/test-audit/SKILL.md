@@ -35,10 +35,12 @@ mode:
   Kubernetes, VM), feature-gated per driver (`e2e-docker`, `e2e-podman`,
   `e2e-kubernetes*`), driven by shell scripts (`e2e-*.sh`) that stand up the
   actual stack.
-- **`crates/openshell-conformance/src/scenarios/`** — driver-agnostic
-  behavioral scenarios run against whichever driver-backed gateway `mise run
-  e2e:*` points at. The right home for a `ComputeDriver`-contract guarantee
-  that every driver must prove, instead of five copies of the same assertion.
+- **The CLI conformance suite** — the reusable scenario library
+  (`crates/openshell-conformance/`) plus the separately compiled
+  installed-artifact workspace (`tests/suites/conformance/`). Use
+  `tests/suites/conformance/README.md` as the canonical source for where a
+  contract belongs and which focused Cargo commands verify it; this skill does
+  not restate that guidance.
 - **`tests/ansible/` + `tests/suites/drivers/*` (the Nix `tmachine` harness)**
   — VM-backed driver-specific suites wired through `tests/config.nix`. Easy to
   believe a fixture is orphaned when it's actually consumed only here — a
@@ -71,13 +73,15 @@ add it yet:
    the same claim as "the value survives the handoff to whatever consumes it."
 2. What credible regression makes it fail?
 3. Why does existing coverage not already catch that failure? Each contract
-   has one primary test owner at the strongest boundary — usually the
-   `crates/openshell-conformance` scenario if the contract applies to more
-   than one driver, or the specific `e2e/rust/tests/<driver>_*.rs` file if it's
-   genuinely driver-specific (a Podman API error shape, a rootless-only
-   Podman flag). Another layer needs its own distinct risk, such as a real
-   daemon a mock can't fail the way the real one does. Prefer extending a
-   table-driven case or shared fixture over a near-duplicate test.
+   has one primary test owner at the strongest boundary. Use
+   `tests/suites/conformance/README.md`'s placement criteria to decide whether
+   a multi-driver contract belongs in the conformance suite — sharing across
+   drivers alone is not sufficient there — or whether it's genuinely
+   driver-specific and belongs in the `e2e/rust/tests/<driver>_*.rs` file (a
+   Podman API error shape, a rootless-only Podman flag). Another layer needs
+   its own distinct risk, such as a real daemon a mock can't fail the way the
+   real one does. Prefer extending a table-driven case or shared fixture over a
+   near-duplicate test.
 4. Does it need a production seam (export, flag, wrapper, injection hook) that
    no production caller needs? If yes, move the test to the real boundary
    instead.
@@ -221,7 +225,9 @@ run parallel discovery lanes when available, one per surface:
   feature actually gets exercised in CI (it may not — see the Podman `E2E_FEATURES`
   empty-string wiring bug found in #3663, where a real, well-written test was
   silently skipped by an env var default);
-- conformance suite: `crates/openshell-conformance/src/scenarios/`;
+- conformance suite: `crates/openshell-conformance/src/scenarios/` and
+  `tests/suites/conformance/` — see `tests/suites/conformance/README.md` for
+  the verification commands for each;
 - `tests/ansible/` + `tests/suites/drivers/*`: read `tests/config.nix`'s
   `testsuites` list to find every playbook a suite actually runs, not just the
   ones with an obvious name;
@@ -334,12 +340,12 @@ Before opening a PR, or starting implementation:
 
 ## Landing and continuation
 
-Commit, push, open a PR, or land only when authorized — this repo requires
-explicit permission before `git push` (see the repository's own CLAUDE.md
-push-workflow rules) and only creates commits when asked. Use
-`create-github-pr` for PR mechanics once authorized. Scope one coherent PR per
-audited surface; after landing, rerun read-only discovery for the next
-high-confidence batch rather than queuing speculative follow-ups.
+Commit, push, and PR authority belongs to the invoking workflow and
+`AGENTS.md`, not this skill — defer to whatever commit/push authorization the
+calling context already established. Use `create-github-pr` for PR mechanics
+once authorized. Scope one coherent PR per audited surface; after landing,
+rerun read-only discovery for the next high-confidence batch rather than
+queuing speculative follow-ups.
 
 A new or substantially changed test-audit finding that reveals a real product
 gap (not a junk test, but missing coverage the audit surfaced) belongs in its
