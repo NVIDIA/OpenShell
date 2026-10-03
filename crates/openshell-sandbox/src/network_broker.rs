@@ -547,9 +547,6 @@ fn dispatch_notification(
     ) {
         return classify_send(&registry, &listener, notification, &queues.dns_relay);
     }
-    if syscall == libc::SYS_getpeername {
-        return get_peer_name(&registry, &listener, notification);
-    }
     if syscall == libc::SYS_setsockopt {
         let level = i32::try_from(notification.args[1])
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -1115,9 +1112,6 @@ fn classify_send(
         libc::SYS_sendmsg => vec![read_sendmsg_message(
             notification.tid,
             notification.args[1],
-            i32::try_from(notification.args[2])
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-            None,
         )?],
         libc::SYS_sendmmsg => read_sendmmsg_messages(notification)?,
         _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -1177,29 +1171,14 @@ fn classify_send(
                 lock(&dns_relay.udp_admissions).remove(&peer);
                 return Err(error);
             }
-            for message in &messages {
-                send_dns_message(source_fd, message)?;
-                if let Some(length_address) = message.result_length_address {
-                    let length = u32::try_from(message.data.len())
-                        .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-                    listener.write_task_output(
-                        notification.id,
-                        notification.tid,
-                        length_address,
-                        &length.to_ne_bytes(),
-                    )?;
-                }
-            }
             entry.set_state(SocketState::DnsUdp {
                 relay: dns_relay.address,
             });
             entry.release_preconnect();
-            let result = if syscall == libc::SYS_sendmmsg {
-                i64::try_from(messages.len()).unwrap_or(i64::MAX)
-            } else {
-                i64::try_from(messages[0].data.len()).unwrap_or(i64::MAX)
-            };
-            listener.respond_value(notification.id, result)
+            // The socket is now pinned to the relay and bound to loopback. The
+            // kernel performs the send and writes any per-message results, so
+            // the broker never writes workload memory.
+            listener.respond_continue(notification.id)
         }
         Ok(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
         // Non-INET sockets and natively accepted sockets were never
@@ -1226,20 +1205,10 @@ fn send_flags(syscall: i64, args: [u64; 6]) -> i32 {
 }
 
 struct SendMessage {
-    data: Vec<u8>,
     destination: Option<SocketAddr>,
-    flags: i32,
-    result_length_address: Option<u64>,
 }
 
 fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
-    let length = usize::try_from(notification.args[2])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-    if u16::try_from(length).is_err() {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = vec![0_u8; length];
-    task_memory::read_exact(notification.tid, notification.args[1], &mut data)?;
     let destination = if notification.args[4] == 0 {
         None
     } else {
@@ -1249,21 +1218,10 @@ fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
             notification.args[5],
         )?)
     };
-    Ok(SendMessage {
-        data,
-        destination,
-        flags: i32::try_from(notification.args[3])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-        result_length_address: None,
-    })
+    Ok(SendMessage { destination })
 }
 
-fn read_sendmsg_message(
-    tid: u32,
-    address: u64,
-    flags: i32,
-    result_length_address: Option<u64>,
-) -> io::Result<SendMessage> {
+fn read_sendmsg_message(tid: u32, address: u64) -> io::Result<SendMessage> {
     let header = read_task_value::<libc::msghdr>(tid, address)?;
     if header.msg_controllen != 0 {
         return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
@@ -1277,39 +1235,7 @@ fn read_sendmsg_message(
             u64::from(header.msg_namelen),
         )?)
     };
-    #[cfg(target_env = "musl")]
-    let iov_count = usize::try_from(header.msg_iovlen)
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    #[cfg(not(target_env = "musl"))]
-    let iov_count = header.msg_iovlen;
-    if iov_count > 32 {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = Vec::new();
-    for index in 0..iov_count {
-        let offset = index
-            .checked_mul(size_of::<libc::iovec>())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-        let iov = read_task_value::<libc::iovec>(
-            tid,
-            (header.msg_iov as u64)
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-        )?;
-        let start = data.len();
-        let end = start
-            .checked_add(iov.iov_len)
-            .filter(|length| u16::try_from(*length).is_ok())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-        data.resize(end, 0);
-        task_memory::read_exact(tid, iov.iov_base as u64, &mut data[start..end])?;
-    }
-    Ok(SendMessage {
-        data,
-        destination,
-        flags,
-        result_length_address,
-    })
+    Ok(SendMessage { destination })
 }
 
 fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMessage>> {
@@ -1318,8 +1244,6 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
     if count == 0 || count > 32 {
         return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
-    let flags = i32::try_from(notification.args[3])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     (0..count)
         .map(|index| {
             let offset = index
@@ -1328,18 +1252,7 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
             let base = notification.args[1]
                 .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-            read_sendmsg_message(
-                notification.tid,
-                base,
-                flags,
-                Some(
-                    base.checked_add(
-                        u64::try_from(std::mem::offset_of!(libc::mmsghdr, msg_len))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-                ),
-            )
+            read_sendmsg_message(notification.tid, base)
         })
         .collect()
 }
@@ -1350,56 +1263,6 @@ fn read_task_value<T: Copy>(tid: u32, address: u64) -> io::Result<T> {
     // SAFETY: `bytes` contains exactly one copied native value; unaligned read
     // avoids imposing alignment on the task-memory scratch allocation.
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
-}
-
-fn send_dns_message(fd: RawFd, message: &SendMessage) -> io::Result<()> {
-    // SAFETY: `fd` is the retained exact UDP socket and the buffer remains
-    // valid for the duration of the syscall.
-    let sent = unsafe {
-        libc::send(
-            fd,
-            message.data.as_ptr().cast(),
-            message.data.len(),
-            message.flags,
-        )
-    };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if usize::try_from(sent).ok() == Some(message.data.len()) {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(libc::EIO))
-    }
-}
-
-fn get_peer_name(
-    registry: &Mutex<SocketRegistry>,
-    listener: &NotificationListener,
-    notification: Notification,
-) -> io::Result<()> {
-    let fd = raw_fd(notification.args[0])?;
-    let registry = lock(registry);
-    let Ok(entry) = registry.resolve(notification.tid, fd) else {
-        return listener.respond_continue(notification.id);
-    };
-    // Only relayed sockets need a synthesized original peer. Every other
-    // descriptor reports its true kernel peer, including on legacy listeners
-    // where the broker cannot write into workload memory. Continuing on a
-    // substituted descriptor only discloses that descriptor's own peer.
-    let SocketState::Connected { original_peer } = entry.state() else {
-        return listener.respond_continue(notification.id);
-    };
-    let peer = *original_peer;
-    write_socket_addr(
-        listener,
-        notification.id,
-        notification.tid,
-        notification.args[1],
-        notification.args[2],
-        peer,
-    )?;
-    listener.respond_value(notification.id, 0)
 }
 
 fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
@@ -1548,49 +1411,6 @@ fn decode_sockaddr(storage: libc::sockaddr_storage, length: usize) -> io::Result
     }
 }
 
-fn write_socket_addr(
-    listener: &NotificationListener,
-    notification_id: u64,
-    tid: u32,
-    address: u64,
-    length_address: u64,
-    value: SocketAddr,
-) -> io::Result<()> {
-    // A LegacyReadOnly listener (kernels < 5.19) cannot safely write into
-    // workload memory: without WAIT_KILLABLE_RECV the notified getpeername
-    // could resume and repurpose these buffers between validation and the
-    // broker write. Fail closed before reading or writing anything, so this
-    // address-writing path is inert in legacy mode.
-    if listener.writes_disabled() {
-        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-    }
-    let mut supplied_length = [0_u8; size_of::<libc::socklen_t>()];
-    task_memory::read_exact(tid, length_address, &mut supplied_length)?;
-    let supplied_length = libc::socklen_t::from_ne_bytes(supplied_length);
-    let (bytes, actual_length) = sockaddr_bytes(value)?;
-    let copied = usize::try_from(supplied_length)
-        .unwrap_or(0)
-        .min(bytes.len());
-    if copied != 0 {
-        listener.write_task_output(notification_id, tid, address, &bytes[..copied])?;
-    }
-    listener.write_task_output(
-        notification_id,
-        tid,
-        length_address,
-        &actual_length.to_ne_bytes(),
-    )
-}
-
-fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {
-    with_sockaddr(address, |native, length| {
-        let length_usize = usize::try_from(length).map_err(io::Error::other)?;
-        // SAFETY: with_sockaddr lends fully initialized storage for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(native.cast::<u8>(), length_usize) };
-        Ok((bytes.to_vec(), length))
-    })
-}
-
 fn with_sockaddr<T>(
     address: SocketAddr,
     operation: impl FnOnce(*const libc::sockaddr, libc::socklen_t) -> io::Result<T>,
@@ -1648,7 +1468,6 @@ fn error_to_errno(error: &io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
     use openshell_isolation_interface::linux::socket_confinement;
 
     #[test]
@@ -1827,25 +1646,6 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
-    }
-
-    #[test]
-    fn legacy_listener_rejects_socket_addr_write() {
-        // Relayed getpeername routes through write_socket_addr; on a
-        // LegacyReadOnly listener the path must fail closed (EOPNOTSUPP)
-        // before any task-memory access.
-        // SAFETY: dup returns a new descriptor or a negative error.
-        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(dup >= 0, "dup stderr");
-        let listener = NotificationListener::from_fd_with_mode(
-            // SAFETY: successful dup returned a new owned descriptor.
-            unsafe { OwnedFd::from_raw_fd(dup) },
-            ListenerMode::LegacyReadOnly,
-        );
-        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let error = write_socket_addr(&listener, 1, 0, 0, 0, peer)
-            .expect_err("legacy listener must reject socket-address writes");
-        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
     }
 
     #[test]
@@ -2198,9 +1998,8 @@ mod tests {
                         ready_tx
                             .send(listener.local_addr()?)
                             .map_err(|_| io::Error::other("test client disappeared"))?;
-                        // std passes a peer-address buffer, which the broker
-                        // could not fill on a legacy listener. Native accept
-                        // reports it directly from the kernel.
+                        // std passes a peer-address buffer; native accept
+                        // fills it directly from the kernel.
                         let (stream, accepted_peer) = listener.accept()?;
                         let peer = stream.peer_addr()?;
                         let device = socket_confinement::bound_device(&stream)?;

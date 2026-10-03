@@ -19,23 +19,12 @@ process to install a nested seccomp user-notification filter and use Landlock.
 OpenShell fails sandbox startup when either capability-free runtime probe fails.
 </Warning>
 
-## Node kernel and legacy read-only mode
+## Node kernel
 
 OpenShell requires OpenShift 4.19 or later. The RHCOS kernels in OpenShift 4.16
 through 4.18 (RHEL 9.4, 5.14.0-427) are built without Landlock, so sandbox
-startup fails its Landlock probe on those releases.
-
-OpenShift nodes run RHCOS, which currently ships a RHEL 9.x kernel (5.14). That
-kernel predates `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19), so the
-sandbox starts in a reduced **legacy read-only** cancellation mode. Isolation is
-unchanged, but the broker fails closed with `EOPNOTSUPP` on the mediated
-operations that write results back into workload memory: `getpeername` on
-connections relayed through the supervisor, and `sendmmsg` per-message length
-write-backs. Local servers, including `accept` with a peer address, run
-unchanged. See the
-[support matrix](/about/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
-for the full behavior; the selected mode is reported as `seccomp_listener_mode`
-in the sandbox qualification output.
+startup fails its Landlock probe on those releases. On supported releases the
+sandbox behaves the same as on newer upstream kernels.
 
 ## Prerequisites
 

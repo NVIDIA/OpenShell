@@ -103,12 +103,9 @@ struct QualificationReport {
     tcp_dns_round_trip: bool,
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
+    /// Whether notified syscalls wait killably (Linux 5.19+). Informational:
+    /// the broker never writes workload memory, so mediation is identical.
     wait_killable_recv: bool,
-    /// Selected seccomp listener cancellation mode: `killable` (>= 5.19) or
-    /// `legacy_read_only` (< 5.19, broker output writes disabled).
-    seccomp_listener_mode: &'static str,
-    /// Whether the broker disables task-memory output writes (legacy mode).
-    task_memory_writes_disabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -209,12 +206,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
         wait_killable_recv: notification.wait_killable_recv,
-        seccomp_listener_mode: if notification.wait_killable_recv {
-            "killable"
-        } else {
-            "legacy_read_only"
-        },
-        task_memory_writes_disabled: !notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
@@ -225,11 +216,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             retained_socket_operation: true,
             proc_fd_identity: true,
             task_memory_read: task_memory_copy,
-            task_memory_write: task_memory_copy,
-            cancellation: notification.wait_killable_recv,
-            // Legacy plain listener (< 5.19) disables broker output writes;
-            // satisfies the `cancellation || writes_disabled` launch invariant.
-            task_memory_writes_disabled: !notification.wait_killable_recv,
         },
         landlock_abi,
         landlock_allow_deny: true,
@@ -469,7 +455,6 @@ fn probe_socket_virtualization() -> Result<()> {
                 openshell_isolation_interface::linux::seccomp_notify::install_listener(&[
                     libc::SYS_socket,
                     libc::SYS_connect,
-                    libc::SYS_getpeername,
                     libc::SYS_sendto,
                 ]);
             let Ok(listener) = listener else {
@@ -524,7 +509,6 @@ fn probe_socket_virtualization() -> Result<()> {
     let mut observed_connect = false;
     let mut observed_dns_tcp_connect = false;
     let mut observed_denied_connect = false;
-    let mut observed_peer = false;
     let mut observed_dns_send = false;
 
     while !(observed_tcp_sockets == 3
@@ -532,7 +516,6 @@ fn probe_socket_virtualization() -> Result<()> {
         && observed_connect
         && observed_dns_tcp_connect
         && observed_denied_connect
-        && observed_peer
         && observed_dns_send)
     {
         let notification = listener
@@ -657,27 +640,6 @@ fn probe_socket_virtualization() -> Result<()> {
                 listener
                     .respond_value(notification.id, 0)
                     .into_diagnostic()?;
-            }
-            libc::SYS_getpeername => {
-                let fd = i32::try_from(notification.args[0])
-                    .map_err(|_| miette::miette!("peer FD does not fit i32"))?;
-                let entry = registry.resolve(notification.tid, fd).into_diagnostic()?;
-                let SocketState::Connected { original_peer } = entry.state() else {
-                    listener
-                        .respond_errno(notification.id, libc::ENOTCONN)
-                        .into_diagnostic()?;
-                    return Err(miette::miette!("peer query preceded mediated connect"));
-                };
-                write_probe_sockaddr(
-                    notification.tid,
-                    notification.args[1],
-                    notification.args[2],
-                    *original_peer,
-                )?;
-                listener
-                    .respond_value(notification.id, 0)
-                    .into_diagnostic()?;
-                observed_peer = true;
             }
             libc::SYS_sendto => {
                 let fd = i32::try_from(notification.args[0])
@@ -950,38 +912,6 @@ fn decode_probe_sockaddr(bytes: &[u8]) -> Result<std::net::SocketAddr> {
         std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
         u16::from_be_bytes([bytes[2], bytes[3]]),
     )))
-}
-
-#[cfg(target_os = "linux")]
-fn write_probe_sockaddr(
-    tid: u32,
-    address: u64,
-    length_address: u64,
-    peer: std::net::SocketAddr,
-) -> Result<()> {
-    use std::mem::size_of;
-
-    let (sockaddr, sockaddr_length) = encode_probe_sockaddr(peer)?;
-    let mut requested_length = [0_u8; size_of::<libc::socklen_t>()];
-    openshell_isolation_interface::linux::task_memory::read_exact(
-        tid,
-        length_address,
-        &mut requested_length,
-    )
-    .into_diagnostic()?;
-    let requested_length = libc::socklen_t::from_ne_bytes(requested_length);
-    if requested_length < sockaddr_length {
-        return Err(miette::miette!("peer sockaddr buffer is too small"));
-    }
-    openshell_isolation_interface::linux::task_memory::write_exact(tid, address, &sockaddr)
-        .into_diagnostic()?;
-    openshell_isolation_interface::linux::task_memory::write_exact(
-        tid,
-        length_address,
-        &sockaddr_length.to_ne_bytes(),
-    )
-    .into_diagnostic()?;
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
