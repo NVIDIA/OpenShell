@@ -1001,16 +1001,7 @@ async fn handle_shell_connect(
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+        .args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1143,16 +1134,7 @@ async fn handle_exec_command(
         .collect::<Vec<_>>()
         .join(" ");
     let mut ssh = std::process::Command::new("ssh");
-    ssh.arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+    ssh.args(sandbox_ssh_args(&proxy_command, "ERROR"))
         .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
@@ -1213,7 +1195,7 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args, shell_escape,
     validate_ssh_session_response,
 };
 
@@ -1604,16 +1586,7 @@ async fn start_port_forwards(
 
         let mut command = std::process::Command::new("ssh");
         command
-            .arg("-o")
-            .arg(format!("ProxyCommand={proxy_command}"))
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("GlobalKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("LogLevel=ERROR")
+            .args(sandbox_ssh_args(&proxy_command, "ERROR"))
             .arg("-o")
             .arg("ConnectTimeout=15")
             .arg("-N")
