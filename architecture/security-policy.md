@@ -44,11 +44,20 @@ parameter names are open user-data maps rather than schema extensions.
 ### Cedar-authored policies
 
 A policy is either YAML or Cedar for the life of a sandbox. A non-empty
-`SandboxPolicy.cedar_policy_source` selects Cedar; it is mutually exclusive
-with `network_policies` and `network_middlewares`. The supervisor chooses the
+`SandboxPolicy.cedar_policy_source` (authored as a `.cedar` file or the YAML
+`cedar_policy` field) selects Cedar; it is mutually exclusive with
+`network_policies` and filesystem paths, and combines with
+`network_middlewares`, `landlock`, and `process`. The supervisor chooses the
 engine once at startup and rejects any reload that would switch formats, and
-the gateway rejects format switches on update, Cedar global policies, and
-provider network layers on Cedar sandboxes.
+the gateway rejects format switches on update and Cedar global policies.
+
+Providers attached to a Cedar sandbox supply credentials but grant no access.
+Provider composition puts their rules in `provider_credential_rules` instead
+of `network_policies`; the gateway still delivers credentials bound to the
+provider's endpoints. For a connection Cedar allows, each matching provider
+endpoint contributes its credential settings to the endpoint configs, and the
+same fail-closed credential guard as YAML refuses an uninspected connection
+to a credentialed endpoint.
 
 `openshell-policy-cedar` validates the Cedar text against the canonical
 schema in `openshell-policy-cedar-schema` and derives three artifacts that
