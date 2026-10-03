@@ -1121,40 +1121,58 @@ impl ComputeRuntime {
             spec.await_main_process_attachment = await_main_process_attachment;
             spec.launch_authentication = launch_authentication.unwrap_or_default();
         }
-        match self
-            .driver
-            .call(
-                openshell_otel::rpc::CREATE_SANDBOX,
-                Some(sandbox.object_id()),
-                |driver| async move {
-                    driver
-                        .create_sandbox(Request::new(CreateSandboxRequest {
-                            sandbox: Some(driver_sandbox),
-                        }))
-                        .await
-                },
+        let result = self
+            .await_provisioning_operation(
+                &sandbox,
+                self.driver.call(
+                    openshell_otel::rpc::CREATE_SANDBOX,
+                    Some(sandbox.object_id()),
+                    |driver| async move {
+                        driver
+                            .create_sandbox(Request::new(CreateSandboxRequest {
+                                sandbox: Some(driver_sandbox),
+                            }))
+                            .await
+                    },
+                ),
             )
-            .await
+            .await;
+        // Transfer the upload only after the driver actually accepts create,
+        // including a success that arrives after the preparation deadline.
+        if result.is_ok()
+            && let Some(staged) = staged.as_mut()
         {
+            staged.disarm();
+        }
+        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        // The scanner can expire preparation while create owns the lifecycle
+        // gate. Every driver outcome must observe that durable decision before
+        // deleting records, publishing status, or compensating a failed create.
+        let current = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|error| Status::internal(format!("fetch created sandbox failed: {error}")))?
+            .ok_or_else(|| Status::not_found("sandbox removed during create"))?;
+        if sandbox_provisioning_attempt_id(&current) != sandbox_provisioning_attempt_id(&sandbox) {
+            return Err(Status::aborted(
+                "sandbox provisioning attempt changed during create",
+            ));
+        }
+        sandbox = current;
+        if provisioning_deadline::timed_out(&sandbox) {
+            return Err(Status::deadline_exceeded(
+                "image preparation deadline expired",
+            ));
+        }
+        match result {
             Ok(response) => {
                 let runtime_identity = response.into_inner().runtime_identity;
-                // The driver now owns the staged archive and removes the
-                // request directory once it has built the disk.
-                if let Some(staged) = staged.as_mut() {
-                    staged.disarm();
-                }
-                let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
                 if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
                     let status =
                         Status::internal("compute driver did not return a runtime identity");
                     return Err(self
-                        .compensate_failed_create(
-                            &sandbox_id,
-                            sandbox.object_name(),
-                            lifecycle_guard,
-                            global_guard,
-                            status,
-                        )
+                        .compensate_failed_create(&sandbox, lifecycle_guard, global_guard, status)
                         .await);
                 }
                 if self.supports_sandbox_authentication() {
@@ -1175,8 +1193,7 @@ impl ComputeRuntime {
                             ));
                             return Err(self
                                 .compensate_failed_create(
-                                    &sandbox_id,
-                                    sandbox.object_name(),
+                                    &sandbox,
                                     lifecycle_guard,
                                     global_guard,
                                     status,
@@ -1189,46 +1206,64 @@ impl ComputeRuntime {
                 self.sandbox_watch_bus.notify(sandbox.object_id());
                 Ok(sandbox)
             }
-            Err(status) if status.code() == Code::AlreadyExists => {
-                let _ = self
+            Err(status) => {
+                // Another replica can expire this attempt after our read.
+                // Remove only the version inspected above, never a newer row.
+                match self
                     .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::already_exists("sandbox already exists"))
-            }
-            Err(status) if status.code() == Code::FailedPrecondition => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::failed_precondition(status.message().to_string()))
-            }
-            Err(err) => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::internal(format!(
-                    "create sandbox failed: {}",
-                    err.message()
-                )))
+                    .delete_if(
+                        Sandbox::object_type(),
+                        &sandbox_id,
+                        sandbox_resource_version(&sandbox),
+                    )
+                    .await
+                {
+                    Ok(_) => self.sandbox_index.remove_sandbox(&sandbox_id),
+                    Err(crate::persistence::PersistenceError::Conflict { .. }) => {
+                        if let Some(current) = self
+                            .store
+                            .get_message::<Sandbox>(&sandbox_id)
+                            .await
+                            .map_err(|error| Status::internal(error.to_string()))?
+                            && provisioning_deadline::timed_out(&current)
+                        {
+                            return Err(Status::deadline_exceeded(
+                                "image preparation deadline expired",
+                            ));
+                        }
+                        return Err(Status::aborted(
+                            "sandbox changed during failed create cleanup",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(Status::internal(format!("clean up failed create: {error}")));
+                    }
+                }
+                match status.code() {
+                    Code::AlreadyExists => Err(Status::already_exists("sandbox already exists")),
+                    Code::FailedPrecondition => {
+                        Err(Status::failed_precondition(status.message().to_string()))
+                    }
+                    _ => Err(Status::internal(format!(
+                        "create sandbox failed: {}",
+                        status.message()
+                    ))),
+                }
             }
         }
     }
 
     async fn compensate_failed_create(
         &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
+        created: &Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
         global_guard: tokio::sync::OwnedMutexGuard<()>,
         original: Status,
     ) -> Status {
+        let sandbox_id = created.object_id();
+        let sandbox_name = created.object_name();
         let transition = match self
-            .begin_sandbox_delete_with_initial_snapshot(sandbox_id, None)
+            .begin_sandbox_delete_with_initial_snapshot(sandbox_id, None, Some(created))
             .await
         {
             Ok(BeginDelete::Started(transition)) => *transition,
@@ -1240,6 +1275,9 @@ impl ComputeRuntime {
                         original.message()
                     ),
                 );
+            }
+            Err(error) if matches!(error.code(), Code::DeadlineExceeded | Code::Aborted) => {
+                return error;
             }
             Err(error) => {
                 drop(global_guard);
@@ -1914,7 +1952,10 @@ impl ComputeRuntime {
                     let current_generation = sandbox_runtime_generation(&current)?;
                     let phase =
                         SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if current_generation != expected_generation || !allowed_phases.contains(&phase)
+                    if current_generation != expected_generation
+                        || sandbox_provisioning_attempt_id(&current)
+                            != sandbox_provisioning_attempt_id(starting)
+                        || !allowed_phases.contains(&phase)
                     {
                         return Err(format!(
                             "sandbox changed lifecycle ownership while persisting runtime identity (phase: {phase:?})"
@@ -2265,7 +2306,7 @@ impl ComputeRuntime {
         // `Deleting` row used to fence recovery, and the prior row used only
         // for exact-version rollback after an ambiguous driver failure.
         let transition = match self
-            .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current))
+            .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current), None)
             .await?
         {
             BeginDelete::AlreadyDeleting => {
@@ -2344,6 +2385,7 @@ impl ComputeRuntime {
         &self,
         sandbox_id: &str,
         mut initial_snapshot: Option<Sandbox>,
+        failed_create: Option<&Sandbox>,
     ) -> Result<BeginDelete, Status> {
         let operation = "set sandbox phase to Deleting";
 
@@ -2357,6 +2399,24 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?,
             };
+
+            // Failed-create compensation owns only its original attempt.
+            // Preserve its timeout diagnosis and any replacement attempt on
+            // every CAS retry. Explicit deletion may remove either state.
+            if let Some(created) = failed_create {
+                if sandbox_provisioning_attempt_id(&sandbox)
+                    != sandbox_provisioning_attempt_id(created)
+                {
+                    return Err(Status::aborted(
+                        "sandbox provisioning attempt changed during create cleanup",
+                    ));
+                }
+                if provisioning_deadline::timed_out(&sandbox) {
+                    return Err(Status::deadline_exceeded(
+                        "image preparation deadline expired",
+                    ));
+                }
+            }
 
             if SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
                 == SandboxPhase::Deleting
@@ -5978,6 +6038,14 @@ fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
     Sandbox::decode(record.payload.as_slice()).map_err(|e| e.to_string())
 }
 
+fn sandbox_provisioning_attempt_id(sandbox: &Sandbox) -> Option<&str> {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        .map(|record| record.attempt_id.as_str())
+}
+
 fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
     sandbox
         .metadata
@@ -7549,8 +7617,10 @@ mod tests {
         delete_requests: TestMutex<Vec<(String, String)>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
         create_started: Notify,
+        create_finished: Notify,
         create_release: Semaphore,
         create_blocked: AtomicBool,
+        create_error: TestMutex<Option<Status>>,
         stop_started: Notify,
         stop_finished: Notify,
         stop_release: Semaphore,
@@ -7588,8 +7658,10 @@ mod tests {
                 delete_requests: TestMutex::new(Vec::new()),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
                 create_started: Notify::new(),
+                create_finished: Notify::new(),
                 create_release: Semaphore::new(0),
                 create_blocked: AtomicBool::new(false),
+                create_error: TestMutex::new(None),
                 stop_started: Notify::new(),
                 stop_finished: Notify::new(),
                 stop_release: Semaphore::new(0),
@@ -7842,6 +7914,15 @@ mod tests {
                     .await
                     .expect("create release semaphore closed")
                     .forget();
+            }
+            self.create_finished.notify_one();
+            if let Some(error) = self
+                .create_error
+                .lock()
+                .expect("create error lock poisoned")
+                .clone()
+            {
+                return Err(error);
             }
             Ok(tonic::Response::new(CreateSandboxResponse {
                 runtime_identity: self
@@ -11700,7 +11781,7 @@ mod tests {
             .unwrap();
 
         let transition = runtime
-            .begin_sandbox_delete_with_initial_snapshot("sb-1", Some(stale_snapshot))
+            .begin_sandbox_delete_with_initial_snapshot("sb-1", Some(stale_snapshot), None)
             .await
             .unwrap();
         let BeginDelete::Started(transition) = transition else {
@@ -15401,6 +15482,450 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    fn stage_create_test_upload(
+        runtime: &mut ComputeRuntime,
+        sandbox: &mut Sandbox,
+        root: &Path,
+    ) -> PathBuf {
+        runtime.rootfs_tar_staging = Arc::new(rootfs_tar::RootfsTarStagingRegistry::new(
+            Some(root.to_path_buf()),
+            1024,
+        ));
+        runtime.admission.allow_driver_config = true;
+        let slot = runtime
+            .rootfs_tar_staging
+            .begin("default", "test", "rootfs.tar", 7)
+            .unwrap();
+        std::fs::write(&slot.upload_path, b"archive").unwrap();
+        sandbox
+            .spec
+            .get_or_insert_with(SandboxSpec::default)
+            .template
+            .get_or_insert_with(SandboxTemplate::default)
+            .driver_config = Some(prost_types::Struct {
+            fields: [(
+                runtime.driver_info.name.clone(),
+                struct_value([("rootfs_tar_staging_token", string_value(&slot.token))]),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        slot.upload_path
+    }
+
+    #[tokio::test]
+    async fn initial_create_preparation_expiry_releases_cleanup_gate() {
+        let driver = ControlledDriver::new();
+        driver.block_create();
+        let mut runtime = test_runtime(driver.clone()).await;
+        let now = openshell_core::time::now_ms();
+        let preparation = provisioning_deadline::new_preparation_record(now, 1);
+        let mut sandbox = sandbox_record("sb-create-ttl", "create-ttl", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        let upload_root = tempfile::tempdir().unwrap();
+        let upload = stage_create_test_upload(&mut runtime, &mut sandbox, upload_root.path());
+        let creating_runtime = runtime.clone();
+        let mut create =
+            tokio::spawn(
+                async move { creating_runtime.create_sandbox(sandbox, None, false).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.create_started.notified())
+            .await
+            .unwrap();
+
+        runtime
+            .reconcile_provisioning_deadlines(now + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.stop_calls(),
+            0,
+            "create still owns the lifecycle gate"
+        );
+        let result = match tokio::time::timeout(Duration::from_secs(3), &mut create).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                create.abort();
+                let _ = create.await;
+                panic!(
+                    "expired initial create kept the lifecycle gate while the driver was blocked"
+                );
+            }
+        };
+        assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while upload.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unaccepted upload must be cleaned up");
+        // No create permit was released. Cleanup must acquire the lifecycle
+        // gate after the deadline waiter cancels the blocked operation.
+        runtime
+            .reconcile_provisioning_deadlines(now + 1_001)
+            .await
+            .unwrap();
+        let retained = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let sandbox = runtime
+                    .store
+                    .get_message::<Sandbox>("sb-create-ttl")
+                    .await
+                    .unwrap()
+                    .expect("retained timeout record");
+                if sandbox
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap()
+                    .cleanup_completed_time
+                    .is_some()
+                {
+                    break sandbox;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(driver.stop_calls(), 1);
+        assert_eq!(driver.delete_calls(), 0);
+        assert_eq!(retained.phase(), i32::from(SandboxPhase::Error));
+        let status = retained.status.as_ref().unwrap();
+        let record = status.provisioning.as_ref().unwrap();
+        assert_eq!(record.attempt_id, preparation.attempt_id);
+        assert_eq!(
+            record.preparation_deadline,
+            preparation.preparation_deadline
+        );
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.reason == "ImagePreparationTimedOut")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_create_cleanup_preserves_timeout_after_cas_conflict() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let now = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record(
+            "sb-compensation-ttl",
+            "compensation-ttl",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(now, 1));
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stale = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let lifecycle_guard = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+        runtime
+            .reconcile_provisioning_deadlines(now + 1_000)
+            .await
+            .unwrap();
+        let _global_guard = runtime.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let result = runtime
+            .begin_sandbox_delete_with_initial_snapshot(
+                sandbox.object_id(),
+                Some(stale.clone()),
+                Some(&stale),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error.code() == Code::DeadlineExceeded));
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(provisioning_deadline::timed_out(&retained));
+        assert_eq!(driver.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn late_initial_create_preserves_retry_from_another_replica() {
+        let driver = ControlledDriver::new();
+        driver.block_create();
+        *driver.create_error.lock().unwrap() = Some(Status::internal("late create failure"));
+        let runtime = test_runtime(driver.clone()).await;
+        let mut other = runtime.clone();
+        other.sync_lock = Arc::new(Mutex::new(()));
+        other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+        other.replica_id = "other-replica".into();
+        let now = openshell_core::time::now_ms();
+        let mut sandbox = sandbox_record(
+            "sb-create-retry",
+            "create-retry",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(now, 1));
+        let creating_runtime = runtime.clone();
+        let create =
+            tokio::spawn(
+                async move { creating_runtime.create_sandbox(sandbox, None, false).await },
+            );
+        driver.create_started.notified().await;
+        other
+            .reconcile_provisioning_deadlines(now + 1_000)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = other
+                    .store
+                    .get_message::<Sandbox>("sb-create-retry")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .provisioning
+                    .as_ref()
+                    .unwrap()
+                    .cleanup_completed_time
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // A's driver has completed, but only A's local lock prevents it from
+        // processing the result. B uses the same store with its own locks.
+        let held = runtime.sync_lock.lock().await;
+        driver.release_create();
+        driver.create_finished.notified().await;
+        let retry = other
+            .start_sandbox("default", "create-retry")
+            .await
+            .unwrap();
+        drop(held);
+        let result = tokio::time::timeout(Duration::from_secs(2), create)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().code(), Code::Aborted);
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>("sb-create-retry")
+            .await
+            .unwrap()
+            .expect("new attempt must survive");
+        assert_eq!(retained, retry);
+        assert_eq!(driver.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_create_cleanup_preserves_retry_after_cas_conflict() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let mut sandbox = sandbox_record("sb-retry-cas", "retry-cas", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stale = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&stale),
+                |current| {
+                    apply_lifecycle_phase(
+                        current,
+                        SandboxPhase::Starting,
+                        "Starting",
+                        "Sandbox start requested",
+                        runtime.image_preparation_timeout_seconds,
+                    );
+                },
+            )
+            .await
+            .unwrap();
+        assert!(sandbox_resource_version(&retry) > sandbox_resource_version(&stale));
+        let result = runtime
+            .begin_sandbox_delete_with_initial_snapshot(
+                sandbox.object_id(),
+                Some(stale.clone()),
+                Some(&stale),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error.code() == Code::Aborted));
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, retry.status);
+    }
+
+    #[tokio::test]
+    async fn create_runtime_binding_rejects_retry_after_cas_conflict() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let mut sandbox = sandbox_record(
+            "sb-binding-retry",
+            "binding-retry",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.status.as_mut().unwrap().provisioning = Some(
+            provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stale = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&stale),
+                |current| {
+                    apply_lifecycle_phase(
+                        current,
+                        SandboxPhase::Starting,
+                        "Starting",
+                        "Sandbox start requested",
+                        runtime.image_preparation_timeout_seconds,
+                    );
+                    current.set_phase(SandboxPhase::Ready.into());
+                    set_compute_runtime_binding(current, "retry-runtime");
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sandbox_runtime_generation(&stale).unwrap(),
+            sandbox_runtime_generation(&retry).unwrap()
+        );
+        let result = runtime
+            .persist_runtime_binding(
+                sandbox.object_id(),
+                &stale,
+                "test-driver",
+                "expired-create-runtime",
+                &[SandboxPhase::Provisioning, SandboxPhase::Ready],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "old create must not bind a replacement attempt"
+        );
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, retry);
+    }
+
+    #[tokio::test]
+    async fn initial_create_preserves_timeout_when_driver_returns_late() {
+        // Exercise every former error-deletion branch and the authenticated
+        // success path that would otherwise compensate for missing identity.
+        for error in [
+            None,
+            Some(Status::already_exists("late duplicate")),
+            Some(Status::failed_precondition("late rejection")),
+            Some(Status::internal("late failure")),
+        ] {
+            let driver = ControlledDriver::new();
+            driver.block_create();
+            let accepted_upload = error.is_none();
+            *driver.create_error.lock().unwrap() = error;
+            let mut runtime = test_runtime(driver.clone()).await;
+            runtime.driver_info.supports_sandbox_authentication = true;
+            let now = openshell_core::time::now_ms();
+            let preparation = provisioning_deadline::new_preparation_record(now, 1);
+            let mut sandbox =
+                sandbox_record("sb-late-create", "late-create", SandboxPhase::Provisioning);
+            sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+            let upload_root = tempfile::tempdir().unwrap();
+            let upload = stage_create_test_upload(&mut runtime, &mut sandbox, upload_root.path());
+            let creating_runtime = runtime.clone();
+            let create =
+                tokio::spawn(
+                    async move { creating_runtime.create_sandbox(sandbox, None, false).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.create_started.notified())
+                .await
+                .unwrap();
+            runtime
+                .reconcile_provisioning_deadlines(now + 1_000)
+                .await
+                .unwrap();
+            driver.release_create();
+            tokio::time::timeout(Duration::from_secs(1), driver.create_finished.notified())
+                .await
+                .expect("driver result must reach the create path before cancellation");
+            let result = tokio::time::timeout(Duration::from_secs(1), create)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
+            if accepted_upload {
+                assert!(
+                    upload.exists(),
+                    "successful driver owns the accepted upload"
+                );
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while upload.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("failed create cleans up the upload");
+            }
+            let retained = runtime
+                .store
+                .get_message::<Sandbox>("sb-late-create")
+                .await
+                .unwrap()
+                .expect("late result must retain timeout diagnosis");
+            assert!(provisioning_deadline::timed_out(&retained));
+            let status = retained.status.as_ref().unwrap();
+            assert_eq!(
+                status.provisioning.as_ref().unwrap().attempt_id,
+                preparation.attempt_id
+            );
+            assert!(
+                status
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "ImagePreparationTimedOut")
+            );
+            assert_eq!(
+                driver.delete_calls(),
+                0,
+                "timeout cleanup must not enter create compensation"
+            );
+        }
     }
 
     #[tokio::test]
