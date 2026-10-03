@@ -252,6 +252,32 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
   };
+  # Runs rootless-only in branch CI today (see .github/workflows/branch-e2e.yml's
+  # driver-specific-integration matrix), unlike podmanDriverArchive above, which
+  # runs both rootful and rootless. This is a deliberate scoping decision, not an
+  # oversight (#3712): most of this archive's selected targets (sandbox/workspace
+  # lifecycle, labels, templates, port forwarding, uploads, settings) exercise
+  # driver-agnostic gateway/policy logic with no privilege-model sensitivity, so a
+  # rootful leg would duplicate coverage without catching anything new.
+  #
+  # podman_host_gateway was checked specifically (host.openshell.internal
+  # resolution plausibly depends on the rootless pasta/slirp4netns vs. rootful
+  # netavark/CNI network backend) and confirmed NOT privilege-sensitive: the
+  # outer container's /etc/hosts entry uses Podman's own native "host-gateway"
+  # alias value (container.rs), which Podman resolves identically in both
+  # modes, and the supervisor-side resolution defaults to a hardcoded
+  # 127.0.0.1 on Linux regardless of rootful/rootless
+  # (PodmanComputeConfig::resolved_host_gateway_ip in config.rs). No rootful
+  # coverage gap here.
+  #
+  # The one confirmed exception is podman_resource_limits, which reads real
+  # cgroup v2 state from inside the sandbox: rootless cgroup delegation
+  # depends on systemd-user `Delegate=` and can silently no-op if
+  # misconfigured, making rootless the harder, higher-risk case -- already
+  # covered here. Rootful is the lower-risk, currently-unverified path for
+  # that one target. Tracked in #4163; since nextest archive filters select
+  # whole binaries, closing that gap means running this entire archive
+  # rootful too, not just the one target that needs it.
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
