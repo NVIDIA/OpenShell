@@ -882,11 +882,7 @@ fn connect_socket(
             InetKind::Tcp => SocketState::DnsTcp { relay: destination },
             InetKind::DnsUdp => SocketState::DnsUdp { relay: destination },
         });
-        // UDP DNS sockets keep the broker's copy: the broker sends their
-        // datagrams so ancillary data in workload memory never reaches them.
-        if kind == InetKind::Tcp {
-            entry.release_preconnect();
-        }
+        entry.release_preconnect();
         return listener.respond_value(notification.id, 0);
     }
     // The metadata service lives in the supervisor, even though SDKs address
@@ -911,7 +907,7 @@ fn connect_socket(
         listener.validate_id(notification.id)?;
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), destination)?;
         entry.set_state(SocketState::Local { peer: destination });
-        // Loopback UDP sends are broker-sent; keep the copy for them.
+        entry.release_preconnect();
         return listener.respond_value(notification.id, 0);
     }
     if kind != InetKind::Tcp {
@@ -1316,8 +1312,6 @@ fn classify_send(
         libc::SYS_sendmsg => vec![read_sendmsg_message(
             notification.tid,
             notification.args[1],
-            i32::try_from(notification.args[2])
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
         )?],
         libc::SYS_sendmmsg => read_sendmmsg_messages(notification)?,
         _ => return Err(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -1330,15 +1324,11 @@ fn classify_send(
             if entry.metadata().kind == InetKind::DnsUdp
                 && matches!(entry.state(), SocketState::Local { .. }) =>
         {
-            if !messages.iter().all(|message| message.destination.is_none()) {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            if messages.iter().all(|message| message.destination.is_none()) {
+                listener.respond_continue(notification.id)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
             }
-            let source_fd = entry.retained_preconnect()?.as_raw_fd();
-            listener.validate_id(notification.id)?;
-            for message in &messages {
-                send_dns_message(source_fd, message)?;
-            }
-            listener.respond_value(notification.id, dns_send_result(syscall, &messages))
         }
         Ok(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
             let SocketState::DnsUdp { relay } = entry.state() else {
@@ -1351,20 +1341,15 @@ fn classify_send(
             // destination is absent or names that same relay. The mandatory
             // outer network fence remains the fail-closed backstop for the
             // sibling-thread pointer race inherent in seccomp CONTINUE.
-            let relay = *relay;
-            if !messages.iter().all(|message| {
+            if messages.iter().all(|message| {
                 message
                     .destination
-                    .is_none_or(|destination| destination == relay)
+                    .is_none_or(|destination| destination == *relay)
             }) {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
+                listener.respond_continue(notification.id)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
             }
-            let source_fd = entry.retained_preconnect()?.as_raw_fd();
-            listener.validate_id(notification.id)?;
-            for message in &messages {
-                send_dns_message(source_fd, message)?;
-            }
-            listener.respond_value(notification.id, dns_send_result(syscall, &messages))
         }
         Ok(entry)
             if entry.metadata().kind == InetKind::DnsUdp
@@ -1387,15 +1372,15 @@ fn classify_send(
                 lock(&dns_relay.udp_admissions).remove(&peer);
                 return Err(error);
             }
-            for message in &messages {
-                send_dns_message(source_fd, message)?;
-            }
-            // Keep the broker's retained socket so later sends also originate
-            // from it; the workload's aliased fd shares this open file.
+            // The socket is pinned to the relay and bound to loopback. The
+            // kernel performs the send; ancillary data was rejected at read
+            // time and a loopback destination contains any per-message
+            // routing override that races the check.
             entry.set_state(SocketState::DnsUdp {
                 relay: dns_relay.address,
             });
-            listener.respond_value(notification.id, dns_send_result(syscall, &messages))
+            entry.release_preconnect();
+            listener.respond_continue(notification.id)
         }
         Ok(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
         // Non-INET sockets and natively accepted sockets were never
@@ -1422,19 +1407,10 @@ fn send_flags(syscall: i64, args: [u64; 6]) -> i32 {
 }
 
 struct SendMessage {
-    data: Vec<u8>,
     destination: Option<SocketAddr>,
-    flags: i32,
 }
 
 fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
-    let length = usize::try_from(notification.args[2])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-    if u16::try_from(length).is_err() {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = vec![0_u8; length];
-    task_memory::read_exact(notification.tid, notification.args[1], &mut data)?;
     let destination = if notification.args[4] == 0 {
         None
     } else {
@@ -1444,19 +1420,15 @@ fn read_sendto_message(notification: Notification) -> io::Result<SendMessage> {
             notification.args[5],
         )?)
     };
-    Ok(SendMessage {
-        data,
-        destination,
-        flags: i32::try_from(notification.args[3])
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-    })
+    Ok(SendMessage { destination })
 }
 
-fn read_sendmsg_message(tid: u32, address: u64, flags: i32) -> io::Result<SendMessage> {
+fn read_sendmsg_message(tid: u32, address: u64) -> io::Result<SendMessage> {
     let header = read_task_value::<libc::msghdr>(tid, address)?;
-    // Ancillary data can carry per-message routing overrides (IP_PKTINFO).
-    // The broker sends from its own socket without control messages, so a
-    // workload that needs them is refused rather than silently stripped.
+    // Ancillary data can carry a per-message routing override (IP_PKTINFO).
+    // Refuse it rather than continue a send the broker did not inspect; a
+    // loopback destination additionally contains an override that races this
+    // check.
     if header.msg_controllen != 0 {
         return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
     }
@@ -1469,38 +1441,7 @@ fn read_sendmsg_message(tid: u32, address: u64, flags: i32) -> io::Result<SendMe
             u64::from(header.msg_namelen),
         )?)
     };
-    #[cfg(target_env = "musl")]
-    let iov_count = usize::try_from(header.msg_iovlen)
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    #[cfg(not(target_env = "musl"))]
-    let iov_count = header.msg_iovlen;
-    if iov_count > 32 {
-        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
-    }
-    let mut data = Vec::new();
-    for index in 0..iov_count {
-        let offset = index
-            .checked_mul(size_of::<libc::iovec>())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-        let iov = read_task_value::<libc::iovec>(
-            tid,
-            (header.msg_iov as u64)
-                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-        )?;
-        let start = data.len();
-        let end = start
-            .checked_add(iov.iov_len)
-            .filter(|length| u16::try_from(*length).is_ok())
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-        data.resize(end, 0);
-        task_memory::read_exact(tid, iov.iov_base as u64, &mut data[start..end])?;
-    }
-    Ok(SendMessage {
-        data,
-        destination,
-        flags,
-    })
+    Ok(SendMessage { destination })
 }
 
 fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMessage>> {
@@ -1509,8 +1450,6 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
     if count == 0 || count > 32 {
         return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
-    let flags = i32::try_from(notification.args[3])
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     (0..count)
         .map(|index| {
             let offset = index
@@ -1519,37 +1458,9 @@ fn read_sendmmsg_messages(notification: Notification) -> io::Result<Vec<SendMess
             let base = notification.args[1]
                 .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-            read_sendmsg_message(notification.tid, base, flags)
+            read_sendmsg_message(notification.tid, base)
         })
         .collect()
-}
-
-/// Send one already-copied datagram from the broker's retained relay socket.
-///
-/// The broker constructs the message with no ancillary data, so a per-message
-/// routing override in workload memory cannot redirect it off loopback.
-fn send_dns_message(fd: RawFd, message: &SendMessage) -> io::Result<()> {
-    // Strip MSG_FASTOPEN (already rejected) and MSG_MORE (no corking here).
-    let flags = message.flags & !(libc::MSG_FASTOPEN | libc::MSG_MORE);
-    // SAFETY: `fd` is the retained relay-connected UDP socket; the buffer is
-    // live for the duration of the call.
-    let sent = unsafe { libc::send(fd, message.data.as_ptr().cast(), message.data.len(), flags) };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if usize::try_from(sent).ok() == Some(message.data.len()) {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(libc::EIO))
-    }
-}
-
-fn dns_send_result(syscall: i64, messages: &[SendMessage]) -> i64 {
-    if syscall == libc::SYS_sendmmsg {
-        i64::try_from(messages.len()).unwrap_or(i64::MAX)
-    } else {
-        i64::try_from(messages.first().map_or(0, |message| message.data.len())).unwrap_or(i64::MAX)
-    }
 }
 
 fn read_task_value<T: Copy>(tid: u32, address: u64) -> io::Result<T> {
