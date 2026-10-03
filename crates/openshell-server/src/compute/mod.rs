@@ -7916,12 +7916,12 @@ mod tests {
                     .forget();
             }
             self.create_finished.notify_one();
-            if let Some(error) = self
+            let create_error = self
                 .create_error
                 .lock()
                 .expect("create error lock poisoned")
-                .clone()
-            {
+                .clone();
+            if let Some(error) = create_error {
                 return Err(error);
             }
             Ok(tonic::Response::new(CreateSandboxResponse {
@@ -15505,11 +15505,10 @@ mod tests {
             .template
             .get_or_insert_with(SandboxTemplate::default)
             .driver_config = Some(prost_types::Struct {
-            fields: [(
+            fields: std::iter::once((
                 runtime.driver_info.name.clone(),
                 struct_value([("rootfs_tar_staging_token", string_value(&slot.token))]),
-            )]
-            .into_iter()
+            ))
             .collect(),
         });
         slot.upload_path
@@ -15544,15 +15543,14 @@ mod tests {
             0,
             "create still owns the lifecycle gate"
         );
-        let result = match tokio::time::timeout(Duration::from_secs(3), &mut create).await {
-            Ok(result) => result.unwrap(),
-            Err(_) => {
-                create.abort();
-                let _ = create.await;
-                panic!(
-                    "expired initial create kept the lifecycle gate while the driver was blocked"
-                );
-            }
+        let result = if let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(3), &mut create).await
+        {
+            result.unwrap()
+        } else {
+            create.abort();
+            let _ = create.await;
+            panic!("expired initial create kept the lifecycle gate while the driver was blocked");
         };
         assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
         tokio::time::timeout(Duration::from_secs(1), async {
