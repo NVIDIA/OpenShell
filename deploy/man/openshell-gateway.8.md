@@ -51,6 +51,27 @@ TLS.
 :   Port for Prometheus metrics (/metrics). Set to 0 to disable.
     Default: **0**. Environment: **OPENSHELL_METRICS_PORT**.
 
+**--metrics-tls-cert** *PATH*
+:   Path to the TLS certificate served by the metrics listener. Pair with
+    **--metrics-tls-key** and enable a metrics port.
+    Environment: **OPENSHELL_METRICS_TLS_CERT**.
+
+**--metrics-tls-key** *PATH*
+:   Path to the TLS private key served by the metrics listener. Pair with
+    **--metrics-tls-cert** and enable a metrics port.
+    Environment: **OPENSHELL_METRICS_TLS_KEY**.
+
+**--metrics-tls-client-ca** *PATH*
+:   Path to the CA certificate used to verify metrics scraper client
+    certificates. Use a CA distinct from the gateway client CA.
+    Environment: **OPENSHELL_METRICS_TLS_CLIENT_CA**.
+
+**--metrics-require-client-auth** *BOOL*
+:   Require metrics clients to present a certificate trusted by
+    **--metrics-tls-client-ca**. Defaults to **false**. When enabled, a
+    metrics client CA is required.
+    Environment: **OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH**.
+
 **--log-level** *LEVEL*
 :   Log level: trace, debug, info, warn, error. Default: **info**.
     Environment: **OPENSHELL_LOG_LEVEL**.

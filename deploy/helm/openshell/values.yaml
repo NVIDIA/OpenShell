@@ -200,6 +200,21 @@ service:
   # -- Gateway metrics service port.
   metricsPort: 9090
 
+# Optional TLS and mTLS configuration for the dedicated metrics listener.
+# Plaintext metrics remain the default for compatibility with existing
+# Prometheus deployments. Secrets are supplied by the operator; the chart does
+# not generate metrics-specific PKI in this initial integration.
+metrics:
+  tls:
+    # -- Enable TLS for the dedicated metrics listener.
+    enabled: false
+    # -- Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName.
+    certSecretName: ""
+    # -- Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. Required when requireClientCert is true.
+    clientCaSecretName: ""
+    # -- Require a client certificate signed by clientCaSecretName to scrape metrics.
+    requireClientCert: false
+
 # Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
 # driver. OpenShell deliberately does not install its CRDs or controller.
 # Enable this check for live Helm installs to fail before creating gateway
