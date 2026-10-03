@@ -605,7 +605,12 @@ async fn handle_create_sandbox_inner(
         .status
         .as_mut()
         .expect("status initialized")
-        .provisioning = Some(crate::compute::provisioning_deadline::new_record(now_ms));
+        .provisioning = Some(
+        crate::compute::provisioning_deadline::new_preparation_record(
+            now_ms,
+            state.config.image_preparation_timeout_seconds,
+        ),
+    );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,

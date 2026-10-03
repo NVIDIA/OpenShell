@@ -240,6 +240,10 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Absolute image preparation and initial supervisor startup budget for new
+    /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
+    pub image_preparation_timeout_seconds: u32,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -865,6 +869,7 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            image_preparation_timeout_seconds: 1800,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),

@@ -70,6 +70,7 @@ struct SandboxState {
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    ready_before_create_returns: Arc<AtomicBool>,
     terminal_before_relay: Arc<AtomicBool>,
     terminal_after_provisional_container_exit: Arc<AtomicBool>,
     provisional_container_exit_without_result: Arc<AtomicBool>,
@@ -194,7 +195,17 @@ impl OpenShell for TestOpenShell {
             }),
             ..Sandbox::default()
         };
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox.set_phase(
+            if self
+                .state
+                .ready_before_create_returns
+                .load(Ordering::SeqCst)
+            {
+                SandboxPhase::Ready as i32
+            } else {
+                SandboxPhase::Provisioning as i32
+            },
+        );
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
@@ -677,6 +688,10 @@ impl OpenShell for TestOpenShell {
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let ready_before_create_returns = self
+            .state
+            .ready_before_create_returns
+            .load(Ordering::SeqCst);
         let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
         let terminal_after_provisional_container_exit = self
             .state
@@ -723,6 +738,18 @@ impl OpenShell for TestOpenShell {
             }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            if ready_before_create_returns {
+                // A watch starts with the current snapshot. Keep it open so
+                // stream closure cannot hide a client that ignores Ready.
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
+                    }))
+                    .await;
+                tx.closed().await;
+                return;
+            }
             let mut completed = provisioning.clone();
             completed.status = Some(SandboxStatus {
                 exit_code: Some(0),
@@ -2370,6 +2397,55 @@ async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
     let rendered = err.to_string();
     assert!(rendered.contains("sandbox entered error phase while provisioning"));
     assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+}
+
+#[tokio::test]
+async fn sandbox_create_accepts_ready_before_create_returns() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .ready_before_create_returns
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("already-ready"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        ),
+    )
+    .await
+    .expect("creation must finish while the watch remains open")
+    .expect("an already-Ready sandbox must not wait for a new provisioning transition");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        1,
+        "the initial Ready snapshot must allow the command to attach"
+    );
 }
 
 #[tokio::test]

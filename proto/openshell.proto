@@ -1184,7 +1184,7 @@ message SandboxStatus {
   SandboxConfigurationAdmission configuration_admission = 11;
   // Durable first-acceptance marker. Absent on legacy records; never reset by restart.
   optional bool configuration_activated = 12;
-  // Gateway-owned repair window. Retained after timeout for inspection and retry.
+  // Gateway-owned provisioning deadlines, retained after timeout for inspection and retry.
   SandboxProvisioning provisioning = 13;
   // Consecutive policy-driven restart number in the current crash loop.
   uint32 restart_count = 14;
@@ -3769,7 +3769,7 @@ message SandboxProvisioning {
   string configuration_change_id = 2;
   google.protobuf.Timestamp configuration_change_time = 3;
   google.protobuf.Timestamp first_rejection_time = 4;
-  // Present only while the repair window is armed.
+  // Active preparation or admission-repair deadline. Absent after Ready/timeout.
   google.protobuf.Timestamp deadline = 5;
   google.protobuf.Timestamp timeout_time = 6;
   // Set only after both supervisor and workload compute have been reclaimed.
@@ -3781,6 +3781,24 @@ message SandboxProvisioning {
   // Attachment edits have their own durable clock; status writes do not change it.
   string attachment_change_id = 10;
   google.protobuf.Timestamp attachment_change_time = 11;
+  // Absolute ceiling for image preparation and initial supervisor startup.
+  // Set once per new attempt; progress, configuration writes, and restarts
+  // cannot extend it. Absent on attempts created before preparation timing.
+  google.protobuf.Timestamp preparation_deadline = 12;
+  // First authenticated supervisor configuration report for this attempt.
+  // Starts the admission repair window. Absent while preparing, including
+  // after a preparation timeout. Duplicate reports never change this value.
+  google.protobuf.Timestamp admission_start_time = 13;
+  // An owned driver create/start future is still pending. Claimed before
+  // dispatch and cleared on its actual success or error response. Monitor
+  // interruption, owner loss, and StopSandbox/NotFound do not clear it.
+  // While set, cleanup cannot complete and retry/deletion remain blocked.
+  // This does not strengthen a driver's transport-error settlement contract.
+  bool driver_operation_pending = 14;
+  // Unique for each claimed driver operation, including recovery and automatic
+  // restart. Retained after settlement to reject delayed callbacks from an
+  // earlier operation on the same attempt and runtime generation.
+  string driver_operation_id = 15;
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.

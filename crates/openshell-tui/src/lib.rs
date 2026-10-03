@@ -2720,7 +2720,12 @@ fn sandbox_notes_for_view(
         } else {
             "compute cleanup pending"
         };
-        let mut notes = format!("Provisioning timed out; {cleanup}");
+        let mut notes =
+            if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                format!("Image preparation timed out; {cleanup}")
+            } else {
+                format!("Provisioning timed out; {cleanup}")
+            };
         if !forwards.is_empty() {
             notes.push_str("; ");
             notes.push_str(&forwards);
@@ -3337,6 +3342,26 @@ mod sandbox_notes_tests {
         assert_eq!(
             sandbox_notes(&sandbox, String::new()),
             "Provisioning timed out; compute reclaimed"
+        );
+    }
+
+    #[test]
+    fn preparation_timeout_notes_identify_the_expired_phase() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(openshell_core::proto::SandboxProvisioning {
+                    preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000)
+                        .ok(),
+                    timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Image preparation timed out; compute cleanup pending"
         );
     }
 

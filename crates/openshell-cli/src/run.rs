@@ -800,11 +800,8 @@ pub async fn sandbox_create(
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
 
-    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
-    // briefly report a stale Ready status before the controller reconciles
-    // a newly created sandbox.  Instead we handle termination client-side:
-    // we wait until we have observed at least one non-Ready phase followed
-    // by Ready (a genuine Provisioning → Ready transition).
+    // Handle terminal states here so a provisional container exit can wait
+    // for the supervisor's canonical-process result before cleanup.
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
@@ -832,8 +829,6 @@ pub async fn sandbox_create(
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
-    // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -911,10 +906,6 @@ pub async fn sandbox_create(
                     last_condition_message = Some(message);
                 }
 
-                if phase != SandboxPhase::Ready {
-                    saw_non_ready = true;
-                }
-
                 let main_process_result = has_main_process_result(&s);
                 if matches!(
                     phase,
@@ -949,9 +940,10 @@ pub async fn sandbox_create(
                     break;
                 }
 
-                // Only accept Ready as terminal after we've observed a
-                // non-Ready phase, proving the controller has reconciled.
-                if saw_non_ready && phase == SandboxPhase::Ready {
+                // The gateway owns readiness. Its initial watch snapshot may
+                // already be Ready if provisioning finished before CREATE
+                // returned; requiring an earlier phase would miss that state.
+                if phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
@@ -1218,25 +1210,31 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let provisioning_timed_out = last_sandbox
+            let timed_out_provisioning = last_sandbox
                 .status
                 .as_ref()
                 .and_then(|status| status.provisioning.as_ref())
-                .is_some_and(|record| record.timeout_time.is_some());
-            let create_result = if provisioning_timed_out {
-                Err(miette::miette!(
-                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
-                ))
-            } else if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
+                .filter(|record| record.timeout_time.is_some());
+            let create_result = timed_out_provisioning.map_or_else(
+                || {
+                    if last_error_reason.is_empty() {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning"
+                        ))
+                    } else {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning: {}",
+                            last_error_reason
+                        ))
+                    }
+                },
+                |record| {
+                    Err(miette::miette!(
+                        "{}",
+                        retained_sandbox_timeout_message(&sandbox_name, &last_error_reason, record)
+                    ))
+                },
+            );
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1257,6 +1255,24 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+/// Use the persisted phase to select recovery guidance. Preparation may expire
+/// before any policy is evaluated, so it must not tell the user to repair policy.
+fn retained_sandbox_timeout_message(
+    sandbox_name: &str,
+    error_reason: &str,
+    record: &openshell_core::proto::SandboxProvisioning,
+) -> String {
+    let recovery = if record.preparation_deadline.is_some() && record.admission_start_time.is_none()
+    {
+        "check image preparation and supervisor startup diagnostics and the gateway's `image_preparation_timeout_seconds` budget"
+    } else {
+        "repair its configuration"
+    };
+    format!(
+        "{error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; {recovery}, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+    )
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -2904,11 +2920,22 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "configuration_change_id": record.configuration_change_id,
             "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
             "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
             "deadline": record.deadline.as_ref().map(ToString::to_string),
             "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
             "cleanup_error": record.cleanup_error,
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
@@ -8107,6 +8134,101 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("pending")
+        );
+    }
+
+    #[test]
+    fn retained_sandbox_timeout_message_matches_expired_phase() {
+        let mut record = openshell_core::proto::SandboxProvisioning {
+            preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            ..Default::default()
+        };
+        let message = super::retained_sandbox_timeout_message(
+            "cold-image",
+            "ImagePreparationTimedOut: preparation expired",
+            &record,
+        );
+        assert!(message.starts_with("ImagePreparationTimedOut: preparation expired\n"));
+        assert!(message.contains("Sandbox 'cold-image' was retained"));
+        assert!(message.contains("image preparation and supervisor startup diagnostics"));
+        assert!(message.contains("image_preparation_timeout_seconds"));
+        assert!(!message.contains("repair its configuration"));
+        assert!(message.contains("openshell sandbox get cold-image"));
+        assert!(message.contains("openshell sandbox start cold-image` after cleanup completes"));
+
+        // An admission timeout retains preparation timestamps. Its completed
+        // transition must select configuration repair rather than a larger budget.
+        record.admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        let admission_without_preparation = openshell_core::proto::SandboxProvisioning {
+            timeout_time: record.timeout_time,
+            ..Default::default()
+        };
+        for admission_record in [&record, &admission_without_preparation] {
+            let message = super::retained_sandbox_timeout_message(
+                "invalid-policy",
+                "ProvisioningTimedOut: repair window expired",
+                admission_record,
+            );
+            assert!(message.contains("repair its configuration"));
+            assert!(!message.contains("image_preparation_timeout_seconds"));
+            assert!(
+                message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
+        assert_eq!(
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
         );
     }
 

@@ -126,12 +126,18 @@ mod tests {
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
+    // Preparation timing adds two optional timestamps to SandboxProvisioning.
+    // Existing rows decode with both absent and retain their active deadline;
+    // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Driver-operation ownership adds pending and a retained operation ID to
+    // SandboxProvisioning in both closures. Old rows decode false and empty;
+    // decoding or deadline updates cannot claim an existing attempt.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
