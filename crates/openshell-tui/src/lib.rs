@@ -1083,7 +1083,7 @@ async fn handle_exec_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &mut EventHandler,
     sandbox_name: &str,
-    command: &str,
+    command: &[String],
     workspace: &str,
 ) -> Result<()> {
     let session = {
@@ -1135,13 +1135,9 @@ async fn handle_exec_command(
     );
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
-    // the user's command appended.  Each word is escaped individually so the
+    // the parsed command appended. Each argument is escaped individually so the
     // remote shell parses it correctly.
-    let command_str = command
-        .split_whitespace()
-        .map(shell_escape)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command_str = build_exec_command(command);
     let mut ssh = std::process::Command::new("ssh");
     ssh.arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
@@ -1216,6 +1212,14 @@ use openshell_core::forward::{
     build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response,
 };
+
+fn build_exec_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -1400,12 +1404,10 @@ fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
 fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
-    let Some((name, image, command, selected_providers, ports)) = app.create_form_data() else {
+    let Some((name, image, selected_providers, ports)) = app.create_form_data() else {
         return;
     };
 
-    // Stash command so we can exec after sandbox creation + Ready.
-    app.pending_exec_command = command;
     // Stash ports so we can include them in the status text.
     app.pending_forward_ports.clone_from(&ports);
 
@@ -3127,6 +3129,46 @@ fn format_age(epoch_ms: i64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exec_command_tests {
+    use super::build_exec_command;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn run_command(command: &str, stdin: &[u8]) -> std::process::Output {
+        let args = shell_words::split(command).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &build_exec_command(&args)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn quoted_script_runs_and_reads_stdin() {
+        let output = run_command(r#"/bin/sh -c "echo GOOD; read x; echo $x""#, b"entered\n");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"GOOD\nentered\n");
+    }
+
+    #[test]
+    fn arguments_remain_literal_at_remote_shell_boundary() {
+        let output = run_command(
+            r#"printf '%s\n' 'hello world' "" "it's" a\ b $HOME '$(echo BAD)' ';' '|' '>' '*.txt'"#,
+            b"",
+        );
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
+        );
     }
 }
 
