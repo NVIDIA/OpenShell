@@ -703,6 +703,65 @@ for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_V
   fi
 done
 
+# Regression: the deb/rpm installer must stop as soon as the openshell-gateway
+# user service fails or gets stuck restarting, instead of waiting out the full
+# listener timeout (issue #4040). local_gateway_service_failed inspects the unit
+# via systemctl --user show; stub as_target_user to feed it known states.
+assert_service_failed() {
+  local name=$1 active=$2 sub=$3 expect=$4 actual
+
+  if (
+    has_cmd() { [ "$1" = systemctl ]; }
+    as_target_user() {
+      case "$*" in
+        *"-p ActiveState"*) printf '%s\n' "$active" ;;
+        *"-p SubState"*) printf '%s\n' "$sub" ;;
+      esac
+    }
+    local_gateway_service_failed
+  ); then
+    actual=failed
+  else
+    actual=healthy
+  fi
+
+  if [ "$actual" != "$expect" ]; then
+    echo "FAIL: ${name}: expected ${expect}, got ${actual} (ActiveState=${active} SubState=${sub})" >&2
+    exit 1
+  fi
+}
+
+assert_service_failed "failed unit stops the installer" failed failed failed
+assert_service_failed "auto-restart loop stops the installer" activating auto-restart failed
+assert_service_failed "starting unit keeps waiting" activating start healthy
+assert_service_failed "running unit keeps waiting" active running healthy
+
+# The fail-fast check must only apply to the systemd user-service installs; snap
+# and macOS manage the gateway differently and must behave as before.
+assert_systemd_user_gateway() {
+  local name=$1 platform=$2 method=$3 expect=$4 actual
+
+  if (
+    PLATFORM=$platform
+    LINUX_INSTALL_METHOD=$method
+    gateway_uses_systemd_user_service
+  ); then
+    actual=yes
+  else
+    actual=no
+  fi
+
+  if [ "$actual" != "$expect" ]; then
+    echo "FAIL: ${name}: expected ${expect}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_systemd_user_gateway "deb install uses the systemd user service" linux deb yes
+assert_systemd_user_gateway "rpm install uses the systemd user service" linux rpm yes
+assert_systemd_user_gateway "snap install is unaffected" linux snap no
+assert_systemd_user_gateway "macOS install is unaffected" darwin "" no
+
 unset -f gh uname linux_package_method
 
 echo "install.sh focused tests passed"
