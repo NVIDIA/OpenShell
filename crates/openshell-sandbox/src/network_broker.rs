@@ -40,6 +40,11 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+const PANIC_SENTINEL_LEVEL: i32 = libc::IPPROTO_TCP;
+#[cfg(test)]
+const PANIC_SENTINEL_OPTION: i32 = 0x7fff_fffe;
+
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
 }
@@ -266,23 +271,47 @@ impl NetworkBroker {
                             break;
                         }
                     };
-                    if let Err(error) = dispatch_notification(
-                        Arc::clone(&registry),
-                        Arc::clone(&listener),
-                        notification,
-                        queues.clone(),
-                    ) {
-                        tracing::warn!(
-                            tid = notification.tid,
-                            syscall = notification.syscall,
-                            %error,
-                            "sandbox network notification denied (tid={}, syscall={}): {error}",
-                            notification.tid,
-                            notification.syscall
-                        );
-                        let _ = listener.respond_errno(notification.id, error_to_errno(&error));
+                    // Contain a handler panic so one faulty notification
+                    // cannot silently kill the broker and hang every blocked
+                    // workload syscall. The failing syscall gets an error; the
+                    // broker keeps mediating the rest.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_notification(
+                            Arc::clone(&registry),
+                            Arc::clone(&listener),
+                            notification,
+                            queues.clone(),
+                        )
+                    }));
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                tid = notification.tid,
+                                syscall = notification.syscall,
+                                %error,
+                                "sandbox network notification denied (tid={}, syscall={}): {error}",
+                                notification.tid,
+                                notification.syscall
+                            );
+                            let _ =
+                                listener.respond_errno(notification.id, error_to_errno(&error));
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                tid = notification.tid,
+                                syscall = notification.syscall,
+                                "sandbox network notification handler panicked (tid={}, syscall={})",
+                                notification.tid,
+                                notification.syscall
+                            );
+                            let _ = listener.respond_errno(notification.id, libc::EIO);
+                        }
                     }
                 }
+                // The broker thread is exiting; dependent operations must fail
+                // closed rather than block on a listener no one services.
+                broker_healthy.store(false, Ordering::Release);
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
@@ -570,6 +599,11 @@ fn dispatch_notification(
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let option = i32::try_from(notification.args[2])
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        #[cfg(test)]
+        assert!(
+            !(level == PANIC_SENTINEL_LEVEL && option == PANIC_SENTINEL_OPTION),
+            "test-only setsockopt panic sentinel"
+        );
         if socket_option_is_denied(level, option) {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
@@ -2717,6 +2751,43 @@ mod tests {
             "mediated socket creation waited {blocking_wait:?} behind a slow connect"
         );
         assert_eq!(nonblocking_result, Some(libc::EINPROGRESS));
+    }
+
+    #[test]
+    fn a_panicking_handler_does_not_kill_the_broker() {
+        // A handler panic must fail only that syscall, not hang every later
+        // mediated syscall by silently killing the broker thread. setsockopt
+        // is routed through a hook that panics in test builds on a sentinel
+        // option, standing in for an unexpected handler bug.
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let (panicked, after) = launcher
+            .execute(|| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                // SAFETY: scalar setsockopt with the test-only panic sentinel.
+                let value = 1_i32;
+                let panicked = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        PANIC_SENTINEL_LEVEL,
+                        PANIC_SENTINEL_OPTION,
+                        (&raw const value).cast(),
+                        libc::socklen_t::try_from(size_of::<i32>()).unwrap(),
+                    )
+                };
+                // A later mediated syscall still completes, proving the broker
+                // survived the panic.
+                let after = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+                    .map(drop)
+                    .map_err(|error| error.raw_os_error());
+                (panicked, after)
+            })
+            .expect("launcher result");
+        assert_eq!(panicked, -1, "panicking syscall must fail");
+        assert_eq!(after, Ok(()), "broker must keep mediating after a panic");
     }
 
     #[test]
