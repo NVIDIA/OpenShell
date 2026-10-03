@@ -21,6 +21,7 @@ use openshell_isolation_interface::contract::{
     BoundaryProcess, BoundarySignal, BoundaryTerminal, ProcessAttachment,
 };
 
+use crate::container_log::{AgentOutputSink, AgentStream};
 use crate::process::ProcessIo;
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
@@ -352,10 +353,13 @@ pub struct MainSession {
     finished: AtomicBool,
     terminal_attachments: Mutex<TerminalAttachmentState>,
     terminal_attachments_done: Notify,
+    container_log: Option<AgentOutputSink>,
+    container_log_released: watch::Sender<bool>,
 }
 
 impl MainSession {
     const REMOTE_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const CONTAINER_LOG_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
         let (input, _input_rx) = tokio::sync::mpsc::channel(64);
@@ -379,6 +383,8 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
+            container_log: None,
+            container_log_released: watch::channel(false).0,
         })
     }
 
@@ -387,7 +393,7 @@ impl MainSession {
         let pty = nix::pty::openpty(None, None).expect("open test PTY");
         let slave = std::fs::File::from(pty.slave);
         (
-            Self::new(ProcessIo::Pty(std::fs::File::from(pty.master)), 1),
+            Self::new(ProcessIo::Pty(std::fs::File::from(pty.master)), 1, None),
             slave,
         )
     }
@@ -403,7 +409,7 @@ impl MainSession {
     }
 
     #[must_use]
-    pub fn new(io: ProcessIo, pid: u32) -> Arc<Self> {
+    pub fn new(io: ProcessIo, pid: u32, container_log: Option<AgentOutputSink>) -> Arc<Self> {
         let terminal = matches!(io, ProcessIo::Pty(_));
         let (input, input_rx) = tokio::sync::mpsc::channel(64);
         let pty_master = match &io {
@@ -433,6 +439,8 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
+            container_log: if terminal { None } else { container_log },
+            container_log_released: watch::channel(false).0,
         });
         Self::start_io(&session, io, input_rx);
         session
@@ -474,6 +482,8 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
+            container_log: None,
+            container_log_released: watch::channel(false).0,
         });
         let stdout_session = Arc::clone(&session);
         tokio::spawn(async move {
@@ -608,9 +618,12 @@ impl MainSession {
                         match stdout.read(&mut buffer).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
-                                stdout_session.publish(MainOutput::Stdout(Bytes::copy_from_slice(
-                                    &buffer[..read],
-                                )));
+                                stdout_session
+                                    .publish_agent(
+                                        AgentStream::Stdout,
+                                        Bytes::copy_from_slice(&buffer[..read]),
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -623,9 +636,12 @@ impl MainSession {
                         match stderr.read(&mut buffer).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
-                                stderr_session.publish(MainOutput::Stderr(Bytes::copy_from_slice(
-                                    &buffer[..read],
-                                )));
+                                stderr_session
+                                    .publish_agent(
+                                        AgentStream::Stderr,
+                                        Bytes::copy_from_slice(&buffer[..read]),
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -652,6 +668,20 @@ impl MainSession {
         self.output.publish(event);
     }
 
+    async fn publish_agent(&self, stream: AgentStream, data: Bytes) {
+        self.publish(match stream {
+            AgentStream::Stdout => MainOutput::Stdout(data.clone()),
+            AgentStream::Stderr => MainOutput::Stderr(data.clone()),
+        });
+        if let Some(container_log) = &self.container_log {
+            let mut released = self.container_log_released.subscribe();
+            tokio::select! {
+                () = container_log.send(stream, data) => {}
+                _ = released.wait_for(|released| *released) => {}
+            }
+        }
+    }
+
     fn reader_finished(&self) {
         if self.readers_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.readers_done.notify_waiters();
@@ -663,6 +693,30 @@ impl MainSession {
     ///
     /// Returns whether terminal delivery must complete before shutdown.
     pub async fn finish(&self, exit_code: i32, attachment_expected: bool) -> bool {
+        self.finish_with_timeout(
+            exit_code,
+            attachment_expected,
+            Self::CONTAINER_LOG_DRAIN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn finish_with_timeout(
+        &self,
+        exit_code: i32,
+        attachment_expected: bool,
+        container_log_timeout: std::time::Duration,
+    ) -> bool {
+        if let Some(container_log) = &self.container_log {
+            let delivered = tokio::time::timeout(container_log_timeout, async {
+                self.wait_for_output_readers().await;
+                container_log.drain().await;
+            })
+            .await;
+            if delivered.is_err() {
+                self.container_log_released.send_replace(true);
+            }
+        }
         self.wait_for_output_readers().await;
         self.complete_finish(exit_code, attachment_expected)
     }
@@ -1476,5 +1530,190 @@ mod tests {
         .expect("PTY input timed out");
         assert_eq!(&received[..read], b"client input\n");
         session.release_input(owner);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_is_not_copied_to_the_container_log() {
+        let (log, stdout, stderr) = crate::container_log::test_support::capture_log();
+        let pty = nix::pty::openpty(None, None).expect("open test PTY");
+        let mut slave = std::fs::File::from(pty.slave);
+        let session = MainSession::new(
+            ProcessIo::Pty(std::fs::File::from(pty.master)),
+            1,
+            Some(log.agent_output()),
+        );
+        let mut output = session.subscribe();
+
+        slave.write_all(b"agent output").expect("write PTY output");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+            .await
+            .expect("PTY output timed out")
+            .expect("PTY output was retained");
+        assert!(matches!(event, MainOutput::Stdout(data) if data == b"agent output"[..]));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(stdout.contents(), "");
+        assert_eq!(stderr.contents(), "");
+    }
+
+    #[tokio::test]
+    async fn piped_output_is_copied_to_the_matching_container_stream() {
+        let (log, stdout, stderr) = crate::container_log::test_support::capture_log();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf 'to stdout\\n'; printf 'to stderr\\n' >&2"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test process");
+        let io = ProcessIo::Pipes {
+            stdin: child.stdin.take().expect("stdin"),
+            stdout: child.stdout.take().expect("stdout"),
+            stderr: child.stderr.take().expect("stderr"),
+        };
+        let session = MainSession::new(io, child.id().unwrap_or(0), Some(log.agent_output()));
+        let _ = child.wait().await;
+        session.wait_for_output_readers().await;
+
+        assert_eq!(stdout.wait_for("to stdout\n").await, "to stdout\n");
+        assert_eq!(stderr.wait_for("to stderr\n").await, "to stderr\n");
+    }
+
+    #[tokio::test]
+    async fn finish_waits_for_output_to_reach_the_container_log() {
+        let gate = crate::container_log::test_support::Gate::default();
+        let (log, stdout, _stderr) = crate::container_log::test_support::gated_capture_log(&gate);
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf 'last words\\n'"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test process");
+        let io = ProcessIo::Pipes {
+            stdin: child.stdin.take().expect("stdin"),
+            stdout: child.stdout.take().expect("stdout"),
+            stderr: child.stderr.take().expect("stderr"),
+        };
+        let session = MainSession::new(io, child.id().unwrap_or(0), Some(log.agent_output()));
+        let _ = child.wait().await;
+        let finish = tokio::spawn({
+            let session = session.clone();
+            async move { session.finish(1, false).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!finish.is_finished());
+
+        gate.open();
+        finish.await.expect("finish task");
+        assert_eq!(stdout.contents(), "last words\n");
+    }
+
+    fn spawn_piped(script: &str) -> (tokio::process::Child, ProcessIo) {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn test process");
+        let io = ProcessIo::Pipes {
+            stdin: child.stdin.take().expect("stdin"),
+            stdout: child.stdout.take().expect("stdout"),
+            stderr: child.stderr.take().expect("stderr"),
+        };
+        (child, io)
+    }
+
+    #[tokio::test]
+    async fn finish_releases_readers_blocked_on_a_stalled_container_log() {
+        let gate = crate::container_log::test_support::Gate::default();
+        let (log, _stdout, _stderr) = crate::container_log::test_support::gated_capture_log(&gate);
+        let (child, io) = spawn_piped("head -c 1048576 /dev/zero");
+        let session = MainSession::new(io, child.id().unwrap_or(0), Some(log.agent_output()));
+
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.finish_with_timeout(1, false, std::time::Duration::from_millis(50)),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "finish waited on the stalled container log"
+        );
+        gate.open();
+    }
+
+    #[tokio::test]
+    async fn stderr_and_attachments_flow_while_stdout_log_is_stalled() {
+        let gate = crate::container_log::test_support::Gate::default();
+        let (log, _stdout, stderr) = crate::container_log::test_support::gated_capture_log(&gate);
+        let (child, io) = spawn_piped(
+            "head -c 1048576 /dev/zero & for i in $(seq 1 100); do echo tick >&2; sleep 0.05; done",
+        );
+        let session = MainSession::new(io, child.id().unwrap_or(0), Some(log.agent_output()));
+        let mut output = session.subscribe();
+
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut ticks = 0;
+            while ticks < 20 {
+                if let Ok(MainOutput::Stderr(data)) = output.recv().await {
+                    ticks += data.windows(4).filter(|window| window == b"tick").count();
+                }
+            }
+        })
+        .await;
+        assert!(replayed.is_ok(), "attachment stopped receiving stderr");
+        let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stderr.contents().matches("tick").count() < 20 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(logged.is_ok(), "container stderr stopped receiving output");
+        gate.open();
+    }
+
+    #[tokio::test]
+    async fn attachments_receive_output_waiting_on_a_stalled_container_log() {
+        let gate = crate::container_log::test_support::Gate::default();
+        let (log, _stdout, _stderr) = crate::container_log::test_support::gated_capture_log(&gate);
+        let sink = log.agent_output();
+        let (child, io) = spawn_piped("sleep 5");
+        let session = MainSession::new(io, child.id().unwrap_or(0), Some(sink.clone()));
+        let saturate = tokio::spawn(async move {
+            loop {
+                sink.send(AgentStream::Stdout, Bytes::from_static(b"x"))
+                    .await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut output = session.subscribe();
+        let publisher = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .publish_agent(AgentStream::Stdout, Bytes::from_static(b"marker"))
+                    .await;
+            }
+        });
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(MainOutput::Stdout(data)) = output.recv().await
+                    && data == b"marker"[..]
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            received.is_ok(),
+            "attachment waited on the stalled container log"
+        );
+        saturate.abort();
+        publisher.abort();
+        gate.open();
     }
 }

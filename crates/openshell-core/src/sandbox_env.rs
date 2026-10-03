@@ -185,7 +185,7 @@ pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
 /// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
 pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
-/// Path to the CA certificate for mTLS communication with the gateway.
+/// Path to the CA certificate used to authenticate the gateway TLS endpoint.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 
 /// Path to the client certificate for mTLS communication with the gateway.

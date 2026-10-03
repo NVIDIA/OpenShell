@@ -126,6 +126,10 @@ that signs credentials, and every credential names exactly one sandbox.
 | **Supervisor** to **sandbox** | The **supervisor** dials into the workload over the driver's private channel. | Mutual TLS, plus a sandbox JWT. |
 | Agent to **supervisor** | The agent never connects directly. The **sandbox** relays its traffic over the connection above. | Covered by the supervisor-to-sandbox channel. |
 
+The **supervisor** verifies the gateway's TLS certificate with its CA. User
+client certificates and private keys stay outside both the **supervisor** and
+workload; the gateway JWT authenticates supervisor RPCs.
+
 ### Getting the first credential
 
 The **supervisor** needs a starting credential to prove which sandbox it belongs

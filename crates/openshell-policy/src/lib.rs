@@ -1348,6 +1348,61 @@ pub fn validate_sandbox_policy(
     validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
 }
 
+/// Validate filesystem paths shared by typed policies and raw OPA data.
+///
+/// Paths must be absolute, contain no parent traversal, and fit the path count
+/// and byte limits. Read-write access to the filesystem root is forbidden.
+/// Callers that expose errors outside trusted authoring tools must redact the
+/// path values carried by the returned violations.
+pub fn validate_filesystem_paths(
+    read_only: &[String],
+    read_write: &[String],
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    let total_paths = read_only.len() + read_write.len();
+    if total_paths > MAX_FILESYSTEM_PATHS {
+        violations.push(PolicyViolation::TooManyPaths { count: total_paths });
+    }
+
+    for path_str in read_only.iter().chain(read_write.iter()) {
+        if path_str.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::FieldTooLong {
+                path: truncate_for_display(path_str),
+                length: path_str.len(),
+            });
+            continue;
+        }
+        let path = Path::new(path_str);
+        if !path.has_root() {
+            violations.push(PolicyViolation::RelativePath {
+                path: path_str.clone(),
+            });
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::PathTraversal {
+                path: path_str.clone(),
+            });
+        }
+    }
+
+    for path_str in read_write {
+        // Repeated separators still designate the filesystem root.
+        if path_str.trim_end_matches('/').is_empty() {
+            violations.push(PolicyViolation::OverlyBroadPath {
+                path: path_str.clone(),
+            });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpVersionPresence {
     RequireMaterialized,
@@ -1389,50 +1444,10 @@ fn validate_sandbox_policy_with_mcp_presence(
         });
     }
 
-    // Check filesystem paths
-    if let Some(ref fs) = policy.filesystem {
-        let total_paths = fs.read_only.len() + fs.read_write.len();
-        if total_paths > MAX_FILESYSTEM_PATHS {
-            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
-        }
-
-        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
-            if path_str.len() > MAX_PATH_LENGTH {
-                violations.push(PolicyViolation::FieldTooLong {
-                    path: truncate_for_display(path_str),
-                    length: path_str.len(),
-                });
-                continue;
-            }
-
-            let path = Path::new(path_str);
-
-            if !path.has_root() {
-                violations.push(PolicyViolation::RelativePath {
-                    path: path_str.clone(),
-                });
-            }
-
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                violations.push(PolicyViolation::PathTraversal {
-                    path: path_str.clone(),
-                });
-            }
-        }
-
-        // Only reject "/" as read-write (overly broad)
-        for path_str in &fs.read_write {
-            let normalized = path_str.trim_end_matches('/');
-            if normalized.is_empty() {
-                // Path is "/" or "///" etc.
-                violations.push(PolicyViolation::OverlyBroadPath {
-                    path: path_str.clone(),
-                });
-            }
-        }
+    if let Some(ref fs) = policy.filesystem
+        && let Err(errors) = validate_filesystem_paths(&fs.read_only, &fs.read_write)
+    {
+        violations.extend(errors);
     }
 
     // Protobuf maps do not preserve iteration order. Sort rule keys so callers

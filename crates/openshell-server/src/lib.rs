@@ -22,10 +22,12 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_ocsf;
 mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+mod ocsf_log;
 mod otel_tracing;
 mod pagination;
 mod persistence;
@@ -949,9 +951,11 @@ pub(crate) async fn run_server(
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
-    state
-        .compute
-        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+    state.compute.spawn_watchers(
+        shutdown_rx.clone(),
+        startup_rx,
+        state.sandbox_session_jwt_authority.clone(),
+    );
 
     // Serve the gateway before reconciling persisted sandboxes so restored
     // supervisors can fetch policy and register their sessions.
@@ -1264,6 +1268,21 @@ pub trait ComputeDriverFactory: Send + Sync {
         false
     }
 
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1275,8 +1294,6 @@ pub struct ComputeDriverRegistration {
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
-    local_singleplayer: bool,
-    supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
@@ -1307,8 +1324,6 @@ impl ComputeDriverRegistration {
             detect,
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
-            local_singleplayer: false,
-            supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
@@ -1334,17 +1349,10 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Mark a backend whose local deployment should use single-player defaults.
+    /// Compatibility no-op retained for existing factory registrations.
+    /// Gateway mTLS user authentication is independent of compute drivers.
     #[must_use]
-    pub fn with_local_singleplayer(mut self) -> Self {
-        self.local_singleplayer = true;
-        self
-    }
-
-    /// Mark a backend that requires user authentication other than mTLS.
-    #[must_use]
-    pub fn without_mtls_user_auth(mut self) -> Self {
-        self.supports_mtls_user_auth = false;
+    pub fn with_local_singleplayer(self) -> Self {
         self
     }
 
@@ -1356,16 +1364,6 @@ impl ComputeDriverRegistration {
     ) -> Self {
         self.in_process_tracing = Some(tracing);
         self
-    }
-
-    #[must_use]
-    pub(crate) fn is_local_singleplayer(&self) -> bool {
-        self.local_singleplayer
-    }
-
-    #[must_use]
-    pub(crate) fn supports_mtls_user_auth(&self) -> bool {
-        self.supports_mtls_user_auth
     }
 
     #[must_use]
@@ -1600,13 +1598,13 @@ impl ComputeDriverBuildContext<'_> {
         self.config.gateway_tls_enabled()
     }
 
-    /// Gateway client credentials that a local driver may mount into guests.
+    /// Gateway CA certificate that a local driver may provide to supervisors.
     #[must_use]
-    pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
+    pub fn guest_tls_ca(&self) -> Option<&Path> {
         self.config
             .driver_startup
             .guest_tls
-            .map(compute::driver_config::GuestTlsPaths::as_paths)
+            .map(compute::driver_config::GuestTlsPaths::as_path)
     }
 
     /// Deserialize the selected driver's merged TOML table.

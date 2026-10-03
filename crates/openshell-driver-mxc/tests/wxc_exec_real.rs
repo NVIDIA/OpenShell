@@ -767,7 +767,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };
-    let backend = MxcComputeBackend::new(config);
+    let backend = MxcComputeBackend::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
     backend
         .create_sandbox(&sandbox)
         .await

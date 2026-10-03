@@ -15,7 +15,6 @@ depends = [
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
   "test:gateway-config",
-  "test:e2e-parity",
   "test:packaging-assets",
   "test:qualification-summary",
   "test:codex-security-release-range",

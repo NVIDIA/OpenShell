@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Detect package gateway runtime
+  ansible.builtin.include_role:
+    name: openshell_gateway
+    tasks_from: detect.yaml
+
+- name: Create runtime image staging directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell
+    state: directory
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0700"
+
+- name: Load candidate runtime images
+  ansible.builtin.include_role:
+    name: openshell_gateway
+    tasks_from: "{{ openshell_gateway_driver }}.yaml"
+
+# Package defaults select published images. Keep candidate image overrides
+# separate from the operator-owned gateway.toml in both installers.
+- name: Create qualification configuration directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/openshell-qualification
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure candidate runtime images for qualification
+  become: true
+  ansible.builtin.template:
+    src: gateway.toml.j2
+    dest: /var/lib/openshell-qualification/gateway.toml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Create packaged gateway environment directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_home }}/.config/openshell"
+    state: directory
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0700"
+
+- name: Select qualification gateway configuration
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0600"
+    content: |
+      OPENSHELL_GATEWAY_CONFIG=/var/lib/openshell-qualification/gateway.toml
+
+- name: Start gateway user manager
+  ansible.builtin.include_role:
+    name: tmachine_user_manager
+  vars:
+    tmachine_user_manager_user: "{{ openshell_gateway_user }}"
+    tmachine_user_manager_uid: "{{ openshell_gateway_uid }}"
+
+- name: Start packaged gateway service
+  become: true
+  become_user: "{{ openshell_gateway_user }}"
+  ansible.builtin.systemd_service:
+    name: openshell-gateway.service
+    scope: user
+    daemon_reload: true
+    enabled: true
+    state: started
+  environment:
+    HOME: "{{ openshell_gateway_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ openshell_gateway_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ openshell_gateway_uid }}/bus"
+
+- name: Wait for packaged gateway
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 17670
+    timeout: 60
+
+# The rootful Podman gateway uses root's image store and packaged user service.
+# Copy only client credentials so the test runner can register that gateway
+# without granting access to root's home or copying server signing keys.
+- name: Prepare test client for rootful gateway
+  when: openshell_gateway_user == 'root'
+  block:
+    - name: Read rootful gateway client credentials
+      become: true
+      ansible.builtin.slurp:
+        src: "/root/.local/state/openshell/tls/{{ item }}"
+      loop: [ca.crt, client/tls.crt, client/tls.key]
+      register: openshell_packaged_gateway_client_credentials
+      no_log: true
+
+    - name: Create test client credential directory
+      ansible.builtin.file:
+        path: /home/tmachine/.config/openshell/gateways/openshell/mtls
+        state: directory
+        mode: "0700"
+
+    - name: Install test client credentials
+      ansible.builtin.copy:
+        content: "{{ item.content | b64decode }}"
+        dest: "/home/tmachine/.config/openshell/gateways/openshell/mtls/{{ item.item | basename }}"
+        mode: "0600"
+      loop: "{{ openshell_packaged_gateway_client_credentials.results }}"
+      no_log: true
+
+- name: Register packaged gateway
+  ansible.builtin.include_role:
+    name: openshell_client
+  vars:
+    openshell_client_gateway_endpoint: https://127.0.0.1:17670
+    openshell_client_gateway_name: openshell

@@ -31,10 +31,10 @@ pub const FILE_TRANSFER_ROUND_TRIP_SCENARIO: Scenario = Scenario {
     run: run_round_trip,
 };
 
-/// Certify Git-aware upload filtering and fallback behavior.
+/// Certify Git-aware upload filtering and explicit unfiltered uploads.
 pub const FILE_TRANSFER_GIT_FILTERING_SCENARIO: Scenario = Scenario {
     name: "file-transfer/git-filtering",
-    description: "Verify Git-aware upload selection and unfiltered fallback behavior.",
+    description: "Verify Git-aware upload selection and explicit unfiltered uploads.",
     run: run_git_filtering,
 };
 
@@ -68,7 +68,8 @@ fn run_git_filtering(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
         let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "git-filtering").await?;
         gitignore_filtering(runner, &sandbox_name, &remote_root, local.path()).await?;
         single_file_from_git_repo(runner, &sandbox_name, &remote_root, local.path()).await?;
-        gitignored_directory_fallback(runner, &sandbox_name, &remote_root, local.path()).await?;
+        gitignored_directory_requires_override(runner, &sandbox_name, &remote_root, local.path())
+            .await?;
         delete_sandbox(runner, &sandbox_name).await
     })
 }
@@ -151,7 +152,16 @@ async fn round_trip(
     fs::write(source.join("large.bin"), &large).map_err(fs_error("write large.bin"))?;
 
     let remote = format!("{remote_root}/roundtrip");
-    upload(runner, sandbox, "roundtrip/upload", &source, &remote, true).await?;
+    let result =
+        upload_result(runner, sandbox, "roundtrip/upload", &source, &remote, false).await?;
+    result.require_success()?;
+    if !result.stderr().contains("outside a Git work tree")
+        || !result.stderr().contains(".gitignore rules are not applied")
+    {
+        return Err(
+            result.failure_diagnostic("upload outside Git warns that filtering is disabled")
+        );
+    }
 
     let destination = local_root.join("roundtrip-download");
     fs::create_dir(&destination).map_err(fs_error("create round-trip destination"))?;
@@ -193,7 +203,7 @@ async fn round_trip(
         "single/upload",
         &single,
         &remote_single,
-        true,
+        false,
     )
     .await?;
     let single_destination = local_root.join("single-download");
@@ -462,7 +472,7 @@ async fn download_dash_leading_name(
     )
 }
 
-async fn gitignored_directory_fallback(
+async fn gitignored_directory_requires_override(
     runner: &OpenShellRunner,
     sandbox: &str,
     remote_root: &str,
@@ -472,22 +482,22 @@ async fn gitignored_directory_fallback(
     exec(
         runner,
         sandbox,
-        "gitignored-fallback/seed",
+        "gitignored-override/seed",
         &format!("mkdir -p '{remote_root}/runs' && printf downloaded-payload > '{remote_seed}'"),
     )
     .await?;
 
-    let repository = local_root.join("fallback-repo");
-    fs::create_dir(&repository).map_err(fs_error("create fallback repository"))?;
+    let repository = local_root.join("override-repo");
+    fs::create_dir(&repository).map_err(fs_error("create override repository"))?;
     git_init(&repository).await?;
     fs::write(repository.join(".gitignore"), "runs/\n")
-        .map_err(fs_error("write fallback .gitignore"))?;
+        .map_err(fs_error("write override .gitignore"))?;
     let runs = repository.join("runs");
     fs::create_dir(&runs).map_err(fs_error("create ignored runs directory"))?;
     download(
         runner,
         sandbox,
-        "gitignored-fallback/download-seed",
+        "gitignored-override/download-seed",
         &remote_seed,
         &runs,
     )
@@ -495,29 +505,47 @@ async fn gitignored_directory_fallback(
     require_exists(&runs.join("test.json"), "downloaded ignored file")?;
 
     let remote = format!("{remote_root}/reuploaded");
-    let upload_result = upload_result(
+    let rejected = upload_result(
         runner,
         sandbox,
-        "gitignored-fallback/upload",
+        "gitignored-override/reject-upload",
         &runs,
         &remote,
         false,
     )
     .await?;
-    upload_result.require_success()?;
-    let output = format!("{}\n{}", upload_result.stdout(), upload_result.stderr());
-    if !output.contains(".gitignore filtering excluded all files") {
-        return Err(upload_result.failure_diagnostic(
-            "upload warns that Git filtering excluded every file and falls back to an unfiltered transfer",
+    let output = format!("{}\n{}", rejected.stdout(), rejected.stderr());
+    if rejected.success()
+        || !output.contains("filtering selected no files")
+        || !output.contains("--no-git-ignore")
+    {
+        return Err(rejected.failure_diagnostic(
+            "upload rejects an empty Git selection and explains the explicit override",
         ));
     }
+    exec(
+        runner,
+        sandbox,
+        "gitignored-override/no-transfer",
+        &format!("test ! -e '{remote}'"),
+    )
+    .await?;
+    upload(
+        runner,
+        sandbox,
+        "gitignored-override/upload",
+        &runs,
+        &remote,
+        true,
+    )
+    .await?;
 
-    let destination = local_root.join("fallback-download");
-    fs::create_dir(&destination).map_err(fs_error("create fallback destination"))?;
+    let destination = local_root.join("override-download");
+    fs::create_dir(&destination).map_err(fs_error("create override destination"))?;
     download(
         runner,
         sandbox,
-        "gitignored-fallback/download",
+        "gitignored-override/download",
         &remote,
         &destination,
     )
@@ -558,7 +586,7 @@ async fn upload_result(
     }
     runner
         .step(step)
-        .description(format!("upload {source:?} to {destination:?} succeeds"))
+        .description(format!("upload {source:?} to {destination:?}"))
         .with_timeout(TRANSFER_TIMEOUT)
         .run(&args)
         .await

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
-use openshell_core::proto::ProviderProfile;
+use openshell_core::policy_identity::canonical_rule_bytes;
+use openshell_core::proto::{NetworkPolicyRule, ProviderProfile};
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
@@ -102,7 +103,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
             if let Some(profile) = stored.profile {
                 let mut profile = profile_response_payload(profile, resource_version);
                 normalize_provider_profile_mcp_fields(&mut profile);
-                hasher.update(profile.encode_to_vec());
+                hasher.update(canonical_provider_profile_bytes(&profile));
                 profiles.push(ScopedSnapshotProfile {
                     scope: ProfileScope::Platform,
                     profile,
@@ -123,7 +124,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
                 if let Some(profile) = stored.profile {
                     let mut profile = profile_response_payload(profile, resource_version);
                     normalize_provider_profile_mcp_fields(&mut profile);
-                    hasher.update(profile.encode_to_vec());
+                    hasher.update(canonical_provider_profile_bytes(&profile));
                     profiles.push(ScopedSnapshotProfile {
                         scope: ProfileScope::Workspace,
                         profile,
@@ -495,7 +496,38 @@ fn hash_scoped_profile_revision(entry: &ScopedProfileEntry, hasher: &mut Sha256)
         b"source-managed"
     };
     hasher.update(ownership_tag);
-    hasher.update(entry.response.encode_to_vec());
+    hasher.update(canonical_provider_profile_bytes(&entry.response));
+}
+
+/// Keep profile revision inputs stable across protobuf map iteration orders.
+fn canonical_provider_profile_bytes(profile: &ProviderProfile) -> Vec<u8> {
+    let mut map_free = profile.clone();
+    map_free.annotations.clear();
+    map_free.endpoints.clear();
+
+    let mut out = Vec::new();
+    append_canonical_bytes(&mut out, &map_free.encode_to_vec());
+    let mut annotations = profile.annotations.iter().collect::<Vec<_>>();
+    annotations.sort_by_key(|(key, _)| key.as_str());
+    out.extend_from_slice(&(annotations.len() as u64).to_le_bytes());
+    for (key, value) in annotations {
+        append_canonical_bytes(&mut out, key.as_bytes());
+        append_canonical_bytes(&mut out, value.as_bytes());
+    }
+    out.extend_from_slice(&(profile.endpoints.len() as u64).to_le_bytes());
+    for endpoint in &profile.endpoints {
+        let rule = NetworkPolicyRule {
+            endpoints: vec![endpoint.clone()],
+            ..Default::default()
+        };
+        append_canonical_bytes(&mut out, &canonical_rule_bytes(&rule));
+    }
+    out
+}
+
+fn append_canonical_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn scope_to_string(scope: ProfileScope) -> &'static str {
@@ -709,7 +741,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-profile-snapshot-v1");
     for profile in profiles {
-        hasher.update(profile.encode_to_vec());
+        hasher.update(canonical_provider_profile_bytes(&profile));
     }
     format!("sha256:{:x}", hasher.finalize())
 }
@@ -1615,6 +1647,63 @@ mod tests {
             }),
             profile: Some(proto),
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_annotated_profile_has_stable_revisions() {
+        use std::collections::HashSet;
+
+        let store = crate::persistence::test_store().await;
+        let mut stored = stored_profile_in_workspace("annotated-api", "default");
+        stored.profile.as_mut().unwrap().annotations = (0..8)
+            .map(|index| (format!("key-{index}"), format!("value-{index}")))
+            .collect();
+        store.put_message(&stored).await.unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+        let mut source_revisions = HashSet::new();
+        let mut profile_revisions = HashSet::new();
+        for _ in 0..32 {
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            source_revisions.insert(catalog.revision().to_string());
+            let mut hasher = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("annotated-api", "default", &mut hasher);
+            profile_revisions.insert(hasher.finalize().to_vec());
+        }
+
+        assert_eq!(source_revisions.len(), 1);
+        assert_eq!(profile_revisions.len(), 1);
+    }
+
+    #[test]
+    fn canonical_profile_bytes_sort_nested_endpoint_maps() {
+        use openshell_core::proto::GraphqlOperation;
+
+        let mut first = profile("mapped-endpoint");
+        let endpoint = first.endpoints.first_mut().unwrap();
+        endpoint.graphql_persisted_queries = (0..8)
+            .map(|index| (format!("query-{index}"), GraphqlOperation::default()))
+            .collect();
+        let mut second = first.clone();
+        second.endpoints[0].graphql_persisted_queries = (0..8)
+            .rev()
+            .map(|index| (format!("query-{index}"), GraphqlOperation::default()))
+            .collect();
+
+        assert_eq!(
+            canonical_provider_profile_bytes(&first),
+            canonical_provider_profile_bytes(&second)
+        );
+        assert!(
+            second.endpoints[0]
+                .graphql_persisted_queries
+                .remove("query-0")
+                .is_some()
+        );
+        assert_ne!(
+            canonical_provider_profile_bytes(&first),
+            canonical_provider_profile_bytes(&second)
+        );
     }
 
     #[tokio::test]

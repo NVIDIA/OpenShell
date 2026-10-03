@@ -363,6 +363,18 @@ func ProviderProfileFromProto(p *pb.ProviderProfile) *types.ProviderProfile {
 		}
 	}
 
+	// Files
+	if files := p.GetFiles(); len(files) > 0 {
+		result.Files = make([]types.ProfileFile, len(files))
+		for i, file := range files {
+			if file != nil {
+				result.Files[i] = types.ProfileFile{
+					Path: file.GetPath(), Content: file.GetContent(), EnvVar: file.GetEnvVar(),
+				}
+			}
+		}
+	}
+
 	// Endpoints
 	if eps := p.GetEndpoints(); len(eps) > 0 {
 		result.Endpoints = make([]types.NetworkEndpoint, len(eps))
@@ -416,6 +428,16 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 		result.Credentials = make([]*pb.ProviderProfileCredential, len(p.Credentials))
 		for i := range p.Credentials {
 			result.Credentials[i] = ProfileCredentialToProto(&p.Credentials[i])
+		}
+	}
+
+	// Files
+	if len(p.Files) > 0 {
+		result.Files = make([]*pb.ProviderProfileFile, len(p.Files))
+		for i, file := range p.Files {
+			result.Files[i] = &pb.ProviderProfileFile{
+				Path: file.Path, Content: file.Content, EnvVar: file.EnvVar,
+			}
 		}
 	}
 

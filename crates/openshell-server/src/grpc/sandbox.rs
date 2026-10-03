@@ -40,7 +40,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxTemplate, SshSession,
+    SandboxRestartPolicy, SandboxTemplate, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -238,6 +238,13 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
     Ok(sandbox)
 }
 
+fn require_ready_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok() {
+        Some(SandboxPhase::Ready) => Ok(()),
+        _ => Err(Status::failed_precondition("sandbox is not ready")),
+    }
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -420,6 +427,13 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -454,12 +468,16 @@ async fn handle_create_sandbox_inner(
         resolved.providers = governance_spec.providers;
         resolved.command = governance_spec.command;
         resolved.tty = governance_spec.tty;
+        resolved.restart_policy = governance_spec.restart_policy;
         (resolved, Some(provenance))
     };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
     spec.provider_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
+        spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
 
     // Leave an omitted command empty rather than persisting a concrete shell:
     // the sandbox boundary resolves the default login shell against the agent image
@@ -662,6 +680,11 @@ async fn handle_create_sandbox_inner(
             &sandbox,
             &exposure.service,
             exposure.target_port,
+            super::service::validate_service_exposure_request(
+                &exposure.service,
+                exposure.target_port,
+                exposure.authorization_mode,
+            )?,
         )
         .await
         {
@@ -723,7 +746,11 @@ fn validate_create_sandbox_request_pre_io(
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
-        super::service::validate_service_exposure_request(&exposure.service, exposure.target_port)?;
+        super::service::validate_service_exposure_request(
+            &exposure.service,
+            exposure.target_port,
+            exposure.authorization_mode,
+        )?;
         if !service_names.insert(exposure.service.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "duplicate service exposure name: '{}'",
@@ -2416,9 +2443,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
@@ -2931,9 +2956,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
-    }
+    require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
@@ -3722,7 +3745,7 @@ impl russh::client::Handler for SandboxSshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -3910,7 +3933,9 @@ mod tests {
         test_server_state_with_driver,
     };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
+    use openshell_core::proto::{
+        GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
+    };
 
     // ---- shell_escape ----
 
@@ -6658,6 +6683,10 @@ mod tests {
 
         let created = response.sandbox.expect("created sandbox");
         assert_eq!(
+            created.spec.as_ref().unwrap().restart_policy(),
+            SandboxRestartPolicy::Never
+        );
+        assert_eq!(
             created
                 .metadata
                 .as_ref()
@@ -6702,10 +6731,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: String::new(),
                         target_port: 4500,
+                        authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                     },
                 ],
                 ..Default::default()
@@ -6738,7 +6769,44 @@ mod tests {
             assert_eq!(endpoint.name, service);
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
+            let expected_mode = if service.is_empty() {
+                ServiceAuthorizationMode::Strip
+            } else {
+                ServiceAuthorizationMode::BearerPassthrough
+            };
+            assert_eq!(endpoint.authorization_mode(), expected_mode);
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_unknown_service_authorization_mode_before_persisting() {
+        let state = test_server_state().await;
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "invalid-service-authorization".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: vec![SandboxServiceExposure {
+                    service: String::new(),
+                    target_port: 4500,
+                    authorization_mode: 99,
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("unknown service authorization mode should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "invalid-service-authorization")
+                .await
+                .expect("sandbox lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6770,10 +6838,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -6857,10 +6927,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8081,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -7549,7 +7621,7 @@ mod tests {
     fn template_create_sandbox_spec_field_policy_is_exhaustive() {
         assert_proto_fields_classified(
             "openshell.v1.SandboxSpec",
-            &["policy", "providers", "command", "tty"],
+            &["policy", "providers", "command", "tty", "restart_policy"],
             &[
                 "log_level",
                 "environment",

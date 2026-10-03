@@ -16,7 +16,7 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
 - **Do** interrogate your agent until you understand every edge case and interaction in your changes.
 - **Don't** submit code you can't explain without your agent open.
-- **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
+- **Don't** use agents as a substitute for understanding the system. Read the RFCs, crate READMEs, and published docs.
 
 ## First-Time Contributors
 
@@ -35,18 +35,18 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, roadmap placement, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents require the expected lifecycle state and the appropriate human-applied `agent:*` request label. An agent directly asked to work on a specific issue warns about missing or incomplete expected labels and continues with the requested phase without changing them.
+An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
 ## Before You Open an Issue
 
 Search open and closed issues for the same need. Bug reports and feature requests must include:
 
-1. **User Story:** who needs the change and what they need to do.
+1. **User Story:** attest that you personally use OpenShell and describe the specific use case and behavior you directly encountered or need. Agents must ask the human operator for this first-hand context before filing if it is missing.
 2. **Problem Statement:** a concise summary of what is broken or missing in the current behavior.
 3. **Impact / Why This Matters:** the consequences of the current behavior, the current workaround, and why that workaround is insufficient.
 4. **Acceptance Criteria:** specific, observable outcomes that define success.
 
-Feature requests must also propose a user-facing workflow and describe alternatives considered. Define the externally observable behavior and leave internal implementation choices open. Bug reports instead include minimal reproduction steps, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior.
+Feature requests must also propose a user-facing workflow and describe alternatives considered, including relevant OpenShell extension points. When an existing middleware, interceptor, provider, or other extension can satisfy the use case, prefer that path. Running another service alone is not grounds to dismiss it. For changes to configuration, CLI, SDK, or other user experience, include notional examples for human review. Bug reports must include reproduction steps using only an OpenShell deployment, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior. Do not install third-party tools solely to demonstrate reproducibility. Frame every issue entirely in terms of OpenShell.
 
 The project includes optional [agent skills](#agent-skills) for using OpenShell and contributing to the repository. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
 
@@ -110,175 +110,13 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
-### Workflow Chains
+### Issue Workflow
 
-Skills connect into pipelines. Individual skill files don't describe these relationships.
+Community issues move through triage, technical validation, and human acceptance. The repository's `state:*` labels record these stages. Inspect the current GitHub labels and their descriptions before applying or interpreting them; do not assume a fixed label list. An agent may assess evidence and request missing information. A maintainer decides whether to accept valid work and where it belongs on the roadmap.
 
-- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
-- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
-- **Security:** `review-security-issue` → `fix-security-issue`
-- **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
+A direct request to an agent authorizes the requested planning or implementation. A request to plan alone does not authorize implementation. For unattended work, inspect current state descriptions, maintainer assignments, and comments to determine the authorized phase. Technical validation alone does not authorize implementation. Check for an existing owner, branch, or PR before starting.
 
-### Issue Lifecycle, Roadmap, and Agent Work
-
-OpenShell separates technical assessment, roadmap decisions, sequencing, and agent delegation.
-
-An open issue is not automatically accepted or ready for implementation. Check its `state:*` label before starting work, and ask a maintainer when its status is unclear.
-
-#### The Four Decisions
-
-Each issue can require four independent decisions:
-
-| Decision | Question | Recorded by |
-|---|---|---|
-| Assessment | Is the report technically valid, and is there enough evidence to act on it? | `state:*` |
-| Disposition | Should OpenShell pursue the work? | `state:accepted`, roadmap placement, or closure as not planned |
-| Sequencing | Where does accepted work sit relative to everything else? | Placement on the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) |
-| Ownership | Will a human implement the issue, will a user directly instruct an agent, or will a maintainer queue it for an unattended agent? | Direct instruction or optional `agent:*` workflow |
-
-`state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. A maintainer signals acceptance with `state:accepted` or roadmap placement. Roadmap placement also communicates sequencing, but it does not assign an owner or queue an unattended agent.
-
-#### Who Controls Each Decision
-
-Agents investigate issues, collect evidence, and report technical findings. Humans retain the product and investment decisions.
-
-| Action | Who performs it |
-|---|---|
-| Assess technical validity and impact | Triage agent or human triager |
-| Request missing evidence | Triage agent or human triager |
-| Mark the assessment complete with `state:validated` | Triage agent or human triager |
-| Accept or decline the work with `state:accepted`, roadmap placement, or closure | Maintainer |
-| Place the issue on the roadmap or move it | Maintainer |
-| Directly request an agent plan | User |
-| Queue an agent plan with `agent:plan-requested` | Maintainer |
-| Produce a plan, implement it, and open a pull request | Agent |
-| Directly request agent implementation | User |
-| Queue approved implementation with `agent:implementation-requested` | Maintainer |
-
-Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. A direct request may authorize work outside the recorded workflow, but it does not alter the issue's disposition or make the labels accurate.
-
-#### Issue State
-
-The `state:*` namespace records the issue's disposition for all contributors, regardless of who might implement it.
-
-| State | Meaning | Normal next action |
-|---|---|---|
-| `state:triage-needed` | The issue has not been assessed. New issues from users without repository write access receive this automatically. | Investigate the report and record the result. |
-| `state:needs-info` | The assessment needs specific evidence or reproduction details. | The reporter or another contributor supplies the requested information. |
-| `state:validated` | The factual assessment is complete. | A maintainer accepts the issue, declines it, or asks for more evidence. |
-| `state:accepted` | A maintainer decided that OpenShell should pursue the issue. | A human may implement it, or a maintainer may delegate work to an agent. |
-
-Keep one of these states on an open issue. When new evidence resolves a `state:needs-info` request, reassess the issue and move it to `state:validated` if the evidence is sufficient.
-
-`state:stale` is an inactivity marker, not a lifecycle decision. Accepted issues and issues awaiting human disposition are exempt from stale handling. An issue in `state:needs-info` can become stale if no new evidence arrives.
-
-#### Assessing an Incoming Issue
-
-Triage checks the user story, reproduction or workflow, environment, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
-
-| Outcome | State or resolution |
-|---|---|
-| A bug is confirmed. | Replace the intake state with `state:validated`. |
-| A feature proposal is technically coherent and feasible. | Replace the intake state with `state:validated`. |
-| The report is credible but needs a deeper investigation or spike. | Add the `spike` label when available and use `state:validated` so a human can decide whether to invest in the investigation. |
-| Critical evidence is missing, or a faithful attempt cannot reproduce the problem. | Use `state:needs-info` and request the exact evidence needed. |
-| A released change already fixes the behavior. | Explain the fix and version. Close the issue only when the causal link is clear; otherwise request a retest. |
-| Another issue is the canonical report. | Link the canonical issue and close the duplicate. |
-| The behavior is expected or caused by unsupported configuration. | Explain the finding and close the issue with the appropriate GitHub reason. |
-| The report describes a security vulnerability. | Stop public triage and follow the private process in `SECURITY.md`. |
-
-Triage establishes facts and impact. It does not decide whether the project should spend time on the work.
-
-#### Human Disposition
-
-When an issue reaches `state:validated`, a maintainer chooses one of three paths:
-
-- **Accept:** apply `state:accepted`, place the issue on the roadmap, or do both. Either action signals that OpenShell should pursue the work; roadmap placement additionally records sequencing.
-- **Decline:** close it as not planned and record the rationale.
-- **Await more evidence:** replace `state:validated` with `state:needs-info` and leave it off the roadmap.
-
-Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records the human decision that OpenShell should pursue the work. Roadmap placement records the same acceptance decision plus sequencing.
-
-#### Roadmap
-
-OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an issue with a roadmap item, signaling acceptance and giving it timing. Issues tracked on the roadmap carry the `roadmap` label.
-
-An issue with `state:accepted` and no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
-
-Roadmap placement does not assign an owner. A roadmap issue still needs a human contributor, a direct user instruction to an agent, or an unattended-agent queue label.
-
-`good first issue` and `help wanted` describe contributor suitability, not sequencing.
-
-#### Human or Agent Ownership
-
-A human contributor may implement an accepted issue without any `agent:*` label. Before starting, check for an assignee, linked pull request, active branch, or comment that shows someone else is already working on it.
-
-Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase even if the issue does not match the normal lifecycle or agent-workflow state. The agent warns about each missing or incomplete expected label and continues without changing the labels.
-
-| Agent workflow | Applied by | Meaning |
-|---|---|---|
-| `agent:plan-requested` | Maintainer | Ask an agent to produce an implementation plan. |
-| `agent:plan-ready` | Agent | The plan is ready for human review. |
-| `agent:implementation-requested` | Maintainer | The plan is approved and an agent may implement it. |
-| `agent:in-progress` | Agent | Authorized implementation is underway. |
-| `agent:pr-opened` | Agent | The implementation produced a pull request. |
-
-The normal delegated workflow is:
-
-```text
-(state:accepted OR roadmap placement)
-  |
-  +-- agent:plan-requested
-        |
-        +-- agent:plan-ready
-              |
-              +-- agent:implementation-requested
-                    |
-                    +-- agent:in-progress
-                          |
-                          +-- agent:pr-opened
-```
-
-`agent:plan-requested` authorizes an unattended agent to pick up planning, not implementation. `agent:implementation-requested` confirms that a human reviewed the plan and authorizes an unattended agent to pick up implementation. Agents never apply either request label. Planning authority does not imply implementation authority.
-
-#### Spikes
-
-Use a spike when the report is credible but technical uncertainty prevents a buildable plan. The triage assessment should identify the unknowns and the evidence the spike needs to produce.
-
-A maintainer first decides whether OpenShell should invest in the investigation. If accepted, the maintainer places it on the roadmap and may request agent work. The spike records its findings in an issue and uses:
-
-- `state:validated` when the evidence supports a human accept or decline decision.
-- `state:needs-info` when material evidence or an external decision is still missing.
-
-A completed spike does not automatically authorize implementation. The resulting issue follows the same human disposition process.
-
-#### Security Issues
-
-Do not file or discuss suspected vulnerabilities in a public GitHub issue. Follow the disclosure instructions in `SECURITY.md`.
-
-Maintainers use the specialized security review and remediation workflow for an authorized security issue. For unattended processing, it uses the same queue controls:
-
-1. A maintainer applies `agent:plan-requested` to request a security review and remediation plan.
-2. The review agent replaces it with `agent:plan-ready`.
-3. A maintainer reviews the plan and applies `agent:implementation-requested`.
-4. The remediation agent implements the approved plan.
-
-A user may instead directly request review or remediation from the specialized skill. If the corresponding queue label is missing, the agent warns and continues without changing it, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
-
-#### When an Issue Is Ready for Work
-
-| You are | Ready when |
-|---|---|
-| A human contributor | The issue has `state:accepted`, roadmap placement, an invitation to contribute, or maintainer confirmation, and has no conflicting owner or implementation. |
-| An unattended agent scanning for planning work | The issue has `state:accepted` or roadmap placement, plus the human-applied `agent:plan-requested` label. |
-| An unattended agent scanning for implementation work | The issue has `state:accepted` or roadmap placement, plus an approved plan and the human-applied `agent:implementation-requested` label. |
-| An agent directly instructed by a user | The instruction explicitly requests the phase the agent will perform and the issue has no conflicting owner or implementation. Missing or incomplete workflow labels produce a warning, not a stop. |
-
-For unattended agents, `state:needs-info` blocks work until the requested evidence arrives, and `state:triage-needed` or `state:validated` blocks work unless a maintainer has separately placed the issue on the roadmap or applied `state:accepted`. For a directly instructed agent, these labels require a warning but do not themselves block the requested work. If information actually needed to do the work is unavailable, the agent reports that concrete blocker rather than treating the label as the blocker.
-
-#### Stale Issues
-
-Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity. Automated closing is currently disabled. Comment on the item or remove `state:stale` to keep it active. Issues awaiting triage or human disposition, accepted issues, active agent workflows, and roadmap issues are exempt. `state:needs-info` may become stale when no new evidence arrives.
+Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
 
 ## Prerequisites
 
@@ -309,17 +147,17 @@ Project requirements:
 - Rust 1.94+
 - Python 3.11+
 - Docker (running)
-- CMake 3.16+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
 The `openshell-prover` crate and standalone `openshell-prover-cli` binary link
 directly against Z3. The `openshell-server` crate depends on the prover, and
 the `openshell-gateway` binary crate depends on `openshell-server` in turn.
-These packages forward a `bundled-z3` feature to
-`openshell-prover/bundled-z3`. The `openshell-cli` crate does not depend on Z3.
-On macOS and Linux, install the system Z3 development package; `z3-sys`
-discovers it through `pkg-config`.
+The `openshell-cli` crate does not depend on Z3. The Nix development shell
+supplies Z3. For builds outside that shell on macOS and Linux, install the
+system Z3 development package; `z3-sys` discovers it through `pkg-config`.
+The linker uses the installed static or shared library. The Nix development
+shell provides a static Z3 library.
 
 ```bash
 # macOS
@@ -332,13 +170,16 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
-compiles Z3 from source during the Rust build and requires CMake 3.16+:
+To build Z3 from source instead, enable `vendored-z3` (requires CMake and a C++
+compiler):
 
 ```bash
-cargo build -p openshell-prover --features bundled-z3
-cargo build -p openshell-prover-cli --features bundled-z3
+cargo build -p openshell-prover --features vendored-z3
+cargo build -p openshell-prover-cli --features vendored-z3
 ```
+
+Local gateway image and E2E builds enable `vendored-z3` so their
+copied gateway binaries do not need a shared Z3 library in the runtime image.
 
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
@@ -353,14 +194,12 @@ For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
   target-compatible MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
   The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
   is set.
-- Bundled Z3: for direct Cargo builds, pass `--features bundled-z3` so `z3-sys`
-  builds Z3 from source.
 
 `openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
 just this crate does not require `LIBCLANG_PATH`:
 
 ```powershell
-cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
 ```
 
 ### Windows full build
@@ -470,7 +309,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
-| `architecture/` | Architecture docs and plans                   |
+| `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
 | `skills/`       | Public skills for using and operating OpenShell |
 | `.agents/`      | Contributor skills and persona definitions    |
@@ -514,14 +353,22 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 ## Pull Requests
 
-1. Create a feature branch from `main`.
+1. Create a branch from `main` named `<type>/<issue-id>-<short-description>/<github-username>`, using a Conventional Commits type such as `feat`, `fix`, `docs`, or `chore`.
 2. Make your changes with tests.
-3. Run `mise run ci` to verify.
+3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
-PRs for new features, user-visible behavior changes, public API changes, architecture changes, or multi-PR efforts must link an accepted issue. Small documentation fixes, mechanical maintenance, and obvious localized bug fixes may omit a separate issue when the PR contains enough context to review the decision and implementation together.
+Every PR must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-In the PR's **Related Issue** section, use `Fixes #NNN` or `Closes #NNN` when an issue is required. For an exempt change, write `No issue required:` followed by a brief reason. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+### Choose Verification for the Change
+
+Choose checks based on the files changed and the behavior they can affect. Run the relevant formatter, linter, type or compile checks, and tests for those areas. Include dependent components when a shared API, schema, dependency, or build change can affect them.
+
+For contributor guidance, skills, Markdown, and issue or PR templates, validate formatting, links, YAML, and cross references as applicable. Run docs validation when published docs or navigation change. These changes do not require full Rust or SDK suites when they cannot affect those components.
+
+For code changes, run tests for the affected crates or SDKs and their dependent behavior. For sandbox, policy, or deployment infrastructure changes, run the relevant E2E lane. Broaden verification when the change spans components, focused checks fail, or a concrete regression risk remains.
+
+`mise run ci` runs the full repository checks, and `mise run pre-commit` runs broad formatting and lint checks. Use them when that scope is warranted; they are not blanket prerequisites for every change. Report what actually ran and any relevant limitation in the PR. Stop once the checks needed for the change have passed.
 
 ### Commit Messages
 

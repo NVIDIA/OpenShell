@@ -88,9 +88,10 @@ pub fn probe_availability() -> LandlockAvailability {
 
 /// A prepared Landlock ruleset ready to be enforced via `restrict_self()`.
 ///
-/// Created by [`prepare`] while running as root (so `PathFd::new()` can open
-/// any path regardless of DAC permissions). Enforced by [`enforce`] after
-/// `drop_privileges()` — `restrict_self()` does not require elevated privileges.
+/// Path FDs are opened before enforcement. The capability-free launch path
+/// prepares the baseline and user rules as the workload identity, then calls
+/// [`enforce`] in the child before exec. `restrict_self()` does not require
+/// elevated privileges.
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
     compatibility: LandlockCompatibility,
@@ -102,10 +103,11 @@ enum PathOpenMode {
     CurrentUser,
 }
 
-/// Phase 1: Open `PathFds` and build the Landlock ruleset **as root**.
+/// Phase 1: Open `PathFds` and build the Landlock ruleset with strict path opening.
 ///
-/// This must run before `drop_privileges()` so that `PathFd::new()` can open
-/// paths that are only accessible to root (e.g. mode 700 directories).
+/// Opens configured paths as the calling identity. Inaccessible paths fail in
+/// hard-requirement mode and are skipped in best-effort mode. Unlike
+/// [`prepare_current_user`], this does not always omit inaccessible paths.
 ///
 /// Returns `None` if there are no filesystem paths to restrict (no-op).
 /// Returns `Some(PreparedRuleset)` on success, or an error.
@@ -394,9 +396,9 @@ fn prepare_with_path_open_mode(
 
 /// Phase 2: Enforce a prepared Landlock ruleset by calling `restrict_self()`.
 ///
-/// This runs **after** `drop_privileges()`. The `restrict_self()` syscall does
-/// not require root — it only restricts the calling thread (and its future
-/// children), which is always permitted.
+/// The capability-free launch path calls this in the child before exec, already
+/// running as the workload identity. `restrict_self()` does not require root;
+/// it restricts the calling thread and its future children.
 ///
 /// Respects the same `best_effort` / `hard_requirement` compatibility as
 /// [`prepare`]: if `restrict_self()` fails and the policy is `best_effort`,

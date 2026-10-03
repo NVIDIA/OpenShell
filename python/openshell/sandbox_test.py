@@ -32,6 +32,7 @@ from openshell.sandbox import (
     SandboxRef,
     SandboxStatusRef,
     SandboxTemplateClient,
+    ServiceAuthorizationMode,
     ServiceExposure,
     TlsConfig,
     _atomic_replace,
@@ -2219,15 +2220,26 @@ def test_create_forwards_service_exposures() -> None:
         name="app-server",
         service_exposures=[
             ServiceExposure(target_port=4500),
-            ServiceExposure(service="metrics", target_port=9090),
+            ServiceExposure(
+                service="metrics",
+                target_port=9090,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+            ),
         ],
     )
 
     assert stub.create_request is not None
     assert [
-        (exposure.service, exposure.target_port)
+        (exposure.service, exposure.target_port, exposure.authorization_mode)
         for exposure in stub.create_request.service_exposures
-    ] == [("", 4500), ("metrics", 9090)]
+    ] == [
+        ("", 4500, openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP),
+        (
+            "metrics",
+            9090,
+            openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
+        ),
+    ]
     assert dict(ref.service_urls) == {
         "": "https://.example.test/",
         "metrics": "https://metrics.example.test/",
@@ -2719,10 +2731,16 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
+    proto.status.restart_count = 2
+    proto.status.next_restart_time.FromMilliseconds(1_700_000_000_000)
+    proto.status.main_process_started_time.FromMilliseconds(1_699_999_000_000)
 
     status = _sandbox_ref(proto).status
 
     assert status.exit_code == 0
+    assert status.restart_count == 2
+    assert status.next_restart_at_ms == 1_700_000_000_000
+    assert status.main_process_started_at_ms == 1_699_999_000_000
 
 
 def test_returned_labels_are_immutable() -> None:

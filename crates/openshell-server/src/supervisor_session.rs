@@ -336,6 +336,8 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
+    /// Last session whose outbound queue received this `RelayOpen`.
+    delivered_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -466,23 +468,28 @@ impl SupervisorSessionRegistry {
         None
     }
 
-    /// Look up the sender for a supervisor session, waiting up to `timeout`
-    /// for it to appear if absent.
+    /// Look up a supervisor session without extending the setup deadline.
     ///
     /// Uses exponential backoff (100ms → 2s) while polling the sessions map.
     async fn wait_for_session(
         &self,
         sandbox_id: &str,
-        timeout: Duration,
-    ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
-        let deadline = Instant::now() + timeout;
+        deadline: tokio::time::Instant,
+        wait_for_missing_session: bool,
+    ) -> Result<(String, mpsc::Sender<GatewayMessage>), Status> {
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
         loop {
-            if let Some(tx) = self.lookup_session(sandbox_id) {
-                return Ok(tx);
+            let session = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(sandbox_id)
+                .map(|session| (session.session_id.clone(), session.tx.clone()));
+            if let Some(session) = session {
+                return Ok(session);
             }
-            if Instant::now() + backoff > deadline {
+            if !wait_for_missing_session || tokio::time::Instant::now() + backoff > deadline {
                 return Err(Status::unavailable("supervisor session not connected"));
             }
             tokio::time::sleep(backoff).await;
@@ -490,6 +497,7 @@ impl SupervisorSessionRegistry {
         }
     }
 
+    #[cfg(test)]
     fn lookup_session(&self, sandbox_id: &str) -> Option<mpsc::Sender<GatewayMessage>> {
         self.sessions
             .lock()
@@ -728,7 +736,8 @@ impl SupervisorSessionRegistry {
     ///   blip, gateway restart, supervisor restart) and the supervisor is
     ///   in its reconnect backoff loop
     ///
-    /// Callers pick the timeout based on how much patience the caller needs.
+    /// The timeout bounds session lookup, reconnect retries, and outbound queue
+    /// capacity waits together. Callers pick it based on their patience.
     /// A first `sandbox connect` right after `sandbox create` may need to
     /// wait for the supervisor's initial TLS + gRPC handshake (tens of
     /// seconds on a slow cluster), while mid-lifetime calls typically just
@@ -788,58 +797,106 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
+        self.open_relay_with_message_until(
+            sandbox_id,
+            relay_open,
+            tokio::time::Instant::now() + session_wait_timeout,
+            true,
+        )
+        .await
+    }
+
+    /// Local routing skips waiting for a missing session, but queue capacity
+    /// and reconnect retries still share the routing caller's setup deadline.
+    async fn open_relay_with_message_until(
+        &self,
+        sandbox_id: &str,
+        relay_open: RelayOpen,
+        deadline: tokio::time::Instant,
+        wait_for_missing_session: bool,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
         if relay_open.channel_id.is_empty() {
             return Err(Status::invalid_argument("relay channel_id is required"));
         }
-        let tx = self
-            .wait_for_session(sandbox_id, session_wait_timeout)
-            .await?;
+        tokio::time::timeout_at(deadline, async {
+            let channel_id = relay_open.channel_id.clone();
 
-        let channel_id = relay_open.channel_id.clone();
-
-        // Register the pending relay before sending RelayOpen to avoid a race.
-        // Both caps are checked and the insert happens under a single lock hold
-        // so two concurrent calls can't both observe "under the cap" and then
-        // both insert past it.
-        let (relay_tx, relay_rx) = oneshot::channel();
-        {
-            let mut pending = self.pending_relays.lock().unwrap();
-            if pending.len() >= MAX_PENDING_RELAYS {
-                return Err(Status::resource_exhausted(format!(
-                    "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
-                )));
+            // Register the pending relay before sending RelayOpen to avoid a race.
+            // Both caps are checked and the insert happens under a single lock hold
+            // so two concurrent calls can't both observe "under the cap" and then
+            // both insert past it.
+            let (relay_tx, relay_rx) = oneshot::channel();
+            let mut relay_tx = Some(relay_tx);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
+                }
+                let (session_id, tx) = self
+                    .wait_for_session(sandbox_id, deadline, wait_for_missing_session)
+                    .await?;
+                // Reserve capacity before taking synchronous locks. The session
+                // may change while waiting; validate it again before insertion.
+                let permit = tx
+                    .reserve()
+                    .await
+                    .map_err(|_| Status::unavailable("supervisor session disconnected"))?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::deadline_exceeded("supervisor relay setup timed out"));
+                }
+                let sent = {
+                    let sessions = self.sessions.lock().unwrap();
+                    if sessions
+                        .get(sandbox_id)
+                        .is_some_and(|session| session.session_id == session_id)
+                    {
+                        let mut pending = self.pending_relays.lock().unwrap();
+                        if pending.len() >= MAX_PENDING_RELAYS {
+                            return Err(Status::resource_exhausted(format!(
+                                "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                            )));
+                        }
+                        let per_sandbox = pending
+                            .values()
+                            .filter(|p| p.sandbox_id == sandbox_id)
+                            .count();
+                        if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                            return Err(Status::resource_exhausted(format!(
+                                "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                            )));
+                        }
+                        pending.insert(
+                            channel_id.clone(),
+                            PendingRelay {
+                                sender: relay_tx.take().unwrap(),
+                                sandbox_id: sandbox_id.to_string(),
+                                relay_open: relay_open.clone(),
+                                created_at: Instant::now(),
+                                delivered_session_id: Some(session_id),
+                            },
+                        );
+                        // Insertion, delivery selection, and enqueueing are atomic with
+                        // respect to registration and replay. No await holds these locks.
+                        permit.send(GatewayMessage {
+                            payload: Some(gateway_message::Payload::RelayOpen(relay_open.clone())),
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if sent {
+                    return Ok((channel_id, relay_rx));
+                }
             }
-            let per_sandbox = pending
-                .values()
-                .filter(|p| p.sandbox_id == sandbox_id)
-                .count();
-            if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
-                return Err(Status::resource_exhausted(format!(
-                    "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
-                )));
-            }
-            pending.insert(
-                channel_id.clone(),
-                PendingRelay {
-                    sender: relay_tx,
-                    sandbox_id: sandbox_id.to_string(),
-                    relay_open: relay_open.clone(),
-                    created_at: Instant::now(),
-                },
-            );
-        }
-
-        let msg = GatewayMessage {
-            payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-        };
-
-        if tx.send(msg).await.is_err() {
-            // Session dropped between our lookup and send.
-            self.pending_relays.lock().unwrap().remove(&channel_id);
-            return Err(Status::unavailable("supervisor session disconnected"));
-        }
-
-        Ok((channel_id, relay_rx))
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
@@ -918,23 +975,43 @@ impl SupervisorSessionRegistry {
         self.remove(sandbox_id);
     }
 
-    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
+    pub async fn replay_pending_relays(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
-            let relay_open = {
+            let needs_replay = {
                 let pending = self.pending_relays.lock().unwrap();
-                pending
-                    .get(&channel_id)
-                    .map(|pending| pending.relay_open.clone())
+                pending.get(&channel_id).is_some_and(|pending| {
+                    pending.delivered_session_id.as_deref() != Some(session_id)
+                })
             };
-            let Some(relay_open) = relay_open else {
+            if !needs_replay {
                 continue;
-            };
-            let msg = GatewayMessage {
-                payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
-            };
-            if tx.send(msg).await.is_err() {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
+            }
+            let Ok(permit) = tx.reserve().await else {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to connected session");
                 break;
+            };
+            let sessions = self.sessions.lock().unwrap();
+            if sessions
+                .get(sandbox_id)
+                .is_none_or(|session| session.session_id != session_id)
+            {
+                break;
+            }
+            let mut pending = self.pending_relays.lock().unwrap();
+            if let Some(pending) = pending.get_mut(&channel_id)
+                && pending.delivered_session_id.as_deref() != Some(session_id)
+            {
+                pending.delivered_session_id = Some(session_id.to_string());
+                permit.send(GatewayMessage {
+                    payload: Some(gateway_message::Payload::RelayOpen(
+                        pending.relay_open.clone(),
+                    )),
+                });
             }
         }
     }
@@ -1390,85 +1467,89 @@ pub async fn open_routed_relay_with_message(
     ),
     Status,
 > {
-    let deadline = Instant::now() + session_wait_timeout;
-    let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
-    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-    loop {
-        if state.supervisor_sessions.has_session(sandbox_id) {
-            match state
-                .supervisor_sessions
-                .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
-                .await
-            {
-                Ok(relay) => return Ok(relay),
-                Err(status) if status.code() == tonic::Code::Unavailable => {
-                    // The session can migrate after `has_session` but before
-                    // RelayOpen reaches its sender. Fall through and reread the
-                    // persisted owner instead of surfacing a handoff race.
-                    warn!(
-                        sandbox_id,
-                        error = %status,
-                        "local supervisor relay disappeared during open; resolving owner again"
-                    );
+    let deadline = tokio::time::Instant::now() + session_wait_timeout;
+    tokio::time::timeout_at(deadline, async {
+        let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+        let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+        loop {
+            if state.supervisor_sessions.has_session(sandbox_id) {
+                match state
+                    .supervisor_sessions
+                    .open_relay_with_message_until(sandbox_id, relay_open.clone(), deadline, false)
+                    .await
+                {
+                    Ok(relay) => return Ok(relay),
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        // The session can migrate after `has_session` but before
+                        // RelayOpen reaches its sender. Fall through and reread the
+                        // persisted owner instead of surfacing a handoff race.
+                        warn!(
+                            sandbox_id,
+                            error = %status,
+                            "local supervisor relay disappeared during open; resolving owner again"
+                        );
+                    }
+                    Err(status) => return Err(status),
                 }
-                Err(status) => return Err(status),
             }
-        }
 
-        if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
-            && owner_is_fresh(&owner)
-        {
-            if owner.owner_replica_id == state.replica_id {
-                warn!(
-                    sandbox_id,
-                    owner_replica_id = %owner.owner_replica_id,
-                    "supervisor owner record points at this replica but no local session is registered; retrying"
-                );
-                state.peer_routes.evict_owner(sandbox_id);
-                if Instant::now() + backoff > deadline {
-                    return Err(Status::unavailable("supervisor session not connected"));
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
-                continue;
-            }
-            if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
-                     set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
-                    owner.owner_replica_id
-                )));
-            }
-            match open_peer_relay(
-                state,
-                owner.owner_peer_endpoint.clone(),
-                sandbox_id,
-                relay_open.clone(),
-            )
-            .await
+            if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
+                && owner_is_fresh(&owner)
             {
-                Ok(relay) => return Ok(relay),
-                Err(status) => {
+                if owner.owner_replica_id == state.replica_id {
                     warn!(
                         sandbox_id,
                         owner_replica_id = %owner.owner_replica_id,
-                        owner_peer_endpoint = %owner.owner_peer_endpoint,
-                        error = %status,
-                        "gateway peer owner relay open failed; retrying until session wait timeout"
+                        "supervisor owner record points at this replica but no local session is registered; retrying"
                     );
-                    // The record may name a replaced pod, so retry against a
-                    // fresh read rather than the cached endpoint.
                     state.peer_routes.evict_owner(sandbox_id);
+                    if tokio::time::Instant::now() + backoff > deadline {
+                        return Err(Status::unavailable("supervisor session not connected"));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+                    continue;
+                }
+                if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
+                         set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
+                        owner.owner_replica_id
+                    )));
+                }
+                match open_peer_relay(
+                    state,
+                    owner.owner_peer_endpoint.clone(),
+                    sandbox_id,
+                    relay_open.clone(),
+                )
+                .await
+                {
+                    Ok(relay) => return Ok(relay),
+                    Err(status) => {
+                        warn!(
+                            sandbox_id,
+                            owner_replica_id = %owner.owner_replica_id,
+                            owner_peer_endpoint = %owner.owner_peer_endpoint,
+                            error = %status,
+                            "gateway peer owner relay open failed; retrying until session wait timeout"
+                        );
+                        // The record may name a replaced pod, so retry against a
+                        // fresh read rather than the cached endpoint.
+                        state.peer_routes.evict_owner(sandbox_id);
+                    }
                 }
             }
-        }
 
-        if Instant::now() + backoff > deadline {
-            return Err(Status::unavailable("supervisor session not connected"));
+            if tokio::time::Instant::now() + backoff > deadline {
+                return Err(Status::unavailable("supervisor session not connected"));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
-    }
+    })
+    .await
+    .map_err(|_| Status::deadline_exceeded("supervisor relay setup timed out"))?
 }
 
 /// Reads the owning replica, reusing a recent result when one is cached.
@@ -1960,12 +2041,13 @@ async fn establish_supervisor_session(
     }
     state.telemetry.sandbox_session_connected(&sandbox_id);
 
-    if superseded {
-        state
-            .supervisor_sessions
-            .replay_pending_relays(&sandbox_id, &tx)
-            .await;
-    }
+    // A disconnected session may already have removed its registration while
+    // an unclaimed RelayOpen remains pending. Replay on every accepted session,
+    // including reconnects that did not supersede a live registration.
+    state
+        .supervisor_sessions
+        .replay_pending_relays(&sandbox_id, &session_id, &tx)
+        .await;
 
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
@@ -2072,10 +2154,18 @@ pub async fn handle_finalize_main_process_exit(
         .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
         .await
         .map_err(Status::failed_precondition)?;
-    if !state
+    let session_finalized = state
         .supervisor_sessions
-        .finalize_main_process_exit(&report.sandbox_id)
-    {
+        .finalize_main_process_exit(&report.sandbox_id);
+    // The session can close between durable result validation and this mark.
+    // Schedule cleanup in either case so a disconnect with an unfinalized
+    // in-memory session cannot strand the ephemeral sandbox.
+    state
+        .compute
+        .cleanup_finalized_ephemeral_sandbox(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::internal)?;
+    if !session_finalized {
         return Err(Status::failed_precondition(
             "supervisor session is not connected",
         ));
@@ -2496,6 +2586,7 @@ mod tests {
                 service_id: String::new(),
             },
             created_at,
+            delivered_session_id: None,
         }
     }
 
@@ -2921,6 +3012,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_relay_attempt_skips_missing_session_without_spending_setup_budget() {
+        let registry = SupervisorSessionRegistry::new();
+        let started = tokio::time::Instant::now();
+        let attempt = registry.open_relay_with_message_until(
+            "missing",
+            RelayOpen {
+                channel_id: "test-channel".into(),
+                ..Default::default()
+            },
+            started + Duration::from_secs(15),
+            false,
+        );
+        tokio::pin!(attempt);
+        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(&mut attempt) else {
+            panic!("local routing must immediately fall back when its session disappears");
+        };
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_setup_deadline_bounds_queue_wait_for_nonwaiting_local_attempt() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register("sbx".into(), "session".into(), tx.clone(), make_shutdown());
+        tx.send(GatewayMessage::default()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let attempt = registry.open_relay_with_message_until(
+            "sbx",
+            RelayOpen {
+                channel_id: "test-channel".into(),
+                ..Default::default()
+            },
+            deadline,
+            false,
+        );
+        tokio::pin!(attempt);
+        // Skipping a missing-session wait must not imply a zero queue budget.
+        assert!(futures_util::poll!(&mut attempt).is_pending());
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(
+            attempt.await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+        rx.recv().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_setup_deadline_is_not_reset_by_reconnects() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        registry.register(
+            "sbx".into(),
+            "session-0".into(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        tx.send(GatewayMessage::default()).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let attempt = registry.open_relay("sbx", Duration::from_secs(9));
+        tokio::pin!(attempt);
+        assert!(futures_util::poll!(&mut attempt).is_pending());
+        for generation in 1..=2 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            let (new_tx, new_rx) = mpsc::channel(1);
+            new_tx.send(GatewayMessage::default()).await.unwrap();
+            registry.register(
+                "sbx".into(),
+                format!("session-{generation}"),
+                new_tx,
+                make_shutdown(),
+            );
+            rx.recv().await.unwrap();
+            assert!(futures_util::poll!(&mut attempt).is_pending());
+            rx = new_rx;
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(
+            attempt.await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(9));
+        assert!(registry.pending_relays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_does_not_duplicate_forward_opened_after_registration() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (old_channel, _old_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        // Session establishment is paused between registration and replay.
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        let (new_channel, new_relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+
+        for expected in [new_channel.clone(), old_channel] {
+            let Some(gateway_message::Payload::RelayOpen(open)) =
+                rx_new.recv().await.unwrap().payload
+            else {
+                panic!("expected RelayOpen");
+            };
+            assert_eq!(open.channel_id, expected);
+        }
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let principal = sandbox_principal("sbx");
+        let _claimed = registry
+            .claim_relay(&new_channel, Some(&principal))
+            .unwrap();
+        assert!(new_relay_rx.await.unwrap().is_ok());
+        assert_eq!(
+            registry
+                .claim_relay(&new_channel, Some(&principal))
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn open_relay_rechecks_session_after_waiting_for_queue_capacity() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(1);
+        registry.register("sbx".into(), "old".into(), tx_old.clone(), make_shutdown());
+        tx_old.send(GatewayMessage::default()).await.unwrap();
+        let open = registry.open_relay("sbx", Duration::from_secs(1));
+        tokio::pin!(open);
+        assert!(futures_util::poll!(&mut open).is_pending());
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown());
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        rx_old.recv().await.unwrap();
+        let (channel_id, _relay_rx) = open.await.unwrap();
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        let Some(gateway_message::Payload::RelayOpen(message)) =
+            rx_new.recv().await.unwrap().payload
+        else {
+            panic!("expected RelayOpen on replacement session");
+        };
+        assert_eq!(message.channel_id, channel_id);
+        assert!(rx_old.try_recv().is_err());
+        assert!(matches!(
+            rx_new.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_after_disconnected_session_was_removed() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel(4);
+        registry.register("sbx".into(), "old".into(), tx_old, make_shutdown());
+        let (channel_id, relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        rx_old.recv().await.unwrap();
+        registry.remove_if_current("sbx", "old");
+
+        let (tx_new, mut rx_new) = mpsc::channel(4);
+        assert!(!registry.register("sbx".into(), "new".into(), tx_new.clone(), make_shutdown()));
+        registry.replay_pending_relays("sbx", "new", &tx_new).await;
+        let replayed = rx_new.recv().await.unwrap();
+        let Some(gateway_message::Payload::RelayOpen(open)) = replayed.payload else {
+            panic!("expected replayed RelayOpen");
+        };
+        assert_eq!(open.channel_id, channel_id);
+        let _claimed = registry
+            .claim_relay(&channel_id, Some(&sandbox_principal("sbx")))
+            .unwrap();
+        assert!(relay_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn replay_pending_relays_reissues_open_to_superseding_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
@@ -2956,7 +3241,7 @@ mod tests {
         assert!(superseded);
 
         registry
-            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", "s-new", &registry.lookup_session("sbx").unwrap())
             .await;
 
         let replayed = rx_new

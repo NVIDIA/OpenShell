@@ -17,6 +17,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
@@ -115,6 +116,12 @@ def _service_exposure_messages(
         openshell_pb2.SandboxServiceExposure(
             service=exposure.service,
             target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
         )
         for exposure in exposures or ()
     ]
@@ -448,6 +455,16 @@ class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
+
+
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
 
 
 @dataclass(frozen=True)
@@ -456,6 +473,7 @@ class ServiceExposure:
 
     target_port: int
     service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -1766,6 +1784,13 @@ def _sandbox_ref(
             current_policy_version=status.current_policy_version if status else 0,
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
+            else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
+            else None,
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},

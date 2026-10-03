@@ -125,12 +125,31 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+`setup-nix` retries development-shell preparation once when `prepare-shell`
+is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
+shell has already been prepared. Cargo, lint, and test commands are not retried.
+Direct Nix builds and app dependency preparation also retry once; apps run
+once after preparation succeeds. Skipped dependent E2E suites indicate blocked
+coverage.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
 not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
+
+For `Protobuf Compatibility`, check the logged train and comparison baseline.
+Branch Checks compares the prospective merge tree with its target; Release Tag
+compares the tagged candidate with the previous stable release. Both use
+the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
+During `0.x`, a minor train permits compatibility findings
+as warnings; a patch train or no active train rejects them. Compare the current
+train's version with the latest stable release; commit messages are irrelevant.
+Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
+the `release-tag-v1` qualification profile. Failed qualification prevents stable
+publication but still allows pre-release artifacts to publish with the failure
+recorded.
 
 View logs for a specific run:
 

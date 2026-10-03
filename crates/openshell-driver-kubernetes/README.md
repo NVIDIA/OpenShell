@@ -157,7 +157,10 @@ UID. Restart requires exactly one matching Sandbox resource and preserves its
 namespace and UID while rotating the supervisor Pod UID. The gateway requires
 the authenticated identity to match the durable binding before returning the
 generation-bound session JWT used by the supervisor. The sandbox Pod receives
-neither token.
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.
@@ -178,6 +181,13 @@ credentials after launch and must inspect its same-identity descendants.
 The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
+
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
 
 ## GPU Support
 

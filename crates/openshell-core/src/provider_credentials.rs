@@ -36,11 +36,14 @@ pub struct ChildEnvironmentSnapshot {
     pub revision: u64,
     /// Prepared environment used by future workload processes.
     pub environment: HashMap<String, String>,
+    /// Complete desired set of non-secret files for this installation.
+    pub files: HashMap<String, String>,
 }
 
 #[derive(Debug)]
 struct ProviderCredentialStateInner {
     current: Arc<ProviderCredentialSnapshot>,
+    files: HashMap<String, String>,
     generations: VecDeque<Arc<SecretResolver>>,
     current_resolver: Option<Arc<SecretResolver>>,
     combined_resolver: Option<Arc<SecretResolver>>,
@@ -117,6 +120,7 @@ impl ProviderCredentialState {
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations,
                 current_resolver,
                 combined_resolver,
@@ -172,6 +176,7 @@ impl ProviderCredentialState {
         Ok(Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations,
                 current_resolver,
                 combined_resolver,
@@ -205,6 +210,7 @@ impl ProviderCredentialState {
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
+                files: HashMap::new(),
                 generations: VecDeque::new(),
                 current_resolver: None,
                 combined_resolver: None,
@@ -410,22 +416,19 @@ impl ProviderCredentialState {
         inner.current = Arc::new(env);
     }
 
-    /// Return `child_env` with GCP static config vars resolved to real values.
+    /// Return `child_env` with explicitly non-secret config vars resolved.
     ///
-    /// The credential pipeline placeholderizes ALL env values, but GCP SDKs
-    /// and coding agents read certain vars (project ID, region, metadata host)
-    /// at process startup before any HTTP request flows through the proxy.
-    /// This method overrides those vars with resolved real values while
-    /// keeping secret credentials (like `GCP_ACCESS_TOKEN`) as placeholders.
+    /// The credential pipeline placeholderizes all env values. Workloads need
+    /// non-secret configuration, including provider file paths, at process
+    /// startup before any HTTP request flows through the proxy. Credential
+    /// values remain placeholders.
     ///
     /// Three layers of env var injection:
     /// 1. **Synthetic vars** (`GCE_METADATA_IP`, `METADATA_SERVER_DETECTION`)
     ///    — sandbox-internal config not from user
     ///    input, inserted directly here with real values.
-    /// 2. **`google_cloud::STATIC_CONFIG_KEYS`** — user-provided non-secret config
-    ///    (project ID, region, SA email) that was placeholderized by
-    ///    `ProviderPlugin::inject_env` → `SecretResolver`; un-placeholderized
-    ///    here so SDKs can read them at startup.
+    /// 2. **Classified non-secret keys** — user-provided config and provider
+    ///    file paths un-placeholderized so workloads can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
         let inner = self
@@ -463,7 +466,16 @@ impl ProviderCredentialState {
             installation_id: inner.current.installation_id.clone(),
             revision,
             environment,
+            files: inner.files.clone(),
         })
+    }
+
+    /// Attach the complete file set to a prepared provider snapshot.
+    pub fn set_managed_files(&self, files: HashMap<String, String>) {
+        self.inner
+            .write()
+            .expect("provider credential state poisoned")
+            .files = files;
     }
 
     fn resolve_child_env_snapshot(
@@ -477,11 +489,7 @@ impl ProviderCredentialState {
             && inner
                 .non_secret_environment_keys
                 .contains("GCE_METADATA_HOST");
-        let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
-            .iter()
-            .any(|key| env.contains_key(*key) && inner.non_secret_environment_keys.contains(*key));
-
-        if !has_gcp_metadata && !has_gcp_config {
+        if !has_gcp_metadata && inner.non_secret_environment_keys.is_empty() {
             return (inner.current.revision, env);
         }
 
@@ -506,16 +514,15 @@ impl ProviderCredentialState {
             );
         }
 
-        // Un-placeholderize non-secret config vars so SDKs can read them
-        // at process startup before any HTTP flows through the proxy.
+        // Only explicitly classified non-secret values may be unwrapped.
         if let Some(ref resolver) = inner.combined_resolver {
-            for key in google_cloud::STATIC_CONFIG_KEYS
-                .iter()
-                .filter(|key| inner.non_secret_environment_keys.contains(**key))
-            {
+            for key in &inner.non_secret_environment_keys {
+                if !env.contains_key(key) || (has_gcp_metadata && key == "GCE_METADATA_HOST") {
+                    continue;
+                }
                 let placeholder = crate::secrets::placeholder_for_env_key(key);
                 if let Some(value) = resolver.resolve_placeholder(&placeholder) {
-                    env.insert(key.to_string(), value.to_string());
+                    env.insert(key.clone(), value.to_string());
                 }
             }
         }
@@ -564,6 +571,26 @@ impl ProviderCredentialState {
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
         Ok(revision)
+    }
+
+    /// Read current provider configuration only when explicitly classified non-secret.
+    ///
+    /// Local metadata adapters must not unwrap credential values just because their
+    /// environment names match a conventional configuration key.
+    pub fn current_non_secret_environment_value(&self, key: &str) -> Option<String> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        if !inner.non_secret_environment_keys.contains(key) {
+            return None;
+        }
+        let placeholder = inner.current.child_env.get(key)?;
+        inner
+            .current_resolver
+            .as_ref()?
+            .resolve_placeholder(placeholder)
+            .map(str::to_string)
     }
 
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
@@ -738,7 +765,7 @@ impl ProviderCredentialState {
     pub fn install_prepared(&self, prepared: &Self) -> usize {
         // Release the candidate lock before taking the live lock, including
         // when a caller passes another handle to the same state.
-        let (snapshot, generations, current_resolver, bindings, non_secret_keys) = {
+        let (snapshot, generations, current_resolver, bindings, non_secret_keys, files) = {
             let candidate = prepared
                 .inner
                 .read()
@@ -749,6 +776,7 @@ impl ProviderCredentialState {
                 candidate.current_resolver.clone(),
                 candidate.static_credential_bindings.clone(),
                 candidate.non_secret_environment_keys.clone(),
+                candidate.files.clone(),
             )
         };
         let mut inner = self
@@ -781,6 +809,7 @@ impl ProviderCredentialState {
         );
         inner.static_credential_bindings = bindings;
         inner.non_secret_environment_keys = non_secret_keys;
+        inner.files = files;
         inner.body_inventory_available = true;
         inner
             .known_body_keys
@@ -2136,6 +2165,33 @@ mod tests {
         );
         assert!(!env.contains_key("GCE_METADATA_HOST"));
         assert!(!env.contains_key("CLAUDE_CODE_USE_VERTEX"));
+    }
+
+    #[test]
+    fn child_env_resolves_provider_file_path_but_keeps_credentials_placeholderized() {
+        let path = "/run/openshell/providers/acme/client.toml";
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([
+                ("ACME_CONFIG_FILE".to_string(), path.to_string()),
+                ("ACME_TOKEN".to_string(), "secret-token".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "ACME_TOKEN".to_string(),
+                binding("api.acme.example", 443, "/**"),
+            )]),
+            vec!["ACME_CONFIG_FILE".to_string()],
+        )
+        .expect("classified provider environment");
+
+        let env = state.child_env_with_gcp_resolved();
+        assert_eq!(env.get("ACME_CONFIG_FILE").map(String::as_str), Some(path));
+        assert_eq!(
+            env.get("ACME_TOKEN").map(String::as_str),
+            Some("openshell:resolve:env:v1_ACME_TOKEN")
+        );
     }
 
     #[test]

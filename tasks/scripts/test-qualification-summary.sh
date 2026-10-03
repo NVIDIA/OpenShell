@@ -22,6 +22,7 @@ export CONFORMANCE_RESULT=success
 export FEATURE_INTEGRATION_RESULT=success
 export DOCKER_E2E_RESULT=success
 export VM_E2E_RESULT=success
+export PROTO_COMPATIBILITY_RESULT=success
 
 current_profile_passed=$("${GENERATOR}" "${TEST_DIR}/qualification-summary.json")
 [[ "${current_profile_passed}" == "false" ]]

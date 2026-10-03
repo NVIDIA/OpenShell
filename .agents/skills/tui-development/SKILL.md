@@ -16,7 +16,7 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 - **Launched via:** `openshell term` or `mise run term`
 - **Crate:** `crates/openshell-tui/`
 - **Key dependencies:**
-  - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
+  - `ratatui` (workspace version) — uses `frame.area()` for the drawable terminal area
   - `crossterm` (workspace version) — terminal backend and event polling
   - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
@@ -102,7 +102,7 @@ match app.screen {
 }
 ```
 
-Within the `Sandbox` screen, the top 20% renders sandbox metadata (`sandbox_detail`), and the bottom 80% dispatches based on focus and tab state:
+Within the `Sandbox` screen, `sandbox_detail::required_height` sizes the metadata and restart status pane to its contents. The remaining area dispatches based on focus and tab state:
 
 ```rust
 match app.focus {
@@ -262,7 +262,7 @@ The `Theme` struct has 16 `Style` fields, accessed at runtime via `app.theme`:
 | `border` | EVERGLADE fg | Light sage fg | Unfocused panel borders |
 | `border_focused` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Focused panel borders |
 | `status_ok` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Healthy, INFO, Ready |
-| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning |
+| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning, Starting |
 | `status_err` | Red fg | Dark red fg | Unhealthy, ERROR |
 | `key_hint` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Keyboard shortcut labels |
 | `log_cursor` | EVERGLADE bg | Light green bg | Selected log line highlight |
@@ -297,7 +297,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, data: &MyData, area: Rect, theme: &T
 
 - **Selected row**: Green `▌` left-border marker on the selected row. Active gateway also gets a green `●` dot.
 - **Focused panel**: Border changes from `border` to `border_focused` style.
-- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/warn, red for unhealthy/error.
+- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/starting/warn, red for unhealthy/error.
 - **Separators**: Muted `│` characters between title bar segments and nav bar sections.
 - **Log source labels**: `"sandbox"` source renders in `accent` (green), `"gateway"` in `muted`.
 
@@ -329,6 +329,8 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 | `openshell status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
+
+The create form parses the optional Command field as shell words before starting creation. Preserve the parsed argument vector through post-create execution and shell-escape each argument at the SSH boundary. Quoting groups arguments; expansions and operators remain literal unless the user explicitly invokes a shell such as `sh -c`. Invalid quoting must leave the form open with an error and must not queue sandbox creation.
 
 ### Scrollable views follow k9s conventions
 
@@ -423,7 +425,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 | `crates/openshell-tui/src/ui/providers.rs` | Provider list table with profile-aware columns: Name, Category, Type, Credentials, Workspace |
 | `crates/openshell-tui/src/ui/global_settings.rs` | Global settings table: Key, Type, Value. Includes edit overlay, confirm-set, and confirm-delete popups |
 | `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image, Workspace, Notes |
-| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, providers, policy version |
+| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, restart policy/status, providers, policy version |
 | `crates/openshell-tui/src/ui/sandbox_policy.rs` | Policy viewer — rendered policy lines with scroll support, tab title |
 | `crates/openshell-tui/src/ui/sandbox_settings.rs` | Sandbox settings table: Key, Type, Value, Scope. Includes edit overlay and confirm popups |
 | `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter, visual selection mode, clipboard copy |

@@ -10,6 +10,11 @@ position: 4
 
 Each gateway runs agent workloads on one compute runtime, selected by its compute driver. Pick the runtime that matches the isolation boundary and infrastructure you need. The CLI workflow stays the same across runtimes: you create, connect to, stop, start, and delete sandboxes through the gateway.
 
+The gateway owns main-process restart policy. Docker, Podman, Kubernetes, and
+MicroVM native restart mechanisms remain disabled. When policy selects a
+replacement, the gateway stops and starts the compute resource while retaining
+the sandbox record and driver-supported persistent storage.
+
 | Runtime | Driver | Use when |
 |---|---|---|
 | [Docker](#docker-driver) | `docker` | Local development and single-machine gateways. |
@@ -30,6 +35,13 @@ compute_driver = "docker"
 When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
+
+For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
+`[openshell.gateway]` or use the package-managed local CA. Remove the retired
+`guest_tls_cert` and `guest_tls_key` fields. Supervisors receive only the
+CA and authenticate gateway RPCs with sandbox bearer tokens. Kubernetes
+projects or stages only the gateway CA from its configured TLS Secret; user
+client certificates and private keys stay outside the sandbox boundary.
 
 ### Extension Drivers
 
@@ -90,6 +102,26 @@ socket_path = "/var/run/docker.sock"
 Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
 Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+
+### Docker Corporate Proxy Egress
+
+For proxy-required networks, the Docker driver accepts `https_proxy`,
+`no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
+`proxy_connect_by_hostname`, and `proxy_ca_bundle`. The companion supervisor
+chains policy-approved TLS tunnels through the proxy with HTTP CONNECT.
+
+`proxy_ca_bundle` is an operator-owned gateway-host PEM path. Docker validates
+and copies the bundle into its supervisor-only named volume, so this also works
+with remote Docker daemons and does not expose the host path to the workload.
+The supervisor uses the bundle for an HTTPS proxy connection and for upstream
+certificates re-signed by a TLS-intercepting proxy. Workload processes receive
+the same corporate roots through their generated combined trust bundle.
+
+Sandbox environment, image contents, and `template.driver_config.docker`
+cannot alter these settings. Invalid proxy relationships or CA files prevent
+the gateway or sandbox from starting and never degrade to direct egress. See
+the [Gateway Configuration File](/how-it-works/gateways/configuration) for URL,
+authentication, `NO_PROXY`, hostname CONNECT, and CA validation details.
 
 ### Docker Mounts
 
@@ -196,11 +228,12 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `image_pull_policy` | `sandbox.image.pullPolicy` | `always`, `if_not_present`, or `never`. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Image-pull Secrets for sandbox pods. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Gateway endpoint reachable from sandbox pods. |
-| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Secret with sandbox client TLS material. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Project or stage only `ca.crt` into supervisor Pods to authenticate the gateway. |
 | `sandbox_runtime_image` | `sandboxRuntime.image.*` | Override the sandbox runtime image. |
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
+| `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
 | `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |
 | `proxy_auth_secret_name` / `proxy_auth_secret_key` | `upstreamProxy.authSecret.name` / `.key` | Secret holding the proxy `user:pass` credential. |
@@ -259,12 +292,14 @@ openshell sandbox create \
 
 ## Sandbox User Identity
 
-Set `process.run_as_user` and `process.run_as_group` in the sandbox policy to choose the sandbox user. Any non-root UID or GID is allowed. When a field is unset, the driver supplies it:
+On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in the creation policy to choose the sandbox user. Selectors accept `sandbox` or numeric IDs from `1` through `4294967294`. Kubernetes and MicroVM select the identity through driver configuration. When a field is unset, the driver supplies it:
 
 | Driver | Default identity |
 |---|---|
 | Docker, Podman | The image's `USER`. Images without `USER` must set both fields in policy. |
 | Kubernetes | OpenShift SCC namespace annotations, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
 | MicroVM | The image's `sandbox` account, otherwise `1000`. Override with `sandbox_uid` and `sandbox_gid`. |
+
+MicroVM persists the resolved UID:GID with the writable overlay and retains it across restarts, even if driver defaults change. Explicit policy selectors must match that identity. For example, `run_as_user: "10000"` fails when the overlay owner is `1000:1000`; OpenShell reports both values without changing file ownership. The symbolic selector `sandbox` refers to the guest account for that owner, and each omitted selector accepts its driver default. The `WorkloadIdentity` condition in `openshell sandbox get <name>` shows the resolved pair separately from workload readiness. Canonical and exec processes use this same pair; live policy updates cannot change it.
 
 On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Podman, Kubernetes, and MicroVM always use `/sandbox`.

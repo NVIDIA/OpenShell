@@ -477,9 +477,12 @@ impl Backend {
     async fn spawn(&mut self, base: &str, tls_directory: &Path) -> Result<String, String> {
         let tls_directory = tls_directory
             .to_str()
-            .filter(|path| !path.contains([',', '\n', '\r']))
+            .filter(|path| !path.contains([':', '\n', '\r']))
             .ok_or("fixture TLS mount path is invalid")?;
-        let mount = format!("type=bind,src={tls_directory},dst=/fixture-tls,readonly");
+        // Docker's structured `--mount` syntax cannot request SELinux
+        // relabeling. Both fixture backends mount this ephemeral directory, so
+        // use the shared `z` label rather than the single-container `Z` label.
+        let mount = format!("{tls_directory}:/fixture-tls:ro,z");
         let namespace_label = format!("openshell.ai/sandbox-namespace={}", self.namespace);
         let mut command = Command::from(self.engine.command());
         command
@@ -501,7 +504,7 @@ impl Backend {
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges:true",
-                "--mount",
+                "--volume",
                 &mount,
                 "--entrypoint",
                 "/usr/bin/python3",

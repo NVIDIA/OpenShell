@@ -71,7 +71,7 @@ Common findings:
 
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
-- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a local mTLS bundle does not match the gateway CA, or TLS termination does not match the gateway listener.
+- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
 - A Snap refresh restarts the gateway with its migrated mTLS config. The secure Snap gateway uses `https://127.0.0.1:17670` and requires a client bundle in the user's Snap state. Refresh replaces insecure configs without keeping a copy; follow the published Snap installation steps to re-register an old HTTP client.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
@@ -130,11 +130,13 @@ WebSocket tunnel for edge-proxy CLI access is off unless
 and RPM package startup migrates only exact package-generated v1 defaults. If
 an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.
-Guest TLS CA, certificate, and key paths are the exception to driver ownership:
-configure the complete bundle under `[openshell.gateway]`, and the gateway
-injects it only into the selected local driver. TLS-enabled Docker, Podman, and
-VM drivers fail startup when neither those paths nor the package-managed local
-bundle is available; Kubernetes projects its bundle through a Secret.
+The supervisor gateway CA is the exception to driver ownership: configure
+`guest_tls_ca` under `[openshell.gateway]`, and the gateway injects it only into
+the selected local driver. Remove the retired `guest_tls_cert` and
+`guest_tls_key` fields. TLS-enabled Docker, Podman, and VM drivers fail startup
+when neither that CA nor the package-managed local CA is available. Kubernetes
+projects only the gateway CA from a Secret into supervisor Pods; supervisors
+authenticate gateway RPCs with sandbox bearer tokens.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
@@ -238,6 +240,10 @@ errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 
+The sandbox container's log holds the sandbox runtime's warnings and the
+main process's stdout and stderr when it runs without a TTY. The supervisor
+container's log holds supervisor diagnostics.
+
 ```bash
 docker info
 docker ps --filter name=openshell
@@ -296,6 +302,34 @@ Common findings:
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
+#### Corporate upstream proxy
+
+Docker corporate proxy settings are operator-owned fields under
+`[openshell.drivers.docker]`. Confirm the complete proxy table and inspect the
+companion supervisor command and logs:
+
+```bash
+grep -A20 '^\[openshell.drivers.docker\]' <gateway.toml> | grep -E 'https_proxy|no_proxy|proxy_auth_file|proxy_auth_allow_insecure|proxy_connect_by_hostname|proxy_ca_bundle'
+docker ps --filter label=openshell.ai/isolation-role=supervisor
+docker inspect --format '{{json .Config.Cmd}} {{json .Mounts}}' <supervisor-container>
+docker logs <supervisor-container> --tail=200 | grep -Ei 'upstream|connect|proxy|certificate'
+```
+
+`proxy_ca_bundle` names a gateway-host PEM file and requires `https_proxy`.
+The proxy URL may use `http://` or `https://`; a plain HTTP proxy may still
+re-sign destination TLS. Missing, unreadable, empty, oversized, malformed, or
+certificate-free bundles fail closed. The Docker driver copies a validated
+bundle into its supervisor-only named volume and passes the fixed path
+`/.openshell/supervisor/upstream-proxy-ca-bundle.pem`. The gateway-host path
+must not appear in container arguments, mounts, workload environment, or
+`template.driver_config.docker`.
+
+An HTTPS proxy certificate error usually means the bundle lacks the proxy
+listener issuer or its certificate does not match the proxy hostname. A
+TLS-intercepted destination error means the re-signing issuer is missing or the
+supervisor did not receive the bundle. Keep verification enabled and correct
+the operator bundle.
+
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
 running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started
@@ -310,6 +344,14 @@ If shutdown reports `Gateway supervisor session cleanup incomplete`, inspect
 the associated persistence errors: a stopped supervisor's owner record may
 remain until its lease expires and temporarily block reconnection. Successful
 compute stop alone does not confirm that session cleanup finished.
+
+For a sandbox with `--restart-policy on-failure` or `always`, inspect
+`openshell sandbox get <name>` for the policy, exit code, restart count, and
+next restart time. `Starting` can mean the gateway is waiting for backoff or
+for a replacement supervisor. Check gateway logs for stop or start errors if
+the deadline passes without a transition to `Ready`. Docker, Podman,
+Kubernetes, and VM native restart policies remain disabled; the gateway owns
+the replacement.
 
 ### Step 5: Check Podman-Backed Gateways
 
@@ -538,7 +580,9 @@ Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
 is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
 for all configurations — the internal server certificate is always signed by
 the chart CA (the same CA that signs the client cert), so its `ca.crt` is
-the right trust anchor.  Only override this if you intentionally mount a
+the right trust anchor. Supervisor Pods project only `ca.crt` from the copied
+Secret; `tls.crt` and `tls.key` are reserved for user clients and must not be
+visible in a sandbox. Only override this if you intentionally mount a
 separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
 client CA matches the CA that signed the client certificate:
 
@@ -703,6 +747,12 @@ remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
 
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
+
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
@@ -860,8 +910,7 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.
@@ -904,6 +953,7 @@ credential failures.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |

@@ -60,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
@@ -125,9 +132,23 @@
           firmwarePkgs = tmachineRuntimePkgs;
         };
         artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
         apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
           build-artifacts = {
             type = "app";
             program = "${artifacts.all}/bin/build-artifacts";
@@ -161,6 +182,11 @@
         };
 
         packages = {
+          # Expose app derivations so CI can prepare them before executing once.
+          check-protobuf-compatibility = checkProtobufCompatibility;
+          build-artifacts-test-archives = artifacts.testArchives;
+          build-artifacts-test-images = artifacts.testImages;
+          build-artifacts-helm = artifacts.helm;
           vm-runtime = vmRuntime;
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;

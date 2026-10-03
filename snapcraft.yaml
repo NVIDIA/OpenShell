@@ -12,7 +12,8 @@ description: |
   profile-backed model-provider access.
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
-  (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).
+  (`openshell.term`), a standalone policy prover (`openshell.prover`), and a
+  managed gateway daemon (`openshell.gateway`).
 
   **Setup instructions**
 
@@ -85,12 +86,19 @@ apps:
       - home
       - network
       - system-observe
+  prover:
+    command: bin/openshell-prover
+    aliases:
+      - openshell-prover
+    plugs:
+      - home
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
-    # Refresh must activate the migrated mTLS config immediately. This
-    # interrupts active sandbox sessions.
-    refresh-mode: restart
+    # refresh-mode: endure prevents snapd from restarting the gateway daemon
+    # during snap refreshes, which would kill active sandbox sessions.
+    # Operators must manually restart the service after a refresh if needed.
+    refresh-mode: endure
     # Snapd runs this daemon as root. The wrapper serves TLS from the bundle
     # generated in $SNAP_COMMON/tls, and the default config requires client
     # certificates; the installer copies the client bundle to the target
@@ -119,7 +127,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -137,6 +145,8 @@ parts:
 
       install -D -m 0755 "$CRAFT_PART_SRC/openshell" \
         "$CRAFT_PART_INSTALL/bin/openshell"
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-prover" \
+        "$CRAFT_PART_INSTALL/bin/openshell-prover"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
