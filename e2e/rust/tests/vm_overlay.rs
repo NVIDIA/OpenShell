@@ -58,7 +58,9 @@ async fn vm_overlay() {
     sandbox.cleanup().await;
 }
 
-const IDENTITY_MAIN: &str = "set -eu; if ! test -f /sandbox/canonical-identity; then printf '%s:%s\\n' \"$(id -u)\" \"$(id -g)\" > /sandbox/canonical-identity; fi; echo vm-identity-ready; exec sleep infinity";
+// VM stop terminates the guest without flushing its page cache. Flush this
+// fixture before readiness so restart checks durable file content and ownership.
+const IDENTITY_MAIN: &str = "set -eu; if ! test -f /sandbox/canonical-identity; then printf '%s:%s\\n' \"$(id -u)\" \"$(id -g)\" > /sandbox/canonical-identity; sync; fi; echo vm-identity-ready; exec sleep infinity";
 
 fn identity_policy(user: &str, group: &str) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().expect("temporary identity policy");
@@ -86,7 +88,7 @@ network_policies: {{}}
 async fn assert_workload_identity(sandbox: &SandboxGuard) -> (String, String) {
     let output = sandbox.exec(&[
         "sh", "-c",
-        "set -eu; actual=$(id -u):$(id -g); test \"$(cat /sandbox/canonical-identity)\" = \"$actual\"; test \"$(stat -c %u:%g /sandbox/canonical-identity)\" = \"$actual\"; printf 'identity=%s\\n' \"$actual\"",
+        "set -eu; actual=$(id -u):$(id -g); canonical=$(cat /sandbox/canonical-identity); owner=$(stat -c %u:%g /sandbox/canonical-identity); printf 'exec=%s canonical=%s owner=%s\\n' \"$actual\" \"$canonical\" \"$owner\"; test \"$canonical\" = \"$actual\"; test \"$owner\" = \"$actual\"; printf 'identity=%s\\n' \"$actual\"",
     ]).await.expect("canonical and exec identities and file ownership agree");
     let clean = strip_ansi(&output);
     let pair = clean
