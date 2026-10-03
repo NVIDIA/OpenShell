@@ -139,6 +139,10 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
+# Absolute image preparation and initial supervisor startup budget.
+# Applies to new attempts only; allowed values are 1 through 86400 seconds.
+image_preparation_timeout_seconds = 1800
+
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
