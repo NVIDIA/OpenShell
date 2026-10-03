@@ -2455,7 +2455,7 @@ mod tests {
                 libc::syscall(
                     libc::SYS_tgkill,
                     libc::getpid(),
-                    libc::gettid(),
+                    libc::syscall(libc::SYS_gettid),
                     libc::SIGCONT,
                 )
             };

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, LoopbackTarget,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -371,7 +371,7 @@ fn owned_processes(
     } else {
         roots.to_vec()
     };
-    let mut visited = HashSet::new();
+    let mut visited = std::collections::HashSet::new();
     let mut owned = Vec::new();
     while let Some(pid) = pending.pop() {
         if !visited.insert(pid) {
