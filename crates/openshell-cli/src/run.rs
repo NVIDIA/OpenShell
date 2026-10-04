@@ -5110,7 +5110,7 @@ async fn sandbox_upload_planned(
     sandbox_path: Option<&str>,
     tls: &TlsOptions,
     workspace: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match plan {
         SandboxUploadPlan::GitAware { base_dir, files } => {
             sandbox_sync_up_files(
@@ -5123,10 +5123,13 @@ async fn sandbox_upload_planned(
                 tls,
                 workspace,
             )
-            .await
+            .await?;
+            Ok(None)
         }
         SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
+                .await
+                .map(Some)
         }
     }
 }
@@ -5152,7 +5155,7 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    sandbox_upload_planned(
+    let uploaded_path = sandbox_upload_planned(
         upload_plan,
         server,
         name,
@@ -5163,7 +5166,11 @@ pub async fn sandbox_upload(
     )
     .await?;
 
-    eprintln!("{} Upload complete", "✓".green().bold());
+    if let Some(path) = uploaded_path {
+        eprintln!("{} Upload complete: {path}", "✓".green().bold());
+    } else {
+        eprintln!("{} Upload complete", "✓".green().bold());
+    }
     Ok(())
 }
 

@@ -1781,7 +1781,11 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to the container's working directory).
+        /// Destination path in the sandbox (defaults to its working directory).
+        ///
+        /// For an unfiltered single-file upload, an existing directory or a
+        /// trailing slash places the file inside that directory. A missing
+        /// nested path without a trailing slash renames the file.
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
