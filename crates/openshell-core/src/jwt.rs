@@ -18,7 +18,7 @@
 #[must_use]
 pub fn parse_exp_secs(token: &str) -> Option<i64> {
     use base64::Engine;
-    let raw = token.strip_prefix("Bearer ").unwrap_or(token);
+    let raw = crate::auth::strip_bearer_scheme(token).unwrap_or(token);
     let mut parts = raw.splitn(3, '.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;
@@ -879,6 +879,7 @@ mod tests {
             sub: None,
         });
         assert_eq!(parse_exp_secs(&format!("Bearer {token}")), Some(42));
+        assert_eq!(parse_exp_secs(&format!("bearer {token}")), Some(42));
     }
 
     #[test]
