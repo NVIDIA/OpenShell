@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::{
-    run_cli, wait_for_healthy, wait_for_sandbox_exec_contains, wait_for_sandbox_phase,
+    run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+    wait_for_sandbox_phase,
 };
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::output::strip_ansi;
@@ -131,6 +132,23 @@ async fn ssh_host_identity_survives_restarts_and_changes_after_recreation() {
         eprintln!("Skipping gateway restart check: this run uses an existing gateway");
     }
 
+    let (output, code) = run_cli(&["sandbox", "delete", &name]).await;
+    assert_eq!(code, 0, "delete failed: {output}");
+    // Delete may return before the driver finishes removing the sandbox.
+    // Its name remains reserved until the gateway confirms removal.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let names = sandbox_names()
+                .await
+                .expect("list sandboxes after deletion");
+            if !names.iter().any(|listed| listed == &name) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("original sandbox was not fully deleted before name reuse");
     sandbox.cleanup().await;
     let mut replacement = SandboxGuard::create(&["--name", &name]).await.unwrap();
     assert_ne!(fingerprint(&name).await, original);
