@@ -1156,6 +1156,9 @@ kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
 
 [openshell.drivers.vm]
+# The driver listens on <state_dir>/run/compute-driver.sock. The gateway refuses
+# to start when that path is longer than the platform's Unix socket limit (103
+# bytes on macOS, 107 on Linux), so keep state_dir short.
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"

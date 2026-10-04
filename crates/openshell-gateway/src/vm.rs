@@ -59,6 +59,14 @@ const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
+/// Longest Unix domain socket path, in bytes and excluding the terminating NUL,
+/// that `bind` accepts on this platform. `sockaddr_un.sun_path` holds 108 bytes
+/// on Linux and 104 on macOS and the BSDs.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const MAX_UNIX_SOCKET_PATH_LEN: usize = 103;
+
 /// Configuration for launching and talking to the VM compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -347,11 +355,35 @@ pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
         .join(COMPUTE_DRIVER_SOCKET_NAME)
 }
 
+/// Reject a driver socket path that `bind` cannot accept, naming the path, its
+/// length, the limit and the settings that move it.
+///
+/// Without this check the driver exits with a bare `path must be shorter than
+/// SUN_LEN`, and the gateway can report only the driver's exit status.
+#[cfg(unix)]
+fn check_compute_driver_socket_path_len(socket_path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let len = socket_path.as_os_str().as_bytes().len();
+    if len <= MAX_UNIX_SOCKET_PATH_LEN {
+        return Ok(());
+    }
+    Err(Error::execution(format!(
+        "vm compute driver socket path '{}' is {len} bytes, over the \
+         {MAX_UNIX_SOCKET_PATH_LEN}-byte limit for Unix socket paths on this platform; \
+         set [openshell.drivers.vm] state_dir to a shorter directory (it defaults to \
+         openshell/vm-driver under $XDG_STATE_HOME, or under ~/.local/state when that is unset)",
+        socket_path.display()
+    )))
+}
+
 #[cfg(unix)]
 fn prepare_compute_driver_socket_path(
     vm_config: &VmComputeConfig,
     socket_path: &Path,
 ) -> Result<()> {
+    // Check before creating any directory so a rejected path leaves no state behind.
+    check_compute_driver_socket_path_len(socket_path)?;
     let expected_uid = current_euid();
     prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
     let parent = socket_path.parent().ok_or_else(|| {
@@ -753,8 +785,9 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
+        MAX_UNIX_SOCKET_PATH_LEN, VmComputeConfig, append_otlp_args, append_vm_identity_args,
+        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args,
+        check_compute_driver_socket_path_len, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
@@ -1208,6 +1241,48 @@ mod tests {
             .expect_err("symlinked run dir should be rejected")
             .to_string();
         assert!(err.contains("is a symlink"));
+    }
+
+    #[test]
+    fn compute_driver_socket_path_len_accepts_the_limit_and_rejects_one_byte_more() {
+        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH_LEN - 1)));
+        assert_eq!(fits.as_os_str().len(), MAX_UNIX_SOCKET_PATH_LEN);
+        check_compute_driver_socket_path_len(&fits).expect("a path at the limit should fit");
+
+        let too_long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH_LEN)));
+        let err = check_compute_driver_socket_path_len(&too_long)
+            .expect_err("a path one byte over the limit should be rejected")
+            .to_string();
+        assert!(err.contains(&too_long.display().to_string()), "{err}");
+        assert!(
+            err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH_LEN + 1)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{MAX_UNIX_SOCKET_PATH_LEN}-byte limit")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_rejects_an_overlong_path_before_creating_state() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("s".repeat(MAX_UNIX_SOCKET_PATH_LEN)),
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+            .expect_err("an overlong socket path should be rejected")
+            .to_string();
+        assert!(err.contains(&socket_path.display().to_string()), "{err}");
+        assert!(err.contains("state_dir"), "{err}");
+        assert!(err.contains("XDG_STATE_HOME"), "{err}");
+        assert!(
+            !vm_config.state_dir.exists(),
+            "a rejected path must not create the state directory"
+        );
     }
 
     #[test]
