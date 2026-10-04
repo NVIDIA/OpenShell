@@ -163,6 +163,8 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 
 [Policy Schema](/how-it-works/policies/schema#network-middleware) lists every field and limit.
 
+You can also keep middleware in its own file that contains only the `network_middlewares` section, and pass it with `--middleware` to `openshell sandbox create` or `openshell policy set`. This is how middleware is supplied for a [Cedar policy](/how-it-works/policies/cedar#add-middleware). The policy itself must not also define `network_middlewares`.
+
 ## Choose Failure Behavior
 
 Middleware fails when it cannot complete its check, for example when its service is unavailable, times out, returns an invalid result, or receives a payload over its limit. By default, OpenShell blocks the affected request, response, or WebSocket connection. The `on_error` field on a policy entry controls this behavior.
