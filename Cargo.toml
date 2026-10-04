@@ -92,6 +92,9 @@ apollo-parser = "0.8.5"
 tower-mcp-types = "=0.22.2"
 regex = "1"
 
+# Policy
+cedar-policy = "4.13"
+
 # HTTP client
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
 

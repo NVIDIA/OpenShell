@@ -1,0 +1,89 @@
+namespace Sandbox {
+
+  // ── Principals ──────────────────────────────────────────────────────────
+
+  entity User {};
+  entity Group {};
+
+  entity Process {
+    user:     User,
+    group:    Group,
+    workdir?: FilesystemPath,   // include_workdir: true consumed here
+  };
+
+  // ── Filesystem resources ─────────────────────────────────────────────────
+  // Parent-child hierarchy: FilesystemPath::"/usr/bin" in FilesystemPath::"/usr"
+  // enables `resource in FilesystemPath::"/usr"` to match any descendant.
+
+  entity FilesystemPath in [FilesystemPath] {};
+
+  // ── Network resources ────────────────────────────────────────────────────
+
+  entity NetworkEndpoint {
+    host:      String,
+    port:      Long,
+    protocol:  String,     // "rest", "grpc", etc.
+    host_port: String,     // precomputed "{host}:{port}", for Set.contains() matching
+  };
+
+  // ── Actions ──────────────────────────────────────────────────────────────
+
+  action "ReadFile"
+    appliesTo {
+      principal: [Process],
+      resource:  [FilesystemPath],
+      context:   {}
+    };
+
+  action "WriteFile"
+    appliesTo {
+      principal: [Process],
+      resource:  [FilesystemPath],
+      context:   {}
+    };
+
+  // binary_path: absolute path of the executable making the call (plain
+  //              string, not a FilesystemPath entity - matching is
+  //              Set.contains()/like, not hierarchy traversal)
+  // ancestors:   absolute paths of the calling process's ancestors, from
+  //              /proc/<pid>/exe walks; excludes cmdline/argv0 (spoofable)
+  // method, path, command: ALWAYS "" for this action. CONNECT happens
+  //              before any HTTP request/SQL statement is seen, so there is
+  //              nothing to report yet — these three fields exist only for
+  //              schema symmetry with HttpRequest's context. A `permit`
+  //              that conditions on one of them (e.g. `context.method ==
+  //              "GET"`) can never match and silently denies every
+  //              connection; gate per-request method/path on the
+  //              HttpRequest action instead.
+  action "NetworkConnect"
+    appliesTo {
+      principal: [Process],
+      resource:  [NetworkEndpoint],
+      context: {
+        binary_path: String,
+        ancestors:   Set<String>,
+        method:      String,
+        path:        String,
+        command:     String,
+      }
+    };
+
+  // Per-request L7 enforcement within an already-permitted NetworkConnect
+  // tunnel. binary_path/ancestors/method/path/command mirror NetworkConnect's
+  // fields (same "" for not-applicable convention; binary identity is
+  // re-checked per request, matching Rego's stateless per-call evaluation);
+  // jsonrpc_method is new, for JSON-RPC method allow-listing.
+  action "HttpRequest"
+    appliesTo {
+      principal: [Process],
+      resource:  [NetworkEndpoint],
+      context: {
+        binary_path:    String,
+        ancestors:      Set<String>,
+        method:         String,
+        path:           String,
+        command:        String,
+        jsonrpc_method: String,
+      }
+    };
+}
