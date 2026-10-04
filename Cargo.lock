@@ -4574,6 +4574,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-driver-docker",
  "openshell-driver-podman",
  "openshell-isolation-interface",
  "openshell-otel",
