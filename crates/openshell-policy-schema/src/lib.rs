@@ -591,9 +591,17 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
-    let policy: PolicyDocument = serde_yml::from_value(&value)
-        .into_diagnostic()
-        .wrap_err("failed to decode sandbox policy fields")?;
+    let policy: PolicyDocument =
+        serde_path_to_error::deserialize(serde_yml::Deserializer::new(&value))
+            .map_err(|error| {
+                let path = bound_path(error.path().to_string());
+                if path == "." {
+                    miette::miette!("{}", error.inner())
+                } else {
+                    miette::miette!("{path}: {}", error.inner())
+                }
+            })
+            .wrap_err("failed to decode sandbox policy fields")?;
     validate_policy(&policy)?;
     Ok(policy)
 }
@@ -937,11 +945,15 @@ fn sequence(value: Option<&serde_yml::Value>) -> &[serde_yml::Value] {
 }
 
 fn join(parent: &str, child: &str) -> String {
-    let mut path = if parent.is_empty() {
+    bound_path(if parent.is_empty() {
         child.to_owned()
     } else {
         format!("{parent}.{child}")
-    };
+    })
+}
+
+// Cap diagnostic paths so oversized authored keys cannot bloat errors.
+fn bound_path(mut path: String) -> String {
     if path.len() > MAX_UNKNOWN_FIELD_PATH_BYTES {
         let mut end = MAX_UNKNOWN_FIELD_PATH_BYTES - 3;
         while !path.is_char_boundary(end) {
@@ -1277,6 +1289,44 @@ mod tests {
                 "missing path {expected_path} in {error:?}"
             );
         }
+    }
+
+    fn decode_error_chain(source: &str) -> Vec<String> {
+        let error = parse_policy(source).expect_err("type mismatch must fail closed");
+        error.chain().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn type_errors_name_the_offending_field() {
+        let source = "version: 1\nnetwork_policies:\n  github_api:\n    endpoints:\n      - host: api.github.com\n        port: \"443\"\n";
+        assert_eq!(
+            decode_error_chain(source),
+            [
+                "failed to decode sandbox policy fields",
+                "network_policies.github_api.endpoints[0].port: type mismatch: expected unsigned integer, found string",
+            ]
+        );
+    }
+
+    #[test]
+    fn type_errors_without_a_path_keep_their_message() {
+        let chain = decode_error_chain("- version: 1\n");
+        assert_eq!(chain[0], "failed to decode sandbox policy fields");
+        assert!(
+            !chain[1].starts_with(".: "),
+            "unexpected prefix in {chain:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_type_error_paths_under_long_keys() {
+        let policy_name = "é".repeat(2_000);
+        let source = format!(
+            "version: 1\nnetwork_policies:\n  {policy_name}:\n    endpoints:\n      - host: example.com\n        port: \"443\"\n"
+        );
+        let chain = decode_error_chain(&source);
+        assert!(chain[1].contains("...: type mismatch"));
+        assert!(chain[1].len() <= MAX_UNKNOWN_FIELD_PATH_BYTES + 100);
     }
 
     #[test]
