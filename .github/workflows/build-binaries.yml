@@ -55,7 +55,9 @@ jobs:
   build:
     name: ${{ inputs.binary }} (${{ inputs.triple }})
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 60
+    # Without a Cachix write token, a dev shell evicted from the public cache
+    # is rebuilt from source; the musl shells alone took 55 minutes.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
