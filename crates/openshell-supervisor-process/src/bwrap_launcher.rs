@@ -4,16 +4,18 @@
 //! Experimental fixed-function Bubblewrap launcher.
 //!
 //! The supervisor starts this helper before installing its inherited seccomp
-//! prelude. Callers submit Python source, never commands, paths, mount options,
-//! or environment variables. Bubblewrap builds the namespace and a second
-//! `OpenShell` invocation installs the final Landlock/seccomp policy before
-//! executing `CPython`.
+//! prelude. Callers submit Python source, never commands, mount options, or
+//! environment variables. Protocol 2 may name the agent's own files directory:
+//! the launcher shows it read-only at `/files` and its `code` subdirectory
+//! read-write at `/files/code`, nothing else. Bubblewrap builds the namespace
+//! and a second `OpenShell` invocation installs the final Landlock/seccomp
+//! policy before executing `CPython`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -31,13 +33,18 @@ use serde_json::{Value, json};
 
 const ENABLE_ENV: &str = "OPENSHELL_EXPERIMENTAL_BWRAP_LAUNCHER";
 const PROTOCOL_VERSION: u64 = 1;
+const FILES_PROTOCOL_VERSION: u64 = 2;
 pub const BWRAP_LAUNCHER_SUBCOMMAND: &str = "experimental-bwrap-launcher";
 pub const BWRAP_CHILD_SUBCOMMAND: &str = "experimental-bwrap-child";
 pub const SOCKET_PATH: &str = "/tmp/openshell-bwrap-launcher.sock";
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const SCRATCH_BYTES: &str = "16777216";
 const RUN_TIMEOUT_SECONDS: u64 = 5;
+const FILES_MOUNT: &str = "/files";
+const CODE_FILES_MOUNT: &str = "/files/code";
+const CHILD_FILES_FLAG: &str = "--files";
 
 pub struct LauncherGuard {
     child: Child,
@@ -224,20 +231,105 @@ fn verify_peer(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(stream: &UnixStream) -> Result<Value> {
-    let request = read_request(stream)?;
-    let request: Value = serde_json::from_slice(&request).into_diagnostic()?;
-    if request.as_object().is_none_or(|fields| fields.len() != 2)
-        || request.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
-    {
+struct RunRequest {
+    version: u64,
+    code: String,
+    files: Option<AgentFiles>,
+}
+
+struct AgentFiles {
+    root: PathBuf,
+    code: PathBuf,
+}
+
+/// Protocol 1 is exactly `{protocol_version, code}`; protocol 2 adds only `files_root`.
+fn parse_request(request: &Value) -> Result<RunRequest> {
+    let fields = request
+        .as_object()
+        .ok_or_else(|| miette::miette!("request must be a JSON object"))?;
+    let version = request.get("protocol_version").and_then(Value::as_u64);
+    let expected = match version {
+        Some(PROTOCOL_VERSION) => 2,
+        Some(FILES_PROTOCOL_VERSION) => 3,
+        _ => 0,
+    };
+    if fields.len() != expected || (expected == 3 && !fields.contains_key("files_root")) {
         return Err(miette::miette!(
-            "request requires protocol_version 1 and only the code field"
+            "request requires protocol_version 1 with only code, or 2 with code and files_root"
         ));
     }
     let code = request
         .get("code")
         .and_then(Value::as_str)
         .ok_or_else(|| miette::miette!("request must contain a string code field"))?;
+    let files = match request.get("files_root") {
+        None => None,
+        Some(root) => {
+            Some(prepare_agent_files(root.as_str().ok_or_else(|| {
+                miette::miette!("files_root must be a string")
+            })?)?)
+        }
+    };
+    Ok(RunRequest {
+        version: version.unwrap_or(PROTOCOL_VERSION),
+        code: code.to_owned(),
+        files,
+    })
+}
+
+/// Accept only a canonical directory the launcher's own user owns and nobody else can
+/// write, so code sees the caller's files and never a path the caller could not use.
+fn prepare_agent_files(root: &str) -> Result<AgentFiles> {
+    let root = Path::new(root);
+    if !root.is_absolute() || root.components().count() < 3 {
+        return Err(miette::miette!(
+            "files_root must be an absolute agent directory"
+        ));
+    }
+    if fs::canonicalize(root).into_diagnostic()? != root {
+        return Err(miette::miette!("files_root must be a canonical path"));
+    }
+    check_owned_directory(root)?;
+    let code = root.join("code");
+    match fs::symlink_metadata(&code) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&code)
+                .into_diagnostic()?;
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+        Ok(_) => {}
+    }
+    check_owned_directory(&code)?;
+    Ok(AgentFiles {
+        root: root.to_path_buf(),
+        code,
+    })
+}
+
+#[allow(unsafe_code)]
+fn check_owned_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).into_diagnostic()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(miette::miette!(
+            "agent files must be a directory owned and writable only by the launcher user"
+        ));
+    }
+    Ok(())
+}
+
+fn handle_request(stream: &UnixStream) -> Result<Value> {
+    let request = read_request(stream)?;
+    let request: Value = serde_json::from_slice(&request).into_diagnostic()?;
+    let RunRequest {
+        version,
+        code,
+        files,
+    } = parse_request(&request)?;
 
     let run = tempfile::Builder::new()
         .prefix("openshell-code-")
@@ -246,7 +338,7 @@ fn handle_request(stream: &UnixStream) -> Result<Value> {
     let program = run.path().join("program.py");
     let stdout_path = run.path().join("stdout");
     let stderr_path = run.path().join("stderr");
-    fs::write(&program, code).into_diagnostic()?;
+    fs::write(&program, &code).into_diagnostic()?;
 
     let executable = std::env::current_exe().into_diagnostic()?;
     let stdout = File::create(&stdout_path).into_diagnostic()?;
@@ -301,6 +393,16 @@ fn handle_request(stream: &UnixStream) -> Result<Value> {
         .arg(&program)
         .arg("/work/program.py")
         .args(["--size", SCRATCH_BYTES, "--tmpfs", "/work/output"])
+        .args(files.as_ref().map_or_else(Vec::new, |files| {
+            vec![
+                "--ro-bind".into(),
+                files.root.clone().into_os_string(),
+                FILES_MOUNT.into(),
+                "--bind".into(),
+                files.code.clone().into_os_string(),
+                CODE_FILES_MOUNT.into(),
+            ]
+        }))
         .args(["--ro-bind"])
         .arg(&executable)
         .arg("/openshell-sandbox")
@@ -310,6 +412,7 @@ fn handle_request(stream: &UnixStream) -> Result<Value> {
             "/openshell-sandbox",
             BWRAP_CHILD_SUBCOMMAND,
         ])
+        .args(files.as_ref().map(|_| CHILD_FILES_FLAG))
         .env_clear()
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -322,7 +425,7 @@ fn handle_request(stream: &UnixStream) -> Result<Value> {
     let stdout = read_bounded(&stdout_path)?;
     let stderr = read_bounded(&stderr_path)?;
     Ok(json!({
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": version,
         "status": if status.success() { "succeeded" } else if timed_out { "timed_out" } else { "failed" },
         "exit_code": status.code(),
         "stdout": stdout,
@@ -367,23 +470,28 @@ fn read_bounded(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-pub fn run_hardened_child() -> Result<()> {
+pub fn run_hardened_child(args: &[String]) -> Result<()> {
+    let files = match args {
+        [] => false,
+        [flag] if flag == CHILD_FILES_FLAG => true,
+        _ => return Err(miette::miette!("unexpected Bubblewrap child arguments")),
+    };
     apply_resource_limits()?;
     // Install before the normal policy, which blocks further seccomp changes.
     // One Python process makes address-space and CPU limits per-run bounds.
     apply_single_process_limit()?;
+    let mut read_only = vec!["/usr", "/app/.venv", "/work/program.py", "/dev/urandom"];
+    let mut read_write = vec!["/tmp", "/work/output", "/dev/null"];
+    if files {
+        read_only.push(FILES_MOUNT);
+        read_write.push(CODE_FILES_MOUNT);
+    }
     let policy = SandboxPolicy {
         version: 1,
         filesystem: FilesystemPolicy {
             include_workdir: false,
-            read_only: ["/usr", "/app/.venv", "/work/program.py", "/dev/urandom"]
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
-            read_write: ["/tmp", "/work/output", "/dev/null"]
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            read_only: read_only.into_iter().map(PathBuf::from).collect(),
+            read_write: read_write.into_iter().map(PathBuf::from).collect(),
         },
         landlock: LandlockPolicy {
             compatibility: LandlockCompatibility::HardRequirement,
@@ -435,7 +543,7 @@ fn apply_single_process_limit() -> Result<()> {
 fn apply_resource_limits() -> Result<()> {
     for (resource, soft, hard) in [
         (libc::RLIMIT_CPU, 3, 3),
-        (libc::RLIMIT_FSIZE, MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+        (libc::RLIMIT_FSIZE, MAX_FILE_BYTES, MAX_FILE_BYTES),
         (libc::RLIMIT_NOFILE, 64, 64),
         (libc::RLIMIT_NPROC, 64, 64),
         (libc::RLIMIT_AS, 512 * 1024 * 1024, 512 * 1024 * 1024),
@@ -520,8 +628,12 @@ mod tests {
     fn rejects_requests_that_select_launcher_options() {
         for request in [
             json!({"protocol_version": 2, "code": "print(1)"}),
+            json!({"protocol_version": 3, "code": "print(1)"}),
             json!({"protocol_version": 1, "code": "print(1)", "env": {}}),
             json!({"protocol_version": 1, "code": "print(1)", "mounts": []}),
+            json!({"protocol_version": 1, "code": "print(1)", "files_root": "/tmp/a/b"}),
+            json!({"protocol_version": 2, "code": "print(1)", "mounts": []}),
+            json!({"protocol_version": 2, "code": "print(1)", "files_root": 7}),
             json!({"protocol_version": 1, "command": ["/bin/sh"]}),
             json!({"protocol_version": 1, "code": 42}),
         ] {
@@ -545,6 +657,46 @@ mod tests {
         assert!(read_request(&server).is_err());
         drop(server);
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn agent_files_must_be_a_canonical_private_directory_of_the_launcher_user() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(parent.path()).unwrap().join("agent-files");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let request = |path: &Path| json!({"protocol_version": 2, "code": "print(1)", "files_root": path.to_str().unwrap()});
+
+        let parsed = parse_request(&request(&root)).unwrap();
+        let files = parsed.files.unwrap();
+        assert_eq!((parsed.version, files.root.as_path()), (2, root.as_path()));
+        assert_eq!(files.code, root.join("code"));
+        assert!(fs::symlink_metadata(&files.code).unwrap().is_dir());
+
+        let linked = root.parent().unwrap().join("linked-files");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        assert!(parse_request(&request(&linked)).is_err());
+        assert!(parse_request(&request(&root.join("..").join("agent-files"))).is_err());
+        assert!(
+            parse_request(&json!({"protocol_version": 2, "code": "", "files_root": "rel/a/b"}))
+                .is_err()
+        );
+        assert!(
+            parse_request(&json!({"protocol_version": 2, "code": "", "files_root": "/"})).is_err()
+        );
+
+        fs::remove_dir(root.join("code")).unwrap();
+        std::os::unix::fs::symlink(parent.path(), root.join("code")).unwrap();
+        assert!(parse_request(&request(&root)).is_err());
+
+        fs::remove_file(root.join("code")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(parse_request(&request(&root)).is_err());
+    }
+
+    #[test]
+    fn child_accepts_only_the_files_flag() {
+        assert!(run_hardened_child(&["--mount".to_owned()]).is_err());
+        assert!(run_hardened_child(&[CHILD_FILES_FLAG.to_owned(), "x".to_owned()]).is_err());
     }
 
     #[test]

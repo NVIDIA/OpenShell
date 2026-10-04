@@ -552,7 +552,7 @@ fn main() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     if raw_args.get(1).map(String::as_str) == Some(BWRAP_CHILD_SUBCOMMAND) {
-        return openshell_supervisor_process::bwrap_launcher::run_hardened_child();
+        return openshell_supervisor_process::bwrap_launcher::run_hardened_child(&raw_args[2..]);
     }
 
     let args = Args::parse();
