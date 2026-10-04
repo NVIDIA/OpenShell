@@ -11,6 +11,7 @@ use crate::config::{
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
 };
+use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
@@ -686,6 +687,7 @@ pub struct KubernetesComputeDriver {
     client: Client,
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
+    lifecycle_gates: Arc<LifecycleGates>,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
@@ -713,6 +715,7 @@ impl KubernetesComputeDriver {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist: None,
         }
@@ -794,6 +797,7 @@ impl KubernetesComputeDriver {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist,
         };
@@ -1764,6 +1768,11 @@ impl KubernetesComputeDriver {
     )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self
+            .lifecycle_gates
+            .gate_for(&sandbox.id)
+            .lock_owned()
+            .await;
         let result = Box::pin(self.create_sandbox_inner(sandbox)).await;
         span_status.finish(result)
     }
@@ -2880,6 +2889,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = Box::pin(self.stop_sandbox_inner(sandbox_id)).await;
         span_status.finish(result)
     }
@@ -2979,6 +2989,7 @@ impl KubernetesComputeDriver {
         expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
             generation_id,
@@ -3457,6 +3468,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = self.delete_sandbox_inner(sandbox_id).await;
         span_status.finish(result)
     }
@@ -3657,6 +3669,44 @@ impl KubernetesComputeDriver {
             let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
                 continue;
             };
+            // Lifecycle RPCs can replace the stable supervisor Pod name while
+            // this LIST snapshot still describes the previous stopped state.
+            // Skip in-flight mutations, then refresh under the shared gate so
+            // a snapshot taken before a completed restart cannot delete it.
+            let Ok(_guard) = self.lifecycle_gates.gate_for(&sandbox_id).try_lock_owned() else {
+                continue;
+            };
+            let Some(name) = object.metadata.name.as_deref() else {
+                continue;
+            };
+            let namespace = object
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(&self.config.namespace);
+            let api = Self::agent_sandbox_api(
+                self.client.clone(),
+                &lookup_api.resource.version,
+                namespace,
+            );
+            let refreshed = match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get(name)).await {
+                Ok(Ok(refreshed)) => refreshed,
+                Ok(Err(KubeError::Api(error))) if error.code == 404 => continue,
+                Ok(Err(error)) => {
+                    debug!(%sandbox_id, %error, "could not refresh Sandbox for runtime reconciliation");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(%sandbox_id, "timed out refreshing Sandbox for runtime reconciliation");
+                    continue;
+                }
+            };
+            if refreshed.metadata.uid != object.metadata.uid
+                || sandbox_id_from_object(&refreshed).as_deref() != Ok(sandbox_id.as_str())
+            {
+                continue;
+            }
+            let object = refreshed;
             if let Err(error) = self.admit_stored_resources(&object).await {
                 warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
                 if error.code() == tonic::Code::FailedPrecondition {
@@ -7449,9 +7499,14 @@ mod tests {
                     serde_json::json!({
                         "apiVersion": "agents.x-k8s.io/v1beta1",
                         "kind": "SandboxList",
-                        "items": [sandbox]
+                        "items": [sandbox.clone()]
                     }),
                 ),
+            ),
+            (
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                kube_test_response(http::StatusCode::OK, sandbox),
             ),
             (
                 http::Method::GET,
@@ -7488,6 +7543,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -8462,6 +8518,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -8552,6 +8609,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -11013,6 +11071,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist: None,
         };
@@ -11748,4 +11807,6 @@ mod tests {
         alpha.data = serde_json::json!({"spec": {"replicas": 1}});
         assert!(sandbox_runtime_should_run(&alpha));
     }
+
+    include!("lifecycle_tests.rs");
 }

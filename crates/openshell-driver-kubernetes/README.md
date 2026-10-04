@@ -182,6 +182,13 @@ The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
 
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
+
 ## GPU Support
 
 When a sandbox requests GPU support, the driver checks node allocatable capacity

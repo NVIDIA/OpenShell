@@ -65,6 +65,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use opentelemetry::trace::TraceContextExt as _;
 use sha2::{Digest as _, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2968,7 +2969,7 @@ impl DockerComputeDriver {
         );
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
+                from_image: Some(normalize_pull_reference(image).into_owned()),
                 ..Default::default()
             }),
             None,
@@ -5288,12 +5289,6 @@ async fn spawn_docker_control_process(
                 if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
-                let sandbox_log_tail =
-                    docker_container_log_tail(&monitored_docker, &failure_context.container_id)
-                        .await;
-                if !sandbox_log_tail.is_empty() {
-                    write!(message, "; sandbox log tail: {sandbox_log_tail}").ok();
-                }
                 let _ = monitored_docker.remove_container(
                     &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
@@ -5344,11 +5339,9 @@ async fn wait_for_docker_supervisor_ready(
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
         if sandbox.state.unwrap_or_default().running == Some(false) {
-            let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-            return Err(Status::unavailable(format!(
-                "Docker sandbox exited before supervisor became ready{}",
-                format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-            )));
+            return Err(Status::unavailable(
+                "Docker sandbox exited before supervisor became ready",
+            ));
         }
         let inspected = docker
             .inspect_container(supervisor_id, None)
@@ -5361,11 +5354,10 @@ async fn wait_for_docker_supervisor_ready(
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
+                warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
                 return Err(Status::unavailable(format!(
-                    "Docker supervisor exited before becoming ready{}{}",
-                    format_log_tail(&log_tail),
-                    format_named_log_tail("sandbox log tail", &sandbox_log_tail)
+                    "Docker supervisor exited before becoming ready{}",
+                    format_log_tail(&log_tail)
                 )));
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -5374,14 +5366,20 @@ async fn wait_for_docker_supervisor_ready(
 }
 
 fn format_log_tail(log_tail: &str) -> String {
-    format_named_log_tail("log tail", log_tail)
-}
-
-fn format_named_log_tail(label: &str, log_tail: &str) -> String {
+    // gRPC status messages travel in HTTP/2 headers. A full 16 KiB container
+    // tail can exceed the client's 16 KiB header budget and hide the real
+    // error behind PROTOCOL_ERROR. Allow for up to 3x percent-encoding expansion.
+    const MAX_STATUS_LOG_TAIL_BYTES: usize = 1024;
     if log_tail.is_empty() {
         String::new()
+    } else if log_tail.len() > MAX_STATUS_LOG_TAIL_BYTES {
+        let mut start = log_tail.len() - MAX_STATUS_LOG_TAIL_BYTES;
+        while !log_tail.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("; log tail: [truncated] {}", &log_tail[start..])
     } else {
-        format!("; {label}: {log_tail}")
+        format!("; log tail: {log_tail}")
     }
 }
 
@@ -6301,6 +6299,43 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
 }
 
+/// Normalize an image reference for a pull request by appending `:latest`
+/// when it carries neither an explicit tag nor a digest.
+///
+/// The Docker daemon's `create_image` endpoint interprets a `fromImage` with
+/// no tag as "every tag in the repository" and pulls them all, so a bare
+/// `--from` reference such as `nicolaka/netshoot` must be resolved to a single
+/// tag the way `docker pull` (and the Podman driver) do.
+///
+/// Parsing mirrors [`openshell_core::driver_utils::supervisor_image_tag`]: only
+/// the final path component may carry a tag, so a registry port such as the
+/// `:5000` in `registry:5000/team/app` is not mistaken for one, and a
+/// digest-pinned reference (`...@sha256:...`) already names an exact image and
+/// is left untouched. A separate helper is needed because `supervisor_image_tag`
+/// resolves a bare reference to an implied `latest` and so cannot distinguish a
+/// reference that still needs a tag appended.
+///
+/// Examples:
+/// - `"nicolaka/netshoot"` → `"nicolaka/netshoot:latest"`
+/// - `"foo:1.2"` → `"foo:1.2"` (already tagged)
+/// - `"foo@sha256:abc"` → `"foo@sha256:abc"` (digest-pinned)
+/// - `"registry:5000/team/app"` → `"registry:5000/team/app:latest"`
+/// - `"registry:5000/team/app:v1"` → `"registry:5000/team/app:v1"`
+fn normalize_pull_reference(image: &str) -> Cow<'_, str> {
+    // A digest-pinned reference already identifies an exact image.
+    if image.contains('@') {
+        return Cow::Borrowed(image);
+    }
+    // A `:` only denotes a tag in the final path component; earlier ones are
+    // registry ports (e.g. `registry:5000/team/app`).
+    let last_component = image.rsplit('/').next().unwrap_or(image);
+    if last_component.contains(':') {
+        Cow::Borrowed(image)
+    } else {
+        Cow::Owned(format!("{image}:latest"))
+    }
+}
+
 /// Docker container names may not end with `-`, `.`, or `_`. Truncation can
 /// leave one of those trailing, so strip them before returning.
 fn trim_container_name_tail(mut value: String) -> String {
@@ -6332,7 +6367,7 @@ fn sanitize_docker_name(value: &str) -> String {
 async fn pull_runtime_image(docker: &Docker, image: &str, role: &str) -> CoreResult<()> {
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
-            from_image: Some(image.to_string()),
+            from_image: Some(normalize_pull_reference(image).into_owned()),
             ..Default::default()
         }),
         None,

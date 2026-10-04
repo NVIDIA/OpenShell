@@ -26,8 +26,8 @@ on:
           [
             {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
             {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-            {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+            {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+            {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
           ]
 
 permissions:
@@ -85,4 +85,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
           INSTALLER: ${{ matrix.installer }}
           TESTSUITE: ${{ matrix.testsuite }}
-        run: nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"
+        run: |
+          # Retry dependency preparation, then execute the test suite once.
+          nix build --no-link .#tmachine || nix build --no-link .#tmachine
+          nix run .#tmachine -- test "${ENVIRONMENT}" "${INSTALLER}" "${TESTSUITE}"

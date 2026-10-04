@@ -52,8 +52,7 @@ Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:che
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
-skipping them. The deterministic gateway parity task uses Git for Windows Bash,
-with temporary Python launchers confined to a unique checkout-owned directory.
+skipping them.
 
 `mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
 (including ARM64 hosts running it under emulation), resolves the protobuf
@@ -103,6 +102,10 @@ OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
 
 Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
 requires mTLS.
+
+`mise run test:gateway-config` validates generated gateway TOML without a live
+runtime. It covers the current schema and the Podman in-tree versus external
+driver configuration boundary.
 
 ### Python E2E (`e2e/python/`)
 

@@ -95,7 +95,11 @@ pub fn complete_local_tls_paths() -> Result<Option<LocalTlsPaths>> {
 
 pub fn complete_local_jwt_config() -> Result<Option<GatewayJwtConfig>> {
     let dir = default_local_tls_dir()?;
-    let paths = LocalJwtPaths::resolve(&dir);
+    local_jwt_config(&dir)
+}
+
+pub fn local_jwt_config(dir: &Path) -> Result<Option<GatewayJwtConfig>> {
+    let paths = LocalJwtPaths::resolve(dir);
     let present = paths.files().iter().filter(|path| path.is_file()).count();
     match present {
         0 => Ok(None),

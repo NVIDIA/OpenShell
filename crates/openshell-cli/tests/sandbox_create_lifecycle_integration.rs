@@ -70,6 +70,7 @@ struct SandboxState {
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    ready_before_create_returns: Arc<AtomicBool>,
     terminal_before_relay: Arc<AtomicBool>,
     terminal_after_provisional_container_exit: Arc<AtomicBool>,
     provisional_container_exit_without_result: Arc<AtomicBool>,
@@ -194,7 +195,17 @@ impl OpenShell for TestOpenShell {
             }),
             ..Sandbox::default()
         };
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox.set_phase(
+            if self
+                .state
+                .ready_before_create_returns
+                .load(Ordering::SeqCst)
+            {
+                SandboxPhase::Ready as i32
+            } else {
+                SandboxPhase::Provisioning as i32
+            },
+        );
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
@@ -677,6 +688,10 @@ impl OpenShell for TestOpenShell {
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let ready_before_create_returns = self
+            .state
+            .ready_before_create_returns
+            .load(Ordering::SeqCst);
         let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
         let terminal_after_provisional_container_exit = self
             .state
@@ -723,6 +738,18 @@ impl OpenShell for TestOpenShell {
             }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            if ready_before_create_returns {
+                // A watch starts with the current snapshot. Keep it open so
+                // stream closure cannot hide a client that ignores Ready.
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
+                    }))
+                    .await;
+                tx.closed().await;
+                return;
+            }
             let mut completed = provisioning.clone();
             completed.status = Some(SandboxStatus {
                 exit_code: Some(0),
@@ -2373,6 +2400,55 @@ async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
 }
 
 #[tokio::test]
+async fn sandbox_create_accepts_ready_before_create_returns() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .ready_before_create_returns
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("already-ready"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        ),
+    )
+    .await
+    .expect("creation must finish while the watch remains open")
+    .expect("an already-Ready sandbox must not wait for a new provisioning transition");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        1,
+        "the initial Ready snapshot must allow the command to attach"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
     let server = run_server().await;
     server
@@ -3093,6 +3169,98 @@ async fn run_cli_sandbox_create(
     let xdg_dir = tempfile::tempdir().unwrap();
     prepare_cli_xdg(server, &xdg_dir);
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_empty() {
+    let server = run_server().await;
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("runs")).unwrap();
+    fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
+    fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+
+    // A broken repository must not be mistaken for a non-repository source.
+    fs::create_dir(source.path().join(".git")).unwrap();
+    let path = source.path().join("runs");
+    let args = ["--detach", "--upload", path.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-no-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("Git filtering failed"), "{stderr}");
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(
+        stderr.contains("Sandbox 'upload-no-repository' was created and still exists"),
+        "{stderr}",
+    );
+    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+
+    fs::remove_dir(source.path().join(".git")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = run_cli_sandbox_create(&server, "upload-empty-selection", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+    assert!(
+        stderr.contains("Git returned 0 uploadable paths"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(
+        stderr.contains("Sandbox 'upload-empty-selection' was created and still exists"),
+        "{stderr}",
+    );
+    // Upload rejection intentionally leaves the provisioned sandbox available
+    // for an explicit retry; it does not roll back sandbox creation.
+    assert_eq!(create_requests(&server).await.len(), 2);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0,
+        "a rejected creation-time upload must not open an SSH session",
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("marker.txt"), "dummy content").unwrap();
+    let args = ["--detach", "--upload", source.path().to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-non-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // The fake SSH transport fails; preflight must still let it try.
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("outside a Git work tree"), "{stderr}");
+    assert!(
+        stderr.contains(".gitignore rules are not applied"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst)
+            > 0,
+        "an upload outside a repository must reach the SSH transport",
+    );
 }
 
 async fn run_cli_sandbox_template_create(

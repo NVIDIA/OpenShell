@@ -370,36 +370,20 @@ pub fn set_rootfs_image_file_mode(
 /// Replay the ext4 journal and repair automatically correctable filesystem
 /// state before the driver mutates a preserved guest disk offline.
 pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
-    let mut failures = Vec::new();
-    let mut unavailable = Vec::new();
-
-    for candidate in e2fs_tool_candidates("e2fsck") {
-        let label = candidate.display().to_string();
-        match Command::new(&candidate)
-            .arg("-p")
-            .arg("-f")
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if matches!(output.status.code(), Some(0..=2)) => return Ok(()),
-            Ok(output) => failures.push(format!(
-                "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                unavailable.push(format!("{label} not found"));
-            }
-            Err(error) => failures.push(format!("run {label}: {error}")),
-        }
+    let mut command = e2fs_command("e2fsck")?;
+    let path = PathBuf::from(command.get_program());
+    let output = command.arg("-p").arg("-f").arg(image_path).output();
+    match output {
+        Ok(output) if matches!(output.status.code(), Some(0..=2)) => Ok(()),
+        Ok(output) => Err(format!(
+            "{} failed with status {}\nstdout: {}\nstderr: {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!("run {}: {error}", path.display())),
     }
-
-    Err(if failures.is_empty() {
-        unavailable.join("\n")
-    } else {
-        failures.join("\n")
-    })
 }
 
 #[cfg(target_os = "macos")]
@@ -668,75 +652,33 @@ fn round_up_to_mib(bytes: u64) -> u64 {
     bytes.div_ceil(MIB) * MIB
 }
 
-enum FormatterAttempt {
-    Succeeded,
-    Failed(String),
-    Unavailable(String),
-}
-
 fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
-    let candidates = ["mke2fs", "mkfs.ext4"]
-        .into_iter()
-        .flat_map(e2fs_tool_candidates);
-    run_ext4_formatter_candidates(candidates, |candidate| {
-            let label = candidate.display().to_string();
-            let output = Command::new(candidate)
-                .arg("-q")
-                .arg("-F")
-                .arg("-t")
-                .arg("ext4")
-                .arg("-E")
-                .arg("root_owner=0:0")
-                .arg("-d")
-                .arg(source)
-                .arg(image_path)
-                .output();
-            match output {
-                Ok(output) if output.status.success() => FormatterAttempt::Succeeded,
-                Ok(output) => FormatterAttempt::Failed(format!(
-                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    )),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    FormatterAttempt::Unavailable(format!("{label} not found"))
-                }
-                Err(err) => FormatterAttempt::Failed(format!("run {label}: {err}")),
-            }
-        })
-        .map_err(|details| {
-            format!(
-                "failed to create ext4 rootfs image from {}: {details}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
-                source.display()
-            )
-        })
-}
-
-fn run_ext4_formatter_candidates(
-    candidates: impl IntoIterator<Item = PathBuf>,
-    mut run: impl FnMut(&Path) -> FormatterAttempt,
-) -> Result<(), String> {
-    let mut failures = Vec::new();
-    let mut unavailable = Vec::new();
-
-    for candidate in candidates {
-        match run(&candidate) {
-            FormatterAttempt::Succeeded => return Ok(()),
-            FormatterAttempt::Failed(error) => failures.push(error),
-            FormatterAttempt::Unavailable(error) => unavailable.push(error),
-        }
+    let path = openshell_core::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"])?;
+    let output = Command::new(&path)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-E")
+        .arg("root_owner=0:0")
+        .arg("-d")
+        .arg(source)
+        .arg(image_path)
+        .output()
+        .map_err(|error| format!("run {}: {error}", path.display()))?;
+    if output.status.success() {
+        return Ok(());
     }
-
-    if failures.is_empty() {
-        Err(if unavailable.is_empty() {
-            "no ext4 formatter candidates configured".to_string()
-        } else {
-            unavailable.join("\n")
-        })
-    } else {
-        Err(failures.join("\n"))
-    }
+    // A selected formatter failure must retain its diagnostics. Retrying with
+    // another installation can overwrite a partial image and hide the cause.
+    Err(format!(
+        "failed to create ext4 rootfs image from {}: {} failed with status {}\nstdout: {}\nstderr: {}",
+        source.display(),
+        path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
@@ -885,52 +827,40 @@ pub fn ext4_image_has_directory(image_path: &Path, guest_path: &str) -> Result<b
     let quoted_path = debugfs_quote_absolute_path(guest_path)
         .ok_or_else(|| format!("invalid debugfs guest path '{guest_path}'"))?;
     let command = format!("stat {quoted_path}");
-    let mut last_error = None;
-
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        match Command::new(&candidate)
-            .arg("-R")
-            .arg(&command)
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                // debugfs exits 0 whether or not the path exists; the answer
-                // is only in its output.
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stdout.contains("Type: directory") {
-                    return Ok(true);
-                }
-                if stdout.contains("Type: ") || stderr.contains("File not found") {
-                    return Ok(false);
-                }
-                return Err(format!(
-                    "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
-                    image_path.display()
-                ));
+    let output = e2fs_command("debugfs")?
+        .arg("-R")
+        .arg(&command)
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            // debugfs exits 0 whether or not the path exists; the answer
+            // is only in its output.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stdout.contains("Type: directory") {
+                return Ok(true);
             }
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
+            if stdout.contains("Type: ") || stderr.contains("File not found") {
+                return Ok(false);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(error) => last_error = Some(format!("run {label}: {error}")),
+            Err(format!(
+                "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
+                image_path.display()
+            ))
         }
+        Ok(output) => Err(format!(
+            "debugfs command '{command}' failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
+            image_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!(
+            "debugfs command '{command}' failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
+            image_path.display()
+        )),
     }
-
-    Err(format!(
-        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
 fn sandbox_guest_user_ids_from_image_path(
@@ -949,45 +879,33 @@ fn sandbox_guest_user_ids_from_image_path(
     let quoted_path = debugfs_quote_absolute_path(guest_path)
         .expect("the static passwd path is a valid debugfs path");
     let command = format!("cat {quoted_path}");
-    let mut last_error = None;
-
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        match Command::new(&candidate)
-            .arg("-R")
-            .arg(&command)
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let passwd = String::from_utf8(output.stdout).map_err(|error| {
-                    format!(
-                        "read {guest_path} from {} as UTF-8: {error}",
-                        image_path.display()
-                    )
-                })?;
-                return parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string());
-            }
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(error) => last_error = Some(format!("run {label}: {error}")),
+    let output = e2fs_command("debugfs")?
+        .arg("-R")
+        .arg(&command)
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let passwd = String::from_utf8(output.stdout).map_err(|error| {
+                format!(
+                    "read {guest_path} from {} as UTF-8: {error}",
+                    image_path.display()
+                )
+            })?;
+            parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string())
         }
+        Ok(output) => Err(format!(
+            "debugfs command '{command}' failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
+            image_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!(
+            "debugfs command '{command}' failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
+            image_path.display()
+        )),
     }
-
-    Err(format!(
-        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
 fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
@@ -1037,83 +955,57 @@ fn run_debugfs_batch(image_path: &Path, commands: &[String]) -> Result<(), Strin
 }
 
 fn run_debugfs_batch_file(image_path: &Path, command_path: &Path) -> Result<(), String> {
-    let mut last_error = None;
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        let output = Command::new(&candidate)
-            .arg("-w")
-            .arg("-f")
-            .arg(command_path)
-            .arg(image_path)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(err) => {
-                last_error = Some(format!("run {label}: {err}"));
-            }
-        }
+    let output = e2fs_command("debugfs")?
+        .arg("-w")
+        .arg("-f")
+        .arg(command_path)
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "debugfs batch {} failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
+            command_path.display(),
+            image_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!(
+            "debugfs batch {} failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
+            command_path.display(),
+            image_path.display()
+        )),
     }
-    Err(format!(
-        "debugfs batch {} failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        command_path.display(),
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
 fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
-    let mut last_error = None;
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        let output = Command::new(&candidate)
-            .arg("-w")
-            .arg("-R")
-            .arg(command)
-            .arg(image_path)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(err) => {
-                last_error = Some(format!("run {label}: {err}"));
-            }
-        }
+    let output = e2fs_command("debugfs")?
+        .arg("-w")
+        .arg("-R")
+        .arg(command)
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "debugfs command '{command}' failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
+            image_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!(
+            "debugfs command '{command}' failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
+            image_path.display()
+        )),
     }
-    Err(format!(
-        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
-fn e2fs_tool_candidates(tool: &str) -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from(tool)];
-    for root in ["/opt/homebrew/opt/e2fsprogs", "/usr/local/opt/e2fsprogs"] {
-        candidates.push(Path::new(root).join("sbin").join(tool));
-        candidates.push(Path::new(root).join("bin").join(tool));
-    }
-    candidates
+fn e2fs_command(tool: &str) -> Result<Command, String> {
+    // Preflight and image operations must execute the same selected file with
+    // the same inherited environment, including when PATH is restricted.
+    Ok(Command::new(openshell_core::e2fsprogs::resolve(&[tool])?))
 }
 
 fn temporary_injection_path(image_path: &Path) -> PathBuf {
@@ -1558,10 +1450,7 @@ mod tests {
 
     #[test]
     fn recover_rootfs_image_accepts_clean_ext4_image() {
-        if !e2fs_tool_candidates("e2fsck")
-            .iter()
-            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
-        {
+        if e2fs_command("e2fsck").is_err() {
             return;
         }
 
@@ -1580,10 +1469,7 @@ mod tests {
 
     #[test]
     fn ext4_image_has_directory_distinguishes_directories_files_and_missing_paths() {
-        if !e2fs_tool_candidates("debugfs")
-            .iter()
-            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
-        {
+        if e2fs_command("debugfs").is_err() {
             return;
         }
 
@@ -1668,58 +1554,90 @@ mod tests {
         assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
     }
 
-    #[test]
-    fn formatter_candidates_preserve_executed_failure_over_missing_fallback() {
-        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("missing")];
-
-        let err = run_ext4_formatter_candidates(candidates, |candidate| {
-            if candidate == Path::new("mke2fs") {
-                FormatterAttempt::Failed(
-                    "mke2fs failed with status 1\nstdout: formatter output\nstderr: no space left"
-                        .to_string(),
-                )
-            } else {
-                FormatterAttempt::Unavailable("missing not found".to_string())
-            }
-        })
-        .expect_err("formatter should fail");
-
-        assert!(err.contains("mke2fs failed with status 1"));
-        assert!(err.contains("no space left"));
-        assert!(!err.contains("missing not found"));
+    fn run_tool_fixture_test(test: &str, directory: &Path) {
+        // Isolate PATH in a child test process. Other tests may prepare images
+        // concurrently and must never observe this deliberately broken tool.
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test, "--nocapture"])
+            .env("PATH", directory)
+            .env("OPENSHELL_ROOTFS_TOOL_TEST_ROOT", directory)
+            .output()
+            .expect("isolated tool test");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
-    fn formatter_candidates_report_all_missing_tools() {
-        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("mkfs.ext4")];
+    fn formatter_preserves_selected_tool_failure_without_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let err = run_ext4_formatter_candidates(candidates, |candidate| {
-            FormatterAttempt::Unavailable(format!("{} not found", candidate.display()))
-        })
-        .expect_err("formatter should be unavailable");
-
-        assert!(err.contains("mke2fs not found"));
-        assert!(err.contains("mkfs.ext4 not found"));
+        if let Some(directory) = std::env::var_os("OPENSHELL_ROOTFS_TOOL_TEST_ROOT") {
+            let directory = PathBuf::from(directory);
+            let image = directory.join("rootfs.ext4");
+            File::create(&image)
+                .expect("image")
+                .set_len(16 * 1024 * 1024)
+                .expect("image size");
+            let source = directory.join("source");
+            fs::create_dir(&source).expect("source directory");
+            let error = format_ext4_image_from_dir(&source, &image)
+                .expect_err("the selected formatter failure must not select another installation");
+            assert!(error.contains("selected-formatter-failed"), "{error}");
+            assert!(error.contains("42"), "{error}");
+            return;
+        }
+        let directory = tempfile::tempdir().expect("tool installation");
+        for (name, body) in [
+            ("mke2fs", "echo selected-formatter-failed >&2\nexit 42"),
+            ("mkfs.ext4", "exit 0"),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("tool fixture");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable");
+        }
+        run_tool_fixture_test(
+            "rootfs::tests::formatter_preserves_selected_tool_failure_without_retry",
+            directory.path(),
+        );
     }
 
     #[test]
-    fn formatter_candidates_accept_successful_fallback() {
-        let candidates = vec![PathBuf::from("first"), PathBuf::from("second")];
-        let mut attempted = Vec::new();
+    fn recovery_preserves_selected_path_and_execution_errors() {
+        use std::os::unix::fs::PermissionsExt as _;
 
-        run_ext4_formatter_candidates(candidates, |candidate| {
-            attempted.push(candidate.to_path_buf());
-            if candidate == Path::new("second") {
-                FormatterAttempt::Succeeded
-            } else {
-                FormatterAttempt::Failed("first failed".to_string())
+        if let Some(directory) = std::env::var_os("OPENSHELL_ROOTFS_TOOL_TEST_ROOT") {
+            let directory = PathBuf::from(directory);
+            let path = directory.join("e2fsck");
+            for (script, expected) in [
+                (
+                    "#!/nonexistent/e2fsprogs-interpreter\n",
+                    "No such file or directory",
+                ),
+                (
+                    "#!/bin/sh\necho recovery-failed >&2\nexit 4\n",
+                    "recovery-failed",
+                ),
+            ] {
+                fs::write(&path, script).expect("recovery tool");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
+                let error = recover_rootfs_image(&directory.join("overlay.ext4"))
+                    .expect_err("recovery failure");
+                assert!(
+                    error.contains(path.canonicalize().unwrap().to_str().unwrap()),
+                    "{error}"
+                );
+                assert!(error.contains(expected), "{error}");
             }
-        })
-        .expect("fallback should succeed");
-
-        assert_eq!(
-            attempted,
-            vec![PathBuf::from("first"), PathBuf::from("second")]
+            return;
+        }
+        let directory = tempfile::tempdir().expect("tool installation");
+        run_tool_fixture_test(
+            "rootfs::tests::recovery_preserves_selected_path_and_execution_errors",
+            directory.path(),
         );
     }
 

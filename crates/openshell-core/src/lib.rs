@@ -17,6 +17,8 @@ pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
 pub mod dynamic_string_allowlist;
+#[cfg(unix)]
+pub mod e2fsprogs;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;

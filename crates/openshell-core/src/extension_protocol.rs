@@ -12,6 +12,13 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
 
+/// Capability for compute drivers that require gateway-minted launch credentials.
+///
+/// Drivers require this capability when every launch needs a
+/// [`crate::jwt::SandboxLaunchAuthentication`] bundle. The gateway checks its
+/// configured signer before accepting sandbox creation.
+pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -103,6 +110,10 @@ pub enum NegotiationError {
 #[must_use]
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let contract = family.contract_capability();
+    let mut supported_capabilities = vec![contract.clone()];
+    if family == ExtensionFamily::Compute {
+        supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+    }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
             major: PROTOCOL_MAJOR,
@@ -110,7 +121,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         }),
         implementation_name: "openshell/gateway".to_string(),
         implementation_version: crate::VERSION.to_string(),
-        supported_capabilities: vec![contract.clone()],
+        supported_capabilities,
         required_capabilities: vec![contract],
     }
 }

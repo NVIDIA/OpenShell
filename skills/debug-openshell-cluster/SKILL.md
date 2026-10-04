@@ -240,6 +240,10 @@ errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 
+The sandbox container's log holds the sandbox runtime's warnings and the
+main process's stdout and stderr when it runs without a TTY. The supervisor
+container's log holds supervisor diagnostics.
+
 ```bash
 docker info
 docker ps --filter name=openshell
@@ -744,6 +748,12 @@ remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
 
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
+
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
@@ -901,8 +911,7 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.

@@ -75,7 +75,9 @@ policy has no `filesystem_policy` section, OpenShell creates one with
 `include_workdir: true`.
 
 The sandbox saves the enriched filesystem policy as a new revision, so the
-added paths appear in `openshell policy get --base`. OpenShell can reject a
+added paths appear in `openshell policy get --base`. While a global policy is
+active, the sandbox adds the paths without saving a revision, so they do not
+appear in the policy views. OpenShell can reject a
 replacement policy that removes filesystem paths, so keep the added paths when
 you replace the complete policy.
 

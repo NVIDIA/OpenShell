@@ -610,6 +610,35 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
+    if openshell_core::google_cloud::is_metadata_destination(destination) {
+        let identity_check = binary_identity
+            .as_ref()
+            .map_err(|_| TcpOpenDenial::IdentityUnavailable)
+            .and_then(|identity| {
+                identity_cache
+                    .verify_or_cache_supplied_identity(identity)
+                    .map_err(|error| match error {
+                        SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
+                        SuppliedIdentityError::CapacityExhausted => {
+                            TcpOpenDenial::ResourceExhausted
+                        }
+                    })
+            });
+        if let Err(denial) = identity_check {
+            let _ = completion.send(TcpOpenDecision::Denied(denial));
+            return None;
+        }
+        completion.send(TcpOpenDecision::RelayReady).ok()?;
+        return Some((
+            stream,
+            Some(binary_identity),
+            None,
+            Some(TransparentOpen {
+                destination,
+                authorization: None,
+            }),
+        ));
+    }
     if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
         if destination.port() != 80 || !has_policy_local {
             emit_staged_transparent_denial(
@@ -2416,11 +2445,15 @@ async fn handle_mediated_connection(
         .as_ref()
         .and_then(EndpointObservationSender::capture);
     let mut policy_local_transparent = false;
+    let mut metadata_transparent = false;
     let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
         transparent_open
     {
         let destination = transparent.destination;
-        if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
+        if openshell_core::google_cloud::is_metadata_destination(destination) {
+            metadata_transparent = true;
+            (None, None)
+        } else if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
             && destination.port() == 80
         {
             policy_local_transparent = true;
@@ -2442,6 +2475,8 @@ async fn handle_mediated_connection(
     } else {
         (None, None)
     };
+    let metadata_deadline = metadata_transparent
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
 
@@ -2458,7 +2493,16 @@ async fn handle_mediated_connection(
         // A mediated open's first workload bytes follow the synthesized CONNECT header.
         // Take only the header out of the reader so the bytes behind it stay buffered for
         // the relay; overlap three bytes so a terminator split across fills is found.
-        let available = client.fill_buf().await.into_diagnostic()?;
+        let available = if let Some(deadline) = metadata_deadline {
+            if let Ok(result) = tokio::time::timeout_at(deadline, client.fill_buf()).await {
+                result.into_diagnostic()?
+            } else {
+                respond(&mut client, b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
+                return Ok(());
+            }
+        } else {
+            client.fill_buf().await.into_diagnostic()?
+        };
         if available.is_empty() {
             return Ok(());
         }
@@ -2497,6 +2541,25 @@ async fn handle_mediated_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
+
+    if metadata_transparent {
+        let credentials = provider_credentials.unwrap_or_else(|| {
+            ProviderCredentialState::from_environment(
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        });
+        return crate::google_cloud_metadata::handle_forward_request(
+            &crate::google_cloud_metadata::MetadataContext::new(credentials),
+            method,
+            target,
+            &buf[..used],
+            &mut client,
+        )
+        .await;
+    }
 
     if policy_local_transparent {
         if !valid_policy_local_request(method, target, request) {
@@ -5224,6 +5287,28 @@ async fn handle_forward_proxy(
     let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
+    if scheme == "http"
+        && ((host_lc == openshell_core::google_cloud::METADATA_HOST && port == 80)
+            || (host_lc == "127.0.0.1" && port == 8174))
+    {
+        let credentials = provider_credentials.unwrap_or_else(|| {
+            ProviderCredentialState::from_environment(
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        });
+        return crate::google_cloud_metadata::handle_forward_request(
+            &crate::google_cloud_metadata::MetadataContext::new(credentials),
+            method,
+            &path,
+            &buf[..used],
+            client,
+        )
+        .await;
+    }
+
     if host_lc == POLICY_LOCAL_HOST {
         if scheme != "http" || port != 80 {
             respond(
@@ -7372,6 +7457,167 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             },
             completion,
         )
+    }
+
+    async fn drive_metadata_request(raw: &[u8], transparent: bool) -> Vec<u8> {
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}",
+            )
+            .unwrap(),
+        );
+        let (server, mut workload) = tokio::io::duplex(32768);
+        let credentials = ProviderCredentialState::from_environment(
+            1,
+            std::collections::HashMap::from([
+                ("GCP_ADC_ACCESS_TOKEN".into(), "real-secret-token".into()),
+                ("GCP_PROJECT_ID".into(), "test-project".into()),
+                (
+                    "GCP_SERVICE_ACCOUNT_EMAIL".into(),
+                    "sa@test-project.iam.gserviceaccount.com".into(),
+                ),
+            ]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        workload.write_all(raw).await.unwrap();
+        let response = async move {
+            let mut bytes = Vec::new();
+            workload.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        };
+        let handler = async move {
+            Box::pin(handle_mediated_connection(
+                tokio::io::BufReader::new(Box::new(server)),
+                None,
+                None,
+                transparent.then(|| TransparentOpen {
+                    destination: openshell_core::google_cloud::METADATA_LOOPBACK_ADDR
+                        .parse()
+                        .unwrap(),
+                    authorization: None,
+                }),
+                None,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(1)),
+                None,
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                Arc::new(None),
+                Some(credentials),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        };
+        let ((), response) = tokio::join!(handler, response);
+        response
+    }
+
+    #[tokio::test]
+    async fn metadata_transparent_and_forward_requests_terminate_locally() {
+        for (target, transparent) in [
+            (
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+                true,
+            ),
+            (
+                "http://127.0.0.1:8174/computeMetadata/v1/instance/service-accounts/default/token",
+                false,
+            ),
+            (
+                "http://gcp.metadata.openshell.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                false,
+            ),
+        ] {
+            let raw = format!(
+                "GET {target} HTTP/1.1\r\nHost: unrelated.example\r\nMetadata-Flavor: Google\r\n\r\n"
+            );
+            let response = drive_metadata_request(raw.as_bytes(), transparent).await;
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert!(response.contains("Metadata-Flavor: Google"));
+            assert!(response.contains("openshell:resolve:env:"));
+            assert!(!response.contains("real-secret-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_ingress_rejects_malformed_and_oversized_headers() {
+        for (raw, status) in [
+            (b"GET / HTTP/1.1\r\nHost: bad\0host\r\n\r\n".to_vec(), "400"),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: local\r\nX-Padding: {}\r\n\r\n",
+                    "a".repeat(MAX_HEADER_BYTES)
+                )
+                .into_bytes(),
+                "431",
+            ),
+        ] {
+            let response = drive_metadata_request(&raw, true).await;
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .starts_with(&format!("HTTP/1.1 {status}"))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_ingress_times_out_incomplete_headers() {
+        let response = drive_metadata_request(b"GET / HTTP/1.1\r\n", true).await;
+        assert!(response.starts_with(b"HTTP/1.1 408 Request Timeout"));
+    }
+
+    #[tokio::test]
+    async fn metadata_staging_requires_verified_identity_without_egress_rules() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}",
+        )
+        .unwrap();
+        for valid_identity in [true, false] {
+            let (mut open, completion) = staged_curl_open(
+                openshell_core::google_cloud::METADATA_LOOPBACK_ADDR
+                    .parse()
+                    .unwrap(),
+                engine.current_generation(),
+            );
+            if !valid_identity {
+                open.binary_identity = Err(ResolveError::Failed("unavailable".into()));
+            }
+            let accepted = preauthorize_transparent_open(
+                open,
+                None,
+                &engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+            if valid_identity {
+                let (_, _, _, transparent) = accepted.expect("metadata is local");
+                assert!(transparent.unwrap().authorization.is_none());
+                assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+            } else {
+                assert!(accepted.is_none());
+                assert_eq!(
+                    completion.await.unwrap(),
+                    TcpOpenDecision::Denied(TcpOpenDenial::IdentityUnavailable)
+                );
+            }
+        }
     }
 
     #[tokio::test]

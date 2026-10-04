@@ -116,6 +116,9 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Absolute preparation budget for new attempts; existing deadlines persist.
+    #[serde(default)]
+    pub image_preparation_timeout_seconds: Option<u32>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]

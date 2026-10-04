@@ -80,19 +80,19 @@ assert_not_contains "$spec" '%%S/openshell/tls'
 # Schema-v2 package startup wiring.
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"
 snapcraft="${ROOT}/snapcraft.yaml"
+snap_workflow="${ROOT}/.github/workflows/snap-package.yml"
 snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
 snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
-snap_docker_hook="${ROOT}/snap/hooks/connect-plug-docker"
-snap_install_hook="${ROOT}/snap/hooks/install"
+snap_post_refresh_hook="${ROOT}/snap/hooks/post-refresh"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
 assert_file_exists "$snapcraft"
+assert_file_exists "$snap_workflow"
 assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
 assert_file_exists "$snap_repro"
-assert_file_exists "$snap_docker_hook"
-assert_file_exists "$snap_install_hook"
+assert_file_exists "$snap_post_refresh_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
@@ -114,32 +114,57 @@ for snap_file in \
   "$snap_install_docs" \
   "$snap_canary" \
   "$snap_repro" \
-  "$snap_docker_hook" \
-  "$snap_install_hook"; do
+  "$snap_post_refresh_hook"; do
   assert_not_contains "$snap_file" "docker:docker-daemon"
   assert_not_contains "$snap_file" "default-provider: docker"
 done
-if [[ ! -x "$snap_install_hook" ]]; then
-  echo "FAIL: Snap install hook must be executable" >&2
+if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
+  echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
   exit 1
 fi
-assert_not_contains "$snap_install_hook" 'compute_driver'
-assert_not_contains "$snap_install_hook" 'allow_unauthenticated_users = true'
-assert_contains "$snapcraft" 'refresh-mode: restart'
-if [[ ! -x "$(dirname "$snap_install_hook")/post-refresh" ]]; then
+if [[ -e "${ROOT}/snap/hooks/install" ]]; then
+  echo "FAIL: obsolete Snap install hook must not exist" >&2
+  exit 1
+fi
+assert_contains "$snapcraft" 'refresh-mode: endure'
+if [[ ! -x "$snap_post_refresh_hook" ]]; then
   echo "FAIL: Snap post-refresh hook must be executable" >&2
   exit 1
 fi
 assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
-bash "$ROOT/tasks/scripts/test-snap-install-hook.sh" "$snap_install_hook"
+bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_hook"
+assert_contains "$snap_workflow" 'name: openshell-prover-${{ matrix.rust_arch }}-unknown-linux-musl'
+assert_contains "$snap_workflow" 'chmod +x prebuilt/prover/openshell-prover'
+assert_contains "$snap_workflow" 'cp prebuilt/prover/openshell-prover snap/prebuilt/openshell-prover'
+assert_contains "$snapcraft" 'for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do'
+assert_contains "$snapcraft" '"$CRAFT_PART_INSTALL/bin/openshell-prover"'
+if ! awk '
+  /^  prover:$/ { in_prover = 1; next }
+  in_prover && /^  [[:alnum:]_-]+:$/ { finished = 1; exit }
+  in_prover && /command: bin\/openshell-prover/ { command = 1 }
+  in_prover && /- openshell-prover/ { alias = 1 }
+  in_prover && /^    plugs:$/ { in_plugs = 1; next }
+  in_prover && in_plugs && /^      - / {
+    plug_count++
+    if ($0 == "      - home") home = 1
+  }
+  END { exit !(in_prover && finished && command && alias && home && plug_count == 1) }
+' "$snapcraft"; then
+  echo "FAIL: Snap prover app must expose the openshell-prover alias with only home access" >&2
+  exit 1
+fi
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
+assert_contains "$snap_install_docs" "systemctl reset-failed snap.openshell.gateway.service"
+assert_contains "$snap_install_docs" "snap restart openshell.gateway"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
+assert_contains "$snap_canary" "openshell.prover check"
 assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_repro" "/snap/bin/openshell.prover check"
 assert_contains "$snap_repro" "system-docker"
 assert_contains "$snap_repro" "missing-docker"
 assert_contains "$snap_repro" "docker-snap"

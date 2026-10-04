@@ -17,11 +17,70 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Protobuf API compatibility
+
+`Protobuf Compatibility` runs in Branch Checks and Release Tag through the shared
+`check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
+and Git from the flake lockfile.
+It uses Buf's `FILE` policy for the `proto/`
+module, covering SDK descriptors and extension contracts. Storage-only protobufs
+remain subject to their separate durability checks.
+
+Branch Checks compares the prospective merge tree with the PR target commit,
+so additions on the target do not look like deletions in an outdated PR. Merge
+queues use their base commit. Both paths resolve the train from tags reachable
+from that target, preventing a PR from selecting its own train. The checkout
+must contain full history and tags; the checker leaves HEAD and working files
+unchanged.
+
+The current train's version is compared with the latest stable release. During
+`0.x`, a minor increment permits breaking changes: for example, `0.2.0-pre.N`
+after stable `0.1.2`. A patch increment such as `0.1.3-pre.N` rejects them.
+Commit messages do not affect this decision. No active train also rejects
+breaking changes. Allowed findings remain visible as warnings; schema errors,
+missing baselines, merge conflicts, and tool failures always fail the check.
+
+Release Tag compares the tagged candidate cumulatively against the previous
+stable release, using the same minor-versus-patch policy. Its result is part
+of the qualification profile: failure blocks stable publication, while a
+pre-release can still publish with failed qualification recorded. This checks
+protobuf compatibility; SDK/configuration compatibility and migration review
+remain separate qualification work.
+
+Fetch the target and tags to check committed branch changes locally, replacing
+`origin/main` for another target:
+
+```shell
+git fetch origin main --tags
+nix run .#check-protobuf-compatibility -- origin/main
+```
+
+The same command accepts a release tag to qualify it against the previous stable
+release. Branch names and commit SHAs select the branch comparison instead:
+
+```shell
+nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
+```
+
+For an intentional minor-train incompatibility, record the Buf finding,
+linked issue, consumer impact, and migration plan in the PR. Keep the finding
+visible; do not disable the job or add a broad Buf ignore rule.
+
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
+
+Every approved `Branch E2E Checks` run builds the RPM packages, including
+runs without optional E2E labels. Core integration qualification builds and installs
+the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
+rootful and rootless Podman. These lanes run conformance using the matching runtime
+images. Release Dev and Release Tag use the same package installers.
+Fedora provider-refresh tests also use RPMs. The Podman driver-specific suites
+retain the binary installer because their fixtures configure its system service,
+local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
+to the package installers and downloads the packages selected by its matrix.
 
 Three opt-in labels enable the long-running E2E suites:
 
@@ -49,8 +108,11 @@ its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an
-`artifact-run-id` from a build of the same commit. Set `category` to
-`policy-advisor` and `test-matrix` to:
+`artifact-run-id` from a build of the same commit. When a `Release Tag` run was
+dispatched from a different commit, also set `source-sha` to the release tag's
+resolved commit so runtime images and test inputs match the candidate binaries.
+Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
+to `policy-advisor` and `test-matrix` to:
 
 ```json
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
@@ -169,7 +231,7 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-The tagged release workflow records security and integration outcomes in a
+The tagged release workflow records protobuf, security, and integration outcomes in a
 qualification job after publishing its commit-addressed OCI images. A failed
 check remains visible in the workflow, but pre-release artifact assembly and
 publication continue. Stable publication currently requires the implemented
@@ -428,8 +490,8 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Protobuf, security, and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 
@@ -449,3 +511,24 @@ merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
+
+## Nix download recovery
+
+Jobs that enter the development shell enable `prepare-shell: "true"` on
+`setup-nix`. After configuring Cachix, the action prepares the shell with
+`nix develop -c true` and retries once on failure. Use `shell-installable`
+to select a different development shell. Rust setup assumes this preparation
+has completed. Jobs that only use Nix apps leave shell preparation disabled.
+
+Nix can report a transport error after receiving a complete cache download,
+then resume at EOF and receive HTTP 416. A fresh invocation restarts the
+operation. Both attempts appear in the job log; a second failure fails the
+step. Any preparation failure is retried once, including deterministic errors.
+Cargo, lint, and test commands are not retried.
+
+Direct `nix build` commands retry once. Before each `nix run`, CI builds the
+app's package with `nix build --no-link`, retrying preparation once, then runs
+the app once. The artifact and protobuf-check apps expose matching package
+outputs for this preparation. Runtime failures from tests, artifact generation,
+and compatibility checks are not retried. Downloads initiated inside an app
+are outside this preparation retry.

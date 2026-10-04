@@ -309,6 +309,8 @@ and receive the exit event and final gRPC status. Input EOF does not immediately
 close the SSH output channel and is distinct from cancelling the RPC. With a PTY,
 input closure is not equivalent to sending a terminal Ctrl-D keystroke.
 
+The supervisor limits pending stdin to 4 MiB per exec channel. If input arrives faster than the command consumes it and this buffer fills, further input fails the exec with exit code 74. The supervisor logs `process stdin buffer is full`. This also applies to SSH file transfers that use exec channels. The limit counts input waiting to be written, so clients that support larger transfers can continue as the command consumes data. Input EOF drains bytes already accepted; cancelling the exec discards pending input.
+
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
 ```shell
@@ -325,8 +327,14 @@ The CLI sends small piped input in one request for compatibility with older
 gateways. It streams larger input in bounded frames, including for commands
 without a TTY, so input is not limited by the gateway's per-message request
 size. Piped input is limited to 4 MiB; use `sandbox upload` for larger files.
-The CLI closes remote stdin when the pipe reaches EOF and continues
-reading command output until the command finishes.
+The CLI waits at most 200 ms for piped stdin to reach EOF. If the pipe is
+still open after that, for example under a CI runner or a harness that never
+closes stdin, the command starts anyway and the remaining input streams to it
+as it arrives. The CLI closes remote stdin when the pipe reaches EOF and
+continues reading command output until the command finishes. Redirect stdin
+from `/dev/null` when a command needs no input.
+
+If streamed stdin exceeds the 4 MiB limit, the CLI reports an error and warns that the command may already have processed partial input. Cancellation does not undo that work.
 
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
 Large stdout and stderr streams are delivered before a successful exit. A slow
@@ -334,6 +342,8 @@ reader backpressures the command. If output delivery fails, `exec` returns a
 failure instead of reporting success with incomplete output.
 If a background process keeps stdout or stderr open for more than 30 seconds
 after the command exits, `exec` reports an output delivery failure.
+
+A failed final gRPC status also makes the CLI report failure, even if the remote command reported exit code zero. The CLI does not automatically retry the execution.
 
 Run an interactive shell with a TTY:
 
@@ -753,6 +763,8 @@ The dashboard has three panels stacked vertically: Gateways, Providers (or Globa
 
 The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
 
+Press `c` in the Sandboxes panel to create a sandbox. In the optional Command field, use quotes or backslashes to group arguments containing spaces. For example, `/bin/sh -c "echo GOOD; read x"` prints `GOOD` and waits for Enter. Invalid quoting keeps the form open without creating a sandbox. The field does not expand variables or evaluate shell operators; invoke a shell explicitly with `sh -c` when you need that behavior.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
@@ -874,10 +886,24 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 By default, uploads inside a Git repository respect `.gitignore` rules so that
 build artifacts, dependency caches, and other ignored files are not transferred.
-If `.gitignore` filtering excludes every file in the upload path, the CLI falls
-back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
-opt into unfiltered uploads explicitly, upload a path outside the Git work
-tree, or force-add the intended files if they should remain Git-aware.
+The CLI stops the affected upload if Git filtering fails or selects no files.
+When the CLI confirms that the source is outside a Git work tree, it uploads
+without filtering and warns that `.gitignore` rules are not applied. Git must
+be installed to determine whether filtering applies. A broken or inaccessible
+repository stops the upload. Pass `--no-git-ignore` to intentionally upload
+without filtering. These rules apply to both `sandbox upload` and
+`sandbox create --upload`.
+
+`sandbox create --upload` provisions the sandbox before checking Git filtering.
+If filtering rejects an upload, the command exits with an error, but the sandbox
+remains running. Earlier uploads in the same command may already have completed.
+Use `openshell sandbox upload` to retry against the existing sandbox, or
+`openshell sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
+if you intend to upload without filtering.
+
+Uploads preserve symlinks, including dangling links, instead of dereferencing
+their targets. A symlink source bypasses Git filtering so the link itself is
+archived.
 
 ## Stop and Start Sandboxes
 
@@ -938,30 +964,24 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
-The gateway enforces a 300-second provisioning repair window, independently of
-the CLI wait timeout. An effective policy, settings, provider, profile, or
-attachment change resets the window from its stored change time. The first
-failed configuration load for that change grants another full window. Repeated
-failures and reconnects do not extend it; reaching `Ready` clears it.
+Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
-When the window expires, the sandbox enters `Error` with reason
-`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
-retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
-remain pending if the backend is unavailable; the gateway retries it. Inspect
-`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
-TUI NOTES distinguishes pending cleanup from reclaimed compute.
+The first authenticated configuration report from the current supervisor ends preparation and starts a separate 300-second admission repair window. A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 
-Repair the configuration, wait for cleanup to complete, then explicitly restart:
+Preparation expiry sets the sandbox to `Error` with reason `ImagePreparationTimedOut`; admission repair expiry uses `ProvisioningTimedOut`. The gateway stops its workload and supervisor compute, retaining the sandbox record, diagnostic, and restartable storage. Cleanup can remain pending if the backend is unavailable; the gateway retries it. Inspect `provisioning` in JSON output for the active `phase`, `deadline`, original `preparation_deadline`, `admission_start_time`, and cleanup timestamps. TUI NOTES identifies preparation timeout and distinguishes pending cleanup from reclaimed compute.
+
+The gateway keeps each submitted create or start operation running after its caller disconnects, its deadline expires, or monitoring fails. This includes recovery and the stop/start sequence for automatic restart. While `driver_operation_pending` is true, explicit start, stop, and deletion are blocked; automatic restart keeps its schedule and waits. Timeout cleanup can try to stop partial compute, but it cannot declare completion until the original driver call returns and a subsequent stop succeeds. This prevents a stop that observed missing compute from allowing a retry just before the original create finishes. Uploaded rootfs archives remain available to the owned operation.
+
+An actual driver response clears the pending flag, including ordinary rejection errors. The gateway retains `driver_operation_id` so a delayed response handler cannot change newer recovery work on the same provisioning attempt. Both fields appear in the `provisioning` JSON object. Backend behavior after a transport error still follows the driver's existing contract. If the owning gateway crashes before recording the response, the flag and any protected upload can remain indefinitely; restart and age alone cannot establish that the operation finished. There is currently no API to resolve that lost ownership, so automatic cleanup completion, retry, and deletion remain blocked for that record.
+
+For `ImagePreparationTimedOut`, inspect image preparation and supervisor startup diagnostics and check whether the configured preparation budget is sufficient. For `ProvisioningTimedOut`, repair the rejected configuration. In either case, wait for cleanup to complete, then explicitly restart:
 
 ```shell
 openshell sandbox get my-sandbox --output json
 openshell sandbox start my-sandbox
 ```
 
-Editing configuration after expiry does not restart compute. A retry gets a new
-300-second window, while static-policy restrictions from any previous activation
-remain in force. Timed-out records are retained even for ephemeral creates; use
-`sandbox delete` when you no longer need the diagnostic or stored state.
+Editing configuration after expiry does not restart compute. An explicit retry gets a new preparation deadline and a separate admission repair window, while static-policy restrictions from any previous activation remain in force. Attempts already active when the gateway is upgraded retain their stored deadline. Timed-out records are retained even for ephemeral creates; use `sandbox delete` when you no longer need the diagnostic or stored state.
 
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

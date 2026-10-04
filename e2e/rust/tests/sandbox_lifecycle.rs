@@ -114,6 +114,28 @@ async fn delete_sandbox(name: &str) {
 
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
+async fn sandbox_exec_outlives_startup_recovery_deadline() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for exec recovery deadline");
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        sandbox.exec(&["sh", "-c", "sleep 31; printf past-recovery-deadline"]),
+    )
+    .await;
+    let next = sandbox.exec(&["printf", "fresh-exec"]).await;
+    sandbox.cleanup().await;
+
+    assert_eq!(
+        output.expect("exec timed out").expect("exec failed"),
+        "past-recovery-deadline",
+        "expiration must not terminate an admitted command"
+    );
+    assert_eq!(next.expect("fresh exec after expiration"), "fresh-exec");
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn sandbox_exec_large_output_is_complete() {
     const BYTES: usize = 8 * 1024 * 1024;
     let mut sandbox = SandboxGuard::create(&[])

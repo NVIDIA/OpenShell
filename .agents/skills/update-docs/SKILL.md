@@ -94,7 +94,7 @@ Identify where the new content should go. Follow the page's existing structure.
 
 ## Step 5: Draft the Update
 
-Write the doc update following the rules in `docs/CONTRIBUTING.mdx`. Key reminders:
+Write the smallest update that tells users exactly what changed and what they need to do. Prefer updating one authoritative page and linking to it over repeating explanations across pages. Omit exhaustive internal details unless they directly affect a user decision or workflow. Follow `docs/CONTRIBUTING.mdx`. Key reminders:
 
 - **Active voice, present tense, second person.**
 - **No unnecessary bold.** Reserve bold for UI labels and parameter names.
