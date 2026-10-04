@@ -19,7 +19,7 @@ use openshell_isolation_interface::contract::{
 
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
 /// these against admission before credentials or discovery reach that backend.
-pub(super) struct LaunchIdentity {
+pub struct LaunchIdentity {
     pub sandbox_id: String,
     pub generation: String,
     pub session_id: SandboxSessionId,
@@ -31,7 +31,7 @@ pub(super) struct LaunchIdentity {
 /// Runtime state remains owned by the supervisor. Backends retain these same
 /// handles so CA publication, provider reload, and bearer rotation stay visible
 /// after attachment; copying their current contents would lose later updates.
-pub(super) struct BackendServices {
+pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
@@ -39,7 +39,7 @@ pub(super) struct BackendServices {
 
 /// Selected by trusted composition, never by payload contents. Decoding and
 /// construction may prepare a client but must not launch workload code.
-pub(super) trait BackendSetup: Sync {
+pub trait BackendSetup: Sync {
     /// Name chosen by trusted composition and checked against admission before decoding.
     fn backend_name(&self) -> &str;
 
@@ -54,7 +54,7 @@ pub(super) trait BackendSetup: Sync {
 /// Native launch data stays with its backend until client construction. Shared
 /// startup admits policy and credentials between discovery and attachment.
 #[tonic::async_trait]
-pub(super) trait PreparedBackend: Send + Sync {
+pub trait PreparedBackend: Send + Sync {
     /// Read image policy through the backend's authenticated client. An invalid
     /// or unreadable policy must return the invalid flag or an error, never missing.
     async fn discover_policy(
@@ -72,7 +72,7 @@ pub(super) trait PreparedBackend: Send + Sync {
 
 /// Created only after name and launch identity checks. Consuming attachment
 /// prevents reusing one prepared startup to build or attach a second client.
-pub(super) struct SelectedBackend {
+pub struct SelectedBackend {
     descriptor: BackendDescriptor,
     identity: LaunchIdentity,
     prepared: Box<dyn PreparedBackend>,
@@ -191,7 +191,7 @@ impl SelectedBackend {
 /// The shared startup sequence owns when attachment advances to confirmation.
 /// Retain network handles before consuming the bound state, as the contract
 /// requires, without exposing the concrete backend to the supervisor.
-pub(super) struct BoundBackend {
+pub struct BoundBackend {
     bound: Box<dyn BoundBoundary>,
 }
 
@@ -220,7 +220,7 @@ impl BoundBackend {
 
 /// Shared startup retains confirmation while preparing networking. Only this
 /// consumed state can invoke the backend's workload launch operation.
-pub(super) struct ReadyBackend {
+pub struct ReadyBackend {
     confirmed: ConfirmedBoundary,
 }
 
@@ -236,9 +236,9 @@ impl ReadyBackend {
     }
 }
 
-/// The standard binary selects the OpenShell Sandbox Protocol. Its wire schema
+/// The standard binary selects the `OpenShell` Sandbox Protocol. Its wire schema
 /// and concrete client stay here rather than in the shared startup sequence.
-pub(super) struct OpenShellBackendSetup;
+pub struct OpenShellBackendSetup;
 
 impl BackendSetup for OpenShellBackendSetup {
     fn backend_name(&self) -> &str {

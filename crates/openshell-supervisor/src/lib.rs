@@ -638,7 +638,8 @@ pub async fn run_sandbox(
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
 ) -> Result<i32> {
-    run_sandbox_with_backend(
+    // Shared startup retains policy and networking state; box it to keep callers' futures small.
+    Box::pin(run_sandbox_with_backend(
         &backend_setup::OpenShellBackendSetup,
         command,
         workdir,
@@ -660,7 +661,7 @@ pub async fn run_sandbox(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
-    )
+    ))
     .await
 }
 

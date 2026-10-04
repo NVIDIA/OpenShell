@@ -7,6 +7,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionRotation};
+use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
 use openshell_core::sandbox_generation::SandboxGenerationId;
 use openshell_isolation_interface::contract::{
     BoundaryConfirmation, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
@@ -15,6 +16,7 @@ use openshell_isolation_interface::contract::{
     OuterFenceGuarantees, PendingDnsQuery, PendingTcpOpen, ReadyBoundary,
     VerifiedBackendDescriptor,
 };
+use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
 
 const TEST_BACKEND: &str = "in-process-test";
 // Deliberately not JSON or a SandboxRuntimeDescriptor. Only TestSetup accepts it.
@@ -70,7 +72,7 @@ impl TestSetup {
         }
     }
 
-    fn descriptor(&self) -> BackendDescriptor {
+    fn descriptor() -> BackendDescriptor {
         BackendDescriptor {
             backend_name: TEST_BACKEND.to_string(),
             payload: TEST_PAYLOAD.to_vec(),
@@ -80,7 +82,7 @@ impl TestSetup {
     fn select(&self) -> SelectedBackend {
         SelectedBackend::select(
             self,
-            self.descriptor(),
+            Self::descriptor(),
             Some(TEST_BACKEND),
             Some("sandbox-1"),
             &self.auth,
@@ -108,10 +110,10 @@ fn identity() -> ResolvedWorkloadIdentity {
 fn policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,
-        filesystem: Default::default(),
-        network: Default::default(),
-        landlock: Default::default(),
-        process: Default::default(),
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy::default(),
+        landlock: LandlockPolicy::default(),
+        process: ProcessPolicy::default(),
     }
 }
 
@@ -391,7 +393,7 @@ fn admission_rejection_never_decodes_or_discovers() {
         ("foreign", Some(TEST_BACKEND)),
         (TEST_BACKEND, Some("foreign")),
     ] {
-        let mut descriptor = setup.descriptor();
+        let mut descriptor = TestSetup::descriptor();
         descriptor.backend_name = descriptor_name.into();
         descriptor.payload = b"malformed".to_vec();
         assert!(
@@ -404,7 +406,7 @@ fn admission_rejection_never_decodes_or_discovers() {
     assert!(
         SelectedBackend::select(
             &setup,
-            setup.descriptor(),
+            TestSetup::descriptor(),
             Some(TEST_BACKEND),
             Some("sandbox-1"),
             &setup.auth
@@ -421,7 +423,7 @@ fn shared_identity_rejection_stops_before_discovery() {
         assert!(
             SelectedBackend::select(
                 &setup,
-                setup.descriptor(),
+                TestSetup::descriptor(),
                 Some(TEST_BACKEND),
                 sandbox,
                 &setup.auth
@@ -434,7 +436,7 @@ fn shared_identity_rejection_stops_before_discovery() {
     assert!(
         SelectedBackend::select(
             &setup,
-            setup.descriptor(),
+            TestSetup::descriptor(),
             Some(TEST_BACKEND),
             Some("sandbox-1"),
             &auth
@@ -446,7 +448,7 @@ fn shared_identity_rejection_stops_before_discovery() {
     assert!(
         SelectedBackend::select(
             &setup,
-            setup.descriptor(),
+            TestSetup::descriptor(),
             Some(TEST_BACKEND),
             Some("sandbox-1"),
             &auth
@@ -460,7 +462,7 @@ fn shared_identity_rejection_stops_before_discovery() {
 #[test]
 fn malformed_selected_payload_stops_at_its_own_decoder() {
     let setup = TestSetup::new();
-    let mut descriptor = setup.descriptor();
+    let mut descriptor = TestSetup::descriptor();
     descriptor.payload = b"malformed".to_vec();
     let error = SelectedBackend::select(
         &setup,
@@ -851,7 +853,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .require_networking
         .store(true, Ordering::SeqCst);
     let startup = || {
-        crate::run_sandbox_with_backend(
+        Box::pin(crate::run_sandbox_with_backend(
             &setup,
             vec!["test-agent".into(), "test-argument".into()],
             Some("/test-workspace".into()),
@@ -868,12 +870,12 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             Some(health_port),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(String::new())),
-            Default::default(),
-            setup.descriptor(),
+            UpstreamProxyArgs::default(),
+            TestSetup::descriptor(),
             setup.auth.clone(),
             Some(TEST_BACKEND.into()),
             Some(marker.clone()),
-        )
+        ))
     };
 
     setup
