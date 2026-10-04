@@ -113,16 +113,25 @@ func SandboxPolicyFromProto(p *sbv1.SandboxPolicy) *types.SandboxPolicy {
 		return nil
 	}
 	result := &types.SandboxPolicy{
-		Version:    p.GetVersion(),
-		Filesystem: filesystemPolicyFromProto(p.GetFilesystem()),
-		Landlock:   landlockPolicyFromProto(p.GetLandlock()),
-		Process:    processPolicyFromProto(p.GetProcess()),
+		Version:           p.GetVersion(),
+		Filesystem:        filesystemPolicyFromProto(p.GetFilesystem()),
+		Landlock:          landlockPolicyFromProto(p.GetLandlock()),
+		Process:           processPolicyFromProto(p.GetProcess()),
+		CedarPolicySource: p.GetCedarPolicySource(),
 	}
 	if np := p.GetNetworkPolicies(); np != nil {
 		result.NetworkPolicies = make(map[string]types.NetworkPolicyRule, len(np))
 		for k, v := range np {
 			if converted := NetworkPolicyRuleFromProto(v); converted != nil {
 				result.NetworkPolicies[k] = *converted
+			}
+		}
+	}
+	if rules := p.GetProviderCredentialRules(); rules != nil {
+		result.ProviderCredentialRules = make(map[string]types.NetworkPolicyRule, len(rules))
+		for k, v := range rules {
+			if converted := NetworkPolicyRuleFromProto(v); converted != nil {
+				result.ProviderCredentialRules[k] = *converted
 			}
 		}
 	}
@@ -144,15 +153,22 @@ func SandboxPolicyToProto(p *types.SandboxPolicy) *sbv1.SandboxPolicy {
 		return nil
 	}
 	result := &sbv1.SandboxPolicy{
-		Version:    p.Version,
-		Filesystem: filesystemPolicyToProto(p.Filesystem),
-		Landlock:   landlockPolicyToProto(p.Landlock),
-		Process:    processPolicyToProto(p.Process),
+		Version:           p.Version,
+		Filesystem:        filesystemPolicyToProto(p.Filesystem),
+		Landlock:          landlockPolicyToProto(p.Landlock),
+		Process:           processPolicyToProto(p.Process),
+		CedarPolicySource: p.CedarPolicySource,
 	}
 	if p.NetworkPolicies != nil {
 		result.NetworkPolicies = make(map[string]*sbv1.NetworkPolicyRule, len(p.NetworkPolicies))
 		for k, v := range p.NetworkPolicies {
 			result.NetworkPolicies[k] = NetworkPolicyRuleToProto(&v)
+		}
+	}
+	if p.ProviderCredentialRules != nil {
+		result.ProviderCredentialRules = make(map[string]*sbv1.NetworkPolicyRule, len(p.ProviderCredentialRules))
+		for k, v := range p.ProviderCredentialRules {
+			result.ProviderCredentialRules[k] = NetworkPolicyRuleToProto(&v)
 		}
 	}
 	if p.NetworkMiddlewares != nil {

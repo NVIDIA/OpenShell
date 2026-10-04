@@ -19,7 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-otel = { path = "../openshell-otel" }
-openshell-policy = { path = "../openshell-policy" }
+openshell-policy = { path = "../openshell-policy", default-features = false }
 
 opentelemetry = { workspace = true }
 tokio = { workspace = true }

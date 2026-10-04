@@ -143,12 +143,15 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // Cedar policies add cedar_policy_source and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode both empty and remain YAML policies.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "329937ca7627bca265dbb804a4884516e761f662fecd342088bc6c5b5fc9005a";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "b1e4d1b603e9451d8f1b3b6a5d7aa9b86c1930d44259f2a9dd34b077bad28465";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "12c8ccc39282317fd886ed86de86092150db97cc2fbefb1d09d6b13cefff86e6";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -613,9 +616,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (312, 27),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

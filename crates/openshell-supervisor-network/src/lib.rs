@@ -8,6 +8,7 @@
 //! owned by the orchestrator; this crate produces denials but does not
 //! aggregate them.
 
+pub mod cedar_only;
 mod google_cloud_metadata;
 #[cfg(target_os = "windows")]
 pub mod host;
@@ -16,6 +17,7 @@ pub mod identity_source;
 pub mod l7;
 pub mod opa;
 pub(crate) mod policy_dns;
+pub mod policy_engine;
 pub mod policy_local;
 pub mod procfs;
 pub mod proxy;

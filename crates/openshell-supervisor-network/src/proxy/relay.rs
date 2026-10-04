@@ -6,6 +6,7 @@
 use super::{EgressDecision, L7RouteSnapshot, emit_l7_tunnel_close_after_policy_change};
 use crate::l7::relay::L7EvalContext;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::policy_engine::PolicyEngine;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
 use openshell_core::endpoint_status::EndpointObservationSender;
@@ -106,18 +107,24 @@ pub(super) fn http_context(
 
 /// Pin a generation for a relay or the forward HTTP single-request path.
 pub(super) fn pin_policy_generation(
-    opa_engine: &OpaEngine,
+    network_engine: &PolicyEngine,
     expected_generation: u64,
 ) -> Result<PolicyGenerationGuard> {
-    opa_engine.generation_guard(expected_generation)
+    network_engine.generation_guard(expected_generation)
 }
 
-/// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
+/// Build the L7 evaluator for a relay or the forward HTTP single-request path.
+///
+/// `opa_engine` supplies middleware and per-tunnel plumbing; `network_engine`
+/// pins the tunnel to the generation of the decision that allowed it and,
+/// for a Cedar policy, makes the L7 decisions. See
+/// [`PolicyEngine::tunnel_engine`].
 pub(super) fn pin_l7_evaluator(
     opa_engine: &OpaEngine,
+    network_engine: &PolicyEngine,
     expected_generation: u64,
 ) -> Result<TunnelPolicyEngine> {
-    opa_engine.clone_engine_for_tunnel(expected_generation)
+    network_engine.tunnel_engine(opa_engine, expected_generation)
 }
 
 pub(super) fn validate_route_generation(
@@ -145,6 +152,7 @@ pub(super) fn validate_route_generation(
 pub(super) fn prepare_http_relay<'a>(
     route: Option<&L7RouteSnapshot>,
     opa_engine: &'a OpaEngine,
+    network_engine: &PolicyEngine,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
@@ -158,17 +166,18 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
-            Ok(evaluator) => evaluator,
-            Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
-                return None;
-            }
-        };
+        let evaluator =
+            match pin_l7_evaluator(opa_engine, network_engine, decision.policy_generation) {
+                Ok(evaluator) => evaluator,
+                Err(error) => {
+                    emit_l7_tunnel_close_after_policy_change(
+                        &decision.intent.destination.host,
+                        decision.intent.destination.port,
+                        error,
+                    );
+                    return None;
+                }
+            };
         let configs = route
             .configs
             .iter()
@@ -179,17 +188,18 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
-                return None;
-            }
-        };
+        let generation_guard =
+            match pin_policy_generation(network_engine, decision.policy_generation) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_l7_tunnel_close_after_policy_change(
+                        &decision.intent.destination.host,
+                        decision.intent.destination.port,
+                        error,
+                    );
+                    return None;
+                }
+            };
         PreparedHttpPolicy::Passthrough { generation_guard }
     };
 
@@ -205,7 +215,7 @@ pub(super) fn prepare_http_relay<'a>(
 /// a stale decision.
 pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &OpaEngine,
+    network_engine: &PolicyEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
@@ -217,7 +227,7 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.policy_generation) {
+    match pin_policy_generation(network_engine, decision.policy_generation) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
@@ -373,6 +383,7 @@ mod tests {
                 matched_policy: Some("test".to_string()),
             },
             policy_generation,
+            engine: "opa",
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,
@@ -413,10 +424,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut upstream, mut server) = tokio::io::duplex(1024);
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let network_engine = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(engine.current_generation());
         let request = request_context();
-        let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
+        let context =
+            prepare_http_relay(None, &engine, &network_engine, &decision, &request).unwrap();
         let persistent = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         // Larger than either transport buffer: closing must drain the body.
         let body = vec![b'x'; 64 * 1024];
@@ -502,11 +515,12 @@ mod tests {
 
     #[test]
     fn relay_without_route_pins_l4_decision_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(engine.current_generation());
         let request = request_context();
 
-        let context = prepare_http_relay(None, &engine, &decision, &request)
+        let context = prepare_http_relay(None, &engine, &policy, &decision, &request)
             .expect("current L4 generation should prepare a relay");
         let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
             panic!("route-less relay should use a generation guard");
@@ -520,7 +534,8 @@ mod tests {
 
     #[test]
     fn empty_hydrated_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -529,14 +544,15 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            prepare_http_relay(Some(&route), &engine, &policy, &decision, &request).is_none(),
             "a current L7 lookup must not freshen a stale L4 allow"
         );
     }
 
     #[test]
     fn inspected_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![super::super::L7ConfigSnapshot {
@@ -567,14 +583,15 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            prepare_http_relay(Some(&route), &engine, &policy, &decision, &request).is_none(),
             "an inspected route must use the generation that authorized CONNECT"
         );
     }
 
     #[test]
     fn raw_route_cannot_replace_stale_l4_generation() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
             configs: vec![],
@@ -582,20 +599,21 @@ mod tests {
         };
 
         assert!(
-            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
+            prepare_raw_relay(Some(&route), &policy, &decision).is_none(),
             "a raw relay must not freshen a stale L4 allow"
         );
     }
 
     #[test]
     fn stale_generation_fails_before_relay_context_is_created() {
-        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let policy = PolicyEngine::from(Arc::clone(&engine));
         let decision = decision(engine.current_generation());
         let request = request_context();
         engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
 
         assert!(
-            prepare_http_relay(None, &engine, &decision, &request).is_none(),
+            prepare_http_relay(None, &engine, &policy, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
     }

@@ -33,6 +33,24 @@ message SandboxPolicy {
   // policy-local names. At most 10 configs are accepted, and at most 10 stages
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
+  // Raw Cedar policy source (.cedar syntax, against the canonical schema
+  // published by the openshell-policy-cedar-schema crate). When non-empty,
+  // this sandbox's network, per-request, and filesystem decisions come
+  // entirely from Cedar: Landlock grants are derived from the Cedar text
+  // (plus the supervisor's baseline paths), and `filesystem` is not used.
+  // `landlock.compatibility`, `process`, and `network_middlewares` are
+  // still honored. Rejected at validation if `network_policies` or
+  // `filesystem` paths are also set.
+  // A sandbox cannot switch between Cedar and YAML after creation, and
+  // global policies must be YAML.
+  string cedar_policy_source = 7;
+  // Gateway-managed, for Cedar policies only: the network rules of the
+  // sandbox's attached providers, keyed like provider-composed
+  // `network_policies` entries. They supply endpoint settings for credential
+  // injection (credential markers, rewrite options, request signing) on
+  // connections the Cedar policy allows, and never grant access themselves.
+  // Rejected in user-submitted policies.
+  map<string, NetworkPolicyRule> provider_credential_rules = 8;
 }
 
 // Filesystem access policy.

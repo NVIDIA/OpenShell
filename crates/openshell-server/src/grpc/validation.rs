@@ -1027,6 +1027,11 @@ pub(super) fn validate_no_reserved_provider_policy_keys(
             "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
         )));
     }
+    if !policy.provider_credential_rules.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider_credential_rules is managed by the gateway from attached providers; use 'openshell policy get <sandbox> --base' for a round-trippable base policy",
+        ));
+    }
     Ok(())
 }
 
@@ -1036,6 +1041,20 @@ pub(super) fn validate_static_fields_unchanged(
     baseline: &ProtoSandboxPolicy,
     new: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
+    // Checked first so a format switch is reported as such rather than as
+    // whichever static field happens to differ between the two formats.
+    // The supervisor picks its authoritative policy engine (OPA or Cedar)
+    // once at startup from whether cedar_policy_source was set; a live
+    // reload only ever re-evaluates within that same engine. Flipping
+    // formats via update would leave the originally-chosen engine stale
+    // (silently evaluating against the old policy) while the other engine's
+    // reload is simply never consulted.
+    if baseline.cedar_policy_source.is_empty() != new.cedar_policy_source.is_empty() {
+        return Err(Status::invalid_argument(
+            "cannot switch a live sandbox between YAML and Cedar policy formats; \
+             recreate the sandbox instead",
+        ));
+    }
     // Filesystem: allow additive changes (new paths can be added, but
     // existing paths cannot be removed and include_workdir cannot change).
     // This supports the supervisor's baseline path enrichment at startup.
@@ -1053,6 +1072,20 @@ pub(super) fn validate_static_fields_unchanged(
         return Err(Status::invalid_argument(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
+    }
+    // A Cedar policy's Landlock grants come from its text. Apply the same
+    // additive-only rule as YAML `filesystem`: Landlock cannot revoke a grant
+    // from a running process, so a narrowing edit would report success while
+    // the old grants stay in force until restart.
+    if !baseline.cedar_policy_source.is_empty()
+        && baseline.cedar_policy_source != new.cedar_policy_source
+    {
+        let baseline_grants =
+            openshell_policy::cedar_filesystem_grants(&baseline.cedar_policy_source);
+        let new_grants = openshell_policy::cedar_filesystem_grants(&new.cedar_policy_source);
+        if let (Some(baseline_grants), Some(new_grants)) = (baseline_grants, new_grants) {
+            validate_filesystem_additive(Some(&baseline_grants), Some(&new_grants))?;
+        }
     }
     Ok(())
 }
@@ -2255,6 +2288,23 @@ mod tests {
     }
 
     #[test]
+    fn validate_no_reserved_provider_policy_keys_rejects_provider_credential_rules() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            ..Default::default()
+        };
+        policy
+            .provider_credential_rules
+            .insert("_provider_work".into(), NetworkPolicyRule::default());
+
+        let error = validate_no_reserved_provider_policy_keys(&policy)
+            .expect_err("user-submitted provider_credential_rules must be rejected");
+        assert!(error.message().contains("provider_credential_rules"));
+    }
+
+    #[test]
     fn validate_no_reserved_provider_policy_keys_accepts_user_key() {
         use openshell_core::proto::NetworkPolicyRule;
 
@@ -2293,6 +2343,101 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_switching_from_yaml_to_cedar() {
+        let baseline = ProtoSandboxPolicy::default();
+        let new = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &new);
+        assert!(result.is_err(), "format flip must be rejected");
+    }
+
+    #[test]
+    fn validate_static_fields_reports_a_format_switch_before_other_static_fields() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy {
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".into(),
+            }),
+            ..Default::default()
+        };
+        let error = validate_static_fields_unchanged(&baseline, &new)
+            .expect_err("format flip must be rejected");
+        assert!(
+            error.message().contains("YAML and Cedar"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_switching_from_cedar_to_yaml() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy::default();
+        let result = validate_static_fields_unchanged(&baseline, &new);
+        assert!(result.is_err(), "format flip must be rejected");
+    }
+
+    #[test]
+    fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
+        let baseline = ProtoSandboxPolicy {
+            cedar_policy_source: "permit(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        };
+        let new = ProtoSandboxPolicy {
+            cedar_policy_source: "forbid(principal, action, resource);".into(),
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        };
+        assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
+    }
+
+    fn cedar_policy_granting(paths: &[&str]) -> ProtoSandboxPolicy {
+        let cedar_policy_source = paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "permit(principal, action == Sandbox::Action::\"ReadFile\", \
+                     resource in Sandbox::FilesystemPath::\"{path}\");"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ProtoSandboxPolicy {
+            cedar_policy_source,
+            provider_credential_rules: HashMap::default(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_removing_a_cedar_filesystem_grant() {
+        let baseline = cedar_policy_granting(&["/usr", "/etc"]);
+        let new = cedar_policy_granting(&["/usr"]);
+        let error = validate_static_fields_unchanged(&baseline, &new)
+            .expect_err("narrowing Landlock grants on a live sandbox must be rejected");
+        assert!(error.message().contains("/etc"), "{}", error.message());
+    }
+
+    #[test]
+    fn validate_static_fields_allows_adding_a_cedar_filesystem_grant() {
+        let baseline = cedar_policy_granting(&["/usr"]);
+        let new = cedar_policy_granting(&["/usr", "/etc"]);
+        assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
     }
 
     #[test]
