@@ -470,6 +470,40 @@ configure_hostname() {
     ts "hostname=${sandbox_hostname}"
 }
 
+# OCI images commonly ship an empty /etc/hosts and rely on the container
+# runtime to bind-mount a generated one. No runtime does that here, and /etc is
+# read-only once the supervisor applies policy, so init supplies the loopback
+# names when the file is missing or empty. A non-empty file is the image
+# author's and is kept as is. Without these entries `localhost` fails to
+# resolve: the guest resolver is the loopback relay, which has no record for it.
+configure_hosts() {
+    local hosts_file
+    hosts_file="$(root_path /etc/hosts)"
+
+    # An absolute symlink target resolves against init's own root, not the
+    # workload root, so following one could write outside the workload. Leave
+    # an image-authored link alone.
+    if [ -L "$hosts_file" ]; then
+        ts "WARN: ${hosts_file} is a symlink; leaving it unchanged"
+        return 0
+    fi
+    if [ -s "$hosts_file" ]; then
+        return 0
+    fi
+
+    # Missing loopback names degrade the workload but do not make the sandbox
+    # unsafe, so a write failure is reported and boot continues. The shell's
+    # own error stays visible on the console to explain the failure.
+    if ! printf '%s\n' \
+        '127.0.0.1 localhost' \
+        '::1 localhost ip6-localhost ip6-loopback' \
+        >"$hosts_file"; then
+        ts "WARN: could not write ${hosts_file}; localhost will not resolve"
+        return 0
+    fi
+    ts "populated empty /etc/hosts with loopback names"
+}
+
 run_openshell_init_dropins() {
     # Run executable drop-ins from /opt/openshell/init.d in deterministic
     # ASCII-sorted order. Drop-ins are *executed* in a child shell rather
@@ -573,6 +607,7 @@ run_post_overlay_setup() {
     setup_sandbox_workdir
 
     configure_hostname
+    configure_hosts
     if ! /opt/openshell/bin/openshell-vm-init prepare-network; then
         ts "FATAL: failed to bring up the loopback interface"
         exit 1
