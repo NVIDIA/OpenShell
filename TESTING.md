@@ -309,8 +309,7 @@ The `driver-podman` suite supports rootful and rootless Podman. The
 `e2e-podman` archive requires rootless Podman for its host workload fixtures.
 DEB and RPM installers share the gateway role; available environments pair
 DEB with Ubuntu/Docker and RPM with Fedora/Podman. A DEB/Podman run requires an
-Ubuntu Podman environment. Run `mise run test:tmachine-gateway` to check the
-binary and package service contexts without launching a guest.
+Ubuntu Podman environment.
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
 
