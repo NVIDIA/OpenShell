@@ -640,6 +640,9 @@ mod tests {
             // This is deliberately the child's last reference. Its parent has
             // no remaining references either, so both must close on this worker.
             drop(child);
+            // Closing the carried span must also restore the worker's default,
+            // so unrelated work cannot leak into this test's private exporter.
+            drop(tracing::info_span!("unrelated_worker_span"));
         })
         .join()
         .expect("worker closes spans without consulting the global registry");
@@ -654,6 +657,37 @@ mod tests {
         );
         assert_eq!(parent_context.span().span_context(), &parent.span_context);
         assert_eq!(child_context.span().span_context(), &child.span_context);
+        assert_eq!(traced.finished_spans().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tracing_exporters_isolate_unrelated_threads_and_successive_tests() {
+        // Use the same callsite under all dispatchers to exercise the global
+        // interest cache without sharing their captured spans.
+        fn emit_span() {
+            drop(tracing::info_span!("isolated_test_span"));
+        }
+
+        let traced = test_exporter::install_traced();
+        emit_span();
+        std::thread::spawn(emit_span)
+            .join()
+            .expect("unrelated worker records only into the global registry");
+        let first = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&first);
+        assert_eq!(traced.finished_spans().len(), 1);
+        drop(traced);
+
+        let traced = test_exporter::install_traced();
+        assert!(traced.finished_spans().is_empty());
+        emit_span();
+        let second = traced.span_named("isolated_test_span");
+        test_exporter::assert_is_root(&second);
+        assert_eq!(traced.finished_spans().len(), 1);
+        assert_ne!(
+            first.span_context.trace_id(),
+            second.span_context.trace_id()
+        );
     }
 
     #[tokio::test]
