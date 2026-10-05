@@ -36,11 +36,20 @@ jq -e '
   and .suites.security == "failure"
   and .run.id == "1234"
   and .run.attempt == "2"
+  and .advisory_reviews.compatibility.required == false
+  and .advisory_reviews.compatibility.status == "reported_separately"
+  and .advisory_reviews.compatibility.artifact_name == "compatibility-review-run-1234-attempt-2"
+  and .advisory_reviews.compatibility.run_url == .run.url
 ' "${TEST_DIR}/qualification-summary.json" >/dev/null
 
 export SECURITY_RESULT=success
 current_profile_passed=$("${GENERATOR}" "${TEST_DIR}/qualified-summary.json")
 [[ "${current_profile_passed}" == "true" ]]
 jq -e '.current_profile_passed == true' "${TEST_DIR}/qualified-summary.json" >/dev/null
+
+jq -e '
+  (.suites | has("compatibility") | not)
+  and (.profile.missing_suites | index("SDK/configuration compatibility and migration review") != null)
+' "${TEST_DIR}/qualified-summary.json" >/dev/null
 
 echo "qualification summary tests passed"

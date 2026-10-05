@@ -415,6 +415,11 @@ jobs:
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
+
+      - name: Test advisory compatibility reviewer
+        run: |
+          mise run test:codex-compatibility
+          mise run test:qualification-summary
   go:
     name: Go SDK
     needs: pr_metadata

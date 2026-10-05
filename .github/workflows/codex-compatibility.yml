@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Codex Compatibility Review
+
+on:
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Candidate or stable 0.x release tag to review
+        required: true
+        type: string
+      source_sha:
+        description: Expected candidate commit from release qualification
+        required: true
+        type: string
+    secrets:
+      CODEX_SECURITY_API_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Candidate or stable 0.x release tag to review (no publication)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-compatibility-${{ inputs.candidate_ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: Compatibility review (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      # Install outside the checkout before repository npm configuration exists.
+      - name: Install Codex CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/compatibility-codex" \
+            --ignore-scripts --no-audit --no-fund @openai/codex@0.160.0
+
+      # Ubuntu's AppArmor restriction otherwise prevents the Codex Linux sandbox
+      # from creating its network namespace. The read-only sandbox stays enabled.
+      - name: Allow sandbox user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Check out review tooling and release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: review-tools
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Review cumulative compatibility
+        id: review
+        working-directory: review-tools
+        env:
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha || '' }}
+          NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+        run: |
+          python3 tasks/scripts/codex_compatibility.py "$CANDIDATE_REF" \
+            --source-sha "$SOURCE_SHA" \
+            --codex-bin "$RUNNER_TEMP/compatibility-codex/node_modules/.bin/codex" \
+            --output-dir "$RUNNER_TEMP/compatibility-report"
+
+      - name: Summarize advisory review
+        if: ${{ !cancelled() }}
+        env:
+          REVIEW_STATUS: ${{ steps.review.outputs.status || 'error' }}
+        run: |
+          report="$RUNNER_TEMP/compatibility-report/report.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '## Compatibility review (advisory)' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Review could not run. No compatibility assessment is available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$REVIEW_STATUS" != complete ]; then
+            echo '::warning::Compatibility review is incomplete or unavailable; publication gates are unchanged.'
+          fi
+
+      - name: Retain compatibility report
+        if: ${{ !cancelled() }}
+        id: report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: compatibility-review-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/compatibility-report/report.json
+            ${{ runner.temp }}/compatibility-report/report.md
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Link retained report
+        if: ${{ !cancelled() && steps.report.outputs.artifact-url != '' }}
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+        run: echo "[Download compatibility report]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
