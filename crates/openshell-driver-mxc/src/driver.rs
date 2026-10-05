@@ -2989,7 +2989,8 @@ mod lifecycle_tests {
             .replace("__OLLAMA_PORT__", "11434")
             .replace("__INFERENCE_HOST__", "integrate.api.nvidia.com")
             .replace("__INFERENCE_PORT__", "443")
-            .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
+            .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe")
+            .replace("__CURL_EXE__", r"C:\Windows\System32\curl.exe");
         parse_sandbox_policy(&rendered).expect("parse rendered shipped demo policy")
     }
 

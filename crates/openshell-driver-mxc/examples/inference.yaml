@@ -21,4 +21,4 @@ network_policies:
         access: read-write
         enforcement: enforce
     binaries:
-      - path: '__CMD_EXE__'
+      - path: '__CURL_EXE__'

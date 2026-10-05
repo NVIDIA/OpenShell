@@ -982,6 +982,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let post_status_path_string = post_status_path.to_string_lossy().into_owned();
     let diagnostic_path_string = diagnostic_path.to_string_lossy().into_owned();
     let cmd_string = cmd.to_string_lossy().into_owned();
+    let curl_string = curl.to_string_lossy().into_owned();
     // Schannel's revocation lookup targets are intentionally outside this
     // test's example.com-only policy. Disable that network lookup while still
     // requiring curl to validate the proxy-issued certificate against the
@@ -1036,7 +1037,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: cmd_string }],
+                binaries: vec![NetworkBinary { path: curl_string }],
             },
         )]),
         ..Default::default()
