@@ -542,6 +542,12 @@ pub async fn sandbox_create(
         return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
 
+    // Plan every upload before provisioning so a rejected one leaves no sandbox.
+    let upload_plans = uploads
+        .iter()
+        .map(|(local_path, _, git_ignore)| sandbox_upload_plan(Path::new(local_path), *git_ignore))
+        .collect::<Result<Vec<_>>>()?;
+
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
     if let Some(ref spec) = forward {
@@ -1033,7 +1039,9 @@ pub async fn sandbox_create(
             drop(client);
 
             let upload_count = uploads.len();
-            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
+            for (idx, ((local_path, sandbox_path, _), upload_plan)) in
+                uploads.iter().zip(upload_plans).enumerate()
+            {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
                 if upload_count > 1 {
@@ -1049,38 +1057,21 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                let local = Path::new(local_path);
-                let upload_plan = sandbox_upload_plan(local, *git_ignore).wrap_err_with(|| {
+                sandbox_upload_planned(
+                    upload_plan,
+                    &effective_server,
+                    &sandbox_name,
+                    Path::new(local_path),
+                    dest,
+                    &effective_tls,
+                    workspace,
+                )
+                .await
+                .wrap_err_with(|| {
                     format!(
                         "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
                     )
                 })?;
-                match upload_plan {
-                    SandboxUploadPlan::GitAware { base_dir, files } => {
-                        sandbox_sync_up_files(
-                            &effective_server,
-                            &sandbox_name,
-                            &base_dir,
-                            &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::Regular => {
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                }
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
@@ -4977,6 +4968,35 @@ fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
     Ok(SandboxUploadPlan::GitAware { base_dir, files })
 }
 
+async fn sandbox_upload_planned(
+    plan: SandboxUploadPlan,
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    match plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+                workspace,
+            )
+            .await
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await
+        }
+    }
+}
+
 /// Upload a local path to a sandbox.
 ///
 /// Symlink sources, including dangling links, bypass Git-aware filtering so
@@ -4998,24 +5018,16 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    match upload_plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-    }
+    sandbox_upload_planned(
+        upload_plan,
+        server,
+        name,
+        local_path,
+        sandbox_path,
+        tls,
+        workspace,
+    )
+    .await?;
 
     eprintln!("{} Upload complete", "✓".green().bold());
     Ok(())

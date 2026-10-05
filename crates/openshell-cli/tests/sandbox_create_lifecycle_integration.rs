@@ -3172,12 +3172,14 @@ async fn run_cli_sandbox_create(
 }
 
 #[tokio::test]
-async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_empty() {
+async fn sandbox_create_upload_is_rejected_before_provisioning_when_planning_fails() {
     let server = run_server().await;
     let source = tempfile::tempdir().unwrap();
     fs::create_dir(source.path().join("runs")).unwrap();
     fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
     fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+    let plain = tempfile::tempdir().unwrap();
+    fs::write(plain.path().join("ok.txt"), "ok").unwrap();
 
     // A broken repository must not be mistaken for a non-repository source.
     fs::create_dir(source.path().join(".git")).unwrap();
@@ -3188,12 +3190,7 @@ async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_e
     assert!(!result.status.success(), "{stderr}");
     assert!(stderr.contains("Git filtering failed"), "{stderr}");
     assert!(stderr.contains("--no-git-ignore"), "{stderr}");
-    assert!(
-        stderr.contains("Sandbox 'upload-no-repository' was created and still exists"),
-        "{stderr}",
-    );
-    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
-    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+    assert!(!stderr.contains("was created"), "{stderr}");
 
     fs::remove_dir(source.path().join(".git")).unwrap();
     assert!(
@@ -3213,13 +3210,33 @@ async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_e
         "{stderr}"
     );
     assert!(stderr.contains("--no-git-ignore"), "{stderr}");
-    assert!(
-        stderr.contains("Sandbox 'upload-empty-selection' was created and still exists"),
-        "{stderr}",
+    assert!(!stderr.contains("was created"), "{stderr}");
+
+    // A valid earlier upload must not get through when a later one is rejected.
+    let args = [
+        "--detach",
+        "--upload",
+        plain.path().to_str().unwrap(),
+        "--upload",
+        path.to_str().unwrap(),
+    ];
+    let result = run_cli_sandbox_create(&server, "upload-later-rejected", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+
+    let missing = plain.path().join("missing");
+    let args = ["--detach", "--upload", missing.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-missing", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("local path does not exist"), "{stderr}");
+
+    assert_eq!(
+        create_requests(&server).await.len(),
+        0,
+        "a rejected upload plan must not provision a sandbox",
     );
-    // Upload rejection intentionally leaves the provisioned sandbox available
-    // for an explicit retry; it does not roll back sandbox creation.
-    assert_eq!(create_requests(&server).await.len(), 2);
     assert_eq!(
         server
             .openshell
@@ -3227,7 +3244,7 @@ async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_e
             .ssh_session_requests
             .load(Ordering::SeqCst),
         0,
-        "a rejected creation-time upload must not open an SSH session",
+        "a rejected upload plan must not open an SSH session",
     );
 }
 
@@ -3251,6 +3268,13 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
         "{stderr}"
     );
     assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+    // A transfer failure after provisioning keeps the sandbox and says so.
+    assert!(
+        stderr.contains("Sandbox 'upload-non-repository' was created and still exists"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
     assert_eq!(create_requests(&server).await.len(), 1);
     assert!(
         server
