@@ -9109,9 +9109,10 @@ type ProviderProfileCredential struct {
 	PathTemplate string                        `protobuf:"bytes,9,opt,name=path_template,json=pathTemplate,proto3" json:"path_template,omitempty"`
 	TokenGrant   *ProviderCredentialTokenGrant `protobuf:"bytes,10,opt,name=token_grant,json=tokenGrant,proto3" json:"token_grant,omitempty"`
 	// Output-only gateway-derived endpoint authorities for resolved token grants.
-	// Empty means no endpoint may obtain this grant. Profile-authored values are
-	// ignored; normal policies name the originating provider endpoint, while a
-	// global policy replaces those authorities with its own endpoints.
+	// For inspected L7 requests, empty means no endpoint may obtain this grant.
+	// L4 injection uses selectors without checking these authorities.
+	// Profile-authored values are ignored; normal policies name the originating
+	// provider endpoint, while a global policy uses its own endpoint authorities.
 	TokenGrantOwners []string `protobuf:"bytes,11,rep,name=token_grant_owners,json=tokenGrantOwners,proto3" json:"token_grant_owners,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache

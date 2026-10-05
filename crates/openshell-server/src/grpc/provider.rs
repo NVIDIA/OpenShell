@@ -1556,7 +1556,7 @@ fn resolve_dynamic_credentials_from_records(
         };
         insert_dynamic_credentials_for_profile(
             &mut dynamic_creds,
-            &profile.to_proto(),
+            &profile,
             &record.name,
             &record.object_id,
         );
@@ -1566,18 +1566,14 @@ fn resolve_dynamic_credentials_from_records(
 
 fn insert_dynamic_credentials_for_profile(
     dynamic_creds: &mut HashMap<String, ProviderProfileCredential>,
-    profile: &ProviderProfile,
+    profile: &ProviderTypeProfile,
     provider_name: &str,
     provider_id: &str,
 ) {
-    // Build the same profile rule used by policy composition. Display names and
-    // collision suffixes never participate in credential ownership.
-    let rule = openshell_core::proto::NetworkPolicyRule {
-        endpoints: profile.endpoints.clone(),
-        binaries: profile.binaries.clone(),
-        ..Default::default()
-    };
+    // Display names and collision suffixes never participate in credential ownership.
+    let rule = profile.network_policy_rule("");
     let owners = openshell_core::policy_identity::provider_token_grant_owners(provider_id, &rule);
+    let profile = profile.to_proto();
     for credential in &profile.credentials {
         if credential.token_grant.is_none() {
             continue;
@@ -1590,7 +1586,6 @@ fn insert_dynamic_credentials_for_profile(
                     port,
                     &endpoint.path,
                     provider_name,
-                    &credential.name,
                     credential,
                     owner,
                 );
@@ -1630,7 +1625,6 @@ fn insert_dynamic_credentials_for_endpoint(
     endpoint_port: u32,
     endpoint_path: &str,
     provider_name: &str,
-    credential_name: &str,
     credential: &ProviderProfileCredential,
     owner: &str,
 ) {
@@ -1639,7 +1633,7 @@ fn insert_dynamic_credentials_for_endpoint(
         endpoint_port,
         endpoint_path,
         provider_name,
-        credential_name,
+        &credential.name,
         owner,
     );
     dynamic_creds.insert(
@@ -1676,7 +1670,7 @@ fn insert_dynamic_credentials_for_endpoint(
             override_port,
             override_path,
             provider_name,
-            credential_name,
+            &credential.name,
             owner,
         );
         dynamic_creds.insert(
@@ -5462,7 +5456,7 @@ mod tests {
         let mut dynamic_creds = HashMap::new();
         insert_dynamic_credentials_for_profile(
             &mut dynamic_creds,
-            &profile,
+            &ProviderTypeProfile::from_proto(&profile),
             "keycloak",
             "provider-uid",
         );
@@ -5506,7 +5500,12 @@ mod tests {
             ..Default::default()
         };
         let mut credentials = HashMap::new();
-        insert_dynamic_credentials_for_profile(&mut credentials, &profile, "api", "provider-uid");
+        insert_dynamic_credentials_for_profile(
+            &mut credentials,
+            &ProviderTypeProfile::from_proto(&profile),
+            "api",
+            "provider-uid",
+        );
         let private: Vec<_> = credentials
             .iter()
             .filter(|(key, _)| key.starts_with("api.example.test\t443\t/api/private/**\t"))

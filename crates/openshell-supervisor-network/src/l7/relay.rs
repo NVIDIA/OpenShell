@@ -153,47 +153,64 @@ async fn inject_inspected_request_grant(
     request_info: &L7RequestInfo,
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
-    if let Some(state) = &ctx.provider_credentials {
-        let snapshot = state.snapshot();
+    let snapshot = ctx
+        .provider_credentials
+        .as_ref()
+        .map(openshell_core::provider_credentials::ProviderCredentialState::snapshot);
+    if let Some(snapshot) = &snapshot {
         scoped.provider_credential_revision = Some(snapshot.revision);
         scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
-        scoped.dynamic_credentials = Some(Arc::new(std::sync::RwLock::new(
-            crate::proxy::revision_scoped_dynamic_credentials(&snapshot),
-        )));
     }
-
-    // Middleware can replace an inspected body. Recompute owner admission for
-    // the body that will be sent, even when another endpoint allowed both the
-    // original and transformed requests. Request method/path/query are immutable.
-    let mut current_info = request_info.clone();
-    match config.protocol {
-        L7Protocol::Graphql => {
-            let body = req
-                .raw_header
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .and_then(|end| req.raw_header.get(end + 4..))
-                .unwrap_or_default();
-            current_info.graphql = Some(crate::l7::graphql::classify_request(&req, body));
-        }
-        L7Protocol::JsonRpc | L7Protocol::Mcp => {
-            let mut options = crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
-            if let Some(revision) = request_info
-                .jsonrpc
-                .as_ref()
-                .and_then(|info| info.mcp_revision)
-            {
-                options = options.with_mcp_revision(revision);
+    let has_grants = snapshot.as_ref().map_or_else(
+        || scoped.dynamic_credentials.is_some(),
+        |snapshot| {
+            snapshot
+                .dynamic_credentials
+                .values()
+                .any(|credential| credential.token_grant.is_some())
+        },
+    );
+    let req = if has_grants {
+        // Middleware can replace an inspected body. Recompute owner admission for
+        // the body that will be sent, even when another endpoint allowed both the
+        // original and transformed requests. Request method/path/query are immutable.
+        let mut current_info = request_info.clone();
+        match config.protocol {
+            L7Protocol::Graphql => {
+                let body = req
+                    .raw_header
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .and_then(|end| req.raw_header.get(end + 4..))
+                    .unwrap_or_default();
+                current_info.graphql = Some(crate::l7::graphql::classify_request(&req, body));
             }
-            current_info.jsonrpc = Some(crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
-                &req, options,
-            )?);
+            L7Protocol::JsonRpc | L7Protocol::Mcp => {
+                let mut options = crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+                if let Some(revision) = request_info
+                    .jsonrpc
+                    .as_ref()
+                    .and_then(|info| info.mcp_revision)
+                {
+                    options = options.with_mcp_revision(revision);
+                }
+                current_info.jsonrpc = Some(
+                    crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(&req, options)?,
+                );
+            }
+            L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
         }
-        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
-    }
-    let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
-    let req =
-        crate::l7::token_grant_injection::inject_for_admitted_owners(req, &scoped, &owners).await?;
+        let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+        crate::l7::token_grant_injection::inject_for_admitted_owners(
+            req,
+            &scoped,
+            snapshot.as_deref(),
+            &owners,
+        )
+        .await?
+    } else {
+        req
+    };
     if engine.is_stale() {
         return Err(miette!("policy changed during token grant resolution"));
     }

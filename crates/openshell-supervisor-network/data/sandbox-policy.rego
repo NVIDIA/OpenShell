@@ -223,27 +223,30 @@ egress_authorization := {
 
 default allow_request = false
 
-# Per-policy helper: true when this single policy has at least one endpoint
-# matching the L4 request whose L7 rules also permit the specific request.
+# Per-policy helper: endpoints whose selectors and L7 rules permit the request.
 # Isolating the endpoint iteration inside a function avoids the regorus
 # "duplicated definition of local variable" error that occurs when the
 # outer `some name` iterates over multiple policies that share a host:port.
-_policy_allows_l7(policy) if {
+_policy_allowed_l7_endpoints(policy) := [ep |
 	some ep
 	ep := policy.endpoints[_]
 	endpoint_matches_l7_request(ep, input.network, input.request)
 	request_allowed_for_endpoint(input.request, ep)
-}
+]
 
-# L7 request allowed if any matching L4 policy also allows the L7 request
-# AND no deny rule blocks it. Deny rules take precedence over allow rules.
-allow_request if {
+# Forwarding and credential selection share endpoint admission. A deny rule
+# on any matching endpoint removes every otherwise admitted endpoint.
+_admitted_l7_endpoints := {ep |
 	some name
 	policy := data.network_policies[name]
-	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
-	_policy_allows_l7(policy)
+	eps := _policy_allowed_l7_endpoints(policy)
+	ep := eps[_]
 	not deny_request
+}
+
+allow_request if {
+	count(_admitted_l7_endpoints) > 0
 }
 
 # Credentials require the admission of their own endpoint. A sibling endpoint's
@@ -253,16 +256,10 @@ allow_request if {
 # Missing owner metadata grants no credential authority. Sorting a set gives
 # consumers a deterministic array without duplicate owner identifiers.
 allowed_token_grant_owners := sort({owner |
-	some name
-	policy := data.network_policies[name]
-	binary_allowed(policy, input.exec)
-	some endpoint in policy.endpoints
-	endpoint_matches_l7_request(endpoint, input.network, input.request)
-	request_allowed_for_endpoint(input.request, endpoint)
+	some endpoint in _admitted_l7_endpoints
 	owner := object.get(endpoint, "token_grant_owner", "")
 	is_string(owner)
 	owner != ""
-	not deny_request
 })
 
 # --- L7 deny rules ---

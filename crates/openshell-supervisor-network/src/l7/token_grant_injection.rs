@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use miette::{Result, miette};
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+use openshell_core::provider_credentials::ProviderCredentialSnapshot;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, Url as OcsfUrl, ctx::ctx as ocsf_ctx, ocsf_emit,
@@ -72,54 +73,43 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// Checks for endpoint-bound token grant credentials and injects an
 /// Authorization header before forwarding the request upstream.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
-    inject(req, ctx, None).await
+    inject(req, ctx, None, None).await
 }
 
 /// Inject only grants owned by endpoints that admitted the inspected request.
 /// An empty owner set permits no acquisition, including audit-only forwarding.
 /// L4-only forwarding continues to use `inject_if_needed` with its existing
 /// endpoint-selector contract; it has no per-request L7 admission decision.
-pub(crate) async fn inject_for_admitted_owners(
+pub(super) async fn inject_for_admitted_owners(
     req: L7Request,
     ctx: &L7EvalContext,
+    snapshot: Option<&ProviderCredentialSnapshot>,
     admitted_owners: &HashSet<String>,
 ) -> Result<L7Request> {
-    inject(req, ctx, Some(admitted_owners)).await
+    inject(req, ctx, snapshot, Some(admitted_owners)).await
 }
 
 async fn inject(
     req: L7Request,
     ctx: &L7EvalContext,
+    snapshot: Option<&ProviderCredentialSnapshot>,
     admitted_owners: Option<&HashSet<String>>,
 ) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = if let Some(dyn_creds) = ctx.dynamic_credentials.as_ref() {
+    let token_grant_credential = if let Some(snapshot) = snapshot {
+        select_token_grant(
+            &snapshot.dynamic_credentials,
+            ctx,
+            request_path,
+            admitted_owners,
+        )
+        .map(|(key, cred)| (revision_scoped_credential_key(key, snapshot), cred.clone()))
+    } else if let Some(dyn_creds) = ctx.dynamic_credentials.as_ref() {
         let creds_guard = dyn_creds
             .read()
             .map_err(|_| miette!("dynamic credential state unavailable"))?;
-        creds_guard
-            .iter()
-            .filter_map(|(key, cred)| {
-                // Admission filters candidates before specificity ranks them.
-                // A narrower sibling cannot lend its grant to an allow from
-                // another endpoint, while an admitted broader owner remains
-                // eligible for its own credential.
-                if admitted_owners.is_some_and(|owners| {
-                    !cred
-                        .token_grant_owners
-                        .iter()
-                        .any(|owner| owners.contains(owner))
-                }) {
-                    return None;
-                }
-                let score =
-                    dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-                cred.token_grant
-                    .is_some()
-                    .then(|| (score, key.clone(), cred.clone()))
-            })
-            .max_by_key(|(score, key, _)| (*score, key.clone()))
-            .map(|(_, key, cred)| (key, cred))
+        select_token_grant(&creds_guard, ctx, request_path, admitted_owners)
+            .map(|(key, cred)| (key.to_owned(), cred.clone()))
     } else {
         None
     };
@@ -196,6 +186,51 @@ async fn inject(
     }
 
     Ok(req)
+}
+
+fn select_token_grant<'a>(
+    credentials: &'a std::collections::HashMap<String, ProviderProfileCredential>,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    admitted_owners: Option<&HashSet<String>>,
+) -> Option<(&'a str, &'a ProviderProfileCredential)> {
+    credentials
+        .iter()
+        .filter_map(|(key, cred)| {
+            // Filter by admission before ranking specificity: a narrower sibling
+            // cannot lend its grant to an allow from another endpoint.
+            if cred.token_grant.is_none()
+                || admitted_owners.is_some_and(|owners| {
+                    !cred
+                        .token_grant_owners
+                        .iter()
+                        .any(|owner| owners.contains(owner))
+                })
+            {
+                return None;
+            }
+            let score = dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
+            Some((score, key, cred))
+        })
+        .max_by_key(|(score, key, _)| (*score, *key))
+        .map(|(_, key, cred)| (key.as_str(), cred))
+}
+
+pub fn revision_scoped_credential_key(key: &str, snapshot: &ProviderCredentialSnapshot) -> String {
+    key.rsplit_once('\t').map_or_else(
+        || {
+            format!(
+                "rev:{}\tinstallation:{}\t{key}",
+                snapshot.revision, snapshot.installation_id
+            )
+        },
+        |(endpoint_selector, provider_credential)| {
+            format!(
+                "{endpoint_selector}\trev:{}\tinstallation:{}\t{provider_credential}",
+                snapshot.revision, snapshot.installation_id
+            )
+        },
+    )
 }
 
 fn ocsf_message_field(value: &str) -> String {

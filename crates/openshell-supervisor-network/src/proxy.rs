@@ -213,28 +213,17 @@ pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.docker.internal",
 ];
 
-pub(crate) fn revision_scoped_dynamic_credentials(
+fn revision_scoped_dynamic_credentials(
     snapshot: &ProviderCredentialSnapshot,
 ) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
     snapshot
         .dynamic_credentials
         .iter()
         .map(|(key, credential)| {
-            let scoped_key = key.rsplit_once('\t').map_or_else(
-                || {
-                    format!(
-                        "rev:{}\tinstallation:{}\t{key}",
-                        snapshot.revision, snapshot.installation_id
-                    )
-                },
-                |(endpoint_selector, provider_credential)| {
-                    format!(
-                        "{endpoint_selector}\trev:{}\tinstallation:{}\t{provider_credential}",
-                        snapshot.revision, snapshot.installation_id
-                    )
-                },
-            );
-            (scoped_key, credential.clone())
+            (
+                crate::l7::token_grant_injection::revision_scoped_credential_key(key, snapshot),
+                credential.clone(),
+            )
         })
         .collect()
 }

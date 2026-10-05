@@ -464,7 +464,7 @@ fn current_time_ms() -> i64 {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     //! Relay fixtures using the production token cache.
     //!
     //! Each resolver owns its cache. Only acquisition is synthetic: no SPIFFE
@@ -478,7 +478,7 @@ pub(crate) mod test_support {
 
     /// One actual acquisition, excluding requests served from the cache.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(crate) struct CacheAcquisition {
+    pub struct CacheAcquisition {
         pub(crate) provider_key: String,
         pub(crate) audience: String,
     }
@@ -492,7 +492,7 @@ pub(crate) mod test_support {
     ///
     /// Misses return `inert-{audience}-{acquisition ordinal}`. The ordinal makes
     /// reacquisition observable even when the provider and audience stay the same.
-    pub(crate) struct CachedTokenGrantResolver {
+    pub struct CachedTokenGrantResolver {
         cache: TokenCache,
         acquisitions: Mutex<Vec<RecordedAcquisition>>,
     }

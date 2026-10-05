@@ -43,7 +43,6 @@ fn profile(id: &str, path: &str) -> ProviderProfile {
         }],
         binaries: vec![NetworkBinary {
             path: "/usr/bin/profile-client".into(),
-            ..Default::default()
         }],
         ..Default::default()
     }
@@ -118,8 +117,8 @@ async fn composed_owners_survive_name_collisions_and_audience_overrides() {
         );
         for (key, credential) in credentials {
             assert_eq!(
-                credential.token_grant_owners,
-                [endpoint.token_grant_owner.clone()]
+                credential.token_grant_owners.as_slice(),
+                std::slice::from_ref(&endpoint.token_grant_owner)
             );
             assert!(key.contains(&endpoint.token_grant_owner));
         }
@@ -172,7 +171,10 @@ async fn refreshed_profile_owners_do_not_match_the_previous_policy() {
     assert_ne!(&first_owner, replacement_owner);
     for (key, credential) in &environment.dynamic_credentials {
         if key.ends_with("\tteam-a:access_token") {
-            assert_eq!(&credential.token_grant_owners, &[replacement_owner.clone()]);
+            assert_eq!(
+                credential.token_grant_owners.as_slice(),
+                std::slice::from_ref(replacement_owner)
+            );
             assert!(!credential.token_grant_owners.contains(&first_owner));
         }
     }
@@ -202,7 +204,6 @@ async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinat
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/global-client".into(),
-                    ..Default::default()
                 }],
             },
         )]),
@@ -242,7 +243,10 @@ async fn global_policy_replaces_grant_authorities_and_preserves_profile_destinat
             before.dynamic_credentials.contains_key(key),
             "global rules do not widen credential selectors"
         );
-        assert_eq!(credential.token_grant_owners, [global_owner.clone()]);
+        assert_eq!(
+            credential.token_grant_owners.as_slice(),
+            std::slice::from_ref(global_owner)
+        );
         assert_ne!(
             credential.token_grant_owners,
             before.dynamic_credentials[key].token_grant_owners

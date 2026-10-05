@@ -816,14 +816,23 @@ async fn keepalive_refresh(route_selection: bool) {
     fixture.install(2, &[("/a/**", "a", "aud-new")]);
     let new_key = fixture.grant_key("/a/**", "a");
     let second = connection.exchange("GET", "/a/second", true).await;
+    fixture.install(3, &[]);
+    let third = connection.exchange("GET", "/a/third", false).await;
     let capture = connection.finish().await;
     assert!(first.starts_with("HTTP/1.1 204") && second.starts_with("HTTP/1.1 204"));
-    assert_eq!(capture.requests.len(), 2);
+    assert!(third.starts_with("HTTP/1.1 204"));
+    assert_eq!(capture.requests.len(), 3);
     fixture
         .resolver
         .assert_calls(&[(&old_key, "aud-old"), (&new_key, "aud-new")]);
     assert_authorization(&capture.requests[0], "aud-old");
     assert_authorization(&capture.requests[1], "aud-new");
+    assert!(
+        !capture.requests[2]
+            .to_ascii_lowercase()
+            .contains("authorization:"),
+        "removing live grants must not reuse the connection's original credential"
+    );
 }
 
 #[tokio::test]

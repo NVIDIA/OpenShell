@@ -2313,9 +2313,10 @@ message ProviderProfileCredential {
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
   // Output-only gateway-derived endpoint authorities for resolved token grants.
-  // Empty means no endpoint may obtain this grant. Profile-authored values are
-  // ignored; normal policies name the originating provider endpoint, while a
-  // global policy replaces those authorities with its own endpoints.
+  // For inspected L7 requests, empty means no endpoint may obtain this grant.
+  // L4 injection uses selectors without checking these authorities.
+  // Profile-authored values are ignored; normal policies name the originating
+  // provider endpoint, while a global policy uses its own endpoint authorities.
   repeated string token_grant_owners = 11;
 }
 
