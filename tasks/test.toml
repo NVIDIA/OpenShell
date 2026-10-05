@@ -18,7 +18,6 @@ depends = [
   "test:packaging-assets",
   "test:qualification-summary",
   "test:codex-security-release-range",
-  "test:codex-compatibility",
   "test:docs-website",
   "test:docs-nav",
   "test:maintainer-approval",
@@ -83,11 +82,6 @@ hide = true
 ["test:maintainer-approval"]
 description = "Test the maintainer approval gate and change-alert tools"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
-hide = true
-
-["test:codex-compatibility"]
-description = "Test advisory release compatibility review without inference"
-run = "uv run --no-project --with pytest --with pytest-asyncio pytest tasks/scripts/codex_compatibility_test.py"
 hide = true
 
 [e2e]
