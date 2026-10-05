@@ -39,7 +39,7 @@ use openshell_server::AcquiredRemoteDriverEndpoint;
 use openshell_server::ManagedDriverProcess;
 use openshell_server::config_file::OtlpConfig;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -56,16 +56,9 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
-const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
-
-/// Longest Unix domain socket path, in bytes and excluding the terminating NUL,
-/// that `bind` accepts on this platform. `sockaddr_un.sun_path` holds 108 bytes
-/// on Linux and 104 on macOS and the BSDs.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-const MAX_UNIX_SOCKET_PATH_LEN: usize = 107;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const MAX_UNIX_SOCKET_PATH_LEN: usize = 103;
+#[cfg(unix)]
+const SOCKET_DIR_ALLOC_RETRIES: usize = 16;
 
 /// Configuration for launching and talking to the VM compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -347,53 +340,42 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-/// Path of the Unix domain socket the driver will listen on.
-pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
-    vm_config
-        .state_dir
-        .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
-        .join(COMPUTE_DRIVER_SOCKET_NAME)
+#[cfg(unix)]
+fn allocate_compute_driver_socket_dir() -> std::io::Result<tempfile::TempDir> {
+    let uid = current_euid();
+    // macOS TMPDIR can itself exceed the Unix socket path limit. Use the same
+    // short base and random private-directory approach as the VM driver.
+    allocate_compute_driver_socket_dir_with(Path::new("/tmp"), || {
+        let random: u128 = rand::random();
+        format!("os-gw-{uid}-{random:032x}")
+    })
 }
 
-/// Reject a driver socket path that `bind` cannot accept, naming the path, its
-/// length, the limit and the settings that move it.
-///
-/// Without this check the driver exits with a bare `path must be shorter than
-/// SUN_LEN`, and the gateway can report only the driver's exit status.
 #[cfg(unix)]
-fn check_compute_driver_socket_path_len(socket_path: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let len = socket_path.as_os_str().as_bytes().len();
-    if len <= MAX_UNIX_SOCKET_PATH_LEN {
-        return Ok(());
+fn allocate_compute_driver_socket_dir_with(
+    base: &Path,
+    mut gen_name: impl FnMut() -> String,
+) -> std::io::Result<tempfile::TempDir> {
+    for _ in 0..SOCKET_DIR_ALLOC_RETRIES {
+        match tempfile::Builder::new()
+            .prefix(&gen_name())
+            .rand_bytes(0)
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(base)
+        {
+            Ok(dir) => return Ok(dir),
+            // Never inspect, reuse, or modify an occupied candidate.
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
     }
-    Err(Error::execution(format!(
-        "vm compute driver socket path '{}' is {len} bytes, over the \
-         {MAX_UNIX_SOCKET_PATH_LEN}-byte limit for Unix socket paths on this platform; \
-         set [openshell.drivers.vm] state_dir to a shorter directory (it defaults to \
-         openshell/vm-driver under $XDG_STATE_HOME, or under ~/.local/state when that is unset)",
-        socket_path.display()
-    )))
-}
-
-#[cfg(unix)]
-fn prepare_compute_driver_socket_path(
-    vm_config: &VmComputeConfig,
-    socket_path: &Path,
-) -> Result<()> {
-    // Check before creating any directory so a rejected path leaves no state behind.
-    check_compute_driver_socket_path_len(socket_path)?;
-    let expected_uid = current_euid();
-    prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
-    let parent = socket_path.parent().ok_or_else(|| {
-        Error::execution(format!(
-            "vm compute driver socket path '{}' has no parent directory",
-            socket_path.display()
-        ))
-    })?;
-    prepare_private_socket_dir(parent, expected_uid)?;
-    remove_stale_socket(socket_path, expected_uid)
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate vm compute driver socket directory under {} after {SOCKET_DIR_ALLOC_RETRIES} attempts",
+            base.display()
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -422,23 +404,6 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_private_socket_dir(socket_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(socket_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })?;
-    let _ = checked_directory_metadata(socket_dir, expected_uid, "vm compute driver socket dir")?;
-    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
-        Error::execution(format!(
-            "failed to restrict vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })
 }
 
 #[cfg(unix)]
@@ -475,47 +440,6 @@ fn checked_directory_metadata(
         )));
     }
     Ok(metadata)
-}
-
-#[cfg(unix)]
-fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to stat vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is a symlink; refusing to remove it",
-            socket_path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is owned by uid {} but current euid is {}",
-            socket_path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    if !file_type.is_socket() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket path '{}' exists but is not a Unix socket",
-            socket_path.display()
-        )));
-    }
-    std::fs::remove_file(socket_path).map_err(|err| {
-        Error::execution(format!(
-            "failed to remove stale vm compute driver socket '{}': {err}",
-            socket_path.display()
-        ))
-    })
 }
 
 #[cfg(unix)]
@@ -561,9 +485,14 @@ pub async fn spawn(
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
-    let socket_path = compute_driver_socket_path(vm_config);
     let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
-    prepare_compute_driver_socket_path(vm_config, &socket_path)?;
+    prepare_vm_state_dir(&vm_config.state_dir, current_euid())?;
+    let socket_dir = allocate_compute_driver_socket_dir().map_err(|err| {
+        Error::execution(format!(
+            "failed to allocate vm compute driver socket directory: {err}"
+        ))
+    })?;
+    let socket_path = socket_dir.path().join(COMPUTE_DRIVER_SOCKET_NAME);
 
     let mut command = Command::new(&driver_bin);
     command.kill_on_drop(true);
@@ -615,7 +544,8 @@ pub async fn spawn(
         ))
     })?;
     let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
-    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
+    let process =
+        Arc::new(ManagedDriverProcess::new(child, socket_path).with_socket_dir(socket_dir));
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
@@ -785,10 +715,10 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        MAX_UNIX_SOCKET_PATH_LEN, VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args,
-        check_compute_driver_socket_path_len, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
+        COMPUTE_DRIVER_SOCKET_NAME, SOCKET_DIR_ALLOC_RETRIES, VmComputeConfig,
+        allocate_compute_driver_socket_dir, allocate_compute_driver_socket_dir_with,
+        append_otlp_args, append_vm_identity_args, append_vm_proxy_and_spiffe_args,
+        append_vm_rootfs_tar_args, compute_driver_guest_tls_paths, current_euid,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
     };
@@ -1133,156 +1063,104 @@ mod tests {
     }
 
     #[test]
-    fn compute_driver_socket_path_uses_private_run_dir() {
-        let state_dir = PathBuf::from("/tmp/openshell-vm-state");
-        let vm_config = VmComputeConfig {
-            state_dir: state_dir.clone(),
-            ..Default::default()
-        };
-
+    fn compute_driver_socket_dir_is_private_unique_and_cleans_up() {
+        let first = allocate_compute_driver_socket_dir().unwrap();
+        let second = allocate_compute_driver_socket_dir().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path().parent(), Some(std::path::Path::new("/tmp")));
+        let metadata = std::fs::metadata(first.path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
         assert_eq!(
-            compute_driver_socket_path(&vm_config),
-            state_dir.join("run").join("compute-driver.sock")
+            std::os::unix::fs::MetadataExt::uid(&metadata),
+            current_euid()
+        );
+        let socket_path = first.path().join(COMPUTE_DRIVER_SOCKET_NAME);
+        let listener = StdUnixListener::bind(&socket_path).unwrap();
+        let directory = first.path().to_path_buf();
+        drop(listener);
+        drop(first);
+        assert!(!directory.exists());
+        assert!(second.path().exists());
+    }
+
+    #[test]
+    fn compute_driver_socket_path_fits_macos_limit() {
+        let path = PathBuf::from("/tmp/os-gw-4294967295-ffffffffffffffffffffffffffffffff")
+            .join(COMPUTE_DRIVER_SOCKET_NAME);
+        assert!(path.as_os_str().len() < 104);
+    }
+
+    #[test]
+    fn compute_driver_socket_dir_retries_without_touching_occupied_entries() {
+        let base = tempdir().unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&victim, base.path().join("attempt-0")).unwrap();
+        std::fs::create_dir(base.path().join("attempt-1")).unwrap();
+        std::fs::write(base.path().join("attempt-2"), "leave this file alone").unwrap();
+        let mut attempts = 0;
+        let allocated = allocate_compute_driver_socket_dir_with(base.path(), || {
+            let name = format!("attempt-{attempts}");
+            attempts += 1;
+            name
+        })
+        .unwrap();
+        assert_eq!(attempts, 4);
+        assert_eq!(allocated.path(), base.path().join("attempt-3"));
+        drop(allocated);
+        assert!(base.path().join("attempt-0").is_symlink());
+        assert!(base.path().join("attempt-1").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(base.path().join("attempt-2")).unwrap(),
+            "leave this file alone"
+        );
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_creates_private_run_dir() {
+    fn compute_driver_socket_dir_stops_after_collision_limit() {
+        let base = tempdir().unwrap();
+        std::fs::create_dir(base.path().join("occupied")).unwrap();
+        let mut attempts = 0;
+        let error = allocate_compute_driver_socket_dir_with(base.path(), || {
+            attempts += 1;
+            "occupied".to_owned()
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(attempts, SOCKET_DIR_ALLOC_RETRIES);
+        assert!(base.path().join("occupied").is_dir());
+    }
+
+    #[test]
+    fn prepare_vm_state_dir_restricts_existing_state_dir() {
         let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+        prepare_vm_state_dir(&state_dir, current_euid()).unwrap();
 
-        let mode = std::fs::metadata(vm_config.state_dir.join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(state_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let run_dir = vm_config.state_dir.join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(run_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::set_permissions(&vm_config.state_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
-
-        let mode = std::fs::metadata(vm_config.state_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_state_dir() {
+    fn prepare_vm_state_dir_rejects_symlinked_state_dir() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
         let state_link = dir.path().join("state-link");
-        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, &state_link).unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: state_link,
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
 
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+        let err = prepare_vm_state_dir(&state_link, current_euid())
             .expect_err("symlinked state dir should be rejected")
             .to_string();
         assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_run_dir() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let target = dir.path().join("run-target");
-        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, vm_config.state_dir.join("run")).unwrap();
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked run dir should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
-    }
-
-    #[test]
-    fn compute_driver_socket_path_len_accepts_the_limit_and_rejects_one_byte_more() {
-        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH_LEN - 1)));
-        assert_eq!(fits.as_os_str().len(), MAX_UNIX_SOCKET_PATH_LEN);
-        check_compute_driver_socket_path_len(&fits).expect("a path at the limit should fit");
-
-        let too_long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH_LEN)));
-        let err = check_compute_driver_socket_path_len(&too_long)
-            .expect_err("a path one byte over the limit should be rejected")
-            .to_string();
-        assert!(err.contains(&too_long.display().to_string()), "{err}");
-        assert!(
-            err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH_LEN + 1)),
-            "{err}"
-        );
-        assert!(
-            err.contains(&format!("{MAX_UNIX_SOCKET_PATH_LEN}-byte limit")),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_an_overlong_path_before_creating_state() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("s".repeat(MAX_UNIX_SOCKET_PATH_LEN)),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("an overlong socket path should be rejected")
-            .to_string();
-        assert!(err.contains(&socket_path.display().to_string()), "{err}");
-        assert!(err.contains("state_dir"), "{err}");
-        assert!(err.contains("XDG_STATE_HOME"), "{err}");
-        assert!(
-            !vm_config.state_dir.exists(),
-            "a rejected path must not create the state directory"
-        );
     }
 
     #[test]
@@ -1302,54 +1180,160 @@ mod tests {
         assert!(err.contains("is owned by uid"));
     }
 
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_symlinked_socket() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("/tmp/not-a-socket", &socket_path).unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("symlinked socket should be rejected")
-            .to_string();
-        assert!(err.contains("is a symlink"));
+    fn install_test_driver(driver_dir: &std::path::Path, command: &str) {
+        let driver = driver_dir.join(super::DRIVER_BIN_NAME);
+        // This executable fixture uses POSIX sh so it runs on Linux and macOS.
+        std::fs::write(
+            &driver,
+            format!(
+                r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --bind-socket) socket="$2"; shift ;;
+        --state-dir) state="$2"; shift ;;
+        --expected-peer-pid) peer="$2"; shift ;;
+    esac
+    shift
+done
+printf '%s' "$socket" > "$state/socket-path"
+printf '%s' "$peer" > "$state/peer-pid"
+export OPENSHELL_TEST_SOCKET="$socket"
+{command}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(driver, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[test]
-    fn prepare_compute_driver_socket_path_rejects_non_socket_stale_path() {
-        let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
+    fn test_driver_config(root: &std::path::Path) -> VmComputeConfig {
+        VmComputeConfig {
+            driver_dir: Some(root.to_path_buf()),
+            state_dir: root.join("persistent-state".repeat(10)),
+            grpc_endpoint: "http://127.0.0.1:8443".to_owned(),
             ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::fs::write(&socket_path, "not a socket").unwrap();
-
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("regular file should be rejected")
-            .to_string();
-        assert!(err.contains("is not a Unix socket"));
+        }
     }
 
-    #[test]
-    fn prepare_compute_driver_socket_path_removes_same_owner_stale_socket() {
+    #[tokio::test]
+    async fn spawn_accepts_overlong_state_dir_and_cleans_up_managed_socket() {
         let dir = tempdir().unwrap();
-        let vm_config = VmComputeConfig {
-            state_dir: dir.path().join("state"),
-            ..Default::default()
-        };
-        let socket_path = compute_driver_socket_path(&vm_config);
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        let listener = StdUnixListener::bind(&socket_path).unwrap();
+        let vm_config = test_driver_config(dir.path());
+        assert!(vm_config.state_dir.as_os_str().len() > 108);
+        let test_binary = std::env::current_exe().unwrap();
+        let quoted_binary = test_binary.to_string_lossy().replace('\'', "'\"'\"'");
+        install_test_driver(
+            dir.path(),
+            &format!(
+                "exec '{quoted_binary}' --exact vm::tests::compute_driver_subprocess_fixture --ignored --nocapture"
+            ),
+        );
 
-        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+        let endpoint = super::spawn("info", "test", &vm_config, None)
+            .await
+            .unwrap();
+        let socket = PathBuf::from(
+            std::fs::read_to_string(vm_config.state_dir.join("socket-path")).unwrap(),
+        );
+        assert_eq!(
+            socket.parent().unwrap().parent(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        assert!(!socket.starts_with(&vm_config.state_dir));
+        assert!(socket.exists());
+        assert_eq!(
+            std::fs::read_to_string(vm_config.state_dir.join("peer-pid")).unwrap(),
+            std::process::id().to_string()
+        );
+        std::fs::write(vm_config.state_dir.join("persistent"), "keep").unwrap();
 
-        drop(listener);
-        assert!(!socket_path.exists());
+        drop(endpoint);
+
+        assert!(!socket.parent().unwrap().exists());
+        assert_eq!(
+            std::fs::read_to_string(vm_config.state_dir.join("persistent")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_removes_socket_dir_when_driver_exits_before_ready() {
+        let dir = tempdir().unwrap();
+        let vm_config = test_driver_config(dir.path());
+        install_test_driver(dir.path(), "exit 23");
+        let error = super::spawn("info", "test", &vm_config, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exited before becoming ready"),
+            "{error}"
+        );
+        let socket = PathBuf::from(
+            std::fs::read_to_string(vm_config.state_dir.join("socket-path")).unwrap(),
+        );
+        assert!(!socket.parent().unwrap().exists());
+        assert!(vm_config.state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn spawn_removes_socket_dir_when_startup_is_cancelled() {
+        let dir = tempdir().unwrap();
+        let vm_config = test_driver_config(dir.path());
+        install_test_driver(dir.path(), "exec sleep 60");
+        let config = vm_config.clone();
+        let task = tokio::spawn(async move { super::spawn("info", "test", &config, None).await });
+        let socket_record = vm_config.state_dir.join("socket-path");
+        let socket = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(path) = std::fs::read_to_string(&socket_record)
+                    && !path.is_empty()
+                {
+                    break PathBuf::from(path);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(socket.parent().unwrap().exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!socket.parent().unwrap().exists());
+    }
+
+    // Re-executed by the startup test as the managed driver process. It serves
+    // an empty successful GetCapabilities response without booting a VM.
+    #[tokio::test]
+    #[ignore = "subprocess fixture for spawn_accepts_overlong_state_dir_and_cleans_up_managed_socket"]
+    async fn compute_driver_subprocess_fixture() {
+        use http_body_util::{BodyExt as _, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let socket = std::env::var_os("OPENSHELL_TEST_SOCKET").unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|_request| async {
+                    let body =
+                        Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])).with_trailers(async {
+                            let mut trailers = http::HeaderMap::new();
+                            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                            Some(Ok(trailers))
+                        });
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
     }
 }
