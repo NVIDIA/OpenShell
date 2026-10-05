@@ -7186,12 +7186,11 @@ async fn terminate_vm_process_within(
         )));
     }
 
-    match tokio::time::timeout(grace, child.wait()).await {
-        Ok(status) => status,
-        Err(_) => {
-            child.kill().await?;
-            child.wait().await
-        }
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status
+    } else {
+        child.kill().await?;
+        child.wait().await
     }
 }
 
