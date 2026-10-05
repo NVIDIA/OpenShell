@@ -146,8 +146,6 @@ ensure_docker_runtime_image \
   sandbox \
   "sandbox runtime"
 
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
-
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
@@ -191,11 +189,14 @@ supervisor_image = "${SUPERVISOR_IMAGE}"
 sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
 sandbox_label = "${SANDBOX_NAMESPACE}"
-grpc_endpoint = "${GRPC_ENDPOINT}"
 # Explicit supervisor-compatible default. Set RuntimeDefault or
 # Localhost/<profile> only on a Docker host with AppArmor enabled.
 app_armor_profile = "Unconfined"
 EOF
+
+if [[ -n "${OPENSHELL_GRPC_ENDPOINT:-}" ]]; then
+  printf 'grpc_endpoint = "%s"\n' "$(toml_escape "${OPENSHELL_GRPC_ENDPOINT}")" >>"${CONFIG_PATH}"
+fi
 
 # Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
 # Credentials stay in the referenced root-owned file; do not echo their value.
