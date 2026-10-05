@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pickle
@@ -35,6 +36,7 @@ from openshell.sandbox import (
     SandboxTemplateClient,
     ServiceExposure,
     TlsConfig,
+    WatchLogEvent,
     WatchLogKind,
     _atomic_replace,
     _BearerAuthInterceptor,
@@ -3144,13 +3146,72 @@ def test_timestamp_from_proto():
     assert dt.timestamp() == 1700000000.0
 
 
-def test_timestamp_from_proto_none():
-    """Verify None timestamp returns current time in UTC."""
-    from datetime import datetime
+def test_timestamp_from_proto_unset_returns_none():
+    """Verify an unset timestamp maps to None instead of a fabricated time."""
+    unset = openshell_pb2.SandboxLogLine().event_time
 
-    before = datetime.now(UTC)
-    dt = sandbox_module._timestamp_from_proto(None)
-    after = datetime.now(UTC)
+    assert sandbox_module._timestamp_from_proto(None) is None
+    assert sandbox_module._timestamp_from_proto(unset) is None
 
-    assert dt.tzinfo == UTC
-    assert before <= dt <= after
+
+def test_watch_logs_log_line_without_event_time_has_no_timestamp():
+    """Verify a log line with no event_time is not stamped with the current time."""
+    pb_event = openshell_pb2.SandboxStreamEvent(
+        cursor="0000000001",
+        log=openshell_pb2.SandboxLogLine(sandbox_id="sb-1", message="replayed"),
+    )
+
+    item = sandbox_module._watch_log_event_from_proto(pb_event)
+
+    assert item is not None
+    assert item.log is not None
+    assert item.log.timestamp is None
+
+
+class _FakeWatchStream:
+    def __init__(self, events: list[openshell_pb2.SandboxStreamEvent]) -> None:
+        self._events = iter(events)
+        self.cancelled = False
+
+    def __iter__(self) -> _FakeWatchStream:
+        return self
+
+    def __next__(self) -> openshell_pb2.SandboxStreamEvent:
+        return next(self._events)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _FakeWatchStub:
+    def __init__(self, events: list[openshell_pb2.SandboxStreamEvent]) -> None:
+        self.stream = _FakeWatchStream(events)
+
+    def WatchSandbox(self, request: openshell_pb2.WatchSandboxRequest):
+        _ = request
+        return self.stream
+
+
+@pytest.mark.asyncio
+async def test_watch_logs_ends_when_stream_closes_cleanly():
+    """Verify a cleanly closed stream ends iteration instead of hanging."""
+    stub = _FakeWatchStub(
+        [
+            openshell_pb2.SandboxStreamEvent(
+                cursor="0000000001",
+                log=openshell_pb2.SandboxLogLine(sandbox_id="sb-1", message="only"),
+            )
+        ]
+    )
+    client = _client_with_fake_stub(stub)
+    client.get = lambda name, **_: SimpleNamespace(name=name)  # type: ignore[method-assign]
+
+    async def collect() -> list[WatchLogEvent]:
+        return [
+            item async for item in client.watch_logs(workspace="default", name="sb-1")
+        ]
+
+    items = await asyncio.wait_for(collect(), timeout=5)
+
+    assert [item.cursor for item in items] == ["0000000001"]
+    assert stub.stream.cancelled

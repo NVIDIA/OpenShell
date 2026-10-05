@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import errno
 import functools
@@ -549,18 +550,21 @@ class SandboxError(RuntimeError):
     pass
 
 
-def _timestamp_from_proto(ts) -> datetime:
-    """Convert protobuf Timestamp to aware UTC datetime. Return current time if unset."""
-    if ts is None or ts.seconds == 0:
-        return datetime.now(UTC)
-    return ts.ToDatetime(tzinfo=UTC)
+def _timestamp_from_proto(ts) -> datetime | None:
+    """Convert protobuf Timestamp to aware UTC datetime. Return None if unset or invalid."""
+    if ts is None or (ts.seconds == 0 and ts.nanos == 0):
+        return None
+    try:
+        return ts.ToDatetime(tzinfo=UTC)
+    except (ValueError, OverflowError):
+        return None
 
 
 @dataclass(frozen=True)
 class PlatformEvent:
     """A runtime event observed for a sandbox (e.g., Kubernetes pod event)."""
 
-    timestamp: datetime
+    timestamp: datetime | None
     source: str
     type: str
     reason: str
@@ -590,7 +594,7 @@ class LogLine:
     """One log entry from a sandbox."""
 
     sandbox_id: str
-    timestamp: datetime
+    timestamp: datetime | None
     level: str
     target: str
     message: str
@@ -1465,93 +1469,110 @@ class SandboxClient:
         if not follow_logs and not follow_events:
             follow_logs = True
 
-        # Resolve sandbox name first (fail fast if not found) — blocking call in executor
+        # Every blocking gRPC call for this watch runs on a dedicated thread so a
+        # long-lived stream never holds a slot in the loop's shared default
+        # executor, which would starve unrelated run_in_executor work.
         loop = asyncio.get_running_loop()
-        sandbox = await loop.run_in_executor(
-            None, functools.partial(self.get, workspace=workspace, name=name)
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="openshell-watch-logs"
         )
-        resolved_name = sandbox.name
+        try:
+            # Resolve sandbox name first (fail fast if not found)
+            sandbox = await loop.run_in_executor(
+                executor, functools.partial(self.get, workspace=workspace, name=name)
+            )
+            resolved_name = sandbox.name
 
-        # Initialize reconnect state
-        cursor = opts.resume_after_cursor
-        backoff = 0.1  # 100ms initial
-        max_backoff = 2.0  # 2s cap
-        consecutive_failures = 0
-        max_retries = 15  # Give up after 15 consecutive UNAVAILABLE
-        stream = None
+            # Initialize reconnect state
+            cursor = opts.resume_after_cursor
+            backoff = 0.1  # 100ms initial
+            max_backoff = 2.0  # 2s cap
+            consecutive_failures = 0
+            max_retries = 15  # Give up after 15 consecutive UNAVAILABLE
+            stream = None
 
-        # Reconnect loop
-        while True:
-            try:
-                # Build watch request
-                request = openshell_pb2.WatchSandboxRequest(
-                    sandbox=resolved_name,
-                    workspace_scope=_workspace_scope(workspace),
-                    follow_status=False,  # Don't want status snapshots
-                    follow_logs=follow_logs,
-                    follow_events=follow_events,
-                    log_tail_lines=opts.log_tail_lines,
-                    event_tail=opts.event_tail,
-                    log_sources=list(opts.log_sources),
-                    log_min_level=opts.log_min_level,
-                    resume_after_cursor=cursor,  # Resume from this cursor
-                )
+            # Reconnect loop
+            while True:
+                try:
+                    # Build watch request
+                    request = openshell_pb2.WatchSandboxRequest(
+                        sandbox=resolved_name,
+                        workspace_scope=_workspace_scope(workspace),
+                        follow_status=False,  # Don't want status snapshots
+                        follow_logs=follow_logs,
+                        follow_events=follow_events,
+                        log_tail_lines=opts.log_tail_lines,
+                        event_tail=opts.event_tail,
+                        log_sources=list(opts.log_sources),
+                        log_min_level=opts.log_min_level,
+                        resume_after_cursor=cursor,  # Resume from this cursor
+                    )
 
-                # Call gRPC stream (blocking, run in executor)
-                stream = await loop.run_in_executor(
-                    None, self._stub.WatchSandbox, request
-                )
+                    # Call gRPC stream (blocking, run in executor)
+                    stream = await loop.run_in_executor(
+                        executor, self._stub.WatchSandbox, request
+                    )
 
-                # Receive events from stream (blocking iteration, run in executor)
-                while True:
-                    pb_event = await loop.run_in_executor(None, next, stream)
+                    # Receive events from stream (blocking iteration, run in executor).
+                    # Use a None sentinel: a StopIteration raised inside the executor
+                    # cannot be set on an asyncio Future and would hang the await.
+                    while True:
+                        pb_event = await loop.run_in_executor(
+                            executor, next, stream, None
+                        )
+                        if pb_event is None:
+                            # Server closed the stream cleanly; nothing left to resume.
+                            return
 
-                    # Convert proto → domain (skip non-resumable)
-                    item = _watch_log_event_from_proto(pb_event)
-                    if item is None:
+                        # Convert proto → domain (skip non-resumable)
+                        item = _watch_log_event_from_proto(pb_event)
+                        if item is None:
+                            continue
+
+                        # Reset backoff and failure count only after yielding resumable item
+                        backoff = 0.1
+                        consecutive_failures = 0
+
+                        # Update cursor: high-water mark (max, not last)
+                        # Live delivery reads log and event sources independently,
+                        # so arrival order ≠ cursor order. Keep max to avoid rewinding.
+                        if item.cursor > cursor:
+                            cursor = item.cursor
+
+                        # Yield to caller
+                        yield item
+
+                except OutOfRangeError:
+                    # Terminal: resume cursor is gone, never retry
+                    # Caller gets this exception, knows to start fresh with empty cursor
+                    raise
+
+                except grpc.RpcError as e:
+                    # Check if retryable (Unavailable = connection drop, gateway restart)
+                    if e.code() == grpc.StatusCode.UNAVAILABLE:
+                        consecutive_failures += 1
+                        if consecutive_failures > max_retries:
+                            # Gave up after max retries, raise as GatewayError
+                            raise from_grpc_error(e) from e
+                        # Sleep with backoff, then reconnect from cursor
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, max_backoff)
                         continue
-
-                    # Reset backoff and failure count only after yielding resumable item
-                    backoff = 0.1
-                    consecutive_failures = 0
-
-                    # Update cursor: high-water mark (max, not last)
-                    # Live delivery reads log and event sources independently,
-                    # so arrival order ≠ cursor order. Keep max to avoid rewinding.
-                    if item.cursor > cursor:
-                        cursor = item.cursor
-
-                    # Yield to caller
-                    yield item
-
-            except OutOfRangeError:
-                # Terminal: resume cursor is gone, never retry
-                # Caller gets this exception, knows to start fresh with empty cursor
-                raise
-
-            except grpc.RpcError as e:
-                # Check if retryable (Unavailable = connection drop, gateway restart)
-                if e.code() == grpc.StatusCode.UNAVAILABLE:
-                    consecutive_failures += 1
-                    if consecutive_failures > max_retries:
-                        # Gave up after max retries, raise as GatewayError
+                    else:
+                        # Other gRPC error (PermissionDenied, NotFound, Internal, etc)
+                        # Terminal — raise as GatewayError
                         raise from_grpc_error(e) from e
-                    # Sleep with backoff, then reconnect from cursor
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-                else:
-                    # Other gRPC error (PermissionDenied, NotFound, Internal, etc)
-                    # Terminal — raise as GatewayError
-                    raise from_grpc_error(e) from e
 
-            finally:
-                if stream is not None:
-                    await loop.run_in_executor(None, stream.cancel)
-                    stream = None
-
-            # If we reach here without exception, stream ended cleanly (shouldn't happen)
-            break
+                finally:
+                    if stream is not None:
+                        # cancel() is non-blocking and thread-safe. Call it directly:
+                        # the executor's only thread may still be blocked in next()
+                        # (e.g. the consumer task was cancelled), and cancelling is
+                        # what unblocks it.
+                        stream.cancel()
+                        stream = None
+        finally:
+            executor.shutdown(wait=False)
 
 
 class SandboxTemplateClient:
