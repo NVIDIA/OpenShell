@@ -86,9 +86,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -7166,13 +7168,15 @@ const _: () = assert!(
 );
 
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
-    terminate_vm_process_within(child, PROCESS_TERMINATION_GRACE).await
+    terminate_vm_process_within(child, PROCESS_TERMINATION_GRACE)
+        .await
+        .map(|_| ())
 }
 
 async fn terminate_vm_process_within(
     child: &mut Child,
     grace: Duration,
-) -> Result<(), std::io::Error> {
+) -> Result<ExitStatus, std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -7183,11 +7187,10 @@ async fn terminate_vm_process_within(
     }
 
     match tokio::time::timeout(grace, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(err),
+        Ok(status) => status,
         Err(_) => {
             child.kill().await?;
-            child.wait().await.map(|_| ())
+            child.wait().await
         }
     }
 }
@@ -7207,8 +7210,20 @@ async fn terminate_sandbox_processes_within(
     process: &mut VmProcess,
     supervisor_grace: Duration,
 ) -> Result<(), std::io::Error> {
+    let supervisor_pid = process.supervisor.id();
     let supervisor_error = terminate_vm_process_within(&mut process.supervisor, supervisor_grace)
         .await
+        .inspect(|status| {
+            // An orderly shutdown returns the workload's exit code, which can
+            // be nonzero even after the guest acknowledges termination.
+            if status.signal().is_some() {
+                warn!(
+                    ?supervisor_pid,
+                    %status,
+                    "VM host supervisor was terminated by a signal; guest filesystem flush was not confirmed and recent writes may be lost"
+                );
+            }
+        })
         .err();
     process.supervisor_liveness.take();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
@@ -11734,6 +11749,14 @@ mod tests {
     async fn stop_signals_supervisor_before_closing_its_liveness_pipe() {
         let dir = unique_temp_dir();
         fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
         let events = dir.join("events");
         let (read_end, write_end) = nix::unistd::pipe().unwrap();
         for fd in [&read_end, &write_end] {
@@ -11750,7 +11773,7 @@ mod tests {
             .arg(
                 r#"events=$1
 (cat <&3 >/dev/null; echo eof >>"$events") &
-trap 'sleep 0.2; echo term >>"$events"; exit 0' TERM
+trap 'sleep 0.2; echo term >>"$events"; exit 143' TERM
 echo ready >>"$events"
 while :; do sleep 0.05; done"#,
             )
@@ -11795,6 +11818,10 @@ while :; do sleep 0.05; done"#,
             Some("term"),
             "SIGTERM must reach the supervisor before its liveness pipe closes; events: {log:?}"
         );
+        assert!(
+            fs::read_to_string(&driver_log).unwrap().is_empty(),
+            "an orderly supervisor shutdown must not warn about lost writes"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -11804,6 +11831,14 @@ while :; do sleep 0.05; done"#,
     async fn stop_kills_a_supervisor_that_ignores_sigterm_after_the_grace() {
         let dir = unique_temp_dir();
         fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
         let events = dir.join("events");
         let (read_end, write_end) = nix::unistd::pipe().unwrap();
         for fd in [&read_end, &write_end] {
@@ -11880,6 +11915,12 @@ while :; do sleep 0.05; done"#,
         tokio::time::timeout(Duration::from_secs(5), closed)
             .await
             .expect("the liveness pipe is closed after the stop");
+        let driver_log = fs::read_to_string(&driver_log).unwrap();
+        assert!(
+            driver_log.contains("WARN")
+                && driver_log.contains("guest filesystem flush was not confirmed"),
+            "a forced supervisor shutdown must warn that recent writes may be lost: {driver_log:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
