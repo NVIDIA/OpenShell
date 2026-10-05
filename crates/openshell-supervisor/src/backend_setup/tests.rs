@@ -529,11 +529,11 @@ async fn constructed_backend_must_keep_selected_name() {
 
 #[test]
 fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
-    assert!(OpenShellBackendSetup.decode(b"{}").is_err());
     use openshell_sandbox_backend::boundary_protocol::{
         SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport,
     };
 
+    assert!(OpenShellBackendSetup.decode(b"{}").is_err());
     let setup = TestSetup::new();
     let mut descriptor = SandboxRuntimeDescriptor {
         boundary_id: setup.sandbox_id.clone(),
