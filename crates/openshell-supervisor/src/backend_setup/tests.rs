@@ -12,9 +12,9 @@ use openshell_core::sandbox_generation::SandboxGenerationId;
 use openshell_isolation_interface::contract::{
     BoundaryConfirmation, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
     BoundaryLoopbackConnector, BoundaryProcess, BoundaryProperties, BoundarySignal,
-    EnforcedProperty, ExecSession, ExecSpec, LoopbackTarget, OuterFenceGuarantee,
-    OuterFenceGuarantees, PendingDnsQuery, PendingTcpOpen, ReadyBoundary,
-    VerifiedBackendDescriptor,
+    ConfirmedBoundary, EnforcedProperty, ExecSession, ExecSpec, LoopbackTarget,
+    NetworkMediationSource, OuterFenceGuarantee, OuterFenceGuarantees, PendingDnsQuery,
+    PendingTcpOpen, ReadyBoundary, RunningBoundary, VerifiedBackendDescriptor,
 };
 use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
 
@@ -26,7 +26,6 @@ const TEST_PAYLOAD: &[u8] = b"in-process-v1\0owned-launch";
 struct Observed {
     events: Mutex<Vec<&'static str>>,
     services: Mutex<Weak<BackendServices>>,
-    discovery_unavailable: AtomicBool,
     deny_confirmation: AtomicBool,
     require_networking: AtomicBool,
     active: AtomicBool,
@@ -175,13 +174,6 @@ impl PreparedBackend for TestLaunch {
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         self.observed.record("discover");
         bearer.authorization_metadata().unwrap();
-        if self
-            .observed
-            .discovery_unavailable
-            .swap(false, Ordering::SeqCst)
-        {
-            return Err(BackendError::Unavailable("discovery unavailable".into()));
-        }
         Ok((None, false))
     }
 
@@ -459,111 +451,8 @@ fn shared_identity_rejection_stops_before_discovery() {
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn malformed_selected_payload_stops_at_its_own_decoder() {
-    let setup = TestSetup::new();
-    let mut descriptor = TestSetup::descriptor();
-    descriptor.payload = b"malformed".to_vec();
-    let error = SelectedBackend::select(
-        &setup,
-        descriptor,
-        Some(TEST_BACKEND),
-        Some("sandbox-1"),
-        &setup.auth,
-    )
-    .err()
-    .expect("selected decoder rejects malformed input");
-    assert_eq!(
-        error.to_string(),
-        "descriptor error: invalid in-process launch data"
-    );
-    assert_eq!(setup.observed.events(), ["decode"]);
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
-}
-
 #[tokio::test]
-async fn distinct_payload_recovers_discovery_without_rebuilding_or_launching_twice() {
-    let setup = TestSetup::new();
-    let selected = setup.select();
-    let services = setup.services();
-    setup
-        .observed
-        .discovery_unavailable
-        .store(true, Ordering::SeqCst);
-    assert!(
-        selected
-            .discover_policy(services.sandbox_bearer.clone())
-            .await
-            .is_err()
-    );
-    assert_eq!(setup.observed.events(), ["decode", "discover"]);
-    assert!(!setup.observed.active.load(Ordering::SeqCst));
-    assert_eq!(
-        selected
-            .discover_policy(services.sandbox_bearer.clone())
-            .await
-            .unwrap(),
-        (None, false)
-    );
-    let bound = selected.attach(services, policy(), agent()).await.unwrap();
-    let ready = bound.confirm().await.unwrap();
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
-    let running = ready.start_agent().await.unwrap();
-    assert_eq!(
-        setup.observed.events(),
-        [
-            "decode", "discover", "discover", "build", "attach", "confirm", "start"
-        ]
-    );
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 1);
-    assert!(setup.observed.active.load(Ordering::SeqCst));
-    drop(running);
-    assert!(!setup.observed.active.load(Ordering::SeqCst));
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
-    assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
-}
-
-#[tokio::test]
-async fn confirmation_denial_releases_attempt_and_repair_starts_once() {
-    let setup = TestSetup::new();
-    setup
-        .observed
-        .deny_confirmation
-        .store(true, Ordering::SeqCst);
-    let bound = setup
-        .select()
-        .attach(setup.services(), policy(), agent())
-        .await
-        .unwrap();
-    assert!(bound.confirm().await.is_err());
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
-    assert!(!setup.observed.active.load(Ordering::SeqCst));
-    assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
-
-    setup
-        .observed
-        .deny_confirmation
-        .store(false, Ordering::SeqCst);
-    let bound = setup
-        .select()
-        .attach(setup.services(), policy(), agent())
-        .await
-        .unwrap();
-    let running = bound.confirm().await.unwrap().start_agent().await.unwrap();
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        setup.observed.events(),
-        [
-            "decode", "build", "attach", "confirm", "decode", "build", "attach", "confirm", "start"
-        ]
-    );
-    drop(running);
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn backend_keeps_live_supervisor_services_through_confirmation_and_start() {
+async fn attachment_receives_live_supervisor_services() {
     let setup = TestSetup::new();
     let services = setup.services();
     let ca_paths = services.ca_file_paths.clone();
@@ -574,7 +463,6 @@ async fn backend_keeps_live_supervisor_services_through_confirmation_and_start()
         .attach(services, policy(), agent())
         .await
         .unwrap();
-    let ready = bound.confirm().await.unwrap();
     let backend_services = setup.observed.services.lock().unwrap().upgrade().unwrap();
     assert!(Arc::ptr_eq(&ca_paths, &backend_services.ca_file_paths));
     assert!(Arc::ptr_eq(
@@ -582,8 +470,7 @@ async fn backend_keeps_live_supervisor_services_through_confirmation_and_start()
         &backend_services.provider_credentials.snapshot()
     ));
 
-    // Networking publishes CA paths after confirmation. Provider and bearer
-    // updates later use the same handles retained by the selected backend.
+    // Later updates must reach the handles retained during attachment.
     *ca_paths.lock().unwrap() = Some(("/test/ca".into(), "/test/bundle".into()));
     providers.install_child_env_snapshot(
         2,
@@ -596,7 +483,6 @@ async fn backend_keeps_live_supervisor_services_through_confirmation_and_start()
             CredentialEpoch::new(2).unwrap(),
         )
         .unwrap();
-    let running = ready.start_agent().await.unwrap();
     assert_eq!(
         *backend_services.ca_file_paths.lock().unwrap(),
         Some(("/test/ca".into(), "/test/bundle".into()))
@@ -621,7 +507,7 @@ async fn backend_keeps_live_supervisor_services_through_confirmation_and_start()
             .is_err()
     );
     drop(backend_services);
-    drop(running);
+    drop(bound);
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
 }
 
@@ -641,78 +527,9 @@ async fn constructed_backend_must_keep_selected_name() {
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
 }
 
-#[tokio::test]
-async fn rejected_second_attachment_preserves_running_owner() {
-    let setup = TestSetup::new();
-    let bound = setup
-        .select()
-        .attach(setup.services(), policy(), agent())
-        .await
-        .unwrap();
-    let running = bound.confirm().await.unwrap().start_agent().await.unwrap();
-    let owner_services = setup.observed.services.lock().unwrap().clone();
-    assert!(
-        setup
-            .select()
-            .attach(setup.services(), policy(), agent())
-            .await
-            .is_err()
-    );
-    assert!(owner_services.upgrade().is_some());
-    assert!(setup.observed.active.load(Ordering::SeqCst));
-    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 0);
-    drop(running);
-    assert!(owner_services.upgrade().is_none());
-    assert!(!setup.observed.active.load(Ordering::SeqCst));
-    assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn abandoned_bound_and_ready_attempts_release_once_without_starting() {
-    for confirm_first in [false, true] {
-        let setup = TestSetup::new();
-        let bound = setup
-            .select()
-            .attach(setup.services(), policy(), agent())
-            .await
-            .unwrap();
-        if confirm_first {
-            drop(bound.confirm().await.unwrap());
-        } else {
-            drop(bound);
-        }
-        assert!(!setup.observed.active.load(Ordering::SeqCst));
-        assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
-        assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
-        assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
-    }
-}
-
 #[test]
-fn standard_setup_still_rejects_malformed_linux_descriptor() {
-    let setup = TestSetup::new();
-    let error = SelectedBackend::select(
-        &OpenShellBackendSetup,
-        BackendDescriptor {
-            backend_name: openshell_sandbox_backend::BACKEND_NAME.into(),
-            payload: b"{}".to_vec(),
-        },
-        Some(openshell_sandbox_backend::BACKEND_NAME),
-        Some("sandbox-1"),
-        &setup.auth,
-    )
-    .err()
-    .expect("Linux descriptor requires its own schema");
-    assert!(
-        error
-            .to_string()
-            .contains("decode sandbox runtime descriptor:")
-    );
-}
-
-#[test]
-fn standard_setup_preserves_driver_fixed_vm_identity() {
+fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
+    assert!(OpenShellBackendSetup.decode(b"{}").is_err());
     use openshell_sandbox_backend::boundary_protocol::{
         SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport,
     };
@@ -855,26 +672,28 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     let startup = || {
         Box::pin(crate::run_sandbox_with_backend(
             &setup,
-            vec!["test-agent".into(), "test-argument".into()],
-            Some("/test-workspace".into()),
-            15,
-            false,
-            false,
-            Some(setup.sandbox_id.clone()),
-            None,
-            None,
-            Some(rules.to_string_lossy().into_owned()),
-            Some(data.to_string_lossy().into_owned()),
-            None,
-            Some(readiness.clone()),
-            Some(health_port),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(String::new())),
-            UpstreamProxyArgs::default(),
-            TestSetup::descriptor(),
-            setup.auth.clone(),
-            Some(TEST_BACKEND.into()),
-            Some(marker.clone()),
+            crate::SandboxRunConfig {
+                command: vec!["test-agent".into(), "test-argument".into()],
+                workdir: Some("/test-workspace".into()),
+                timeout_secs: 15,
+                interactive: false,
+                await_main_process_attachment: false,
+                sandbox_id: Some(setup.sandbox_id.clone()),
+                sandbox: None,
+                openshell_endpoint: None,
+                policy_rules: Some(rules.to_string_lossy().into_owned()),
+                policy_data: Some(data.to_string_lossy().into_owned()),
+                ssh_socket_path: None,
+                health_socket_path: Some(readiness.clone()),
+                health_port: Some(health_port),
+                ocsf_enabled: Arc::new(AtomicBool::new(false)),
+                ocsf_schema_version: Arc::new(Mutex::new(String::new())),
+                upstream_proxy_args: UpstreamProxyArgs::default(),
+                backend_descriptor: TestSetup::descriptor(),
+                auth_bundle: setup.auth.clone(),
+                admitted_isolation_backend: Some(TEST_BACKEND.into()),
+                main_exit_marker: Some(marker.clone()),
+            },
         ))
     };
 

@@ -641,40 +641,33 @@ pub async fn run_sandbox(
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
         &backend_setup::OpenShellBackendSetup,
-        command,
-        workdir,
-        timeout_secs,
-        interactive,
-        await_main_process_attachment,
-        sandbox_id,
-        sandbox,
-        openshell_endpoint,
-        policy_rules,
-        policy_data,
-        ssh_socket_path,
-        health_socket_path,
-        health_port,
-        ocsf_enabled,
-        ocsf_schema_version,
-        upstream_proxy_args,
-        backend_descriptor,
-        auth_bundle,
-        admitted_isolation_backend,
-        main_exit_marker,
+        SandboxRunConfig {
+            command,
+            workdir,
+            timeout_secs,
+            interactive,
+            await_main_process_attachment,
+            sandbox_id,
+            sandbox,
+            openshell_endpoint,
+            policy_rules,
+            policy_data,
+            ssh_socket_path,
+            health_socket_path,
+            health_port,
+            ocsf_enabled,
+            ocsf_schema_version,
+            upstream_proxy_args,
+            backend_descriptor,
+            auth_bundle,
+            admitted_isolation_backend,
+            main_exit_marker,
+        },
     ))
     .await
 }
 
-/// Trusted composition chooses the setup before shared admission, policy, and
-/// lifecycle handling. Payload contents never select a backend implementation.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::implicit_hasher,
-    clippy::similar_names,
-    clippy::fn_params_excessive_bools
-)]
-async fn run_sandbox_with_backend(
-    backend_setup: &dyn backend_setup::BackendSetup,
+struct SandboxRunConfig {
     command: Vec<String>,
     workdir: Option<String>,
     timeout_secs: u64,
@@ -695,7 +688,37 @@ async fn run_sandbox_with_backend(
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+}
+
+/// Trusted composition chooses the setup before shared admission, policy, and
+/// lifecycle handling. Payload contents never select a backend implementation.
+#[allow(clippy::similar_names)]
+async fn run_sandbox_with_backend(
+    backend_setup: &dyn backend_setup::BackendSetup,
+    config: SandboxRunConfig,
 ) -> Result<i32> {
+    let SandboxRunConfig {
+        command,
+        workdir,
+        timeout_secs,
+        interactive,
+        await_main_process_attachment,
+        sandbox_id,
+        sandbox,
+        openshell_endpoint,
+        policy_rules,
+        policy_data,
+        ssh_socket_path,
+        health_socket_path,
+        health_port,
+        ocsf_enabled,
+        ocsf_schema_version,
+        upstream_proxy_args,
+        backend_descriptor,
+        auth_bundle,
+        admitted_isolation_backend,
+        main_exit_marker,
+    } = config;
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -963,7 +986,10 @@ async fn run_sandbox_with_backend(
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
-        let ready = bound.confirm().await?;
+        let ready = bound
+            .confirm()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
         (ready, backend_name, ca_file_paths)
     };
@@ -1187,7 +1213,11 @@ async fn run_sandbox_with_backend(
 
     let (confirmed, backend_name) = remote_ready;
     let exit_code = {
-        let running = confirmed.start_agent().await?;
+        let running = confirmed
+            .into_boundary()
+            .start_agent()
+            .await
+            .map_err(|error| miette::miette!(error.to_string()))?;
         workload_started_tx.send_replace(true);
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();

@@ -12,9 +12,8 @@ use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BackendRegistry, BoundBoundary, ConfirmedBoundary,
-    IsolationBackend, NetworkMediationSource, ResolvedWorkloadIdentity, RunningBoundary,
-    SandboxContext, SandboxPolicy,
+    BackendDescriptor, BackendError, BackendRegistry, BoundBoundary, IsolationBackend,
+    ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
 };
 
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
@@ -158,7 +157,7 @@ impl SelectedBackend {
         services: BackendServices,
         policy: SandboxPolicy,
         agent: AgentSpec,
-    ) -> Result<BoundBackend> {
+    ) -> Result<Box<dyn BoundBoundary>> {
         let backend = self
             .prepared
             .build(services)
@@ -171,7 +170,7 @@ impl SelectedBackend {
         let (backend, verified) = registry
             .resolve(self.descriptor, &admitted_backend)
             .map_err(|error| miette::miette!(error.to_string()))?;
-        let bound = backend
+        backend
             .attach(
                 verified,
                 SandboxContext {
@@ -182,55 +181,6 @@ impl SelectedBackend {
                     identity: self.identity.workload_identity,
                 },
             )
-            .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        Ok(BoundBackend { bound })
-    }
-}
-
-/// The shared startup sequence owns when attachment advances to confirmation.
-/// Retain network handles before consuming the bound state, as the contract
-/// requires, without exposing the concrete backend to the supervisor.
-pub struct BoundBackend {
-    bound: Box<dyn BoundBoundary>,
-}
-
-impl BoundBackend {
-    /// Retain the backend's network request source before consuming attachment.
-    pub fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
-        self.bound.network_mediation_source()
-    }
-
-    /// Return the backend's trusted host dial address, if one is required.
-    pub fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
-        self.bound.host_gateway_ip()
-    }
-
-    /// Consume attachment and require the backend's validated enforcement
-    /// confirmation. A failure returns no state capable of starting the agent.
-    pub async fn confirm(self) -> Result<ReadyBackend> {
-        let confirmed = self
-            .bound
-            .confirm()
-            .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        Ok(ReadyBackend { confirmed })
-    }
-}
-
-/// Shared startup retains confirmation while preparing networking. Only this
-/// consumed state can invoke the backend's workload launch operation.
-pub struct ReadyBackend {
-    confirmed: ConfirmedBoundary,
-}
-
-impl ReadyBackend {
-    /// Consume confirmation and start the workload once shared networking is
-    /// ready. Backend launch failure does not restore a reusable ready state.
-    pub async fn start_agent(self) -> Result<Box<dyn RunningBoundary>> {
-        self.confirmed
-            .into_boundary()
-            .start_agent()
             .await
             .map_err(|error| miette::miette!(error.to_string()))
     }
