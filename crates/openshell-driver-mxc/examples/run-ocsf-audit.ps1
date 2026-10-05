@@ -129,7 +129,11 @@ function Invoke-Cli([string[]]$CommandArgs, [switch]$AllowFailure) {
   if (-not $AllowFailure -and $process.ExitCode -ne 0) {
     throw "openshell $($CommandArgs -join ' ') failed (exit $($process.ExitCode)): $text"
   }
-  return @{ ExitCode = $process.ExitCode; Text = $text }
+  return @{
+    ExitCode = $process.ExitCode
+    Text = $text
+    StdOut = $stdout.Result
+  }
 }
 
 function Resolve-Artifact([string]$explicit, [string]$leaf) {
@@ -319,11 +323,42 @@ try {
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
-  $env:OPENSHELL_GATEWAY = ""
-  $gatewayAdd = Invoke-Cli @("gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName) -AllowFailure
+  Remove-Item Env:OPENSHELL_GATEWAY -ErrorAction SilentlyContinue
+  $expectedEndpoint = "http://127.0.0.1:$Port"
+  $gatewayAdd = Invoke-Cli @("gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName) -AllowFailure
   if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
-  if ($gatewayAdd.ExitCode -ne 0 -and $gatewayAdd.Text -notmatch '(?i)already exists') {
-    throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
+  if ($gatewayAdd.ExitCode -ne 0) {
+    $gatewayList = Invoke-Cli @("gateway", "list", "-o", "json") -AllowFailure
+    if ($gatewayList.ExitCode -ne 0) {
+      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text); gateway list also failed: $($gatewayList.Text)"
+    }
+    try {
+      $gateways = $gatewayList.StdOut | ConvertFrom-Json
+    } catch {
+      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text); could not parse gateway list JSON: $($_.Exception.Message)"
+    }
+    $existing = $gateways | Where-Object { $_.name -eq $GatewayName } | Select-Object -First 1
+    if ($null -eq $existing) {
+      throw "gateway registration failed (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
+    }
+
+    $existingEndpoint = ([string]$existing.endpoint).TrimEnd('/')
+    $normalizedExpected = $expectedEndpoint.TrimEnd('/')
+    if ($existingEndpoint -ne $normalizedExpected) {
+      Info "'$GatewayName' points at '$existingEndpoint' instead of '$normalizedExpected'; replacing the stale registration"
+      $gatewayRemove = Invoke-Cli @("gateway", "remove", $GatewayName) -AllowFailure
+      if ($gatewayRemove.Text) { Info $gatewayRemove.Text }
+      if ($gatewayRemove.ExitCode -ne 0) {
+        throw "failed to remove stale gateway '$GatewayName' (exit $($gatewayRemove.ExitCode)): $($gatewayRemove.Text)"
+      }
+      $gatewayAdd = Invoke-Cli @("gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName) -AllowFailure
+      if ($gatewayAdd.Text) { Info $gatewayAdd.Text }
+      if ($gatewayAdd.ExitCode -ne 0) {
+        throw "gateway registration failed after removing stale registration (exit $($gatewayAdd.ExitCode)): $($gatewayAdd.Text)"
+      }
+    } else {
+      Info "'$GatewayName' already points at '$normalizedExpected'; reusing it"
+    }
   }
   $gatewaySelect = Invoke-Cli @("gateway", "select", $GatewayName)
   if ($gatewaySelect.Text) { Info $gatewaySelect.Text }

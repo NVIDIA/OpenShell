@@ -144,6 +144,7 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
     return @{
         ExitCode = $process.ExitCode
         Output = @($stdout.Result, $stderr.Result) | Where-Object { $_ }
+        StdOut = $stdout.Result
     }
 }
 
@@ -233,15 +234,48 @@ function Stop-Gw($p) {
 
 function Register-Cli {
     if ($script:registered) { return }
-    $env:OPENSHELL_GATEWAY = ""
+    Remove-Item Env:OPENSHELL_GATEWAY -ErrorAction SilentlyContinue
 
+    $expectedEndpoint = "http://127.0.0.1:$Port"
     $addResult = Invoke-NativeCaptured $cli @(
-        "gateway", "add", "http://127.0.0.1:$Port", "--local", "--name", $GatewayName
+        "gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName
     )
     $addText = ($addResult.Output -join "`n")
     if ($addText) { $addResult.Output | ForEach-Object { Info $_ } }
-    if ($addResult.ExitCode -ne 0 -and $addText -notmatch '(?i)already exists') {
-        throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
+    if ($addResult.ExitCode -ne 0) {
+        $listResult = Invoke-NativeCaptured $cli @("gateway", "list", "-o", "json")
+        if ($listResult.ExitCode -ne 0) {
+            throw "gateway add failed (exit $($addResult.ExitCode)): $addText; gateway list also failed: $($listResult.Output -join "`n")"
+        }
+        try {
+            $gateways = $listResult.StdOut | ConvertFrom-Json
+        } catch {
+            throw "gateway add failed (exit $($addResult.ExitCode)): $addText; could not parse gateway list JSON: $($_.Exception.Message)"
+        }
+        $existing = $gateways | Where-Object { $_.name -eq $GatewayName } | Select-Object -First 1
+        if ($null -eq $existing) {
+            throw "gateway add failed (exit $($addResult.ExitCode)): $addText"
+        }
+
+        $existingEndpoint = ([string]$existing.endpoint).TrimEnd('/')
+        $normalizedExpected = $expectedEndpoint.TrimEnd('/')
+        if ($existingEndpoint -ne $normalizedExpected) {
+            Info "'$GatewayName' points at '$existingEndpoint' instead of '$normalizedExpected'; replacing the stale registration"
+            $removeResult = Invoke-NativeCaptured $cli @("gateway", "remove", $GatewayName)
+            if ($removeResult.Output) { $removeResult.Output | ForEach-Object { Info $_ } }
+            if ($removeResult.ExitCode -ne 0) {
+                throw "failed to remove stale gateway '$GatewayName' (exit $($removeResult.ExitCode)): $($removeResult.Output -join "`n")"
+            }
+            $addResult = Invoke-NativeCaptured $cli @(
+                "gateway", "add", $expectedEndpoint, "--local", "--name", $GatewayName
+            )
+            if ($addResult.Output) { $addResult.Output | ForEach-Object { Info $_ } }
+            if ($addResult.ExitCode -ne 0) {
+                throw "gateway add failed after removing stale registration (exit $($addResult.ExitCode)): $($addResult.Output -join "`n")"
+            }
+        } else {
+            Info "'$GatewayName' already points at '$normalizedExpected'; reusing it"
+        }
     }
 
     $selectResult = Invoke-NativeCaptured $cli @("gateway", "select", $GatewayName)
