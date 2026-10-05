@@ -9,6 +9,7 @@
 //! - Common error types
 //! - Build version metadata
 
+pub mod account_files;
 pub mod activity;
 pub mod auth;
 pub mod config;

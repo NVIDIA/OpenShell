@@ -2159,12 +2159,16 @@ class _RecordingHighLevelClient:
         spec: Any = None,
         name: str | None = None,
         labels: Any = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> Any:
         self.create_kwargs = {
             "workspace": workspace,
             "spec": spec,
             "name": name,
             "labels": labels,
+            "use_authenticated_username": use_authenticated_username,
+            "use_parent_hostname": use_parent_hostname,
         }
         return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
 
@@ -2176,6 +2180,8 @@ class _RecordingHighLevelClient:
         spec: Any = None,
         name: str | None = None,
         labels: Any = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> Any:
         self.create_template_kwargs = {
             "workspace": workspace,
@@ -2183,6 +2189,8 @@ class _RecordingHighLevelClient:
             "spec": spec,
             "name": name,
             "labels": labels,
+            "use_authenticated_username": use_authenticated_username,
+            "use_parent_hostname": use_parent_hostname,
         }
         return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
 
@@ -2203,12 +2211,18 @@ def test_create_forwards_name_and_labels() -> None:
     client = _client_with_fake_stub(stub)
 
     ref = client.create(
-        workspace="default", name="job-1", labels={"aiq": "deep-research"}
+        workspace="default",
+        name="job-1",
+        labels={"aiq": "deep-research"},
+        use_authenticated_username=True,
+        use_parent_hostname=True,
     )
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-1"
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+    assert stub.create_request.use_authenticated_username is True
+    assert stub.create_request.use_parent_hostname is True
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
 
@@ -2262,6 +2276,8 @@ def test_create_from_template_forwards_workload_template() -> None:
         spec=spec,
         name="job-1",
         labels={"team": "runtime"},
+        use_authenticated_username=True,
+        use_parent_hostname=True,
     )
 
     assert stub.create_request is not None
@@ -2271,6 +2287,8 @@ def test_create_from_template_forwards_workload_template() -> None:
     assert list(stub.create_request.spec.providers) == ["github"]
     assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
     assert stub.create_request.spec.tty is True
+    assert stub.create_request.use_authenticated_username is True
+    assert stub.create_request.use_parent_hostname is True
     assert dict(ref.labels) == {"team": "runtime"}
 
 
@@ -2577,12 +2595,18 @@ def test_create_session_forwards_name_and_labels() -> None:
     client = _client_with_fake_stub(stub)
 
     session = client.create_session(
-        workspace="default", name="job-2", labels={"team": "aiq"}
+        workspace="default",
+        name="job-2",
+        labels={"team": "aiq"},
+        use_authenticated_username=True,
+        use_parent_hostname=True,
     )
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-2"
     assert dict(stub.create_request.labels) == {"team": "aiq"}
+    assert stub.create_request.use_authenticated_username is True
+    assert stub.create_request.use_parent_hostname is True
     assert session.sandbox.name == "job-2"
 
 
@@ -2877,7 +2901,7 @@ def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
         ref.labels["mutated"] = "nope"  # type: ignore[index]
 
 
-def test_high_level_creation_forwards_name_and_labels(
+def test_high_level_creation_forwards_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recording = _RecordingHighLevelClient()
@@ -2892,6 +2916,8 @@ def test_high_level_creation_forwards_name_and_labels(
         name="job-1",
         labels={"aiq": "deep-research"},
         delete_on_exit=False,
+        use_authenticated_username=True,
+        use_parent_hostname=True,
     )
     sandbox.__enter__()
 
@@ -2900,6 +2926,8 @@ def test_high_level_creation_forwards_name_and_labels(
         "spec": None,
         "name": "job-1",
         "labels": {"aiq": "deep-research"},
+        "use_authenticated_username": True,
+        "use_parent_hostname": True,
     }
 
 
@@ -2925,6 +2953,8 @@ def test_high_level_template_creation_forwards_workload_template(
         name="job-1",
         labels={"team": "runtime"},
         delete_on_exit=False,
+        use_authenticated_username=True,
+        use_parent_hostname=True,
     )
     sandbox.__enter__()
 
@@ -2934,6 +2964,8 @@ def test_high_level_template_creation_forwards_workload_template(
         "spec": spec,
         "name": "job-1",
         "labels": {"team": "runtime"},
+        "use_authenticated_username": True,
+        "use_parent_hostname": True,
     }
     assert recording.create_template_kwargs is not None
     forwarded_spec = recording.create_template_kwargs["spec"]

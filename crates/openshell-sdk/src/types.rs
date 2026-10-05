@@ -265,9 +265,14 @@ impl From<SandboxRestartPolicy> for proto::SandboxRestartPolicy {
 /// full proto surface (volume claim templates, runtime classes, struct
 /// resources, etc.) should drop down to [`crate::raw`].
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
     pub name: Option<String>,
+    /// Use the authenticated user's name for the sandbox account.
+    pub use_authenticated_username: bool,
+    /// Use the parent host's FQDN as the Docker container hostname.
+    pub use_parent_hostname: bool,
     /// Container image reference (e.g. `registry.example.com/agents/python:latest`).
     pub image: Option<String>,
     /// Labels attached to the sandbox.
@@ -321,9 +326,14 @@ impl From<ServiceAuthorizationMode> for proto::ServiceAuthorizationMode {
 
 /// Caller intent for creating a sandbox from a named workload template.
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SandboxTemplateCreateSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
     pub name: Option<String>,
+    /// Use the authenticated user's name for the sandbox account.
+    pub use_authenticated_username: bool,
+    /// Use the parent host's FQDN as the Docker container hostname.
+    pub use_parent_hostname: bool,
     /// Workspace-scoped template name to resolve at creation time.
     pub template_name: String,
     /// Labels attached to the sandbox.
