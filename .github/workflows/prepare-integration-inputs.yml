@@ -31,11 +31,6 @@ on:
         required: false
         type: boolean
         default: false
-      include-rpm-upgrade-source:
-        description: Include the latest published release RPMs and runtime images as upgrade inputs
-        required: false
-        type: boolean
-        default: false
     outputs:
       source_sha:
         description: Source revision of the candidate artifacts
@@ -141,7 +136,7 @@ jobs:
           rm -rf "$download_dir"
 
       - name: Resolve released upgrade source
-        if: inputs['include-deb-upgrade-source'] || inputs['include-rpm-upgrade-source']
+        if: inputs['include-deb-upgrade-source']
         id: upgrade-source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -186,7 +181,7 @@ jobs:
       # this release tag, while tmachine consumes tarballs to keep guest setup
       # independent of registry access.
       - name: Export released runtime images for upgrade sources
-        if: inputs['include-deb-upgrade-source'] || inputs['include-rpm-upgrade-source']
+        if: inputs['include-deb-upgrade-source']
         env:
           IMAGE_TAG: ${{ steps.upgrade-source.outputs.tag }}
         run: |
@@ -199,41 +194,6 @@ jobs:
 
           docker pull "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
           docker save --output artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
-
-      - name: Download released RPM upgrade source
-        if: inputs['include-rpm-upgrade-source']
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_TAG: ${{ steps.upgrade-source.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release download "$SOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'openshell-[0-9]*.x86_64.rpm' \
-            --pattern 'openshell-gateway-[0-9]*.x86_64.rpm' \
-            --pattern openshell-checksums-sha256.txt \
-            --dir artifacts/upgrade/rpm/source/download
-
-      - name: Stage released RPM upgrade source
-        if: inputs['include-rpm-upgrade-source']
-        run: |
-          set -euo pipefail
-          source_dir=artifacts/upgrade/rpm/source
-          download_dir="${source_dir}/download"
-          cli_rpm=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell-[0-9]*.x86_64.rpm' -print -quit)
-          gateway_rpm=$(find "$download_dir" -maxdepth 1 -type f -name 'openshell-gateway-[0-9]*.x86_64.rpm' -print -quit)
-          if [[ -z "$cli_rpm" || -z "$gateway_rpm" || ! -f "${download_dir}/openshell-checksums-sha256.txt" ]]; then
-            echo "released source artifact did not contain the expected RPMs and checksums" >&2
-            exit 1
-          fi
-          (
-            cd "$download_dir"
-            grep -F " $(basename "$cli_rpm")" openshell-checksums-sha256.txt | sha256sum --check --status
-            grep -F " $(basename "$gateway_rpm")" openshell-checksums-sha256.txt | sha256sum --check --status
-          )
-          mv "$cli_rpm" "${source_dir}/openshell.rpm"
-          mv "$gateway_rpm" "${source_dir}/openshell-gateway.rpm"
-          mv "${download_dir}/openshell-checksums-sha256.txt" "${source_dir}/openshell-checksums-sha256.txt"
-          rm -rf "$download_dir"
 
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin

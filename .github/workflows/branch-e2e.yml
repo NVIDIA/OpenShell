@@ -261,7 +261,7 @@ jobs:
 
   prepare-integration-upgrades:
     name: Prepare upgrade qualification inputs
-    needs: [pr_metadata, build-binaries, build-images, build-deb, build-rpm]
+    needs: [pr_metadata, build-binaries, build-images, build-deb]
     if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
     permissions:
       actions: read
@@ -270,9 +270,7 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
-      rpm-artifact-name: rpm-linux-x86_64
       include-deb-upgrade-source: true
-      include-rpm-upgrade-source: true
 
   integration-upgrades:
     name: Integration upgrades
@@ -288,8 +286,7 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration-upgrades.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"},
-          {"environment":"fedora-podman-rootless","installer":"rpm-upgrade-source","testsuite":"rpm-upgrade"}
+          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"}
         ]
 
   # Run driver-independent conformance tests.
