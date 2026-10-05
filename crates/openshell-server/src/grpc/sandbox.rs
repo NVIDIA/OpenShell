@@ -318,6 +318,106 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
     }))
 }
 
+fn apply_docker_hostname_override(spec: &mut SandboxSpec, fqdn: &str) -> Result<(), Status> {
+    if fqdn.is_empty() {
+        return Ok(());
+    }
+
+    let (hostname, domainname) = fqdn.split_once('.').unwrap_or((fqdn, ""));
+    let config = spec
+        .template
+        .get_or_insert_default()
+        .driver_config
+        .get_or_insert_default();
+    let docker = config
+        .fields
+        .entry("docker".to_string())
+        .or_insert_with(|| Value {
+            kind: Some(Kind::StructValue(Struct::default())),
+        });
+    let Some(Kind::StructValue(docker)) = docker.kind.as_mut() else {
+        return Err(Status::invalid_argument(
+            "driver_config.docker must be an object",
+        ));
+    };
+    if !domainname.is_empty() {
+        docker.fields.insert(
+            "domainname".to_string(),
+            Value {
+                kind: Some(Kind::StringValue(domainname.to_string())),
+            },
+        );
+    }
+    docker.fields.insert(
+        "hostname".to_string(),
+        Value {
+            kind: Some(Kind::StringValue(hostname.to_string())),
+        },
+    );
+    Ok(())
+}
+
+fn authenticated_username(principal: &crate::auth::principal::Principal) -> Result<&str, Status> {
+    let crate::auth::principal::Principal::User(user) = principal else {
+        return Err(Status::failed_precondition(
+            "authenticated principal has no valid username",
+        ));
+    };
+
+    user.identity
+        .display_name
+        .as_deref()
+        .filter(|username| is_valid_username(username))
+        .or_else(|| {
+            is_valid_username(&user.identity.subject).then_some(user.identity.subject.as_str())
+        })
+        .ok_or_else(|| Status::failed_precondition("authenticated principal has no valid username"))
+}
+
+fn is_valid_username(username: &str) -> bool {
+    let mut chars = username.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    username != "root"
+        && username.len() <= 256
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '$')
+        })
+}
+
+fn parent_fqdn() -> Result<String, Status> {
+    let hostname = dns_lookup::get_hostname()
+        .map_err(|error| Status::internal(format!("read parent hostname: {error}")))?;
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        return Err(Status::internal("parent hostname is empty"));
+    }
+    if hostname.contains('.') {
+        return Ok(hostname.to_string());
+    }
+
+    let Ok(addresses) = dns_lookup::lookup_host(hostname) else {
+        return Ok(hostname.to_string());
+    };
+    let addresses = addresses.collect::<Vec<_>>();
+    let Some(address) = addresses
+        .iter()
+        .find(|address| !address.is_loopback())
+        .or_else(|| addresses.first())
+    else {
+        return Ok(hostname.to_string());
+    };
+    let Ok(fqdn) = dns_lookup::lookup_addr(address) else {
+        return Ok(hostname.to_string());
+    };
+    let fqdn = fqdn.trim_end_matches('.');
+
+    Ok(if fqdn.is_empty() { hostname } else { fqdn }.to_string())
+}
+
 /// Stable caller identity used to bind a staging slot to its requester.
 fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
     match principal {
@@ -326,6 +426,24 @@ fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<St
             "rootfs tar staging requires a user principal",
         )),
     }
+}
+
+fn spec_sets_docker_hostname_identity(spec: &SandboxSpec) -> bool {
+    let Some(config) = spec
+        .template
+        .as_ref()
+        .and_then(|template| template.driver_config.as_ref())
+    else {
+        return false;
+    };
+    let Some(Kind::StructValue(docker)) = config
+        .fields
+        .get("docker")
+        .and_then(|value| value.kind.as_ref())
+    else {
+        return false;
+    };
+    docker.fields.contains_key("domainname") || docker.fields.contains_key("hostname")
 }
 
 /// Read the staging token a caller named for the active driver, without
@@ -423,16 +541,18 @@ async fn handle_create_sandbox_inner(
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let await_main_process_attachment = request.await_main_process_attachment;
+    let docker_hostname = request.docker_hostname.clone();
     let workload_template_name = request.workload_template.trim().to_string();
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
-
     // Validate labels (keys and values must meet Kubernetes requirements).
     for (key, value) in &request.labels {
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+
+    validate_driver_sandbox_options(state.compute.configured_driver_name(), &request)?;
 
     let authz = authorize_workspace(
         &state.store,
@@ -477,6 +597,15 @@ async fn handle_create_sandbox_inner(
     spec.provider_attachment_epoch = uuid::Uuid::new_v4().to_string();
     if spec.restart_policy == SandboxRestartPolicy::Unspecified as i32 {
         spec.restart_policy = SandboxRestartPolicy::Never as i32;
+    }
+
+    apply_docker_hostname_override(&mut spec, &docker_hostname)?;
+    if request.use_parent_hostname {
+        let hostname = tokio::task::spawn_blocking(parent_fqdn)
+            .await
+            .map_err(|error| Status::internal(format!("resolve parent FQDN task: {error}")))??;
+
+        apply_docker_hostname_override(&mut spec, &hostname)?;
     }
 
     // Leave an omitted command empty rather than persisting a concrete shell:
@@ -572,6 +701,15 @@ async fn handle_create_sandbox_inner(
     .await?;
 
     let now_ms = current_time_ms();
+    let mut annotations = request.annotations.clone();
+    annotations.remove(crate::compute::SANDBOX_USERNAME_ANNOTATION);
+
+    if request.use_authenticated_username {
+        annotations.insert(
+            crate::compute::SANDBOX_USERNAME_ANNOTATION.to_string(),
+            authenticated_username(&principal)?.to_string(),
+        );
+    }
 
     let mut sandbox = Sandbox {
         metadata: Some(ObjectMeta {
@@ -580,7 +718,7 @@ async fn handle_create_sandbox_inner(
             created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: request.labels.clone(),
             resource_version: 0,
-            annotations: request.annotations.clone(),
+            annotations,
             workspace,
             deletion_time: None,
         }),
@@ -736,6 +874,25 @@ async fn handle_create_sandbox_inner(
     }))
 }
 
+fn validate_driver_sandbox_options(
+    driver_name: &str,
+    request: &CreateSandboxRequest,
+) -> Result<(), Status> {
+    if request.use_parent_hostname && driver_name != "docker" {
+        return Err(Status::invalid_argument(
+            "--hostname requires the Docker compute driver",
+        ));
+    }
+
+    if request.use_authenticated_username && !matches!(driver_name, "docker" | "podman" | "vm") {
+        return Err(Status::invalid_argument(
+            "--username requires the Docker, Podman, or VM compute driver",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_create_sandbox_request_pre_io(
     request: &CreateSandboxRequest,
     workload_template_name: &str,
@@ -765,6 +922,16 @@ fn validate_create_sandbox_request_pre_io(
                 exposure.service
             )));
         }
+    }
+
+    if request
+        .spec
+        .as_ref()
+        .is_some_and(spec_sets_docker_hostname_identity)
+    {
+        return Err(Status::invalid_argument(
+            "driver_config.docker.domainname and .hostname are managed by --hostname",
+        ));
     }
 
     if workload_template_name.is_empty() {
@@ -1185,6 +1352,11 @@ fn validate_sandbox_workload_template(template: &SandboxWorkloadTemplate) -> Res
     validate_dns1123_label(&name, "template.metadata.name")?;
     validate_sandbox_workload_template_service_level(template)?;
     let spec = sandbox_spec_from_user_workload_template(template)?;
+    if spec_sets_docker_hostname_identity(&spec) {
+        return Err(Status::invalid_argument(
+            "driver_config.docker.domainname and .hostname are managed by --hostname",
+        ));
+    }
     validate_sandbox_spec(&name, &spec)?;
     Ok(())
 }
@@ -4053,6 +4225,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_username_prefers_valid_display_name() {
+        let principal =
+            crate::auth::principal::Principal::User(crate::auth::principal::UserPrincipal {
+                identity: crate::auth::identity::Identity {
+                    display_name: Some("ebusto".to_string()),
+                    provider: crate::auth::identity::IdentityProvider::Oidc,
+                    roles: Vec::new(),
+                    scopes: Vec::new(),
+                    subject: "user-42".to_string(),
+                },
+            });
+
+        assert_eq!(authenticated_username(&principal).unwrap(), "ebusto");
+    }
+
+    #[test]
+    fn authenticated_username_rejects_invalid_identity() {
+        let principal =
+            crate::auth::principal::Principal::User(crate::auth::principal::UserPrincipal {
+                identity: crate::auth::identity::Identity {
+                    display_name: Some("Invalid User".to_string()),
+                    provider: crate::auth::identity::IdentityProvider::Oidc,
+                    roles: Vec::new(),
+                    scopes: Vec::new(),
+                    subject: "invalid subject".to_string(),
+                },
+            });
+
+        let err = authenticated_username(&principal).unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn authenticated_username_uses_valid_subject_as_fallback() {
+        let principal =
+            crate::auth::principal::Principal::User(crate::auth::principal::UserPrincipal {
+                identity: crate::auth::identity::Identity {
+                    display_name: Some("Invalid User".to_string()),
+                    provider: crate::auth::identity::IdentityProvider::Oidc,
+                    roles: Vec::new(),
+                    scopes: Vec::new(),
+                    subject: "user-42".to_string(),
+                },
+            });
+
+        assert_eq!(authenticated_username(&principal).unwrap(), "user-42");
+    }
+
     // ---- shell_escape ----
 
     #[test]
@@ -6216,6 +6438,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -6274,6 +6499,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_removes_username_annotation_when_unrequested() {
+        let state = test_server_state().await;
+        let annotation = crate::compute::SANDBOX_USERNAME_ANNOTATION.to_string();
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                annotations: HashMap::from([(annotation.clone(), "spoofed".to_string())]),
+                name: "username-default".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let annotations = &response
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.metadata.as_ref())
+            .unwrap()
+            .annotations;
+        assert!(!annotations.contains_key(&annotation));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_stamps_authenticated_username_when_requested() {
+        let state = test_server_state_with_driver("docker").await;
+        let annotation = crate::compute::SANDBOX_USERNAME_ANNOTATION.to_string();
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                annotations: HashMap::from([(annotation.clone(), "spoofed".to_string())]),
+                name: "sandbox-username".to_string(),
+                spec: Some(SandboxSpec::default()),
+                use_authenticated_username: true,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let act = response
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.metadata.as_ref())
+            .and_then(|metadata| metadata.annotations.get(&annotation))
+            .map(String::as_str);
+        assert_eq!(act, Some("dev-user"));
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "sandbox-username")
+            .await
+            .unwrap()
+            .unwrap();
+        let act = stored
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.annotations.get(&annotation))
+            .map(String::as_str);
+        assert_eq!(act, Some("dev-user"));
+    }
+
+    #[tokio::test]
     async fn create_sandbox_uses_configured_provider_profile_sources() {
         let state = test_server_state().await;
 
@@ -6291,6 +6586,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -6329,6 +6627,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_authenticated_username: false,
+                use_parent_hostname: false,
             }),
         )
         .await
@@ -6411,6 +6712,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -6791,6 +7095,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -7098,6 +7405,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -7169,6 +7479,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -7205,6 +7518,9 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template: String::new(),
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -7243,6 +7559,9 @@ mod tests {
                     await_main_process_attachment: false,
                     workload_template: String::new(),
                     service_exposures: Vec::new(),
+                    docker_hostname: String::new(),
+                    use_parent_hostname: false,
+                    use_authenticated_username: false,
                 }),
             )
             .await
@@ -7796,6 +8115,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_sandbox_rejects_arbitrary_docker_domainname() {
+        let driver_config = openshell_core::proto_struct::json_object_to_struct(
+            serde_json::json!({
+                "docker": {
+                    "domainname": "example.com"
+                }
+            })
+            .as_object()
+            .expect("driver config object")
+            .clone(),
+        )
+        .expect("driver config");
+        let request = CreateSandboxRequest {
+            name: "arbitrary-domainname".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(driver_config),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_create_sandbox_request_pre_io(&request, "")
+            .expect_err("arbitrary domainname must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("managed by --hostname"));
+    }
+
+    #[test]
+    fn create_sandbox_rejects_arbitrary_docker_hostname() {
+        let driver_config = openshell_core::proto_struct::json_object_to_struct(
+            serde_json::json!({
+                "docker": {
+                    "hostname": "config.example.com"
+                }
+            })
+            .as_object()
+            .expect("driver config object")
+            .clone(),
+        )
+        .expect("driver config");
+        let request = CreateSandboxRequest {
+            name: "arbitrary-hostname".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    driver_config: Some(driver_config),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_create_sandbox_request_pre_io(&request, "")
+            .expect_err("arbitrary hostname must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("managed by --hostname"));
+    }
+
+    #[test]
+    fn create_sandbox_rejects_username_for_unsupported_driver() {
+        let request = CreateSandboxRequest {
+            use_authenticated_username: true,
+            ..Default::default()
+        };
+
+        let err = validate_driver_sandbox_options("kubernetes", &request)
+            .expect_err("Kubernetes username mapping must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Docker, Podman, or VM"));
+    }
+
     #[tokio::test]
     async fn create_sandbox_ignores_caller_provider_attachment_epoch() {
         let state = test_server_state().await;
@@ -7851,8 +8248,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_requires_docker_for_parent_hostname() {
+        let state = test_server_state_with_driver("podman").await;
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "parent-hostname".to_string(),
+                spec: Some(SandboxSpec::default()),
+                use_parent_hostname: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("parent hostname must require Docker");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Docker"));
+    }
+
+    #[test]
+    fn create_sandbox_template_rejects_arbitrary_docker_hostname() {
+        let driver_config = openshell_core::proto_struct::json_object_to_struct(
+            serde_json::json!({
+                "docker": {
+                    "hostname": "config.example.com"
+                }
+            })
+            .as_object()
+            .expect("driver config object")
+            .clone(),
+        )
+        .expect("driver config");
+        let mut template = test_workload_template("arbitrary-hostname");
+        template.metadata.as_mut().expect("template metadata").id = "template-id".to_string();
+        template.spec.as_mut().expect("template spec").driver_config = Some(driver_config);
+
+        let err = validate_sandbox_workload_template(&template)
+            .expect_err("arbitrary hostname must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("managed by --hostname"), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn create_sandbox_from_workload_template_resolves_workload_and_preserves_governance() {
-        let state = test_server_state().await;
+        let state = test_server_state_with_driver("docker").await;
+        let workload_template = test_workload_template("gpu-kata");
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -7862,7 +8303,7 @@ mod tests {
             &state,
             authed_request(CreateSandboxTemplateRequest {
                 request_id: String::new(),
-                template: Some(test_workload_template("gpu-kata")),
+                template: Some(workload_template),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -7903,6 +8344,9 @@ mod tests {
                 workload_template: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_authenticated_username: false,
+                use_parent_hostname: true,
             }),
         )
         .await
@@ -7932,6 +8376,26 @@ mod tests {
 
         let template = spec.template.expect("resolved inline template");
         assert_eq!(template.image, "registry.example.com/agent:latest");
+        let docker = template
+            .driver_config
+            .as_ref()
+            .and_then(|config| config.fields.get("docker"))
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                Kind::StructValue(docker) => Some(&docker.fields),
+                _ => None,
+            })
+            .expect("Docker driver config");
+        let fqdn = parent_fqdn().unwrap();
+        let (hostname, domainname) = fqdn.split_once('.').unwrap_or((&fqdn, ""));
+        assert_eq!(
+            docker.get("domainname").and_then(proto_string_value),
+            (!domainname.is_empty()).then_some(domainname)
+        );
+        assert_eq!(
+            docker.get("hostname").and_then(proto_string_value),
+            Some(hostname)
+        );
         let limits = template
             .resources
             .as_ref()
@@ -7992,6 +8456,9 @@ mod tests {
                 workload_template: "default-image".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8046,6 +8513,9 @@ mod tests {
                 workload_template: "default-gpu".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8087,6 +8557,9 @@ mod tests {
                 workload_template: "corrupt-template".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8129,6 +8602,9 @@ mod tests {
                 workload_template: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8156,6 +8632,9 @@ mod tests {
                 workload_template: "Invalid_Template_Name".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8186,6 +8665,9 @@ mod tests {
                 workload_template: "missing-template".to_string(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await
@@ -8216,6 +8698,9 @@ mod tests {
                 workload_template: String::new(),
                 await_main_process_attachment: false,
                 service_exposures: Vec::new(),
+                docker_hostname: String::new(),
+                use_parent_hostname: false,
+                use_authenticated_username: false,
             }),
         )
         .await

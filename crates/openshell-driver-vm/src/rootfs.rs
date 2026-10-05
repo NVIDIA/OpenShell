@@ -1291,7 +1291,11 @@ mod tests {
             )
         );
         assert!(init_script.contains("OPENSHELL_VM_SANDBOX_BOOTSTRAP"));
-        assert!(init_script.contains("    reconcile_sandbox_account\n    setup_sandbox_workdir"));
+        assert!(init_script.contains(concat!(
+            "    reconcile_sandbox_account\n",
+            "    unset OPENSHELL_SANDBOX_USERNAME\n",
+            "    setup_sandbox_workdir",
+        )));
         assert!(
             init_script
                 .contains("chown \"${_sandbox_uid}:${_sandbox_gid}\" \"$_sandbox_state_dir\"")

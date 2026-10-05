@@ -392,6 +392,7 @@ setup_gpu() {
 }
 
 reconcile_sandbox_account() {
+    local account_name="${OPENSHELL_SANDBOX_USERNAME:-sandbox}"
     local sandbox_uid="${OPENSHELL_VM_SANDBOX_UID:-}"
     local sandbox_gid="${OPENSHELL_VM_SANDBOX_GID:-}"
     local etc
@@ -401,38 +402,62 @@ reconcile_sandbox_account() {
         ts "FATAL: invalid requested sandbox identity"
         exit 1
     }
+    [[ "$account_name" =~ ^[A-Za-z_][A-Za-z0-9_.\$-]*$ ]] &&
+        [ "$account_name" != "root" ] || {
+        ts "FATAL: invalid requested sandbox account name"
+        exit 1
+    }
     etc="$(root_path /etc)"
     mkdir -p "$etc"
     touch "$etc/passwd" "$etc/group" "$etc/shadow" "$etc/gshadow"
-    if grep -q '^sandbox:' "$etc/group"; then
-        if ! awk -F: -v OFS=: -v gid="$sandbox_gid" \
-            '$1 == "sandbox" { $3 = gid } { print }' \
-            "$etc/group" >"$etc/group.openshell"; then
-            rm -f "$etc/group.openshell"
-            ts "FATAL: failed to reconcile sandbox group"
-            exit 1
-        fi
-        mv "$etc/group.openshell" "$etc/group"
-    else
-        printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$etc/group"
+    if ! awk -F: -v OFS=: -v gid="$sandbox_gid" -v name="$account_name" '
+        BEGIN { found = 0 }
+        $1 == name {
+            if (!found) { $3 = gid; print; found = 1 }
+            next
+        }
+        $1 == "sandbox" || $3 == gid {
+            if (!found) { print name, "x", gid, ""; found = 1 }
+            next
+        }
+        { print }
+        END { if (!found) print name, "x", gid, "" }
+    ' "$etc/group" >"$etc/group.openshell"; then
+        rm -f "$etc/group.openshell"
+        ts "FATAL: failed to reconcile sandbox group"
+        exit 1
     fi
-    if grep -q '^sandbox:' "$etc/passwd"; then
-        # Preserve image-owned account metadata (home, shell, and description)
-        # while restoring the UID/GID contract recorded for this overlay.
-        if ! awk -F: -v OFS=: -v uid="$sandbox_uid" -v gid="$sandbox_gid" \
-            '$1 == "sandbox" { $3 = uid; $4 = gid } { print }' \
-            "$etc/passwd" >"$etc/passwd.openshell"; then
-            rm -f "$etc/passwd.openshell"
-            ts "FATAL: failed to reconcile sandbox account"
-            exit 1
-        fi
-        mv "$etc/passwd.openshell" "$etc/passwd"
-    else
-        printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$etc/passwd"
+    mv "$etc/group.openshell" "$etc/group"
+    if ! awk -F: -v OFS=: -v gid="$sandbox_gid" -v name="$account_name" \
+        -v uid="$sandbox_uid" '
+        BEGIN { found = 0 }
+        $1 == name {
+            if (!found) { $3 = uid; $4 = gid; print; found = 1 }
+            next
+        }
+        $1 == "sandbox" || $3 == uid {
+            if (!found) {
+                print name, "x", uid, gid, "OpenShell Sandbox", "/sandbox", "/bin/sh"
+                found = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!found)
+                print name, "x", uid, gid, "OpenShell Sandbox", "/sandbox", "/bin/sh"
+        }
+    ' "$etc/passwd" >"$etc/passwd.openshell"; then
+        rm -f "$etc/passwd.openshell"
+        ts "FATAL: failed to reconcile sandbox account"
+        exit 1
     fi
-    grep -q '^sandbox:' "$etc/gshadow" || printf 'sandbox:!::\n' >> "$etc/gshadow"
-    grep -q '^sandbox:' "$etc/shadow" || printf 'sandbox:!:20123:0:99999:7:::\n' >> "$etc/shadow"
-    ts "reconciled sandbox account (${sandbox_uid}:${sandbox_gid})"
+    mv "$etc/passwd.openshell" "$etc/passwd"
+    grep -q "^${account_name}:" "$etc/gshadow" ||
+        printf '%s:!::\n' "$account_name" >> "$etc/gshadow"
+    grep -q "^${account_name}:" "$etc/shadow" ||
+        printf '%s:!:20123:0:99999:7:::\n' "$account_name" >> "$etc/shadow"
+    ts "reconciled sandbox account ${account_name} (${sandbox_uid}:${sandbox_gid})"
 }
 
 setup_sandbox_workdir() {
@@ -570,6 +595,7 @@ run_post_overlay_setup() {
     wait
 
     reconcile_sandbox_account
+    unset OPENSHELL_SANDBOX_USERNAME
     setup_sandbox_workdir
 
     configure_hostname

@@ -1452,6 +1452,9 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             await_main_process_attachment: false,
             workload_template: String::new(),
             service_exposures: Vec::new(),
+            docker_hostname: String::new(),
+            use_authenticated_username: false,
+            use_parent_hostname: false,
         };
 
         let sandbox_name =

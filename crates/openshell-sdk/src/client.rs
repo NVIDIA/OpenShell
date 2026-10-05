@@ -1319,6 +1319,8 @@ fn store_bearer(slot: &BearerSlot, token: &str) -> Result<()> {
 fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
     let SandboxSpec {
         name,
+        use_authenticated_username,
+        use_parent_hostname,
         image,
         labels,
         environment,
@@ -1364,6 +1366,9 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
                 ) as i32,
             })
             .collect(),
+        docker_hostname: String::new(),
+        use_authenticated_username,
+        use_parent_hostname,
     }
 }
 
@@ -1372,6 +1377,8 @@ fn create_sandbox_from_template_request(
 ) -> proto::CreateSandboxRequest {
     let SandboxTemplateCreateSpec {
         name,
+        use_authenticated_username,
+        use_parent_hostname,
         template_name,
         labels,
         providers,
@@ -1405,6 +1412,9 @@ fn create_sandbox_from_template_request(
                 ) as i32,
             })
             .collect(),
+        docker_hostname: String::new(),
+        use_authenticated_username,
+        use_parent_hostname,
     }
 }
 
@@ -1638,11 +1648,13 @@ mod tests {
     }
 
     #[test]
-    fn create_request_preserves_canonical_main_process() {
+    fn create_request_preserves_sandbox_options() {
         let request = create_sandbox_request(SandboxSpec {
             command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
             tty: false,
             restart_policy: crate::types::SandboxRestartPolicy::OnFailure,
+            use_authenticated_username: true,
+            use_parent_hostname: true,
             ..SandboxSpec::default()
         });
 
@@ -1653,5 +1665,25 @@ mod tests {
             spec.restart_policy(),
             proto::SandboxRestartPolicy::OnFailure
         );
+        assert!(request.use_authenticated_username);
+        assert!(request.use_parent_hostname);
+    }
+
+    #[test]
+    fn create_template_request_preserves_sandbox_options() {
+        let request = create_sandbox_from_template_request(SandboxTemplateCreateSpec {
+            command: vec!["/opt/agent".into()],
+            template_name: "agent-template".into(),
+            tty: true,
+            use_authenticated_username: true,
+            use_parent_hostname: true,
+            ..SandboxTemplateCreateSpec::default()
+        });
+
+        let spec = request.spec.expect("sandbox spec should be present");
+        assert_eq!(spec.command, ["/opt/agent"]);
+        assert!(spec.tty);
+        assert!(request.use_authenticated_username);
+        assert!(request.use_parent_hostname);
     }
 }

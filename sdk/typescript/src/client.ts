@@ -148,6 +148,10 @@ export interface SandboxSpec {
   serviceExposures?: ServiceExposure[];
   /** Restart behavior after the canonical main process exits. */
   restartPolicy?: SandboxRestartPolicyName;
+  /** Use the authenticated user's name for the sandbox account. */
+  useAuthenticatedUsername?: boolean;
+  /** Use the gateway host's FQDN as the Docker container hostname. */
+  useParentHostname?: boolean;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -201,6 +205,10 @@ export interface SandboxFromTemplateSpec {
   tty?: boolean;
   /** Loopback HTTP services to expose when the sandbox is created. */
   serviceExposures?: ServiceExposure[];
+  /** Use the authenticated user's name for the sandbox account. */
+  useAuthenticatedUsername?: boolean;
+  /** Use the gateway host's FQDN as the Docker container hostname. */
+  useParentHostname?: boolean;
   /**
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
@@ -1043,6 +1051,8 @@ export class SandboxClient {
             targetPort: exposure.targetPort,
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
+        useAuthenticatedUsername: spec.useAuthenticatedUsername ?? false,
+        useParentHostname: spec.useParentHostname ?? false,
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
     } catch (e) {
@@ -1070,6 +1080,8 @@ export class SandboxClient {
             targetPort: exposure.targetPort,
             authorizationMode: serviceAuthorizationModeToProto(exposure.authorizationMode),
           })) ?? [],
+        useAuthenticatedUsername: spec.useAuthenticatedUsername ?? false,
+        useParentHostname: spec.useParentHostname ?? false,
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
     } catch (e) {

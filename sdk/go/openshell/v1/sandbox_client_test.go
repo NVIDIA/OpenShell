@@ -316,14 +316,18 @@ func TestSandboxCreate(t *testing.T) {
 		"my-sandbox",
 		spec,
 		labels,
-		CreateOptions{ServiceExposures: []ServiceExposure{
-			{TargetPort: 4500},
-			{
-				Service:           "metrics",
-				TargetPort:        9090,
-				AuthorizationMode: ServiceAuthorizationModeBearerPassthrough,
+		CreateOptions{
+			ServiceExposures: []ServiceExposure{
+				{TargetPort: 4500},
+				{
+					Service:           "metrics",
+					TargetPort:        9090,
+					AuthorizationMode: ServiceAuthorizationModeBearerPassthrough,
+				},
 			},
-		}},
+			UseAuthenticatedUsername: true,
+			UseParentHostname:        true,
+		},
 	)
 
 	require.NoError(t, err)
@@ -341,6 +345,12 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_STRIP, mock.createRequest.GetServiceExposures()[0].GetAuthorizationMode())
 	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.True(t, mock.createRequest.GetUseAuthenticatedUsername())
+	assert.True(t, mock.createRequest.GetUseParentHostname())
 }
 
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
@@ -406,7 +416,10 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 		Providers: []string{"github"},
 		Command:   []string{"/opt/worker", "--serve"},
 		TTY:       true,
-	}, map[string]string{"team": "runtime"})
+	}, map[string]string{"team": "runtime"}, CreateOptions{
+		UseAuthenticatedUsername: true,
+		UseParentHostname:        true,
+	})
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -420,6 +433,8 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 	require.NotNil(t, mock.createRequest.GetSpec())
 	assert.Equal(t, []string{"/opt/worker", "--serve"}, mock.createRequest.GetSpec().GetCommand())
 	assert.True(t, mock.createRequest.GetSpec().GetTty())
+	assert.True(t, mock.createRequest.GetUseAuthenticatedUsername())
+	assert.True(t, mock.createRequest.GetUseParentHostname())
 }
 
 func TestSandboxCreate_AlreadyExists(t *testing.T) {

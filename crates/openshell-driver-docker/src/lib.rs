@@ -716,6 +716,8 @@ struct DockerSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     cdi_devices: Option<Vec<String>>,
+    domainname: Option<String>,
+    hostname: Option<String>,
     mounts: Vec<DockerDriverMountConfig>,
 }
 
@@ -4368,6 +4370,31 @@ fn append_docker_archive_file(
         .map_err(|error| Status::internal(format!("build Docker sandbox archive: {error}")))
 }
 
+fn docker_account_files_archive(
+    files: &openshell_core::account_files::AccountFiles,
+) -> Result<Vec<u8>, Status> {
+    let mut archive = tar::Builder::new(Vec::new());
+    append_docker_archive_file(
+        &mut archive,
+        "etc/group",
+        0o644,
+        0,
+        0,
+        files.group.as_bytes(),
+    )?;
+    append_docker_archive_file(
+        &mut archive,
+        "etc/passwd",
+        0o644,
+        0,
+        0,
+        files.passwd.as_bytes(),
+    )?;
+    archive
+        .into_inner()
+        .map_err(|error| Status::internal(format!("finish Docker account archive: {error}")))
+}
+
 #[derive(Clone, Copy)]
 struct DockerSandboxTls<'a> {
     certificate: &'a [u8],
@@ -4476,6 +4503,43 @@ async fn stage_docker_sandbox_bundle(
         )
         .await
         .map_err(|error| Status::internal(format!("stage Docker sandbox bundle: {error}")))
+}
+
+async fn stage_docker_sandbox_username(
+    docker: &Docker,
+    container_id: &str,
+    sandbox: &DriverSandbox,
+    identity: &ResolvedWorkloadIdentity,
+) -> Result<(), Status> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(());
+    };
+    let request = openshell_core::account_files::AccountReconciliation::from_driver_spec(
+        spec,
+        identity.uid,
+        identity.gid,
+    )
+    .map_err(Status::failed_precondition)?;
+    let passwd = download_path_from_container(docker, container_id, "/etc/passwd", true)
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let group = download_path_from_container(docker, container_id, "/etc/group", true)
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let files = openshell_core::account_files::AccountFiles::new(passwd, group)
+        .map_err(Status::failed_precondition)?
+        .reconcile(request);
+    let archive = docker_account_files_archive(&files)?;
+    let options = UploadToContainerOptionsBuilder::default().path("/").build();
+
+    docker
+        .upload_to_container(
+            container_id,
+            Some(options),
+            bollard::body_full(Bytes::from(archive)),
+        )
+        .await
+        .map_err(|error| Status::internal(format!("stage Docker account files: {error}")))
 }
 
 fn decode_docker_launch_authentication(
@@ -4588,6 +4652,7 @@ async fn prepare_docker_boundary_files(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
+    stage_docker_sandbox_username(docker, container_id, sandbox, workload_identity).await?;
     stage_docker_sandbox_bundle(
         docker,
         container_id,
@@ -5030,28 +5095,11 @@ fn docker_supervisor_host_address(grpc_endpoint: &str) -> Option<IpAddr> {
     }
 }
 
-async fn spawn_docker_control_process(
-    docker: &Docker,
+fn docker_supervisor_environment(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
-    failure_context: DockerRuntimeFailureContext,
-) -> Result<DockerControlProcess, Status> {
-    let directory = docker_boundary_state_dir(sandbox, config)?;
-    let main_process_spec = tokio::fs::read_to_string(directory.join(MAIN_PROCESS_SPEC_FILE))
-        .await
-        .map_err(|error| Status::internal(format!("read Docker main process spec: {error}")))?;
-    let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
-        .await
-        .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
-    let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
-    let _ = docker
-        .remove_container(
-            &supervisor_name,
-            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-        )
-        .await;
-    let runtime_descriptor_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/runtime-descriptor.json");
-    let auth_bundle_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/auth.json");
+    main_process_spec: &str,
+) -> Result<Vec<String>, Status> {
     let mut environment = vec![
         format!(
             "{}={DRIVER_ADMITTED_BACKEND}",
@@ -5099,6 +5147,7 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::TLS_CA
         ));
     }
+
     if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
         let projected = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
             .map_err(Status::failed_precondition)?;
@@ -5107,6 +5156,33 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
         ));
     }
+
+    Ok(environment)
+}
+
+async fn spawn_docker_control_process(
+    docker: &Docker,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    failure_context: DockerRuntimeFailureContext,
+) -> Result<DockerControlProcess, Status> {
+    let directory = docker_boundary_state_dir(sandbox, config)?;
+    let main_process_spec = tokio::fs::read_to_string(directory.join(MAIN_PROCESS_SPEC_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker main process spec: {error}")))?;
+    let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
+    let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
+    let _ = docker
+        .remove_container(
+            &supervisor_name,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await;
+    let runtime_descriptor_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/runtime-descriptor.json");
+    let auth_bundle_path = format!("{SUPERVISOR_STATE_MOUNT_PATH}/auth.json");
+    let environment = docker_supervisor_environment(sandbox, config, &main_process_spec)?;
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
     stage_docker_supervisor_bundle(docker, sandbox, config, supervisor_archive).await?;
     let labels = HashMap::from([
@@ -5523,6 +5599,7 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
         openshell_core::sandbox_env::SANDBOX_TOKEN,
         openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
         openshell_core::sandbox_env::SANDBOX_UID,
+        openshell_core::sandbox_env::SANDBOX_USERNAME,
         openshell_core::sandbox_env::SSH_SOCKET_PATH,
         openshell_core::sandbox_env::TLS_CA,
         openshell_core::sandbox_env::TLS_CERT,
@@ -5755,6 +5832,8 @@ fn build_container_create_body_for_image(
     );
 
     Ok(ContainerCreateBody {
+        domainname: driver_config.domainname.clone(),
+        hostname: driver_config.hostname.clone(),
         image: Some(image.id.clone()),
         user: Some(format!(
             "{}:{}",
@@ -5822,12 +5901,30 @@ fn build_container_create_body_for_image(
                 "net.ipv4.ip_unprivileged_port_start".to_string(),
                 "0".to_string(),
             )])),
-            extra_hosts: None,
+            extra_hosts: docker_hostname_extra_hosts(driver_config),
             ..Default::default()
         }),
         networking_config: None,
         ..Default::default()
     })
+}
+
+fn docker_hostname_extra_hosts(driver_config: &DockerSandboxDriverConfig) -> Option<Vec<String>> {
+    let hostname = driver_config
+        .hostname
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let hostnames = driver_config
+        .domainname
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || hostname.to_string(),
+            |domainname| format!("{hostname}.{domainname} {hostname}"),
+        );
+
+    // Docker preserves the canonical name and alias order in this host field.
+    Some(vec![format!("{hostnames}:127.0.1.1")])
 }
 
 /// Reject driver requests that arrive with neither a sandbox id nor a

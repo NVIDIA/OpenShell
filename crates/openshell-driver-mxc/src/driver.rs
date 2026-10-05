@@ -275,6 +275,8 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
         }
         environment.extend(spec.environment.clone());
     }
+    environment.remove(openshell_core::sandbox_env::SANDBOX_USERNAME);
+
     let mut environment = environment
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))

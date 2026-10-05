@@ -1503,6 +1503,14 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
+        /// Use the parent host's FQDN as the Docker container hostname.
+        #[arg(long)]
+        hostname: bool,
+
+        /// Use the authenticated user's name for the sandbox account.
+        #[arg(long)]
+        username: bool,
+
         /// Driver-keyed JSON object for driver-specific sandbox settings.
         /// Disabled unless the gateway administrator enables `allow_driver_config`.
         /// External resource attachments still require approval labels.
@@ -3352,6 +3360,8 @@ async fn run_async() -> Result<()> {
                     gpu,
                     cpu,
                     memory,
+                    hostname,
+                    username,
                     driver_config_json,
                     providers,
                     policy,
@@ -3449,6 +3459,8 @@ async fn run_async() -> Result<()> {
                             gpu_requirements,
                             cpu: cpu.as_deref(),
                             memory: memory.as_deref(),
+                            use_authenticated_username: username,
+                            use_parent_hostname: hostname,
                             driver_config_json: driver_config_json.as_deref(),
                             editor,
                             providers: &providers,
@@ -6411,6 +6423,33 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_hostname_flag_parses_with_template() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--hostname",
+            "--template",
+            "gpu-kata",
+        ])
+        .expect("sandbox create hostname flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        hostname, template, ..
+                    }),
+                ..
+            }) => {
+                assert!(hostname);
+                assert_eq!(template.as_deref(), Some("gpu-kata"));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_create_template_flag_parses() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -6435,6 +6474,33 @@ mod tests {
             }) => {
                 assert_eq!(template.as_deref(), Some("gpu-kata"));
                 assert_eq!(providers, vec!["github".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_username_flag_parses_with_template() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--template",
+            "gpu-kata",
+            "--username",
+        ])
+        .expect("sandbox create username flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        template, username, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert!(username);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }

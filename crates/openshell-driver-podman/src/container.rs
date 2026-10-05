@@ -537,6 +537,8 @@ fn build_env(
             user_env.insert(k.clone(), v.clone());
         }
     }
+    user_env.remove(openshell_core::sandbox_env::SANDBOX_USERNAME);
+
     // User environment belongs exclusively to mediated workload children. In
     // particular, never activate loader or policy overrides in the supervisor.
     if !user_env.is_empty() {
@@ -1728,11 +1730,13 @@ mod tests {
 
     #[test]
     fn isolated_pair_keeps_privileges_network_and_secrets_out_of_workload() {
-        let sandbox = DriverSandbox {
+        let mut sandbox = DriverSandbox {
             id: "pair".into(),
             name: "agent".into(),
             ..Default::default()
         };
+        let spec = sandbox.spec.get_or_insert_default();
+        spec.sandbox_username = "ebusto".to_string();
         let mut config = PodmanComputeConfig::default();
         config.app_armor_profile = Some(openshell_core::config::AppArmorProfile::Localhost(
             "openshell-sandbox".into(),
@@ -1845,6 +1849,12 @@ mod tests {
         assert!(specs.supervisor.networks.is_empty());
         assert!(specs.supervisor.portmappings.is_empty());
         assert!(specs.workload.env.is_empty());
+        assert!(
+            !specs
+                .supervisor
+                .env
+                .contains_key(openshell_core::sandbox_env::SANDBOX_USERNAME)
+        );
         assert_eq!(specs.workload.unsetenv, vec!["LD_PRELOAD", "HTTP_PROXY"]);
         assert_eq!(specs.workload.secrets.len(), 1);
         assert_eq!(specs.workload.secrets[0].source, "resolver");

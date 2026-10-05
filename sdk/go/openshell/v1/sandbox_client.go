@@ -42,6 +42,8 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		req.UseAuthenticatedUsername = opts[0].UseAuthenticatedUsername
+		req.UseParentHostname = opts[0].UseParentHostname
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
@@ -75,6 +77,8 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		req.UseAuthenticatedUsername = opts[0].UseAuthenticatedUsername
+		req.UseParentHostname = opts[0].UseParentHostname
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {

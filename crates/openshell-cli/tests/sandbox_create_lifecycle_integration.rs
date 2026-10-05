@@ -2009,6 +2009,68 @@ async fn sandbox_create_sends_driver_config_json() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_hostname_with_template() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            command: &["echo".into(), "OK".into()],
+            name: Some("hostname-template"),
+            template: Some("gpu-kata"),
+            use_parent_hostname: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let request = requests.first().expect("create request should be recorded");
+    assert!(request.use_parent_hostname);
+    assert_eq!(request.workload_template, "gpu-kata");
+}
+
+#[tokio::test]
+async fn sandbox_create_sends_username_with_template() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            command: &["echo".into(), "OK".into()],
+            name: Some("username-template"),
+            template: Some("gpu-kata"),
+            use_authenticated_username: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let request = requests.first().expect("create request should be recorded");
+    assert!(request.use_authenticated_username);
+    assert_eq!(request.workload_template, "gpu-kata");
+}
+
+#[tokio::test]
 async fn sandbox_create_with_template_sends_workload_template_name() {
     let server = run_server().await;
     add_provider(&server, "github", "github").await;

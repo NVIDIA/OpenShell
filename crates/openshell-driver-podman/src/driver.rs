@@ -1195,6 +1195,38 @@ impl PodmanComputeDriver {
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
+                    let spec = sandbox.spec.as_ref().ok_or_else(|| {
+                        ComputeDriverError::Precondition(
+                            "Podman sandbox spec is required".to_string(),
+                        )
+                    })?;
+                    let request =
+                        openshell_core::account_files::AccountReconciliation::from_driver_spec(
+                            spec,
+                            identity.uid,
+                            identity.gid,
+                        )
+                        .map_err(ComputeDriverError::Precondition)?;
+                    let passwd_archive = self
+                        .client
+                        .copy_from_container(&workload_id, "/etc/passwd")
+                        .await?;
+                    let passwd = extract_first_tar_entry(&passwd_archive)
+                        .map_err(ComputeDriverError::Precondition)?;
+                    let group_archive = self
+                        .client
+                        .copy_from_container(&workload_id, "/etc/group")
+                        .await?;
+                    let group = extract_first_tar_entry(&group_archive)
+                        .map_err(ComputeDriverError::Precondition)?;
+                    let files = openshell_core::account_files::AccountFiles::new(passwd, group)
+                        .map_err(ComputeDriverError::Precondition)?
+                        .reconcile(request);
+                    let archive = crate::isolation::account_files_archive(&files, &identity)?;
+
+                    self.client
+                        .copy_to_container(&workload_id, "/", archive)
+                        .await?;
                     let child_env = podman_child_environment(sandbox, &image_env);
                     let launch_authentication = sandbox
                         .spec
@@ -2473,6 +2505,7 @@ mod tests {
         assert_eq!(
             uploads,
             [
+                "/libpod/containers/workload/archive?path=%2F",
                 "/libpod/containers/workload/archive?path=%2F.openshell%2Fchannel",
                 "/libpod/containers/workload/archive?path=%2Fsandbox",
                 "/libpod/containers/supervisor/archive?path=%2F",
@@ -3559,6 +3592,21 @@ mod tests {
         )
     }
 
+    fn account_file_archive_response(path: &str, content: &[u8]) -> StubResponse {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, content).unwrap();
+            builder.finish().unwrap();
+        }
+        StubResponse::new(StatusCode::OK, archive)
+    }
+
     fn created_response(id: &'static str) -> StubResponse {
         #[derive(serde::Serialize)]
         struct Created {
@@ -3679,6 +3727,10 @@ mod tests {
         vec![
             created_response("workload"),
             fence_response(),
+            account_file_archive_response("passwd", b"root:x:0:0::/root:/bin/sh\n"),
+            account_file_archive_response("group", b"root:x:0:\n"),
+            StubResponse::new(StatusCode::OK, "")
+                .with_archive_members(&["etc/group", "etc/passwd"]),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
             StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
             created_response("supervisor"),
@@ -3787,7 +3839,7 @@ mod tests {
             "create-start-fail",
             create_setup_responses(true, sandbox_id)
                 .into_iter()
-                .chain(create_launch_responses().into_iter().take(7))
+                .chain(create_launch_responses().into_iter().take(10))
                 .chain([
                     StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "supervisor start failed"),
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor
