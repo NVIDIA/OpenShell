@@ -367,6 +367,8 @@ struct ConnectCancellation {
 }
 
 impl ConnectCancellation {
+    // Signal registration is fallible only on Unix; keep one API for callers.
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
     fn new() -> Result<Self> {
         Ok(Self {
             #[cfg(unix)]
@@ -374,6 +376,8 @@ impl ConnectCancellation {
         })
     }
 
+    // Unix signal receivers require mutable access; other targets only await the future.
+    #[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
     async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
     where
         F: Future<Output = T>,
@@ -419,6 +423,8 @@ async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i
     Ok(128 + signal as i32)
 }
 
+// Unix signal handling mutates cancellation while waiting for the SSH child.
+#[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
 async fn run_main_attach_supervised(
     session: &SshSessionConfig,
     cancellation: &mut ConnectCancellation,
