@@ -82,6 +82,28 @@ USEFUL OPTIONS
   -ShareOut <path>    Copy the results bundle to a shared location
                       (e.g. \\server\share). Off by default (results stay local).
   -KeepRunning        Leave the gateway running afterward for inspection.
+  -SandboxingProviderGuid <guid>
+                      Override the OS ETW provider GUID the consumer listens
+                      on. Use this if a run reports "event coverage: 0 of 8"
+                      with "sandbox_ids distinct in log: 0" despite the
+                      sandboxes completing successfully -- the gateway log
+                      line "MXC ETW->OCSF consumer has received zero events
+                      from the Sandboxing provider despite sandbox activity"
+                      confirms this. The built-in default
+                      (f6ec123e-314e-400b-9e0a-151365e23083) is this
+                      consumer's best-known identity for the OS "Sandboxing"
+                      TraceLogging provider, but that provider is not
+                      manifest-registered, so its GUID is not independently
+                      verifiable, and it has been observed entirely absent
+                      from `logman query providers` / `Get-WinEvent
+                      -ListProvider` enumeration on at least one Windows
+                      Insider/ARM64 build (see nvbugs 6782870). This option
+                      does not discover the correct GUID for you -- it is an
+                      escape hatch for an operator who has independently
+                      confirmed it, e.g. from a known-good MXC/wxc-exec
+                      build's own ETW manifest. Accepts a bare
+                      (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) or braced
+                      ({...}) GUID. Leave unset to keep the built-in default.
 
 NOTES
   - The control plane between CLI and gateway runs with --disable-tls on loopback;

@@ -256,6 +256,22 @@ pub struct MxcComputeConfig {
     /// Sandboxing provider MXC drives and emits OCSF into the gateway trail.
     /// Requires the gateway account to be in "Performance Log Users" (or admin).
     pub etw_audit: bool,
+    /// Override the OS ETW provider GUID the Plane-A consumer listens on, in
+    /// place of the built-in default (`etw_consumer::SANDBOXING_PROVIDER_GUID`,
+    /// `f6ec123e-314e-400b-9e0a-151365e23083`). Accepts a bare
+    /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or braced (`{...}`) GUID.
+    /// Empty string (default) uses the built-in GUID.
+    ///
+    /// The default is this driver's best-known identity for the OS
+    /// "Sandboxing" TraceLogging provider, but that provider is not
+    /// manifest-registered, so its GUID can't be independently verified the
+    /// way a normal ETW provider's can, and it is not guaranteed stable
+    /// across Windows builds/channels. Set this when `etw_audit = true`
+    /// consistently produces zero events despite real sandbox activity (the
+    /// zero-events watchdog's warning in the gateway log) and you have
+    /// independently confirmed the correct GUID for this host/build. See
+    /// nvbugs 6782870.
+    pub etw_sandboxing_provider_guid: String,
 }
 
 impl Default for MxcComputeConfig {
@@ -281,6 +297,7 @@ impl Default for MxcComputeConfig {
 
             debug: false,
             etw_audit: false,
+            etw_sandboxing_provider_guid: String::new(),
         }
     }
 }
@@ -505,6 +522,27 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
         ));
     }
     Ok(config)
+}
+
+/// Resolve the effective ETW provider GUID for the Plane-A consumer:
+/// `configured` (trimmed, optional surrounding `{}` stripped) when non-empty,
+/// otherwise [`crate::etw_consumer::SANDBOXING_PROVIDER_GUID`]. A non-empty
+/// value that isn't a well-formed GUID is an error rather than a silent
+/// fallback -- a typo'd override must not silently downgrade to "the default
+/// that's already known not to work on this host," which is exactly the
+/// scenario `etw_sandboxing_provider_guid` exists to let an operator escape.
+/// See nvbugs 6782870.
+fn resolve_etw_provider_guid(configured: &str) -> Result<windows::core::GUID, String> {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return Ok(crate::etw_consumer::SANDBOXING_PROVIDER_GUID);
+    }
+    let bare = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    windows::core::GUID::try_from(bare)
+        .map_err(|_| format!("etw_sandboxing_provider_guid is not a valid GUID: {configured:?}"))
 }
 
 fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
@@ -1014,10 +1052,24 @@ impl MxcComputeBackend {
             crate::etw_consumer::AttributionIndex::new(),
         ));
         let etw_session = if config.etw_audit {
-            match crate::etw_consumer::start_session(attribution.clone()) {
-                Ok(session) => Some(session),
+            match resolve_etw_provider_guid(&config.etw_sandboxing_provider_guid) {
+                Ok(provider_guid) => {
+                    match crate::etw_consumer::start_session(attribution.clone(), provider_guid) {
+                        Ok(session) => Some(session),
+                        Err(e) => {
+                            warn!(error = %e, "MXC ETW audit consumer failed to start; continuing without it");
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
-                    warn!(error = %e, "MXC ETW audit consumer failed to start; continuing without it");
+                    // A misconfigured override is a config mistake, not a transient
+                    // runtime failure -- warn loudly rather than silently falling
+                    // back to a default GUID already known not to work on this host.
+                    warn!(
+                        error = %e,
+                        "MXC ETW audit consumer not started: invalid etw_sandboxing_provider_guid"
+                    );
                     None
                 }
             }
@@ -3532,6 +3584,44 @@ mod lifecycle_tests {
             let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
             key == "SHARED" || key == "TOKEN"
         }));
+    }
+
+    #[test]
+    fn resolve_etw_provider_guid_defaults_to_the_sandboxing_provider_when_empty() {
+        assert_eq!(
+            resolve_etw_provider_guid("").unwrap(),
+            crate::etw_consumer::SANDBOXING_PROVIDER_GUID
+        );
+        // Whitespace-only is also "unset".
+        assert_eq!(
+            resolve_etw_provider_guid("   ").unwrap(),
+            crate::etw_consumer::SANDBOXING_PROVIDER_GUID
+        );
+    }
+
+    #[test]
+    fn resolve_etw_provider_guid_accepts_bare_and_braced_forms() {
+        let bare = "73a33ab2-1966-4999-8add-868c41415269";
+        let braced = "{73a33ab2-1966-4999-8add-868c41415269}";
+        let expected = windows::core::GUID::try_from(bare).unwrap();
+
+        assert_eq!(resolve_etw_provider_guid(bare).unwrap(), expected);
+        assert_eq!(resolve_etw_provider_guid(braced).unwrap(), expected);
+        // Surrounding whitespace around either form is tolerated.
+        assert_eq!(
+            resolve_etw_provider_guid(&format!("  {braced}  ")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolve_etw_provider_guid_rejects_malformed_input_instead_of_falling_back() {
+        // A typo'd override must surface as an error, not silently resolve to
+        // the default GUID that nvbugs 6782870 already found doesn't work on
+        // at least one host/build -- a silent fallback here would make a
+        // config mistake indistinguishable from "the override is working".
+        let err = resolve_etw_provider_guid("not-a-guid").unwrap_err();
+        assert!(err.contains("not a valid GUID"), "error was: {err}");
     }
 
     #[test]

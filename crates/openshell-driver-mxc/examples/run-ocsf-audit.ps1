@@ -47,6 +47,13 @@ param(
   [int]    $SandboxCount = 2,
   # Disable the per-sandbox egress proxy (omits the SandboxProxyConfigured event).
   [switch] $NoProxy,
+  # Override the OS ETW provider GUID the consumer listens on, in place of
+  # the built-in Sandboxing-provider default. Use when a run reports "0 of 8
+  # event types fired" / the zero-events watchdog warning despite real
+  # sandbox activity -- confirm the correct GUID for this host/build first
+  # (see README-ocsf-audit.txt), then pass it here. Empty (default) leaves
+  # the built-in default in place. See nvbugs 6782870.
+  [string] $SandboxingProviderGuid = "",
   # Gateway bind port (matches the gateway default) + CLI registration name.
   [int]    $Port         = 17670,
   [string] $GatewayName  = "openshell-mxc-ocsf",
@@ -210,6 +217,19 @@ try {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\s*#?\s*egress_proxy\s*=.*$', "egress_proxy = $proxyVal")
   } else {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`negress_proxy = $proxyVal")
+  }
+  if (-not [string]::IsNullOrWhiteSpace($SandboxingProviderGuid)) {
+    $guidToml = $SandboxingProviderGuid.Replace('"', '')
+    if ($tomlText -match '(?m)^\s*#?\s*etw_sandboxing_provider_guid\s*=') {
+      $tomlText = [regex]::Replace(
+        $tomlText, '(?m)^\s*#?\s*etw_sandboxing_provider_guid\s*=.*$',
+        "etw_sandboxing_provider_guid = `"$guidToml`"")
+    } else {
+      $tomlText = [regex]::Replace(
+        $tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$',
+        "[openshell.drivers.mxc]`r`netw_sandboxing_provider_guid = `"$guidToml`"")
+    }
+    Info "overriding ETW provider GUID: $guidToml"
   }
   Set-Content $toml -Value $tomlText -Encoding UTF8
 

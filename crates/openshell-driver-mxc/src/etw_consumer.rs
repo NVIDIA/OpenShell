@@ -82,8 +82,19 @@ use openshell_ocsf::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// OS ProcessModel/Sandboxing TraceLogging provider — the Plane-A source.
-/// `{f6ec123e-314e-400b-9e0a-151365e23083}`.
+/// OS ProcessModel/Sandboxing TraceLogging provider — the Plane-A source, and
+/// the default used unless overridden by `MxcComputeConfig::
+/// etw_sandboxing_provider_guid`. `{f6ec123e-314e-400b-9e0a-151365e23083}`.
+///
+/// This provider is not manifest-registered (`logman query providers` /
+/// `Get-WinEvent -ListProvider` do not enumerate it), so its GUID is not
+/// independently verifiable the way a normal ETW provider's is, and is not
+/// guaranteed stable across Windows builds/channels. Confirmed entirely
+/// absent from both enumeration methods, and zero events ever matched this
+/// GUID across real sandbox activity, on at least one Windows Insider/ARM64
+/// build -- see nvbugs 6782870. The override exists for exactly that case:
+/// once the correct GUID for a given host/build is independently confirmed,
+/// an operator can configure it without waiting for a source change here.
 pub(crate) const SANDBOXING_PROVIDER_GUID: GUID =
     GUID::from_u128(0xf6ec123e_314e_400b_9e0a_151365e23083);
 
@@ -305,10 +316,11 @@ struct CaptureHealth {
     queued_bytes: AtomicUsize,
     /// Largest observed value of `queued_bytes`, retained for diagnostics.
     queue_high_water_bytes: AtomicUsize,
-    /// Count of raw events the callback matched to [`SANDBOXING_PROVIDER_GUID`]
-    /// and forwarded to the consumer thread, regardless of whether TDH decode
-    /// later succeeded. Zero here after real sandbox activity means the OS
-    /// session is not delivering *any* events under this GUID at all -- a
+    /// Count of raw events the callback matched to the session's configured
+    /// provider GUID (see [`CallbackContext::provider_guid`]) and forwarded
+    /// to the consumer thread, regardless of whether TDH decode later
+    /// succeeded. Zero here after real sandbox activity means the OS session
+    /// is not delivering *any* events under this GUID at all -- a
     /// provider-identity mismatch or a provider that isn't firing on this
     /// host/build, not a decode/attribution bug. See the zero-events watchdog
     /// in `start_session`'s consumer loop.
@@ -318,6 +330,11 @@ struct CaptureHealth {
 struct CallbackContext {
     tx: mpsc::SyncSender<RawEtwEvent>,
     health: Arc<CaptureHealth>,
+    /// The provider GUID this session enabled -- [`SANDBOXING_PROVIDER_GUID`]
+    /// by default, or `MxcComputeConfig::etw_sandboxing_provider_guid` when
+    /// set. The callback filters on this, not the constant directly, so an
+    /// override actually changes what gets captured.
+    provider_guid: GUID,
 }
 
 /// Rate-limits the dropped-unattributed warning the same way
@@ -482,16 +499,21 @@ unsafe impl Send for OpenedTrace {}
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Start the real-time ETW session on the Sandboxing provider. Every decoded
-/// event is attributed (via `index`) and mapped to OCSF on a dedicated consumer
+/// Start the real-time ETW session on `provider_guid` (normally
+/// [`SANDBOXING_PROVIDER_GUID`], or `MxcComputeConfig::
+/// etw_sandboxing_provider_guid`'s override when set). Every decoded event is
+/// attributed (via `index`) and mapped to OCSF on a dedicated consumer
 /// thread. The driver seeds `index` (pid → sandbox_id) as it launches sandboxes.
 ///
 /// Returns an [`EtwSession`] that must be kept alive; dropping it stops capture.
-pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSession, String> {
+pub(crate) fn start_session(
+    index: Arc<Mutex<AttributionIndex>>,
+    provider_guid: GUID,
+) -> Result<EtwSession, String> {
     let session_name = new_session_name();
 
     let handle = start_trace_session(&session_name)?;
-    enable_provider(handle, &session_name)?;
+    enable_provider(handle, &session_name, &provider_guid)?;
 
     // Created before the consumer thread spawns (unlike the pump thread's
     // `health` clone below) so the consumer loop can track received-event
@@ -560,7 +582,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                     )
                 {
                     warned_no_events = true;
-                    warn_zero_events_received();
+                    warn_zero_events_received(provider_guid);
                 }
             }
             // Final drain on shutdown so anything still resolvable is emitted.
@@ -581,6 +603,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     let callback_context = Box::into_raw(Box::new(CallbackContext {
         tx,
         health: health.clone(),
+        provider_guid,
     }));
     let opened = match open_trace(&session_name, callback_context) {
         Ok(o) => o,
@@ -611,6 +634,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
 
     tracing::info!(
         session = %session_name,
+        provider = ?provider_guid,
         "MXC ETW→OCSF consumer started (Sandboxing provider)"
     );
 
@@ -696,7 +720,11 @@ fn start_trace_session(session_name: &str) -> Result<u64, String> {
     Ok(handle.Value)
 }
 
-fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String> {
+fn enable_provider(
+    session_handle: u64,
+    session_name: &str,
+    provider_guid: &GUID,
+) -> Result<(), String> {
     let h = CONTROLTRACE_HANDLE {
         Value: session_handle,
     };
@@ -709,7 +737,7 @@ fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String
     let status = unsafe {
         EnableTraceEx2(
             h,
-            &SANDBOXING_PROVIDER_GUID,
+            provider_guid,
             EVENT_CONTROL_CODE_ENABLE_PROVIDER,
             TRACE_LEVEL_VERBOSE as u8,
             0xFFFF_FFFF_FFFF_FFFF, // all keywords
@@ -722,7 +750,7 @@ fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String
     if status != WIN32_ERROR(0) {
         stop_session(session_handle, session_name);
         return Err(format!(
-            "EnableTraceEx2 (Sandboxing provider) failed: error {}",
+            "EnableTraceEx2 (Sandboxing provider, {provider_guid:?}) failed: error {}",
             status.0
         ));
     }
@@ -849,16 +877,18 @@ fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
 
 unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
     let event = unsafe { &*event_record };
+    // `UserContext` is set before the session is enabled (see `open_trace`),
+    // so it's always valid once events start arriving.
+    let context = unsafe { &*(event.UserContext as *const CallbackContext) };
     // Hot path — keep it minimal (decode runs on the consumer thread). We only
-    // enabled the Sandboxing provider, but guard anyway.
-    if event.EventHeader.ProviderId != SANDBOXING_PROVIDER_GUID {
+    // enabled `context.provider_guid`, but guard anyway.
+    if event.EventHeader.ProviderId != context.provider_guid {
         return;
     }
     // Hot path: reserve bounded queue memory, copy raw bytes, then use a
     // non-blocking send. No TDH decode or logging runs here. Overload is counted
     // atomically and reported by the consumer thread so ETW's pump never waits
     // for decoding, disk, or tracing sinks.
-    let context = unsafe { &*(event.UserContext as *const CallbackContext) };
     let Some(queued_bytes) = (unsafe { raw_event_queued_bytes(event_record) }) else {
         record_queue_drop(&context.health);
         return;
@@ -1979,21 +2009,26 @@ fn should_warn_zero_events(
 
 /// Fired once per session by the zero-events watchdog when real sandbox
 /// activity has happened but the session has never matched a single event to
-/// [`SANDBOXING_PROVIDER_GUID`]. `EnableTraceEx2` success only proves the
-/// *request* to enable the provider succeeded, not that the provider exists
-/// on this host/build or will ever actually fire -- this is the detection gap
-/// that made a real-world provider-identity mismatch silently produce an
-/// empty OCSF audit trail with no diagnostic at all.
-fn warn_zero_events_received() {
+/// `provider_guid` -- the session's actual configured provider ([`SANDBOXING_PROVIDER_GUID`]
+/// by default, or `MxcComputeConfig::etw_sandboxing_provider_guid`'s override
+/// when set; always logged here rather than the constant, so the warning
+/// stays accurate under an override instead of pointing at the wrong GUID).
+/// `EnableTraceEx2` success only proves the *request* to enable the provider
+/// succeeded, not that the provider exists on this host/build or will ever
+/// actually fire -- this is the detection gap that made a real-world
+/// provider-identity mismatch silently produce an empty OCSF audit trail
+/// with no diagnostic at all.
+fn warn_zero_events_received(provider_guid: GUID) {
     tracing::warn!(
         target: "mxc_etw",
-        provider = ?SANDBOXING_PROVIDER_GUID,
+        provider = ?provider_guid,
         session = SESSION_NAME_PREFIX,
         "MXC ETW->OCSF consumer has received zero events from the Sandboxing \
          provider despite sandbox activity; the OS-sourced audit trail is \
          empty for this session. EnableTraceEx2 succeeding does not prove the \
          provider exists on this host/build or will ever fire -- verify with \
-         `logman query providers` and confirm wxc-exec targets this GUID."
+         `logman query providers`, and if this GUID is wrong for this host/build, \
+         override it via etw_sandboxing_provider_guid in the gateway config."
     );
     emit_ocsf(
         "",
@@ -2157,6 +2192,7 @@ mod tests {
         let context = CallbackContext {
             tx,
             health: health.clone(),
+            provider_guid: SANDBOXING_PROVIDER_GUID,
         };
         let event_bytes = size_of::<RawEtwEvent>();
 
