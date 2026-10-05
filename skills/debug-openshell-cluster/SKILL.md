@@ -101,8 +101,13 @@ sandbox applications and uses server TLS without requesting control-plane
 client certificates. Keep supervisor callback and peer endpoints on the primary
 port. In Helm, `service.ingressPort` exposes the dedicated listener separately
 from `service.port`. Verify application ingress targets that port and that it
-does not collide with primary, health, or metrics ports. Service URLs preserve
-the dedicated port, so a control-plane port-forward alone cannot reach them.
+does not collide with primary, health, or metrics ports.
+`service.ingressNodePort` fixes its NodePort and advertised URL port.
+For other external mappings, set `service.ingressPublicPort` (or
+`service_public_port` in gateway TOML) to the reachable port. An automatically
+allocated NodePort must be queried from the Service and configured explicitly.
+Service URLs preserve the advertised port, so a control-plane port-forward
+alone cannot reach them.
 
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`

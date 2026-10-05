@@ -282,11 +282,12 @@ impl MultiplexService {
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
 
-        // Add this outside typed dispatch so durable mutation replays also
-        // advertise the current listener configuration.
-        let service_port = self.state.config.service_bind_address.map(|address| {
-            HeaderValue::from_str(&address.port().to_string()).expect("port is a valid header")
-        });
+        // Advertise the reachable service port so clients do not replace it
+        // with an externally forwarded control-plane port.
+        let service_port =
+            self.state.config.advertised_service_port().map(|port| {
+                HeaderValue::from_str(&port.to_string()).expect("port is a valid header")
+            });
         let grpc_service = tower::ServiceBuilder::new()
             .map_response(move |mut response: Response<tonic::body::Body>| {
                 if let Some(port) = &service_port {

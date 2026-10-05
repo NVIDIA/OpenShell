@@ -24,6 +24,9 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'bind_address\s*=\s*"0.0.0.0:8080"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_public_port'
   - it: exposes the dedicated ingress service port separately
     template: templates/service.yaml
     set:
@@ -75,3 +78,85 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: service.ingressPort must be 0 or a port from 1 to 65535
+  - it: fixes the ingress NodePort independently of the control plane
+    template: templates/service.yaml
+    set:
+      service.type: NodePort
+      service.nodePort: 30080
+      service.ingressPort: 8082
+      service.ingressNodePort: 32082
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            port: 8082
+            targetPort: ingress
+            protocol: TCP
+            name: ingress
+            nodePort: 32082
+  - it: advertises the fixed ingress NodePort without changing the listener
+    template: templates/gateway-config.yaml
+    set:
+      service.type: NodePort
+      service.ingressPort: 8082
+      service.ingressNodePort: 32082
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_public_port\s*=\s*32082'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_bind_address\s*=\s*"0.0.0.0:8082"'
+  - it: allows a public port override above the NodePort
+    template: templates/gateway-config.yaml
+    set:
+      service.type: NodePort
+      service.ingressPort: 8082
+      service.ingressNodePort: 32082
+      service.ingressPublicPort: 443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_public_port\s*=\s*443'
+  - it: advertises a proxy port for ClusterIP ingress
+    template: templates/gateway-config.yaml
+    set:
+      service.ingressPort: 8082
+      service.ingressPublicPort: 443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_public_port\s*=\s*443'
+  - it: requires ingress when advertising an ingress port
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPublicPort: 443
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressNodePort and service.ingressPublicPort require service.ingressPort
+  - it: requires a NodePort service for an ingress NodePort
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 8082
+      service.ingressNodePort: 32082
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressNodePort requires service.type=NodePort
+  - it: rejects conflicting control plane and ingress NodePorts
+    template: templates/statefulset.yaml
+    set:
+      service.type: NodePort
+      service.nodePort: 32082
+      service.ingressPort: 8082
+      service.ingressNodePort: 32082
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressNodePort must differ from service.nodePort
+  - it: rejects out of range public ports
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 8082
+      service.ingressPublicPort: 65536
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressNodePort and service.ingressPublicPort must be 0 or a port from 1 to 65535

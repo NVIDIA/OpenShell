@@ -916,9 +916,14 @@ one non-empty Bearer credential and forwards that value unchanged. It rejects
 duplicate, malformed, or non-Bearer authorization before contacting the
 application. The application remains responsible for validating the token, and
 the raw token reaches the sandbox process, so never log it. Service routes
-bypass control-plane RPC authorization, but they still use the gateway's
-existing listener, domain routing, and TLS configuration, including any client
-certificate requirement. See the published
+bypass control-plane RPC authorization. Shared-port gateways retain the gateway's
+TLS client-certificate requirements. When dedicated service ingress is enabled,
+application HTTP and WebSockets use a separate port with the server certificates
+and domain routing, without requesting control-plane client certificates.
+Upgrade the CLI before enabling the split and make the advertised service port
+reachable independently of the control-plane port. See the published
+[gateway configuration documentation](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
+for listener and external port configuration, and the
 [sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for the complete security contract.
 

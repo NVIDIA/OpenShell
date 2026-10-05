@@ -491,6 +491,8 @@ fn prepare_server_config_with_drivers(
     );
 
     validate_listener_ports(bind, service_bind, health_bind, metrics_bind)?;
+    config.service_public_port = file_gateway.and_then(|g| g.service_public_port);
+    validate_service_public_port(config.service_public_port)?;
     if let Some(addr) = service_bind {
         config = config.with_service_bind_address(addr);
     }
@@ -1020,6 +1022,7 @@ fn validate_preflight_semantics(
         "service_port",
         || gateway.service_bind_address,
     );
+    validate_service_public_port(gateway.service_public_port)?;
     let health_bind = resolve_aux_listener(
         args.bind_address,
         args.health_port,
@@ -1061,6 +1064,15 @@ fn validate_listener_ports(
         if !ports.insert(address.port()) {
             return Err(miette::miette!("gateway listener ports must be distinct"));
         }
+    }
+    Ok(())
+}
+
+fn validate_service_public_port(port: Option<u16>) -> Result<()> {
+    if port == Some(0) {
+        return Err(miette::miette!(
+            "service_public_port requires a nonzero port"
+        ));
     }
     Ok(())
 }
@@ -2374,6 +2386,10 @@ mod tests {
                 "[openshell]\nversion = 2\n[openshell.gateway]\nservice_bind_address = '0.0.0.0:0'\ndisable_tls = true\n",
             ),
             (
+                "service-public-port-zero",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nservice_public_port = 0\ndisable_tls = true\n",
+            ),
+            (
                 "driver-selector",
                 "[openshell]\nversion = 2\n[openshell.gateway]\ncompute_driver = 'secret-driver-marker'\ndisable_tls = true\n",
             ),
@@ -3168,6 +3184,35 @@ service_bind_address = '0.0.0.0:8082'
             ),
             Some("127.0.0.1:8084".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn service_public_port_is_loaded_without_rebinding_the_listener() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            "[openshell]\nversion = 2\n[openshell.gateway]\nservice_bind_address = '0.0.0.0:8082'\nservice_public_port = 32082\ndisable_tls = true\n",
+        )
+        .unwrap();
+        let _config = EnvVarGuard::set("OPENSHELL_GATEWAY_CONFIG", path.to_str().unwrap());
+        let _service_port = EnvVarGuard::remove("OPENSHELL_SERVICE_PORT");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let registry = test_registry("shared", false);
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "shared",
+        ]);
+        let prepared =
+            super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+        assert_eq!(prepared.config.service_address().port(), 8082);
+        assert_eq!(prepared.config.advertised_service_port(), Some(32082));
     }
 
     #[test]

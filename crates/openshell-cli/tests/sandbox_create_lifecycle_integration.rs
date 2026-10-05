@@ -3501,30 +3501,32 @@ async fn sandbox_create_json_stdout_is_parseable() {
 
 #[tokio::test]
 async fn sandbox_create_json_uses_dedicated_ingress_port() {
-    let server = run_server().await;
-    server
-        .openshell
-        .state
-        .service_ingress_port
-        .store(8082, Ordering::SeqCst);
-    let result = run_cli_sandbox_create(
-        &server,
-        "dedicated-ingress",
-        &["--output=json", "--expose=4500", "--detach"],
-    )
-    .await;
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-    assert_eq!(
-        value["service_urls"],
-        serde_json::json!({
-            "": "https://default--sandbox.openshell.localhost:8082/"
-        })
-    );
+    for port in [8082, 32082] {
+        let server = run_server().await;
+        server
+            .openshell
+            .state
+            .service_ingress_port
+            .store(port, Ordering::SeqCst);
+        let result = run_cli_sandbox_create(
+            &server,
+            "dedicated-ingress",
+            &["--output=json", "--expose=4500", "--detach"],
+        )
+        .await;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(
+            value["service_urls"],
+            serde_json::json!({
+                "": format!("https://default--sandbox.openshell.localhost:{port}/")
+            })
+        );
+    }
 }
 
 #[tokio::test]

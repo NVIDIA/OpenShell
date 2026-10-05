@@ -163,7 +163,9 @@ pub fn endpoint_url(
 ) -> Option<String> {
     let host = endpoint_host(&config.service_routing, workspace, sandbox, service)?;
     let scheme = endpoint_scheme(config);
-    let port = config.service_address().port();
+    let port = config
+        .advertised_service_port()
+        .unwrap_or_else(|| config.service_address().port());
     let include_port = !matches!((scheme, port), ("https", 443) | ("http", 80));
     Some(if include_port {
         format!("{scheme}://{host}:{port}/")
@@ -1140,6 +1142,25 @@ mod tests {
         assert_eq!(
             endpoint_url(&cfg, "default", "app", "web").as_deref(),
             Some("https://default--app--web.dev.openshell.localhost:8082/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_uses_public_port_without_changing_the_listener() {
+        let mut config = openshell_core::Config::new(None)
+            .with_service_bind_address("0.0.0.0:8082".parse().unwrap())
+            .with_server_sans(["*.services.example.com"]);
+        config.service_public_port = Some(32082);
+        assert_eq!(
+            endpoint_url(&config, "default", "app", "web").unwrap(),
+            "http://default--app--web.services.example.com:32082/"
+        );
+        assert_eq!(config.service_address().port(), 8082);
+        assert_eq!(config.advertised_service_port(), Some(32082));
+        config.service_public_port = Some(80);
+        assert_eq!(
+            endpoint_url(&config, "default", "app", "web").unwrap(),
+            "http://default--app--web.services.example.com/"
         );
     }
 

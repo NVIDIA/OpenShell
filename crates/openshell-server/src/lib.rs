@@ -2268,6 +2268,7 @@ mod tests {
 
     async fn start_split_test_listeners(
         tls: bool,
+        public_port: Option<u16>,
     ) -> (
         SocketAddr,
         SocketAddr,
@@ -2287,6 +2288,7 @@ mod tests {
         let mut state = test_state(primary_addr, false).await;
         let config = &mut Arc::get_mut(&mut state).unwrap().config;
         config.service_bind_address = Some(ingress_addr);
+        config.service_public_port = public_port;
         config.auth.allow_unauthenticated_users = true;
         config.enable_websocket_tunnel = true;
         let tls_config = openshell_core::TlsConfig {
@@ -2341,7 +2343,8 @@ mod tests {
 
     #[tokio::test]
     async fn split_listeners_separate_gateway_rpc_and_service_routes() {
-        let (primary, ingress, shutdown, handles, _dir) = start_split_test_listeners(false).await;
+        let (primary, ingress, shutdown, handles, _dir) =
+            start_split_test_listeners(false, None).await;
         let mut client = OpenShellClient::connect(format!("http://{primary}"))
             .await
             .unwrap();
@@ -2381,8 +2384,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_listeners_advertise_public_ingress_port_in_rpc_metadata() {
+        let (primary, _ingress, shutdown, handles, _dir) =
+            start_split_test_listeners(false, Some(32082)).await;
+        let mut client = OpenShellClient::connect(format!("http://{primary}"))
+            .await
+            .unwrap();
+        let response = client.health(HealthRequest {}).await.unwrap();
+        assert_eq!(
+            response
+                .metadata()
+                .get(openshell_core::config::SERVICE_PORT_METADATA_KEY)
+                .unwrap(),
+            "32082"
+        );
+        shutdown.send(true).unwrap();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn split_service_tls_does_not_require_control_plane_client_certificate() {
-        let (primary, ingress, shutdown, handles, dir) = start_split_test_listeners(true).await;
+        let (primary, ingress, shutdown, handles, dir) =
+            start_split_test_listeners(true, None).await;
         let ca = reqwest::Certificate::from_pem(&std::fs::read(dir.path().join("ca.pem")).unwrap())
             .unwrap();
         let client = reqwest::Client::builder()

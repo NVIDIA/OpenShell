@@ -38,6 +38,9 @@ data:
     [openshell.gateway]
     name                  = {{ .Values.server.name | default (include "openshell.fullname" .) | quote }}
     bind_address          = "0.0.0.0:{{ .Values.service.port }}"
+    {{- if and (not .Values.service.ingressPort) (or .Values.service.ingressNodePort .Values.service.ingressPublicPort) }}
+    {{- fail "service.ingressNodePort and service.ingressPublicPort require service.ingressPort" }}
+    {{- end }}
     {{- if .Values.service.ingressPort }}
     {{- $ingressPort := int .Values.service.ingressPort }}
     {{- if or (lt $ingressPort 1) (gt $ingressPort 65535) }}
@@ -47,6 +50,25 @@ data:
     {{- fail "service.ingressPort must differ from service.port, service.healthPort, and service.metricsPort" }}
     {{- end }}
     service_bind_address  = "0.0.0.0:{{ .Values.service.ingressPort }}"
+    {{- $ingressNodePort := int (.Values.service.ingressNodePort | default 0) }}
+    {{- $publicPort := int (.Values.service.ingressPublicPort | default 0) }}
+    {{- if or (lt $ingressNodePort 0) (gt $ingressNodePort 65535) (lt $publicPort 0) (gt $publicPort 65535) }}
+    {{- fail "service.ingressNodePort and service.ingressPublicPort must be 0 or a port from 1 to 65535" }}
+    {{- end }}
+    {{- if $ingressNodePort }}
+    {{- if ne .Values.service.type "NodePort" }}
+    {{- fail "service.ingressNodePort requires service.type=NodePort" }}
+    {{- end }}
+    {{- if eq $ingressNodePort (int (.Values.service.nodePort | default 0)) }}
+    {{- fail "service.ingressNodePort must differ from service.nodePort" }}
+    {{- end }}
+    {{- if not $publicPort }}
+    {{- $publicPort = $ingressNodePort }}
+    {{- end }}
+    {{- end }}
+    {{- if $publicPort }}
+    service_public_port   = {{ $publicPort }}
+    {{- end }}
     {{- end }}
     {{- if .Values.service.healthPort }}
     health_bind_address   = "0.0.0.0:{{ .Values.service.healthPort }}"

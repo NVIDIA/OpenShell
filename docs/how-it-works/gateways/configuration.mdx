@@ -172,6 +172,20 @@ routing. The TOML address can select a different interface. In Helm, set
 application ingress routes at that Service port and keep control-plane routes
 on `service.port`.
 
+If a proxy or port mapping exposes ingress on a different port, set
+`service_public_port` to that nonzero externally reachable port. It changes generated
+API URLs and CLI output without changing the listener. For Helm NodePort
+deployments, set `service.ingressNodePort` to a fixed NodePort; the gateway
+advertises it automatically. `service.ingressPublicPort` overrides that value
+for another external mapping. With an automatically allocated NodePort, query
+the Service and set `service.ingressPublicPort` to the assigned port; the gateway
+cannot discover it from the listener configuration.
+
+Upgrade CLIs before enabling the split: older versions replace the service port
+with the control-plane port. Configure callers and network access rules for the
+service listener as part of the same rollout. Retried API mutations regenerate
+service URLs from the current configuration.
+
 ## Full Example
 
 A complete gateway configuration covering every section. Trim to the fields you need.

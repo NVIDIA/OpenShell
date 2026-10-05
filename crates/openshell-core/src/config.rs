@@ -197,6 +197,10 @@ pub struct Config {
     /// primary listener serves control-plane operations only.
     pub service_bind_address: Option<SocketAddr>,
 
+    /// Optional externally reachable service port, overriding the listener port
+    /// in generated URLs (for example, a `NodePort` or reverse proxy).
+    pub service_public_port: Option<u16>,
+
     /// Address to bind the unauthenticated health endpoint to.
     ///
     /// When `None`, the dedicated health listener is disabled.
@@ -304,7 +308,7 @@ pub struct ServiceRoutingConfig {
     pub enable_loopback_service_http: bool,
 }
 
-/// gRPC response metadata advertising a dedicated service ingress port.
+/// gRPC response metadata advertising an explicitly configured service port.
 /// Clients use this port for service URLs instead of the control-plane
 /// endpoint's externally forwarded port when this is set.
 pub const SERVICE_PORT_METADATA_KEY: &str = "openshell-service-port";
@@ -885,6 +889,7 @@ impl Config {
             name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
             service_bind_address: None,
+            service_public_port: None,
             health_bind_address: None,
             metrics_bind_address: None,
             log_level: default_log_level(),
@@ -934,6 +939,14 @@ impl Config {
     #[must_use]
     pub fn service_address(&self) -> SocketAddr {
         self.service_bind_address.unwrap_or(self.bind_address)
+    }
+
+    /// Explicit service port clients should use instead of a forwarded
+    /// control-plane port. Shared mode retains legacy client behavior by default.
+    #[must_use]
+    pub fn advertised_service_port(&self) -> Option<u16> {
+        self.service_public_port
+            .or_else(|| self.service_bind_address.map(|address| address.port()))
     }
 
     #[must_use]

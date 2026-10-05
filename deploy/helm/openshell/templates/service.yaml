@@ -23,6 +23,9 @@ spec:
       targetPort: ingress
       protocol: TCP
       name: ingress
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.ingressNodePort }}
+      nodePort: {{ .Values.service.ingressNodePort }}
+      {{- end }}
     {{- end }}
     {{- if .Values.service.metricsPort }}
     - port: {{ .Values.service.metricsPort }}

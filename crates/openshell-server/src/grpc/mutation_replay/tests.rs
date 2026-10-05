@@ -6,9 +6,9 @@ use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
-    CreateSandboxRequest, SandboxServiceExposure, SandboxSpec, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
-    WorkspaceMember, WorkspaceRole,
+    CreateSandboxRequest, ExposeServiceRequest, SandboxServiceExposure, SandboxSpec,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    ServiceAuthorizationMode, WorkspaceMember, WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -106,7 +106,7 @@ async fn create_sandbox_replay_preserves_service_urls() {
             gateway_id: "test".into(),
             ttl_secs: None,
         });
-    let service = crate::grpc::OpenShellService::new(state);
+    let service = crate::grpc::OpenShellService::new(state.clone());
     let request = CreateSandboxRequest {
         name: "replay-services".into(),
         spec: Some(SandboxSpec::default()),
@@ -134,6 +134,35 @@ async fn create_sandbox_replay_preserves_service_urls() {
     assert_eq!(replay.get_ref().service_urls, original.service_urls);
     assert_eq!(replay.into_inner(), original);
 
+    // A restart retains admissions but changes the service listener and domain.
+    // Assert response fields directly, without the CLI's metadata correction.
+    for public_port in [None, Some(32082)] {
+        let mut restarted = test_server_state().await;
+        let inner = Arc::get_mut(&mut restarted).unwrap();
+        inner.store = state.store.clone();
+        inner.config = state.config.clone();
+        inner.config.service_bind_address = Some("0.0.0.0:8082".parse().unwrap());
+        inner.config.service_public_port = public_port;
+        inner.config.service_routing.base_domains = vec!["services.example.com".into()];
+        let service = crate::grpc::OpenShellService::new(restarted);
+        let replay = service
+            .create_sandbox(authed_request(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+        assert_eq!(replay.get_ref().sandbox, original.sandbox);
+        assert_eq!(
+            replay.get_ref().service_urls,
+            HashMap::from([(
+                "web".into(),
+                format!(
+                    "http://default--replay-services--web.services.example.com:{}/",
+                    public_port.unwrap_or(8082)
+                ),
+            )])
+        );
+    }
+
     let mut changed_authorization = request;
     changed_authorization.service_exposures[0].authorization_mode =
         ServiceAuthorizationMode::BearerPassthrough as i32;
@@ -145,6 +174,64 @@ async fn create_sandbox_replay_preserves_service_urls() {
                 .unwrap_err()
         ),
         "REQUEST_ID_PAYLOAD_MISMATCH"
+    );
+}
+
+#[tokio::test]
+async fn expose_service_replay_regenerates_url_after_ingress_remapping() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("private-key");
+    std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
+    let mut state = test_server_state().await;
+    Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+        Some(openshell_core::config::GatewayJwtConfig {
+            signing_key_path: key,
+            public_key_path: directory.path().join("public"),
+            kid_path: directory.path().join("kid"),
+            gateway_id: "test".into(),
+            ttl_secs: None,
+        });
+    let service = crate::grpc::OpenShellService::new(state.clone());
+    service
+        .create_sandbox(authed_request(CreateSandboxRequest {
+            name: "replay-expose".into(),
+            spec: Some(SandboxSpec::default()),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let request = ExposeServiceRequest {
+        sandbox: "replay-expose".into(),
+        name: "web".into(),
+        target_port: 8080,
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let original = service
+        .expose_service(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut restarted = test_server_state().await;
+    let inner = Arc::get_mut(&mut restarted).unwrap();
+    inner.store = state.store.clone();
+    inner.config = state.config.clone();
+    inner.config.service_bind_address = Some("0.0.0.0:8082".parse().unwrap());
+    inner.config.service_public_port = Some(32082);
+    inner.config.service_routing.base_domains = vec!["services.example.com".into()];
+    let service = crate::grpc::OpenShellService::new(restarted);
+    let replay = service
+        .expose_service(authed_request(request))
+        .await
+        .unwrap();
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(replay.get_ref().endpoint, original.endpoint);
+    assert_ne!(replay.get_ref().url, original.url);
+    assert_eq!(
+        replay.get_ref().url,
+        "http://default--replay-expose--web.services.example.com:32082/"
     );
 }
 
@@ -691,7 +778,11 @@ impl Mutation for ControlledCreate {
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status> {
         resource_success(response.get_ref().workspace.as_ref())
     }
-    async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status> {
+    async fn restore(
+        store: &Store,
+        _config: &openshell_core::Config,
+        success: Success,
+    ) -> Result<Self::Output, Status> {
         Ok(CreateWorkspaceResponse {
             workspace: Some(restore_resource(store, success).await?),
         })
