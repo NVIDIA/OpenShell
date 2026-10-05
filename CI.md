@@ -92,7 +92,7 @@ the tmachine upgrade execution and its runtime-image preparation.
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
-- `test:upgrade` runs tmachine Debian upgrade qualification in
+- `test:upgrade` runs tmachine Debian and RPM upgrade qualification in
   `Branch E2E Checks`: the latest published release packages and matching
   runtime images are installed first, then the PR's packages are installed and
   both existing and new sandboxes are verified
@@ -454,7 +454,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Debian upgrade qualification and Kubernetes HA E2E remain optional and label-driven on PRs.
+- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Debian and RPM upgrade qualification and Kubernetes HA E2E remain optional and label-driven on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -480,7 +480,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Debian upgrade, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Debian and RPM upgrade, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
