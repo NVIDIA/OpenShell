@@ -128,10 +128,14 @@ mod tests {
     // the additive file map while retaining the rest of the response.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Token-grant owner fields add gateway-derived metadata to endpoints and
+    // profile credentials reachable from stored policies and provider profiles.
+    // Legacy payloads decode empty owners; the gateway rebuilds their authority
+    // from effective policy rather than trusting persisted owner stamps.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "e43055b6d58e0dc9fe8173a7fbf4b59d75bef70776be5cef1404d4fa7ce2d46c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "eaaceaf6140f2c0b6b628997197d64f9e423d8eb2074ef2ccdaafe64f0b8a1af";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

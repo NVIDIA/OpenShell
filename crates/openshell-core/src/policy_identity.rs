@@ -267,7 +267,6 @@ mod token_grant_owner_tests {
             ],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/client".into(),
-                ..Default::default()
             }],
             ..Default::default()
         }

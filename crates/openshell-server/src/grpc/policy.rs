@@ -813,7 +813,7 @@ fn evaluate_proposal_candidate(
         rule_name: rule_name.clone(),
         rule: rule.clone(),
     }];
-    let candidate_base = match merge_policy(base_policy.clone(), &operations) {
+    let mut candidate_base = match merge_policy(base_policy.clone(), &operations) {
         Ok(result) => result.policy,
         Err(error) => {
             let application_error = format!("merge failed: {}", one_line(&error.to_string()));
@@ -835,6 +835,7 @@ fn evaluate_proposal_candidate(
         }
     };
 
+    clear_provider_credentialed_markers(&mut candidate_base);
     let validation = (|| -> Result<ProtoSandboxPolicy, Status> {
         validate_policy_safety(&candidate_base)?;
         validate_candidate_effective_policy(&candidate_base, validation_context.provider_layers)?;
@@ -7115,7 +7116,8 @@ fn validate_operator_merged_credential_policy(
         bindings,
         context.endpointless_provider_names,
     );
-    clear_provider_credentialed_markers(effective_policy);
+    // Recompute the credential flags without clearing owner IDs that provider
+    // composition already derived for this effective policy.
     stamp_provider_credentialed_endpoints(effective_policy, &credentialed_scopes);
     validate_uninspected_credentialed_endpoints(effective_policy)
 }
@@ -7128,7 +7130,8 @@ fn stage_validated_merge_operation(
     validate_merge_operations_for_server(std::slice::from_ref(operation))?;
     let merged = merge_policy(current_policy.clone(), std::slice::from_ref(operation))
         .map_err(map_policy_merge_error)?;
-    let candidate = merged.policy;
+    let mut candidate = merged.policy;
+    clear_provider_credentialed_markers(&mut candidate);
     validate_policy_safety(&candidate)?;
     validate_candidate_effective_policy(&candidate, validation_context.provider_layers)?;
     let mut effective = if validation_context.provider_layers.is_empty() {
@@ -7161,13 +7164,14 @@ async fn apply_merge_operations_with_retry(
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        let (current_policy, current_hash) = if let Some(ref record) = latest {
+        let (mut current_policy, current_hash) = if let Some(ref record) = latest {
             let (policy, hash) = canonical_policy_record_identity(record)?;
             (policy, Some(hash))
         } else {
             (baseline_policy.cloned().unwrap_or_default(), None)
         };
 
+        clear_provider_credentialed_markers(&mut current_policy);
         if let Some(expected_hash) = expected_current_effective_hash {
             let mut current_effective = if provider_layers.is_empty() {
                 current_policy.clone()
@@ -7190,7 +7194,8 @@ async fn apply_merge_operations_with_retry(
         }
 
         let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
-        let new_policy = merged.policy;
+        let mut new_policy = merged.policy;
+        clear_provider_credentialed_markers(&mut new_policy);
         let hash = deterministic_policy_hash(&new_policy);
 
         if let Some(baseline_policy) = baseline_policy {
@@ -8384,9 +8389,11 @@ mod tests {
         let settings = load_global_settings(state.store.as_ref())
             .await
             .expect("test global settings lookup");
-        decode_policy_from_global_settings(&settings)
+        let mut policy = decode_policy_from_global_settings(&settings)
             .expect("test global policy must decode")
-            .expect("test global policy must be present")
+            .expect("test global policy must be present");
+        openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
+        policy
     }
 
     #[tokio::test]
@@ -18586,6 +18593,19 @@ mod tests {
                         read_write: vec!["/sandbox".to_string()],
                         ..Default::default()
                     }),
+                    network_policies: HashMap::from([(
+                        "authored_existing".to_string(),
+                        NetworkPolicyRule {
+                            name: "authored_existing".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.example.test".to_string(),
+                                port: 443,
+                                token_grant_owner: "forged-source-owner".to_string(),
+                                ..Default::default()
+                            }],
+                            binaries: Vec::new(),
+                        },
+                    )]),
                     ..Default::default()
                 }),
                 providers: vec!["work-custom".to_string()],
@@ -18595,6 +18615,19 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
+        let stored_source = sandbox.spec.as_ref().unwrap().policy.as_ref().unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-agent-provider-effective-policy",
+                sandbox_id,
+                "default",
+                1,
+                &stored_source.encode_to_vec(),
+                &deterministic_policy_hash(stored_source),
+            )
+            .await
+            .unwrap();
 
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
@@ -18614,6 +18647,7 @@ mod tests {
                     }),
                 }],
                 advisor_proposed: true,
+                token_grant_owner: "forged-proposal-owner".to_string(),
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
@@ -18690,6 +18724,20 @@ mod tests {
         .await
         .expect("provider-overlap proposal should approve");
 
+        let candidate = chunk.candidate_effective_policy.as_ref().unwrap();
+        for rule_name in ["authored_existing", "github_contents_write"] {
+            assert!(
+                candidate.network_policies[rule_name].endpoints[0]
+                    .token_grant_owner
+                    .is_empty()
+            );
+        }
+        assert!(
+            !candidate.network_policies["_provider_work_custom"].endpoints[0]
+                .token_grant_owner
+                .is_empty()
+        );
+
         let stored = state
             .store
             .get_latest_policy(sandbox_id)
@@ -18709,7 +18757,19 @@ mod tests {
             "provider-composed rules must not be copied into the mutable base policy"
         );
 
+        assert!(
+            base_policy
+                .network_policies
+                .values()
+                .flat_map(|rule| &rule.endpoints)
+                .all(|endpoint| endpoint.token_grant_owner.is_empty())
+        );
+
         let effective_policy = get_sandbox_policy(&state, sandbox_id).await;
+        assert_eq!(
+            deterministic_policy_hash(&effective_policy),
+            chunk.candidate_effective_policy_hash
+        );
         let provider_rule = &effective_policy.network_policies["_provider_work_custom"];
         assert_eq!(
             provider_rule.endpoints[0].access,
@@ -18717,6 +18777,7 @@ mod tests {
         );
         assert_eq!(provider_rule.endpoints[0].deny_rules.len(), 1);
         assert!(!provider_rule.endpoints[0].advisor_proposed);
+        assert!(!provider_rule.endpoints[0].token_grant_owner.is_empty());
         assert!(
             effective_policy
                 .network_policies
