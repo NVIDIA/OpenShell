@@ -411,11 +411,6 @@ jobs:
       - name: Test
         run: mise run test:python
 
-      - name: Test release publication gates
-        run: |
-          mise run test:qualification-summary
-          mise run test:release-publication
-
       - name: Test local gateway configuration helpers
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh

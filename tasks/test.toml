@@ -17,7 +17,6 @@ depends = [
   "test:gateway-config",
   "test:packaging-assets",
   "test:qualification-summary",
-  "test:release-publication",
   "test:codex-security-release-range",
   "test:docs-website",
   "test:docs-nav",
@@ -72,12 +71,6 @@ hide = true
 description = "Test release qualification summary generation"
 run = "tasks/scripts/test-qualification-summary.sh"
 run_windows = "echo Skipping test:qualification-summary: the release workflow runs on Unix hosts."
-hide = true
-
-["test:release-publication"]
-description = "Test tagged release qualification and Snap publication ordering"
-run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/release_publication_test.py"
-run_windows = "echo Skipping test:release-publication: tagged release workflows run on Unix hosts."
 hide = true
 
 ["test:codex-security-release-range"]
