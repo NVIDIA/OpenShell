@@ -146,7 +146,7 @@ where
 /// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
 pub mod test_exporter {
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
     use tracing::{Dispatch, Subscriber, dispatcher::WeakDispatch};
 
@@ -159,6 +159,7 @@ pub mod test_exporter {
     struct CloseWithDispatch<S> {
         inner: S,
         dispatch: OnceLock<WeakDispatch>,
+        closed: Arc<tokio::sync::Notify>,
     }
 
     impl<S: Subscriber> Subscriber for CloseWithDispatch<S> {
@@ -224,7 +225,14 @@ pub mod test_exporter {
                 .get()
                 .and_then(WeakDispatch::upgrade)
                 .expect("a live span keeps its test dispatcher alive");
-            tracing::dispatcher::with_default(&dispatch, || self.inner.try_close(id))
+            let closed = tracing::dispatcher::with_default(&dispatch, || self.inner.try_close(id));
+            if closed {
+                // The simple exporter has finished before try_close returns.
+                // Wake assertions only after the owning registry and layers
+                // have completed cleanup, including recursive parent closure.
+                self.closed.notify_waiters();
+            }
+            closed
         }
 
         fn current_span(&self) -> tracing_core::span::Current {
@@ -273,14 +281,17 @@ pub mod test_exporter {
             .with_simple_exporter(exporter.clone())
             .build();
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
+        let closed = Arc::new(tokio::sync::Notify::new());
         let dispatch = Dispatch::new(CloseWithDispatch {
             inner: subscriber,
             dispatch: OnceLock::new(),
+            closed: Arc::clone(&closed),
         });
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
             _provider: provider,
             exporter,
+            closed,
             _lock: lock,
         }
     }
@@ -289,6 +300,52 @@ pub mod test_exporter {
         /// Every span recorded by this test's in-memory exporter.
         pub fn finished_spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
             self.exporter.get_finished_spans().expect("in-memory spans")
+        }
+
+        /// Wait for expected spans to finish before taking an assertion snapshot.
+        ///
+        /// A completed `SQLx` query may still have its span held by a `SQLite`
+        /// worker. Export is synchronous once the span closes, but flushing
+        /// cannot close that live span. Await closure notifications instead of
+        /// assuming the query result also means tracing cleanup has completed.
+        pub async fn wait_for_spans(
+            &self,
+            predicate: impl Fn(&[opentelemetry_sdk::trace::SpanData]) -> bool + Send + Sync,
+        ) -> Vec<opentelemetry_sdk::trace::SpanData> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    // notify_waiters wakes futures created before notification,
+                    // even before polling. Subscribe before reading so closure
+                    // between the snapshot and await cannot lose a wakeup.
+                    let notified = self.closed.notified();
+                    let spans = self.finished_spans();
+                    if predicate(&spans) {
+                        return spans;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for expected spans, got {:?}",
+                    self.finished_spans()
+                        .iter()
+                        .map(|span| &span.name)
+                        .collect::<Vec<_>>()
+                )
+            })
+        }
+
+        /// Wait for the completed span named `name`.
+        pub async fn wait_for_span(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
+            let spans = self
+                .wait_for_spans(|spans| spans.iter().any(|span| span.name == name))
+                .await;
+            spans
+                .into_iter()
+                .find(|span| span.name == name)
+                .expect("the awaited snapshot contains the expected span")
         }
 
         /// Spans named `name`.
@@ -378,6 +435,7 @@ pub mod test_exporter {
         _default: tracing::dispatcher::DefaultGuard,
         _provider: opentelemetry_sdk::trace::SdkTracerProvider,
         exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+        closed: Arc<tokio::sync::Notify>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -688,6 +746,56 @@ mod tests {
             first.span_context.trace_id(),
             second.span_context.trace_id()
         );
+    }
+
+    #[tokio::test]
+    async fn tracing_waits_for_worker_held_spans_to_close() {
+        let traced = test_exporter::install_traced();
+        let parent = tracing::info_span!("awaited_parent");
+        let child = tracing::info_span!(parent: &parent, "awaited_child");
+        drop(parent);
+
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            released.recv().expect("test releases the worker's span");
+            drop(child);
+        });
+
+        assert!(traced.finished_spans().is_empty());
+        let waiting = traced.wait_for_span("awaited_parent");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        let parent = waiting.await;
+        worker.join().expect("worker closes child and parent");
+        let child = traced.span_named("awaited_child");
+        test_exporter::assert_is_root(&parent);
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+    }
+
+    #[tokio::test]
+    async fn tracing_wait_does_not_lose_closure_between_snapshot_and_await() {
+        let traced = test_exporter::install_traced();
+        let span = std::sync::Mutex::new(Some(tracing::info_span!("close_before_await")));
+        let spans = traced
+            .wait_for_spans(|spans| {
+                // The first snapshot is empty. Close its span before polling
+                // the notification future, as a worker could do concurrently.
+                drop(span.lock().unwrap().take());
+                spans.iter().any(|span| span.name == "close_before_await")
+            })
+            .await;
+        assert_eq!(spans.len(), 1);
+        test_exporter::assert_is_root(&spans[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "timed out waiting for expected spans")]
+    async fn tracing_wait_times_out_when_a_span_never_closes() {
+        let traced = test_exporter::install_traced();
+        let _span = tracing::info_span!("still_open");
+        traced.wait_for_span("still_open").await;
     }
 
     #[tokio::test]
