@@ -4,9 +4,6 @@
 name: Codex Compatibility Review
 
 on:
-  push:
-    branches:
-      - 2860-codex-compatibility-review/SDAChess
   workflow_call:
     inputs:
       candidate_ref:
@@ -68,7 +65,7 @@ jobs:
         working-directory: review-tools
         shell: nix develop --no-write-lock-file -c bash -euo pipefail {0}
         env:
-          CANDIDATE_REF: ${{ inputs.candidate_ref || 'v0.1.2' }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
           SOURCE_SHA: ${{ inputs.source_sha || '' }}
           NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
         run: |
