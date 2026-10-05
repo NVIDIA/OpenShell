@@ -26,7 +26,7 @@ A gateway provisions sandboxes through the compute driver configured for that ga
 
 | Runtime | Where sandboxes run | Best for |
 |---|---|---|
-| Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
+| Docker | Containers on the Docker daemon host. | Solo development, quick iteration, and single-machine gateways. |
 | Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
 | Kubernetes | Pods in an operator-managed cluster. | Shared clusters and cloud environments. |
 | MicroVM | VM-backed sandboxes. | Workflows that need VM-backed isolation. |

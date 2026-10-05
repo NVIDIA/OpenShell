@@ -293,9 +293,21 @@ Common findings:
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
 - Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
-  can mean host networking is disabled. Enable host networking in Docker
-  Desktop, ensure Enhanced Container Isolation is disabled, and verify the
-  gateway's primary endpoint is reachable from a host-networked container.
+  can mean the supervisor's selected network mode cannot reach the gateway.
+  Check the gateway's `Selected Docker supervisor networking` log. The default
+  `supervisor_network_mode = "auto"` selects bridge for inspected `sysbox-runc`
+  workloads (ECI), and host otherwise. Host mode requires Desktop host
+  networking enabled and ECI disabled; set `bridge` explicitly when neither
+  feature is enabled. Bridge mode uses `host.docker.internal` for the Desktop
+  host and requires a bridge-reachable listener on native Linux. Explicit
+  `grpc_endpoint` values must be reachable in the selected mode, including any
+  remapped published port, with matching TLS certificate names. The local
+  `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
+  supplies an override. Mode selection
+  does not bypass Landlock/seccomp qualification. A gateway container under ECI
+  also needs an administrator-approved Docker socket exception. See the
+  published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
+  for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.

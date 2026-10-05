@@ -947,9 +947,11 @@ default_image      = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
-# Optional override. When omitted, the host-networked supervisor uses the
-# gateway's primary loopback endpoint.
-grpc_endpoint      = "https://127.0.0.1:17670"
+# auto uses bridge for Sysbox/ECI workloads, otherwise host networking.
+# Operator-owned; sandbox driver config cannot override this choice.
+supervisor_network_mode = "auto"
+# Optional override. Omit for automatic host or bridge callback selection.
+# grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
 # Supervisor runtime. Defaults to the gateway version.
@@ -984,6 +986,25 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 
 Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
+
+`supervisor_network_mode` accepts `auto` (the default), `host`, or `bridge`.
+`auto` selects bridge for Docker Desktop Enhanced Container Isolation (ECI)
+workloads using `sysbox-runc`, otherwise host, on every launch and restart.
+The workload always uses `network=none`.
+
+Omit `grpc_endpoint` for automatic selection: host mode uses loopback; bridge
+uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
+the Linux listener's non-loopback address. Both use the gateway's bind port.
+Bridge requires a reachable listener; OpenShell does not widen it. Set an
+explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint.
+The local `gateway:docker` task uses automatic endpoint selection unless you set
+`OPENSHELL_GRPC_ENDPOINT`.
+
+Bridge resolves both host aliases through Docker's `host-gateway`; native Linux
+services bound only to loopback remain unreachable. Desktop host mode requires
+host networking enabled and ECI disabled. ECI still requires Landlock and seccomp
+qualification, plus an administrator-approved Docker socket exception for
+containerized gateways.
 
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;

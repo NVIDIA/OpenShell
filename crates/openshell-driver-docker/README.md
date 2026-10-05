@@ -41,9 +41,11 @@ mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
-bypassed. The trusted supervisor companion uses Docker host networking, where
-it reaches the gateway's primary loopback listener and originates approved
-egress.
+bypassed. The trusted supervisor companion originates approved egress. Its
+operator-owned `supervisor_network_mode` defaults to `auto`: each launch
+inspects the existing workload container and chooses bridge for `sysbox-runc`
+(the Docker Desktop ECI runtime), or host for other runtimes. Explicit `host`
+and `bridge` values override this heuristic. No probe container is created.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
@@ -158,7 +160,7 @@ openshell sandbox create \
 `/openshell-sandbox` binary. The driver extracts that binary as bytes and
 stages it into the stopped workload. `supervisor_image` contains the
 dynamically linked glibc `/openshell-supervisor` binary that runs in the
-host-networked supervisor container. Release and gateway image builds bake
+supervisor companion container. Release and gateway image builds bake
 matching image tags into the binary.
 
 ## Gateway session and TLS
@@ -172,7 +174,7 @@ When no endpoint is configured, the supervisor connects to
 Docker daemon host. A configured HTTPS server certificate must include the
 endpoint host in its subject alternative names.
 
-The driver publishes host loopback as the backend address for
+In host mode, the driver publishes host loopback as the backend address for
 `host.openshell.internal`. Policy DNS resolves that reserved name through the
 mediated path, so policies can reach host services without a Docker bridge,
 container DNS alias, or another gateway listener.
@@ -181,9 +183,26 @@ For HTTPS endpoints, the supervisor receives only the gateway CA and
 uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
-Docker Engine on Linux supports host networking directly. Docker Desktop
-requires host networking to be enabled in Settings and does not support it
-when Enhanced Container Isolation is enabled.
+Host mode on Docker Desktop requires host networking enabled in Settings and
+ECI disabled. Bridge mode uses Docker-resolved `host-gateway` entries for both
+host aliases. The supervisor's `--host-gateway-from-hosts` option pins the
+numeric address from its own driver-owned `/etc/hosts` into the runtime
+descriptor before attaching the workload; workload DNS and hosts files cannot
+select this address. Gateway endpoints and host aliases are independent in
+bridge mode.
+
+When `grpc_endpoint` is omitted, bridge mode uses `host.docker.internal` on
+Desktop or for a wildcard gateway listener, and the concrete bind address for
+other non-loopback Linux listeners. The port is the gateway bind port; remapped
+container publications require an explicit endpoint. Native Linux loopback-only
+listeners cannot serve a bridge supervisor and produce an actionable error.
+Explicit endpoints retain TLS verification and are never rewritten; bridge
+rejects loopback/unspecified endpoint addresses. Host services bound only to
+loopback are also unreachable from a native Linux bridge supervisor.
+
+Selecting bridge does not qualify full ECI support. Landlock and seccomp probes
+remain mandatory, and a gateway container under ECI needs an administrator's
+Docker socket exception.
 
 The supervisor owns these security-critical variables:
 
