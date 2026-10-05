@@ -301,7 +301,9 @@ Common findings:
   feature is enabled. Bridge mode uses `host.docker.internal` for the Desktop
   host and requires a bridge-reachable listener on native Linux. Explicit
   `grpc_endpoint` values must be reachable in the selected mode, including any
-  remapped published port, with matching TLS certificate names. Mode selection
+  remapped published port, with matching TLS certificate names. The local
+  `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
+  supplies an override. Mode selection
   does not bypass Landlock/seccomp qualification. A gateway container under ECI
   also needs an administrator-approved Docker socket exception. See the
   published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)

@@ -966,6 +966,8 @@ uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
 the Linux listener's non-loopback address. Both use the gateway's bind port.
 Bridge requires a reachable listener; OpenShell does not widen it. Set an
 explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint.
+The local `gateway:docker` task uses automatic endpoint selection unless you set
+`OPENSHELL_GRPC_ENDPOINT`.
 
 Bridge resolves both host aliases through Docker's `host-gateway`; native Linux
 services bound only to loopback remain unreachable. Desktop host mode requires
