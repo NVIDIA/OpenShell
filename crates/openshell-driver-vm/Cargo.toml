@@ -29,7 +29,6 @@ openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-otel = { path = "../openshell-otel", optional = true }
 openshell-policy = { path = "../openshell-policy", optional = true }
-openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 openshell-vfio = { path = "../openshell-vfio", optional = true }
 
@@ -80,7 +79,6 @@ compute-driver = [
     "dep:oci-client",
     "dep:openshell-otel",
     "dep:openshell-policy",
-    "dep:openshell-driver-docker",
     "dep:openshell-driver-podman",
     "dep:openshell-vfio",
     "dep:opentelemetry",

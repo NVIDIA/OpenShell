@@ -5055,7 +5055,7 @@ async fn connect_local_container_engine() -> Option<Docker> {
 ///
 /// 1. `connect_with_local_defaults`, which honours any `DOCKER_HOST` scheme
 ///    (including `tcp://` and `ssh://`) and otherwise `/var/run/docker.sock`.
-/// 2. A Docker socket found by the Docker driver's discovery. Docker Desktop
+/// 2. A Docker socket found by the shared core discovery. Docker Desktop
 ///    for macOS may expose only a per-user socket, which step 1 never probes.
 ///    A failed `DOCKER_HOST` does not stop the search: an unreachable engine
 ///    is replaced by a live local one, as it already was by Podman.
@@ -5103,7 +5103,7 @@ async fn connect_unix_engine(socket: &Path) -> Option<Docker> {
 }
 
 fn detect_docker_socket() -> Option<PathBuf> {
-    openshell_driver_docker::detect_socket()
+    openshell_core::local_api_socket::detect_docker_socket()
 }
 
 fn detect_podman_socket() -> Option<PathBuf> {
@@ -7562,7 +7562,7 @@ mod tests {
     }
 
     #[test]
-    fn container_engine_default_detector_uses_the_docker_driver_discovery() {
+    fn container_engine_default_detector_uses_shared_docker_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("real.sock");
         let _guard = ENV_LOCK
