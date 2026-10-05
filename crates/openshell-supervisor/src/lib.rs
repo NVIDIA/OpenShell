@@ -6450,9 +6450,9 @@ network_policies:
 
     async fn assert_startup_write_aborted_refetches(image_upload: bool) {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
-        // An operator installs a policy after startup reads its snapshot but
-        // before either startup write completes. The next write would replace
-        // that policy, so the gateway's conflict must force a fresh read.
+        // Inject ABORTED while the fixture changes the desired policy. This
+        // checks the supervisor's response to a reported conflict; it does not
+        // show that the gateway rejects an unfenced stale policy write.
         let operator_policy = proto_policy_fixture();
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
@@ -6626,7 +6626,6 @@ network_policies:
         }
     }
 
-
     #[tokio::test(start_paused = true)]
     async fn startup_conflict_writes_keep_reconciliation_budget() {
         use openshell_core::proto::PolicySource;
@@ -6671,7 +6670,6 @@ network_policies:
             );
         }
     }
-
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_image_repair_before_report_refetches() {

@@ -941,7 +941,7 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
-If a configuration change makes a startup policy write or rejection report stale, the gateway can return `ABORTED`. The supervisor then reads the latest configuration and resumes startup. You do not need to recreate the sandbox for that conflict.
+When the gateway returns `ABORTED` for a startup policy write or rejection report, the supervisor reads the latest configuration before retrying startup. Repeated conflicts can still exhaust the startup retry budget.
 
 Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
