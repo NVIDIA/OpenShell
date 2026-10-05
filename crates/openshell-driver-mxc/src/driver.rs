@@ -455,7 +455,7 @@ impl MxcComputeBackend {
     /// Test-only constructor wiring the in-process mock `wxc-exec` shim.
     #[cfg(test)]
     pub(crate) fn new_mocked(config: MxcComputeConfig) -> Self {
-        let mut backend = Self::new(config);
+        let mut backend = Self::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
         backend.invoker = WxcExecInvoker::mocked(&backend.config.wxc_exec_path);
         backend
     }
