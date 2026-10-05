@@ -86,7 +86,10 @@ management, agent execution, and provider access via gRPC.
 
 # Extract vendored Cargo dependencies and configure offline build
 tar xf %{SOURCE1}
-%cargo_prep -v vendor
+# Retain RPM build settings, then use Cargo's complete source mapping.
+# The -v macro redirects crates.io only and omits vendored Git sources.
+%cargo_prep -N
+cat cargo-vendor-config.toml >> .cargo/config.toml
 
 # Patch workspace version from placeholder to actual build identity.
 sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml
