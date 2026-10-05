@@ -146,6 +146,105 @@ where
 /// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
 pub mod test_exporter {
+    use std::sync::OnceLock;
+
+    use tracing::{Dispatch, Subscriber, dispatcher::WeakDispatch};
+
+    /// Keep parent-span cleanup on the registry that created the span.
+    ///
+    /// `SQLx` moves spans onto its `SQLite` worker without installing the test's
+    /// thread-local dispatcher. `tracing-subscriber` closes a child's parent
+    /// through the current dispatcher, so the worker can otherwise look up the
+    /// parent in the unrelated global registry when it drops the last reference.
+    struct CloseWithDispatch<S> {
+        inner: S,
+        dispatch: OnceLock<WeakDispatch>,
+    }
+
+    impl<S: Subscriber> Subscriber for CloseWithDispatch<S> {
+        fn on_register_dispatch(&self, dispatch: &Dispatch) {
+            self.dispatch
+                .set(dispatch.downgrade())
+                .expect("test subscriber is registered once");
+            self.inner.on_register_dispatch(dispatch);
+        }
+
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            self.inner.register_callsite(metadata)
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.inner.enabled(metadata)
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            self.inner.max_level_hint()
+        }
+
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.inner.new_span(attributes)
+        }
+
+        fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            self.inner.record(id, values);
+        }
+
+        fn record_follows_from(&self, id: &tracing::span::Id, follows: &tracing::span::Id) {
+            self.inner.record_follows_from(id, follows);
+        }
+
+        fn event_enabled(&self, event: &tracing::Event<'_>) -> bool {
+            self.inner.event_enabled(event)
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.inner.event(event);
+        }
+
+        fn enter(&self, id: &tracing::span::Id) {
+            self.inner.enter(id);
+        }
+
+        fn exit(&self, id: &tracing::span::Id) {
+            self.inner.exit(id);
+        }
+
+        fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+            self.inner.clone_span(id)
+        }
+
+        fn try_close(&self, id: tracing::span::Id) -> bool {
+            // The span being closed owns a strong dispatcher reference. Store
+            // only a weak reference here to avoid a subscriber/dispatcher cycle.
+            let dispatch = self
+                .dispatch
+                .get()
+                .and_then(WeakDispatch::upgrade)
+                .expect("a live span keeps its test dispatcher alive");
+            tracing::dispatcher::with_default(&dispatch, || self.inner.try_close(id))
+        }
+
+        fn current_span(&self) -> tracing_core::span::Current {
+            self.inner.current_span()
+        }
+
+        // OpenTelemetrySpanExt downcasts through the subscriber to its layer.
+        // SAFETY: Forward the unchanged TypeId to the inner subscriber, which
+        // owns the returned pointer for exactly as long as this wrapper lives.
+        #[allow(unsafe_code)]
+        unsafe fn downcast_raw(&self, id: std::any::TypeId) -> Option<*const ()> {
+            if id == std::any::TypeId::of::<Self>() {
+                Some(std::ptr::from_ref(self).cast())
+            } else {
+                // SAFETY: The inner subscriber owns and validates this downcast.
+                unsafe { self.inner.downcast_raw(id) }
+            }
+        }
+    }
+
     /// Installs a process-wide registry before any scoped test subscriber is
     /// used.
     ///
@@ -174,7 +273,10 @@ pub mod test_exporter {
             .with_simple_exporter(exporter.clone())
             .build();
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
-        let dispatch = tracing::Dispatch::new(subscriber);
+        let dispatch = Dispatch::new(CloseWithDispatch {
+            inner: subscriber,
+            dispatch: OnceLock::new(),
+        });
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
             _provider: provider,
@@ -255,7 +357,7 @@ pub mod test_exporter {
     /// Forces the global subscriber up first so callsite interest is decided
     /// by a registry that records, not by the no-op default.
     #[must_use]
-    pub fn install_scoped(subscriber: impl Into<tracing::Dispatch>) -> ScopedTracingTestGuard {
+    pub fn install_scoped(subscriber: impl Into<Dispatch>) -> ScopedTracingTestGuard {
         let lock = crate::TEST_TRACING_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -516,6 +618,42 @@ mod tests {
             "a bad endpoint degrades to no export rather than failing startup"
         );
         assert!(err.is_some(), "the failure is reportable, not swallowed");
+    }
+
+    #[tokio::test]
+    async fn tracing_child_closed_on_worker_keeps_its_parent_and_exporter() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let traced = test_exporter::install_traced();
+        let parent = tracing::info_span!("worker_parent");
+        let child = tracing::info_span!(parent: &parent, "worker_child");
+        // Also exercise layer downcasting through the fixture's subscriber.
+        let parent_context = parent.context();
+        let child_context = child.context();
+        drop(parent);
+
+        std::thread::spawn(move || {
+            // Like SQLx, enter the carried span without installing its dispatcher.
+            let entered = child.enter();
+            drop(entered);
+            // This is deliberately the child's last reference. Its parent has
+            // no remaining references either, so both must close on this worker.
+            drop(child);
+        })
+        .join()
+        .expect("worker closes spans without consulting the global registry");
+
+        let parent = traced.span_named("worker_parent");
+        let child = traced.span_named("worker_child");
+        test_exporter::assert_is_root(&parent);
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+        assert_eq!(
+            child.span_context.trace_id(),
+            parent.span_context.trace_id()
+        );
+        assert_eq!(parent_context.span().span_context(), &parent.span_context);
+        assert_eq!(child_context.span().span_context(), &child.span_context);
     }
 
     #[tokio::test]

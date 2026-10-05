@@ -4980,6 +4980,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-appender",
+ "tracing-core",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
