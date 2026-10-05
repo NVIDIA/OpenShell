@@ -37,7 +37,7 @@ The launcher:
 - Scans `profile_paths` in manifest order and imports or updates `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
-- Builds with Codex CLI pinned to `0.160.0` by default so upgrades are reviewed alongside model and authentication compatibility.
+- Builds with the latest Codex CLI by default. Docker can reuse the cached install layer; rebuild with that layer's cache disabled to fetch a newer release.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
