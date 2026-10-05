@@ -311,10 +311,10 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Require current qualification profile for stable releases
-        if: needs.compute-versions.outputs.is_prerelease != 'true' && steps.summary.outputs.current-profile-passed != 'true'
+      - name: Require current qualification profile before publication
+        if: steps.summary.outputs.current-profile-passed != 'true'
         run: |
-          echo "Stable release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
           exit 1
 
   build-python-wheel:
@@ -372,7 +372,7 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       upload-channel: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
       github-environment: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
-      publish: ${{ needs.compute-versions.outputs.is_prerelease != 'true' }}
+      publish: false
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
@@ -386,11 +386,23 @@ jobs:
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  publish-snap:
+    name: Publish Snap
+    needs: [compute-versions, release, qualification-result]
+    if: needs.compute-versions.outputs.is_prerelease != 'true' && needs.qualification-result.outputs.current-profile-passed == 'true'
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/stable
+      github-environment: latest/stable
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+
   # ---------------------------------------------------------------------------
-  # Assemble release artifacts. Stable publication remains qualification-gated.
+  # Assemble release artifacts after the current qualification profile passes.
   # ---------------------------------------------------------------------------
   release:
     name: Release
+    if: needs.qualification-result.outputs.current-profile-passed == 'true'
     needs:
       - compute-versions
       - package-binaries
@@ -740,9 +752,10 @@ jobs:
   publish-qualification:
     name: Publish Qualification Summary (OCI)
     if: >-
-      always()
+      !cancelled()
       && needs.release.result == 'success'
       && needs.qualification-result.result == 'success'
+      && needs.qualification-result.outputs.current-profile-passed == 'true'
     needs: [compute-versions, qualification-result, release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
