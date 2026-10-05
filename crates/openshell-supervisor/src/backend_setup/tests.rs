@@ -26,6 +26,7 @@ const TEST_PAYLOAD: &[u8] = b"in-process-v1\0owned-launch";
 struct Observed {
     events: Mutex<Vec<&'static str>>,
     services: Mutex<Weak<BackendServices>>,
+    discovery_unavailable: AtomicBool,
     deny_confirmation: AtomicBool,
     require_networking: AtomicBool,
     active: AtomicBool,
@@ -174,6 +175,9 @@ impl PreparedBackend for TestLaunch {
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         self.observed.record("discover");
         bearer.authorization_metadata().unwrap();
+        if self.observed.discovery_unavailable.load(Ordering::SeqCst) {
+            return Err(BackendError::Unavailable("discovery unavailable".into()));
+        }
         Ok((None, false))
     }
 
@@ -699,12 +703,36 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
 
     setup
         .observed
+        .discovery_unavailable
+        .store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(Duration::from_secs(5), startup())
+        .await
+        .expect("discovery failure must end startup")
+        .expect_err("discovery failure must reject startup");
+    assert!(error.to_string().contains("discovery unavailable"));
+    assert_eq!(setup.observed.events(), ["decode", "discover"]);
+    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    assert!(!readiness.exists());
+    assert!(!marker.exists());
+    assert!(
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, health_port))
+            .await
+            .is_err()
+    );
+    setup
+        .observed
+        .discovery_unavailable
+        .store(false, Ordering::SeqCst);
+    setup
+        .observed
         .deny_confirmation
         .store(true, Ordering::SeqCst);
     assert!(startup().await.is_err());
     assert_eq!(
         setup.observed.events(),
-        ["decode", "discover", "build", "attach", "confirm"]
+        [
+            "decode", "discover", "decode", "discover", "build", "attach", "confirm"
+        ]
     );
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
     assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
@@ -751,8 +779,8 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     assert_eq!(
         setup.observed.events(),
         [
-            "decode", "discover", "build", "attach", "confirm", "decode", "discover", "build",
-            "attach", "confirm", "start"
+            "decode", "discover", "decode", "discover", "build", "attach", "confirm", "decode",
+            "discover", "build", "attach", "confirm", "start"
         ]
     );
     assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
