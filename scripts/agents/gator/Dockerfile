@@ -65,7 +65,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-ARG CODEX_VERSION=latest
+ARG CODEX_VERSION=0.160.0
 RUN npm install -g "@openai/codex@${CODEX_VERSION}" && \
     (npm cache clean --force >/dev/null 2>&1 || true) && \
     codex --version
