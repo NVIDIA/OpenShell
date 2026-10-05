@@ -691,7 +691,9 @@ mod tests {
         let child_context = child.context();
         drop(parent);
 
-        std::thread::spawn(move || {
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            released.recv().expect("test releases the worker's span");
             // Like SQLx, enter the carried span without installing its dispatcher.
             let entered = child.enter();
             drop(entered);
@@ -701,11 +703,18 @@ mod tests {
             // Closing the carried span must also restore the worker's default,
             // so unrelated work cannot leak into this test's private exporter.
             drop(tracing::info_span!("unrelated_worker_span"));
-        })
-        .join()
-        .expect("worker closes spans without consulting the global registry");
+        });
 
-        let parent = traced.span_named("worker_parent");
+        assert!(traced.finished_spans().is_empty());
+        let waiting = traced.wait_for_span("worker_parent");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        let parent = waiting.await;
+        worker
+            .join()
+            .expect("worker closes spans without consulting the global registry");
         let child = traced.span_named("worker_child");
         test_exporter::assert_is_root(&parent);
         assert_eq!(child.parent_span_id, parent.span_context.span_id());
@@ -746,32 +755,6 @@ mod tests {
             first.span_context.trace_id(),
             second.span_context.trace_id()
         );
-    }
-
-    #[tokio::test]
-    async fn tracing_waits_for_worker_held_spans_to_close() {
-        let traced = test_exporter::install_traced();
-        let parent = tracing::info_span!("awaited_parent");
-        let child = tracing::info_span!(parent: &parent, "awaited_child");
-        drop(parent);
-
-        let (release, released) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            released.recv().expect("test releases the worker's span");
-            drop(child);
-        });
-
-        assert!(traced.finished_spans().is_empty());
-        let waiting = traced.wait_for_span("awaited_parent");
-        tokio::pin!(waiting);
-        assert!(futures::poll!(waiting.as_mut()).is_pending());
-
-        release.send(()).unwrap();
-        let parent = waiting.await;
-        worker.join().expect("worker closes child and parent");
-        let child = traced.span_named("awaited_child");
-        test_exporter::assert_is_root(&parent);
-        assert_eq!(child.parent_span_id, parent.span_context.span_id());
     }
 
     #[tokio::test]
