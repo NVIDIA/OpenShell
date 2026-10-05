@@ -81,8 +81,10 @@ protobuf check. It reviews public Rust, Python, Go, and TypeScript SDKs, API
 behavior, CLI contracts, configuration, policy, Helm, and persisted state.
 It does not replace Buf or change the release train's version.
 
-The reviewer uses the standard Codex CLI through the same NVIDIA endpoint,
-model, medium reasoning effort, and `CODEX_SECURITY_API_KEY` as Codex Security.
+The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
+runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
+`CODEX_SECURITY_API_KEY` as Codex Security. The workflow uses `uv run` from the
+existing Nix devShell; the SDK is not an OpenShell package dependency.
 It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
 repository; candidate-side agent configuration and instructions are not loaded.
 It does not run candidate builds or tests. The review has a 30-minute execution

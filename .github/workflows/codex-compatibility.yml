@@ -38,17 +38,19 @@ jobs:
     timeout-minutes: 40
     continue-on-error: true
     steps:
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Check out review tooling and release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "26"
-          package-manager-cache: false
+          ref: ${{ github.workflow_sha }}
+          path: review-tools
+          fetch-depth: 0
+          persist-credentials: false
 
-      # Install outside the checkout before repository npm configuration exists.
-      - name: Install Codex CLI
-        run: |
-          npm install --prefix "$RUNNER_TEMP/compatibility-codex" \
-            --ignore-scripts --no-audit --no-fund @openai/codex@0.160.0
+      - name: Set up Nix
+        uses: ./review-tools/.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          shell-installable: ./review-tools
 
       # Ubuntu's AppArmor restriction otherwise prevents the Codex Linux sandbox
       # from creating its network namespace. The read-only sandbox stays enabled.
@@ -58,25 +60,18 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Check out review tooling and release history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: review-tools
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Review cumulative compatibility
         id: review
         working-directory: review-tools
+        shell: nix develop --no-write-lock-file -c bash -euo pipefail {0}
         env:
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
           SOURCE_SHA: ${{ inputs.source_sha || '' }}
           NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
         run: |
-          python3 tasks/scripts/codex_compatibility.py "$CANDIDATE_REF" \
+          uv run --no-project --with openai-codex==0.160.0 \
+            python tasks/scripts/codex_compatibility.py "$CANDIDATE_REF" \
             --source-sha "$SOURCE_SHA" \
-            --codex-bin "$RUNNER_TEMP/compatibility-codex/node_modules/.bin/codex" \
             --output-dir "$RUNNER_TEMP/compatibility-report"
 
       - name: Summarize advisory review

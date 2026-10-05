@@ -4,13 +4,17 @@
 """Run an advisory, cumulative release compatibility review with Codex."""
 
 import argparse
+import asyncio
 import json
 import os
 import re
 import subprocess
 import tempfile
+from importlib.metadata import version
 from pathlib import Path
 
+# Installed only in the review workflow's isolated Python environment.
+import openai_codex  # ty: ignore[unresolved-import]
 from check_proto_compatibility import git, train_policy
 from codex_compatibility_report import validate_review, write_report
 
@@ -40,7 +44,7 @@ def resolve_candidate(tag: str, expected_sha: str) -> dict:
     }
 
 
-def invoke_codex(binary: str, context: dict, directory: Path) -> dict:
+async def invoke_codex(context: dict, directory: Path) -> dict:
     # Git objects expose both revisions without loading candidate-side agent
     # instructions, configuration, skills, or hooks into the review workspace.
     subprocess.run(
@@ -56,29 +60,8 @@ def invoke_codex(binary: str, context: dict, directory: Path) -> dict:
         check=True,
         capture_output=True,
     )
-    response = directory / "response.json"
-    command = [
-        binary,
-        "exec",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
-        "--color",
-        "never",
-        "--model",
-        MODEL,
-        "--output-schema",
-        str(ASSETS / "compatibility-review.schema.json"),
-        "--output-last-message",
-        str(response),
-    ]
-    for setting in (
-        'approval_policy="never"',
+    settings = (
         "allow_login_shell=false",
-        'model_provider="nvidia"',
         'model_providers.nvidia.name="NVIDIA Inference"',
         f'model_providers.nvidia.base_url="{ENDPOINT}"',
         'model_providers.nvidia.env_key="NVIDIA_INFERENCE_API_KEY"',
@@ -93,30 +76,40 @@ def invoke_codex(binary: str, context: dict, directory: Path) -> dict:
         "features.multi_agent_v2=false",
         'shell_environment_policy.inherit="none"',
         "shell_environment_policy.ignore_default_excludes=false",
-    ):
-        command += ["-c", setting]
+    )
     prompt = (ASSETS / "compatibility-review.md").read_text()
     prompt += "\nReview context:\n" + json.dumps(context)
+    schema = json.loads((ASSETS / "compatibility-review.schema.json").read_text())
+    codex = openai_codex.AsyncCodex(
+        openai_codex.CodexConfig(cwd=str(directory), config_overrides=settings)
+    )
     # Raw agent output can include inspected source or tool output. Publish only
     # the validated final report, never the transcript or credential environment.
-    subprocess.run(
-        [*command, "-"],
-        input=prompt,
-        cwd=directory,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-        timeout=1800,
-    )
-    review = json.loads(response.read_text())
+    try:
+        async with asyncio.timeout(1800):
+            thread = await codex.thread_start(
+                cwd=str(directory),
+                model=MODEL,
+                model_provider="nvidia",
+                sandbox=openai_codex.Sandbox.read_only,
+                approval_mode=openai_codex.ApprovalMode.deny_all,
+                ephemeral=True,
+            )
+            result = await thread.run(prompt, output_schema=schema)
+    except (openai_codex.CodexError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            f"Codex SDK review failed ({type(error).__name__}); no assessment is available."
+        ) from None
+    finally:
+        await codex.close()
+    if result.status.value != "completed" or not result.final_response:
+        raise ValueError("Codex did not complete the compatibility review.")
+    review = json.loads(result.final_response)
     validate_review(review)
     return review
 
 
-def run_review(
-    tag: str, expected_sha: str, output: Path, binary: str = "codex"
-) -> dict:
+def run_review(tag: str, expected_sha: str, output: Path) -> dict:
     result = {
         "schema_version": 1,
         "advisory": True,
@@ -127,6 +120,7 @@ def run_review(
         "model": MODEL,
         "reasoning_effort": "medium",
         "codex_version": "",
+        "codex_sdk_version": "",
         "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA", ""),
         "run_id": os.environ.get("GITHUB_RUN_ID", ""),
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
@@ -135,20 +129,18 @@ def run_review(
         result["context"] = resolve_candidate(tag, expected_sha)
         if not os.environ.get("NVIDIA_INFERENCE_API_KEY"):
             raise ValueError("NVIDIA inference credential is missing.")
-        result["codex_version"] = subprocess.check_output(
-            [binary, "--version"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        ).strip()
+        result["codex_version"] = version("openai-codex-cli-bin")
+        result["codex_sdk_version"] = version("openai-codex")
         with tempfile.TemporaryDirectory(
             prefix="openshell-compatibility-"
         ) as temporary:
-            result["review"] = invoke_codex(binary, result["context"], Path(temporary))
+            result["review"] = asyncio.run(
+                invoke_codex(result["context"], Path(temporary))
+            )
         result["status"] = (
             "incomplete" if result["review"]["unreviewed_surfaces"] else "complete"
         )
-    except subprocess.TimeoutExpired:
+    except TimeoutError:
         result["error"] = "Compatibility review exceeded its time limit."
     except subprocess.CalledProcessError as error:
         result["error"] = (
@@ -173,11 +165,8 @@ def main() -> None:
         "--source-sha", default="", help="Expected qualification commit."
     )
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--codex-bin", default="codex")
     args = parser.parse_args()
-    result = run_review(
-        args.candidate, args.source_sha, args.output_dir, args.codex_bin
-    )
+    result = run_review(args.candidate, args.source_sha, args.output_dir)
     verdict = result["review"]["verdict"] if result["review"] else "unavailable"
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a") as handle:
