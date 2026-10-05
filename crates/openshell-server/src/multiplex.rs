@@ -2592,8 +2592,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_primary_gateway_reflection_advertises_only_public_services() {
+    async fn reflection_protocol_serves_complete_public_descriptors_and_recovers_from_errors() {
         use crate::auth::authenticator::test_support::MockAuthenticator;
+        use prost_reflect::{DescriptorPool, Value};
         use tonic_reflection::pb::v1::{
             ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
             server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
@@ -2647,8 +2648,23 @@ mod tests {
                 "openshell.v1.OpenShell".to_string(),
             )),
         };
+        let missing_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.DoesNotExist".to_string(),
+            )),
+        };
+        let list_after_error_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
         let mut responses = client
-            .server_reflection_info(tokio_stream::iter([list_request, descriptor_request]))
+            .server_reflection_info(tokio_stream::iter([
+                list_request,
+                descriptor_request,
+                missing_request,
+                list_after_error_request,
+            ]))
             .await
             .unwrap()
             .into_inner();
@@ -2672,11 +2688,92 @@ mod tests {
         else {
             panic!("expected a reflection file-descriptor response");
         };
-        let descriptor = prost_types::FileDescriptorProto::decode(
-            response.file_descriptor_proto.first().unwrap().as_slice(),
-        )
-        .unwrap();
-        assert_eq!(descriptor.name.as_deref(), Some("openshell.proto"));
+        let mut reflected_pool = DescriptorPool::new();
+        for descriptor in &response.file_descriptor_proto {
+            reflected_pool
+                .decode_file_descriptor_proto(descriptor.as_slice())
+                .unwrap();
+        }
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.OpenShell")
+                .is_some(),
+            "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_message_by_name("openshell.v1.HealthRequest")
+                .is_some(),
+            "the response must include imported public message descriptors"
+        );
+
+        let source_pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let source_auth = source_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let reflected_auth = reflected_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let source_health = source_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let reflected_health = reflected_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let source_options = source_health.options();
+        let reflected_options = reflected_health.options();
+        let Value::Message(source_auth_value) = &*source_options.get_extension(&source_auth) else {
+            panic!("source authorization option must be a message");
+        };
+        let Value::Message(reflected_auth_value) =
+            &*reflected_options.get_extension(&reflected_auth)
+        else {
+            panic!("reflected authorization option must be a message");
+        };
+        assert_eq!(
+            source_auth_value.encode_to_vec(),
+            reflected_auth_value.encode_to_vec()
+        );
+
+        let source_secret = source_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let reflected_secret = reflected_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let source_field = source_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        let reflected_field = reflected_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        assert_eq!(
+            source_field.options().get_extension(&source_secret),
+            reflected_field.options().get_extension(&reflected_secret),
+            "secret-field annotations must retain their original value"
+        );
+
+        let error_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = error_response.message_response else {
+            panic!("expected an in-band reflection error response");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+
+        let response_after_error = responses.message().await.unwrap().unwrap();
+        assert!(matches!(
+            response_after_error.message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
         server.abort();
     }
 
@@ -2736,11 +2833,10 @@ mod tests {
 
     #[test]
     fn reflection_descriptor_excludes_internal_service_protos() {
-        let descriptors = crate::reflection::gateway_reflection_descriptor_set().unwrap();
+        let descriptors = crate::reflection::gateway_reflection_descriptors().unwrap();
         let names: std::collections::BTreeSet<_> = descriptors
-            .file
             .iter()
-            .filter_map(|file| file.name.as_deref())
+            .map(prost_reflect::FileDescriptor::name)
             .collect();
 
         assert!(names.contains("openshell.proto"));

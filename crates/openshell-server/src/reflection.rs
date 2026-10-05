@@ -6,8 +6,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use prost::Message;
-use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto, FileDescriptorSet};
+use prost_reflect::{DescriptorError, DescriptorPool, FileDescriptor};
+use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
@@ -17,8 +17,8 @@ use tonic_reflection::pb::v1::server_reflection_server::{
     ServerReflection, ServerReflectionServer,
 };
 use tonic_reflection::pb::v1::{
-    ExtensionNumberResponse, FileDescriptorResponse, ListServiceResponse, ServerReflectionRequest,
-    ServerReflectionResponse, ServiceResponse,
+    ErrorResponse, ExtensionNumberResponse, FileDescriptorResponse, ListServiceResponse,
+    ServerReflectionRequest, ServerReflectionResponse, ServiceResponse,
 };
 
 use openshell_core::Config;
@@ -31,8 +31,8 @@ const ADVERTISED_SERVICES: &[&str] = &["openshell.v1.OpenShell"];
 pub type GatewayReflectionServer = ServerReflectionServer<GatewayReflectionService>;
 
 /// Decode and filter the compiled descriptors to the public gateway schema.
-pub fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::DecodeError> {
-    let mut descriptor_set = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)?;
+pub fn gateway_reflection_descriptors() -> Result<Vec<FileDescriptor>, DescriptorError> {
+    let descriptor_pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)?;
     let mut included: BTreeSet<String> = REFLECTED_PROTO_ROOTS
         .iter()
         .map(|name| (*name).to_string())
@@ -40,13 +40,12 @@ pub fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::D
 
     loop {
         let before = included.len();
-        for file in &descriptor_set.file {
-            if file
-                .name
-                .as_ref()
-                .is_some_and(|name| included.contains(name))
-            {
-                included.extend(file.dependency.iter().cloned());
+        for file in descriptor_pool.files() {
+            if included.contains(file.name()) {
+                included.extend(
+                    file.dependencies()
+                        .map(|dependency| dependency.name().to_string()),
+                );
             }
         }
         if included.len() == before {
@@ -54,22 +53,19 @@ pub fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::D
         }
     }
 
-    descriptor_set.file.retain(|file| {
-        file.name
-            .as_ref()
-            .is_some_and(|name| included.contains(name))
-    });
-    Ok(descriptor_set)
+    Ok(descriptor_pool
+        .files()
+        .filter(|file| included.contains(file.name()))
+        .collect())
 }
 
 /// Build the immutable reflection index once at gateway service startup.
 pub fn build_gateway_reflection_service(
     config: &Config,
-) -> Result<GatewayReflectionServer, prost::DecodeError> {
-    let mut descriptors = gateway_reflection_descriptor_set()?;
+) -> Result<GatewayReflectionServer, DescriptorError> {
+    let mut descriptors = gateway_reflection_descriptors()?;
     descriptors
-        .file
-        .extend(FileDescriptorSet::decode(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)?.file);
+        .extend(DescriptorPool::decode(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)?.files());
 
     let state = ReflectionState::new(descriptors);
     Ok(ServerReflectionServer::new(GatewayReflectionService {
@@ -80,36 +76,48 @@ pub fn build_gateway_reflection_service(
 
 #[derive(Debug)]
 struct ReflectionState {
-    files: HashMap<String, Arc<FileDescriptorProto>>,
-    symbols: HashMap<String, Arc<FileDescriptorProto>>,
+    files: HashMap<String, Arc<ReflectionFile>>,
+    symbols: HashMap<String, Arc<ReflectionFile>>,
+}
+
+#[derive(Debug)]
+struct ReflectionFile {
+    descriptor: FileDescriptorProto,
+    encoded: Vec<u8>,
 }
 
 impl ReflectionState {
-    fn new(descriptors: FileDescriptorSet) -> Self {
+    fn new(descriptors: Vec<FileDescriptor>) -> Self {
         let mut state = Self {
             files: HashMap::new(),
             symbols: HashMap::new(),
         };
-        for descriptor in descriptors.file {
-            let Some(name) = descriptor.name.clone() else {
-                continue;
-            };
-            let descriptor = Arc::new(descriptor);
+        for descriptor in descriptors {
+            let name = descriptor.name().to_string();
+            let descriptor = Arc::new(ReflectionFile {
+                descriptor: descriptor.file_descriptor_proto().clone(),
+                encoded: descriptor.encode_to_vec(),
+            });
             state.process_file(descriptor.clone());
             state.files.insert(name, descriptor);
         }
         state
     }
 
-    fn process_file(&mut self, file: Arc<FileDescriptorProto>) {
-        let prefix = file.package.as_deref().unwrap_or_default().to_string();
-        for message in &file.message_type {
+    fn process_file(&mut self, file: Arc<ReflectionFile>) {
+        let prefix = file
+            .descriptor
+            .package
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        for message in &file.descriptor.message_type {
             self.process_message(file.clone(), &prefix, message);
         }
-        for enumeration in &file.enum_type {
+        for enumeration in &file.descriptor.enum_type {
             self.process_enum(file.clone(), &prefix, enumeration);
         }
-        for service in &file.service {
+        for service in &file.descriptor.service {
             let Some(name) = service.name.as_deref() else {
                 continue;
             };
@@ -126,7 +134,7 @@ impl ReflectionState {
 
     fn process_message(
         &mut self,
-        file: Arc<FileDescriptorProto>,
+        file: Arc<ReflectionFile>,
         prefix: &str,
         message: &DescriptorProto,
     ) {
@@ -157,7 +165,7 @@ impl ReflectionState {
 
     fn process_enum(
         &mut self,
-        file: Arc<FileDescriptorProto>,
+        file: Arc<ReflectionFile>,
         prefix: &str,
         enumeration: &EnumDescriptorProto,
     ) {
@@ -174,25 +182,55 @@ impl ReflectionState {
         }
     }
 
-    fn encode_file(file: &FileDescriptorProto) -> Result<Vec<u8>, Status> {
-        let mut encoded = Vec::new();
-        file.encode(&mut encoded)
-            .map_err(|_| Status::internal("failed to encode reflection descriptor"))?;
-        Ok(encoded)
+    fn file_by_name(&self, name: &str) -> Result<Arc<ReflectionFile>, Status> {
+        self.files
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("file '{name}' not found")))
     }
 
-    fn file_by_name(&self, name: &str) -> Result<Vec<u8>, Status> {
-        self.files.get(name).map_or_else(
-            || Err(Status::not_found(format!("file '{name}' not found"))),
-            |file| Self::encode_file(file),
-        )
+    fn file_by_symbol(&self, symbol: &str) -> Result<Arc<ReflectionFile>, Status> {
+        self.symbols
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("symbol '{symbol}' not found")))
     }
 
-    fn file_by_symbol(&self, symbol: &str) -> Result<Vec<u8>, Status> {
-        self.symbols.get(symbol).map_or_else(
-            || Err(Status::not_found(format!("symbol '{symbol}' not found"))),
-            |file| Self::encode_file(file),
-        )
+    fn file_with_dependencies(
+        &self,
+        file: Arc<ReflectionFile>,
+        sent: &mut BTreeSet<String>,
+    ) -> Result<Vec<Vec<u8>>, Status> {
+        let mut descriptors = Vec::new();
+        self.collect_file_with_dependencies(file, sent, &mut descriptors)?;
+        Ok(descriptors)
+    }
+
+    fn collect_file_with_dependencies(
+        &self,
+        file: Arc<ReflectionFile>,
+        sent: &mut BTreeSet<String>,
+        descriptors: &mut Vec<Vec<u8>>,
+    ) -> Result<(), Status> {
+        let name = file
+            .descriptor
+            .name
+            .as_deref()
+            .ok_or_else(|| Status::internal("reflection descriptor is missing its filename"))?;
+        if !sent.insert(name.to_string()) {
+            return Ok(());
+        }
+
+        for dependency in &file.descriptor.dependency {
+            let dependency = self.files.get(dependency).cloned().ok_or_else(|| {
+                Status::internal(format!(
+                    "reflection descriptor '{name}' has unavailable dependency '{dependency}'"
+                ))
+            })?;
+            self.collect_file_with_dependencies(dependency, sent, descriptors)?;
+        }
+        descriptors.push(file.encoded.clone());
+        Ok(())
     }
 }
 
@@ -225,6 +263,7 @@ impl ServerReflection for GatewayReflectionService {
         let limiter = self.limiter.clone();
 
         tokio::spawn(async move {
+            let mut sent_descriptors = BTreeSet::new();
             while let Some(request) = requests.next().await {
                 let Ok(request) = request else {
                     return;
@@ -239,20 +278,26 @@ impl ServerReflection for GatewayReflectionService {
                 }
 
                 let response = match request.message_request.as_ref() {
-                    Some(MessageRequest::FileByFilename(name)) => {
-                        state.file_by_name(name).map(|descriptor| {
-                            MessageResponse::FileDescriptorResponse(FileDescriptorResponse {
-                                file_descriptor_proto: vec![descriptor],
-                            })
+                    Some(MessageRequest::FileByFilename(name)) => state
+                        .file_by_name(name)
+                        .and_then(|descriptor| {
+                            state.file_with_dependencies(descriptor, &mut sent_descriptors)
                         })
-                    }
-                    Some(MessageRequest::FileContainingSymbol(symbol)) => {
-                        state.file_by_symbol(symbol).map(|descriptor| {
+                        .map(|descriptors| {
                             MessageResponse::FileDescriptorResponse(FileDescriptorResponse {
-                                file_descriptor_proto: vec![descriptor],
+                                file_descriptor_proto: descriptors,
                             })
+                        }),
+                    Some(MessageRequest::FileContainingSymbol(symbol)) => state
+                        .file_by_symbol(symbol)
+                        .and_then(|descriptor| {
+                            state.file_with_dependencies(descriptor, &mut sent_descriptors)
                         })
-                    }
+                        .map(|descriptors| {
+                            MessageResponse::FileDescriptorResponse(FileDescriptorResponse {
+                                file_descriptor_proto: descriptors,
+                            })
+                        }),
                     Some(MessageRequest::FileContainingExtension(_)) => {
                         Err(Status::not_found("extensions are not supported"))
                     }
@@ -286,8 +331,17 @@ impl ServerReflection for GatewayReflectionService {
                         }
                     }
                     Err(status) => {
-                        let _ = responses_tx.send(Err(status)).await;
-                        return;
+                        let response = ServerReflectionResponse {
+                            valid_host: request.host.clone(),
+                            original_request: Some(request),
+                            message_response: Some(MessageResponse::ErrorResponse(ErrorResponse {
+                                error_code: status.code() as i32,
+                                error_message: status.message().to_string(),
+                            })),
+                        };
+                        if responses_tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
