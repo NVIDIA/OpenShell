@@ -99,6 +99,15 @@
             deb: /var/tmp/openshell-upgrade-target.deb
             allow_downgrade: true
 
+        - name: Select candidate runtime images through the package environment
+          ansible.builtin.copy:
+            dest: /home/tmachine/.config/openshell/gateway.env
+            mode: "0600"
+            content: |
+              OPENSHELL_COMPUTE_DRIVER=docker
+              OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
+              OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
+
         - name: Restart packaged OpenShell gateway service
           ansible.builtin.systemd_service:
             name: openshell-gateway.service
@@ -178,7 +187,7 @@
               sudo docker logs "${container}" 2>&1
             done
             sudo docker images
-            sudo cat /var/lib/openshell-qualification/gateway.toml
+            cat /home/tmachine/.config/openshell/gateway.env
           args:
             executable: /bin/bash
           environment: "{{ user_systemd_environment }}"

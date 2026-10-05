@@ -45,6 +45,10 @@
       OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
       OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 
+- name: Prepare legacy upgrade source image configuration
+  when: openshell_packaged_gateway_legacy_images | default(false) | bool
+  ansible.builtin.include_tasks: legacy-images.yaml
+
 - name: Start gateway user manager
   ansible.builtin.include_role:
     name: tmachine_user_manager

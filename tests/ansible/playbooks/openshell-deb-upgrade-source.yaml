@@ -4,6 +4,8 @@
 ---
 - name: Install prerelease OpenShell Debian upgrade source
   ansible.builtin.import_playbook: openshell-deb.yaml
+  vars:
+    openshell_packaged_gateway_legacy_images: true
 
 - name: Record OpenShell Debian upgrade source
   hosts: all

@@ -220,18 +220,6 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-images.yml
 
-  build-deb:
-    name: Build Debian packages
-    needs: [pr_metadata, version, build-binaries, build-vm-driver]
-    if: needs.pr_metadata.outputs.run_integration == 'true'
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/deb-package.yml
-    with:
-      checkout-ref: ${{ github.sha }}
-      deb-version: ${{ needs.version.outputs.deb_version }}
-
   build-rpm:
     name: Build RPM packages
     needs: [pr_metadata, version, build-binaries]

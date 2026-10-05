@@ -4,6 +4,8 @@
 ---
 - name: Install prerelease OpenShell RPM upgrade source
   ansible.builtin.import_playbook: openshell-rpm.yaml
+  vars:
+    openshell_packaged_gateway_legacy_images: true
 
 - name: Record OpenShell RPM upgrade source
   hosts: all

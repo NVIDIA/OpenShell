@@ -136,9 +136,9 @@ mod tests {
     // decoding or deadline updates cannot claim an existing attempt.
     // NetworkEndpoint retains pre.4 string fields and uses new tags for enums.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
+        "75dc8ba3eea1457d0ffed3a2eee1a0ea471e3cb5743b819d7707592805ebf01a";
     const DURABLE_SCHEMA_SHA256: &str =
-        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
+        "56baed61dd3b61272e648d60fcb6b37f4a71c6c6b192f1e3cb086f28df420bf1";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
