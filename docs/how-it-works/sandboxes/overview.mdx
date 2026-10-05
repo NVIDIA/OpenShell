@@ -468,14 +468,17 @@ with SandboxClient.from_active_cluster(client_credentials=auth) as client:
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
 
 Expose the unnamed service as part of sandbox creation when the sandbox's main
-process starts the server:
+process starts the server. This example uses a Python image because the
+[built-in default workload image](/about/support-matrix#workload-images) does
+not include Python:
 
 ```shell
 openshell sandbox create \
   --name my-sandbox \
+  --from docker.io/library/python:3.14-slim \
   --expose 8080 \
   --detach \
-  -- python -m http.server 8080 --bind 127.0.0.1
+  -- python3 -m http.server 8080 --bind 127.0.0.1
 ```
 
 The CLI includes the unnamed endpoint in the sandbox create request and prints
