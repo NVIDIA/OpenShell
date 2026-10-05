@@ -412,6 +412,7 @@ Booleans are rejected because they would otherwise convert to 1 or 0.
 {{- fail (printf "%s must be an integer between 1 and 4294967294" .name) -}}
 {{- end -}}
 {{- $id -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -516,6 +517,14 @@ absent fields so every chart consumer observes the same configuration.
 {{- end -}}
 {{- range $legacyKey, $runtimeKey := dict "workspaceDefaultStorageSize" "workspace_default_storage_size" "workspaceStorageClass" "workspace_storage_class" "defaultRuntimeClassName" "default_runtime_class_name" -}}
 {{- if and (get $legacyServer $legacyKey) (not (hasKey $kubernetes $runtimeKey)) -}}{{- $_ := set $kubernetes $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- if not (hasKey $kubernetes "sandbox_uid") -}}
+{{- $sandboxUid := include "openshell.sandboxId" (dict "name" "server.sandboxUid" "value" (get $legacyServer "sandboxUid")) -}}
+{{- if ne $sandboxUid "" -}}{{- $_ := set $kubernetes "sandbox_uid" (int64 $sandboxUid) -}}{{- end -}}
+{{- end -}}
+{{- if not (hasKey $kubernetes "sandbox_gid") -}}
+{{- $sandboxGid := include "openshell.sandboxId" (dict "name" "server.sandboxGid" "value" (get $legacyServer "sandboxGid")) -}}
+{{- if ne $sandboxGid "" -}}{{- $_ := set $kubernetes "sandbox_gid" (int64 $sandboxGid) -}}{{- end -}}
 {{- end -}}
 {{- $legacySpiffe := .Values.server.providerTokenGrants.spiffe | default dict -}}
 {{- if and (get $legacySpiffe "enabled") (not (hasKey $kubernetes "provider_spiffe_workload_api_socket_path")) -}}
