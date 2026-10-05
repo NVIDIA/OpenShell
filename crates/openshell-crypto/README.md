@@ -168,7 +168,9 @@ and an actual TLS handshake after process-default preemption.
 `cargo test -p openshell-crypto --no-default-features --test independent_backend`
 exercises independent test-only key and AEAD implementations without AWS-LC or
 Ring. Inspect that boundary with
-`cargo tree -p openshell-crypto --no-default-features --edges normal,build`.
+`cargo tree -p openshell-crypto --no-default-features --edges normal,build,dev`.
+Branch Checks runs this test separately from workspace tests and rejects Ring or
+AWS-LC in the dependency tree, including build and test dependencies.
 Existing bootstrap, credential-store, gateway TLS/OIDC, and proxy tests exercise the
 migrated consumers. The cargo-deny Ring restrictions and their explicit wrapper
 exceptions remain in force.
