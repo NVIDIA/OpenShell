@@ -653,7 +653,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
     };
 
     // Match the binary's process setup before exercising the shared library.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let root = PathBuf::from(root);
     let rules = root.join("policy.rego");
     let data = root.join("policy.yaml");

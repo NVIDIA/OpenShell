@@ -124,7 +124,9 @@ impl Attempt {
     pub fn create(cache_root: &Path) -> io::Result<Self> {
         let root = cache_root.join(ATTEMPTS_DIR);
         fs::create_dir_all(&root)?;
-        let name = format!("attempt-{:032x}", rand::random::<u128>());
+        let random =
+            u128::from_ne_bytes(openshell_crypto::random_bytes::<16>().map_err(io::Error::other)?);
+        let name = format!("attempt-{random:032x}");
         let directory = root.join(&name);
         let lease_path = root.join(format!("{name}.lease"));
         let mut lease = OpenOptions::new()
