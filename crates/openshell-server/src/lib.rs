@@ -824,6 +824,11 @@ pub(crate) async fn run_server(
         })?;
 
     let gateway_listener = bind_gateway_listener(config.bind_address).await?;
+    let service_listener = if let Some(address) = config.service_bind_address {
+        Some(bind_gateway_listener(address).await?)
+    } else {
+        None
+    };
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -897,14 +902,38 @@ pub(crate) async fn run_server(
         None
     };
 
+    // Dedicated ingress never requests control-plane client certificates.
+    // Reuse server certificates and SNI selection, with independent reload.
+    let service_tls_acceptor = if service_listener.is_some() {
+        if let Some(tls) = &config.tls {
+            let acceptor = TlsAcceptor::for_service_ingress(tls)?;
+            acceptor.spawn_reload_worker(shutdown_rx.clone());
+            Some(acceptor)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     let listener_task = tokio::spawn(serve_gateway_listener(
         gateway_listener,
         service.clone(),
         tls_acceptor.clone(),
-        enable_loopback_service_http,
+        enable_loopback_service_http && service_listener.is_none(),
+        ListenerKind::ControlPlane,
         shutdown_rx.clone(),
     ));
+    let service_listener_task = service_listener.map(|listener| {
+        tokio::spawn(serve_gateway_listener(
+            listener,
+            service.clone(),
+            service_tls_acceptor,
+            enable_loopback_service_http,
+            ListenerKind::ServiceIngress,
+            shutdown_rx.clone(),
+        ))
+    });
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
@@ -964,6 +993,11 @@ pub(crate) async fn run_server(
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
+    if let Some(task) = service_listener_task
+        && let Err(err) = task.await
+    {
+        warn!(error = %err, "Service ingress listener task failed during shutdown");
+    }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
     // A stopped supervisor may still have a detached task deleting its owner
@@ -982,11 +1016,18 @@ pub(crate) async fn run_server(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ListenerKind {
+    ControlPlane,
+    ServiceIngress,
+}
+
 async fn serve_gateway_listener(
     bound_listener: BoundGatewayListener,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
+    kind: ListenerKind,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let BoundGatewayListener {
@@ -1021,6 +1062,7 @@ async fn serve_gateway_listener(
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
+            kind,
         );
     }
 }
@@ -1089,6 +1131,7 @@ fn spawn_gateway_connection(
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
+    kind: ListenerKind,
 ) {
     if let Some(acceptor) = tls_acceptor {
         tokio::spawn(async move {
@@ -1122,10 +1165,17 @@ fn spawn_gateway_connection(
                     match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
-                            if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
-                                .await
-                            {
+                            let result = match kind {
+                                ListenerKind::ControlPlane => {
+                                    service
+                                        .serve_with_peer_identity(tls_stream, peer_identity)
+                                        .await
+                                }
+                                ListenerKind::ServiceIngress => {
+                                    service.serve_service_ingress(tls_stream).await
+                                }
+                            };
+                            if let Err(e) = result {
                                 if is_benign_connection_close(e.as_ref()) {
                                     debug!(error = %e, client = %addr, "Connection closed");
                                 } else {
@@ -1149,7 +1199,11 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            let result = match kind {
+                ListenerKind::ControlPlane => service.serve(stream).await,
+                ListenerKind::ServiceIngress => service.serve_service_ingress(stream).await,
+            };
+            if let Err(e) = result {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -2181,6 +2235,7 @@ mod tests {
             service,
             Some(tls_acceptor),
             enable_loopback_service_http,
+            super::ListenerKind::ControlPlane,
             shutdown_rx,
         ));
         (listen_addr, shutdown_tx, handle, tls_dir)
@@ -2209,6 +2264,171 @@ mod tests {
             panic!("failed to read response: {err}");
         }
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    async fn start_split_test_listeners(
+        tls: bool,
+    ) -> (
+        SocketAddr,
+        SocketAddr,
+        watch::Sender<bool>,
+        Vec<tokio::task::JoinHandle<()>>,
+        TempDir,
+    ) {
+        let primary = bind_gateway_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let ingress = bind_gateway_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let primary_addr = primary.address;
+        let ingress_addr = ingress.address;
+        let (dir, _) = test_tls_acceptor();
+        let mut state = test_state(primary_addr, false).await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.service_bind_address = Some(ingress_addr);
+        config.auth.allow_unauthenticated_users = true;
+        config.enable_websocket_tunnel = true;
+        let tls_config = openshell_core::TlsConfig {
+            cert_path: dir.path().join("server-cert.pem"),
+            key_path: dir.path().join("server-key.pem"),
+            client_ca_path: Some(dir.path().join("ca.pem")),
+            require_client_auth: true,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        };
+        let primary_tls = tls.then(|| {
+            TlsAcceptor::from_files(
+                &tls_config.cert_path,
+                &tls_config.key_path,
+                tls_config.client_ca_path.as_deref(),
+                true,
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+        });
+        let ingress_tls = tls.then(|| {
+            let acceptor = TlsAcceptor::for_service_ingress(&tls_config).unwrap();
+            // Reload must preserve the service listener's TLS policy too.
+            acceptor.reload().unwrap();
+            acceptor
+        });
+        let service = MultiplexService::new(state);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handles = vec![
+            tokio::spawn(serve_gateway_listener(
+                primary,
+                service.clone(),
+                primary_tls,
+                false,
+                super::ListenerKind::ControlPlane,
+                shutdown_rx.clone(),
+            )),
+            tokio::spawn(serve_gateway_listener(
+                ingress,
+                service,
+                ingress_tls,
+                false,
+                super::ListenerKind::ServiceIngress,
+                shutdown_rx,
+            )),
+        ];
+        (primary_addr, ingress_addr, shutdown_tx, handles, dir)
+    }
+
+    #[tokio::test]
+    async fn split_listeners_separate_gateway_rpc_and_service_routes() {
+        let (primary, ingress, shutdown, handles, _dir) = start_split_test_listeners(false).await;
+        let mut client = OpenShellClient::connect(format!("http://{primary}"))
+            .await
+            .unwrap();
+        let response = client.health(HealthRequest {}).await.unwrap();
+        assert_eq!(
+            response
+                .metadata()
+                .get(openshell_core::config::SERVICE_PORT_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            ingress.port().to_string()
+        );
+
+        let mut ingress_client = OpenShellClient::connect(format!("http://{ingress}"))
+            .await
+            .unwrap();
+        assert!(ingress_client.health(HealthRequest {}).await.is_err());
+        let response = send_plain_http(primary, service_request(primary, &[])).await;
+        assert!(response.starts_with("HTTP/1.1 404"));
+        assert!(!response.contains("Service endpoint not found"));
+        let response = send_plain_http(ingress, service_request(ingress, &[])).await;
+        assert!(response.contains("Service endpoint not found"));
+
+        for path in ["/auth/connect", "/_ws_tunnel", "/healthz", "/metrics"] {
+            let response = send_plain_http(
+                ingress,
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+        }
+        shutdown.send(true).unwrap();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn split_service_tls_does_not_require_control_plane_client_certificate() {
+        let (primary, ingress, shutdown, handles, dir) = start_split_test_listeners(true).await;
+        let ca = reqwest::Certificate::from_pem(&std::fs::read(dir.path().join("ca.pem")).unwrap())
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(ca)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        // Trusted server certificate, but no client certificate: only ingress accepts it.
+        assert!(
+            client
+                .get(format!("https://localhost:{}/auth/connect", primary.port()))
+                .send()
+                .await
+                .is_err()
+        );
+        let response = client
+            .get(format!("https://localhost:{}/", ingress.port()))
+            .header(
+                "Host",
+                format!(
+                    "default--my-sandbox--web.dev.openshell.localhost:{}",
+                    ingress.port()
+                ),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("Service endpoint not found")
+        );
+        let response = client
+            .get(format!("https://localhost:{}/auth/connect", ingress.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        shutdown.send(true).unwrap();
+        for handle in handles {
+            handle.await.unwrap();
+        }
     }
 
     fn service_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) -> String {

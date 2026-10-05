@@ -44,6 +44,23 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
+    /// Reuse gateway server certificates for service ingress without requesting
+    /// control-plane client certificates.
+    ///
+    /// # Errors
+    /// Returns an error if the server certificate or key cannot be loaded.
+    pub fn for_service_ingress(tls: &openshell_core::TlsConfig) -> Result<Self> {
+        Self::from_files(
+            &tls.cert_path,
+            &tls.key_path,
+            None,
+            false,
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            tls.external_server_names.clone(),
+        )
+    }
+
     /// Create a new TLS acceptor from certificate and key files.
     ///
     /// When `client_ca_path` is `Some` and `require_client_auth` is `true`,

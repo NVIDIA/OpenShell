@@ -195,6 +195,8 @@ service:
   type: ClusterIP
   # -- Gateway gRPC/HTTP service port.
   port: 8080
+  # -- Dedicated sandbox service ingress port. Set to 0 to share the primary gateway port.
+  ingressPort: 0
   # -- Gateway health service port.
   healthPort: 8081
   # -- Gateway metrics service port.

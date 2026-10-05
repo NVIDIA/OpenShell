@@ -86,13 +86,18 @@ struct RunArgs {
     )]
     name: String,
 
-    /// IP address to bind the server, health, and metrics listeners to.
+    /// IP address to bind the server and auxiliary listeners to.
     #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
     bind_address: IpAddr,
 
     /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
+
+    /// Dedicated sandbox service ingress port. Set to 0 to share the primary
+    /// listener. Use `service_bind_address` in TOML to bind a different interface.
+    #[arg(long, default_value_t = 0, env = "OPENSHELL_SERVICE_PORT")]
+    service_port: u16,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
     /// Set to 0 to disable the dedicated health listener.
@@ -456,13 +461,20 @@ fn prepare_server_config_with_drivers(
     }
     config.mtls_auth.enabled = mtls_auth_enabled;
 
-    // Listener addresses for the health and metrics endpoints. The file may
+    // Listener addresses for service, health, and metrics endpoints. The file may
     // pin a different interface than the main listener (e.g. health on
     // 127.0.0.1 while gRPC binds 0.0.0.0); the full `SocketAddr` from the
-    // file is preserved unless CLI/env supplied an explicit `--health-port` /
-    // `--metrics-port`, in which case the port overrides the file value
+    // file is preserved unless CLI/env supplied an explicit auxiliary port,
+    // in which case the port overrides the file value
     // while the IP defaults to `args.bind_address`.
     let file_gateway = file.as_ref().map(|f| &f.openshell.gateway);
+    let service_bind = resolve_aux_listener(
+        args.bind_address,
+        args.service_port,
+        matches,
+        "service_port",
+        || file_gateway.and_then(|g| g.service_bind_address),
+    );
     let health_bind = resolve_aux_listener(
         args.bind_address,
         args.health_port,
@@ -478,31 +490,16 @@ fn prepare_server_config_with_drivers(
         || file_gateway.and_then(|g| g.metrics_bind_address),
     );
 
+    validate_listener_ports(bind, service_bind, health_bind, metrics_bind)?;
+    if let Some(addr) = service_bind {
+        config = config.with_service_bind_address(addr);
+    }
+
     if let Some(addr) = health_bind {
-        if args.port == addr.port() {
-            return Err(miette::miette!(
-                "--port and --health-port must be different (both set to {})",
-                args.port
-            ));
-        }
         config = config.with_health_bind_address(addr);
     }
 
     if let Some(addr) = metrics_bind {
-        if args.port == addr.port() {
-            return Err(miette::miette!(
-                "--port and --metrics-port must be different (both set to {})",
-                args.port
-            ));
-        }
-        if let Some(health) = health_bind
-            && health.port() == addr.port()
-        {
-            return Err(miette::miette!(
-                "--health-port and --metrics-port must be different (both set to {})",
-                health.port()
-            ));
-        }
         config = config.with_metrics_bind_address(addr);
     }
 
@@ -1016,6 +1013,13 @@ fn validate_preflight_semantics(
         return Err(miette::miette!("gateway name must not be empty"));
     }
 
+    let service_bind = resolve_aux_listener(
+        args.bind_address,
+        args.service_port,
+        matches,
+        "service_port",
+        || gateway.service_bind_address,
+    );
     let health_bind = resolve_aux_listener(
         args.bind_address,
         args.health_port,
@@ -1030,13 +1034,33 @@ fn validate_preflight_semantics(
         "metrics_port",
         || gateway.metrics_bind_address,
     );
-    if health_bind.is_some_and(|address| address.port() == args.port)
-        || metrics_bind.is_some_and(|address| address.port() == args.port)
-        || health_bind
-            .zip(metrics_bind)
-            .is_some_and(|(health, metrics)| health.port() == metrics.port())
+    validate_listener_ports(
+        SocketAddr::new(args.bind_address, args.port),
+        service_bind,
+        health_bind,
+        metrics_bind,
+    )
+}
+
+fn validate_listener_ports(
+    primary: SocketAddr,
+    service: Option<SocketAddr>,
+    health: Option<SocketAddr>,
+    metrics: Option<SocketAddr>,
+) -> Result<()> {
+    if service.is_some_and(|address| address.port() == 0) {
+        return Err(miette::miette!(
+            "service_bind_address requires a nonzero port"
+        ));
+    }
+    let mut ports = std::collections::HashSet::new();
+    for address in [Some(primary), service, health, metrics]
+        .into_iter()
+        .flatten()
     {
-        return Err(miette::miette!("gateway listener ports must be distinct"));
+        if !ports.insert(address.port()) {
+            return Err(miette::miette!("gateway listener ports must be distinct"));
+        }
     }
     Ok(())
 }
@@ -1091,13 +1115,13 @@ fn arg_defaulted(matches: &ArgMatches, id: &str) -> bool {
     )
 }
 
-/// Resolve the bind address for an auxiliary listener (health / metrics).
+/// Resolve the bind address for an auxiliary listener (service / health / metrics).
 ///
 /// The precedence is:
 ///   1. CLI flag or `OPENSHELL_*` env var explicitly set on the corresponding
 ///      port argument → `bind_address:port` (port from CLI, IP from the main
 ///      listener interface).
-///   2. Full `SocketAddr` from `[openshell.gateway].{health,metrics}_bind_address`
+///   2. Full `SocketAddr` from `[openshell.gateway].{service,health,metrics}_bind_address`
 ///      → used as-is (this is how operators pin a loopback-only health port
 ///      on a gateway whose gRPC listener is bound publicly).
 ///   3. Otherwise the listener is disabled (returns `None`).
@@ -1143,7 +1167,7 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
             args.port = addr.port();
         }
     }
-    // Note: file's full health_bind_address / metrics_bind_address are
+    // Note: file's full service / health / metrics bind addresses are
     // consumed in `run_from_args`'s listener-resolution block so the IP
     // half of the SocketAddr is preserved. Copying only the port here
     // would silently relocate a loopback-intended listener onto the
@@ -1312,7 +1336,7 @@ mod tests {
     use super::{Cli, command};
     use crate::TEST_ENV_LOCK as ENV_LOCK;
     use clap::Parser;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static REGISTRY_DETECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -2342,6 +2366,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cases = [
             (
+                "service-listener-collision",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nbind_address = '127.0.0.1:8080'\nservice_bind_address = '0.0.0.0:8080'\ndisable_tls = true\n",
+            ),
+            (
+                "service-listener-zero",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nservice_bind_address = '0.0.0.0:0'\ndisable_tls = true\n",
+            ),
+            (
                 "driver-selector",
                 "[openshell]\nversion = 2\n[openshell.gateway]\ncompute_driver = 'secret-driver-marker'\ndisable_tls = true\n",
             ),
@@ -3076,7 +3108,7 @@ grpc_rate_limit_window_seconds = 30
             "--health-port",
             "9999",
         ]);
-        let file_addr: std::net::SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let file_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
         let resolved = super::resolve_aux_listener(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             9999,
@@ -3089,6 +3121,74 @@ grpc_rate_limit_window_seconds = 30
             Some("0.0.0.0:9999".parse().unwrap()),
             "CLI flag must win over file value"
         );
+    }
+
+    #[test]
+    fn service_listener_preserves_file_interface_and_respects_cli_and_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::remove("OPENSHELL_SERVICE_PORT");
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+service_bind_address = '0.0.0.0:8082'
+",
+        );
+        let file_addr = file.openshell.gateway.service_bind_address;
+        for (flags, expected) in [
+            (vec!["openshell-gateway"], Some("0.0.0.0:8082")),
+            (
+                vec!["openshell-gateway", "--service-port", "8083"],
+                Some("127.0.0.1:8083"),
+            ),
+            (vec!["openshell-gateway", "--service-port", "0"], None),
+        ] {
+            let (args, matches) = parse_with_args(&flags);
+            assert_eq!(
+                super::resolve_aux_listener(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    args.service_port,
+                    &matches,
+                    "service_port",
+                    || file_addr
+                ),
+                expected.map(|address| address.parse().unwrap())
+            );
+        }
+        let _env_override = EnvVarGuard::set("OPENSHELL_SERVICE_PORT", "8084");
+        let (args, matches) = parse_with_args(&["openshell-gateway"]);
+        assert_eq!(
+            super::resolve_aux_listener(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                args.service_port,
+                &matches,
+                "service_port",
+                || file_addr
+            ),
+            Some("127.0.0.1:8084".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn service_listener_rejects_zero_and_collisions_with_all_other_ports() {
+        let primary = "127.0.0.1:8080".parse().unwrap();
+        let health = Some("127.0.0.1:8081".parse().unwrap());
+        let metrics = Some("127.0.0.1:9090".parse().unwrap());
+        for port in [0, 8080, 8081, 9090] {
+            let service = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+            assert!(super::validate_listener_ports(primary, service, health, metrics).is_err());
+        }
+        assert!(
+            super::validate_listener_ports(
+                primary,
+                Some("0.0.0.0:8082".parse().unwrap()),
+                health,
+                metrics
+            )
+            .is_ok()
+        );
+        assert!(super::validate_listener_ports(primary, None, health, metrics).is_ok());
     }
 
     #[test]

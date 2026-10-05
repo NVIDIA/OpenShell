@@ -38,6 +38,16 @@ data:
     [openshell.gateway]
     name                  = {{ .Values.server.name | default (include "openshell.fullname" .) | quote }}
     bind_address          = "0.0.0.0:{{ .Values.service.port }}"
+    {{- if .Values.service.ingressPort }}
+    {{- $ingressPort := int .Values.service.ingressPort }}
+    {{- if or (lt $ingressPort 1) (gt $ingressPort 65535) }}
+    {{- fail "service.ingressPort must be 0 or a port from 1 to 65535" }}
+    {{- end }}
+    {{- if or (eq $ingressPort (int .Values.service.port)) (eq $ingressPort (int .Values.service.healthPort)) (eq $ingressPort (int .Values.service.metricsPort)) }}
+    {{- fail "service.ingressPort must differ from service.port, service.healthPort, and service.metricsPort" }}
+    {{- end }}
+    service_bind_address  = "0.0.0.0:{{ .Values.service.ingressPort }}"
+    {{- end }}
     {{- if .Values.service.healthPort }}
     health_bind_address   = "0.0.0.0:{{ .Values.service.healthPort }}"
     {{- end }}

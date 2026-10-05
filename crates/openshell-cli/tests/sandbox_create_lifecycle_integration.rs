@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,6 +71,7 @@ struct SandboxState {
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
     ready_before_create_returns: Arc<AtomicBool>,
+    service_ingress_port: Arc<AtomicU16>,
     terminal_before_relay: Arc<AtomicBool>,
     terminal_after_provisional_container_exit: Arc<AtomicBool>,
     provisional_container_exit_without_result: Arc<AtomicBool>,
@@ -206,10 +207,18 @@ impl OpenShell for TestOpenShell {
                 SandboxPhase::Provisioning as i32
             },
         );
-        Ok(Response::new(SandboxResponse {
+        let mut response = Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
-        }))
+        });
+        let port = self.state.service_ingress_port.load(Ordering::SeqCst);
+        if port != 0 {
+            response.metadata_mut().insert(
+                openshell_core::config::SERVICE_PORT_METADATA_KEY,
+                port.to_string().parse().unwrap(),
+            );
+        }
+        Ok(response)
     }
 
     async fn stop_sandbox(
@@ -3486,6 +3495,34 @@ async fn sandbox_create_json_stdout_is_parseable() {
         value["service_urls"],
         serde_json::json!({
             "": format!("https://default--sandbox.openshell.localhost:{gateway_port}/")
+        })
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_json_uses_dedicated_ingress_port() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .service_ingress_port
+        .store(8082, Ordering::SeqCst);
+    let result = run_cli_sandbox_create(
+        &server,
+        "dedicated-ingress",
+        &["--output=json", "--expose=4500", "--detach"],
+    )
+    .await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        value["service_urls"],
+        serde_json::json!({
+            "": "https://default--sandbox.openshell.localhost:8082/"
         })
     );
 }

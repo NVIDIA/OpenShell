@@ -701,25 +701,35 @@ pub async fn sandbox_create(
             .collect(),
     };
 
-    let response = match client.create_sandbox(request).await {
-        Ok(resp) => resp,
-        Err(status) if status.code() == Code::AlreadyExists => {
-            return Err(miette::miette!(
-                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
-                status.message()
-            ));
-        }
-        Err(status) => return Err(miette::miette!(status.to_string())),
+    // Drop response metadata before waiting for sandbox lifecycle events.
+    let (sandbox, service_urls) = {
+        let response = match client.create_sandbox(request).await {
+            Ok(resp) => resp,
+            Err(status) if status.code() == Code::AlreadyExists => {
+                return Err(miette::miette!(
+                    "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
+                    status.message()
+                ));
+            }
+            Err(status) => return Err(miette::miette!(status.to_string())),
+        };
+        let dedicated_service_port = service_ingress_port(&response);
+        let response = response.into_inner();
+        let service_urls = response
+            .service_urls
+            .into_iter()
+            .map(|(service, url)| {
+                (
+                    service,
+                    service_url_for_gateway(&url, &effective_server, dedicated_service_port),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let sandbox = response
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
+        (sandbox, service_urls)
     };
-    let response = response.into_inner();
-    let service_urls = response
-        .service_urls
-        .into_iter()
-        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
-        .collect::<HashMap<_, _>>();
-    let sandbox = response
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
     let sandbox_name = if sandbox.object_name().is_empty() {
@@ -1117,10 +1127,7 @@ pub async fn sandbox_create(
                     "\u{2713}".green().bold(),
                 );
                 if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
-                    eprintln!(
-                        "  Access at: {}",
-                        service_url_for_gateway(url, &effective_server)
-                    );
+                    eprintln!("  Access at: {url}");
                 }
             }
 
@@ -4027,7 +4034,7 @@ pub async fn service_expose(
         );
     }
     if !response.url.is_empty() {
-        let url = service_url_for_gateway(&response.url, server);
+        let url = &response.url;
         println!("  URL: {}", url.cyan());
     }
     Ok(())
@@ -4043,7 +4050,7 @@ async fn expose_service_endpoint(
     tls: &TlsOptions,
 ) -> Result<ServiceEndpointResponse> {
     let mut client = grpc_client(server, tls).await?;
-    client
+    let response = client
         .expose_service(ExposeServiceRequest {
             request_id: String::new(),
             sandbox: sandbox.to_string(),
@@ -4056,8 +4063,11 @@ async fn expose_service_endpoint(
             )),
         })
         .await
-        .map_err(service_expose_status_error)
-        .map(tonic::Response::into_inner)
+        .map_err(service_expose_status_error)?;
+    let dedicated_service_port = service_ingress_port(&response);
+    let mut response = response.into_inner();
+    response.url = service_url_for_gateway(&response.url, server, dedicated_service_port);
+    Ok(response)
 }
 
 fn service_expose_status_error(status: Status) -> miette::Report {
@@ -4088,14 +4098,15 @@ pub async fn service_list(
             }),
         })
         .await
-        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
-        .into_inner();
+        .map_err(|status| service_status_error("list services", "sandbox:read", status))?;
+    let dedicated_service_port = service_ingress_port(&response);
+    let response = response.into_inner();
 
     let next_page_token = response.next_page_token.clone();
     let services = response
         .services
         .iter()
-        .filter_map(|response| service_endpoint_to_json(response, server))
+        .filter_map(|response| service_endpoint_to_json(response, server, dedicated_service_port))
         .collect::<Vec<_>>();
     if crate::output::print_paginated_output_collection(
         output,
@@ -4117,7 +4128,12 @@ pub async fn service_list(
         return Ok(());
     }
 
-    print_service_endpoint_table(&response.services, server, all_workspaces);
+    print_service_endpoint_table(
+        &response.services,
+        server,
+        all_workspaces,
+        dedicated_service_port,
+    );
     Ok(())
 }
 
@@ -4138,10 +4154,11 @@ pub async fn service_get(
             name: service.to_string(),
         })
         .await
-        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
-        .into_inner();
+        .map_err(|status| service_status_error("get service", "sandbox:read", status))?;
+    let dedicated_service_port = service_ingress_port(&response);
+    let response = response.into_inner();
 
-    print_service_endpoint_table(&[response], server, false);
+    print_service_endpoint_table(&[response], server, false, dedicated_service_port);
     Ok(())
 }
 
@@ -4212,6 +4229,7 @@ fn print_service_endpoint_table(
     services: &[ServiceEndpointResponse],
     gateway_endpoint: &str,
     all_workspaces: bool,
+    dedicated_service_port: Option<u16>,
 ) {
     let rows = services
         .iter()
@@ -4227,7 +4245,7 @@ fn print_service_endpoint_table(
             let url = if response.url.is_empty() {
                 String::new()
             } else {
-                service_url_for_gateway(&response.url, gateway_endpoint)
+                service_url_for_gateway(&response.url, gateway_endpoint, dedicated_service_port)
             };
             Some((
                 workspace.to_string(),
@@ -4309,6 +4327,7 @@ fn print_service_endpoint_table(
 fn service_endpoint_to_json(
     response: &ServiceEndpointResponse,
     gateway_endpoint: &str,
+    dedicated_service_port: Option<u16>,
 ) -> Option<serde_json::Value> {
     let endpoint = response.endpoint.as_ref()?;
     let workspace = endpoint
@@ -4318,7 +4337,7 @@ fn service_endpoint_to_json(
     let url = if response.url.is_empty() {
         String::new()
     } else {
-        service_url_for_gateway(&response.url, gateway_endpoint)
+        service_url_for_gateway(&response.url, gateway_endpoint, dedicated_service_port)
     };
 
     Some(serde_json::json!({
@@ -4342,25 +4361,32 @@ fn service_authorization_mode_name(mode: i32) -> &'static str {
     }
 }
 
-/// Read gcloud Application Default Credentials from disk.
-///
-/// Returns `(client_id, client_secret, refresh_token)`.
-///
-/// Checks `GOOGLE_APPLICATION_CREDENTIALS` first; falls back to
-/// `$CLOUDSDK_CONFIG/application_default_credentials.json` when set, then to
-/// `~/.config/gcloud/application_default_credentials.json`.
-fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
-    let (Ok(mut service_url), Ok(gateway_endpoint)) = (
-        url::Url::parse(service_url),
-        url::Url::parse(gateway_endpoint),
-    ) else {
+/// Dedicated ingress is independent of externally forwarded control-plane ports.
+fn service_ingress_port<T>(response: &tonic::Response<T>) -> Option<u16> {
+    response
+        .metadata()
+        .get(openshell_core::config::SERVICE_PORT_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+}
+
+fn service_url_for_gateway(
+    service_url: &str,
+    gateway_endpoint: &str,
+    dedicated_service_port: Option<u16>,
+) -> String {
+    let Ok(mut service_url) = url::Url::parse(service_url) else {
         return service_url.to_string();
     };
-
-    if service_url
-        .set_port(gateway_endpoint.port_or_known_default())
-        .is_err()
-    {
+    let port = if let Some(port) = dedicated_service_port {
+        Some(port)
+    } else if let Ok(gateway) = url::Url::parse(gateway_endpoint) {
+        gateway.port_or_known_default()
+    } else {
+        return service_url.to_string();
+    };
+    if service_url.set_port(port).is_err() {
         return service_url.to_string();
     }
 
@@ -6927,7 +6953,7 @@ mod tests {
             url: "https://api.openshell.localhost:3000/".to_string(),
         };
 
-        let value = service_endpoint_to_json(&response, "https://gateway.example:17670")
+        let value = service_endpoint_to_json(&response, "https://gateway.example:17670", None)
             .expect("service endpoint JSON");
         assert_eq!(
             value,
@@ -6940,7 +6966,9 @@ mod tests {
                 "url": "https://api.openshell.localhost:17670/",
             })
         );
-        assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
+        assert!(
+            service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused", None).is_none()
+        );
     }
 
     #[test]
@@ -7633,10 +7661,52 @@ mod tests {
         assert_eq!(
             service_url_for_gateway(
                 "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
-                "https://127.0.0.1:31886"
+                "https://127.0.0.1:31886",
+                None
             ),
             "https://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
+    }
+
+    #[test]
+    fn service_url_for_gateway_preserves_dedicated_service_port() {
+        // A replay can contain a URL from an earlier listener configuration.
+        assert_eq!(
+            service_url_for_gateway(
+                "https://default--app--web.example.com:8080/",
+                "https://127.0.0.1:31886",
+                Some(8082)
+            ),
+            "https://default--app--web.example.com:8082/"
+        );
+        assert_eq!(
+            service_url_for_gateway(
+                "https://default--app--web.example.com:8082/",
+                "https://127.0.0.1:31886",
+                Some(8082)
+            ),
+            "https://default--app--web.example.com:8082/"
+        );
+        assert_eq!(
+            service_url_for_gateway(
+                "https://default--app--web.example.com/",
+                "https://127.0.0.1:31886",
+                Some(443)
+            ),
+            "https://default--app--web.example.com/"
+        );
+        let mut response = tonic::Response::new(());
+        assert_eq!(super::service_ingress_port(&response), None);
+        response.metadata_mut().insert(
+            openshell_core::config::SERVICE_PORT_METADATA_KEY,
+            "8082".parse().unwrap(),
+        );
+        assert_eq!(super::service_ingress_port(&response), Some(8082));
+        response.metadata_mut().insert(
+            openshell_core::config::SERVICE_PORT_METADATA_KEY,
+            "0".parse().unwrap(),
+        );
+        assert_eq!(super::service_ingress_port(&response), None);
     }
 
     #[test]
@@ -7644,7 +7714,8 @@ mod tests {
         assert_eq!(
             service_url_for_gateway(
                 "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
-                "https://gateway.example.com"
+                "https://gateway.example.com",
+                None
             ),
             "https://quiet-flamingo--notebook.navigator.openshell.localhost/"
         );
@@ -7655,7 +7726,8 @@ mod tests {
         assert_eq!(
             service_url_for_gateway(
                 "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
-                "https://127.0.0.1:31886"
+                "https://127.0.0.1:31886",
+                None
             ),
             "http://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
@@ -7666,7 +7738,8 @@ mod tests {
         assert_eq!(
             service_url_for_gateway(
                 "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
-                "https://gateway.example.com"
+                "https://gateway.example.com",
+                None
             ),
             "http://quiet-flamingo--notebook.navigator.openshell.localhost:443/"
         );

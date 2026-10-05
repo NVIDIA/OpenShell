@@ -282,6 +282,22 @@ impl MultiplexService {
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
 
+        // Add this outside typed dispatch so durable mutation replays also
+        // advertise the current listener configuration.
+        let service_port = self.state.config.service_bind_address.map(|address| {
+            HeaderValue::from_str(&address.port().to_string()).expect("port is a valid header")
+        });
+        let grpc_service = tower::ServiceBuilder::new()
+            .map_response(move |mut response: Response<tonic::body::Body>| {
+                if let Some(port) = &service_port {
+                    response.headers_mut().insert(
+                        openshell_core::config::SERVICE_PORT_METADATA_KEY,
+                        port.clone(),
+                    );
+                }
+                response
+            })
+            .service(grpc_service);
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
@@ -327,6 +343,23 @@ impl MultiplexService {
             .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
             .await?;
 
+        Ok(())
+    }
+
+    /// Serve only sandbox application routes on dedicated ingress.
+    pub async fn serve_service_ingress<S>(
+        &self,
+        stream: S,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let http_service = TowerToHyperService::new(request_id_middleware!(
+            crate::http::service_ingress_router(self.state.clone())
+        ));
+        Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
+            .await?;
         Ok(())
     }
 }

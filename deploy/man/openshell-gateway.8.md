@@ -47,6 +47,14 @@ TLS.
     Set to 0 to disable. Default: **0**.
     Environment: **OPENSHELL_HEALTH_PORT**.
 
+**--service-port** *PORT*
+:   Dedicated sandbox service ingress port on the primary bind interface.
+    Set to 0 to share the primary listener. Default: **0**.
+    With a dedicated port, the primary listener serves only control-plane
+    operations; service ingress does not request control-plane client
+    certificates. Set **service_bind_address** in gateway TOML to select a
+    different interface. Environment: **OPENSHELL_SERVICE_PORT**.
+
 **--metrics-port** *PORT*
 :   Port for Prometheus metrics (/metrics). Set to 0 to disable.
     Default: **0**. Environment: **OPENSHELL_METRICS_PORT**.

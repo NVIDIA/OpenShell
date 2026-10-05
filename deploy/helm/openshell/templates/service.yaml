@@ -18,6 +18,12 @@ spec:
       {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
+    {{- if .Values.service.ingressPort }}
+    - port: {{ .Values.service.ingressPort }}
+      targetPort: ingress
+      protocol: TCP
+      name: ingress
+    {{- end }}
     {{- if .Values.service.metricsPort }}
     - port: {{ .Values.service.metricsPort }}
       targetPort: metrics

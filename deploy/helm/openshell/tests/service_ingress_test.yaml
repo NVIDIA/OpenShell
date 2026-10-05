@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: dedicated sandbox service ingress
+templates:
+  - templates/gateway-config.yaml
+  - templates/service.yaml
+  - templates/statefulset.yaml
+tests:
+  - it: keeps service ingress on the primary listener by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_bind_address'
+  - it: configures a dedicated service listener
+    template: templates/gateway-config.yaml
+    set:
+      service.ingressPort: 8082
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'service_bind_address\s*=\s*"0.0.0.0:8082"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'bind_address\s*=\s*"0.0.0.0:8080"'
+  - it: exposes the dedicated ingress service port separately
+    template: templates/service.yaml
+    set:
+      service.ingressPort: 8082
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            port: 8082
+            targetPort: ingress
+            protocol: TCP
+            name: ingress
+  - it: exposes the dedicated ingress container port
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 8082
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: ingress
+            containerPort: 8082
+            protocol: TCP
+  - it: rejects collision with the primary port
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 8080
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressPort must differ from service.port, service.healthPort, and service.metricsPort
+  - it: rejects collision with the health port
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 8081
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressPort must differ from service.port, service.healthPort, and service.metricsPort
+  - it: rejects collision with the metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 9090
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressPort must differ from service.port, service.healthPort, and service.metricsPort
+  - it: rejects out of range ports
+    template: templates/statefulset.yaml
+    set:
+      service.ingressPort: 65536
+    asserts:
+      - failedTemplate:
+          errorMessage: service.ingressPort must be 0 or a port from 1 to 65535

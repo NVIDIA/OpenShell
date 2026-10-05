@@ -93,6 +93,17 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+If the gateway uses a dedicated service ingress listener, consult the published
+gateway configuration reference and installed `openshell-gateway --help` for
+`service_bind_address`, `--service-port`, and `OPENSHELL_SERVICE_PORT`. The
+primary port serves privileged gateway traffic; the dedicated port serves only
+sandbox applications and uses server TLS without requesting control-plane
+client certificates. Keep supervisor callback and peer endpoints on the primary
+port. In Helm, `service.ingressPort` exposes the dedicated listener separately
+from `service.port`. Verify application ingress targets that port and that it
+does not collide with primary, health, or metrics ports. Service URLs preserve
+the dedicated port, so a control-plane port-forward alone cannot reach them.
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,

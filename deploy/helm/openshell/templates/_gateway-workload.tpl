@@ -191,6 +191,11 @@ spec:
         - name: grpc
           containerPort: {{ .Values.service.port }}
           protocol: TCP
+        {{- if .Values.service.ingressPort }}
+        - name: ingress
+          containerPort: {{ .Values.service.ingressPort }}
+          protocol: TCP
+        {{- end }}
         - name: health
           containerPort: {{ .Values.service.healthPort }}
           protocol: TCP

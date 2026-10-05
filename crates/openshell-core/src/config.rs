@@ -193,6 +193,10 @@ pub struct Config {
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
 
+    /// Optional dedicated sandbox service ingress address. When set, the
+    /// primary listener serves control-plane operations only.
+    pub service_bind_address: Option<SocketAddr>,
+
     /// Address to bind the unauthenticated health endpoint to.
     ///
     /// When `None`, the dedicated health listener is disabled.
@@ -299,6 +303,11 @@ pub struct ServiceRoutingConfig {
     /// HTTP for sandbox service hostnames.
     pub enable_loopback_service_http: bool,
 }
+
+/// gRPC response metadata advertising a dedicated service ingress port.
+/// Clients use this port for service URLs instead of the control-plane
+/// endpoint's externally forwarded port when this is set.
+pub const SERVICE_PORT_METADATA_KEY: &str = "openshell-service-port";
 
 /// TLS configuration.
 ///
@@ -875,6 +884,7 @@ impl Config {
         Self {
             name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
+            service_bind_address: None,
             health_bind_address: None,
             metrics_bind_address: None,
             log_level: default_log_level(),
@@ -912,6 +922,18 @@ impl Config {
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
         self.bind_address = addr;
         self
+    }
+
+    #[must_use]
+    pub const fn with_service_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.service_bind_address = Some(addr);
+        self
+    }
+
+    /// Effective address for sandbox service ingress, including shared mode.
+    #[must_use]
+    pub fn service_address(&self) -> SocketAddr {
+        self.service_bind_address.unwrap_or(self.bind_address)
     }
 
     #[must_use]
