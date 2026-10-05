@@ -258,10 +258,10 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         .exec(&[
             "sh",
             "-c",
-            "set -eu; stat -c 'workspace-owner=%u:%g' /sandbox; touch /sandbox/probe; rm /sandbox/probe; echo podman-workspace-write-ok",
+            "set -eu; test \"$(pwd -P)\" = /home/app/project; test ! -e /sandbox; stat -c 'workspace-owner=%u:%g' .; touch probe; rm probe; echo podman-workspace-write-ok",
         ])
         .await
-        .expect("OCI workload should be able to write to the managed workspace");
+        .expect("OCI workload should be able to write to its image workspace");
     assert!(
         workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
         "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"

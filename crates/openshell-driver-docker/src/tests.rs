@@ -3673,6 +3673,74 @@ fn supervisor_workspace_validation_exit_is_reported_explicitly() {
         CONDITION_WORKSPACE_VALIDATION_FAILED
     );
     assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+
+    let (reason, message) =
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            error: "image workspace validation failed".into(),
+        })));
+    assert_eq!(reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+    assert!(message.contains("status 78"));
+    assert_eq!(
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: 1,
+            error: String::new(),
+        })))
+        .0,
+        "ControlSupervisorExited"
+    );
+}
+
+#[tokio::test]
+async fn docker_wait_exit_78_keeps_workspace_failure_reason() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let size = socket.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..size]).contains("/containers/supervisor/wait"));
+        let body = r#"{"StatusCode":78,"Error":null}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    let docker =
+        Docker::connect_with_http(&address.to_string(), 5, bollard::API_DEFAULT_VERSION).unwrap();
+    let mut wait = docker.wait_container(
+        "supervisor",
+        None::<bollard::query_parameters::WaitContainerOptions>,
+    );
+    let (reason, message) = docker_supervisor_wait_failure(wait.next().await);
+    assert_eq!(reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+    assert!(message.contains("status 78"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspection() {
+    let failures = Arc::new(Mutex::new(HashMap::from([(
+        "sandbox-1".to_string(),
+        DockerRuntimeFailure {
+            reason: CONDITION_WORKSPACE_VALIDATION_FAILED,
+            message: "Docker supervisor container exited with status 78".into(),
+        },
+    )])));
+    // There is no Docker daemon at this address: a monitor that has removed
+    // the supervisor must not need another inspection to retain the reason.
+    let docker = Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap();
+    let status =
+        wait_for_docker_supervisor_ready(&docker, "removed-supervisor", "sandbox-1", &failures)
+            .await
+            .expect_err("the recorded workspace failure takes precedence over inspection");
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
 }
 
 #[test]
