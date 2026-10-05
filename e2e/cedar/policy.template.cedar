@@ -27,14 +27,28 @@ permit (
 )
 when { context.binary_path == "/usr/bin/curl" };
 
-// Requests: GET anywhere under /allowed/, and POST only to /allowed/echo.
+// Network: curl may reach any single-label subdomain of github.com. The
+// delimited host glob also makes those hosts resolvable through policy DNS.
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource is Sandbox::NetworkEndpoint
+)
+when {
+    resource.host like("*.github.com", ".")
+    && resource.port == 443
+    && context.binary_path == "/usr/bin/curl"
+};
+
+// Requests: GET one path segment under /allowed/, and POST only to
+// /allowed/echo. The `/` delimiter keeps `*` within one segment.
 permit (
     principal is Sandbox::Process,
     action == Sandbox::Action::"HttpRequest",
     resource == Sandbox::NetworkEndpoint::"__HOST__:__PORT__"
 )
 when {
-    (context.method == "GET" && context.path like "__PREFIX__/allowed/*")
+    (context.method == "GET" && context.path like("__PREFIX__/allowed/*", "/"))
     || (context.method == "POST" && context.path == "__PREFIX__/allowed/echo")
 };
 

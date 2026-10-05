@@ -146,6 +146,22 @@ expect_eq "network: permitted GET reaches upstream" "$(status "" /allowed/ok)" "
 expect_eq "network: path outside the permit is denied" "$(status "" /blocked)" "403"
 expect_eq "network: method outside the permit is denied" "$(status "-X DELETE" /allowed/ok)" "403"
 expect_eq "network: forbid overrides permit" "$(status "" /allowed/secret)" "403"
+expect_eq "network: delimited path glob stays within one segment" \
+    "$(status "" /allowed/deeper/path)" "403"
+
+github_status() {
+    capture_in_sandbox "curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://$1/" | tail -1
+}
+# Any HTTP status proves DNS resolution, the CONNECT decision, and the TLS
+# handshake succeeded; 000 means the connection never got that far.
+api_status="$(github_status api.github.com)"
+if [[ "$api_status" =~ ^[1-5][0-9][0-9]$ ]]; then
+    pass "network: delimited host glob admits a matching subdomain ($api_status)"
+else
+    fail "network: delimited host glob admits a matching subdomain" "got '$api_status'"
+fi
+expect_eq "network: delimited host glob does not match the parent domain" \
+    "$(github_status github.com)" "000"
 
 cat > "${TMP_DIR}/urllib.py" <<EOF
 import urllib.error

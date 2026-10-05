@@ -134,13 +134,17 @@ pub struct FilesystemGrants {
 
 /// One host a Cedar policy set permits `NetworkConnect` to, with its ports.
 ///
-/// Used for DNS eligibility, not CONNECT-time matching: only endpoints named
-/// literally in a `permit` scope are included. A host reachable only through
-/// a condition such as `resource.host like "*.example.com"` is not, so DNS
-/// resolution for it fails closed.
+/// Used for DNS eligibility, not CONNECT-time matching. Includes endpoints
+/// named in a `permit` scope, and hosts and host globs a `permit`'s `when`
+/// conditions require together with a port (see the `analysis` module). A
+/// host matched any other way, such as `resource.host like "*.example.com"`
+/// without a delimiter, is not included, so DNS resolution for it fails
+/// closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedNetworkEndpoint {
-    /// Destination host, lowercased.
+    /// Destination host, lowercased, or a host glob in policy DNS syntax: `*`
+    /// within one DNS label, and `**` as a whole first label spanning one or
+    /// more labels.
     pub host: String,
     /// Ports this host is permitted on.
     pub ports: Vec<u16>,
@@ -213,7 +217,7 @@ impl CedarEngine {
         &self.analysis.filesystem
     }
 
-    /// Returns the exact `NetworkConnect` endpoints eligible for policy DNS.
+    /// Returns the `NetworkConnect` hosts and host globs eligible for policy DNS.
     #[must_use]
     pub fn dns_endpoints(&self) -> &[AuthorizedNetworkEndpoint] {
         &self.analysis.dns_endpoints

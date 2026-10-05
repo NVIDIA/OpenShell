@@ -98,7 +98,7 @@ permit (
     action == Sandbox::Action::"HttpRequest",
     resource == Sandbox::NetworkEndpoint::"api.github.com:443"
 )
-when { context.method == "GET" && context.path like "/repos/*" };
+when { context.method == "GET" && context.path like("/repos/*/*", "/") };
 ```
 
 ## Filesystem Rules
@@ -119,10 +119,31 @@ The supervisor adds the same baseline runtime paths it adds for YAML policies. O
 Cedar evaluates `NetworkConnect` for every outbound connection, with the calling binary in `context.binary_path` and its ancestors in `context.ancestors`. Conditions on these actions are evaluated by Cedar as written.
 
 <Warning>
-Cedar compares binary paths exactly. Use the resolved executable path, such as `/usr/bin/python3.12`, rather than a symlink such as `/usr/bin/python3`.
+Cedar compares binary paths exactly. Use the resolved executable path, such as `/usr/bin/python3.12`, rather than a symlink such as `/usr/bin/python3`, or a glob such as `context.binary_path like("/usr/lib/postgresql/*/bin/psql", "/")`.
 </Warning>
 
-Policy DNS only resolves hosts named in a `NetworkConnect` permit scope, such as `resource == Sandbox::NetworkEndpoint::"pypi.org:443"`. A host matched only through a condition, such as `resource.host like "*.example.com"`, is not resolvable, so the connection fails closed.
+## Globs
+
+Write globs with a delimiter, as `like("pattern", "delimiter")`. With a delimiter, `*` matches within one segment and `**` matches across segments, as in YAML policies. Use `"."` for hosts and `"/"` for paths. Without a delimiter, `like` treats every `*` as matching across segments, so `context.path like "/repos/*"` also matches `/repos/a/b/c`.
+
+```cedar
+permit (
+    principal is Sandbox::Process,
+    action == Sandbox::Action::"NetworkConnect",
+    resource is Sandbox::NetworkEndpoint
+)
+when {
+    resource.host like("*.example.com", ".")
+    && resource.port == 443
+    && context.binary_path == "/usr/bin/curl"
+};
+```
+
+## Policy DNS
+
+Policy DNS resolves a host when a `NetworkConnect` permit names it in its scope, such as `resource == Sandbox::NetworkEndpoint::"pypi.org:443"`, or requires both the host and the port in its `when` conditions, as in the example above. The host condition can be an exact string or a host glob with a `.` delimiter that follows the YAML wildcard host rules: `*` or `**` as the whole first label, `*` within the first label, `*` as a whole later label, and no wildcard top-level domain such as `*.com`. Policy DNS does not resolve any other host, so the connection fails closed.
+
+A host named exactly may resolve to a private address. A host matched by a glob may not, unless you name it exactly in another permit.
 
 ## Request Rules
 

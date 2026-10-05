@@ -8,7 +8,7 @@ layer enforces it:
 
 | Area | Source | Checks |
 |---|---|---|
-| Network | `policy.template.cedar` | Permitted `GET` reaches the upstream; other paths, other methods, a `forbid`, another binary, and an unlisted host are denied. |
+| Network | `policy.template.cedar` | Permitted `GET` reaches the upstream; other paths, a path one segment deeper than a delimited glob allows, other methods, a `forbid`, another binary, and an unlisted host are denied. A delimited host glob (`*.github.com`) admits `api.github.com` through policy DNS but not `github.com`. |
 | Middleware | `middleware.template.yaml` via `--middleware` | The `openshell/regex` middleware redacts a secret in the request body before it reaches the upstream. |
 | Filesystem | `policy.template.cedar` | A `WriteFile` grant makes `/sandbox` writable, a `ReadFile` grant makes `/opt` readable, and `/srv` stays unreadable. |
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |
@@ -21,7 +21,7 @@ as a separate YAML file instead of being part of the Cedar policy.
 The network checks use `echo-server.py`, a small HTTP server the test starts
 on the host and reaches at `host.openshell.internal`, so the suite does not
 depend on the internet except for confirming that `example.com` is
-unreachable.
+unreachable and that the host glob check can reach `api.github.com`.
 
 The sandbox only trusts `host.openshell.internal` when it maps to the host
 gateway address the gateway configured, as in CI. Where it does not (for

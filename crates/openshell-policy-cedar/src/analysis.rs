@@ -22,10 +22,14 @@
 //!   `HttpRequest` must therefore name its endpoint literally in the scope,
 //!   and every endpoint so named is inspected. An `HttpRequest` policy the
 //!   proxy could not route would otherwise be silently skipped.
-//! - **DNS eligibility.** Exact `NetworkConnect` endpoints named in a
-//!   `permit` scope are eligible for policy DNS. Endpoints reachable only
-//!   through a condition (for example `resource.host like "*.example.com"`)
-//!   are not, which fails closed.
+//! - **DNS eligibility.** A `NetworkConnect` `permit` makes a host eligible
+//!   for policy DNS when it names the endpoint in its scope, or when its
+//!   `when` conditions require both `resource.host` and `resource.port`: the
+//!   host as an exact string or as a host glob written with a `.` delimiter
+//!   (`resource.host like("*.example.com", ".")`), and the port as a number.
+//!   Host globs follow the same shape rules as YAML wildcard hosts. Hosts
+//!   matched any other way, such as an undelimited `like`, are not eligible,
+//!   which fails closed.
 //!
 //! Before any of that, the policy set is validated against the schema in
 //! strict mode, so a typo such as `context.binray_path` is a load error
@@ -198,12 +202,13 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             }
         }
 
-        if touches_network_connect
-            && policy.effect() == Effect::Permit
-            && let Some(endpoint) = scope_endpoint(policy)
-        {
-            let (host, port) = parse_endpoint(&policy_id, &endpoint)?;
-            dns_ports.entry(host).or_default().insert(port);
+        if touches_network_connect && policy.effect() == Effect::Permit {
+            if let Some(endpoint) = scope_endpoint(policy) {
+                let (host, port) = parse_endpoint(&policy_id, &endpoint)?;
+                dns_ports.entry(host).or_default().insert(port);
+            } else if let Some((host, port)) = condition_endpoint(policy) {
+                dns_ports.entry(host).or_default().insert(port);
+            }
         }
     }
 
@@ -323,7 +328,236 @@ fn parse_endpoint(policy_id: &str, endpoint: &str) -> Result<(String, u16), Ceda
         // literal could never match.
         return Err(invalid("host must be lowercase"));
     }
+    if host.contains('*') {
+        // An entity id matches only itself, so `*` here is a literal star that
+        // no host contains, while policy DNS would read it as a wildcard.
+        return Err(invalid(
+            "host must not contain '*'; match hosts with \
+             `resource.host like(\"*.example.com\", \".\")` in a `when` clause",
+        ));
+    }
     Ok((host.to_string(), port))
+}
+
+/// Delimiter that makes a `like` on `resource.host` a DNS-label host glob.
+const HOST_LABEL_DELIMITER: &str = ".";
+
+/// Returns the host and port a `permit`'s `when` conditions require.
+///
+/// Every top-level `&&` operand of a `when` condition is necessary for the
+/// policy to apply, so a host and port found there bound every endpoint the
+/// policy can allow, the same over-approximation YAML eligibility makes by
+/// ignoring binaries. Returns `None`, so the policy grants no eligibility,
+/// unless exactly one operand constrains the host and one the port, both in a
+/// recognised form.
+fn condition_endpoint(policy: &Policy) -> Option<(String, u16)> {
+    let json = policy.to_json().ok()?;
+    let mut operands = Vec::new();
+    for condition in json.get("conditions")?.as_array()? {
+        if condition.get("kind")?.as_str()? == "when" {
+            collect_conjuncts(condition.get("body")?, &mut operands);
+        }
+    }
+    let mut hosts = operands.iter().filter_map(|expr| required_host(expr));
+    let mut ports = operands.iter().filter_map(|expr| required_port(expr));
+    let host = hosts.next()?;
+    let port = ports.next()?;
+    if hosts.next().is_some() || ports.next().is_some() {
+        return None;
+    }
+    match host {
+        HostConstraint::Eligible(host) => Some((host, port)),
+        HostConstraint::Ineligible => None,
+    }
+}
+
+/// Flattens an `&&` tree into its operands.
+fn collect_conjuncts<'a>(expr: &'a Value, operands: &mut Vec<&'a Value>) {
+    if let Some(and) = expr.get("&&")
+        && let (Some(left), Some(right)) = (and.get("left"), and.get("right"))
+    {
+        collect_conjuncts(left, operands);
+        collect_conjuncts(right, operands);
+    } else {
+        operands.push(expr);
+    }
+}
+
+/// True if `expr` is `resource.<attr>`.
+fn is_resource_attr(expr: &Value, attr: &str) -> bool {
+    expr.get(".").is_some_and(|access| {
+        access
+            .get("left")
+            .and_then(|left| left.get("Var"))
+            .and_then(Value::as_str)
+            == Some("resource")
+            && access.get("attr").and_then(Value::as_str) == Some(attr)
+    })
+}
+
+/// Returns the operand of `resource.<attr> == <literal>`, in either order.
+fn equality_with_resource_attr<'a>(expr: &'a Value, attr: &str) -> Option<&'a Value> {
+    let eq = expr.get("==")?;
+    let (left, right) = (eq.get("left")?, eq.get("right")?);
+    let literal = if is_resource_attr(left, attr) {
+        right
+    } else if is_resource_attr(right, attr) {
+        left
+    } else {
+        return None;
+    };
+    literal.get("Value")
+}
+
+/// A `when` operand that constrains `resource.host`.
+enum HostConstraint {
+    /// An exact host or host glob policy DNS can match exactly.
+    Eligible(String),
+    /// A host constraint in a form that grants no eligibility.
+    Ineligible,
+}
+
+impl From<Option<String>> for HostConstraint {
+    fn from(host: Option<String>) -> Self {
+        host.map_or(Self::Ineligible, Self::Eligible)
+    }
+}
+
+/// Classifies an operand, returning `None` if it does not constrain the host.
+fn required_host(expr: &Value) -> Option<HostConstraint> {
+    if let Some(value) = equality_with_resource_attr(expr, "host") {
+        return Some(value.as_str().and_then(exact_host).into());
+    }
+    let like = expr.get("like")?;
+    if !is_resource_attr(like.get("left")?, "host") {
+        return None;
+    }
+    if like.get("delim").and_then(Value::as_str) != Some(HOST_LABEL_DELIMITER) {
+        return Some(HostConstraint::Ineligible);
+    }
+    Some(
+        like.get("pattern")
+            .and_then(Value::as_array)
+            .and_then(|elems| host_glob(elems))
+            .into(),
+    )
+}
+
+/// Returns the port of a `resource.port == <port>` operand.
+fn required_port(expr: &Value) -> Option<u16> {
+    equality_with_resource_attr(expr, "port")?
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+}
+
+/// Accepts a lowercase host without wildcards or empty labels.
+fn exact_host(host: &str) -> Option<String> {
+    let valid = !host.is_empty()
+        && host == host.to_ascii_lowercase()
+        && !host.split('.').any(str::is_empty)
+        && host.chars().all(|c| c == '.' || is_host_char(c));
+    valid.then(|| host.to_string())
+}
+
+/// Characters a host label may contain. Excludes glob metacharacters, so a
+/// literal in a Cedar pattern can never be read as a wildcard by policy DNS.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+}
+
+/// One element of a delimited `like` pattern on `resource.host`.
+#[derive(Clone, Copy)]
+enum PatternChar {
+    Literal(char),
+    /// `*`: any run of characters within one label.
+    Wildcard,
+    /// `**`: any run of characters, across labels.
+    MultiWildcard,
+}
+
+/// One `.`-separated label of a delimited host pattern.
+enum HostLabel {
+    /// Literal characters, with `*` standing for a Cedar `Wildcard`.
+    Glob(String),
+    /// A whole-label Cedar `MultiWildcard`, written `**`.
+    Recursive,
+}
+
+/// Converts a delimited `like` pattern on `resource.host` into the host glob
+/// policy DNS matches, if both mean the same thing.
+///
+/// Cedar's delimited `*` stays within one label and its `**` crosses labels,
+/// as policy DNS does for YAML wildcard hosts. The two agree on every valid
+/// host when the pattern also satisfies YAML's wildcard host rules: `**` only
+/// as the whole first label, `*` within the first label or as a whole later
+/// label, and no wildcard top-level domain such as `*.com`.
+fn host_glob(elems: &[Value]) -> Option<String> {
+    let mut labels = vec![Vec::new()];
+    for elem in elems {
+        match elem {
+            Value::String(kind) if kind == "Wildcard" => {
+                labels.last_mut()?.push(PatternChar::Wildcard);
+            }
+            Value::String(kind) if kind == "MultiWildcard" => {
+                labels.last_mut()?.push(PatternChar::MultiWildcard);
+            }
+            Value::Object(literal) => {
+                for c in literal.get("Literal")?.as_str()?.chars() {
+                    if c == '.' {
+                        labels.push(Vec::new());
+                    } else if is_host_char(c) {
+                        labels.last_mut()?.push(PatternChar::Literal(c));
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let labels = labels
+        .into_iter()
+        .map(|label| match label.as_slice() {
+            [] => None,
+            [PatternChar::MultiWildcard] => Some(HostLabel::Recursive),
+            _ => {
+                let mut glob = String::new();
+                for elem in &label {
+                    match *elem {
+                        // Adjacent `*`s within a label match the same text as one.
+                        PatternChar::Wildcard if glob.ends_with('*') => {}
+                        PatternChar::Wildcard => glob.push('*'),
+                        PatternChar::Literal(c) => glob.push(c),
+                        PatternChar::MultiWildcard => return None,
+                    }
+                }
+                Some(HostLabel::Glob(glob))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let (first, rest) = labels.split_first()?;
+    let later_labels_valid = rest.iter().all(|label| match label {
+        HostLabel::Recursive => false,
+        HostLabel::Glob(glob) => glob == "*" || !glob.contains('*'),
+    });
+    let whole_first_wildcard =
+        matches!(first, HostLabel::Recursive) || matches!(first, HostLabel::Glob(g) if g == "*");
+    let tld_wildcard = whole_first_wildcard && labels.len() <= 2;
+    if !later_labels_valid || tld_wildcard {
+        return None;
+    }
+    Some(
+        labels
+            .iter()
+            .map(|label| match label {
+                HostLabel::Recursive => "**",
+                HostLabel::Glob(glob) => glob.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 /// Paths and access level granted by one filesystem `permit`.

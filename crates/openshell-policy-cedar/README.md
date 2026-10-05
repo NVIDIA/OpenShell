@@ -16,6 +16,19 @@ shapes whose meaning those artifacts can enforce exactly. The CLI, the gateway,
 and the supervisor reject everything else. Cedar evaluation errors fail the
 request instead of skipping the erroring policy.
 
+Policy DNS eligibility comes from `NetworkConnect` permit scopes, and from
+`when` conditions that require both `resource.host` and `resource.port`. A host
+condition can be an exact string, or a delimited glob such as
+`resource.host like("*.example.com", ".")` that follows the YAML wildcard host
+rules. The glob is converted from Cedar's pattern elements, not its source
+text, so policy DNS matches exactly the hosts Cedar's delimited `like` admits.
+A glob never counts as an exactly named host, so it cannot resolve to a
+private address.
+
+Delimited `like` is not yet in a Cedar release. This branch depends on the
+experimental `extended-like-wip` branch of `lianah/cedar`, pinned by commit,
+with a matching `allow-git` exception in `deny.toml`.
+
 ## Integration
 
 - `openshell-policy` validates Cedar sources behind its default `cedar`

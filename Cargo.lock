@@ -1059,8 +1059,7 @@ dependencies = [
 [[package]]
 name = "cedar-policy"
 version = "4.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e4f5e46c425491b7133eecb3030d82d27301b84bfa08533c59a6902cca7eb80"
+source = "git+https://github.com/lianah/cedar.git?rev=56e29b377c4e62e4bff406136dbeddc830fc5596#56e29b377c4e62e4bff406136dbeddc830fc5596"
 dependencies = [
  "cedar-policy-core",
  "cedar-policy-formatter",
@@ -1080,11 +1079,10 @@ dependencies = [
 [[package]]
 name = "cedar-policy-core"
 version = "4.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a30d11033d59b262bbb380d8bb5dc5c3dd2dd2281675c558ef4fd8a161ce669"
+source = "git+https://github.com/lianah/cedar.git?rev=56e29b377c4e62e4bff406136dbeddc830fc5596#56e29b377c4e62e4bff406136dbeddc830fc5596"
 dependencies = [
  "chrono",
- "educe 0.7.6",
+ "educe 0.8.1",
  "either",
  "itertools 0.15.0",
  "lalrpop",
@@ -1108,8 +1106,7 @@ dependencies = [
 [[package]]
 name = "cedar-policy-formatter"
 version = "4.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a2c8dc671e62597c85caa11694365b76050abcd9f2177f0520ccac0580f9a41"
+source = "git+https://github.com/lianah/cedar.git?rev=56e29b377c4e62e4bff406136dbeddc830fc5596#56e29b377c4e62e4bff406136dbeddc830fc5596"
 dependencies = [
  "cedar-policy-core",
  "itertools 0.15.0",
@@ -2067,9 +2064,9 @@ dependencies = [
 
 [[package]]
 name = "educe"
-version = "0.7.6"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e451fac8dd8dece16234604bf1efce6e90fddd8ab6ad4d66eec0eca5160959dd"
+checksum = "1ebdb1f8f8d2815bbe7b369a7da10343c82026a4503b68bd1279ba557611e96d"
 dependencies = [
  "enum-ordinalize",
  "proc-macro2",

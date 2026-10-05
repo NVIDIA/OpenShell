@@ -136,13 +136,15 @@ impl LoadedPolicy {
 }
 
 impl LoadedPolicy {
-    /// Returns whether a `NetworkConnect` permit scope names `host:port` exactly.
+    /// Returns whether a `NetworkConnect` permit names `host:port` exactly.
+    ///
+    /// A host glob never counts, even when the requested host spells the glob
+    /// itself, matching YAML wildcard hosts.
     fn declares_endpoint(&self, host: &str, port: u16) -> bool {
         let host = normalize_host(host);
-        self.cedar
-            .dns_endpoints()
-            .iter()
-            .any(|endpoint| endpoint.host == host && endpoint.ports.contains(&port))
+        self.cedar.dns_endpoints().iter().any(|endpoint| {
+            !endpoint.host.contains('*') && endpoint.host == host && endpoint.ports.contains(&port)
+        })
     }
 }
 
@@ -1127,5 +1129,44 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
             .expect("request evaluates");
         assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
         assert!(!authorization.exact_declared_endpoint_host);
+    }
+
+    const HOST_GLOB_POLICY: &str = r#"
+permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { resource.host like("*.example.com", ".") && resource.port == 443 };
+"#;
+
+    #[test]
+    fn delimited_host_glob_is_eligible_for_policy_dns() {
+        let engine = CedarOnlyEngine::from_policy_str(HOST_GLOB_POLICY).expect("policy parses");
+        let snapshot = engine.policy_dns_eligibility_snapshot().expect("snapshot");
+        let hosts: Vec<_> = snapshot
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.endpoint.to_string())
+            .collect();
+        assert_eq!(hosts.len(), 1, "{hosts:?}");
+        assert!(hosts[0].contains("*.example.com"), "{hosts:?}");
+
+        let selector =
+            openshell_core::host_pattern::HostSelector::new(&["*.example.com".to_string()], &[])
+                .expect("policy DNS accepts the glob");
+        assert!(selector.matches("api.example.com"));
+        assert!(!selector.matches("a.b.example.com"));
+    }
+
+    #[test]
+    fn host_glob_never_counts_as_an_exact_declared_host() {
+        let engine = CedarOnlyEngine::from_policy_str(HOST_GLOB_POLICY).expect("policy parses");
+        for host in ["api.example.com", "*.example.com"] {
+            let authorization = engine
+                .authorize_egress(&curl_input(host))
+                .expect("request evaluates");
+            assert!(
+                matches!(authorization.action, NetworkAction::Allow { .. }),
+                "{host}"
+            );
+            assert!(!authorization.exact_declared_endpoint_host, "{host}");
+        }
     }
 }
