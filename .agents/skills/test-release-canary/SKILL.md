@@ -41,7 +41,7 @@ every approved branch run, independently of optional E2E labels.
 
 The host-package jobs exercise fresh installs, not upgrades from persisted
 gateway state. Release Dev and Release Tag additionally run tmachine Ubuntu DEB
-and Fedora RPM upgrade lanes: they install the latest retained prerelease
+and Fedora RPM upgrade lanes: they install the latest published release
 packages and matching runtime images, upgrade to the candidate packages, verify
 an existing sandbox survives, and create a new sandbox. Those lanes are part of
 the release conformance matrix, not this canary. Validate Homebrew exact-default

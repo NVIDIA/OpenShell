@@ -34,6 +34,7 @@
 # generating operator-owned gateway TOML. Preflight and startup must resolve
 # the same candidate runtime images.
 - name: Configure candidate runtime images for qualification
+  when: not (openshell_packaged_gateway_released_source | default(false) | bool)
   become: true
   ansible.builtin.copy:
     dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"
@@ -44,10 +45,6 @@
       OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}
       OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
       OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
-
-- name: Prepare legacy upgrade source image configuration
-  when: openshell_packaged_gateway_legacy_images | default(false) | bool
-  ansible.builtin.include_tasks: legacy-images.yaml
 
 - name: Start gateway user manager
   ansible.builtin.include_role:
@@ -110,6 +107,6 @@
   vars:
     openshell_client_gateway_endpoint: https://127.0.0.1:17670
     openshell_client_gateway_name: openshell
-    openshell_client_gateway_config_path: /var/lib/openshell-qualification/gateway.toml
+    openshell_client_gateway_config_path: "{{ openshell_gateway_home }}/.config/openshell/gateway.toml"
     openshell_client_gateway_service_scope: user
     openshell_client_gateway_network_name: openshell

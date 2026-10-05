@@ -93,7 +93,7 @@ the tmachine upgrade execution and its runtime-image preparation.
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:upgrade` runs tmachine Debian and RPM upgrade qualification in
-  `Branch E2E Checks`: the latest retained prerelease packages and matching
+  `Branch E2E Checks`: the latest published release packages and matching
   runtime images are installed first, then the PR's packages are installed and
   both existing and new sandboxes are verified
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay

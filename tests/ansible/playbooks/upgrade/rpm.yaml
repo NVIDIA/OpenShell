@@ -16,7 +16,7 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Exercise prerelease baseline and RPM upgrade candidate
+    - name: Exercise released baseline and RPM upgrade candidate
       block:
         - name: Read expected source package versions
           become: true
@@ -40,11 +40,11 @@
           register: installed_source_versions
           changed_when: false
 
-        - name: Require exact prerelease source packages
+        - name: Require exact released source packages
           ansible.builtin.assert:
             that: installed_source_versions.stdout | trim == upgrade_source_versions
             fail_msg: >-
-              Expected prerelease source packages {{ upgrade_source_versions }},
+              Expected released source packages {{ upgrade_source_versions }},
               found {{ installed_source_versions.stdout | trim }}.
 
         - name: Check source gateway status
@@ -103,7 +103,7 @@
         - name: Require candidate RPM packages to replace source packages
           ansible.builtin.assert:
             that: candidate_package_versions.stdout | trim != upgrade_source_versions
-            fail_msg: Candidate RPM versions match the retained prerelease source.
+            fail_msg: Candidate RPM versions match the released source.
 
         - name: Copy candidate runtime images
           become: true

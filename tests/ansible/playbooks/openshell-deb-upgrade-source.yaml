@@ -2,15 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Install prerelease OpenShell Debian upgrade source
+- name: Install released OpenShell Debian upgrade source
   ansible.builtin.import_playbook: openshell-deb.yaml
   vars:
-    openshell_packaged_gateway_legacy_images: true
+    openshell_packaged_gateway_released_source: true
 
 - name: Record OpenShell Debian upgrade source
   hosts: all
   gather_facts: false
   tasks:
+    - name: Create upgrade source metadata directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openshell-qualification
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Copy upgrade source version metadata
       become: true
       ansible.builtin.copy:

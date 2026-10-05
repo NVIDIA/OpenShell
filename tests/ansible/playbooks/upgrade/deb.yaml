@@ -15,7 +15,7 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Exercise prerelease baseline and upgrade candidate
+    - name: Exercise released baseline and upgrade candidate
       block:
         - name: Read expected source package version
           become: true
@@ -33,11 +33,11 @@
           register: installed_source_version
           changed_when: false
 
-        - name: Require exact prerelease source package
+        - name: Require exact released source package
           ansible.builtin.assert:
             that: installed_source_version.stdout == upgrade_source_version
             fail_msg: >-
-              Expected prerelease source {{ upgrade_source_version }}, found
+              Expected released source {{ upgrade_source_version }}, found
               {{ installed_source_version.stdout }}.
 
         - name: Check source gateway status
@@ -132,7 +132,7 @@
           ansible.builtin.assert:
             that: installed_target_version.stdout != upgrade_source_version
             fail_msg: >-
-              Candidate package did not replace prerelease source
+              Candidate package did not replace released source
               {{ upgrade_source_version }}.
 
         - name: Wait for upgraded gateway status
