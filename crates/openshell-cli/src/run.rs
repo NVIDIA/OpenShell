@@ -427,6 +427,7 @@ async fn finalize_sandbox_create_session(
 /// on the function signature, following the `provider_refresh_config(server, input, tls)`
 /// precedent. This struct captures sandbox-specific options.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
     pub template: Option<&'a str>,
@@ -436,6 +437,8 @@ pub struct SandboxCreateConfig<'a> {
     pub gpu_requirements: Option<GpuResourceRequirements>,
     pub cpu: Option<&'a str>,
     pub memory: Option<&'a str>,
+    pub use_authenticated_username: bool,
+    pub use_parent_hostname: bool,
     pub driver_config_json: Option<&'a str>,
     pub editor: Option<Editor>,
     pub providers: &'a [String],
@@ -466,6 +469,8 @@ impl Default for SandboxCreateConfig<'_> {
             gpu_requirements: None,
             cpu: None,
             memory: None,
+            use_authenticated_username: false,
+            use_parent_hostname: false,
             driver_config_json: None,
             editor: None,
             providers: &[],
@@ -504,6 +509,8 @@ pub async fn sandbox_create(
         gpu_requirements,
         cpu,
         memory,
+        use_authenticated_username,
+        use_parent_hostname,
         driver_config_json,
         editor,
         providers,
@@ -699,6 +706,9 @@ pub async fn sandbox_create(
             })
             .into_iter()
             .collect(),
+        docker_hostname: String::new(),
+        use_authenticated_username,
+        use_parent_hostname,
     };
 
     let response = match client.create_sandbox(request).await {

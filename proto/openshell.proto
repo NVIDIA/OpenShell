@@ -1272,6 +1272,13 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+  // Docker container hostname. Overrides a workload template hostname.
+  string docker_hostname = 10;
+  // Use the authenticated user's name for the sandbox account.
+  // False uses a named process policy user, then "sandbox".
+  bool use_authenticated_username = 11;
+  // Use the parent host's FQDN as the Docker container hostname.
+  bool use_parent_hostname = 12;
 }
 
 message CreateSandboxTemplateRequest {

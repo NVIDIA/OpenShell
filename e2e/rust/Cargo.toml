@@ -214,6 +214,11 @@ path = "tests/sandbox_templates.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "sandbox_identity_exposure"
+path = "tests/sandbox_identity_exposure.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
@@ -237,6 +242,7 @@ required-features = ["e2e-gpu"]
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
+dns-lookup = "3.0"
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }

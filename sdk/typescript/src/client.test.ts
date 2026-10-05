@@ -343,8 +343,12 @@ describe('create', () => {
     expect(created.spec?.policy?.version).toBe(1);
   });
 
-  it('sends canonical main process fields', async () => {
-    let created: { spec?: { command?: string[]; tty?: boolean } } = {};
+  it('sends sandbox creation options', async () => {
+    let created: {
+      spec?: { command?: string[]; tty?: boolean };
+      useAuthenticatedUsername?: boolean;
+      useParentHostname?: boolean;
+    } = {};
     const sandbox = client({
       createSandbox: (req) => {
         created = req;
@@ -356,10 +360,14 @@ describe('create', () => {
       image: 'img',
       command: ['/opt/worker', '--serve'],
       tty: true,
+      useAuthenticatedUsername: true,
+      useParentHostname: true,
     });
 
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+    expect(created.useAuthenticatedUsername).toBe(true);
+    expect(created.useParentHostname).toBe(true);
   });
 
   it('sends the restart policy', async () => {
@@ -409,6 +417,8 @@ describe('create', () => {
       name?: string;
       workspace?: string;
       labels?: Record<string, string>;
+      useAuthenticatedUsername?: boolean;
+      useParentHostname?: boolean;
       spec?: {
         policy?: { version?: number };
         providers?: string[];
@@ -431,6 +441,8 @@ describe('create', () => {
       providers: ['github'],
       command: ['/opt/worker', '--serve'],
       tty: true,
+      useAuthenticatedUsername: true,
+      useParentHostname: true,
       policy: { version: 1, networkPolicies: {} },
     });
 
@@ -441,6 +453,8 @@ describe('create', () => {
     expect(created.spec?.providers).toEqual(['github']);
     expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
     expect(created.spec?.tty).toBe(true);
+    expect(created.useAuthenticatedUsername).toBe(true);
+    expect(created.useParentHostname).toBe(true);
     expect(created.spec?.policy?.version).toBe(1);
     expect(created.spec?.template).toBeUndefined();
     expect(ref.workspace).toBe('staging');

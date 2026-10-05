@@ -99,6 +99,7 @@ fn test_sandbox() -> DriverSandbox {
             await_main_process_attachment: false,
             workload_identity: None,
             launch_authentication: test_launch_authentication(),
+            ..Default::default()
         }),
         status: None,
         workspace: String::new(),
@@ -1364,6 +1365,28 @@ fn container_create_body_sets_driver_owned_pids_limit() {
 }
 
 #[test]
+fn docker_account_files_archive_uses_root_owned_system_paths() {
+    let files = openshell_core::account_files::AccountFiles {
+        group: "ebusto:x:1001:\n".to_string(),
+        passwd: "ebusto:x:1000:1001::/sandbox:/bin/sh\n".to_string(),
+    };
+    let archive = docker_account_files_archive(&files).unwrap();
+    let mut archive = tar::Archive::new(archive.as_slice());
+    let mut entries = archive.entries().unwrap();
+
+    for exp in ["etc/group", "etc/passwd"] {
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().as_ref(), Path::new(exp));
+        assert_eq!(entry.header().gid().unwrap(), 0);
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.header().uid().unwrap(), 0);
+        let mut content = String::new();
+        entry.read_to_string(&mut content).unwrap();
+        assert!(content.starts_with("ebusto:"));
+    }
+}
+
+#[test]
 fn docker_child_environment_strips_supervisor_control_keys() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
@@ -1374,6 +1397,7 @@ fn docker_child_environment_strips_supervisor_control_keys() {
         openshell_core::sandbox_env::OCI_IMAGE_USER,
         openshell_core::sandbox_env::SANDBOX_TOKEN,
         openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
+        openshell_core::sandbox_env::SANDBOX_USERNAME,
     ] {
         spec.environment
             .insert(key.to_string(), "spoofed".to_string());
@@ -1387,6 +1411,20 @@ fn docker_child_environment_strips_supervisor_control_keys() {
     assert!(env.contains_key("TEMPLATE_ENV"));
     assert!(env.contains_key("SPEC_ENV"));
     assert!(!env.values().any(|value| value == "spoofed"));
+}
+
+#[test]
+fn boundary_environment_excludes_requested_sandbox_username() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.sandbox_username = "ebusto".to_string();
+
+    let env = build_boundary_environment(&sandbox, &runtime_config());
+
+    assert!(!env.iter().any(|entry| entry.starts_with(&format!(
+        "{}=",
+        openshell_core::sandbox_env::SANDBOX_USERNAME
+    ))));
 }
 
 #[test]
@@ -1624,6 +1662,19 @@ fn sandbox_bundle_stages_private_tls_server_material() {
         Some(&(0o711, u64::from(identity.uid), u64::from(identity.gid))),
         "the supervisor must be able to traverse to the authenticated socket without reading sandbox secrets"
     );
+}
+
+#[test]
+fn docker_hostname_extra_hosts_supports_short_hostname() {
+    let config = DockerSandboxDriverConfig {
+        hostname: Some("server1".to_string()),
+        ..Default::default()
+    };
+    let exp = Some(vec!["server1:127.0.1.1".to_string()]);
+
+    let act = docker_hostname_extra_hosts(&config);
+
+    assert_eq!(act, exp);
 }
 
 #[test]
@@ -1871,10 +1922,12 @@ fn build_binds_does_not_expose_host_runtime_material() {
 }
 
 #[test]
-fn build_container_create_body_includes_driver_config_mounts() {
+fn build_container_create_body_includes_driver_config() {
     let mut sandbox = test_sandbox();
     let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
     template.driver_config = Some(json_struct(serde_json::json!({
+        "domainname": "example.com",
+        "hostname": "parent",
         "mounts": [
             {
                 "type": "volume",
@@ -1894,9 +1947,15 @@ fn build_container_create_body_includes_driver_config_mounts() {
     })));
 
     let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
-    let mounts = body
-        .host_config
-        .unwrap()
+
+    assert_eq!(body.domainname.as_deref(), Some("example.com"));
+    assert_eq!(body.hostname.as_deref(), Some("parent"));
+    let host_config = body.host_config.unwrap();
+    assert_eq!(
+        host_config.extra_hosts,
+        Some(vec!["parent.example.com parent:127.0.1.1".to_string()])
+    );
+    let mounts = host_config
         .mounts
         .expect("driver config mounts should be set");
 

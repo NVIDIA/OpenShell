@@ -124,6 +124,21 @@ Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
 
+## Container Hostname
+
+Use `--hostname` to copy the gateway host's FQDN into the container:
+
+```shell
+openshell sandbox create \
+  --hostname \
+  -- claude
+```
+
+The gateway rejects caller-supplied `driver_config.docker.domainname` and
+`driver_config.docker.hostname` values. The flag does not add a DNS record or
+give the container the gateway host's network identity. The FQDN and its short
+hostname resolve to `127.0.1.1` inside the container.
+
 ## Driver Config Mounts
 
 The gateway forwards the `docker` block from `--driver-config-json`. Supported

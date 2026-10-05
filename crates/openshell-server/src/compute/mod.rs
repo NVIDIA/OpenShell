@@ -77,6 +77,7 @@ pub type SharedComputeDriver =
 use provisioning_operation::ProvisioningOperationError;
 use traced_driver::TracedDriver;
 
+pub const SANDBOX_USERNAME_ANNOTATION: &str = "openshell.ai/sandbox-username";
 const LIFECYCLE_SWEEP_PAGE_SIZE: u32 = 1000;
 const SHUTDOWN_STOP_CONCURRENCY: usize = 16;
 
@@ -5844,15 +5845,26 @@ fn driver_sandbox_from_public(
     sandbox: &Sandbox,
     driver_name: &str,
 ) -> Result<DriverSandbox, Box<Status>> {
+    let mut spec = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
+        .transpose()?;
+
+    if let Some(username) = sandbox
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.annotations.get(SANDBOX_USERNAME_ANNOTATION))
+        && let Some(spec) = spec.as_mut()
+    {
+        spec.sandbox_username.clone_from(username);
+    }
+
     Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
         name: sandbox.object_name().to_string(),
         namespace: String::new(), // Namespace is set by the driver based on its config
-        spec: sandbox
-            .spec
-            .as_ref()
-            .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
-            .transpose()?,
+        spec,
         status: sandbox
             .status
             .as_ref()
@@ -5865,9 +5877,12 @@ fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
+    let mut environment = spec.environment.clone();
+    environment.remove(openshell_core::sandbox_env::SANDBOX_USERNAME);
+
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
-        environment: spec.environment.clone(),
+        environment,
         template: spec
             .template
             .as_ref()
@@ -5899,6 +5914,7 @@ fn driver_sandbox_spec_from_public(
                 .map_or_else(String::new, |process| process.run_as_group.clone()),
         }),
         launch_authentication: Vec::new(),
+        sandbox_username: String::new(),
     })
 }
 
@@ -7544,6 +7560,55 @@ mod tests {
         };
 
         assert!(take_public_staging_token(&mut sandbox, "vm").is_none());
+    }
+
+    #[test]
+    fn driver_sandbox_empty_username_reconciles_to_sandbox() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let driver = driver_sandbox_from_public(&sandbox, "docker").unwrap();
+        let spec = driver.spec.as_ref().unwrap();
+        let act = openshell_core::account_files::AccountReconciliation::from_driver_spec(
+            spec, 1000, 1001,
+        )
+        .unwrap();
+
+        assert!(spec.sandbox_username.is_empty());
+        assert_eq!(act.user_name, "sandbox");
+    }
+
+    #[test]
+    fn driver_sandbox_uses_gateway_sandbox_username() {
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                annotations: HashMap::from([(
+                    SANDBOX_USERNAME_ANNOTATION.to_string(),
+                    "ebusto".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::SANDBOX_USERNAME.to_string(),
+                    "spoofed".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let act = driver_sandbox_from_public(&sandbox, "docker").unwrap();
+
+        let spec = act.spec.as_ref().unwrap();
+        assert_eq!(spec.sandbox_username, "ebusto");
+        assert!(
+            !spec
+                .environment
+                .contains_key(openshell_core::sandbox_env::SANDBOX_USERNAME)
+        );
     }
 
     #[test]

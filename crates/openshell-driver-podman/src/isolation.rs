@@ -182,6 +182,16 @@ pub fn resolve_identity(
         .map_err(invalid)
 }
 
+pub fn account_files_archive(
+    files: &openshell_core::account_files::AccountFiles,
+    identity: &ResolvedWorkloadIdentity,
+) -> Result<Vec<u8>, ComputeDriverError> {
+    let mut archive = Archive::new(identity);
+    archive.root_file("etc/group", files.group.as_bytes())?;
+    archive.root_file("etc/passwd", files.passwd.as_bytes())?;
+    archive.finish()
+}
+
 pub struct BootstrapArchives {
     pub channel: Vec<u8>,
     pub workspace: Vec<u8>,
@@ -348,24 +358,6 @@ struct Archive<'a> {
     identity: &'a ResolvedWorkloadIdentity,
 }
 impl<'a> Archive<'a> {
-    fn new(identity: &'a ResolvedWorkloadIdentity) -> Self {
-        Self {
-            builder: tar::Builder::new(Vec::new()),
-            identity,
-        }
-    }
-    fn directory(&mut self, path: &str, mode: u32, owned: bool) -> Result<(), ComputeDriverError> {
-        self.append(path, mode, owned, tar::EntryType::Directory, &[])
-    }
-    fn file(&mut self, path: &str, content: &[u8]) -> Result<(), ComputeDriverError> {
-        self.append(
-            path.trim_start_matches('/'),
-            0o600,
-            true,
-            tar::EntryType::Regular,
-            content,
-        )
-    }
     fn append(
         &mut self,
         path: &str,
@@ -394,8 +386,40 @@ impl<'a> Archive<'a> {
             .append_data(&mut header, path, content)
             .map_err(invalid)
     }
+
+    fn directory(&mut self, path: &str, mode: u32, owned: bool) -> Result<(), ComputeDriverError> {
+        self.append(path, mode, owned, tar::EntryType::Directory, &[])
+    }
+
+    fn file(&mut self, path: &str, content: &[u8]) -> Result<(), ComputeDriverError> {
+        self.append(
+            path.trim_start_matches('/'),
+            0o600,
+            true,
+            tar::EntryType::Regular,
+            content,
+        )
+    }
+
     fn finish(self) -> Result<Vec<u8>, ComputeDriverError> {
         self.builder.into_inner().map_err(invalid)
+    }
+
+    fn new(identity: &'a ResolvedWorkloadIdentity) -> Self {
+        Self {
+            builder: tar::Builder::new(Vec::new()),
+            identity,
+        }
+    }
+
+    fn root_file(&mut self, path: &str, content: &[u8]) -> Result<(), ComputeDriverError> {
+        self.append(
+            path.trim_start_matches('/'),
+            0o644,
+            false,
+            tar::EntryType::Regular,
+            content,
+        )
     }
 }
 
@@ -506,6 +530,33 @@ mod tests {
                 Some((path, content))
             })
             .collect()
+    }
+
+    #[test]
+    fn account_files_archive_uses_root_owned_system_paths() {
+        let identity = ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let files = openshell_core::account_files::AccountFiles {
+            group: "ebusto:x:1001:\n".to_string(),
+            passwd: "ebusto:x:1000:1001::/sandbox:/bin/sh\n".to_string(),
+        };
+        let archive = account_files_archive(&files, &identity).unwrap();
+        let mut archive = tar::Archive::new(archive.as_slice());
+        let mut entries = archive.entries().unwrap();
+
+        for exp in ["etc/group", "etc/passwd"] {
+            let entry = entries.next().unwrap().unwrap();
+            assert_eq!(entry.path().unwrap().as_ref(), std::path::Path::new(exp));
+            assert_eq!(entry.header().gid().unwrap(), 0);
+            assert_eq!(entry.header().mode().unwrap(), 0o644);
+            assert_eq!(entry.header().uid().unwrap(), 0);
+        }
     }
 
     #[test]

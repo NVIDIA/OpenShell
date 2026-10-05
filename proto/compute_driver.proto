@@ -208,6 +208,8 @@ message DriverSandboxSpec {
   // material between the host supervisor and workload-side sandbox runtime;
   // it must never expose the supervisor bearer tokens to the workload.
   bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
+  // Authenticated account name used to label the resolved numeric identity.
+  string sandbox_username = 18;
 }
 
 // Identity inputs admitted by the gateway before workload provisioning.

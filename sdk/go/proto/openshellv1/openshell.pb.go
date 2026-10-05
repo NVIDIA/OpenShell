@@ -3463,8 +3463,15 @@ type CreateSandboxRequest struct {
 	// registered after the sandbox has been persisted and route only while the
 	// sandbox is ready.
 	ServiceExposures []*SandboxServiceExposure `protobuf:"bytes,9,rep,name=service_exposures,json=serviceExposures,proto3" json:"service_exposures,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Docker container hostname. Overrides a workload template hostname.
+	DockerHostname string `protobuf:"bytes,10,opt,name=docker_hostname,json=dockerHostname,proto3" json:"docker_hostname,omitempty"`
+	// Use the authenticated user's name for the sandbox account.
+	// False uses a named process policy user, then "sandbox".
+	UseAuthenticatedUsername bool `protobuf:"varint,11,opt,name=use_authenticated_username,json=useAuthenticatedUsername,proto3" json:"use_authenticated_username,omitempty"`
+	// Use the parent host's FQDN as the Docker container hostname.
+	UseParentHostname bool `protobuf:"varint,12,opt,name=use_parent_hostname,json=useParentHostname,proto3" json:"use_parent_hostname,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CreateSandboxRequest) Reset() {
@@ -3558,6 +3565,27 @@ func (x *CreateSandboxRequest) GetServiceExposures() []*SandboxServiceExposure {
 		return x.ServiceExposures
 	}
 	return nil
+}
+
+func (x *CreateSandboxRequest) GetDockerHostname() string {
+	if x != nil {
+		return x.DockerHostname
+	}
+	return ""
+}
+
+func (x *CreateSandboxRequest) GetUseAuthenticatedUsername() bool {
+	if x != nil {
+		return x.UseAuthenticatedUsername
+	}
+	return false
+}
+
+func (x *CreateSandboxRequest) GetUseParentHostname() bool {
+	if x != nil {
+		return x.UseParentHostname
+	}
+	return false
 }
 
 type CreateSandboxTemplateRequest struct {
@@ -18050,7 +18078,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\bmetadata\x18\x06 \x03(\v2).openshell.v1.PlatformEvent.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\ftimestamp_ms\"\xa9\x05\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\ftimestamp_ms\"\xc0\x06\n" +
 	"\x14CreateSandboxRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\a \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12-\n" +
 	"\x04spec\x18\x01 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x12\x12\n" +
@@ -18061,7 +18089,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x11workload_template\x18\x06 \x01(\tR\x10workloadTemplate\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\b \x01(\tR\trequestId\x12Q\n" +
-	"\x11service_exposures\x18\t \x03(\v2$.openshell.v1.SandboxServiceExposureR\x10serviceExposures\x1a9\n" +
+	"\x11service_exposures\x18\t \x03(\v2$.openshell.v1.SandboxServiceExposureR\x10serviceExposures\x12'\n" +
+	"\x0fdocker_hostname\x18\n" +
+	" \x01(\tR\x0edockerHostname\x12<\n" +
+	"\x1ause_authenticated_username\x18\v \x01(\bR\x18useAuthenticatedUsername\x12.\n" +
+	"\x13use_parent_hostname\x18\f \x01(\bR\x11useParentHostname\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +

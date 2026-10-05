@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 /// Name of the sandbox (used for policy sync and identification).
 pub const SANDBOX: &str = "OPENSHELL_SANDBOX";
 
+/// Authenticated account name requested for the sandbox workload identity.
+///
+/// The VM driver passes this only to privileged guest initialization for
+/// account-file reconciliation.
+pub const SANDBOX_USERNAME: &str = "OPENSHELL_SANDBOX_USERNAME";
+
 /// gRPC endpoint of the `OpenShell` gateway that the sandbox reports to.
 pub const ENDPOINT: &str = "OPENSHELL_ENDPOINT";
 
