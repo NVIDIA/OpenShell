@@ -15,6 +15,12 @@ e2e_require_openshell_bin() {
     echo "ERROR: openshell CLI is not executable: ${OPENSHELL_BIN}" >&2
     return 2
   fi
+
+  # Cargo runs each test from its package directory, so resolve the candidate
+  # relative to the caller's working directory before passing it to the tests.
+  local binary_dir
+  binary_dir="$(cd "$(dirname "${OPENSHELL_BIN}")" && pwd -P)" || return
+  export OPENSHELL_BIN="${binary_dir}/$(basename "${OPENSHELL_BIN}")"
 }
 
 e2e_run_openshell_conformance() {
