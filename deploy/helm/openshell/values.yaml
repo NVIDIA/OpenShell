@@ -72,6 +72,15 @@ supervisor:
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
+  # -- Compute resources for the supervisor container in every sandbox's
+  # supervisor pod. The default requests keep the pod out of the BestEffort QoS
+  # class and count it in namespace quotas and scheduling. Each map replaces
+  # the driver default; set it to `{}` to omit it.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits: {}
 
 sandbox:
   image:

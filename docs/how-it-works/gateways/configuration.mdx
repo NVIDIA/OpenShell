@@ -875,7 +875,25 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+
+# Compute resources for the supervisor container of every sandbox. Each map
+# replaces the default; an empty table omits it.
+[openshell.drivers.kubernetes.sandbox_runtime.supervisor_resources.requests]
+cpu = "50m"
+memory = "64Mi"
+
+[openshell.drivers.kubernetes.sandbox_runtime.supervisor_resources.limits]
+# memory = "256Mi"
 ```
+
+The supervisor pod requests `50m` CPU and `64Mi` memory by default and sets no
+limits. The requests keep the pod out of the `BestEffort` QoS class, so node
+memory pressure does not evict it ahead of its sandbox. They also count the
+supervisor in namespace `ResourceQuota` and scheduling. In a namespace whose
+`ResourceQuota` covers compute requests, Kubernetes rejects pods that do not
+set them. Set `limits` when your cluster requires them on every container.
+Values are Kubernetes resource quantities, and the API server validates them
+when it creates the pod.
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress

@@ -74,18 +74,27 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Default CPU request for the supervisor container.
+pub const DEFAULT_SUPERVISOR_CPU_REQUEST: &str = "50m";
+
+/// Default memory request for the supervisor container.
+pub const DEFAULT_SUPERVISOR_MEMORY_REQUEST: &str = "64Mi";
+
 /// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
+    /// Compute resources for the supervisor container of every sandbox.
+    pub supervisor_resources: KubernetesContainerResources,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            supervisor_resources: KubernetesContainerResources::supervisor_default(),
         }
     }
 }
@@ -94,6 +103,53 @@ impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
+        }
+        self.supervisor_resources
+            .validate("sandbox_runtime.supervisor_resources")
+    }
+}
+
+/// Requests and limits for a container the driver creates itself.
+///
+/// Values are Kubernetes resource quantities such as `"50m"` or `"64Mi"`; the
+/// API server validates them when the pod is created. Setting `requests` or
+/// `limits` replaces that map as a whole, so an empty table removes the
+/// defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesContainerResources {
+    pub requests: BTreeMap<String, String>,
+    pub limits: BTreeMap<String, String>,
+}
+
+impl KubernetesContainerResources {
+    /// The supervisor's default: requests so the pod is not `BestEffort` and
+    /// is counted by quotas and schedulers, and no limits.
+    pub fn supervisor_default() -> Self {
+        Self {
+            requests: BTreeMap::from([
+                (
+                    "cpu".to_string(),
+                    DEFAULT_SUPERVISOR_CPU_REQUEST.to_string(),
+                ),
+                (
+                    "memory".to_string(),
+                    DEFAULT_SUPERVISOR_MEMORY_REQUEST.to_string(),
+                ),
+            ]),
+            limits: BTreeMap::new(),
+        }
+    }
+
+    fn validate(&self, field: &str) -> Result<(), String> {
+        for (section, values) in [("requests", &self.requests), ("limits", &self.limits)] {
+            for (name, quantity) in values {
+                if name.trim().is_empty() || quantity.trim().is_empty() {
+                    return Err(format!(
+                        "{field}.{section} entries need a resource name and a quantity"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -851,6 +907,84 @@ mod tests {
             let input = format!("{field} = \"sometimes\"");
             assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
         }
+    }
+
+    #[test]
+    fn supervisor_resources_default_to_requests_only() {
+        let config: KubernetesComputeConfig = toml::from_str("").expect("empty config");
+        assert_eq!(
+            config.sandbox_runtime.supervisor_resources,
+            KubernetesContainerResources::supervisor_default()
+        );
+        assert_eq!(
+            config.sandbox_runtime.supervisor_resources.requests,
+            BTreeMap::from([
+                ("cpu".to_string(), "50m".to_string()),
+                ("memory".to_string(), "64Mi".to_string()),
+            ])
+        );
+        assert!(
+            config
+                .sandbox_runtime
+                .supervisor_resources
+                .limits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn supervisor_resources_replace_each_configured_map() {
+        let config: KubernetesComputeConfig = toml::from_str(
+            r#"
+            [sandbox_runtime.supervisor_resources]
+            requests = { cpu = "100m" }
+            limits = { memory = "256Mi" }
+            "#,
+        )
+        .expect("supervisor resources");
+        let resources = &config.sandbox_runtime.supervisor_resources;
+        assert_eq!(
+            resources.requests,
+            BTreeMap::from([("cpu".to_string(), "100m".to_string())])
+        );
+        assert_eq!(
+            resources.limits,
+            BTreeMap::from([("memory".to_string(), "256Mi".to_string())])
+        );
+        assert!(config.sandbox_runtime.validate().is_ok());
+    }
+
+    #[test]
+    fn supervisor_resources_can_be_cleared() {
+        let config: KubernetesComputeConfig = toml::from_str(
+            "
+            [sandbox_runtime.supervisor_resources]
+            requests = {}
+            ",
+        )
+        .expect("cleared supervisor resources");
+        assert_eq!(
+            config.sandbox_runtime.supervisor_resources,
+            KubernetesContainerResources::default()
+        );
+    }
+
+    #[test]
+    fn supervisor_resources_reject_unknown_fields_and_empty_quantities() {
+        assert!(
+            toml::from_str::<KubernetesComputeConfig>(
+                "[sandbox_runtime.supervisor_resources]\nclaims = {}"
+            )
+            .is_err()
+        );
+        let config: KubernetesComputeConfig =
+            toml::from_str("[sandbox_runtime.supervisor_resources]\nrequests = { cpu = \" \" }")
+                .expect("parses before validation");
+        let error = config
+            .sandbox_runtime
+            .validate()
+            .expect_err("empty quantity");
+        assert!(error.contains("sandbox_runtime.supervisor_resources.requests"));
     }
 
     #[test]

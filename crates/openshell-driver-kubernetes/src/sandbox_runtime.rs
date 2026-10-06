@@ -10,10 +10,11 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
     CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
     LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
-    ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
-    ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
-    VolumeProjection,
+    ProjectedVolumeSource, ResourceRequirements, Secret, SecretVolumeSource, SecurityContext,
+    Service, ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume,
+    VolumeMount, VolumeProjection,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
@@ -207,6 +208,28 @@ pub fn boundary_service(
     }
 }
 
+/// Converts configured requests and limits into a container's resources,
+/// leaving the field unset when neither map has entries.
+fn resource_requirements(
+    resources: &crate::KubernetesContainerResources,
+) -> Option<ResourceRequirements> {
+    let quantities = |values: &BTreeMap<String, String>| {
+        (!values.is_empty()).then(|| {
+            values
+                .iter()
+                .map(|(name, quantity)| (name.clone(), Quantity(quantity.clone())))
+                .collect::<BTreeMap<_, _>>()
+        })
+    };
+    let requests = quantities(&resources.requests);
+    let limits = quantities(&resources.limits);
+    (requests.is_some() || limits.is_some()).then(|| ResourceRequirements {
+        requests,
+        limits,
+        ..Default::default()
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn supervisor_pod(
     namespace: &str,
@@ -216,6 +239,7 @@ pub fn supervisor_pod(
     gateway_id: &str,
     supervisor_image: &str,
     supervisor_pull_policy: Option<crate::KubernetesImagePullPolicy>,
+    supervisor_resources: &crate::KubernetesContainerResources,
     service_account_name: &str,
     control_uid: u32,
     control_gid: u32,
@@ -437,6 +461,7 @@ pub fn supervisor_pod(
             ..Default::default()
         }),
         volume_mounts: Some(volume_mounts),
+        resources: resource_requirements(supervisor_resources),
         ..Default::default()
     };
     if let Some(policy) = supervisor_pull_policy {
@@ -800,6 +825,7 @@ mod tests {
             "gateway",
             "supervisor:latest",
             None,
+            &crate::KubernetesContainerResources::supervisor_default(),
             "sandbox-sa",
             1000,
             1000,
@@ -859,6 +885,7 @@ mod tests {
             "gateway",
             "supervisor:latest",
             None,
+            &crate::KubernetesContainerResources::supervisor_default(),
             "sandbox-sa",
             1000,
             1000,
@@ -946,6 +973,88 @@ mod tests {
         assert!(!volumes.contains(&"client-tls".to_string()));
     }
 
+    fn supervisor_pod_with_resources(resources: &crate::KubernetesContainerResources) -> Pod {
+        supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            resources,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Disabled,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            owner(),
+            &[],
+        )
+        .expect("render supervisor Pod")
+    }
+
+    fn supervisor_container_resources(pod: &Pod) -> Option<ResourceRequirements> {
+        pod.spec.as_ref().expect("Pod spec").containers[0]
+            .resources
+            .clone()
+    }
+
+    fn quantity_map(entries: &[(&str, &str)]) -> BTreeMap<String, Quantity> {
+        entries
+            .iter()
+            .map(|(name, quantity)| ((*name).to_string(), Quantity((*quantity).to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn supervisor_pod_requests_resources_by_default() {
+        let pod = supervisor_pod_with_resources(
+            &crate::KubernetesContainerResources::supervisor_default(),
+        );
+        let resources = supervisor_container_resources(&pod).expect("supervisor resources");
+        assert_eq!(
+            resources.requests,
+            Some(quantity_map(&[("cpu", "50m"), ("memory", "64Mi")]))
+        );
+        assert_eq!(resources.limits, None);
+    }
+
+    #[test]
+    fn supervisor_pod_applies_configured_requests_and_limits() {
+        let configured = crate::KubernetesContainerResources {
+            requests: BTreeMap::from([
+                ("cpu".to_string(), "100m".to_string()),
+                ("memory".to_string(), "128Mi".to_string()),
+            ]),
+            limits: BTreeMap::from([("memory".to_string(), "256Mi".to_string())]),
+        };
+        let resources = supervisor_container_resources(&supervisor_pod_with_resources(&configured))
+            .expect("supervisor resources");
+        assert_eq!(
+            resources.requests,
+            Some(quantity_map(&[("cpu", "100m"), ("memory", "128Mi")]))
+        );
+        assert_eq!(resources.limits, Some(quantity_map(&[("memory", "256Mi")])));
+    }
+
+    #[test]
+    fn supervisor_pod_omits_resources_when_none_are_configured() {
+        let pod = supervisor_pod_with_resources(&crate::KubernetesContainerResources::default());
+        assert_eq!(supervisor_container_resources(&pod), None);
+    }
+
     #[test]
     fn owner_reference_does_not_require_finalizer_mutation_permission() {
         assert_eq!(owner().block_owner_deletion, Some(false));
@@ -962,6 +1071,7 @@ mod tests {
             "gateway",
             "supervisor:latest",
             Some(crate::KubernetesImagePullPolicy::IfNotPresent),
+            &crate::KubernetesContainerResources::supervisor_default(),
             "sandbox-sa",
             1000,
             1000,
@@ -1220,6 +1330,7 @@ mod tests {
             "gateway",
             "supervisor:latest",
             None,
+            &crate::KubernetesContainerResources::supervisor_default(),
             "sandbox-sa",
             1000,
             1000,

@@ -13,6 +13,29 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: requests supervisor resources by default without limits
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sandbox_runtime\.supervisor_resources\.requests\]\s*"cpu" = "50m"\s*"memory" = "64Mi"\s*\[openshell\.drivers\.kubernetes\.sandbox_runtime\.supervisor_resources\.limits\]\s*\['
+
+  - it: renders configured supervisor requests and limits as quantity strings
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.resources.requests:
+        cpu: 0.1
+        memory: 128Mi
+      supervisor.resources.limits:
+        memory: 256Mi
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)supervisor_resources\.requests\]\s*"cpu" = "0\.1"\s*"memory" = "128Mi"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)supervisor_resources\.limits\]\s*"memory" = "256Mi"'
+
   - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
     template: templates/gateway-config.yaml
     asserts:

@@ -277,6 +277,16 @@ data:
     [openshell.drivers.kubernetes.sandbox_runtime]
     boundary_port                = {{ .Values.supervisor.sandboxRuntime.boundaryPort | default 5500 }}
 
+    [openshell.drivers.kubernetes.sandbox_runtime.supervisor_resources.requests]
+    {{- range $key, $value := .Values.supervisor.resources.requests }}
+    {{ $key | quote }} = {{ $value | toString | quote }}
+    {{- end }}
+
+    [openshell.drivers.kubernetes.sandbox_runtime.supervisor_resources.limits]
+    {{- range $key, $value := .Values.supervisor.resources.limits }}
+    {{ $key | quote }} = {{ $value | toString | quote }}
+    {{- end }}
+
     {{- if not $credentialDrivers }}
 
     [openshell.gateway.credential_storage]
