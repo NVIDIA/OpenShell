@@ -72,8 +72,8 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification builds and installs
+`Branch E2E Checks` builds binaries and images only when an E2E suite is
+selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev and Release Tag use the same package installers.

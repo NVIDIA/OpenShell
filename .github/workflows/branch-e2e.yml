@@ -71,7 +71,7 @@ jobs:
 
   version:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -217,7 +217,7 @@ jobs:
   build-rpm:
     name: Build RPM packages
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
       contents: read
