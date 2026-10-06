@@ -322,15 +322,8 @@ async fn run_cli(
         .run(args)
         .await
         .map_err(|error| error.to_string())?;
-    if result.success() == expect_success {
-        Ok(result)
-    } else {
-        Err(result.failure_diagnostic(if expect_success {
-            "command succeeds"
-        } else {
-            "command fails"
-        }))
-    }
+    result.require_outcome(expect_success)?;
+    Ok(result)
 }
 
 fn require_contains(result: &CommandResult, needle: &str, expectation: &str) -> Result<(), String> {

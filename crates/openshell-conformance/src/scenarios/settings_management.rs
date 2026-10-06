@@ -22,6 +22,7 @@ const TEST_KEY: &str = "ocsf_json_enabled";
 
 #[derive(Debug, Deserialize)]
 struct SandboxState {
+    name: String,
     phase: String,
 }
 
@@ -77,10 +78,10 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     wait_for_ready(runner, &sandbox_name).await?;
 
     let initial = settings_get(runner, &sandbox_name, "initial").await?;
-    require_setting_line_with_scope(
+    require_setting_line(
         &initial,
         "<unset>",
-        "unset",
+        Some("unset"),
         "initial sandbox setting is unset",
     )?;
 
@@ -88,10 +89,10 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     wait_for_setting_value(runner, &sandbox_name, "true", "sandbox").await?;
 
     let after_sandbox_set = settings_get(runner, &sandbox_name, "after-sandbox-set").await?;
-    require_setting_line_with_scope(
+    require_setting_line(
         &after_sandbox_set,
         "true",
-        "sandbox",
+        Some("sandbox"),
         "setting reflects the sandbox-scoped value",
     )?;
 
@@ -101,10 +102,10 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     }
 
     let after_sandbox_delete = settings_get(runner, &sandbox_name, "after-sandbox-delete").await?;
-    require_setting_line_with_scope(
+    require_setting_line(
         &after_sandbox_delete,
         "<unset>",
-        "unset",
+        Some("unset"),
         "setting is unset again after sandbox delete",
     )?;
 
@@ -164,6 +165,7 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     require_setting_line(
         &global_get,
         "false",
+        None,
         "global setting reflects the override value",
     )?;
 
@@ -190,6 +192,7 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     require_setting_line(
         &global_after_delete,
         "<unset>",
+        None,
         "global setting is unset after delete",
     )?;
 
@@ -203,10 +206,10 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     wait_for_setting_value(runner, &sandbox_name, "false", "sandbox").await?;
 
     let sandbox_after_delete = settings_get(runner, &sandbox_name, "after-global-delete").await?;
-    require_setting_line_with_scope(
+    require_setting_line(
         &sandbox_after_delete,
         "false",
-        "sandbox",
+        Some("sandbox"),
         "sandbox-level control resumes after global delete",
     )?;
 
@@ -241,6 +244,10 @@ async fn wait_for_ready(runner: &mut OpenShellRunner, sandbox_name: &str) -> Res
                         Poll::Pending(result.failure_diagnostic("sandbox can be retrieved"))
                     }
                     Ok(result) => match result.json::<SandboxState>() {
+                        Ok(state) if state.name != sandbox_name => Poll::Failed(format!(
+                            "sandbox get returned {:?}; expected '{sandbox_name}'",
+                            state.name
+                        )),
                         Ok(state) if state.phase == "Ready" => Poll::Ready(()),
                         Ok(state) => Poll::Pending(format!(
                             "sandbox phase is {:?}; expected \"Ready\"",
@@ -359,15 +366,8 @@ async fn settings_delete(
         .run(&["settings", "delete", sandbox_name, "--key", TEST_KEY])
         .await
         .map_err(|error| error.to_string())?;
-    if result.success() == expect_success {
-        Ok(result)
-    } else {
-        Err(result.failure_diagnostic(if expect_success {
-            "command succeeds"
-        } else {
-            "command fails"
-        }))
-    }
+    result.require_outcome(expect_success)?;
+    Ok(result)
 }
 
 /// Best-effort teardown. Mirrors a `Drop`-guard cleanup: ignore failures since
@@ -386,22 +386,14 @@ async fn cleanup_global_setting(runner: &OpenShellRunner) {
 fn require_setting_line(
     result: &CommandResult,
     expected: &str,
+    scope: Option<&str>,
     expectation: &str,
 ) -> Result<(), String> {
-    if result.output_contains(&format!("{TEST_KEY} = {expected}")) {
-        Ok(())
-    } else {
-        Err(result.failure_diagnostic(expectation))
-    }
-}
-
-fn require_setting_line_with_scope(
-    result: &CommandResult,
-    expected: &str,
-    scope: &str,
-    expectation: &str,
-) -> Result<(), String> {
-    if result.output_contains(&format!("{TEST_KEY} = {expected} ({scope})")) {
+    let needle = match scope {
+        Some(scope) => format!("{TEST_KEY} = {expected} ({scope})"),
+        None => format!("{TEST_KEY} = {expected}"),
+    };
+    if result.output_contains(&needle) {
         Ok(())
     } else {
         Err(result.failure_diagnostic(expectation))

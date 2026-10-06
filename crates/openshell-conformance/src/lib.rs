@@ -161,6 +161,20 @@ impl CommandResult {
         Err(self.failure_diagnostic(&self.expectation))
     }
 
+    /// Assert the command's success matches `expect_success` (`false` asserts
+    /// the command fails, e.g. a rejected duplicate-name or blocked-while-managed case).
+    pub fn require_outcome(&self, expect_success: bool) -> Result<(), String> {
+        if self.success() == expect_success {
+            Ok(())
+        } else {
+            Err(self.failure_diagnostic(if expect_success {
+                "command succeeds"
+            } else {
+                "command fails"
+            }))
+        }
+    }
+
     pub fn failure_diagnostic(&self, expectation: &str) -> String {
         format!(
             "{}\nexpected: {expectation}\nactual: exit {} after {:.1?}\ncommand: {}\nstdout:\n{}\nstderr:\n{}",

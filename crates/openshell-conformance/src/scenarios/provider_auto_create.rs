@@ -23,7 +23,10 @@ network_policies: {}
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
-const PROVIDER_DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+// Must comfortably exceed COMMAND_TIMEOUT: poll_until only checks elapsed
+// time between attempts, so a single slow attempt must not be able to
+// consume the whole retry budget before a second attempt gets a chance.
+const PROVIDER_DETACH_TIMEOUT: Duration = Duration::from_mins(3);
 const PROVIDER_DETACH_INTERVAL: Duration = Duration::from_secs(1);
 
 // "claude-code" is a recognized auto-provider type, not an arbitrary name:
@@ -55,9 +58,15 @@ fn run_provider_auto_create(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
         delete_provider_best_effort(runner).await;
 
         let sandbox_name = format!("ct-{}-pa", runner.id());
+        // Tracked as a safety net for runner.finish()'s generic sweep (and the
+        // Drop-impl warning) if a panic skips the explicit cleanup() below;
+        // the ordered, poll-retried delete in cleanup() is what actually
+        // avoids the sandbox/provider detach race in the common case.
+        runner.track_sandbox(&sandbox_name);
         let result =
             auto_created_provider_credential_available_in_sandbox(runner, &sandbox_name).await;
         cleanup(runner, &sandbox_name).await;
+        runner.forget_sandbox(&sandbox_name);
         result
     })
 }
