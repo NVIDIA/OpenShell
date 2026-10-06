@@ -5240,7 +5240,8 @@ async fn spawn_docker_control_process(
     let supervisor_id = created.id;
     let monitored_supervisor_id = supervisor_id.clone();
     let monitored_docker = failure_context.docker.clone();
-    let readiness_sandbox_id = failure_context.container_id.clone();
+    let readiness_container_id = failure_context.container_id.clone();
+    let readiness_sandbox_id = sandbox_id.clone();
     let readiness_failures = failure_context.failures.clone();
     let task = tokio::spawn(async move {
         let wait = async {
@@ -5317,6 +5318,7 @@ async fn spawn_docker_control_process(
     if let Err(error) = Box::pin(wait_for_docker_supervisor_ready(
         docker,
         &supervisor_id,
+        &readiness_container_id,
         &readiness_sandbox_id,
         &readiness_failures,
     ))
@@ -5331,6 +5333,7 @@ async fn spawn_docker_control_process(
 async fn wait_for_docker_supervisor_ready(
     docker: &Docker,
     supervisor_id: &str,
+    workload_container_id: &str,
     sandbox_id: &str,
     failures: &Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
 ) -> Result<(), Status> {
@@ -5341,7 +5344,7 @@ async fn wait_for_docker_supervisor_ready(
         if let Some(status) = recorded_workspace_validation_failure(failures, sandbox_id).await {
             return Err(status);
         }
-        let sandbox = match docker.inspect_container(sandbox_id, None).await {
+        let sandbox = match docker.inspect_container(workload_container_id, None).await {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 return Err(recorded_workspace_validation_failure(failures, sandbox_id)

@@ -3733,10 +3733,15 @@ async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspecti
     // There is no Docker daemon at this address: a monitor that has removed
     // the supervisor must not need another inspection to retain the reason.
     let docker = Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap();
-    let status =
-        wait_for_docker_supervisor_ready(&docker, "removed-supervisor", "sandbox-1", &failures)
-            .await
-            .expect_err("the recorded workspace failure takes precedence over inspection");
+    let status = wait_for_docker_supervisor_ready(
+        &docker,
+        "removed-supervisor",
+        "workload-container-1",
+        "sandbox-1",
+        &failures,
+    )
+    .await
+    .expect_err("the recorded workspace failure takes precedence over inspection");
     assert_eq!(
         supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
         CONDITION_WORKSPACE_VALIDATION_FAILED
