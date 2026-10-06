@@ -195,12 +195,6 @@ pub struct PolicyDocument {
         skip_serializing_if = "Option::is_none"
     )]
     pub process: Option<ProcessPolicy>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_non_null_optional_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ui: Option<UiPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub network_policies: BTreeMap<String, NetworkPolicyRule>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -240,34 +234,6 @@ pub struct ProcessPolicy {
     pub run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_as_group: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UiPolicy {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_graphical_ui: bool,
-    #[serde(default, skip_serializing_if = "UiClipboardAccess::is_none")]
-    pub clipboard: UiClipboardAccess,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_input_injection: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UiClipboardAccess {
-    #[default]
-    None,
-    Read,
-    Write,
-    All,
-}
-
-impl UiClipboardAccess {
-    #[must_use]
-    pub const fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -774,7 +740,6 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
             "filesystem_policy",
             "landlock",
             "process",
-            "ui",
             "network_policies",
             "network_middlewares",
         ],
@@ -793,11 +758,6 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
         root.get("process"),
         "process",
         &["run_as_user", "run_as_group"],
-    )?;
-    inspect_named(
-        root.get("ui"),
-        "ui",
-        &["allow_graphical_ui", "clipboard", "allow_input_injection"],
     )?;
 
     for (name, rule) in open_map(root.get("network_policies")) {
@@ -1262,7 +1222,6 @@ mod tests {
         for source in [
             "version: 1\nfilesystem_policy: null\n",
             "version: 1\nprocess: null\n",
-            "version: 1\nui: null\n",
             "version: 1\nmetadata: null\n",
             "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 443\n        mcp: null\n",
         ] {
@@ -1348,7 +1307,6 @@ mod tests {
                 "landlock.future",
             ),
             ("version: 1\nprocess: { future: true }\n", "process.future"),
-            ("version: 1\nui: { future: true }\n", "ui.future"),
             (
                 "version: 1\nnetwork_policies: { api: { future: true } }\n",
                 "network_policies.api.future",
