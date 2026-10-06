@@ -398,7 +398,9 @@ openshell sandbox upload my-sandbox ./src
 openshell sandbox download my-sandbox output ./local-output
 ```
 
-Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
+Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
+
+If `sandbox create --upload` rejects an upload, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
 

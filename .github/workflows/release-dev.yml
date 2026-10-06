@@ -22,7 +22,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -201,7 +201,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -249,10 +249,6 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
-      upload-channel: latest/edge
-      github-environment: latest/edge
-    secrets:
-      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
@@ -263,6 +259,16 @@ jobs:
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
+  publish-snap:
+    name: Publish Snap
+    needs: build-snap
+    uses: ./.github/workflows/snap-publish.yml
+    with:
+      upload-channel: latest/edge
+      github-environment: latest/edge
+    secrets:
+      publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
@@ -279,7 +285,7 @@ jobs:
       - vm-e2e
       - build-deb
       - build-rpm
-      - build-snap
+      - publish-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:

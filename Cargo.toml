@@ -49,7 +49,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 indicatif = "0.17"
 owo-colors = "4"
-ratatui = "0.26"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 crossterm = "0.28"
 terminal-colorsaurus = "1.0"
 
@@ -128,6 +128,7 @@ tokio-stream = "0.1"
 protoc-bin-vendored = "3.2.0"
 url = "2"
 indexmap = "2"
+shell-words = "1.1.1"
 
 # Database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "sqlite", "migrate", "macros"] }

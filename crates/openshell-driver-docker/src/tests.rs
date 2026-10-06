@@ -210,6 +210,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_binary: Arc::new(b"\x7fELFtest".to_vec()),
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
+        supervisor_otlp_endpoint: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -1390,6 +1391,21 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
+fn supervisor_tracing_environment_requires_an_endpoint() {
+    let mut config = runtime_config();
+    assert!(supervisor_tracing_environment(&config).is_empty());
+
+    config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+    assert_eq!(
+        supervisor_tracing_environment(&config),
+        [format!(
+            "{}=http://127.0.0.1:4317",
+            openshell_core::sandbox_env::OTLP_ENDPOINT
+        )]
+    );
+}
+
+#[test]
 fn boundary_environment_contains_only_driver_owned_values() {
     let env = build_boundary_environment(&test_sandbox(), &runtime_config());
 
@@ -2501,6 +2517,23 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+    for field in ["sandbox_runtime_image", "supervisor_image"] {
+        let template = DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                (field): "registry.example.com/openshell/runtime:untrusted"
+            }))),
+            ..Default::default()
+        };
+
+        let error = DockerSandboxDriverConfig::from_template(&template)
+            .expect_err("sandbox requests must not select trusted runtime images");
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
 }
 
 #[test]
@@ -3687,4 +3720,33 @@ fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
     ));
     assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
     assert_eq!(lookup.message, "inspect docker volume failed");
+}
+
+#[test]
+fn normalize_pull_reference_appends_latest_only_when_untagged() {
+    // A bare repository reference must resolve to a single tag so the daemon
+    // does not pull every tag in the repository (issue #4029).
+    assert_eq!(
+        normalize_pull_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    // An explicit tag is preserved untouched.
+    assert_eq!(normalize_pull_reference("foo:1.2"), "foo:1.2");
+    // A digest-pinned reference already names an exact image.
+    assert_eq!(
+        normalize_pull_reference(
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    // A registry port is not a tag, so `:latest` is still appended.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app"),
+        "registry:5000/team/app:latest"
+    );
+    // A registry port combined with an explicit tag is left unchanged.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app:v1"),
+        "registry:5000/team/app:v1"
+    );
 }

@@ -290,7 +290,12 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
         Some(Commands::Config(args)) => match args.command {
             ConfigCommand::Preflight(args) => {
-                run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)
+                let driver =
+                    run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)?;
+                for report in preflight_host_tools(driver).await? {
+                    println!("{report}");
+                }
+                Ok(())
             }
         },
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
@@ -367,7 +372,15 @@ fn prepare_server_config_with_drivers(
         args.disable_tls,
     )
     .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
-    let local_jwt = defaults::complete_local_jwt_config()?;
+    // Explicit signing configuration must not depend on an unrelated, partial
+    // local bundle left by a package-managed installation.
+    let explicit_jwt = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.gateway_jwt.clone());
+    let gateway_jwt = match explicit_jwt {
+        Some(jwt) => Some(jwt),
+        None => defaults::complete_local_jwt_config()?,
+    };
 
     let bind = SocketAddr::new(args.bind_address, args.port);
 
@@ -562,6 +575,18 @@ fn prepare_server_config_with_drivers(
         })
         .unwrap_or_default();
 
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.image_preparation_timeout_seconds)
+    {
+        if !(1..=86_400).contains(&seconds) {
+            return Err(miette::miette!(
+                "image_preparation_timeout_seconds must be between 1 and 86400"
+            ));
+        }
+        config.image_preparation_timeout_seconds = seconds;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -580,14 +605,7 @@ fn prepare_server_config_with_drivers(
     // package-managed starts also auto-detect the JWT bundle written next to
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
-    if let Some(jwt) = file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
-    {
-        config.gateway_jwt = Some(jwt);
-    } else if let Some(jwt) = local_jwt {
-        config.gateway_jwt = Some(jwt);
-    }
+    config.gateway_jwt = gateway_jwt;
 
     Ok(ServerStartupConfig {
         config,
@@ -762,7 +780,7 @@ fn run_config_preflight(
         Some(detect_preflight_test_driver),
         PreflightTestFactory,
     )?)?;
-    run_config_preflight_with_drivers(args, run, matches, &registry)
+    run_config_preflight_with_drivers(args, run, matches, &registry).map(|_| ())
 }
 
 fn run_config_preflight_with_drivers(
@@ -770,7 +788,7 @@ fn run_config_preflight_with_drivers(
     run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     if args.gateway_args.is_empty() {
         return run_effective_config_preflight(args.path, run, matches, compute_drivers);
     }
@@ -785,7 +803,7 @@ fn run_config_preflight_with_drivers(
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) =>
         {
-            return Ok(());
+            return Ok(None);
         }
         Err(error) => return Err(miette::miette!("{error}")),
     };
@@ -794,7 +812,7 @@ fn run_config_preflight_with_drivers(
     if replay.command.is_some() {
         // A valid non-daemon action does not consume gateway startup
         // configuration. Let the immediately following invocation perform it.
-        return Ok(());
+        return Ok(None);
     }
     run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
 }
@@ -804,7 +822,7 @@ fn run_effective_config_preflight(
     mut run: RunArgs,
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
-) -> Result<()> {
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
     let path = if path_override.is_some() {
         path_override
     } else {
@@ -849,8 +867,9 @@ fn run_effective_config_preflight(
             gateway_tls_enabled: !run.disable_tls,
             endpoint_overrides: &endpoint_overrides,
         };
+        let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
-            crate::validate_compute_driver_config(
+            selected_driver = Some(crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
                 run.name.trim(),
@@ -858,7 +877,7 @@ fn run_effective_config_preflight(
                 &run.log_level,
                 driver_startup,
                 true,
-            )?;
+            )?);
         } else if file.is_some() {
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
@@ -880,16 +899,66 @@ fn run_effective_config_preflight(
                 )?;
             }
         }
-        Ok(())
+        Ok(selected_driver)
     })();
 
     match (validation, path.as_ref()) {
-        (Ok(()), _) => Ok(()),
+        (Ok(driver), _) => Ok(driver),
         (Err(_), Some(path)) => Err(miette::miette!(
             "{}",
             config_file::ConfigPreflightError::invalid_current(path)
         )),
         (Err(error), None) => Err(error),
+    }
+}
+
+/// Run executable probes outside the pure configuration-validation context.
+async fn preflight_host_tools(
+    driver: Option<crate::ConfiguredComputeDriver>,
+) -> Result<Vec<String>> {
+    match driver {
+        Some(crate::ConfiguredComputeDriver::Registered(registration)) => {
+            let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                // Register before polling the hook: a probe owns a separate
+                // process group, so default CLI termination cannot clean it up.
+                let mut interrupt = signal(SignalKind::interrupt())
+                    .map_err(|error| miette::miette!("register preflight SIGINT: {error}"))?;
+                let mut terminate = signal(SignalKind::terminate())
+                    .map_err(|error| miette::miette!("register preflight SIGTERM: {error}"))?;
+                let check = registration.factory.preflight_host_tools(cancellation_rx);
+                tokio::pin!(check);
+                let reason = tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                    result = &mut check => return result.map_err(|error| miette::miette!("{error}")),
+                };
+                cancellation_tx.send_replace(true);
+                // The hook owns its children. Await its cancellation cleanup
+                // before the short-lived CLI shuts down the Tokio runtime.
+                let _ = check.await;
+                Err(miette::miette!(
+                    "host tool preflight interrupted by {reason}"
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                let _cancellation_tx = cancellation_tx;
+                registration
+                    .factory
+                    .preflight_host_tools(cancellation_rx)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))
+            }
+        }
+        Some(crate::ConfiguredComputeDriver::Remote { name }) => Ok(vec![format!(
+            "compute driver '{name}': host tool checks not performed for a remote endpoint; run preflight on the driver host with its service account and environment"
+        )]),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -3262,6 +3331,7 @@ version = 2
 
 [openshell.gateway]
 policy_validation_failure_mode = "retain_last_valid"
+image_preparation_timeout_seconds = 2400
 
 [openshell.drivers.docker]
 unknown_docker_key = true
@@ -3287,6 +3357,7 @@ mem_mib = "not-a-number"
             super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
 
         assert_eq!(prepared.config.compute_driver.as_deref(), Some("podman"));
+        assert_eq!(prepared.config.image_preparation_timeout_seconds, 2400);
         assert_eq!(
             prepared.config.policy_validation_failure_mode,
             openshell_core::PolicyValidationFailureMode::RetainLastValid
@@ -3294,5 +3365,88 @@ mem_mib = "not-a-number"
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_image_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _tls = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+        let config_path = state.path().join("gateway.toml");
+        for seconds in [0, 86_401] {
+            std::fs::write(&config_path, format!(
+                "[openshell]\nversion = 2\n[openshell.gateway]\nimage_preparation_timeout_seconds = {seconds}\n"
+            )).unwrap();
+            let (mut args, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "podman",
+                "--disable-tls",
+            ]);
+            let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                panic!("unbounded preparation must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("image_preparation_timeout_seconds must be between 1 and 86400")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_launch_signing_config_ignores_partial_local_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", directory.path().to_str().unwrap());
+        let _local = EnvVarGuard::set(
+            "OPENSHELL_LOCAL_TLS_DIR",
+            directory.path().to_str().unwrap(),
+        );
+        std::fs::create_dir(directory.path().join("jwt")).unwrap();
+        std::fs::write(
+            directory.path().join("jwt/signing.pem"),
+            "incomplete local bundle",
+        )
+        .unwrap();
+        let config_path = directory.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/explicit/signing.pem"
+public_key_path = "/explicit/public.pem"
+kid_path = "/explicit/kid"
+gateway_id = "explicit-gateway"
+"#,
+        )
+        .unwrap();
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+        let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+        assert_eq!(
+            prepared.config.gateway_jwt.unwrap().gateway_id,
+            "explicit-gateway"
+        );
     }
 }

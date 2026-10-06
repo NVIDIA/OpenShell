@@ -275,10 +275,14 @@ impl ComputeDriver for ComputeDriverService {
                     })?;
                 match self.driver.workspace_mode() {
                     WorkspaceMode::Managed => {
-                        self.driver
-                            .ensure_namespace(&workspace)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        self.driver.ensure_namespace(&workspace).await.map_err(
+                            |error| match error {
+                                crate::KubernetesDriverError::Precondition(message) => {
+                                    Status::failed_precondition(message)
+                                }
+                                error => Status::internal(error.to_string()),
+                            },
+                        )?;
                     }
                     WorkspaceMode::Operator => {
                         if let Some(allowlist) = self.driver.operator_allowlist()

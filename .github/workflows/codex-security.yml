@@ -76,9 +76,9 @@ concurrency:
 
 env:
   CODEX_SECURITY_MAX_CONCURRENT_THREADS: "8"
-  CODEX_SECURITY_REASONING_EFFORT: medium
+  CODEX_SECURITY_REASONING_EFFORT: high
   NVIDIA_INFERENCE_BASE_URL: https://inference-api.nvidia.com/v1
-  NVIDIA_INFERENCE_MODEL: openai/openai/gpt-5.6-sol
+  NVIDIA_INFERENCE_MODEL: openai/openai/gpt-6.1-sol
 
 jobs:
   analyze:

@@ -112,11 +112,23 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 
 ### Issue Workflow
 
-Community issues move through triage, technical validation, and human acceptance. The repository's `state:*` labels record these stages. Inspect the current GitHub labels and their descriptions before applying or interpreting them; do not assume a fixed label list. An agent may assess evidence and request missing information. A maintainer decides whether to accept valid work and where it belongs on the roadmap.
+Community issues move through triage, technical validation, and human acceptance. The repository's `state:*` labels record these stages. Follow [Label Discovery](#label-discovery) before applying or interpreting them; do not assume a fixed label list. An agent may assess evidence and request missing information. A maintainer decides whether to accept valid work and where it belongs on the roadmap.
 
 A direct request to an agent authorizes the requested planning or implementation. A request to plan alone does not authorize implementation. For unattended work, inspect current state descriptions, maintainer assignments, and comments to determine the authorized phase. Technical validation alone does not authorize implementation. Check for an existing owner, branch, or PR before starting.
 
 Do not file suspected vulnerabilities as public issues. Follow [SECURITY.md](SECURITY.md). Use the specialized security skills for authorized review or remediation.
+
+### Label Discovery
+
+Retrieve every page of repository labels and their descriptions:
+
+```shell
+gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[] | {name, description}'
+```
+
+The default `gh label list` output is limited to 30 labels. Do not treat that first page as the complete workflow definition. If a description is missing or ambiguous, check maintainer instructions and issue comments for the intended meaning. If it remains unclear, ask a maintainer to define it before changing the state or starting unattended work. Do not infer authorization from a label name alone.
+
+When recording a triage outcome, replace the previous assessment state rather than accumulating assessment labels. Preserve maintainer acceptance, execution state, roadmap decisions, and unrelated labels.
 
 ## Prerequisites
 
@@ -279,6 +291,22 @@ each worktree. Cache reuse therefore depends on the compiler inputs: outputs
 that embed absolute paths, including Rust dependencies in some builds, can
 still miss across worktrees.
 
+## Container Image Base Overrides
+
+The gateway and supervisor Dockerfiles accept `GATEWAY_BASE_IMAGE` and
+`SUPERVISOR_BASE_IMAGE` build arguments. Omitting them keeps the pinned
+distroless defaults. To build with your own bases, pass the argument through
+the corresponding task:
+
+```shell
+mise run build:docker:gateway -- --build-arg GATEWAY_BASE_IMAGE=registry.example.com/gateway-base:tag
+mise run build:docker:supervisor -- --build-arg SUPERVISOR_BASE_IMAGE=registry.example.com/supervisor-base:tag
+```
+
+Choose bases that provide the GNU runtime libraries required by the binaries
+and CA certificates for the target architecture. Validate the resulting images
+with your deployment. The sandbox image uses `scratch` and has no base override.
+
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
@@ -353,12 +381,22 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 ## Pull Requests
 
-1. Create a branch from `main` named `<type>/<issue-id>-<short-description>/<github-username>`, using a Conventional Commits type such as `feat`, `fix`, `docs`, or `chore`.
+1. Create a branch from `main`, or from the parent PR branch for dependent work, following [Branch Names](#branch-names).
 2. Make your changes with tests.
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
-Every PR must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+
+Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not change applicable verification, review, or private vulnerability disclosure requirements.
+
+### Branch Names
+
+Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
+
+For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
+
+Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 

@@ -42,8 +42,8 @@ missing baselines, merge conflicts, and tool failures always fail the check.
 
 Release Tag compares the tagged candidate cumulatively against the previous
 stable release, using the same minor-versus-patch policy. Its result is part
-of the qualification profile: failure blocks stable publication, while a
-pre-release can still publish with failed qualification recorded. This checks
+of the qualification profile: failure blocks both pre-release and stable
+publication. Failed candidates retain build artifacts and evidence in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
 
@@ -72,8 +72,8 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-Every approved `Branch E2E Checks` run builds the RPM packages, including
-runs without optional E2E labels. Core integration qualification builds and installs
+`Branch E2E Checks` builds binaries and images only when an E2E suite is
+selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
 the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
 rootful and rootless Podman. These lanes run conformance using the matching runtime
 images. Release Dev and Release Tag use the same package installers.
@@ -187,12 +187,18 @@ candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
 Tagged releases treat Cargo Deny and Codex Security findings as failures of the
-currently implemented qualification profile. A profile failure does not prevent
-a pre-release candidate's complete artifact set from being published, but it
-does prevent stable publication. CodeQL, Trivy, and Zizmor findings are
+currently implemented qualification profile. A profile failure prevents both
+pre-release and stable publication. CodeQL, Trivy, and Zizmor findings are
 temporarily informational for tagged releases: the existing findings were
 reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
+
+Failed pre-release builds send notifications via Slack using a webhook and
+at-mentioning the triage engineer with a link to the failure. The webhook is
+stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
+mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
+Notifications are non-blocking and do not affect release results; an unset
+webhook skips sending; an unset mention sends without a mention.
 
 ```shell
 gh workflow run security-scan.yml --ref main \
@@ -201,8 +207,9 @@ gh workflow run security-scan.yml --ref main \
   -F fail-on-static-findings=false
 ```
 
-To integrate it into a larger workflow, run it after the job that pushes the
-candidate tag and publishes the artifacts. This example assumes an existing
+To integrate it into a larger workflow, run it after the job that creates the
+candidate tag and stages source-addressed artifacts for scanning. Release-facing
+publication follows successful qualification. This example assumes an existing
 `build` job with outputs named `candidate_tag`, `gateway_image`, `sandbox_image`,
 and `chart_ref`; adapt those names to your workflow:
 
@@ -233,8 +240,8 @@ jobs:
 Set `needs: security` on a downstream promotion job to require successful scans.
 The tagged release workflow records protobuf, security, and integration outcomes in a
 qualification job after publishing its commit-addressed OCI images. A failed
-check remains visible in the workflow, but pre-release artifact assembly and
-publication continue. Stable publication currently requires the implemented
+check remains visible in the workflow, with build artifacts and evidence retained
+in Actions storage. Both pre-release and stable publication require the implemented
 `release-tag-v1` profile to pass; that profile is an incremental subset of RFC
 0014 qualification.
 
@@ -410,7 +417,7 @@ Flow:
 Prerequisites:
 
 - DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
-- First-time external contributors must be vouched. See the [Vouch System](AGENTS.md#vouch-system).
+- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
@@ -426,8 +433,6 @@ Important: if a PR requires manual admission, every new commit needs another `/o
 GitHub merge queue is required for `main`. Repository administrators must enable **Require merge queue** in the branch ruleset for `main` and keep these required status contexts aligned with the PR gates:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 
@@ -438,7 +443,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -464,7 +469,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -490,18 +495,23 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Protobuf, security, and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
+| `.github/workflows/snap-package.yml` | Builds Snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
+| `.github/workflows/snap-publish.yml` | Uploads existing Snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after Snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 
 Require these statuses in the branch ruleset for PR and merge-queue CI:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+
+The following statuses are opt-in and controlled by labels:
+
+- `OpenShell / E2E`: `test:e2e`
+- `OpenShell / GPU E2E`: `test:e2e-gpu`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
@@ -511,3 +521,24 @@ merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
+
+## Nix download recovery
+
+Jobs that enter the development shell enable `prepare-shell: "true"` on
+`setup-nix`. After configuring Cachix, the action prepares the shell with
+`nix develop -c true` and retries once on failure. Use `shell-installable`
+to select a different development shell. Rust setup assumes this preparation
+has completed. Jobs that only use Nix apps leave shell preparation disabled.
+
+Nix can report a transport error after receiving a complete cache download,
+then resume at EOF and receive HTTP 416. A fresh invocation restarts the
+operation. Both attempts appear in the job log; a second failure fails the
+step. Any preparation failure is retried once, including deterministic errors.
+Cargo, lint, and test commands are not retried.
+
+Direct `nix build` commands retry once. Before each `nix run`, CI builds the
+app's package with `nix build --no-link`, retrying preparation once, then runs
+the app once. The artifact and protobuf-check apps expose matching package
+outputs for this preparation. Runtime failures from tests, artifact generation,
+and compatibility checks are not retried. Downloads initiated inside an app
+are outside this preparation retry.

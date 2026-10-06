@@ -4828,7 +4828,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     .map_err(Status::internal)?;
     if crate::compute::provisioning_deadline::timed_out(&sandbox) {
         return Err(Status::failed_precondition(
-            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+            "provisioning deadline expired; explicitly start the sandbox after cleanup",
         ));
     }
     let current = sandbox
@@ -4914,10 +4914,10 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .claim_provisioning_timeout(&sandbox, now_ms)
                 .await
                 .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "provisioning repair window expired",
-            ));
+            return Err(Status::failed_precondition("provisioning deadline expired"));
         }
+        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
+            .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
             crate::compute::provisioning_deadline::record_rejection(record, now_ms)
                 .map_err(Status::internal)?;
@@ -8157,6 +8157,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_registration_starts_repair_once_after_a_cold_start() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        use openshell_core::time::timestamp_to_millis;
+        let state = test_server_state().await;
+        let sandbox_id = "sb-cold-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "cold-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let request = || {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: instance_id.clone(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            )
+        };
+        // A duplicate report racing the initial registration must share one
+        // persisted transition; either may acquire the lifecycle fence first.
+        let (first, duplicate) = tokio::join!(
+            handle_report_sandbox_configuration(&state, request()),
+            handle_report_sandbox_configuration(&state, request()),
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        let saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let record = saved
+            .status
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            record.preparation_deadline,
+            preparation.preparation_deadline
+        );
+        let start = timestamp_to_millis(record.admission_start_time.as_ref().unwrap()).unwrap();
+        let deadline = timestamp_to_millis(record.deadline.as_ref().unwrap()).unwrap();
+        assert_eq!(deadline - start, 300_000);
+        handle_report_sandbox_configuration(&state, request())
+            .await
+            .unwrap();
+        let repeated = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repeated
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_expiry_rejects_registration_before_the_scanner_runs() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-expired-preparation";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "expired-preparation",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let expired = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        let status = expired.status.unwrap();
+        assert!(status.provisioning.unwrap().admission_start_time.is_none());
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ImagePreparationTimedOut")
+        );
+    }
+
+    #[tokio::test]
     async fn provisioning_timeout_rejects_supervisor_registration() {
         use openshell_core::proto::{
             ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
@@ -8194,7 +8331,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("repair window expired"));
+        assert!(error.message().contains("provisioning deadline expired"));
     }
 
     #[tokio::test]
@@ -14287,6 +14424,48 @@ mod tests {
             second.environment.get("GITHUB_TOKEN"),
             Some(&"rotated".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn annotated_profile_has_stable_provider_environment_revision() {
+        let state = test_server_state().await;
+        let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+        profile.annotations = (0..8)
+            .map(|index| (format!("key-{index}"), format!("value-{index}")))
+            .collect();
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                profile,
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-stable-provider-revision",
+            "stable-provider-revision",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut revisions = HashSet::new();
+        for _ in 0..16 {
+            let config = load_sandbox_config(&state, &sandbox).await.unwrap();
+            let environment = load_sandbox_provider_environment(&state, &sandbox, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                config.provider_env_revision,
+                environment.provider_env_revision
+            );
+            revisions.insert(config.provider_env_revision);
+        }
+        assert_eq!(revisions.len(), 1);
     }
 
     #[tokio::test]

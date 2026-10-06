@@ -233,6 +233,7 @@ pub fn supervisor_pod(
     upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
+    tracing_environment: &[(&str, String)],
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -269,6 +270,11 @@ pub fn supervisor_pod(
             "",
         ),
     ];
+    environment.extend(
+        tracing_environment
+            .iter()
+            .map(|(name, value)| env_var(name, value)),
+    );
     let mut volume_mounts = vec![
         volume_mount("bootstrap", "/.openshell/supervisor", true),
         volume_mount("sa-token", "/var/run/secrets/openshell", true),
@@ -811,6 +817,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }
@@ -838,6 +845,58 @@ mod tests {
             .map(|volume| volume.name.clone())
             .collect();
         (env, volumes)
+    }
+
+    #[test]
+    fn supervisor_pod_carries_tracing_environment() {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let client_tls = SupervisorClientTls::Disabled;
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            client_tls,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            owner(),
+            &[
+                (
+                    "OPENSHELL_OTLP_ENDPOINT",
+                    "http://collector:4317".to_string(),
+                ),
+                ("TRACEPARENT", TRACEPARENT.to_string()),
+            ],
+        )
+        .expect("render supervisor Pod");
+        let environment = pod.spec.expect("Pod spec").containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment["OPENSHELL_OTLP_ENDPOINT"],
+            "http://collector:4317"
+        );
+        assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
     }
 
     #[test]
@@ -920,6 +979,7 @@ mod tests {
             false,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1177,6 +1237,7 @@ mod tests {
             staged,
             None,
             owner(),
+            &[],
         )
         .expect("render supervisor Pod")
     }

@@ -35,11 +35,11 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, ExitStatusWire, MAX_CONTROL_FRAME_BYTES,
-    Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
-    STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
-    read_stream_frame, validate_resource_claims, write_stream_frame,
+    AgentSpecWire, DnsQueryResultWire, EXEC_REQUEST_RETRY_WINDOW, ExecSpecWire, ExitStatusWire,
+    MAX_CONTROL_FRAME_BYTES, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
+    STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire,
+    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame,
+    encode_frame, read_stream_frame, validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
@@ -1398,7 +1398,7 @@ impl BoundaryClient {
         request: Request,
     ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let envelope = Self::prepare_request(request)?;
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tokio::time::timeout(EXEC_REQUEST_RETRY_WINDOW, async {
             loop {
                 let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
@@ -1415,7 +1415,10 @@ impl BoundaryClient {
         })
         .await
         .map_err(|_| {
-            BackendError::Unavailable("boundary idempotent stream request timed out".to_string())
+            BackendError::Unavailable(
+                "exec startup recovery deadline expired; execution outcome may be unknown"
+                    .to_string(),
+            )
         })?
     }
 
@@ -2906,9 +2909,6 @@ mod tests {
                 retained_socket_operation: true,
                 proc_fd_identity: true,
                 task_memory_read: true,
-                task_memory_write: true,
-                cancellation: true,
-                task_memory_writes_disabled: false,
             },
             landlock_abi: 3,
             landlock_allow_deny: true,
@@ -2916,6 +2916,7 @@ mod tests {
             tcp_dns_round_trip: true,
             tcp_allow_round_trip: true,
             tcp_deny_round_trip: true,
+            socket_loopback_confinement: true,
         };
         openshell_isolation_interface::contract::BoundaryConfirmation {
             generation: "test-generation".to_string(),

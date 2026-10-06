@@ -935,8 +935,19 @@ start_user_gateway() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_local_gateway_listener
+  wait_for_local_gateway_listener user_gateway_service_failed
   wait_for_local_gateway_status
+}
+
+# Succeeds when the gateway user service has failed or is waiting to restart
+# after a failure. A unit that is starting or running does not match, even if
+# it failed before it was restarted.
+user_gateway_service_failed() {
+  _unit_state="$(as_target_user systemctl --user show openshell-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
+  case "$_unit_state" in
+    *ActiveState=failed* | *SubState=auto-restart*) return 0 ;;
+  esac
+  return 1
 }
 
 dump_local_gateway_diagnostics() {
@@ -1015,10 +1026,14 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+# An optional command name stops the wait early when it succeeds, so a service
+# that already failed does not run out the full timeout.
 wait_for_local_gateway_listener() {
+  _failed_check="${1:-}"
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
   _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
@@ -1030,12 +1045,19 @@ wait_for_local_gateway_listener() {
       info "local gateway listener is reachable"
       return 0
     fi
+    if [ -n "$_failed_check" ] && "$_failed_check"; then
+      _service_failed=1
+      break
+    fi
     sleep 1
     _elapsed=$((_elapsed + 1))
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
+  if [ "$_service_failed" -eq 1 ]; then
+    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+  fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 

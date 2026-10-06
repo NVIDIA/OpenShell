@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Setup Rust
-description: Configure the Nix development shell and Rust caches
+description: Configure Rust caches after setup-nix has prepared the development shell
 
 inputs:
   cache-key:
@@ -22,10 +22,6 @@ runs:
       run: |
         shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
-
-    - name: Realize Nix development shell
-      shell: bash
-      run: nix develop -c true
 
     - name: Cache Rust target and registry
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

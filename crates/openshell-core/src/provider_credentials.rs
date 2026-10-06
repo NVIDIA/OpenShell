@@ -573,6 +573,26 @@ impl ProviderCredentialState {
         Ok(revision)
     }
 
+    /// Read current provider configuration only when explicitly classified non-secret.
+    ///
+    /// Local metadata adapters must not unwrap credential values just because their
+    /// environment names match a conventional configuration key.
+    pub fn current_non_secret_environment_value(&self, key: &str) -> Option<String> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        if !inner.non_secret_environment_keys.contains(key) {
+            return None;
+        }
+        let placeholder = inner.current.child_env.get(key)?;
+        inner
+            .current_resolver
+            .as_ref()?
+            .resolve_placeholder(placeholder)
+            .map(str::to_string)
+    }
+
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
     ///
     /// Searches `google_cloud::TOKEN_ENV_KEYS` in priority order (SA before

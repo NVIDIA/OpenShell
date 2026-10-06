@@ -90,6 +90,21 @@ The script installs a Debian package on Debian and Ubuntu or an RPM package on F
 
 The gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
 
+Both Debian and RPM load `~/.config/openshell/gateway.env` for configuration
+preflight and gateway startup. Use it to select exact trusted runtime artifacts
+without creating driver-specific TOML:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor@sha256:<digest>
+```
+
+The environment variables take precedence over image fields in the selected
+Docker, Podman, or Kubernetes TOML table. Restart the user service after
+editing the file. Treat these variables as trusted operator configuration;
+sandbox requests cannot set them, and registry credentials must remain in the
+container runtime's credential store or Kubernetes image-pull secrets.
+
 ```shell
 systemctl --user status openshell-gateway
 systemctl --user restart openshell-gateway
@@ -106,11 +121,16 @@ sudo loginctl enable-linger $USER
 
 The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.
 
+The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then either rerun the `install.sh` script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`, or install the snap directly:
+
 ```shell
 sudo snap install openshell
 ```
 
-The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`.
+The snap installs the standalone policy prover as `openshell.prover`. The
+`openshell-prover` alias requires Snap Store approval and may not be available.
+The prover reads local policy files through the `home` interface and does not
+connect to the gateway.
 
 The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
 

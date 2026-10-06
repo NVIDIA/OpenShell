@@ -219,6 +219,10 @@ The requested sandbox image is never selected as the bootstrap image. Operators
 must configure either `bootstrap_image` or `default_image`; when both are empty,
 the driver fails during startup.
 
+Image and writable-overlay preparation run in owned worker processes. Stopping or deleting a sandbox cancels its worker and formatter processes, waits for them to exit, then removes the attempt's temporary files under `<state-dir>/images/preparations/`. New overlays, including retries after an interrupted first start, are built there and renamed into sandbox state only after completion. A file lock inherited by the worker's children keeps cleanup from deleting files that a process still owns. If cleanup cannot establish that the processes have stopped, the operation returns an error and retains both temporary files and sandbox state.
+
+At startup, the driver reclaims inactive attempts in this directory. It preserves active attempts, committed image caches, and unmarked staging from older releases. Concurrent preparations serialize image-cache publication; an interrupted attempt cannot publish a partial disk over an existing cache entry. Gateway upload slots for `rootfs_tar_path` keep their existing, separate lifecycle.
+
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
 with the prepared image rootfs as lowerdir when present, otherwise the bootstrap

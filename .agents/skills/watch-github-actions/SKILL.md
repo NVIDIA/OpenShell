@@ -125,6 +125,13 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+`setup-nix` retries development-shell preparation once when `prepare-shell`
+is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
+shell has already been prepared. Cargo, lint, and test commands are not retried.
+Direct Nix builds and app dependency preparation also retry once; apps run
+once after preparation succeeds. Skipped dependent E2E suites indicate blocked
+coverage.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
@@ -140,9 +147,12 @@ During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Failed qualification prevents stable
-publication but still allows pre-release artifacts to publish with the failure
-recorded.
+the `release-tag-v1` qualification profile. Both tagged pre-release and stable
+publication require this profile to pass. Failed, cancelled, or skipped suites
+block publication; build artifacts and qualification evidence remain in Actions
+storage for diagnosis. Source-SHA images are staging inputs for qualification.
+Snap builds run in parallel with qualification, but tagged stable Store uploads
+consume those built artifacts only after qualification passes.
 
 View logs for a specific run:
 

@@ -11,6 +11,7 @@ use crate::config::{
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
 };
+use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
@@ -266,6 +267,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENSHIFT_SCC_ALLOCATOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     match error.code() {
         tonic::Code::InvalidArgument => {
@@ -686,6 +688,7 @@ pub struct KubernetesComputeDriver {
     client: Client,
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
+    lifecycle_gates: Arc<LifecycleGates>,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
@@ -701,6 +704,19 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
+    /// Environment that lets a supervisor export spans and join the current trace.
+    fn supervisor_tracing_environment(&self) -> Vec<(&'static str, String)> {
+        let Some(endpoint) = self.config.supervisor_otlp_endpoint.as_deref() else {
+            return Vec::new();
+        };
+        let mut environment = vec![(
+            openshell_core::sandbox_env::OTLP_ENDPOINT,
+            endpoint.to_string(),
+        )];
+        environment.extend(openshell_otel::current_trace_context_environment());
+        environment
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(config: KubernetesComputeConfig) -> Self {
         let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async {
@@ -713,6 +729,7 @@ impl KubernetesComputeDriver {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist: None,
         }
@@ -794,6 +811,7 @@ impl KubernetesComputeDriver {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist,
         };
@@ -1059,6 +1077,13 @@ impl KubernetesComputeDriver {
                 )));
             }
         };
+        let openshift_scc_allocator_enabled = [
+            crate::config::ANNOTATION_SCC_MCS,
+            crate::config::ANNOTATION_SCC_UID_RANGE,
+            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+        ]
+        .iter()
+        .any(|key| gateway_ns_annotations.contains_key(*key));
 
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -1068,35 +1093,24 @@ impl KubernetesComputeDriver {
         labels.insert(LABEL_GATEWAY_ID.to_string(), self.config.gateway_id.clone());
         labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), workspace.to_string());
 
-        let mut annotations = BTreeMap::new();
-        for key in [
-            crate::config::ANNOTATION_SCC_UID_RANGE,
-            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
-        ] {
-            if let Some(val) = gateway_ns_annotations.get(key) {
-                annotations.insert(key.to_string(), val.clone());
-            }
-        }
-
         let ns = Namespace {
             metadata: ObjectMeta {
                 name: Some(ns_name.clone()),
                 labels: Some(labels),
-                annotations: if annotations.is_empty() {
-                    None
-                } else {
-                    Some(annotations)
-                },
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.create(&PostParams::default(), &ns))
-            .await
+        let initial_namespace = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            ns_api.create(&PostParams::default(), &ns),
+        )
+        .await
         {
-            Ok(Ok(_)) => {
+            Ok(Ok(created)) => {
                 info!(namespace = %ns_name, workspace = %workspace, "created managed namespace");
+                created
             }
             Ok(Err(KubeError::Api(api))) if api.code == 409 => {
                 let existing =
@@ -1118,6 +1132,7 @@ impl KubernetesComputeDriver {
                     )));
                 }
                 debug!(namespace = %ns_name, "managed namespace already exists");
+                existing
             }
             Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
             Err(_) => {
@@ -1125,12 +1140,73 @@ impl KubernetesComputeDriver {
                     "timeout creating namespace {ns_name}"
                 )));
             }
+        };
+
+        if openshift_scc_allocator_enabled {
+            self.wait_for_openshift_scc_annotations(&ns_api, &ns_name, initial_namespace)
+                .await?;
         }
 
         self.ensure_service_account(&ns_name).await?;
         self.ensure_managed_ssh_network_policy(&ns_name).await?;
 
         Ok(ns_name)
+    }
+
+    async fn wait_for_openshift_scc_annotations(
+        &self,
+        ns_api: &Api<Namespace>,
+        namespace: &str,
+        mut current: Namespace,
+    ) -> Result<(), KubernetesDriverError> {
+        let operation = async {
+            loop {
+                let annotations = current.metadata.annotations.unwrap_or_default();
+                if [
+                    crate::config::ANNOTATION_SCC_MCS,
+                    crate::config::ANNOTATION_SCC_UID_RANGE,
+                    crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+                ]
+                .into_iter()
+                .all(|key| {
+                    annotations
+                        .get(key)
+                        .is_some_and(|value| !value.trim().is_empty())
+                }) {
+                    return Ok(());
+                }
+
+                let has_uid_range = annotations
+                    .get(crate::config::ANNOTATION_SCC_UID_RANGE)
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_mcs = annotations
+                    .get(crate::config::ANNOTATION_SCC_MCS)
+                    .is_some_and(|value| !value.trim().is_empty());
+                if has_uid_range && !has_mcs {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "managed namespace {namespace} has an OpenShift UID range but no MCS annotation; the SCC allocator skips namespaces with an existing UID range, so delete and recreate this workspace namespace"
+                    )));
+                }
+
+                tokio::time::sleep(OPENSHIFT_SCC_ALLOCATOR_POLL_INTERVAL).await;
+                current = match ns_api.get(namespace).await {
+                    Ok(namespace) => namespace,
+                    Err(KubeError::Api(api)) if api.code == 404 => {
+                        return Err(KubernetesDriverError::Message(format!(
+                            "managed namespace {namespace} disappeared while waiting for OpenShift SCC allocator annotations"
+                        )));
+                    }
+                    Err(error) => return Err(KubernetesDriverError::from_kube(error)),
+                };
+            }
+        };
+        tokio::time::timeout(KUBE_API_TIMEOUT, operation)
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out waiting for OpenShift SCC allocator annotations on managed namespace {namespace}"
+                ))
+            })?
     }
 
     async fn ensure_managed_ssh_network_policy(
@@ -1764,6 +1840,11 @@ impl KubernetesComputeDriver {
     )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self
+            .lifecycle_gates
+            .gate_for(&sandbox.id)
+            .lock_owned()
+            .await;
         let result = Box::pin(self.create_sandbox_inner(sandbox)).await;
         span_status.finish(result)
     }
@@ -2374,6 +2455,7 @@ impl KubernetesComputeDriver {
                             .as_str(),
                     ),
                     dependent_owner.clone(),
+                    &self.supervisor_tracing_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -2880,6 +2962,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = Box::pin(self.stop_sandbox_inner(sandbox_id)).await;
         span_status.finish(result)
     }
@@ -2979,6 +3062,7 @@ impl KubernetesComputeDriver {
         expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
             generation_id,
@@ -3178,6 +3262,7 @@ impl KubernetesComputeDriver {
                         &sandbox_api.resource.api_version,
                         false,
                     ),
+                    &self.supervisor_tracing_environment(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -3457,6 +3542,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
         let result = self.delete_sandbox_inner(sandbox_id).await;
         span_status.finish(result)
     }
@@ -3657,6 +3743,44 @@ impl KubernetesComputeDriver {
             let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
                 continue;
             };
+            // Lifecycle RPCs can replace the stable supervisor Pod name while
+            // this LIST snapshot still describes the previous stopped state.
+            // Skip in-flight mutations, then refresh under the shared gate so
+            // a snapshot taken before a completed restart cannot delete it.
+            let Ok(_guard) = self.lifecycle_gates.gate_for(&sandbox_id).try_lock_owned() else {
+                continue;
+            };
+            let Some(name) = object.metadata.name.as_deref() else {
+                continue;
+            };
+            let namespace = object
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(&self.config.namespace);
+            let api = Self::agent_sandbox_api(
+                self.client.clone(),
+                &lookup_api.resource.version,
+                namespace,
+            );
+            let refreshed = match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.get(name)).await {
+                Ok(Ok(refreshed)) => refreshed,
+                Ok(Err(KubeError::Api(error))) if error.code == 404 => continue,
+                Ok(Err(error)) => {
+                    debug!(%sandbox_id, %error, "could not refresh Sandbox for runtime reconciliation");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(%sandbox_id, "timed out refreshing Sandbox for runtime reconciliation");
+                    continue;
+                }
+            };
+            if refreshed.metadata.uid != object.metadata.uid
+                || sandbox_id_from_object(&refreshed).as_deref() != Ok(sandbox_id.as_str())
+            {
+                continue;
+            }
+            let object = refreshed;
             if let Err(error) = self.admit_stored_resources(&object).await {
                 warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
                 if error.code() == tonic::Code::FailedPrecondition {
@@ -7449,9 +7573,14 @@ mod tests {
                     serde_json::json!({
                         "apiVersion": "agents.x-k8s.io/v1beta1",
                         "kind": "SandboxList",
-                        "items": [sandbox]
+                        "items": [sandbox.clone()]
                     }),
                 ),
+            ),
+            (
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                kube_test_response(http::StatusCode::OK, sandbox),
             ),
             (
                 http::Method::GET,
@@ -7488,6 +7617,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -8462,6 +8592,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -8552,6 +8683,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
         };
@@ -8805,6 +8937,23 @@ mod tests {
         let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
         assert!(err.contains("unknown field"));
+    }
+
+    #[test]
+    fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+        for field in ["sandbox_runtime_image", "supervisor_image"] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    (field): "registry.example.com/openshell/runtime:untrusted"
+                }))),
+                ..Default::default()
+            };
+
+            let error = KubernetesSandboxDriverConfig::from_template(&template)
+                .expect_err("sandbox requests must not select trusted runtime images");
+            assert!(error.contains("unknown field"), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
     }
 
     #[test]
@@ -11013,6 +11162,7 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
+            lifecycle_gates: Arc::default(),
             config,
             operator_allowlist: None,
         };
@@ -11038,6 +11188,302 @@ mod tests {
             image_pull_secrets: image_pull_secrets.iter().map(ToString::to_string).collect(),
             client_tls_secret_name: "openshell-client-tls".into(),
             ..Default::default()
+        }
+    }
+
+    async fn call_ensure_workspace(
+        service: &crate::ComputeDriverService,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::EnsureWorkspaceResponse>,
+        tonic::Status,
+    > {
+        openshell_core::proto::compute::v1::compute_driver_server::ComputeDriver::ensure_workspace(
+            service,
+            tonic::Request::new(openshell_core::proto::compute::v1::EnsureWorkspaceRequest {
+                workspace: "team-a".into(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_openshift_namespace_waits_for_allocator_without_copying_annotations() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c1,c2",
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000000/10000"
+                }
+            }
+        });
+        let pending_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": namespace}
+        });
+        let allocated_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": namespace,
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c3,c4",
+                    "openshift.io/sa.scc.uid-range": "1000000001/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000001/10000"
+                }
+            }
+        });
+        for allocated_on_create in [true, false] {
+            let mut steps = vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace.clone()),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CREATED,
+                        if allocated_on_create {
+                            allocated_namespace.clone()
+                        } else {
+                            pending_namespace.clone()
+                        },
+                    ),
+                ),
+            ];
+            if !allocated_on_create {
+                steps.push((
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_response(http::StatusCode::OK, allocated_namespace.clone()),
+                ));
+            }
+            steps.push((
+                http::Method::POST,
+                "/api/v1/namespaces/openshell-gateway-a-team-a/serviceaccounts",
+                kube_test_response(
+                    http::StatusCode::CREATED,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceAccount",
+                        "metadata": {"name": "default", "namespace": namespace}
+                    }),
+                ),
+            ));
+            let (driver, steps, bodies) = scripted_driver(managed_config(&[]), steps);
+
+            assert_eq!(driver.ensure_namespace("team-a").await.unwrap(), namespace);
+            assert!(steps.lock().unwrap().is_empty());
+            assert_eq!(
+                bodies.lock().unwrap()[0]["metadata"].get("annotations"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_rejects_existing_uid_range_without_mcs() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.mcs": "s0:c1,c2",
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000000/10000"
+                }
+            }
+        });
+        let existing_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": namespace,
+                "labels": {
+                    "openshell.ai/managed-by": "openshell",
+                    "openshell.ai/gateway-id": "gateway-a",
+                    "openshell.ai/sandbox-workspace": "team-a"
+                },
+                "annotations": {
+                    "openshift.io/sa.scc.uid-range": "1000000001/10000",
+                    "openshift.io/sa.scc.supplemental-groups": "1000000001/10000"
+                }
+            }
+        });
+        let (driver, steps, _) = scripted_driver(
+            managed_config(&[]),
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "AlreadyExists",
+                            "message": format!("namespaces {namespace:?} already exists"),
+                            "code": 409
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_response(http::StatusCode::OK, existing_namespace),
+                ),
+            ],
+        );
+
+        let service = crate::ComputeDriverService::new(driver);
+
+        let error = call_ensure_workspace(&service)
+            .await
+            .expect_err("a stale OpenShift namespace should be a permanent precondition failure");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("MCS") && error.message().contains("recreate"));
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_keeps_namespace_setup_failures_internal() {
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {"openshift.io/sa.scc.uid-range": "1000000000/10000"}
+            }
+        });
+        for steps in [
+            vec![(
+                http::Method::GET,
+                "/api/v1/namespaces/openshell",
+                kube_test_not_found("namespaces", "openshell"),
+            )],
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell",
+                    kube_test_response(http::StatusCode::OK, gateway_namespace),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces",
+                    kube_test_response(
+                        http::StatusCode::CREATED,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {"name": "openshell-gateway-a-team-a"}
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell-gateway-a-team-a",
+                    kube_test_not_found("namespaces", "openshell-gateway-a-team-a"),
+                ),
+            ],
+        ] {
+            let (driver, steps, _) = scripted_driver(managed_config(&[]), steps);
+            let service = crate::ComputeDriverService::new(driver);
+
+            let error = call_ensure_workspace(&service)
+                .await
+                .expect_err("namespace setup failures should remain internal");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(steps.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_workspace_reports_scc_allocator_timeout_as_internal() {
+        let namespace = "openshell-gateway-a-team-a";
+        let gateway_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "openshell",
+                "annotations": {
+                    "openshift.io/sa.scc.uid-range": "1000000000/10000"
+                }
+            }
+        });
+        let pending_namespace = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": namespace}
+        });
+        for stalled_get in [false, true] {
+            let gateway_namespace = gateway_namespace.clone();
+            let pending_namespace = pending_namespace.clone();
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let service_reads = reads.clone();
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let gateway_namespace = gateway_namespace.clone();
+                let pending_namespace = pending_namespace.clone();
+                let reads = service_reads.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&http::Method::GET, "/api/v1/namespaces/openshell") => {
+                            kube_test_response(http::StatusCode::OK, gateway_namespace)
+                        }
+                        (&http::Method::POST, "/api/v1/namespaces") => {
+                            kube_test_response(http::StatusCode::CREATED, pending_namespace)
+                        }
+                        (&http::Method::GET, "/api/v1/namespaces/openshell-gateway-a-team-a") => {
+                            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if stalled_get {
+                                std::future::pending::<()>().await;
+                            }
+                            kube_test_response(http::StatusCode::OK, pending_namespace)
+                        }
+                        unexpected => panic!("unexpected Kubernetes API request: {unexpected:?}"),
+                    };
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            let client = Client::new(service, "openshell");
+            let driver = KubernetesComputeDriver {
+                client: client.clone(),
+                watch_client: client,
+                sandbox_api_version: Arc::new(OnceCell::new()),
+                lifecycle_gates: Arc::default(),
+                config: managed_config(&[]),
+                operator_allowlist: None,
+            };
+            let service = crate::ComputeDriverService::new(driver);
+
+            let error = call_ensure_workspace(&service)
+                .await
+                .expect_err("allocator timeout should remain a retryable setup failure");
+
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error.message().contains("timed out"));
+            let reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+            if stalled_get {
+                assert_eq!(reads, 1);
+            } else {
+                assert!(reads > 1);
+            }
         }
     }
 
@@ -11748,4 +12194,6 @@ mod tests {
         alpha.data = serde_json::json!({"spec": {"replicas": 1}});
         assert!(sandbox_runtime_should_run(&alpha));
     }
+
+    include!("lifecycle_tests.rs");
 }

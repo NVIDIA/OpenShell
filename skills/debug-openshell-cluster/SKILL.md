@@ -93,6 +93,11 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+The gateway container uses a Distroless Debian runtime. For OS-library
+vulnerability findings, check the deployed image digest and package version;
+deploy a rebuilt gateway image with the patched base. Updating the gateway
+binary alone does not update the libraries supplied by its container image.
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
@@ -213,6 +218,8 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
+runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
@@ -511,6 +518,41 @@ name and load the chart CA plus client identity from
 the `peer-client-tls` volume exists, those files are readable, and the server
 certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
 
+To check per-replica capacity on a multi-replica gateway, read each gateway
+pod's metrics and the autoscaler:
+
+```bash
+for pod in $(kubectl -n openshell get pod \
+    -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
+  echo "${pod}"
+  kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+done
+kubectl -n openshell get hpa
+kubectl -n openshell describe hpa openshell
+```
+
+The JSONPath filter keeps only pods whose first container is the gateway
+(`openshell-gateway`). It skips certificate hook Job pods, which older charts
+labeled like gateway pods. The metrics port is `service.metricsPort` (default
+`9090`).
+
+The API server proxy connects to each pod from the control plane. A
+NetworkPolicy that accepts the metrics port only from a monitoring namespace
+blocks it unless the policy also allows the control plane. In that case,
+read one pod at a time through `kubectl port-forward`, which reaches the pod
+through the kubelet and is not blocked by NetworkPolicy:
+
+```bash
+kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
+pf_pid=$!
+sleep 2
+curl -s http://localhost:9090/metrics \
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+kill "${pf_pid}"
+```
+
 Check required Helm deployment secrets:
 
 ```bash
@@ -747,6 +789,12 @@ remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
 
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
+
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
@@ -904,8 +952,7 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.
@@ -957,6 +1004,9 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
+| One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |

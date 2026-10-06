@@ -342,7 +342,9 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
-Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** regardless of `allowed_ips`.
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
+
+The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
 
 ```yaml
 # Example: Pin an internal service to a known private IP range
@@ -511,6 +513,8 @@ When the user explicitly requests `process.run_as_user` or
 `4294967294`. Reject root (`0`) and the invalid identity sentinel
 (`4294967295`). Warn that a low numeric identity inherits permissions granted
 to the same ID on image files, mounted volumes, or devices.
+
+For MicroVM, numeric selectors must match the resolved owner of the sandbox's writable overlay. User and group are checked independently; either mismatch prevents startup. If the owner UID:GID is unknown, omit the selectors or use `sandbox` so the driver retains that identity. Do not choose another numeric identity or suggest that the policy can change an existing overlay's owner. For example, with an owner of `1000:1000`, a request for UID `10000` must be rejected with an explanation and the omission/`sandbox` alternatives, rather than generating a policy that the VM cannot start.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 
