@@ -7,6 +7,7 @@ mod file_transfer;
 mod policy_behavior;
 mod provider_auto_create;
 mod sandbox_lifecycle;
+mod sandbox_templates;
 mod smoke;
 mod workspace_lifecycle;
 
@@ -19,5 +20,10 @@ pub use policy_behavior::{
 };
 pub use provider_auto_create::PROVIDER_AUTO_CREATE_SCENARIO;
 pub use sandbox_lifecycle::SANDBOX_LIFECYCLE_SCENARIO;
+pub use sandbox_templates::{
+    SANDBOX_TEMPLATE_DUPLICATE_NAME_SCENARIO, SANDBOX_TEMPLATE_GET_AFTER_DELETE_SCENARIO,
+    SANDBOX_TEMPLATE_LIFECYCLE_SCENARIO, SANDBOX_TEMPLATE_MISSING_TEMPLATE_SCENARIO,
+    SANDBOX_TEMPLATES_SCENARIO,
+};
 pub use smoke::SMOKE_SCENARIO;
 pub use workspace_lifecycle::{WORKSPACE_LIFECYCLE_SCENARIO, WORKSPACE_TERMINATING_SCENARIO};
