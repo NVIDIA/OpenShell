@@ -11,244 +11,265 @@ links:
 
 ## Summary
 
-Organise tests by the behavior they verify, independently of how OpenShell is
-deployed. Reuse public-contract tests across drivers and environments, keep
-implementation-specific coverage separate, and make each test's contract and
-each run's coverage explicit.
+Establish a shared testing strategy for OpenShell so required public behavior
+is verified consistently across drivers and deployment environments. Separate
+conformance end-to-end tests from feature-specific and driver-specific coverage, and
+separate target preparation from test execution.
 
-This proposal defines test categories, conformance rules, and an execution model
-that builds on Nix and tmachine without requiring tests to depend on them.
-Adopt it incrementally; it does not describe CI gates already in place.
+Run end-to-end tests on request for PRs and during release qualification. Adopt the
+strategy incrementally using the existing infrastructure.
 
 ## Motivation
 
-Existing E2E binaries mix public behavior, runtime inspection, external
+Existing end-to-end binaries mix public behavior, runtime inspection, external
 integrations, and performance measurements. This makes coverage difficult to
 reuse across drivers and obscures whether a failure reflects the product or
 its test infrastructure.
 
-A shared model lets contributors place tests by purpose and reviewers understand
-what passing establishes. The Podman migration in #3712 is an initial consumer,
-not the definition of OpenShell conformance.
+Clear test categories help contributors decide where tests belong and reviewers
+understand what they verify.
 
 ## Non-goals
 
-- Implement the framework, capability API, or CI matrices in this PR.
+- Implement the framework or CI matrices in this PR.
 - Classify every existing test; retain that work in migration issues.
-- Introduce certification, a review board, or version-skew testing.
-- Replace the SDK compatibility design in #3238.
+- Introduce certification or a review board.
+- Define a cross-version compatibility matrix.
+- Define SDK-specific compatibility testing.
+- Define benchmark execution policy or performance thresholds.
 
 ## Proposal
 
-### 1. Organise tests by contract
+### 1. Organise tests by family
 
-A behavioral contract specifies an operation's expected observable result under
-stated conditions. A test case exercises it, an assertion checks an observation,
-and a suite groups related cases. For example, deleting a sandbox must remove
-it from the sandbox list; an assertion checks that its identifier is absent.
+Test families describe the scope and purpose of a check. Use them to decide
+where a test belongs and what a passing result establishes.
 
-| Family | Purpose |
+| Test Family | Description |
 | --- | --- |
-| Unit and component integration | Internal logic and implementation mechanics, at the lowest effective layer. |
-| General conformance | Public behavioral contracts across drivers and environments. |
-| Feature-specific | Features requiring configured external integration or currently implemented on only one driver. |
-| Driver-specific | Driver configuration, runtime and host integration, and implementation contracts. |
-| Disruption conformance | Portable continuity or recovery behavior under deliberately induced disruption. |
-| Load/scale | Performance and scaling measurements, separate from behavioral correctness. |
+| Lint | Check formatting, style, and static rules. |
+| Unit | Verify one component in isolation. Place tests inline in its Rust module or in an adjacent `test.rs` file under `src/`. |
+| Integration | Verify interactions between components. Place Rust integration tests in the crate's top-level `tests/` directory. |
+| End-to-end (e2e) | Verify a configured OpenShell target through a client interface. Place suites in `e2e/suites/`. |
+| Benchmark | Measure performance or scale. Place crate benchmarks in crate-level `benchmarks/` directories and full-system benchmarks in a root `benchmarks/` directory. |
 
-The client interface is not a test category: CLI and SDK tests can exercise the
-same public contract. SDK-specific semantics retain focused coverage. Security
-tests span these families; introduce a separate family only if tests need shared
-specialized infrastructure. Performance thresholds belong in load/scale unless
-the deadline is itself a public contract.
+Within the e2e family, group tests by the behavior they verify. This separates
+reusable public behavior checks from checks tied to particular integrations
+or drivers.
 
-### 2. Define conformance through public behavior
+| e2e type | What it verifies | Proposed folder |
+| --- | --- | --- |
+| Conformance | Required public behavior, including continuity across gateway restarts and upgrades. | `e2e/suites/conformance/` |
+| Feature | Behavior requiring a named external service or special gateway configuration. | `e2e/suites/features/` |
+| Driver | Behavior specific to a driver, its host integration, or its configuration. | `e2e/suites/drivers/` |
 
-Each test owns its contract: keep its stable identity, preconditions, expected
-behavior, mandatory/optional status, and significant side effects alongside the
-test. Do not maintain a duplicate specification elsewhere.
+Conformance may include disruption tests. Add these under
+`e2e/suites/disruption/` initially, with their harness developed separately.
 
-General conformance uses an already configured gateway, initially through the
-CLI until direct API access is necessary. Assert observable behavior and
-structured output, not incidental presentation or native runtime details.
-Pass/fail requires only public CLI/API access and sandbox operations.
-Administrative access belongs to provisioning, diagnostics, or disruption
-actuators; unavailable diagnostics must not affect results.
+### 2. Define conformance e2e requirements
 
-Tests must not change gateway startup configuration. They may mutate public
-API-managed state, using unique names and cleanup and avoiding conflicting
-global-setting changes within a run. Document global effects; restoring prior
-global settings is recommended, not mandatory.
+Conformance is the e2e test type that verifies required public behavior against
+a configured gateway. Each test must pass; a failure indicates a conformance
+gap. These tests provide common expectations across supported targets.
 
-Test-owned short-lived services are allowed. External services requiring gateway
-configuration belong in feature-specific suites. Behavioral assertions must not
-depend on public internet services; provisioning may download dependencies and
-images. Use existing workload images and a small common toolset, supplied by the
-harness. Missing prerequisites are setup errors. Dedicated fixture images and
-enforced offline validation are follow-ups, not migration gates.
+Conformance tests can be grouped into broad behavioral areas. The following
+section gives examples.
 
-General-conformance admission requires evidence from at least two drivers;
-Docker and Podman suffice initially. Then run against every supported driver
-with available infrastructure, recording gaps. Feature tests need one
-representative driver. Disruption tests need one working actuator initially;
-an absent actuator prevents selection, while a broken configured actuator is
-an infrastructure error.
+#### Conformance areas
 
-Use normal PR review, without a soak period or separate promotion PR. Resolve
-known flakiness rather than hiding it with retries. Changes or removals must
-distinguish test corrections from changes to promised behavior, including
-withdrawal of advertised support.
+These user stories illustrate each area from a user or administrator's
+perspective. Tests requiring external services or special gateway configuration
+belong in feature-specific suites.
 
-### 3. Make applicability and coverage explicit
-
-The gateway must report effective capabilities for its running configuration
-through the public API and machine-readable CLI output. Discovery failure aborts
-conformance. Start with flat, namespaced booleans; defer hierarchy, parameters,
-and profiles. Capabilities describe product behavior, not test selectors,
-credentials, or external-service prerequisites.
-
-Portable, non-universal behavior is a reason to extend capability reporting;
-prefer adding the capability and its test together. Whether those tests belong
-in general conformance or feature-specific suites remains open until a concrete
-migration example requires a decision.
-
-| Result | Meaning |
+| Area | User stories |
 | --- | --- |
-| Passed | The behavioral assertions held. |
-| Failed | Mandatory support is absent or an exercised contract was violated. |
-| Unsupported | Optional support was not advertised. |
-| Skipped | The test was deliberately excluded. |
-| Error | Infrastructure or fixture failure prevented evaluation. |
+| Sandbox lifecycle and continuity | I can create, inspect, start, stop, and delete a sandbox. I can observe workload status and exit codes. My sandbox retains its expected state across stops and gateway restarts, including upgrades. Ephemeral sandboxes are removed when their workloads finish. |
+| Sandbox I/O | I can execute commands with input and receive complete output and exit status. I can connect interactively and reconnect as supported. I can upload and download files safely. I can forward a port to a sandbox service. |
+| Workspaces and resource management | I can create, inspect, and delete workspaces. My resources remain scoped to their workspace. I can label and filter resources. Deletion guards prevent accidental removal of resources still in use. |
+| Policy management | I can validate, apply, inspect, and update policy. I can see which policy is effective and when an update takes effect. Invalid policy is rejected without weakening existing protection. |
+| Sandbox enforcement | My workload can access permitted files, processes, and network destinations. Prohibited access is blocked. Updating policy changes enforcement as promised. |
+| Providers | I can create, attach, update, detach, and delete providers. Authorized workloads receive usable credentials without exposing secrets. Credential changes and revocation take effect as promised. |
+| Identity and authorization | I can authenticate and access resources I am authorized to use. Unauthorized requests are rejected. Access through another client interface does not bypass authorization. |
+| Settings | I can read, change, and remove settings through public APIs. I can inspect effective values. Global overrides take precedence and prevent conflicting sandbox changes. |
+| Middleware | My requests use the selected middleware in the configured order. Transformations and failure handling follow the configured behavior. |
+| Interceptors | My gateway requests are transformed or rejected as configured. Interception preserves authorization boundaries. |
 
-Advertised behavior must pass even when support is optional. A complete run
-accounts for the entire identified suite without filtering; evaluated optional
-unsupported cases count as accounted for. Filtered or interrupted runs are
-partial. Completeness is not success: failures and errors cannot yield a complete
-pass. Advisory CI policy must not relabel failed tests as passing.
+#### Test requirements
 
-Initially, suite, CLI, and gateway use the same OpenShell revision; no
-cross-version claim is made. Start reports with that SHA and the tmachine
-configuration, or equivalent target identity. Record mock targets as mocks,
-not evidence for production drivers.
+Each conformance test documents its expected behavior, preconditions, required
+permissions, and significant side effects alongside its implementation. Use a
+descriptive, stable test name that identifies the behavior being verified and
+allows results to be tracked across runs.
 
-### 4. Separate target preparation from test execution
+Tests exercise a configured gateway through public client interfaces. Assertions
+verify observable behavior and structured output. They must not depend on native
+runtime details, incidental presentation, or diagnostic availability.
 
-A run combines a configured target with a selected suite. Platform, driver,
-environment, gateway configuration, installation method, and client interface
-may vary without changing the contract. Rootful and rootless Podman are two
-environments of one driver, not two-driver evidence.
+Tests exercise public APIs within their declared permissions. Keep end-user and
+administrative interactions in separate tests. Tests may change resources and
+settings through public APIs, but must not change deployment configuration.
+
+Tests must clean up their changes. Behavioral checks must not depend on public
+internet services.
+
+Run tests across supported targets. Changes or removals must distinguish
+corrections to tests from changes to promised behavior.
+
+#### Failure handling
+
+Investigate each failure and track the underlying product, test, or
+infrastructure issue. Notify the responsible maintainers of new failures.
+Do not automatically retry failed tests; intermittent failures may expose races
+that affect larger installations.
+
+Failures may be explicitly waived. Record each waiver's scope, rationale, and
+tracking issue, and retain the failed result.
+
+Retain test results, failure logs, revision, target configuration, and run
+duration for investigation.
+
+### 3. Separate target preparation from test execution
+
+Prepare the target separately from test execution so the same suite can run
+against locally provisioned or externally managed gateways.
+
+Target preparation supplies deployment configuration, credentials, images, and
+tools. Test runs accept the gateway endpoint and credentials. Host and runtime
+access supports provisioning, diagnostics, and disruption mechanisms.
+
+Tests must not depend on a particular provisioning tool. Conformance requirements
+remain the same across supported target configurations.
 
 ```mermaid
 flowchart LR
-    subgraph preparation[Target preparation]
-        machine[Machine / base image] --> setup[Environment setup]
-        setup --> install[Install and configure OpenShell]
-    end
-    artifacts[Build artifacts] --> install
-    install --> target[Configured OpenShell target]
+    preparation[Prepare target] --> target[Configured gateway]
     external[External provisioning] --> target
     suite[Test suite] --> client[CLI or SDK]
     client -->|exercises| target
 ```
 
-Nix pins build inputs and produces artifacts and test archives. Tmachine
-composes a `Machine` and `Environment` for setup, an `Installer` for installation,
-and a `Testsuite` for execution. Other provisioners may supply targets tmachine
-cannot represent. General conformance must also run against externally prepared
-gateways.
+### 4. Select and trigger test runs
 
-CI selects meaningful combinations, not a full cross-product, and reuses setup
-definitions rather than duplicating them. Keep source checks and affected SDK
-checks; protobuf changes require all affected SDK checks. Packaging selection
-must include transitive inputs and broaden when impact is uncertain.
-Release validation installs exact candidate artifacts before running applicable
-suites. Installation, upgrade, and uninstall behavior need separate assertions;
-successful conformance alone does not validate packaging.
+Test execution depends on the purpose of the run:
+
+| Context | Tests to run |
+| --- | --- |
+| Pull requests | Automatically run lint, unit, and component integration checks. Run e2e tests when requested. |
+| Release qualification | Run those checks and all applicable e2e tests for dev and stable releases. |
+| Additional schedules | Add scheduled runs where further coverage is needed. |
+
+Allow conformance, feature-specific, and driver-specific tests to be requested
+independently or together. Conformance includes disruption tests. Add separate
+disruption, feature, or driver subcategory selection only when run durations
+justify it.
+
+Release qualification validates installation and uninstall behavior using
+candidate artifacts. Upgrade qualification verifies continuity across gateway
+replacement.
 
 ## Implementation plan
 
-Build on the existing layout; only the marked documents are proposed additions:
+### Execution infrastructure
+
+Nix pins build inputs and produces artifacts and test archives. Tmachine
+composes a `Machine` and `Environment` for setup, an `Installer` for installation,
+and a `Testsuite` for execution. Other provisioners may supply targets tmachine
+cannot represent.
+
+CI reuses provisioning definitions across selected target configurations.
+
+### Layout and migration
+
+Existing conformance tests use the CLI against a configured gateway. Planned
+work will extend coverage to direct API usage.
+
+Move suites to `e2e/suites/`; keep provisioning under `tests/`:
 
 ```text
 tests/
-├── config.nix                     # tmachine definitions
-├── artifacts.nix                  # Artifact construction
-├── ansible/                       # Provisioning and execution
-├── CONFORMANCE.md                 # Proposed: agreed policy
+├── config.nix
+├── artifacts.nix
+└── ansible/
+e2e/
 └── suites/
     ├── conformance/
-    │   ├── cli/                   # CLI test entry points
-    │   └── README.md              # Proposed: contributor guidance
+    │   ├── cli/
+    │   └── README.md              # Requirements, authoring, and execution
+    ├── disruption/              # Added in a later phase
     ├── drivers/podman/
     └── features/provider-refresh/keycloak/
 ```
 
-1. Consolidate the conformance library under `tests/suites/conformance` alongside
-   Cargo test entry points after standalone CLI removal. Update build and CI
-   references together. Keep component tests and SDK-native tests in their
-   existing trees; extract shared helpers only when consumers need them.
-2. Add effective capability discovery and the result semantics above.
-   Migrations may proceed in parallel, but conformance qualification requires
-   reporting. Keep test contracts alongside their implementations.
-3. Migrate by behavioral intent, in parallel by destination family. One PR may
-   add coverage and remove covered source tests; delete empty binaries and
-   split or rename residual ones. Preserve coverage until validated replacement
-   or explicit retirement, without a mandatory overlap period.
-4. Track dependencies in #3954 and the Podman inventory in #3712. Retire the
-   temporary e2e-podman feature, exclusion list, and tmachine suite when its
-   source intent is covered or explicitly retired. Add no inventory machinery
-   unless source churn warrants it.
-5. Expand CI and candidate-installation validation, then demonstrate offline
-   runs once provisioning supplies their dependencies. Document actual gates
-   and remaining gaps, not proposed gates as if already enforced.
+1. Classify and migrate existing tests by behavioral intent, preserving coverage
+   and updating build and CI references together. Track migration work and
+   conformance gaps in implementation issues.
+2. Assess conformance tests against the requirements and document their
+   contracts. Validate execution against externally prepared gateways and ensure
+   behavioral checks do not depend on public internet services. Resolve fixture
+   networking as part of this work.
+3. Retain results and diagnostic evidence, notify maintainers of new failures,
+   and support issue tracking and explicit waivers. Preserve failed results
+   without automatic retries.
+4. Implement independent and combined PR selection for the three e2e streams.
+   Run applicable suites during dev and stable release qualification, including
+   candidate installation and uninstall checks.
+5. Update testing and CI documentation as each part is implemented. Record
+   actual gates and remaining gaps.
 
-As implementation lands, `TESTING.md` owns routing and working commands,
-`tests/CONFORMANCE.md` owns shared policy, suite READMEs own authoring and
-execution guidance, and `CI.md` owns implemented CI behavior. Agent guidance
-links to these sources. Per-test contracts stay in tests; detailed migration
-inventories and PR coordination belong in tracking issues.
+### CI selection
+
+PR labels select e2e streams: `test:e2e/conformance` runs conformance tests,
+including disruption tests when added, `test:e2e/features` runs feature-specific
+tests, and
+`test:e2e/drivers` runs driver-specific tests. `test:e2e` selects all three
+streams. Migrate existing GPU and Kubernetes labels according to test intent.
+
+### Later phase: disruption tests
+
+Add restart and upgrade continuity tests in a later phase. Design their harness
+separately from the migration of existing suites. Include these tests in
+conformance PR runs and release qualification. Consolidate shared contracts and
+helpers when practical.
+
+### Follow-up work
+
+Package the conformance suite to run without a source checkout as a follow-up.
+
+### Documentation
+
+`TESTING.md` defines test families and links to suite READMEs.
+`e2e/suites/conformance/README.md` owns conformance requirements, authoring, and
+execution guidance. `CI.md` records merge and release gates as qualification
+workflows are implemented. Agent guidance links to these sources.
 
 ## Risks
 
 - Two Linux drivers can share accidental OS assumptions. Review probe portability
   and expand platform coverage; a pass applies only to the tested configuration.
-- Capability withdrawal can hide regressions. Review it as a contract change,
-  and do not weaken mandatory requirements to accommodate product limitations.
-- Global-state changes can affect other workloads. Disclose side effects and
-  coordinate within a run; cross-process coordination remains undesigned.
 - Shared-library and provisioning changes can conflict with parallel migrations.
   Sequence common infrastructure changes before dependent work.
 
 ## Alternatives
 
-- **Independent driver E2E suites:** less migration now, but duplicated public
+- **Independent driver e2e suites:** less migration now, but duplicated public
   checks and diverging expectations. Retain only genuinely driver-specific work.
 - **Tests provision their own gateways:** convenient locally, but harder to reuse
   against installed artifacts or externally prepared targets.
 - **Separate API and CLI frameworks immediately:** adds overlapping runners
-  before a CLI limitation requires them; retain SDK-specific coverage separately.
-- **Require every behavior everywhere:** uniform, but excludes useful optional
-  behavior. Require advertised support to work without yet deciding its category.
+  before shared execution needs are understood; retain SDK-specific coverage
+  separately.
 
 ## Prior art
 
 - [Kubernetes conformance testing](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-architecture/conformance-tests.md)
   informs public-contract testing and per-test specifications. OpenShell uses
   normal PR review rather than its promotion process, soak period, or governance,
-  and defers version-skew testing.
+  and defers a cross-version compatibility matrix.
 - OpenShell's reusable CLI scenarios and Cargo execution provide the starting
   implementation. Earlier sandbox-continuity work motivates separating portable
   recovery assertions from environment-specific disruption actuators.
-- SDK proposal #3238 retains interface-specific compatibility concerns without
-  making the client interface a separate behavioral test family.
 
 ## Open questions
 
-- Where do portable capability-dependent tests belong? Decide from a concrete
-  migration example, without adding a category in advance.
-- How should test-owned fixtures be reachable from externally prepared gateways?
-- Which jobs gate merges and releases, and which expensive/platform-specific runs
-  are scheduled? What upgrade coverage is required?
-- Where should disruption and load/scale suites live, and what actuator interface
-  does the first disruption migration need?
-- What report fields beyond SHA and configuration do actual consumers require?
+None. Fixture networking and disruption harness design are deferred to
+implementation.
