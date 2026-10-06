@@ -4434,7 +4434,10 @@ impl ComputeRuntime {
                 SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
             });
 
-        if existing_phase != SandboxPhase::Starting {
+        let ready_container_exit = existing_phase == SandboxPhase::Ready
+            && (driver_snapshot_confirms_stopped(&incoming)
+                || driver_snapshot_reports_runtime_restart(&incoming));
+        if existing_phase != SandboxPhase::Starting && !ready_container_exit {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -4442,10 +4445,12 @@ impl ComputeRuntime {
         // durable phase to Starting. In particular, an old-generation Ready
         // event followed by its terminal event can otherwise promote and then
         // stop the new generation before the replacement supervisor connects.
+        // The replacement may already be Ready when the old exit arrives, so
+        // terminal container snapshots need the same check after readiness.
         // Release the global watch lock, wait for that lifecycle operation,
         // and then reread both the driver and store before applying an
         // authoritative observation. Taking the per-sandbox gate only for
-        // this ambiguous phase avoids delaying unrelated watch events behind
+        // these ambiguous snapshots avoids delaying unrelated watch events behind
         // slow lifecycle operations.
         let existing_name = existing_sandbox.as_ref().map_or_else(
             || incoming.name.clone(),
@@ -4475,7 +4480,7 @@ impl ComputeRuntime {
             {
                 warn!(
                     sandbox_id = %incoming.id,
-                    "Could not validate driver snapshot during sandbox start; retaining current sandbox state"
+                    "Could not validate driver snapshot against current runtime; retaining current sandbox state"
                 );
                 return Ok(());
             }
@@ -11605,6 +11610,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn container_exit_after_replacement_ready_is_revalidated() {
+        for (reason, live_exited) in [
+            ("ContainerExited", false),
+            ("ContainerExited", true),
+            ("ContainerStopped", false),
+            ("ContainerStopped", true),
+            ("ContainerRuntimeRestart", false),
+            ("ContainerRuntimeRestart", true),
+        ] {
+            let driver = ControlledDriver::new();
+            let mut sandbox =
+                sandbox_record("sb-restarted", "sandbox-restarted", SandboxPhase::Starting);
+            sandbox.status.as_mut().unwrap().restart_count = 1;
+            sandbox.status.as_mut().unwrap().exit_code = Some(17);
+            sandbox.status.as_mut().unwrap().main_process_instance_id = "previous".to_string();
+            let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            exited.status = Some(make_driver_status(make_driver_condition(
+                reason,
+                "container exited",
+            )));
+            let live = if live_exited {
+                exited.clone()
+            } else {
+                ready_driver_sandbox(sandbox.object_id(), sandbox.object_name())
+            };
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(live)));
+            let runtime = test_runtime(driver).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+            runtime
+                .supervisor_session_connected(sandbox.object_id(), "replacement")
+                .await
+                .unwrap();
+
+            runtime.apply_sandbox_update(exited).await.unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                if live_exited {
+                    SandboxPhase::Error
+                } else {
+                    SandboxPhase::Ready
+                } as i32,
+                "only a live {reason} may fail the replacement runtime"
+            );
+            let status = stored.status.unwrap();
+            assert_eq!(status.main_process_instance_id, "replacement");
+            assert_eq!(status.restart_count, 1);
+            assert_eq!(status.exit_code, None);
+        }
+    }
+
+    #[tokio::test]
     async fn stale_ready_snapshot_queued_before_start_is_revalidated() {
         let driver = ControlledDriver::new();
         driver.block_start();
@@ -13375,13 +13439,17 @@ mod tests {
 
     #[tokio::test]
     async fn unexpected_term_runtime_restart_transitions_to_error() {
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
         let sandbox = sandbox_record("sb-term-exit", "sandbox-term-exit", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
         let mut runtime_restart = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         runtime_restart.status = Some(make_driver_status(make_driver_condition(
             "ContainerRuntimeRestart",
             "container exited with status 143",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            runtime_restart.clone(),
         )));
 
         runtime.apply_sandbox_update(runtime_restart).await.unwrap();
