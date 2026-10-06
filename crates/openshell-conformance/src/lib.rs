@@ -123,6 +123,28 @@ impl CommandResult {
         self.elapsed
     }
 
+    /// Check combined stdout+stderr for `needle`, normalizing miette's
+    /// line-wrapped, `│`-continued diagnostic text first so phrase matches
+    /// don't depend on the terminal width the CLI detected when rendering.
+    pub fn output_contains(&self, needle: &str) -> bool {
+        self.normalized_output().contains(needle)
+    }
+
+    /// Case-insensitive variant of [`Self::output_contains`].
+    pub fn output_contains_ignore_case(&self, needle: &str) -> bool {
+        self.normalized_output()
+            .to_lowercase()
+            .contains(&needle.to_lowercase())
+    }
+
+    fn normalized_output(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+            .replace(['\n', '│'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, RunnerError> {
         serde_json::from_str(&self.stdout).map_err(|source| RunnerError::InvalidJson {
             context: self.context(),

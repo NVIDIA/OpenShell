@@ -96,7 +96,7 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
     )?;
 
     let sandbox_delete = settings_delete(runner, &sandbox_name, "sandbox-delete", true).await?;
-    if !output_contains(&sandbox_delete, "Deleted sandbox setting") {
+    if !sandbox_delete.output_contains("Deleted sandbox setting") {
         return Err(sandbox_delete.failure_diagnostic("sandbox delete confirms removal"));
     }
 
@@ -121,7 +121,7 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
         .await
         .map_err(|error| error.to_string())?;
     set_global.require_success()?;
-    if !output_contains(&set_global, &format!("Set global setting {TEST_KEY}=false")) {
+    if !set_global.output_contains(&format!("Set global setting {TEST_KEY}=false")) {
         return Err(set_global.failure_diagnostic("global set output confirms the new value"));
     }
 
@@ -145,16 +145,13 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
             blocked_set.failure_diagnostic("sandbox setting set is blocked while globally managed")
         );
     }
-    if !output_contains(&blocked_set, "is managed") {
+    if !blocked_set.output_contains("is managed") {
         return Err(blocked_set.failure_diagnostic("blocked set error mentions global management"));
     }
 
-    let blocked_delete =
-        settings_delete(runner, &sandbox_name, "blocked-sandbox-delete", false).await?;
-    if blocked_delete.success() {
-        return Err(blocked_delete
-            .failure_diagnostic("sandbox setting delete is blocked while globally managed"));
-    }
+    // `settings_delete`'s own `expect_success` check already enforces that
+    // this command fails while the key is globally managed.
+    settings_delete(runner, &sandbox_name, "blocked-sandbox-delete", false).await?;
 
     let global_get = runner
         .step("global-get")
@@ -178,10 +175,7 @@ async fn settings_global_override_round_trip(runner: &mut OpenShellRunner) -> Re
         .await
         .map_err(|error| error.to_string())?;
     delete_global.require_success()?;
-    if !output_contains(
-        &delete_global,
-        &format!("Deleted global setting {TEST_KEY}"),
-    ) {
+    if !delete_global.output_contains(&format!("Deleted global setting {TEST_KEY}")) {
         return Err(delete_global.failure_diagnostic("global delete output confirms removal"));
     }
 
@@ -389,17 +383,12 @@ async fn cleanup_global_setting(runner: &OpenShellRunner) {
         .await;
 }
 
-fn output_contains(result: &CommandResult, needle: &str) -> bool {
-    result.stdout().contains(needle) || result.stderr().contains(needle)
-}
-
 fn require_setting_line(
     result: &CommandResult,
     expected: &str,
     expectation: &str,
 ) -> Result<(), String> {
-    let needle = format!("{TEST_KEY} = {expected}");
-    if result.stdout().contains(&needle) {
+    if result.output_contains(&format!("{TEST_KEY} = {expected}")) {
         Ok(())
     } else {
         Err(result.failure_diagnostic(expectation))
@@ -412,8 +401,7 @@ fn require_setting_line_with_scope(
     scope: &str,
     expectation: &str,
 ) -> Result<(), String> {
-    let needle = format!("{TEST_KEY} = {expected} ({scope})");
-    if result.stdout().contains(&needle) {
+    if result.output_contains(&format!("{TEST_KEY} = {expected} ({scope})")) {
         Ok(())
     } else {
         Err(result.failure_diagnostic(expectation))

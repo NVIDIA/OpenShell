@@ -333,23 +333,8 @@ async fn run_cli(
     }
 }
 
-fn output_contains(result: &CommandResult, needle: &str) -> bool {
-    normalize_wrapping(result.stdout()).contains(needle)
-        || normalize_wrapping(result.stderr()).contains(needle)
-}
-
-/// Collapse miette's line-wrapped, `│`-continued diagnostic text back into a
-/// single line so phrase matches don't depend on the terminal width the CLI
-/// detected when it rendered the error.
-fn normalize_wrapping(text: &str) -> String {
-    text.replace(['\n', '│'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn require_contains(result: &CommandResult, needle: &str, expectation: &str) -> Result<(), String> {
-    if output_contains(result, needle) {
+    if result.output_contains(needle) {
         Ok(())
     } else {
         Err(result.failure_diagnostic(expectation))
@@ -361,7 +346,7 @@ fn require_not_contains(
     needle: &str,
     expectation: &str,
 ) -> Result<(), String> {
-    if output_contains(result, needle) {
+    if result.output_contains(needle) {
         Err(result.failure_diagnostic(expectation))
     } else {
         Ok(())

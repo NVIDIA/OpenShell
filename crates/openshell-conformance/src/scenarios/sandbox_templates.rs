@@ -169,7 +169,7 @@ async fn lifecycle(
         .await
         .map_err(|error| error.to_string())?;
     create_sandbox.require_success()?;
-    if !output_contains(&create_sandbox, "template-env-ok") {
+    if !create_sandbox.output_contains_ignore_case("template-env-ok") {
         return Err(create_sandbox.failure_diagnostic("sandbox inherits template environment"));
     }
 
@@ -262,7 +262,7 @@ async fn duplicate_name(runner: &OpenShellRunner, template_name: &str) -> Result
     if duplicate.success() {
         return Err(duplicate.failure_diagnostic("duplicate template creation is rejected"));
     }
-    if !output_contains(&duplicate, "already exists") {
+    if !duplicate.output_contains_ignore_case("already exists") {
         return Err(duplicate.failure_diagnostic("duplicate template error reports already-exists"));
     }
     Ok(())
@@ -325,13 +325,9 @@ async fn cleanup_template(runner: &OpenShellRunner, template_name: &str) {
         .await;
 }
 
-fn output_contains(result: &CommandResult, needle: &str) -> bool {
-    let haystack = format!("{}{}", result.stdout(), result.stderr()).to_lowercase();
-    haystack.contains(&needle.to_lowercase())
-}
-
 fn output_mentions_template_not_found(result: &CommandResult) -> bool {
-    output_contains(result, "sandbox template") && output_contains(result, "not found")
+    result.output_contains_ignore_case("sandbox template")
+        && result.output_contains_ignore_case("not found")
 }
 
 fn require_eq(actual: &Value, expected: &str, label: &str) -> Result<(), String> {

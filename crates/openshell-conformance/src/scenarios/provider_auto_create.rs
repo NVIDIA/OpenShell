@@ -3,12 +3,28 @@
 
 //! Portable provider auto-creation conformance scenario.
 
+use std::fs;
 use std::time::Duration;
 
-use crate::{CommandResult, OpenShellRunner, Scenario, ScenarioFuture};
+use crate::{OpenShellRunner, Poll, Scenario, ScenarioFuture};
+
+// Avoid inheriting the default image's network rules, which may be
+// incompatible with the attached credential provider's startup validation.
+// This test only reads the injected environment placeholder.
+const TEST_POLICY: &str = r"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /etc, /proc]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+network_policies: {}
+";
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+const PROVIDER_DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_DETACH_INTERVAL: Duration = Duration::from_secs(1);
 
 // "claude-code" is a recognized auto-provider type, not an arbitrary name:
 // the CLI names the auto-created provider after the `--provider` value, so
@@ -36,12 +52,13 @@ fn run_provider_auto_create(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
         }
 
         // Defensive cleanup of any leftover from a previous crashed run.
-        delete_provider(runner).await;
+        delete_provider_best_effort(runner).await;
 
         let sandbox_name = format!("ct-{}-pa", runner.id());
-        runner.track_sandbox(&sandbox_name);
-        runner.track_provider(PROVIDER_NAME);
-        auto_created_provider_credential_available_in_sandbox(runner, &sandbox_name).await
+        let result =
+            auto_created_provider_credential_available_in_sandbox(runner, &sandbox_name).await;
+        cleanup(runner, &sandbox_name).await;
+        result
     })
 }
 
@@ -58,7 +75,7 @@ async fn provider_exists(runner: &OpenShellRunner) -> Result<bool, String> {
     Ok(result.success())
 }
 
-async fn delete_provider(runner: &OpenShellRunner) {
+async fn delete_provider_best_effort(runner: &OpenShellRunner) {
     let _ = runner
         .step("preflight/provider-delete")
         .description(format!(
@@ -69,10 +86,59 @@ async fn delete_provider(runner: &OpenShellRunner) {
         .await;
 }
 
+/// Best-effort teardown. Deletes the sandbox first, then polls the provider
+/// delete: the gateway can briefly still report the provider as attached to
+/// the just-deleted sandbox, since sandbox deletion isn't synchronous with
+/// detaching its providers.
+async fn cleanup(runner: &mut OpenShellRunner, sandbox_name: &str) {
+    let _ = runner
+        .step("cleanup/sandbox-delete")
+        .description(format!(
+            "sandbox '{sandbox_name}' is deleted or already absent"
+        ))
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&["sandbox", "delete", sandbox_name])
+        .await;
+
+    let _ = runner
+        .poll_until(
+            "cleanup/provider-delete",
+            PROVIDER_DETACH_TIMEOUT,
+            PROVIDER_DETACH_INTERVAL,
+            async move |runner| {
+                let result = runner
+                    .step("cleanup/provider-delete/attempt")
+                    .description(format!(
+                        "provider '{PROVIDER_NAME}' is deleted or already absent"
+                    ))
+                    .with_timeout(COMMAND_TIMEOUT)
+                    .run(&["provider", "delete", PROVIDER_NAME])
+                    .await;
+                match result {
+                    Ok(result) if result.success() => Poll::Ready(()),
+                    Ok(result) => {
+                        Poll::Pending(result.failure_diagnostic("provider delete succeeds"))
+                    }
+                    Err(error) => Poll::Pending(error.to_string()),
+                }
+            },
+        )
+        .await;
+}
+
 async fn auto_created_provider_credential_available_in_sandbox(
     runner: &OpenShellRunner,
     sandbox_name: &str,
 ) -> Result<(), String> {
+    let policy = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("create provider test policy: {error}"))?;
+    fs::write(policy.path(), TEST_POLICY)
+        .map_err(|error| format!("write provider test policy: {error}"))?;
+    let policy_path = policy
+        .path()
+        .to_str()
+        .ok_or_else(|| "provider test policy path is not UTF-8".to_string())?;
+
     let create = runner
         .step("create")
         .description(format!(
@@ -86,6 +152,8 @@ async fn auto_created_provider_credential_available_in_sandbox(
                 "--name",
                 sandbox_name,
                 "--detach",
+                "--policy",
+                policy_path,
                 "--provider",
                 PROVIDER_NAME,
                 "--auto-providers",
@@ -99,7 +167,7 @@ async fn auto_created_provider_credential_available_in_sandbox(
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
-    if !output_contains(&create, "Created provider claude-code") {
+    if !create.output_contains(&format!("Created provider {PROVIDER_NAME}")) {
         return Err(create.failure_diagnostic("output confirms provider auto-creation"));
     }
 
@@ -130,17 +198,13 @@ async fn auto_created_provider_credential_available_in_sandbox(
             "sandbox environment contains a resolve placeholder for {CREDENTIAL_ENV_VAR}"
         )));
     }
-    if output_contains(&exec, TEST_API_KEY) {
+    if exec.output_contains(TEST_API_KEY) {
         return Err(exec.failure_diagnostic(&format!(
             "sandbox environment does not expose the raw {CREDENTIAL_ENV_VAR} secret"
         )));
     }
 
     Ok(())
-}
-
-fn output_contains(result: &CommandResult, needle: &str) -> bool {
-    result.stdout().contains(needle) || result.stderr().contains(needle)
 }
 
 /// Matches the supervisor's credential-resolution placeholder token, which is
