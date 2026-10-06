@@ -5,6 +5,7 @@
 
 mod file_transfer;
 mod policy_behavior;
+mod provider_auto_create;
 mod sandbox_lifecycle;
 mod smoke;
 mod workspace_lifecycle;
@@ -16,6 +17,7 @@ pub use file_transfer::{
 pub use policy_behavior::{
     MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO,
 };
+pub use provider_auto_create::PROVIDER_AUTO_CREATE_SCENARIO;
 pub use sandbox_lifecycle::SANDBOX_LIFECYCLE_SCENARIO;
 pub use smoke::SMOKE_SCENARIO;
 pub use workspace_lifecycle::{WORKSPACE_LIFECYCLE_SCENARIO, WORKSPACE_TERMINATING_SCENARIO};
