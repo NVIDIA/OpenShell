@@ -3,6 +3,7 @@
 
 //! Portable conformance scenarios exercised by the Cargo test suite.
 
+mod draft_assertion;
 mod file_transfer;
 mod policy_behavior;
 mod sandbox_lifecycle;
