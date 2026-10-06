@@ -3,6 +3,8 @@
 
 //! `OpenShell` supervisor executable.
 
+mod rolling_logs;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -310,17 +312,16 @@ fn main() -> Result<()> {
         None
     };
 
-    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openshell")
-        .filename_suffix("log")
-        .max_log_files(3)
-        .build("/var/log")
-        .ok()
-        .map(|roller| {
-            let (writer, guard) = tracing_appender::non_blocking(roller);
-            (writer, guard)
-        });
+    let file_logging = rolling_logs::appender(
+        "/var/log",
+        rolling_logs::SHORTHAND_PREFIX,
+        tracing_appender::rolling::Rotation::DAILY,
+    )
+    .ok()
+    .map(|roller| {
+        let (writer, guard) = tracing_appender::non_blocking(roller);
+        (writer, guard)
+    });
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -349,20 +350,19 @@ fn main() -> Result<()> {
         let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer)
-                        .with_enabled_flag(ocsf_enabled.clone())
-                        .with_target_version(ocsf_schema_version.clone());
-                    (layer, guard)
-                });
+            let jsonl_logging = rolling_logs::appender(
+                "/var/log",
+                rolling_logs::OCSF_PREFIX,
+                tracing_appender::rolling::Rotation::DAILY,
+            )
+            .ok()
+            .map(|roller| {
+                let (writer, guard) = tracing_appender::non_blocking(roller);
+                let layer = OcsfJsonlLayer::new(writer)
+                    .with_enabled_flag(ocsf_enabled.clone())
+                    .with_target_version(ocsf_schema_version.clone());
+                (layer, guard)
+            });
             let (jsonl_layer, jsonl_guard) =
                 jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
             tracing_subscriber::registry()

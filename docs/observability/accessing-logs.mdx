@@ -78,13 +78,13 @@ Start an independent shell with `sandbox exec` to read log files directly:
 
 ```text
 openshell sandbox exec --name my-sandbox --tty -- /bin/bash -l
-sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
+sandbox@my-sandbox:~$ cat /var/log/openshell-text.2026-04-01.log
 ```
 
 Or run a one-off command without an interactive shell:
 
 ```shell
-openshell sandbox exec --name my-sandbox -- cat /var/log/openshell.2026-04-01.log
+openshell sandbox exec --name my-sandbox -- cat /var/log/openshell-text.2026-04-01.log
 ```
 
 `sandbox connect` attaches to the sandbox's existing canonical main process; it
@@ -98,25 +98,25 @@ The shorthand format is designed for `grep`. Some useful patterns:
 
 ```shell
 # All denied connections
-grep "DENIED\|BLOCKED" /var/log/openshell.*.log
+grep "DENIED\|BLOCKED" /var/log/openshell-text.*.log
 
 # All network events
-grep "OCSF NET:" /var/log/openshell.*.log
+grep "OCSF NET:" /var/log/openshell-text.*.log
 
 # All L7 enforcement decisions
-grep "OCSF HTTP:" /var/log/openshell.*.log
+grep "OCSF HTTP:" /var/log/openshell-text.*.log
 
 # Security findings only
-grep "OCSF FINDING:" /var/log/openshell.*.log
+grep "OCSF FINDING:" /var/log/openshell-text.*.log
 
 # Policy changes
-grep "OCSF CONFIG:" /var/log/openshell.*.log
+grep "OCSF CONFIG:" /var/log/openshell-text.*.log
 
 # All OCSF events, excluding standard tracing
-grep "^.* OCSF " /var/log/openshell.*.log
+grep "^.* OCSF " /var/log/openshell-text.*.log
 
 # Events at medium severity or above
-grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell.*.log
+grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell-text.*.log
 ```
 
 ## Next Steps

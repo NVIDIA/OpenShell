@@ -73,12 +73,12 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
-/// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
-/// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
+/// Read current and legacy shorthand filenames. The trailing dots in the
+/// prefixes disambiguate from the OCSF JSONL appender's
 /// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
 /// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
 /// `/v1/denials`).
-const SHORTHAND_LOG_PREFIX: &str = "openshell.";
+const SHORTHAND_LOG_PREFIXES: [&str; 2] = ["openshell-text.", "openshell."];
 /// Defensive cap on per-line length returned to the agent so a pathological
 /// log entry (very long URL path, etc.) cannot blow up the response.
 const MAX_DENIAL_LINE_BYTES: usize = 4096;
@@ -342,7 +342,7 @@ async fn recent_denials_response(
     });
     if !log_available {
         payload["note"] = serde_json::json!(
-            "no shorthand log file is present yet at /var/log/openshell.YYYY-MM-DD.log; the supervisor may not have emitted any events to disk yet"
+            "no shorthand log file is present yet at /var/log/openshell-text.YYYY-MM-DD.log; the supervisor may not have emitted any events to disk yet"
         );
     }
 
@@ -469,9 +469,11 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
-            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
-            if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
+            if !SHORTHAND_LOG_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                || !name.ends_with(".log")
+            {
                 return None;
             }
             let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
@@ -1615,7 +1617,7 @@ mod tests {
     #[tokio::test]
     async fn recent_denials_returns_newest_first_from_shorthand_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("openshell.2026-05-06.log");
+        let log_path = dir.path().join("openshell-text.2026-05-06.log");
         // Mixed file: allowed events, non-OCSF info lines, two denials.
         // Lines are written in chronological order; reader walks newest-first.
         let body = "\
@@ -1679,6 +1681,34 @@ mod tests {
         assert_eq!(payload["denials"].as_array().unwrap().len(), 0);
     }
 
+    #[test]
+    fn shorthand_file_selection_includes_legacy_and_excludes_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let filenames = [
+            "openshell.2026-05-05.log",
+            "openshell.2026-05-06.log",
+            "openshell-text.2026-05-07.log",
+            "openshell-ocsf.2026-05-07.log",
+            "openshell-text.2026-05-07.log.bak",
+        ];
+        for (index, filename) in filenames.iter().enumerate() {
+            let path = dir.path().join(filename);
+            std::fs::write(&path, b"log entry").unwrap();
+            let modified = std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(u64::try_from(index).unwrap());
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        assert_eq!(
+            collect_shorthand_log_files(dir.path(), DENIAL_LOG_FILES_TO_SCAN).unwrap(),
+            vec![dir.path().join(filenames[2]), dir.path().join(filenames[1])]
+        );
+    }
+
     #[tokio::test]
     async fn recent_denials_signals_when_log_is_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1698,7 +1728,7 @@ mod tests {
             payload["note"]
                 .as_str()
                 .unwrap()
-                .contains("/var/log/openshell.")
+                .contains("/var/log/openshell-text.")
         );
     }
 

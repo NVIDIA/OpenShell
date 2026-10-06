@@ -222,7 +222,8 @@ The new submission wins by structural overlap.
 Two local files complement the API and are useful when debugging policy
 behavior:
 
-- `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
+- `/var/log/openshell-text.YYYY-MM-DD.log` — shorthand log of sandbox activity.
+  Older supervisors use `/var/log/openshell.YYYY-MM-DD.log`.
   This is what `/v1/denials` reads from.
 - `/var/log/openshell-ocsf.YYYY-MM-DD.log` — full OCSF JSON events, only
   written when the `ocsf_json_enabled` setting is on. Not used by

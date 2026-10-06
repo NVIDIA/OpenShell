@@ -258,10 +258,16 @@ Inside the sandbox, logs are written to `/var/log/`:
 
 | File | Format | Rotation |
 |---|---|---|
-| `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
+| `openshell-text.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
 | `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily, 3 files max |
 
-Both files rotate daily and retain the 3 most recent files to bound disk usage.
+Each format rotates daily and retains up to 3 files independently.
+
+Update shorthand collectors from `/var/log/openshell.*.log` to
+`/var/log/openshell-text.*.log`. Existing `openshell.YYYY-MM-DD.log` files remain
+readable, including through `/v1/denials`, but the new appender does not prune
+them. Collect and remove those legacy files as needed. The OCSF JSONL collection
+path is unchanged.
 
 ## Next Steps
 
