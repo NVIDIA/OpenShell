@@ -135,7 +135,6 @@ let
     "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
-    "workspace_lifecycle"
   ];
   podmanE2eArchiveFilter =
     let
