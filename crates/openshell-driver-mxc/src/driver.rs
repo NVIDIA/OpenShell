@@ -236,8 +236,11 @@ pub struct MxcComputeConfig {
     /// Ignored unless `pc_relay_spawner_path` is set. `0` disables spawner
     /// wrapping (default) — the per-sandbox command runs directly.
     pub pc_relay_target_port: u16,
-    /// MXC `configurationId` for isolation session. Default: `"composable"`.
-    /// Never use `"small"` (known OS bug).
+    /// Deprecated MXC pre-1.0 `configurationId` compatibility setting.
+    ///
+    /// MXC 1.0.0 removed this field from `IsolationSession` provisioning. The
+    /// gateway still accepts it so existing configuration files continue to
+    /// load, but the driver does not send it to `wxc-exec`.
     pub default_configuration_id: String,
     /// Enable Pattern-C governed egress for sandbox policies that contain
     /// explicit network rules. MXC permits loopback-only egress, the driver
@@ -275,7 +278,7 @@ impl Default for MxcComputeConfig {
             pc_relay_target_port: 0,
             pc_allow_local_network: false,
             pc_minimal_env: false,
-            default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
+            default_configuration_id: "composable".into(),
             egress_proxy: false,
             egress_proxy_addr: String::new(),
 
@@ -1873,10 +1876,7 @@ async fn run_lifecycle(
 
     let child = match config.backend {
         MxcBackend::IsolationSession => {
-            let iso_sandbox_id = match invoker
-                .provision(&config.default_configuration_id, filesystem, network)
-                .await
-            {
+            let iso_sandbox_id = match invoker.provision(filesystem).await {
                 Ok(id) => id,
                 Err(error) => {
                     set_failed(

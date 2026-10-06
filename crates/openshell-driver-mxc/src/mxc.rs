@@ -17,12 +17,8 @@ use thiserror::Error;
 use tokio::process::Command;
 use tracing::{debug, info};
 
-/// MXC config schema version. The mapper and one-shot launcher share the
-/// MXC 0.8 directional network schema.
-pub const MXC_SCHEMA_VERSION: &str = "0.8.0-alpha";
-
-/// Default `configurationId` for isolation session. Never use `"small"` (known OS bug).
-pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
+/// Stable MXC config schema version shared by the mapper and live launcher.
+pub const MXC_SCHEMA_VERSION: &str = "1.0.0";
 
 /// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
 /// `"1"`, the invoker does NOT spawn the real `wxc-exec.exe`; instead it emits
@@ -181,7 +177,7 @@ fn redact_env_for_debug(config: &serde_json::Value) -> serde_json::Value {
 }
 
 fn network_json(network: &MxcNetwork) -> serde_json::Value {
-    // MXC 0.8.0-alpha schema uses a directional egress/ingress format.
+    // MXC 1.0.0 uses a directional egress/ingress format.
     // "block" default_policy maps to egress.default "deny"; "allow" maps to "allow".
     let egress_default = if network.default_policy == "block" {
         "deny"
@@ -227,30 +223,37 @@ fn network_json(network: &MxcNetwork) -> serde_json::Value {
     value
 }
 
-fn provision_config_json(
-    configuration_id: &str,
-    filesystem: &MxcFilesystem,
-    network: Option<&MxcNetwork>,
-) -> serde_json::Value {
-    let mut config = serde_json::json!({
+fn provision_config_json() -> serde_json::Value {
+    serde_json::json!({
         "version": MXC_SCHEMA_VERSION,
-        "phase": "provision",
         "containment": "isolation_session",
-        "filesystem": {
-            "readwritePaths": &filesystem.readwrite_paths,
-            "readonlyPaths": &filesystem.readonly_paths,
-        },
-        "experimental": {
-            "isolation_session": {
-                "configurationId": configuration_id,
-                "provision": {}
-            }
+        // IsolationSession cannot restrict networking. MXC 1.0.0 requires the
+        // provision request to declare that actual all-allow posture exactly.
+        "network": {
+            "egress": { "default": "allow" },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
         }
-    });
-    if let Some(network) = network {
-        config["network"] = network_json(network);
-    }
-    config
+    })
+}
+
+fn lifecycle_config_json() -> serde_json::Value {
+    serde_json::json!({ "version": MXC_SCHEMA_VERSION })
+}
+
+fn exec_config_json(process: &MxcProcess) -> serde_json::Value {
+    serde_json::json!({
+        "version": MXC_SCHEMA_VERSION,
+        "process": {
+            "commandLine": process.command_line,
+            "cwd": process.cwd,
+            "env": process.env,
+            // IsolationSession always starts from the agent user's default
+            // environment. MXC 1.0.0 rejects a supplied env array unless
+            // callers explicitly request layering instead of replacement.
+            "inheritDefaultEnv": true,
+            "timeout": process.timeout,
+        }
+    })
 }
 
 fn oneshot_config_json(
@@ -441,28 +444,37 @@ impl WxcExecInvoker {
         }
     }
 
-    /// Encode `config` as base64 and invoke wxc-exec, returning the parsed envelope.
-    /// Use this for all **non-exec** phases (provision/start/stop/deprovision).
-    pub async fn run_phase(&self, config: &serde_json::Value) -> Result<(), InvokerError> {
+    /// Encode a lifecycle config as base64 and invoke `wxc-exec`.
+    ///
+    /// MXC 1.0.0 takes the operation and sandbox identity as command-line
+    /// routing arguments. The config must omit the legacy `phase` and
+    /// `sandboxId` fields because the executor injects them before validation.
+    async fn run_phase(
+        &self,
+        operation: &str,
+        sandbox_id: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), InvokerError> {
         if self.mock {
             // Mock start/stop/deprovision: canned `{"result":{}}` success.
-            debug!(phase = ?config.get("phase"), "mock wxc-exec phase (no-op success)");
+            debug!(operation, sandbox_id, "mock wxc-exec phase (no-op success)");
             return Ok(());
         }
         let json = serde_json::to_string(config)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
         let mut cmd = Command::new(&self.exec_path);
-        cmd.arg("--config-base64").arg(&b64).arg("--experimental");
+        cmd.arg("--config-base64")
+            .arg(&b64)
+            .arg("--operation")
+            .arg(operation)
+            .arg("--container-id")
+            .arg(sandbox_id);
         if self.debug {
             cmd.arg("--debug");
         }
 
-        // `config` here never carries `process.env` today (provision/start/
-        // stop/deprovision have no `process` field at all -- see run_phase's
-        // doc comment), but redact defensively rather than relying on that
-        // staying true.
-        debug!(config = %redact_env_for_debug(config), "wxc-exec phase");
+        debug!(operation, sandbox_id, config = %redact_env_for_debug(config), "wxc-exec phase");
         let output = cmd.output().await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -498,12 +510,7 @@ impl WxcExecInvoker {
     }
 
     /// Run the provision phase and return the `sandboxId` from the response.
-    pub async fn provision(
-        &self,
-        configuration_id: &str,
-        filesystem: MxcFilesystem,
-        network: Option<MxcNetwork>,
-    ) -> Result<String, InvokerError> {
+    pub async fn provision(&self, filesystem: MxcFilesystem) -> Result<String, InvokerError> {
         if self.mock {
             // Mock provision: mint a synthetic `iso:` id and record the granted
             // read-write paths so the mock exec can enforce the policy.
@@ -516,19 +523,22 @@ impl WxcExecInvoker {
             mock_grants().lock().unwrap().insert(id.clone(), grants);
             #[cfg(test)]
             {
-                let config = provision_config_json(configuration_id, &filesystem, network.as_ref());
+                let config = provision_config_json();
                 mock_configs().lock().unwrap().insert(id.clone(), config);
             }
             debug!(sandbox_id = %id, "mock wxc-exec provision");
             return Ok(id);
         }
-        let config = provision_config_json(configuration_id, &filesystem, network.as_ref());
+        let config = provision_config_json();
 
         let json = serde_json::to_string(&config)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
         let mut cmd = Command::new(&self.exec_path);
-        cmd.arg("--config-base64").arg(&b64).arg("--experimental");
+        cmd.arg("--config-base64")
+            .arg(&b64)
+            .arg("--operation")
+            .arg("provision");
         if self.debug {
             cmd.arg("--debug");
         }
@@ -585,17 +595,8 @@ impl WxcExecInvoker {
 
     /// Run the start phase for an already-provisioned sandbox.
     pub async fn start(&self, iso_sandbox_id: &str) -> Result<(), InvokerError> {
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "start",
-            "sandboxId": iso_sandbox_id,
-            "experimental": {
-                "isolation_session": {
-                    "start": {}
-                }
-            }
-        });
-        self.run_phase(&config).await
+        let config = lifecycle_config_json();
+        self.run_phase("start", iso_sandbox_id, &config).await
     }
 
     /// Spawn the exec phase (agent command). Returns the child process handle.
@@ -608,17 +609,7 @@ impl WxcExecInvoker {
         if self.mock {
             return Self::mock_spawn_exec(iso_sandbox_id, &process);
         }
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "exec",
-            "sandboxId": iso_sandbox_id,
-            "process": {
-                "commandLine": process.command_line,
-                "cwd": process.cwd,
-                "env": process.env,
-                "timeout": process.timeout,
-            }
-        });
+        let config = exec_config_json(&process);
 
         let json = serde_json::to_string(&config)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
@@ -626,7 +617,10 @@ impl WxcExecInvoker {
         let mut cmd = Command::new(&self.exec_path);
         cmd.arg("--config-base64")
             .arg(&b64)
-            .arg("--experimental")
+            .arg("--operation")
+            .arg("exec")
+            .arg("--container-id")
+            .arg(iso_sandbox_id)
             // Piped (not null): mirrors the ProcessContainer one-shot spawn
             // below -- with STDIO passthrough, wxc-exec forwards this handle
             // down to the exec'd child, giving the driver a control channel
@@ -803,37 +797,17 @@ impl WxcExecInvoker {
 
     /// Run the stop phase.
     ///
-    /// `stop`/`deprovision` are **unit** variants in the wxc-exec schema: they
-    /// must serialize as `null`, not `{}`. Empirical (build 26300.8553,
-    /// wxc-exec 2026-06-10): `"stop": {}` is rejected with `malformed_request`
-    /// ("invalid type: map, expected unit"); `provision`/`start` accept maps.
+    /// MXC 1.0.0 selects the operation and sandbox through CLI arguments, so
+    /// the config carries only the stable contract version.
     pub async fn stop(&self, iso_sandbox_id: &str) -> Result<(), InvokerError> {
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "stop",
-            "sandboxId": iso_sandbox_id,
-            "experimental": {
-                "isolation_session": {
-                    "stop": null
-                }
-            }
-        });
-        self.run_phase(&config).await
+        let config = lifecycle_config_json();
+        self.run_phase("stop", iso_sandbox_id, &config).await
     }
 
-    /// Run the deprovision phase (unit variant — see [`Self::stop`]).
+    /// Run the deprovision phase.
     pub async fn deprovision(&self, iso_sandbox_id: &str) -> Result<(), InvokerError> {
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "deprovision",
-            "sandboxId": iso_sandbox_id,
-            "experimental": {
-                "isolation_session": {
-                    "deprovision": null
-                }
-            }
-        });
-        self.run_phase(&config).await
+        let config = lifecycle_config_json();
+        self.run_phase("deprovision", iso_sandbox_id, &config).await
     }
 }
 
@@ -877,29 +851,18 @@ mod tests {
 
     #[test]
     fn provision_config_json_shape() {
-        // Verify the JSON we send wxc-exec has the expected shape.
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "provision",
-            "containment": "isolation_session",
-            "filesystem": {
-                "readwritePaths": ["C:\\work\\demo"],
-                "readonlyPaths": [],
-            },
-            "experimental": {
-                "isolation_session": {
-                    "configurationId": DEFAULT_CONFIGURATION_ID,
-                    "provision": {}
-                }
-            }
-        });
-        assert_eq!(config["phase"], "provision");
+        let config = provision_config_json();
+        assert_eq!(config["version"], "1.0.0");
         assert_eq!(config["containment"], "isolation_session");
-        assert_eq!(
-            config["experimental"]["isolation_session"]["configurationId"],
-            "composable"
-        );
-        assert_eq!(config["filesystem"]["readwritePaths"][0], "C:\\work\\demo");
+        assert_eq!(config["network"]["egress"]["default"], "allow");
+        assert_eq!(config["network"]["ingress"]["default"], "allow");
+        assert_eq!(config["network"]["ingress"]["hostLoopback"], "allow");
+        for legacy in ["phase", "sandboxId", "filesystem", "experimental"] {
+            assert!(
+                config.get(legacy).is_none(),
+                "legacy field {legacy} must be omitted"
+            );
+        }
     }
 
     #[test]
@@ -935,39 +898,24 @@ mod tests {
     }
 
     #[test]
-    fn provision_config_json_includes_network_loopback_when_proxy_supplied() {
-        let filesystem = MxcFilesystem {
-            readwrite_paths: vec!["C:\\work\\demo".into()],
-            readonly_paths: Vec::new(),
-            denied_paths: Vec::new(),
+    fn isolation_exec_config_layers_environment_and_omits_cli_routing() {
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: "C:\\Windows\\Temp".into(),
+            env: vec!["MODE=test".into()],
+            timeout: 0,
         };
-        let network = MxcNetwork {
-            default_policy: "block".into(),
-            proxy: Some("127.0.0.1:18080".parse().unwrap()),
-            allow_local_network: false,
-        };
-        let config = provision_config_json(DEFAULT_CONFIGURATION_ID, &filesystem, Some(&network));
-
-        // With proxy: use direct loopback egress (127.0.0.1/32 allow) instead of
-        // runtimeConfig.networkProxy proxy mode, so relay can reach its spawned
-        // target process via loopback without processmodel.dll proxy-redirect WFP
-        // interference. PSEC tier still selected via requires_psec_networking().
-        assert_eq!(config["network"]["egress"]["default"], "deny");
-        assert_eq!(
-            config["network"]["egress"]["allow"][0]["to"][0]["cidr"],
-            "127.0.0.1/32"
-        );
-        assert_eq!(config["network"]["ingress"]["default"], "allow");
-        assert_eq!(config["network"]["ingress"]["hostLoopback"], "allow");
-        assert!(config["network"].get("defaultPolicy").is_none());
-        assert!(config["network"].get("proxy").is_none());
-        // No runtimeConfig.networkProxy — using direct loopback egress instead.
-        assert!(config.get("runtimeConfig").is_none());
+        let config = exec_config_json(&process);
+        assert_eq!(config["version"], "1.0.0");
+        assert_eq!(config["process"]["inheritDefaultEnv"], true);
+        assert_eq!(config["process"]["env"][0], "MODE=test");
+        assert!(config.get("phase").is_none());
+        assert!(config.get("sandboxId").is_none());
     }
 
     #[test]
     fn network_json_emits_directional_format() {
-        // MXC 0.8.0-alpha: egress/ingress replaces the legacy
+        // MXC 1.0.0: egress/ingress replaces the legacy
         // defaultPolicy / allowedHosts / proxy.localhost shape.
         let network = MxcNetwork {
             default_policy: "block".into(),
@@ -1084,32 +1032,16 @@ mod tests {
 
     #[test]
     fn isolation_provision_config_never_synthesizes_ui() {
-        let config =
-            provision_config_json(DEFAULT_CONFIGURATION_ID, &MxcFilesystem::default(), None);
+        let config = provision_config_json();
         assert!(config.get("ui").is_none());
     }
 
     #[test]
-    fn stop_and_deprovision_serialize_as_unit_variants() {
-        // Pins the empirical schema contract (test box, build 26300.8553):
-        // stop/deprovision are unit variants and must be `null`; `{}` is
-        // rejected with malformed_request "invalid type: map, expected unit".
-        for phase in ["stop", "deprovision"] {
-            let config = serde_json::json!({
-                "version": MXC_SCHEMA_VERSION,
-                "phase": phase,
-                "sandboxId": "iso:wxc-test",
-                "experimental": {
-                    "isolation_session": {
-                        phase: null
-                    }
-                }
-            });
-            assert!(
-                config["experimental"]["isolation_session"][phase].is_null(),
-                "{phase} must serialize as null (unit variant)"
-            );
-        }
+    fn lifecycle_config_omits_operation_and_sandbox_id() {
+        let config = lifecycle_config_json();
+        assert_eq!(config["version"], "1.0.0");
+        assert!(config.get("phase").is_none());
+        assert!(config.get("sandboxId").is_none());
     }
 
     #[test]

@@ -68,6 +68,13 @@ The selected backend changes both lifecycle and enforceable policy. Backend
 selection belongs to gateway startup configuration, not to an individual
 sandbox request.
 
+The driver emits the stable MXC 1.0.0 schema. IsolationSession lifecycle
+routing uses `wxc-exec --operation`; later phases pass the returned identity
+with `--container-id`, while the JSON omits the legacy `phase`, `sandboxId`, and
+`experimental.isolation_session` fields. Provisioning declares MXC's required
+all-allow IsolationSession network posture, and exec layers OpenShell variables
+onto the agent user's default environment.
+
 | Property | `process_container` | `isolation_session` |
 |---|---|---|
 | Runtime model | One-shot AppContainer process; default backend | Persistent MXC session used to run one configured process |

@@ -293,7 +293,7 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
         $probeDir = Join-Path $env:TEMP "mxc-e2e-probe"
         New-Item -ItemType Directory -Force $probeDir | Out-Null
         $config = @{
-            version     = "0.6.0-alpha"
+            version     = "1.0.0"
             containerId = "e2e-probe-pc"
             containment = "processcontainer"
             process     = @{ commandLine = "C:\Windows\System32\cmd.exe /c exit 0"; cwd = $probeDir; timeout = 30000 }  # ms (MXC process.timeout is milliseconds)
@@ -314,21 +314,17 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
 
     if ($backendName -eq "isolation_session") {
         $config = @{
-            version     = "0.6.0-alpha"
-            phase       = "provision"
+            version     = "1.0.0"
             containment = "isolation_session"
-            filesystem  = @{ readwritePaths = @(); readonlyPaths = @() }
-            experimental = @{
-                isolation_session = @{
-                    configurationId = "composable"
-                    provision       = @{}
-                }
+            network     = @{
+                egress  = @{ default = "allow" }
+                ingress = @{ default = "allow"; hostLoopback = "allow" }
             }
         }
         $json = $config | ConvertTo-Json -Depth 20 -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $b64 = [Convert]::ToBase64String($bytes)
-        $outObj = & $wxc --config-base64 $b64 --experimental 2>&1
+        $outObj = & $wxc --config-base64 $b64 --operation provision 2>&1
         $exitCode = $LASTEXITCODE
         $output = ($outObj -join "`n").ToLower()
         if ($output -match "backend_unavailable" -or $output -match "0x80040154") {
@@ -345,19 +341,11 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
             $sandboxId = $parsed.result.sandboxId
         } catch {}
         if ($null -ne $sandboxId) {
-            $deprovConfig = @{
-                version      = "0.6.0-alpha"
-                phase        = "deprovision"
-                sandboxId    = $sandboxId
-                experimental = @{
-                    # Unit variant: null, not @{} (malformed_request otherwise).
-                    isolation_session = @{ deprovision = $null }
-                }
-            }
+            $deprovConfig = @{ version = "1.0.0" }
             $deprovJson = $deprovConfig | ConvertTo-Json -Depth 20 -Compress
             $deprovBytes = [System.Text.Encoding]::UTF8.GetBytes($deprovJson)
             $deprovB64 = [Convert]::ToBase64String($deprovBytes)
-            & $wxc --config-base64 $deprovB64 --experimental 2>&1 | Out-Null
+            & $wxc --config-base64 $deprovB64 --operation deprovision --container-id $sandboxId 2>&1 | Out-Null
         }
         return @{ Live = $true; Reason = "isolation_session probe: provisioned and deprovisioned" }
     }

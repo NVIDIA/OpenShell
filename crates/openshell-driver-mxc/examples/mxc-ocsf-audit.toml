@@ -25,7 +25,6 @@ wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 # captures. (isolation_session is "dark" — it emits no provider events.)
 backend = "process_container"
 
-default_configuration_id = "composable"
 
 debug = false
 

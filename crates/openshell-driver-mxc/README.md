@@ -23,7 +23,7 @@ it does not implement the Linux `ConnectSupervisor` protocol.
 |---|---|
 | Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces them with default-deny behavior. `isolation_session` does not support OpenShell filesystem-policy grants; MXC rejects non-empty grants during provisioning. |
 | UI policy | `process_container` advertises complete support and maps portable graphical UI, clipboard-direction, and input-injection controls to MXC; omitted fields inside an explicit section deny. `isolation_session` advertises no support, so the gateway rejects any explicit section before provisioning. |
-| Network policy | With `egress_proxy = true` on `process_container`, an explicit `network_policies` rule activates MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. A policy without network rules does not activate the proxy. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
+| Network policy | With `egress_proxy = true` on `process_container`, an explicit `network_policies` rule activates MXC 1.0 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. A policy without network rules does not activate the proxy. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
 | Provider credentials | The child receives revision-scoped placeholders and non-secret provider environment only. The per-sandbox host proxy retains the resolver and substitutes credentials only for their bound endpoints. |
 | Process policy | Unsupported; MXC supplies OS isolation only. |
 | Resource limits | Unsupported; MXC exposes no CPU rate control or memory limiting to non-WSLC backends. `CreateSandbox` rejects any request carrying `cpu_limit`, `cpu_request`, `memory_limit`, or `memory_request` synchronously rather than silently discarding them. |
@@ -47,7 +47,6 @@ wxc_exec_path = "C:\\path\\to\\wxc-exec.exe"
 # Default: process_container. isolation_session is opt-in and does not support
 # OpenShell filesystem-policy grants.
 backend = "process_container"
-default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
 # Either backend: launch openshell-supervisor-relay instead of the per-sandbox
@@ -85,6 +84,10 @@ PATH-lookup or working-directory-relative resolution execute an unapproved
 binary with the gateway's identity instead of the approved `wxc-exec`. There
 is no usable default.
 
+MXC 1.0 removed the IsolationSession `configurationId`. The driver still
+accepts the legacy `default_configuration_id` gateway setting so existing TOML
+files load, but it ignores the value and does not send it to `wxc-exec`.
+
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. For policies with explicit network rules, the driver preserves
 the configured IP and allocates a unique ephemeral port for that sandbox's
@@ -107,7 +110,7 @@ The `command` array is required and preserves Windows argument boundaries. `cwd`
 
 UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
 
-`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: for a sandbox policy with explicit network rules, the driver reserves a unique ephemeral loopback port. MXC 0.8 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. A policy without network rules keeps MXC's default network posture and receives neither a host listener nor proxy environment variables. The current governed-egress policy permits all loopback ports, so governed sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
+`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: for a sandbox policy with explicit network rules, the driver reserves a unique ephemeral loopback port. MXC 1.0 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. A policy without network rules keeps MXC's default network posture and receives neither a host listener nor proxy environment variables. The current governed-egress policy permits all loopback ports, so governed sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
 
 When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
 session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
@@ -176,6 +179,7 @@ host proxy and reach the child only as placeholders.
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553
+- MXC 1.0.0 RC3 or a newer binary compatible with the stable 1.0.0 schema
 - `IsoSessionApp.dll` present and registered
 - `wxc-exec.exe` built with `--features isolation_session`
 - Any enforced App Control policy allows both `openshell-gateway.exe` and

@@ -23,7 +23,7 @@
 //!   driver: MXC handles filesystem + containment + loopback-only egress,
 //!   while the full `OpenShell` network policy is preserved in a trimmed policy
 //!   enforced by the host CONNECT proxy. This path uses the live driver's MXC
-//!   0.8 directional-network schema.
+//!   1.0 directional-network schema.
 //!
 //! The coarse mapper's schema version describes its generated artifact, not the
 //! live driver's operating schema. The embedded driver may use a coarse mapping

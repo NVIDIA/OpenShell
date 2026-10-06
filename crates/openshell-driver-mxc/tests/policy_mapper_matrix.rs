@@ -147,7 +147,7 @@ fn a_schema_versions_match_their_distinct_network_shapes() {
     let governed = split_policy(&policy, &pc_split_opts())
         .expect("governed split must exist when a proxy redirect is configured")
         .mxc_config;
-    assert_eq!(governed["version"], "0.8.0-alpha");
+    assert_eq!(governed["version"], "1.0.0");
     assert!(governed["network"].get("allowedHosts").is_none());
     assert!(governed["network"].get("egress").is_some());
 }
@@ -410,13 +410,13 @@ fn a_split_network_verbatim_and_version_preserved() {
     );
 }
 
-/// Split path emits MXC 0.8 loopback-only governed-egress fields.
+/// Split path emits MXC 1.0 loopback-only governed-egress fields.
 #[test]
-fn a_split_proxy_uses_loopback_only_08_fields() {
+fn a_split_proxy_uses_loopback_only_1_0_fields() {
     let policy = SandboxPolicy::default();
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
     assert!(result.mxc_config.get("runtimeConfig").is_none());
-    assert_eq!(result.mxc_config["version"], "0.8.0-alpha");
+    assert_eq!(result.mxc_config["version"], "1.0.0");
     assert_eq!(result.mxc_config["network"]["egress"]["default"], "deny");
     assert_eq!(
         result.mxc_config["network"]["egress"]["allow"][0]["to"][0]["cidr"],

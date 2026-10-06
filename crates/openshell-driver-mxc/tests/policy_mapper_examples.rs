@@ -210,7 +210,7 @@ fn all_example_policies_split_with_expected_invariants() {
             assert!(str_list(&cfg["filesystem"]["readonlyPaths"]).is_empty());
         }
 
-        assert_eq!(cfg["version"], "0.8.0-alpha");
+        assert_eq!(cfg["version"], "1.0.0");
         assert_eq!(cfg["network"]["egress"]["default"], "deny");
         assert_eq!(
             cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],
@@ -423,7 +423,7 @@ fn network_only_policy_has_empty_filesystem() {
 // ── New tests: proxy JSON shape and non-127.0.0.1 guard ──────────────────────
 
 #[test]
-fn split_with_loopback_addr_emits_loopback_only_08_shape() {
+fn split_with_loopback_addr_emits_loopback_only_1_0_shape() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
@@ -436,7 +436,7 @@ fn split_with_loopback_addr_emits_loopback_only_08_shape() {
     let result = split_policy(&policy, &opts).expect("split returns Some");
     let cfg = &result.mxc_config;
 
-    assert_eq!(cfg["version"], "0.8.0-alpha");
+    assert_eq!(cfg["version"], "1.0.0");
     assert_eq!(cfg["network"]["egress"]["default"], "deny");
     assert_eq!(
         cfg["network"]["egress"]["allow"][0]["to"][0]["cidr"],

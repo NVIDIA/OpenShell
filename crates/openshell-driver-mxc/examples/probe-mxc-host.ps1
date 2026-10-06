@@ -65,15 +65,23 @@ function Invoke-WxcDryRun([string] $wxc, [hashtable] $config) {
     return Invoke-Native @($wxc, "--config-base64", $b64, "--dry-run")
 }
 
-function Invoke-WxcPhase([string] $wxc, [hashtable] $config, [switch] $Experimental) {
+function Invoke-WxcPhase(
+    [string] $wxc,
+    [hashtable] $config,
+    [string] $Operation,
+    [string] $ContainerId
+) {
     $json = $config | ConvertTo-Json -Depth 20 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     $b64 = [Convert]::ToBase64String($bytes)
-    if ($Experimental) {
-        return Invoke-Native @($wxc, "--config-base64", $b64, "--experimental")
-    } else {
-        return Invoke-Native @($wxc, "--config-base64", $b64)
+    $arguments = @($wxc, "--config-base64", $b64)
+    if (-not [string]::IsNullOrWhiteSpace($Operation)) {
+        $arguments += @("--operation", $Operation)
     }
+    if (-not [string]::IsNullOrWhiteSpace($ContainerId)) {
+        $arguments += @("--container-id", $ContainerId)
+    }
+    return Invoke-Native $arguments
 }
 
 function Invoke-WxcProbe([string] $wxc) {
@@ -130,7 +138,7 @@ if ($wxcInfo.exists) {
 
     # dry-run trial (minimal processcontainer config)
     $dryConfig = @{
-        version     = "0.6.0-alpha"
+        version     = "1.0.0"
         containerId = "probe-dryrun"
         containment = "processcontainer"
         process     = @{
@@ -148,7 +156,7 @@ if ($wxcInfo.exists) {
 
     # processcontainer one-shot trial
     $pcConfig = @{
-        version     = "0.6.0-alpha"
+        version     = "1.0.0"
         containerId = "probe-pc-oneshot"
         containment = "processcontainer"
         process     = @{
@@ -198,21 +206,14 @@ if ($wxcInfo.exists) {
 
     # isolation_session provision trial
     $isoConfig = @{
-        version     = "0.6.0-alpha"
-        phase       = "provision"
+        version     = "1.0.0"
         containment = "isolation_session"
-        filesystem  = @{
-            readwritePaths = @()
-            readonlyPaths  = @()
-        }
-        experimental = @{
-            isolation_session = @{
-                configurationId = "composable"
-                provision       = @{}
-            }
+        network     = @{
+            egress  = @{ default = "allow" }
+            ingress = @{ default = "allow"; hostLoopback = "allow" }
         }
     }
-    $isoResult = Invoke-WxcPhase -wxc $WxcExecPath -config $isoConfig -Experimental
+    $isoResult = Invoke-WxcPhase -wxc $WxcExecPath -config $isoConfig -Operation "provision"
     $isoOutput = $isoResult.Output
     $isoOutputLower = $isoOutput.ToLower()
 
@@ -232,32 +233,10 @@ if ($wxcInfo.exists) {
         } catch {}
 
         if ($null -ne $sandboxId) {
-            # Stop first (a provisioned-but-unstarted session may still accept it;
-            # ignore failures), then deprovision. Surface the deprovision error
-            # text — an orphaned session blocks the single-session backend.
-            $stopConfig = @{
-                version    = "0.6.0-alpha"
-                phase      = "stop"
-                sandboxId  = $sandboxId
-                experimental = @{
-                    isolation_session = @{
-                        # Unit variant: serialize as null, not {} (malformed_request otherwise).
-                        stop = $null
-                    }
-                }
-            }
-            Invoke-WxcPhase -wxc $WxcExecPath -config $stopConfig -Experimental | Out-Null
-            $deprovConfig = @{
-                version    = "0.6.0-alpha"
-                phase      = "deprovision"
-                sandboxId  = $sandboxId
-                experimental = @{
-                    isolation_session = @{
-                        deprovision = $null
-                    }
-                }
-            }
-            $deprovResult = Invoke-WxcPhase -wxc $WxcExecPath -config $deprovConfig -Experimental
+            # Deprovision immediately. Surface the error text because an
+            # orphaned session blocks the single-session backend.
+            $deprovConfig = @{ version = "1.0.0" }
+            $deprovResult = Invoke-WxcPhase -wxc $WxcExecPath -config $deprovConfig -Operation "deprovision" -ContainerId $sandboxId
             if ($deprovResult.ExitCode -eq 0) {
                 $isoTrialMessage = "isolation_session live (provisioned $sandboxId, deprovisioned cleanly)"
             } else {

@@ -16,7 +16,7 @@ pub const DEFAULT_COMMAND: &str = "sh -lc \"echo OpenShell policy mapped to MXC;
 ///
 /// This is deliberately independent from [`crate::mxc::MXC_SCHEMA_VERSION`]:
 /// the coarse artifact uses the MXC 0.7 `allowedHosts` shape, while live driver
-/// requests and the governed-egress split use MXC 0.8 directional networking.
+/// requests and the governed-egress split use MXC 1.0 directional networking.
 pub const DEFAULT_COARSE_MXC_VERSION: &str = "0.7.0-alpha";
 
 /// Compatibility name for [`DEFAULT_COARSE_MXC_VERSION`].

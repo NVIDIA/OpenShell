@@ -29,7 +29,7 @@ pc_least_privilege = false
 # because Node.js (OpenClaw's runtime) touches user32/gdi32 during its own
 # startup and dies with STATUS_DLL_INIT_FAILED under the Win32k lockdown
 # that applies when a policy has no `ui:` section, confirmed empirically
-# against mxc-release-binaries-v0.8.0, even though this target never
+# against mxc-release-binaries-v1.0.0-rc3, even though this target never
 # actually opens a window.
 
 # Egress proxy for outbound TCP connectivity.
