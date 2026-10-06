@@ -33,8 +33,8 @@ assert_resolves "digest reference is unchanged" \
   "registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
   "registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" test
 assert_resolves "registry port inherits tag" \
-  "localhost:5000/openshell/gateway:test" \
-  "localhost:5000/openshell/gateway" test
+  "localhost:5000/ryno/gateway:test" \
+  "localhost:5000/ryno/gateway" test
 
 if e2e_image_reference_is_complete "registry.example/gateway:branch" \
   && e2e_image_reference_is_complete "registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
@@ -61,17 +61,17 @@ assert_reference_part "repository strips tag" \
   "registry.example/gateway" \
   "$(e2e_image_reference_repository "registry.example/gateway:branch")"
 assert_reference_part "repository preserves registry port" \
-  "localhost:5000/openshell/gateway" \
-  "$(e2e_image_reference_repository "localhost:5000/openshell/gateway:test")"
+  "localhost:5000/ryno/gateway" \
+  "$(e2e_image_reference_repository "localhost:5000/ryno/gateway:test")"
 assert_reference_part "registry extracts hostname" \
   "registry.example" \
-  "$(e2e_image_reference_registry "registry.example/openshell/gateway:branch")"
+  "$(e2e_image_reference_registry "registry.example/ryno/gateway:branch")"
 assert_reference_part "registry extracts hostname and port" \
   "localhost:5000" \
-  "$(e2e_image_reference_registry "localhost:5000/openshell/gateway:test")"
+  "$(e2e_image_reference_registry "localhost:5000/ryno/gateway:test")"
 assert_reference_part "repository path excludes registry" \
-  "openshell/gateway" \
-  "$(e2e_image_reference_repository_path "registry.example/openshell/gateway:branch")"
+  "ryno/gateway" \
+  "$(e2e_image_reference_repository_path "registry.example/ryno/gateway:branch")"
 assert_reference_part "tag extracts tag" \
   "branch" \
   "$(e2e_image_reference_tag "registry.example/gateway:branch")"
@@ -106,7 +106,7 @@ assert_helm_image_translation() {
 assert_helm_image_translation "gateway" \
   "registry.example/gateway:branch" "registry.example" "gateway" "branch" ""
 assert_helm_image_translation "supervisor" \
-  "localhost:5000/openshell/supervisor:test" "localhost:5000" "openshell/supervisor" "test" ""
+  "localhost:5000/ryno/supervisor:test" "localhost:5000" "ryno/supervisor" "test" ""
 assert_helm_image_translation "sandbox" \
   "registry.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
   "registry.example" "sandbox" "" "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

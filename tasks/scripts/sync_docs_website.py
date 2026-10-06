@@ -410,8 +410,8 @@ def sync_redirects(source_docs_yml: Path, target_docs_yml: Path, slug: str) -> N
         # version. Unversioned aliases belong to their destination's version.
         for field in ("source", "destination"):
             url = urlsplit(cast("str", rule[field]))
-            if not url.netloc and url.path.startswith("/openshell/"):
-                version = url.path.removeprefix("/openshell/").split("/", 1)[0]
+            if not url.netloc and url.path.startswith("/ryno/"):
+                version = url.path.removeprefix("/ryno/").split("/", 1)[0]
                 if version in version_slugs:
                     return version
         # Dev owns shared rules such as the legacy .html URL normalization.

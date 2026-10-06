@@ -6,7 +6,7 @@
 `smoke-fail` validates negative-path diagnostics in e2e test plumbing.
 
 The workload does not perform GPU-specific work. It prints
-`OPENSHELL_GPU_WORKLOAD_FAILURE`, emits a stable diagnostic, and exits non-zero.
+`RYNO_GPU_WORKLOAD_FAILURE`, emits a stable diagnostic, and exits non-zero.
 
 Build it with:
 
@@ -20,14 +20,14 @@ That command also refreshes the local workload manifest at
 To build only this workload locally, set:
 
 ```shell
-OPENSHELL_GPU_WORKLOAD_IMAGES=smoke-fail mise run e2e:workloads:build
+RYNO_GPU_WORKLOAD_IMAGES=smoke-fail mise run e2e:workloads:build
 ```
 
 Run it directly:
 
 ```shell
 source e2e/gpu/images/.build/latest.env
-docker run --rm "${OPENSHELL_E2E_GPU_SMOKE_FAIL_IMAGE}"
+docker run --rm "${RYNO_E2E_GPU_SMOKE_FAIL_IMAGE}"
 ```
 
 The direct run should fail.

@@ -14,6 +14,6 @@
 
 - name: Create test-guest state directory
   ansible.builtin.file:
-    path: /etc/openshell-test-guest
+    path: /etc/ryno-test-guest
     state: directory
     mode: "0755"

@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.datamodel.v1;
+package ryno.datamodel.v1;
 
 import "options.proto";
 import "google/protobuf/timestamp.proto";
@@ -28,7 +28,7 @@ message WorkspaceSelector {
 // Marker for the all-workspaces selector variant.
 message AllWorkspaces {}
 
-// Kubernetes-style metadata shared by all top-level OpenShell domain objects.
+// Kubernetes-style metadata shared by all top-level Ryno domain objects.
 //
 // This structure provides consistent metadata (identity, labels, annotations,
 // timestamps, resource versioning) across Sandbox, Provider, SshSession, and
@@ -92,7 +92,7 @@ message Workspace {
 }
 
 // Opaque handle for a provider credential stored by gateway credential storage.
-// Handles are created by OpenShell and must not be authored by users.
+// Handles are created by Ryno and must not be authored by users.
 message CredentialHandle {
   // Internal storage owner or credential driver that owns this handle.
   string driver = 1;
@@ -102,7 +102,7 @@ message CredentialHandle {
   map<string, string> metadata = 3;
 }
 
-// Provider model stored by OpenShell.
+// Provider model stored by Ryno.
 message Provider {
   reserved 5;
   reserved "credential_expires_at_ms";
@@ -112,7 +112,7 @@ message Provider {
   // exactly (for example: "claude-code", "github").
   string type = 2;
   // Secret values used for authentication.
-  map<string, string> credentials = 3 [(openshell.options.v1.secret) = true];
+  map<string, string> credentials = 3 [(ryno.options.v1.secret) = true];
   // Non-secret provider configuration.
   map<string, string> config = 4;
   // Expiration times for credential values, keyed by credential/env var name.

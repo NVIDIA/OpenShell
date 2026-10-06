@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "NVIDIA OpenShell Developer Guide"
-description: "OpenShell is the safe, private runtime for fleets of autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
+title: "NVIDIA Ryno Developer Guide"
+description: "Ryno is the safe, private runtime for fleets of autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Privacy, Provider Credentials"
 position: 1
 ---
@@ -13,49 +13,49 @@ import { CommandTerminal } from "./_components/CommandTerminal";
 <BadgeLinks
   badges={[
     {
-      href: "https://github.com/NVIDIA/OpenShell",
+      href: "https://github.com/NVIDIA/Ryno",
       src: "https://img.shields.io/badge/github-repo-green?logo=github",
       alt: "GitHub",
     },
     {
-      href: "https://github.com/NVIDIA/OpenShell/blob/main/LICENSE",
+      href: "https://github.com/NVIDIA/Ryno/blob/main/LICENSE",
       src: "https://img.shields.io/badge/License-Apache_2.0-blue",
       alt: "License",
     },
     {
-      href: "https://pypi.org/project/openshell/",
-      src: "https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi",
+      href: "https://pypi.org/project/ryno/",
+      src: "https://img.shields.io/badge/PyPI-ryno-orange?logo=pypi",
       alt: "PyPI",
     },
   ]}
 />
 
-NVIDIA OpenShell is the safe, private runtime for fleets of autonomous AI agents. It provides sandboxed execution environments
+NVIDIA Ryno is the safe, private runtime for fleets of autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
 
 <Note>
-New in OpenShell 0.1.x: a [stable release cadence](/about/support-matrix#releases), new [isolation primitives](/about/architecture), and an expanded [extension surface](/extensibility/overview), along with much more.
+New in Ryno 0.1.x: a [stable release cadence](/about/support-matrix#releases), new [isolation primitives](/about/architecture), and an expanded [extension surface](/extensibility/overview), along with much more.
 
 See our [upgrade guide](/upgrade/0-1-0) for everything that's changed.
 </Note>
 
 ## Get Started
 
-Install OpenShell and create your first sandbox in two commands.
+Install Ryno and create your first sandbox in two commands.
 
 <llms-ignore>
 
-<CommandTerminal command="curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh" />
+<CommandTerminal command="curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | sh" />
 
 </llms-ignore>
 
 <llms-only>
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-openshell sandbox create
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | sh
+ryno sandbox create
 ```
 
 </llms-only>
@@ -70,9 +70,9 @@ provider, and policy workflow.
 <div className="explore-cards">
 <Cards>
 
-<Card title="About OpenShell" href="/about/overview">
+<Card title="About Ryno" href="/about/overview">
 
-Learn about OpenShell and its capabilities.
+Learn about Ryno and its capabilities.
 
 <Badge intent="tip" minimal outlined>Concept</Badge>
 </Card>

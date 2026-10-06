@@ -1,4 +1,4 @@
-# OpenShell RPM Quick Start
+# Ryno RPM Quick Start
 
 Get from `dnf install` to a running sandbox in five minutes.
 
@@ -52,13 +52,13 @@ creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
 
 For air-gapped environments, pre-load images with `podman pull` and
 set `image_pull_policy = "never"` in
-`~/.config/openshell/gateway.toml`. See CONFIGURATION.md for
+`~/.config/ryno/gateway.toml`. See CONFIGURATION.md for
 details.
 
 ## Start the gateway
 
 ```shell
-systemctl --user enable --now openshell-gateway
+systemctl --user enable --now ryno-gateway
 ```
 
 On first start, the gateway automatically generates:
@@ -73,7 +73,7 @@ On first start, the gateway automatically generates:
 Verify the service is running:
 
 ```shell
-systemctl --user status openshell-gateway
+systemctl --user status ryno-gateway
 ```
 
 ## Register the gateway with the CLI
@@ -81,17 +81,17 @@ systemctl --user status openshell-gateway
 The CLI needs to know where the gateway is. Register it:
 
 ```shell
-openshell gateway add --local https://127.0.0.1:17670
+ryno gateway add --local https://127.0.0.1:17670
 ```
 
 This discovers the pre-provisioned mTLS certificates at
-`~/.config/openshell/gateways/openshell/mtls/` and sets the gateway
+`~/.config/ryno/gateways/ryno/mtls/` and sets the gateway
 as active.
 
 Verify the connection:
 
 ```shell
-openshell status
+ryno status
 ```
 
 ## Persist across reboots
@@ -113,7 +113,7 @@ Set your API key in the environment, then create a sandbox:
 
 ```shell
 export ANTHROPIC_API_KEY=sk-...
-openshell sandbox create -- claude
+ryno sandbox create -- claude
 ```
 
 The CLI detects the agent, prompts to create a credential provider
@@ -123,8 +123,8 @@ and connects you to the running sandbox.
 Other agents:
 
 ```shell
-openshell sandbox create -- opencode
-openshell sandbox create -- codex
+ryno sandbox create -- opencode
+ryno sandbox create -- codex
 ```
 
 ## Set up providers manually
@@ -133,14 +133,14 @@ If you prefer to configure providers before creating sandboxes:
 
 ```shell
 # Create a provider from a local environment variable
-openshell provider create --name anthropic --type anthropic --from-existing
+ryno provider create --name anthropic --type anthropic --from-existing
 
 # Or supply the credential directly
-openshell provider create --name openai --type openai \
+ryno provider create --name openai --type openai \
   --credential OPENAI_API_KEY=sk-...
 
 # List configured providers
-openshell provider list
+ryno provider list
 ```
 
 ## Configure provider-backed inference (optional)
@@ -148,7 +148,7 @@ openshell provider list
 To grant a sandbox access to a model provider:
 
 ```shell
-openshell sandbox provider attach <sandbox> openai
+ryno sandbox provider attach <sandbox> openai
 
 # Configure the workload to call the provider's native endpoint and select
 # the model in the client.
@@ -160,5 +160,5 @@ openshell sandbox provider attach <sandbox> openai
   file locations.
 - See TROUBLESHOOTING.md for CLI compatibility notes, remote access,
   and common issues.
-- Run `man openshell` for the CLI reference.
-- Run `man openshell-gateway` for the gateway daemon reference.
+- Run `man ryno` for the CLI reference.
+- Run `man ryno-gateway` for the gateway daemon reference.

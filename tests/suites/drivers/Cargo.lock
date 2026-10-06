@@ -99,7 +99,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openshell-conformance"
+name = "ryno-conformance"
 version = "0.0.0"
 dependencies = [
  "rand",
@@ -110,10 +110,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-test-suite-podman"
+name = "ryno-test-suite-podman"
 version = "0.0.0"
 dependencies = [
- "openshell-conformance",
+ "ryno-conformance",
  "serde",
  "tokio",
 ]

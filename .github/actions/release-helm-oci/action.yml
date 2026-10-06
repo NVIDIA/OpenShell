@@ -53,8 +53,8 @@ runs:
         set -euo pipefail
         GATEWAY_CHART_DIR="${RUNNER_TEMP}/gateway-chart-build"
         WORKSPACE_CHART_DIR="${RUNNER_TEMP}/workspace-chart-build"
-        cp -a deploy/helm/openshell/. "${GATEWAY_CHART_DIR}"
-        cp -a deploy/helm/openshell-workspace/. "${WORKSPACE_CHART_DIR}"
+        cp -a deploy/helm/ryno/. "${GATEWAY_CHART_DIR}"
+        cp -a deploy/helm/ryno-workspace/. "${WORKSPACE_CHART_DIR}"
         for chart_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do
           sed -i "s/^version:.*/version: ${CHART_VERSION}/" "${chart_dir}/Chart.yaml"
           sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" "${chart_dir}/Chart.yaml"
@@ -70,8 +70,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        for chart in helm-chart openshell-workspace; do
-          OCI_CHART="oci://ghcr.io/nvidia/openshell/${chart}"
+        for chart in helm-chart ryno-workspace; do
+          OCI_CHART="oci://ghcr.io/nvidia/ryno/${chart}"
           if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
             echo "::error::Chart ${chart}:${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
             exit 1
@@ -95,7 +95,7 @@ runs:
       run: |
         set -euo pipefail
         for archive in /tmp/helm-charts/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          helm push "${archive}" oci://ghcr.io/nvidia/ryno
         done
 
     - name: Push SHA-pinned chart
@@ -117,5 +117,5 @@ runs:
           helm package "${sha_chart_dir}" --destination /tmp/sha-pin
         done
         for archive in /tmp/sha-pin/*.tgz; do
-          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+          helm push "${archive}" oci://ghcr.io/nvidia/ryno
         done

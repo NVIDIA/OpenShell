@@ -31,7 +31,7 @@ misconfigurations:
       - "**/statefulset.yaml"
       - "**/deployment.yaml"
     statement: >-
-      Images come from ghcr.io/nvidia/openshell, this project's own registry.
+      Images come from ghcr.io/nvidia/ryno, this project's own registry.
 
   # The Kubernetes compute driver creates its runtime infrastructure and the
   # per-sandbox outer egress fence in the configured sandbox namespace.

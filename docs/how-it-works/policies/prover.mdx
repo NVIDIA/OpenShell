@@ -3,18 +3,18 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Policy Prover"
 sidebar-title: "Policy Prover"
-description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a boundary policy you define."
+description: "Understand how Ryno uses the policy prover, and check that a policy grants no more access than a boundary policy you define."
 keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
 position: 4
 ---
 
-The policy prover is OpenShell's policy verification engine. It uses an SMT
+The policy prover is Ryno's policy verification engine. It uses an SMT
 solver to check whether policies satisfy specified properties, such as staying
 within an allowed access boundary. Its guarantees apply to the policy features
-and behavior represented by its model. OpenShell is actively extending the model
+and behavior represented by its model. Ryno is actively extending the model
 to cover more policy features.
 
-OpenShell uses the prover for two types of checks:
+Ryno uses the prover for two types of checks:
 
 - A boundary check verifies that a policy allows no access beyond a boundary
   policy, which defines the most access allowed in an environment.
@@ -22,7 +22,7 @@ OpenShell uses the prover for two types of checks:
   access compared with the sandbox's current policy, such as access to cloud
   metadata addresses or new destinations for provider credentials.
 
-You run a boundary check with the `openshell-prover` CLI, which is primarily
+You run a boundary check with the `ryno-prover` CLI, which is primarily
 intended for agents. For example, a parent agent can check that a policy it
 writes for a subagent stays within the parent's own maximum allowed policy. A
 proposal risk check runs automatically each time an agent proposes a network
@@ -36,15 +36,15 @@ contain access that the proposal risk check would flag.
 This page covers the boundary check. To learn about the proposal risk check,
 refer to [Policy Advisor](/how-it-works/policies/advisor).
 
-For Snap installations, replace `openshell-prover` in these examples with
-`openshell.prover`. The `openshell-prover` Snap alias requires Store approval
+For Snap installations, replace `ryno-prover` in these examples with
+`ryno.prover`. The `ryno-prover` Snap alias requires Store approval
 and may not be available.
 
 The prover remains independent of the gateway at runtime. If you only need the
 standalone binary, use the artifacts listed in the
 [Support Matrix](/about/support-matrix#standalone-policy-prover). These
-artifacts and `openshell-prover-checksums-sha256.txt` are attached to
-[OpenShell releases](https://github.com/NVIDIA/OpenShell/releases).
+artifacts and `ryno-prover-checksums-sha256.txt` are attached to
+[Ryno releases](https://github.com/NVIDIA/Ryno/releases).
 
 ## Run a Boundary Check
 
@@ -61,7 +61,7 @@ ignoring those rules. [What the Boundary Check
 Covers](#what-the-boundary-check-covers) describes each part and its limits.
 
 The Homebrew, Debian, RPM, and Snap packages install the prover. Homebrew,
-Debian, and RPM expose it as `openshell-prover`; use `openshell.prover` with the
+Debian, and RPM expose it as `ryno-prover`; use `ryno.prover` with the
 Snap. The CLI reads policy files on your machine, does not need a gateway, and
 does not apply or approve policies.
 
@@ -87,7 +87,7 @@ filesystem_policy:
 Check the candidate against the boundary:
 
 ```shell
-openshell-prover check candidate.yaml --boundary boundary.yaml
+ryno-prover check candidate.yaml --boundary boundary.yaml
 ```
 
 The candidate allows less than the boundary, so the check passes:
@@ -125,8 +125,8 @@ To check the policy that a sandbox enforces, save its effective policy and use
 it as the candidate:
 
 ```shell
-openshell sandbox get my-sandbox --policy-only > candidate.yaml
-openshell-prover check candidate.yaml --boundary boundary.yaml
+ryno sandbox get my-sandbox --policy-only > candidate.yaml
+ryno-prover check candidate.yaml --boundary boundary.yaml
 ```
 
 The effective policy includes rules from attached providers, so the check
@@ -160,7 +160,7 @@ For agents and scripts, add `--output json`. Read the `result` and
 `reason_code` fields instead of parsing the text output. `reason_code` is a
 stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also
 check that `coverage.domains` includes every part of the policy that you rely
-on. Run `openshell-prover check --help` for all options, including `--timeout`,
+on. Run `ryno-prover check --help` for all options, including `--timeout`,
 which changes the default 10-second time limit.
 
 ## What the Boundary Check Covers

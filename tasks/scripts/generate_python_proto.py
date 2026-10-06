@@ -9,24 +9,24 @@ import sys
 from pathlib import Path
 
 PROTO_FILES = [
-    "proto/openshell.proto",
+    "proto/ryno.proto",
     "proto/datamodel.proto",
     "proto/options.proto",
     "proto/sandbox.proto",
 ]
 
 LINE_REWRITES = {
-    "python/openshell/_proto/openshell_pb2_grpc.py": [
+    "python/ryno/_proto/ryno_pb2_grpc.py": [
         (
-            r"^import openshell_pb2 as openshell__pb2$",
-            "from . import openshell_pb2 as openshell__pb2",
+            r"^import ryno_pb2 as ryno__pb2$",
+            "from . import ryno_pb2 as ryno__pb2",
         ),
         (
             r"^import sandbox_pb2 as sandbox__pb2$",
             "from . import sandbox_pb2 as sandbox__pb2",
         ),
     ],
-    "python/openshell/_proto/openshell_pb2.py": [
+    "python/ryno/_proto/ryno_pb2.py": [
         (
             r"^import datamodel_pb2 as datamodel__pb2$",
             "from . import datamodel_pb2 as datamodel__pb2",
@@ -40,7 +40,7 @@ LINE_REWRITES = {
             "from . import sandbox_pb2 as sandbox__pb2",
         ),
     ],
-    "python/openshell/_proto/datamodel_pb2.py": [
+    "python/ryno/_proto/datamodel_pb2.py": [
         (
             r"^import options_pb2 as options__pb2$",
             "from . import options_pb2 as options__pb2",
@@ -50,19 +50,19 @@ LINE_REWRITES = {
             "from . import sandbox_pb2 as sandbox__pb2",
         ),
     ],
-    "python/openshell/_proto/datamodel_pb2_grpc.py": [
+    "python/ryno/_proto/datamodel_pb2_grpc.py": [
         (
             r"^import datamodel_pb2 as datamodel__pb2$",
             "from . import datamodel_pb2 as datamodel__pb2",
         ),
     ],
-    "python/openshell/_proto/sandbox_pb2.py": [
+    "python/ryno/_proto/sandbox_pb2.py": [
         (
             r"^import datamodel_pb2 as datamodel__pb2$",
             "from . import datamodel_pb2 as datamodel__pb2",
         ),
     ],
-    "python/openshell/_proto/sandbox_pb2_grpc.py": [
+    "python/ryno/_proto/sandbox_pb2_grpc.py": [
         (
             r"^import sandbox_pb2 as sandbox__pb2$",
             "from . import sandbox_pb2 as sandbox__pb2",
@@ -78,9 +78,9 @@ def main() -> None:
             "-m",
             "grpc_tools.protoc",
             "-Iproto",
-            "--python_out=python/openshell/_proto",
-            "--pyi_out=python/openshell/_proto",
-            "--grpc_python_out=python/openshell/_proto",
+            "--python_out=python/ryno/_proto",
+            "--pyi_out=python/ryno/_proto",
+            "--grpc_python_out=python/ryno/_proto",
             *PROTO_FILES,
         ],
         check=True,

@@ -1,18 +1,18 @@
 blank_issues_enabled: false
 contact_links:
   - name: First-time contributor? Get vouched first
-    url: https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request
+    url: https://github.com/NVIDIA/Ryno/discussions/new?category=vouch-request
     about: >
       First-time contributors must be vouched before submitting PRs. Open a
       Vouch Request discussion describing what you want to work on. A
       maintainer will approve you with /vouch.
   - name: Have a question?
-    url: https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#skills-for-using-openshell
+    url: https://github.com/NVIDIA/Ryno/blob/main/CONTRIBUTING.md#skills-for-using-ryno
     about: >
-      Install the public OpenShell skills for CLI usage, cluster and inference
+      Install the public Ryno skills for CLI usage, cluster and inference
       debugging, and policy generation. See CONTRIBUTING.md for details.
   - name: Security vulnerability?
-    url: https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md
+    url: https://github.com/NVIDIA/Ryno/blob/main/SECURITY.md
     about: >
       Do not report security vulnerabilities through GitHub issues. Follow
       the disclosure process in SECURITY.md — report through the NVIDIA PSIRT

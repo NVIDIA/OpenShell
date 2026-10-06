@@ -43,7 +43,7 @@ let
         manifest_path="$root/${manifestPath}"
         workspace_root="$root/${workspacePath}"
         output="$root/${output}"
-        bundle_dir=$(mktemp -d -p /tmp openshell-test-bundle.XXXXXX)
+        bundle_dir=$(mktemp -d -p /tmp ryno-test-bundle.XXXXXX)
         cleanup() {
           status=$?
           trap - EXIT
@@ -80,18 +80,18 @@ let
     };
 
   conformanceCliArchive = mkTestArchive {
-    name = "openshell-conformance";
+    name = "ryno-conformance";
     workspacePath = "tests/suites/conformance";
     manifestPath = "tests/suites/conformance/Cargo.toml";
-    package = "openshell-test-conformance-cli";
+    package = "ryno-test-conformance-cli";
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/ryno-conformance-tests.tar";
   };
   providerRefreshKeycloakArchive = mkTestArchive {
     name = "provider-refresh-keycloak";
     workspacePath = "tests/suites/features";
     manifestPath = "tests/suites/features/Cargo.toml";
-    package = "openshell-test-feature-provider-refresh-keycloak";
+    package = "ryno-test-feature-provider-refresh-keycloak";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
@@ -155,7 +155,7 @@ let
       cargo nextest list \
         --manifest-path e2e/rust/Cargo.toml \
         --target ${muslToolchain.target} \
-        -p openshell-e2e \
+        -p ryno-e2e \
         --features e2e-podman \
         --list-type binaries-only \
         --message-format json \
@@ -179,17 +179,17 @@ let
     name = "podman-driver";
     workspacePath = "tests/suites/drivers";
     manifestPath = "tests/suites/drivers/Cargo.toml";
-    package = "openshell-test-suite-podman";
+    package = "ryno-test-suite-podman";
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/ryno-podman-tests.tar";
   };
   podmanE2eArchive = mkTestArchive {
     name = "podman-e2e";
     workspacePath = "e2e/rust";
     manifestPath = "e2e/rust/Cargo.toml";
-    package = "openshell-e2e";
+    package = "ryno-e2e";
     target = muslToolchain.target;
-    output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-e2e-tests.tar";
+    output = "artifacts/test-archives/${muslToolchain.target}/ryno-podman-e2e-tests.tar";
     features = "e2e-podman";
     filter = podmanE2eArchiveFilter;
   };
@@ -216,28 +216,28 @@ rec {
       cd "$root"
 
       cargo build --target ${muslToolchain.target} \
-        -p openshell-cli \
-        -p openshell-sandbox
+        -p ryno-cli \
+        -p ryno-sandbox
 
       cargo build --target ${gnuToolchain.target} \
-        -p openshell-gateway \
-        -p openshell-supervisor
+        -p ryno-gateway \
+        -p ryno-supervisor
 
       install -D -m 0755 \
-        target/${muslToolchain.target}/debug/openshell \
-        artifacts/binaries/${muslToolchain.target}/openshell
+        target/${muslToolchain.target}/debug/ryno \
+        artifacts/binaries/${muslToolchain.target}/ryno
 
       install -D -m 0755 \
-        target/${muslToolchain.target}/debug/openshell-sandbox \
-        artifacts/binaries/${muslToolchain.target}/openshell-sandbox
+        target/${muslToolchain.target}/debug/ryno-sandbox \
+        artifacts/binaries/${muslToolchain.target}/ryno-sandbox
 
       install -D -m 0755 \
-        target/${gnuToolchain.target}/debug/openshell-gateway \
-        artifacts/binaries/${gnuToolchain.target}/openshell-gateway
+        target/${gnuToolchain.target}/debug/ryno-gateway \
+        artifacts/binaries/${gnuToolchain.target}/ryno-gateway
 
       install -D -m 0755 \
-        target/${gnuToolchain.target}/debug/openshell-supervisor \
-        artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
+        target/${gnuToolchain.target}/debug/ryno-supervisor \
+        artifacts/binaries/${gnuToolchain.target}/ryno-supervisor
     '';
   };
 
@@ -250,7 +250,7 @@ rec {
       podmanE2eArchive
     ];
     text = ''
-      build-openshell-conformance-test-archive
+      build-ryno-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
@@ -272,13 +272,13 @@ rec {
         --platform linux/${dockerArch} \
         --file e2e/python/Dockerfile.workload \
         --build-arg "PYTHON_VERSION=$(cat .python-version)" \
-        --tag openshell/e2e-python:dev \
+        --tag ryno/e2e-python:dev \
         e2e/python
 
       mkdir -p artifacts/images
       docker save \
-        --output artifacts/images/openshell-e2e-python-dev.tar \
-        openshell/e2e-python:dev
+        --output artifacts/images/ryno-e2e-python-dev.tar \
+        ryno/e2e-python:dev
     '';
   };
 
@@ -295,51 +295,51 @@ rec {
       cd "$root"
 
       install -D -m 0755 \
-        artifacts/binaries/${gnuToolchain.target}/openshell-gateway \
-        deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-gateway
+        artifacts/binaries/${gnuToolchain.target}/ryno-gateway \
+        deploy/docker/.build/prebuilt-binaries/${dockerArch}/ryno-gateway
 
       install -D -m 0755 \
-        artifacts/binaries/${gnuToolchain.target}/openshell-supervisor \
-        deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-supervisor
+        artifacts/binaries/${gnuToolchain.target}/ryno-supervisor \
+        deploy/docker/.build/prebuilt-binaries/${dockerArch}/ryno-supervisor
 
       install -D -m 0755 \
-        artifacts/binaries/${muslToolchain.target}/openshell-sandbox \
-        deploy/docker/.build/prebuilt-binaries/${dockerArch}/openshell-sandbox
+        artifacts/binaries/${muslToolchain.target}/ryno-sandbox \
+        deploy/docker/.build/prebuilt-binaries/${dockerArch}/ryno-sandbox
 
       docker build \
         --platform linux/${dockerArch} \
         --file deploy/docker/Dockerfile.gateway \
         --target gateway \
-        --tag openshell/gateway:tmachine \
+        --tag ryno/gateway:tmachine \
         .
 
       docker build \
         --platform linux/${dockerArch} \
         --file deploy/docker/Dockerfile.supervisor \
         --target supervisor \
-        --tag openshell/supervisor:tmachine \
+        --tag ryno/supervisor:tmachine \
         .
 
       docker build \
         --platform linux/${dockerArch} \
         --file deploy/docker/Dockerfile.sandbox \
         --target sandbox \
-        --tag openshell/sandbox:tmachine \
+        --tag ryno/sandbox:tmachine \
         .
 
       mkdir -p artifacts/images
 
       docker save \
-        --output artifacts/images/openshell-gateway-tmachine.tar \
-        openshell/gateway:tmachine
+        --output artifacts/images/ryno-gateway-tmachine.tar \
+        ryno/gateway:tmachine
 
       docker save \
-        --output artifacts/images/openshell-supervisor-tmachine.tar \
-        openshell/supervisor:tmachine
+        --output artifacts/images/ryno-supervisor-tmachine.tar \
+        ryno/supervisor:tmachine
 
       docker save \
-        --output artifacts/images/openshell-sandbox-tmachine.tar \
-        openshell/sandbox:tmachine
+        --output artifacts/images/ryno-sandbox-tmachine.tar \
+        ryno/sandbox:tmachine
 
       build-artifacts-test-images
     '';
@@ -356,7 +356,7 @@ rec {
       cd "$root"
 
       mkdir -p artifacts/helm
-      helm package deploy/helm/openshell --destination artifacts/helm
+      helm package deploy/helm/ryno --destination artifacts/helm
     '';
   };
 

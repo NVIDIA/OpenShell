@@ -1,16 +1,16 @@
 # Gateway
 
-Package: `openshell/v1/gateway`
+Package: `ryno/v1/gateway`
 
 The gateway package reads on-disk gateway configurations created by the
-OpenShell Rust CLI and constructs fully wired SDK clients. It eliminates
+Ryno Rust CLI and constructs fully wired SDK clients. It eliminates
 the boilerplate of locating config files, parsing metadata, loading
 tokens, and wiring auth providers.
 
 ## Quick Start
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/gateway"
 
 // Connect to a named gateway
 client, err := gateway.NewClient("prod")
@@ -35,7 +35,7 @@ func NewClient(name string, opts ...ClientOption) (*v1.Client, error)
 ```
 
 Creates a fully configured SDK client for the named gateway. If `name`
-is empty, the active gateway (set via `openshell gateway use`) is used.
+is empty, the active gateway (set via `ryno gateway use`) is used.
 
 The function resolves the gateway directory, parses `metadata.json`,
 loads tokens lazily, maps the auth mode to an SDK auth provider, and
@@ -144,10 +144,10 @@ All errors support `errors.Is` for classification:
 ```go
 client, err := gateway.NewClient("my-gateway")
 if errors.Is(err, gateway.ErrGatewayNotFound) {
-    fmt.Println("Gateway not configured. Run: openshell gateway add my-gateway")
+    fmt.Println("Gateway not configured. Run: ryno gateway add my-gateway")
 }
 if errors.Is(err, gateway.ErrTokenLoad) {
-    fmt.Println("Token expired or missing. Run: openshell gateway login my-gateway")
+    fmt.Println("Token expired or missing. Run: ryno gateway login my-gateway")
 }
 ```
 
@@ -165,7 +165,7 @@ if errors.Is(err, gateway.ErrTokenLoad) {
 The package reads gateway metadata from these locations:
 
 ```
-$XDG_CONFIG_HOME/openshell/          (user, default: ~/.config/openshell/)
+$XDG_CONFIG_HOME/ryno/          (user, default: ~/.config/ryno/)
 ├── active_gateway                   # Plain text: active gateway name
 └── gateways/
     └── <name>/
@@ -174,7 +174,7 @@ $XDG_CONFIG_HOME/openshell/          (user, default: ~/.config/openshell/)
         ├── cf_token                 # Legacy edge token (fallback)
         └── oidc_token.json          # OIDC token bundle
 
-/etc/openshell/gateways/             (system, fallback)
+/etc/ryno/gateways/             (system, fallback)
 ```
 
 User gateways take precedence over system gateways with the same name.

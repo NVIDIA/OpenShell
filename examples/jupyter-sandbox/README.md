@@ -1,10 +1,10 @@
 # Jupyter Sandbox
 
-Run a published Jupyter image in OpenShell, expose its server locally, and
+Run a published Jupyter image in Ryno, expose its server locally, and
 execute a local notebook on the sandboxed kernel.
 
-Run these commands from `examples/jupyter-sandbox`. You need a local OpenShell
-gateway, the `openshell` CLI, Cargo, and OpenSSL on the host.
+Run these commands from `examples/jupyter-sandbox`. You need a local Ryno
+gateway, the `ryno` CLI, Cargo, and OpenSSL on the host.
 
 ## 1. Install the notebook CLI
 
@@ -14,7 +14,7 @@ Install the [Jupyter community notebook CLI](https://github.com/jupyter-ai-contr
 cargo install nb-cli --version 0.0.10 --locked
 ```
 
-OpenShell pulls the published `quay.io/jupyter/base-notebook:2026-09-29` image
+Ryno pulls the published `quay.io/jupyter/base-notebook:2026-09-29` image
 when it creates the sandbox. The image includes Jupyter Server and a Python
 kernel, so no container build is needed.
 
@@ -22,7 +22,7 @@ kernel, so no container build is needed.
 
 ```shell
 JUPYTER_TOKEN="$(openssl rand -hex 32)"
-openshell sandbox create \
+ryno sandbox create \
   --name jupyter-demo \
   --from quay.io/jupyter/base-notebook:2026-09-29 \
   --policy policy.yaml \
@@ -49,7 +49,7 @@ Use the service URL printed in step 2 as the `--gateway` value:
 
 ```shell
 nb execute demo.ipynb \
-  --gateway 'http://default--jupyter-demo.openshell.localhost:<gateway-port>/' \
+  --gateway 'http://default--jupyter-demo.ryno.localhost:<gateway-port>/' \
   --gateway-token "$JUPYTER_TOKEN"
 ```
 
@@ -60,5 +60,5 @@ URL as a flag and authenticates its REST and WebSocket connections.
 When finished, delete the sandbox and its service:
 
 ```shell
-openshell sandbox delete jupyter-demo
+ryno sandbox delete jupyter-demo
 ```

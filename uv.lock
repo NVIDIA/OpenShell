@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11"
 
 [[package]]
@@ -315,54 +315,6 @@ wheels = [
 ]
 
 [[package]]
-name = "openshell"
-source = { editable = "." }
-dependencies = [
-    { name = "cloudpickle" },
-    { name = "googleapis-common-protos" },
-    { name = "grpcio" },
-    { name = "httpx" },
-    { name = "protobuf" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "grpcio-tools" },
-    { name = "pyelftools" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-xdist" },
-    { name = "pyyaml" },
-    { name = "ruff" },
-    { name = "ty" },
-    { name = "types-pyyaml" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cloudpickle", specifier = ">=3.0" },
-    { name = "googleapis-common-protos", specifier = ">=1.63" },
-    { name = "grpcio", specifier = ">=1.60" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "protobuf", specifier = ">=4.25" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "grpcio-tools", specifier = ">=1.60" },
-    { name = "pyelftools", specifier = ">=0.30" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "pytest-cov", specifier = ">=4.0" },
-    { name = "pytest-xdist", specifier = ">=3.0" },
-    { name = "pyyaml", specifier = "==6.0.2" },
-    { name = "ruff", specifier = ">=0.4" },
-    { name = "ty", specifier = ">=0.0.1a6" },
-    { name = "types-pyyaml", specifier = ">=6.0.12.20260518" },
-]
-
-[[package]]
 name = "packaging"
 version = "26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -528,6 +480,54 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2c/aa/9f89c719c467dfaf8ad799b9bae0df494513fb21d31a6059cb5870e57e74/ruff-0.14.14-py3-none-win32.whl", hash = "sha256:b530c191970b143375b6a68e6f743800b2b786bbcf03a7965b06c4bf04568167", size = 10502442, upload-time = "2026-01-22T22:30:38.93Z" },
     { url = "https://files.pythonhosted.org/packages/87/44/90fa543014c45560cae1fffc63ea059fb3575ee6e1cb654562197e5d16fb/ruff-0.14.14-py3-none-win_amd64.whl", hash = "sha256:3dde1435e6b6fe5b66506c1dff67a421d0b7f6488d466f651c07f4cab3bf20fd", size = 11630486, upload-time = "2026-01-22T22:30:10.852Z" },
     { url = "https://files.pythonhosted.org/packages/9e/6a/40fee331a52339926a92e17ae748827270b288a35ef4a15c9c8f2ec54715/ruff-0.14.14-py3-none-win_arm64.whl", hash = "sha256:56e6981a98b13a32236a72a8da421d7839221fa308b223b9283312312e5ac76c", size = 10920448, upload-time = "2026-01-22T22:30:15.417Z" },
+]
+
+[[package]]
+name = "ryno"
+source = { editable = "." }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "grpcio-tools" },
+    { name = "pyelftools" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-xdist" },
+    { name = "pyyaml" },
+    { name = "ruff" },
+    { name = "ty" },
+    { name = "types-pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cloudpickle", specifier = ">=3.0" },
+    { name = "googleapis-common-protos", specifier = ">=1.63" },
+    { name = "grpcio", specifier = ">=1.60" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "protobuf", specifier = ">=4.25" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "grpcio-tools", specifier = ">=1.60" },
+    { name = "pyelftools", specifier = ">=0.30" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "pytest-cov", specifier = ">=4.0" },
+    { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "pyyaml", specifier = "==6.0.2" },
+    { name = "ruff", specifier = ">=0.4" },
+    { name = "ty", specifier = ">=0.0.1a6" },
+    { name = "types-pyyaml", specifier = ">=6.0.12.20260518" },
 ]
 
 [[package]]

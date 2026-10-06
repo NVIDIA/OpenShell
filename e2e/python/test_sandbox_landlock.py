@@ -15,19 +15,19 @@ These tests require a Linux host with Landlock support (kernel 5.13+).
 GitHub Actions Linux runners satisfy this requirement. Docker Desktop
 linuxkit kernels also support Landlock (ABI v5+).
 
-Related: https://github.com/NVIDIA/OpenShell/issues/803
+Related: https://github.com/NVIDIA/Ryno/issues/803
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from ryno._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox
+    from ryno import Sandbox
 
 
 # =============================================================================

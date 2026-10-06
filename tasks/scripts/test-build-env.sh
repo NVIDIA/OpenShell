@@ -83,7 +83,7 @@ pass "raises low soft limit on macOS with cargo-zigbuild"
 # the host default).
 (
   before="$(ulimit -n)"
-  OPENSHELL_BUILD_NOFILE_LIMIT=1 ensure_build_nofile_limit >/dev/null
+  RYNO_BUILD_NOFILE_LIMIT=1 ensure_build_nofile_limit >/dev/null
   after="$(ulimit -n)"
   [ "${before}" = "${after}" ] || fail "limit changed when already above desired (${before} -> ${after})"
 )

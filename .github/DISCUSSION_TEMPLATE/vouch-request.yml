@@ -6,7 +6,7 @@ body:
       value: |
         ## Vouch Request
 
-        OpenShell uses a vouch system for first-time contributors. Fill out this
+        Ryno uses a vouch system for first-time contributors. Fill out this
         form to request approval. A maintainer will review and comment `/vouch`
         if approved. Approved requests are closed automatically.
 
@@ -41,5 +41,5 @@ body:
       options:
         - label: I wrote this request myself (not AI-generated)
           required: true
-        - label: I have read [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md)
+        - label: I have read [CONTRIBUTING.md](https://github.com/NVIDIA/Ryno/blob/main/CONTRIBUTING.md)
           required: true

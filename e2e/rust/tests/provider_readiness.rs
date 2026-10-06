@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{ContainerEngine, e2e_network_name};
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::{ContainerEngine, e2e_network_name};
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -105,7 +105,7 @@ import json, os, pathlib, re, ssl, sys, time, urllib.error, urllib.request
 config = json.loads(sys.argv[1])
 key = 'PROVIDER_READINESS_E2E_TOKEN'
 token = os.environ.get(key, '')
-if not re.fullmatch(r'openshell:resolve:env:v[1-9][0-9]*_' + key, token):
+if not re.fullmatch(r'ryno:resolve:env:v[1-9][0-9]*_' + key, token):
     print('client did not receive a revision-scoped reference', flush=True)
     sys.exit(64)
 client = sys.argv[2]
@@ -175,7 +175,7 @@ impl FixtureImage {
         Ok(Self {
             engine: ContainerEngine::from_env()?,
             tag: format!(
-                "localhost/openshell-e2e-readiness-{}-{:016x}:latest",
+                "localhost/ryno-e2e-readiness-{}-{:016x}:latest",
                 std::process::id(),
                 rand::random::<u64>(),
             ),
@@ -223,15 +223,15 @@ struct GatewayTrustConfig {
 
 impl GatewayTrustConfig {
     fn load() -> Result<Self, String> {
-        if std::env::var_os("OPENSHELL_GATEWAY_ENDPOINT").is_some()
-            || std::env::var_os("OPENSHELL_E2E_GATEWAY_BIN").is_none()
-            || std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker")
-            || std::env::var("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER")
+        if std::env::var_os("RYNO_GATEWAY_ENDPOINT").is_some()
+            || std::env::var_os("RYNO_E2E_GATEWAY_BIN").is_none()
+            || std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("docker")
+            || std::env::var("RYNO_E2E_EXTERNAL_COMPUTE_DRIVER")
                 .is_ok_and(|value| value != "0")
         {
             return Err("provider readiness fixture requires a wrapper-owned gateway with the bundled Docker driver".to_string());
         }
-        let args_file = std::env::var_os("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
+        let args_file = std::env::var_os("RYNO_E2E_GATEWAY_ARGS_FILE")
             .ok_or("managed gateway argument metadata is missing")?;
         let raw =
             std::fs::read(args_file).map_err(|_| "could not read managed gateway arguments")?;
@@ -309,7 +309,7 @@ fn docker_supervisor_image(config: &str) -> Result<(std::ops::Range<usize>, Stri
     for line in config.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_docker = trimmed == "[openshell.drivers.docker]";
+            in_docker = trimmed == "[ryno.drivers.docker]";
         } else if in_docker && let Some((key, value)) = trimmed.split_once('=') {
             if key.trim() == "socket_path" {
                 return Err(
@@ -465,7 +465,7 @@ impl Backend {
             engine: ContainerEngine::from_env()?,
             name,
             network: e2e_network_name().ok_or("fixture requires the managed Docker network")?,
-            namespace: std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
+            namespace: std::env::var("RYNO_E2E_SANDBOX_NAMESPACE")
                 .map_err(|_| "fixture requires the managed Docker namespace")?,
             child: None,
             input: None,
@@ -483,7 +483,7 @@ impl Backend {
         // relabeling. Both fixture backends mount this ephemeral directory, so
         // use the shared `z` label rather than the single-container `Z` label.
         let mount = format!("{tls_directory}:/fixture-tls:ro,z");
-        let namespace_label = format!("openshell.ai/sandbox-namespace={}", self.namespace);
+        let namespace_label = format!("ryno.ai/sandbox-namespace={}", self.namespace);
         let mut command = Command::from(self.engine.command());
         command
             .args([
@@ -496,11 +496,11 @@ impl Backend {
                 "--network",
                 &self.network,
                 "--label",
-                "openshell.ai/managed-by=openshell",
+                "ryno.ai/managed-by=ryno",
                 "--label",
                 &namespace_label,
                 "--label",
-                "openshell.ai/isolation-role=fixture",
+                "ryno.ai/isolation-role=fixture",
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges:true",
@@ -762,7 +762,7 @@ async fn checked_command_with_timeout(
 }
 
 async fn cli(label: &str, args: &[&str], credential: Option<&str>) -> Result<String, String> {
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     command.args(args);
     if let Some(credential) = credential {
         command.env(TOKEN_ENV, credential);
@@ -771,7 +771,7 @@ async fn cli(label: &str, args: &[&str], credential: Option<&str>) -> Result<Str
 }
 
 fn sandbox_command(sandbox: &SandboxGuard, argv: &[&str]) -> Command {
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     command
         .args(["sandbox", "exec", "--name", &sandbox.name, "--no-tty", "--"])
         .args(argv);
@@ -859,15 +859,15 @@ async fn base_binaries(base: &str) -> Result<Value, String> {
         std::process::id(),
         rand::random::<u64>()
     );
-    let namespace = std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
+    let namespace = std::env::var("RYNO_E2E_SANDBOX_NAMESPACE")
         .map_err(|_| "binary probe requires the managed Docker namespace")?;
-    let namespace_label = format!("openshell.ai/sandbox-namespace={namespace}");
+    let namespace_label = format!("ryno.ai/sandbox-namespace={namespace}");
     let mut command = Command::from(engine.command());
     command.args([
         "run", "--rm", "--name", &name, "--network", "none",
-        "--label", "openshell.ai/managed-by=openshell",
+        "--label", "ryno.ai/managed-by=ryno",
         "--label", &namespace_label,
-        "--label", "openshell.ai/isolation-role=fixture",
+        "--label", "ryno.ai/isolation-role=fixture",
         "--entrypoint", "/usr/bin/python3", base,
         "-c", "import json,os,shutil,sys; print(json.dumps({'python':os.path.realpath(sys.executable),'curl':shutil.which('curl')}))",
     ]);
@@ -980,7 +980,7 @@ fn readiness_output(output: &str, keys: &[String; 2]) -> Result<Value, String> {
     // Never echo a malformed response: both a key leak and a leaked issued
     // reference must fail with the same fixed diagnostic.
     if keys.iter().any(|key| output.contains(key))
-        || output.contains("openshell:resolve:")
+        || output.contains("ryno:resolve:")
         || output.contains("Bearer ")
     {
         return Err("provider readiness output contained credential material".to_string());
@@ -1097,7 +1097,7 @@ impl MutationReceipt {
         expected_state: &str,
         keys: &[String; 2],
     ) -> Result<Value, String> {
-        let mut command = openshell_cmd();
+        let mut command = ryno_cmd();
         command.args([
             "sandbox",
             "provider",
@@ -1177,7 +1177,7 @@ async fn future_environment(
 ) -> Result<(), String> {
     // A new exec consumes the process supervisor's current launch snapshot.
     // Only booleans leave the process, never the reference or its length.
-    let script = "import json,os,re; key='PROVIDER_READINESS_E2E_TOKEN'; value=os.environ.get(key,''); print(json.dumps({'present':key in os.environ,'reference':bool(re.fullmatch(r'openshell:resolve:env:v[1-9][0-9]*_'+key,value))}))";
+    let script = "import json,os,re; key='PROVIDER_READINESS_E2E_TOKEN'; value=os.environ.get(key,''); print(json.dumps({'present':key in os.environ,'reference':bool(re.fullmatch(r'ryno:resolve:env:v[1-9][0-9]*_'+key,value))}))";
     let output = checked_command(
         &mut sandbox_command(sandbox, &[python, "-c", script]),
         "probe future process provider environment",

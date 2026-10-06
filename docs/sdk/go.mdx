@@ -3,21 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Go SDK"
 sidebar-title: "Go"
-description: "Install the OpenShell Go SDK, connect to a gateway, and manage a sandbox."
-keywords: "OpenShell, SDK, Go, Golang, gRPC, Sandbox"
+description: "Install the Ryno Go SDK, connect to a gateway, and manage a sandbox."
+keywords: "Ryno, SDK, Go, Golang, gRPC, Sandbox"
 position: 1
 ---
 
-Use the Go SDK to manage OpenShell resources from Go applications, operators,
+Use the Go SDK to manage Ryno resources from Go applications, operators,
 and controllers. Its typed subclients follow familiar Kubernetes client
-patterns. Use the SDK and gateway from the same OpenShell release when possible.
+patterns. Use the SDK and gateway from the same Ryno release when possible.
 
 ## Install the SDK
 
 The SDK requires Go 1.25.13 or later. Add it to your Go module:
 
 ```shell
-go get github.com/NVIDIA/OpenShell/sdk/go@latest
+go get github.com/NVIDIA/Ryno/sdk/go@latest
 ```
 
 ## Connect to a Gateway
@@ -34,7 +34,7 @@ import (
     "log"
     "time"
 
-    v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+    v1 "github.com/NVIDIA/Ryno/sdk/go/ryno/v1"
 )
 
 func main() {
@@ -63,14 +63,14 @@ For an authenticated TLS gateway, provide the bearer token and TLS settings:
 ```go
 client, err := v1.NewClient(v1.Config{
     Address: "gateway.example.com:443",
-    Auth:    v1.StaticToken(os.Getenv("OPENSHELL_TOKEN")),
+    Auth:    v1.StaticToken(os.Getenv("RYNO_TOKEN")),
     TLS:     &v1.TLSConfig{CAFile: "/path/to/ca.crt"},
 })
 ```
 
 Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
 `oidc.NewClientCredentialsAuth` from
-`github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc`.
+`github.com/NVIDIA/Ryno/sdk/go/ryno/v1/oidc`.
 
 ## Create and Use a Sandbox
 
@@ -103,7 +103,7 @@ result, err := client.Exec().Run(
     ctx,
     "default",
     sandbox.Name,
-    []string{"python", "-c", "print('hello from OpenShell')"},
+    []string{"python", "-c", "print('hello from Ryno')"},
 )
 if err != nil {
     log.Fatal(err)
@@ -123,4 +123,4 @@ return lazy pagers so callers choose when to fetch the next page.
 
 - Review [Gateway Authentication](/how-it-works/gateways/authentication) before connecting a service to a production gateway.
 - Review [API Errors](/sdk/api-errors) for the gateway error model.
-- Browse the [Go package reference](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1) for all exported types and methods.
+- Browse the [Go package reference](https://pkg.go.dev/github.com/NVIDIA/Ryno/sdk/go/ryno/v1) for all exported types and methods.

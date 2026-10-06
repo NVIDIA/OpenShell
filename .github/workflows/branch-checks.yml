@@ -64,7 +64,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -89,7 +89,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -232,9 +232,9 @@ jobs:
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
         env:
-          OPENSHELL_TELEMETRY_ENABLED: "false"
+          RYNO_TELEMETRY_ENABLED: "false"
         run: |
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --locked --profile ci --workspace --features ryno-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
   rust-build-modes:
@@ -269,31 +269,31 @@ jobs:
       - name: Verify build modes
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo build --locked -p openshell-gateway --bin openshell-gateway
-          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
-          cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
-          cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
-          cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
+          cargo build --locked -p ryno-gateway --bin ryno-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/ryno-gateway
+          cargo build --locked -p ryno-gateway --bin ryno-gateway --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/ryno-gateway
+          cargo build --locked -p ryno-supervisor --bin ryno-supervisor --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/ryno-supervisor
+          cargo check --locked -p ryno-supervisor --all-targets --no-default-features --features system-ca-roots
 
       - name: Verify system CA roots dependency boundary
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo tree --locked -p openshell-supervisor --prefix none --no-default-features --features system-ca-roots > /tmp/openshell-supervisor-dependencies.txt
-          if grep -Eq '^(webpki-roots|webpki-root-certs) v' /tmp/openshell-supervisor-dependencies.txt; then
+          cargo tree --locked -p ryno-supervisor --prefix none --no-default-features --features system-ca-roots > /tmp/ryno-supervisor-dependencies.txt
+          if grep -Eq '^(webpki-roots|webpki-root-certs) v' /tmp/ryno-supervisor-dependencies.txt; then
             echo "ERROR: bundled Mozilla roots found in system CA roots build" >&2
-            cat /tmp/openshell-supervisor-dependencies.txt >&2
+            cat /tmp/ryno-supervisor-dependencies.txt >&2
             exit 1
           fi
 
       - name: Verify standalone prover dependency boundary
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
-          if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
-            echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
-            cat /tmp/openshell-prover-dependencies.txt >&2
+          cargo tree --locked -p ryno-prover-cli --edges normal --prefix none > /tmp/ryno-prover-dependencies.txt
+          if grep -Eq '^(ryno-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/ryno-prover-dependencies.txt; then
+            echo "ERROR: standalone prover includes an Ryno control-plane dependency" >&2
+            cat /tmp/ryno-prover-dependencies.txt >&2
             exit 1
           fi
 
@@ -344,10 +344,10 @@ jobs:
       - name: Verify core gateway compute-driver feature sets
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-podman
 
   rust-gateway-extended-features:
     name: Rust gateway extended features
@@ -371,9 +371,9 @@ jobs:
       - name: Verify extended gateway compute-driver feature sets
         shell: nix develop -c bash -euo pipefail {0}
         run: |
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
-          cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo nextest run --locked --profile ci -p ryno-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
   python:
     name: Python (${{ matrix.runner }})
@@ -386,7 +386,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -422,7 +422,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -442,7 +442,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -462,7 +462,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -480,7 +480,7 @@ jobs:
       # version, which validates the prerelease dist-tag branch too.
       - name: Verify publishable artifact (dry-run)
         env:
-          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+          RYNO_NPM_PUBLISH_ARGS: --dry-run
         run: |
-          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
+          RYNO_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
             mise run sdk:ts:publish

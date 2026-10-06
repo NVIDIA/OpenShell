@@ -6,9 +6,9 @@
 use std::io::Write;
 use std::process::Stdio;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::is_e2e_driver;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::is_e2e_driver;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -21,13 +21,13 @@ const BINDING_PROFILE_A_ID: &str = "e2e-static-endpoint-binding-a";
 const BINDING_PROFILE_B_ID: &str = "e2e-static-endpoint-binding-b";
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("failed to spawn openshell {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("failed to spawn ryno {}: {e}", args.join(" ")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -35,7 +35,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
 
     if !output.status.success() {
         return Err(format!(
-            "openshell {} failed (exit {:?}):\n{combined}",
+            "ryno {} failed (exit {:?}):\n{combined}",
             args.join(" "),
             output.status.code()
         ));
@@ -206,7 +206,7 @@ network_policies:
   binding_test:
     name: binding_test
     endpoints:
-      - host: host.openshell.internal
+      - host: host.ryno.internal
         port: {port}
         path: /**
         protocol: rest
@@ -236,7 +236,7 @@ impl Drop for HostServer {
 }
 
 async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("provider")
         .arg("delete")
         .arg(name)
@@ -246,7 +246,7 @@ async fn delete_provider(name: &str) {
 }
 
 async fn delete_provider_profile(id: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("profile")
         .arg("delete")
         .arg(id)
@@ -287,7 +287,7 @@ network_policies:
   host_echo:
     name: host_echo
     endpoints:
-      - host: host.openshell.internal
+      - host: host.ryno.internal
         port: {port}
         allowed_ips:
           - "10.0.0.0/8"
@@ -306,7 +306,7 @@ network_policies:
 }
 
 #[tokio::test]
-async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
+async fn sandbox_reaches_host_ryno_internal_via_host_gateway_alias() {
     let server = HostServer::start(r#"{"message":"hello-from-host"}"#)
         .await
         .expect("start host echo server");
@@ -318,7 +318,7 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         .to_string();
 
     let command = format!(
-        r#"exec 3<>/dev/tcp/host.openshell.internal/{0}; printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{0}\r\nConnection: close\r\n\r\n' >&3; while IFS= read -r line <&3 || [[ -n $line ]]; do printf '%s\n' "$line"; done"#,
+        r#"exec 3<>/dev/tcp/host.ryno.internal/{0}; printf 'GET / HTTP/1.1\r\nHost: host.ryno.internal:{0}\r\nConnection: close\r\n\r\n' >&3; while IFS= read -r line <&3 || [[ -n $line ]]; do printf '%s\n' "$line"; done"#,
         server.port
     );
     let guard = SandboxGuard::create(&[
@@ -330,7 +330,7 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         &command,
     ])
     .await
-    .expect("sandbox create with host.openshell.internal echo request");
+    .expect("sandbox create with host.ryno.internal echo request");
 
     assert!(
         guard
@@ -367,8 +367,8 @@ async fn sandbox_receives_eof_after_closing_http_response() {
         let policy = write_policy(server.port).unwrap();
         let command = format!(
             r#"set -eu
-exec 3<>/dev/tcp/host.openshell.internal/{port}
-printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\n\r\n' >&3
+exec 3<>/dev/tcp/host.ryno.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.ryno.internal:{port}\r\n\r\n' >&3
 while true; do
   line=
   if IFS= read -r -t 5 line <&3; then
@@ -422,7 +422,7 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         BINDING_PROFILE_A_ID,
         "E2E static endpoint binding A",
         "BOUND_TOKEN_A",
-        "host.openshell.internal",
+        "host.ryno.internal",
         server.port,
     )
     .expect("write provider A binding profile");
@@ -495,9 +495,9 @@ http_request() {{
   while IFS= read -r line <&3 || [[ -n "$line" ]]; do HTTP_BODY+="$line"; done
   exec 3>&- 3<&-
 }}
-http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
+http_request host.ryno.internal /allowed/check; allowed="$HTTP_BODY"
 http_request host.docker.internal /allowed/check || true; host_denied="$HTTP_STATUS"
-http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
+http_request host.ryno.internal /other/check; path_denied="$HTTP_STATUS"
 printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
 "#,
         port = server.port,
@@ -519,7 +519,7 @@ printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$
     .expect("run endpoint-binding requests");
 
     let logs = wait_for_sandbox_logs(&guard.name, |logs| {
-        logs.contains("openshell.provider_credential.endpoint_mismatch")
+        logs.contains("ryno.provider_credential.endpoint_mismatch")
             && logs.contains("credential_endpoint_mismatch")
     })
     .await
@@ -548,7 +548,7 @@ printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$
     );
 
     assert!(
-        logs.contains("openshell.provider_credential.endpoint_mismatch")
+        logs.contains("ryno.provider_credential.endpoint_mismatch")
             && logs.contains("credential_endpoint_mismatch"),
         "OCSF logs should explain the endpoint-binding denial without secret material:\n{logs}"
     );

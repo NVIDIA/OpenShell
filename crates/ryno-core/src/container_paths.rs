@@ -1,0 +1,159 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Canonical paths reserved for `Ryno` control state inside sandboxes.
+//!
+//! Keep fixed in-container and VM guest paths here so the code that creates or
+//! consumes control state cannot drift from the mount-collision validator.
+
+use std::path::{Path, PathBuf};
+
+pub const OPT_ROOT: &str = "/opt/ryno";
+pub const ETC_ROOT: &str = "/etc/ryno";
+pub const TLS_ROOT: &str = "/etc/ryno-tls";
+pub const RUN_ROOT: &str = "/run/ryno";
+pub const SIDECAR_RUN_ROOT: &str = "/run/ryno-sidecar";
+pub const NETNS_MOUNT_ROOT: &str = "/run/netns";
+pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
+
+/// Standard Linux container namespaces that an image-selected workspace must
+/// not contain or enter.
+///
+/// These roots cover the default filesystems and devices defined by the OCI
+/// Runtime Specification: procfs, sysfs, cgroups, device nodes, devpts, shared
+/// memory, and POSIX message queues.
+/// <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#default-filesystems>
+pub const OCI_RUNTIME_MOUNT_ROOTS: &[&str] = &["/proc", "/sys", "/dev"];
+
+/// High-level namespaces mounted or created by `Ryno` inside sandboxes.
+///
+/// This is intentionally not a general Linux system-path denylist. Kernel and
+/// image-provided paths have separate trust models; see NVIDIA/Ryno#2578.
+pub const CONTROL_ROOTS: &[&str] = &[
+    OPT_ROOT,
+    ETC_ROOT,
+    TLS_ROOT,
+    RUN_ROOT,
+    SIDECAR_RUN_ROOT,
+    NETNS_MOUNT_ROOT,
+    // The supervisor currently uses the conventional iproute2 spelling.
+    NETNS_IPROUTE2_ROOT,
+];
+
+pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/ryno/bin";
+pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/ryno/bin/ryno-sandbox";
+pub const TLS_CLIENT_DIR: &str = "/etc/ryno/tls/client";
+pub const TLS_CA_MOUNT_PATH: &str = "/etc/ryno/tls/client/ca.crt";
+pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/ryno/auth/sandbox.jwt";
+pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/ryno/auth/upstream-proxy";
+pub const CONTAINER_POLICY_PATH: &str = "/etc/ryno/policy.yaml";
+pub const POLICY_ADVISOR_SKILL_PATH: &str = "/etc/ryno/skills/policy_advisor.md";
+
+pub const SSH_SOCKET_PATH: &str = "/run/ryno/ssh.sock";
+pub const SIDECAR_CONTROL_SOCKET: &str = "/run/ryno-sidecar/control.sock";
+pub const SIDECAR_TLS_DIR: &str = "/etc/ryno-tls/proxy";
+pub const SIDECAR_CLIENT_TLS_DIR: &str = "/etc/ryno-tls/proxy/client";
+pub const CLIENT_TLS_DIR: &str = "/etc/ryno-tls/client";
+pub const SUPERVISOR_CA_CERT_PATH: &str = "/etc/ryno-tls/ryno-ca.pem";
+pub const SUPERVISOR_CA_BUNDLE_PATH: &str = "/etc/ryno-tls/ca-bundle.pem";
+
+pub const VM_GUEST_TLS_CA_PATH: &str = "/opt/ryno/tls/ca.crt";
+pub const VM_GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/ryno/auth/sandbox.jwt";
+pub const VM_GUEST_INIT_DROPIN_DIR: &str = "/opt/ryno/init.d";
+pub const VM_GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/ryno/init.d.manifest";
+
+/// Guest path for the corporate upstream-proxy credential in VM sandboxes.
+///
+/// The VM driver stages the `user:pass` credential here (mode `0600`,
+/// root-only) inside the per-sandbox overlay upperdir, and passes only this
+/// path on the supervisor's argv. A microVM has no bind mounts or container
+/// secrets, so this is the same delivery the per-sandbox JWT already uses.
+pub const VM_GUEST_UPSTREAM_PROXY_AUTH_PATH: &str = "/opt/ryno/auth/upstream-proxy";
+
+/// Guest path for the corporate proxy CA bundle staged by the VM driver.
+///
+/// The bundle is operator-owned but not secret. The driver validates it and
+/// writes it into each sandbox overlay with mode `0644`, then passes only this
+/// guest path to the supervisor.
+pub const VM_GUEST_PROXY_CA_PATH: &str = "/opt/ryno/tls/proxy-ca.pem";
+
+/// Guest path for the driver-authored supervisor argument list in VM sandboxes.
+///
+/// Podman and Kubernetes build the supervisor's command line directly; the VM
+/// guest init script execs a fixed argv, so driver-owned arguments travel
+/// through this file instead. The driver writes it into the overlay upperdir
+/// on every launch — empty when it has no arguments to pass — so a sandbox
+/// image can neither forge entries nor shadow the driver's copy, and the
+/// guest appends exactly what it finds there and nothing else.
+pub const VM_GUEST_SUPERVISOR_ARGS_PATH: &str = "/opt/ryno/supervisor-args";
+pub const VM_UMOCI_PATH: &str = "/opt/ryno/bin/umoci";
+pub const VM_SANDBOX_OWNER_NORMALIZED_MARKER: &str = "/opt/ryno/.sandbox-owner-normalized";
+
+/// Return the conventional iproute2 path for a named network namespace.
+pub fn netns_path(name: &str) -> PathBuf {
+    Path::new(NETNS_IPROUTE2_ROOT).join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_fixed_control_path_is_below_a_reserved_root() {
+        let paths = [
+            SUPERVISOR_CONTAINER_DIR,
+            SUPERVISOR_CONTAINER_BINARY,
+            TLS_CLIENT_DIR,
+            TLS_CA_MOUNT_PATH,
+            SANDBOX_TOKEN_MOUNT_PATH,
+            UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+            CONTAINER_POLICY_PATH,
+            POLICY_ADVISOR_SKILL_PATH,
+            SSH_SOCKET_PATH,
+            SIDECAR_CONTROL_SOCKET,
+            SIDECAR_TLS_DIR,
+            SIDECAR_CLIENT_TLS_DIR,
+            CLIENT_TLS_DIR,
+            SUPERVISOR_CA_CERT_PATH,
+            SUPERVISOR_CA_BUNDLE_PATH,
+            VM_GUEST_TLS_CA_PATH,
+            VM_GUEST_SANDBOX_TOKEN_PATH,
+            VM_GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            VM_GUEST_PROXY_CA_PATH,
+            VM_GUEST_INIT_DROPIN_DIR,
+            VM_GUEST_INIT_DROPIN_MANIFEST,
+            VM_GUEST_SUPERVISOR_ARGS_PATH,
+            VM_UMOCI_PATH,
+            VM_SANDBOX_OWNER_NORMALIZED_MARKER,
+        ];
+
+        for path in paths {
+            assert!(
+                CONTROL_ROOTS
+                    .iter()
+                    .any(|root| Path::new(path).starts_with(root)),
+                "fixed control path {path} is outside the reserved roots"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_roots_cover_standard_oci_mount_destinations() {
+        for path in [
+            "/proc",
+            "/dev",
+            "/dev/pts",
+            "/dev/shm",
+            "/dev/mqueue",
+            "/sys",
+            "/sys/fs/cgroup",
+        ] {
+            assert!(
+                OCI_RUNTIME_MOUNT_ROOTS
+                    .iter()
+                    .any(|root| Path::new(path).starts_with(root)),
+                "OCI runtime mount {path} is outside the reserved roots"
+            );
+        }
+    }
+}

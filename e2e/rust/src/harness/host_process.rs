@@ -40,7 +40,7 @@ impl HostPythonFixture {
     /// within 60 seconds.
     pub async fn start(script: &str, port: u16) -> Result<Self, String> {
         let log_path = std::env::temp_dir().join(format!(
-            "openshell-e2e-fixture-{}-{port}.log",
+            "ryno-e2e-fixture-{}-{port}.log",
             std::process::id()
         ));
         let log = std::fs::File::create(&log_path)

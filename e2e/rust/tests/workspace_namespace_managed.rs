@@ -6,7 +6,7 @@
 //! E2E tests for managed workspace mode.
 //!
 //! The gateway is deployed with `workspace_mode = "managed"`, which
-//! auto-creates a K8s namespace per workspace (`openshell-{gateway_id}-{ws}`)
+//! auto-creates a K8s namespace per workspace (`ryno-{gateway_id}-{ws}`)
 //! and deletes it when the last sandbox is removed.
 //!
 //! Namespace cleanup after sandbox deletion is best-effort and depends on
@@ -17,14 +17,14 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::{ryno_bin, ryno_cmd};
+use ryno_e2e::harness::output::strip_ansi;
 
 const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
 
 fn kube_context() -> String {
-    std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        .expect("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE must be set")
+    std::env::var("RYNO_E2E_KUBE_CONTEXT_ACTIVE")
+        .expect("RYNO_E2E_KUBE_CONTEXT_ACTIVE must be set")
 }
 
 async fn kubectl(args: &[&str]) -> (bool, String) {
@@ -48,13 +48,13 @@ async fn kubectl(args: &[&str]) -> (bool, String) {
 }
 
 fn managed_namespace(workspace: &str) -> String {
-    format!("openshell-openshell-{workspace}")
+    format!("ryno-ryno-{workspace}")
 }
 
 async fn run_cli(args: &[&str]) -> (bool, String) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = cmd.output().await.expect("failed to spawn openshell");
+    let output = cmd.output().await.expect("failed to spawn ryno");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -95,7 +95,7 @@ struct ManagedCleanup {
 
 impl Drop for ManagedCleanup {
     fn drop(&mut self) {
-        let bin = openshell_bin();
+        let bin = ryno_bin();
         for sb in &self.sandboxes {
             let _ = std::process::Command::new(&bin)
                 .args(["sandbox", "delete", sb, "--workspace", &self.workspace])
@@ -108,7 +108,7 @@ impl Drop for ManagedCleanup {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE").unwrap_or_default();
+        let context = std::env::var("RYNO_E2E_KUBE_CONTEXT_ACTIVE").unwrap_or_default();
         if !context.is_empty() {
             let ns = managed_namespace(&self.workspace);
             let _ = std::process::Command::new("kubectl")
@@ -168,17 +168,17 @@ async fn managed_creates_namespace_with_labels() {
         kubectl(&["get", "namespace", &ns, "-o", "jsonpath={.metadata.labels}"]).await;
     assert!(ok, "failed to read namespace labels: {label_out}");
     assert!(
-        label_out.contains("openshell.ai/managed-by"),
+        label_out.contains("ryno.ai/managed-by"),
         "namespace missing managed-by label: {label_out}"
     );
     assert!(
-        label_out.contains("openshell.ai/gateway-id"),
+        label_out.contains("ryno.ai/gateway-id"),
         "namespace missing gateway-id label: {label_out}"
     );
 
     // Verify the ServiceAccount was created in the managed namespace.
-    let (ok, _) = kubectl(&["get", "serviceaccount", "openshell-sandbox", "-n", &ns]).await;
-    assert!(ok, "ServiceAccount openshell-sandbox should exist in {ns}");
+    let (ok, _) = kubectl(&["get", "serviceaccount", "ryno-sandbox", "-n", &ns]).await;
+    assert!(ok, "ServiceAccount ryno-sandbox should exist in {ns}");
 
     // Each runtime generation gets its own immutable copy of the configured
     // image-pull Secret; the configured name is never created in {ns}.
@@ -188,7 +188,7 @@ async fn managed_creates_namespace_with_labels() {
         "-n",
         &ns,
         "-l",
-        "openshell.ai/component=image-pull",
+        "ryno.ai/component=image-pull",
         "-o",
         "jsonpath={range .items[*]}{.metadata.name} {.type} {.immutable}{\"\\n\"}{end}",
     ])
@@ -209,7 +209,7 @@ async fn managed_creates_namespace_with_labels() {
     let (ok, policy) = kubectl(&[
         "get",
         "networkpolicy",
-        "openshell-sandbox-ssh",
+        "ryno-sandbox-ssh",
         "-n",
         &ns,
         "-o",
@@ -223,13 +223,13 @@ async fn managed_creates_namespace_with_labels() {
     let policy: serde_json::Value =
         serde_json::from_str(&policy).expect("managed SSH NetworkPolicy should be valid JSON");
     assert_eq!(
-        policy["spec"]["podSelector"]["matchLabels"]["openshell.ai/managed-by"],
-        "openshell"
+        policy["spec"]["podSelector"]["matchLabels"]["ryno.ai/managed-by"],
+        "ryno"
     );
     assert_eq!(policy["spec"]["ingress"][0]["ports"][0]["port"], 2222);
     assert_eq!(
         policy["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
-        "openshell"
+        "ryno"
     );
     assert!(
         policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
@@ -243,7 +243,7 @@ async fn managed_creates_namespace_with_labels() {
     assert!(ok, "sandbox CR should exist in namespace {ns}: {out}");
     assert!(out.contains("mgd-sb"), "sandbox CR name mismatch: {out}");
 
-    // Verify the sandbox is resolvable through the OpenShell control plane.
+    // Verify the sandbox is resolvable through the Ryno control plane.
     let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
     assert!(ok, "sandbox list failed: {out}");
     assert!(
@@ -325,7 +325,7 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
         "sb-b CR should still be present: {out}"
     );
 
-    // Verify sb-b is still resolvable through the OpenShell control plane.
+    // Verify sb-b is still resolvable through the Ryno control plane.
     let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
     assert!(ok, "sandbox list failed: {out}");
     assert!(
@@ -408,7 +408,7 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
         "sb-iso-a should NOT be in {ns_b}"
     );
 
-    // Verify workspace isolation through the OpenShell control plane.
+    // Verify workspace isolation through the Ryno control plane.
     let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws_a]).await;
     assert!(ok, "sandbox list ws_a failed: {out}");
     assert!(
@@ -494,9 +494,9 @@ async fn managed_supervisor_reads_client_tls_from_its_bootstrap_secret() {
     let (ok, config_out) = kubectl(&[
         "get",
         "configmap",
-        "openshell-config",
+        "ryno-config",
         "-n",
-        "openshell",
+        "ryno",
         "-o",
         "jsonpath={.data.gateway\\.toml}",
     ])
@@ -534,7 +534,7 @@ async fn managed_supervisor_reads_client_tls_from_its_bootstrap_secret() {
         "sandbox output missing expected string: {out}"
     );
 
-    let (ok, _) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
+    let (ok, _) = kubectl(&["get", "secret", "ryno-client-tls", "-n", &ns]).await;
     assert!(
         !ok,
         "client TLS Secret must not be copied into managed namespace {ns}"
@@ -546,7 +546,7 @@ async fn managed_supervisor_reads_client_tls_from_its_bootstrap_secret() {
         "-n",
         &ns,
         "-l",
-        "openshell.ai/component=supervisor-bootstrap",
+        "ryno.ai/component=supervisor-bootstrap",
         "-o",
         "jsonpath={.items[*].data}",
     ])
@@ -557,7 +557,7 @@ async fn managed_supervisor_reads_client_tls_from_its_bootstrap_secret() {
     );
 }
 
-const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:openshell:openshell";
+const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:ryno:ryno";
 
 async fn gateway_can(verb: &str, resource: &str, namespace: &str) -> bool {
     let (_, out) = kubectl(&[
@@ -596,14 +596,14 @@ async fn managed_gateway_cannot_read_or_modify_workspace_secrets() {
         !gateway_can("list", "secrets", &ns).await,
         "gateway must not list Secrets in workspace namespace {ns}"
     );
-    for copied in ["secrets/openshell-client-tls", "secrets/e2e-regcred"] {
+    for copied in ["secrets/ryno-client-tls", "secrets/e2e-regcred"] {
         assert!(
             !gateway_can("get", copied, &ns).await,
             "gateway must not read {copied} outside its sandbox namespace"
         );
     }
     assert!(
-        gateway_can("get", "secrets", "openshell").await,
+        gateway_can("get", "secrets", "ryno").await,
         "gateway must still reach provider credential Secrets in its configured namespace"
     );
 }
@@ -624,8 +624,8 @@ async fn managed_rejects_namespace_owned_by_different_gateway() {
         "label",
         "namespace",
         &ns,
-        "openshell.ai/managed-by=openshell",
-        "openshell.ai/gateway-id=wrong-gateway",
+        "ryno.ai/managed-by=ryno",
+        "ryno.ai/gateway-id=wrong-gateway",
     ])
     .await;
     assert!(ok, "failed to label namespace: {out}");

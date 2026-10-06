@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Run Your First Agent"
 sidebar-title: "Run Your First Agent"
-description: "Configure a provider, image, and policy to run an AI agent in an OpenShell sandbox."
+description: "Configure a provider, image, and policy to run an AI agent in an Ryno sandbox."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Provider Profiles, Policies, Custom Images"
 position: 4
 ---
 
-OpenShell can run any agent that is available in a sandbox image. Configure the
+Ryno can run any agent that is available in a sandbox image. Configure the
 agent's external services, choose its image and policy, then create the sandbox
 with the agent as its main process.
 
@@ -19,22 +19,22 @@ endpoints, and executable paths an agent may use.
 
 This example runs OpenCode
 against OpenRouter. Review the
-[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml),
+[example profile](https://github.com/NVIDIA/Ryno/blob/main/providers/openrouter.yaml),
 which allows `/usr/local/bin/opencode` to reach `openrouter.ai`, then import
 it and [create a provider](/how-it-works/providers/overview#create-a-provider)
 that stores its credentials.
 
 ```shell
-openshell profile import \
-  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
+ryno profile import \
+  --url https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/openrouter.yaml
 
-openshell provider create \
+ryno provider create \
   --name openrouter \
   --type openrouter \
   --from-existing
 ```
 
-Set `OPENROUTER_API_KEY` before creating the provider. OpenShell stores its
+Set `OPENROUTER_API_KEY` before creating the provider. Ryno stores its
 value in the credential store and sends it only to `openrouter.ai`.
 
 **2. Choose the sandbox image.**
@@ -54,7 +54,7 @@ servers, or other destinations.
 provider, and pass the agent command after `--`:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name my-agent \
   --from ghcr.io/anomalyco/opencode:latest \
   --provider openrouter \
@@ -70,7 +70,7 @@ For more control over what the agent can access, refer to
 
 **4. Grant more access as the agent needs it.**
 
-When the agent reaches a destination that policy does not allow, OpenShell
+When the agent reaches a destination that policy does not allow, Ryno
 denies the request and drafts a rule for it. The
 [policy advisor](/how-it-works/policies/advisor)'s mechanistic mapper groups
 recent denials by host, port, and calling program, then submits a narrow
@@ -80,16 +80,16 @@ proposal to the gateway. The gateway checks each proposal with the
 List pending proposals from the host:
 
 ```shell
-openshell rule get my-agent --status pending
+ryno rule get my-agent --status pending
 ```
 
 Approve a proposal when its rule matches the access you intend to grant, or
 reject it with a reason:
 
 ```shell
-openshell rule approve my-agent --chunk-id <chunk-id>
+ryno rule approve my-agent --chunk-id <chunk-id>
 
-openshell rule reject my-agent \
+ryno rule reject my-agent \
   --chunk-id <chunk-id> \
   --reason "Not needed for this task."
 ```
@@ -99,7 +99,7 @@ policy, so you can list them again and approve them one after another. To
 approve every pending proposal in one step, run:
 
 ```shell
-openshell rule approve-all my-agent
+ryno rule approve-all my-agent
 ```
 
 `rule approve-all` skips proposals with a security flag unless you add

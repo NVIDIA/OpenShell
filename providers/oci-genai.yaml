@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/oci-genai.yaml
-#   openshell provider profile import -f providers/oci-genai.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/oci-genai.yaml
+#   ryno provider profile import -f providers/oci-genai.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -26,7 +26,7 @@
 #                    surface with GET, POST, and DELETE. Generative AI API keys
 #                    are only valid there; the native /20231130 API needs OCI
 #                    request signing, which this profile does not grant.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      curl -sS --compressed \
 #                        https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1/chat/completions \
 #                        -H "Authorization: Bearer $OCI_GENAI_API_KEY" \
@@ -42,12 +42,12 @@
 #      Pin it to one key later by adding request.principal.id='<api-key-ocid>'.
 #   2. Create the key in that compartment and region, with an expiry:
 #        oci generative-ai api-key create --compartment-id <ocid> \
-#          --region us-chicago-1 --display-name openshell-agents \
+#          --region us-chicago-1 --display-name ryno-agents \
 #          --key-details '[{"keyName":"primary","timeExpiry":"2027-01-01T00:00:00Z"}]'
 #      The sk-... secret is returned once. Rotate with `api-key renew`,
 #      disable with `api-key set-api-key-state`; sandboxes are unaffected
 #      because the gateway, not the sandbox, holds the value.
-#   3. openshell provider create --name my-oci-genai --type oci-genai \
+#   3. ryno provider create --name my-oci-genai --type oci-genai \
 #        --credential OCI_GENAI_API_KEY="$OCI_GENAI_API_KEY"
 #
 # Verified through the sandbox proxy with this profile: chat completions with
@@ -63,7 +63,7 @@
 # Other realms use their realm domain instead of oraclecloud.com: copy the
 # profile and add a matching endpoint entry. Signed OCI transports (API key
 # signing, security token, instance/resource principal, OKE workload identity)
-# need proxy-side request signing; see https://github.com/NVIDIA/OpenShell/issues/3879.
+# need proxy-side request signing; see https://github.com/NVIDIA/Ryno/issues/3879.
 
 id: oci-genai
 display_name: OCI Generative AI

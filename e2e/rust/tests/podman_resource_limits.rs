@@ -14,7 +14,7 @@
 //! cgroup v2 interface files from inside the sandbox itself, so it exercises
 //! the actual enforcement boundary the workload experiences.
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 const CGROUP_READ_POLICY: &str = r"version: 1
 filesystem_policy:
@@ -31,20 +31,20 @@ const MEMORY_REQUEST: &str = "512Mi";
 
 // "500m" (500 millicores) becomes a 50000us quota over Podman's 100000us
 // (100ms) CFS period — see
-// crates/openshell-driver-podman/src/container.rs's parse_cpu_to_microseconds.
+// crates/ryno-driver-podman/src/container.rs's parse_cpu_to_microseconds.
 // Verified directly against a real `podman run --cpus=0.5` container, whose
 // cpu.max reads "50000 100000".
 const EXPECTED_CPU_MAX: &str = "50000 100000";
 
 // "512Mi" (mebibytes) becomes exactly 512 * 1024 * 1024 bytes — see
-// crates/openshell-driver-podman/src/container.rs's parse_memory_to_bytes.
+// crates/ryno-driver-podman/src/container.rs's parse_memory_to_bytes.
 // Verified directly against a real `podman run --memory=512m` container,
 // whose memory.max reads "536870912".
 const EXPECTED_MEMORY_MAX: &str = "536870912";
 
 #[tokio::test]
 async fn sandbox_resource_limits_are_enforced_via_cgroups() {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("podman") {
         eprintln!("Skipping Podman resource-limit test: e2e driver is not podman");
         return;
     }

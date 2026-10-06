@@ -123,7 +123,7 @@ jobs:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-gateway-plain:
-    name: openshell-gateway driver-free (${{ matrix.triple }})
+    name: ryno-gateway driver-free (${{ matrix.triple }})
     needs: [pr_metadata, version]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
@@ -148,9 +148,9 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
-          package: openshell-gateway
-          binary: openshell-gateway
-          artifact-name: openshell-gateway-plain-${{ matrix.triple }}
+          package: ryno-gateway
+          binary: ryno-gateway
+          artifact-name: ryno-gateway-plain-${{ matrix.triple }}
           triple: ${{ matrix.triple }}
           cargo-version: ${{ needs.version.outputs.cargo }}
           extra-cargo-flags: --no-default-features
@@ -164,16 +164,16 @@ jobs:
     strategy:
       matrix:
         include:
-          - package: openshell-driver-docker
-            binary: openshell-driver-docker
+          - package: ryno-driver-docker
+            binary: ryno-driver-docker
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-          - package: openshell-driver-podman
-            binary: openshell-driver-podman
+          - package: ryno-driver-podman
+            binary: ryno-driver-podman
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-          - package: openshell-driver-kubernetes
-            binary: openshell-driver-kubernetes
+          - package: ryno-driver-kubernetes
+            binary: ryno-driver-kubernetes
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
     runs-on: ${{ matrix.runner }}
@@ -321,7 +321,7 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   podman-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -333,7 +333,7 @@ jobs:
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
       image-tag: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
       suite-matrix: >-
         [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]
 
@@ -346,7 +346,7 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   docker-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
@@ -359,9 +359,9 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-docker
-      conformance-artifact-prefix: openshell-conformance
+      gateway-artifact: ryno-gateway-plain-aarch64-unknown-linux-gnu
+      external-driver-binary: ryno-driver-docker
+      conformance-artifact-prefix: ryno-conformance
       suite-matrix: >-
         [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
 
@@ -375,9 +375,9 @@ jobs:
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
       image-tag: ${{ github.sha }}
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-podman
-      conformance-artifact-prefix: openshell-conformance
+      gateway-artifact: ryno-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: ryno-driver-podman
+      conformance-artifact-prefix: ryno-conformance
       suite-matrix: >-
         [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
 
@@ -390,10 +390,10 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
+      gateway-artifact: ryno-gateway-plain-x86_64-unknown-linux-gnu
       suite-name: external-driver
       e2e-task: e2e:vm:external-driver
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   gpu-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -405,7 +405,7 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-test.yaml
     with:
       image-tag: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -427,7 +427,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-workspace-managed-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -441,7 +441,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
@@ -455,10 +455,10 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (external compute driver)
       e2e-task: e2e:kubernetes:external-driver
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-kubernetes
+      gateway-artifact: ryno-gateway-plain-x86_64-unknown-linux-gnu
+      external-driver-binary: ryno-driver-kubernetes
       cluster-images: sandbox supervisor
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-workspace-operator-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -472,7 +472,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -485,12 +485,12 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes HA E2E (Rust smoke)
-      extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
-      external-postgres-secret: openshell-ha-pg
+      extra-helm-values: deploy/helm/ryno/ci/values-high-availability.yaml
+      external-postgres-secret: ryno-ha-pg
       test-name: kubernetes_ha_rebalancing
       kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha
       use-envoy-gateway: true
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   kubernetes-credential-drivers-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -504,7 +504,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes Credential Drivers E2E
       e2e-task: e2e:kubernetes:credential-drivers
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   core-e2e-result:
     name: Core E2E result

@@ -20,11 +20,11 @@
 
 use std::io::Write as _;
 
-use openshell_e2e::harness::container::HostSupportContainer;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::HostSupportContainer;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const HOST_ALIAS: &str = "host.openshell.internal";
+const HOST_ALIAS: &str = "host.ryno.internal";
 const FIXTURE_PORT: u16 = 8000;
 const USER: &str = "proxyuser";
 const PASS: &str = "proxypass";
@@ -149,15 +149,15 @@ network_policies:
 
 #[tokio::test]
 async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
-    if std::env::var("OPENSHELL_E2E_KUBE_CORPORATE_PROXY").as_deref() != Ok("1") {
+    if std::env::var("RYNO_E2E_KUBE_CORPORATE_PROXY").as_deref() != Ok("1") {
         eprintln!("Skipping corporate proxy test: fixture mode is disabled");
         return;
     }
-    let proxy_port: u16 = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_PORT")
+    let proxy_port: u16 = std::env::var("RYNO_E2E_CORPORATE_PROXY_PORT")
         .expect("proxy fixture port must be supplied by Kubernetes e2e wrapper")
         .parse()
         .expect("proxy fixture port must be a u16");
-    let mode = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_MODE")
+    let mode = std::env::var("RYNO_E2E_CORPORATE_PROXY_MODE")
         .unwrap_or_else(|_| "authenticated".to_string());
     if matches!(mode.as_str(), "missing-secret" | "malformed") {
         let mut policy = NamedTempFile::new().expect("create policy file");
@@ -183,9 +183,9 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
         return;
     }
     let proxy_tls = if mode == "https-ca" {
-        let cert = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT")
+        let cert = std::env::var("RYNO_E2E_CORPORATE_PROXY_TLS_CERT")
             .expect("https-ca mode requires the proxy leaf certificate from the wrapper");
-        let key = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY")
+        let key = std::env::var("RYNO_E2E_CORPORATE_PROXY_TLS_KEY")
             .expect("https-ca mode requires the proxy leaf key from the wrapper");
         Some((cert, key))
     } else {
@@ -201,7 +201,7 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
             .await
             .expect("start authenticated forward proxy");
     let upstream = if mode == "no-proxy" {
-        let port: u16 = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_UPSTREAM_PORT")
+        let port: u16 = std::env::var("RYNO_E2E_CORPORATE_PROXY_UPSTREAM_PORT")
             .expect("no-proxy fixture port must be supplied by Kubernetes e2e wrapper")
             .parse()
             .expect("no-proxy fixture port must be a u16");

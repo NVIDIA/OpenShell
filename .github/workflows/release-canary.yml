@@ -15,8 +15,8 @@ defaults:
     shell: bash
 
 env:
-  OPENSHELL_VERSION: dev
-  OPENSHELL_TELEMETRY_ENABLED: "false"
+  RYNO_VERSION: dev
+  RYNO_TELEMETRY_ENABLED: "false"
 
 jobs:
   macos:
@@ -27,15 +27,15 @@ jobs:
     steps:
       - name: Ensure VM driver
         run: |
-          launchctl setenv OPENSHELL_COMPUTE_DRIVER vm
-          launchctl setenv OPENSHELL_TELEMETRY_ENABLED "$OPENSHELL_TELEMETRY_ENABLED"
+          launchctl setenv RYNO_COMPUTE_DRIVER vm
+          launchctl setenv RYNO_TELEMETRY_ENABLED "$RYNO_TELEMETRY_ENABLED"
 
       - name: Install and check gateway status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
-          openshell --version
-          openshell status
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          ryno --version
+          ryno status
 
       # GitHub-hosted macOS runners do not expose the Hypervisor.framework
       # support libkrun needs. Sandbox launch is covered by the VM E2E lane.
@@ -43,10 +43,10 @@ jobs:
         if: failure()
         run: |
           set +e
-          brew services info openshell
+          brew services info ryno
           for log in \
-            "$(brew --prefix)/var/log/openshell/openshell-gateway.out.log" \
-            "$(brew --prefix)/var/log/openshell/openshell-gateway.err.log"; do
+            "$(brew --prefix)/var/log/ryno/ryno-gateway.out.log" \
+            "$(brew --prefix)/var/log/ryno/ryno-gateway.err.log"; do
             if [ -f "$log" ]; then
               echo "--- $log ---"
               tail -n 300 "$log"
@@ -76,20 +76,20 @@ jobs:
             sudo apt-get install -y docker.io
           fi
           sudo systemctl start docker || sudo service docker start
-          mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_COMPUTE_DRIVER=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
-            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
+          mkdir -p "${HOME}/.config/ryno"
+          printf 'RYNO_COMPUTE_DRIVER=docker\nRYNO_TELEMETRY_ENABLED=%s\n' \
+            "$RYNO_TELEMETRY_ENABLED" > "${HOME}/.config/ryno/gateway.env"
           docker info
 
       - name: Install and check status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
-          openshell status
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          ryno status
           sandbox="rc-${GITHUB_RUN_ID}"
-          openshell sandbox create --name "$sandbox" --detach
-          openshell sandbox exec --name "$sandbox" --no-tty -- true
-          openshell sandbox delete "$sandbox"
+          ryno sandbox create --name "$sandbox" --detach
+          ryno sandbox exec --name "$sandbox" --no-tty -- true
+          ryno sandbox delete "$sandbox"
 
   fedora:
     name: Fedora RPM
@@ -97,7 +97,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     env:
-      FEDORA_CANARY_CONTAINER: openshell-fedora-canary-${{ github.run_id }}-${{ github.run_attempt }}
+      FEDORA_CANARY_CONTAINER: ryno-fedora-canary-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Start Fedora systemd container and root user manager
         run: |
@@ -169,21 +169,21 @@ jobs:
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
-            OPENSHELL_VERSION="$OPENSHELL_VERSION" \
-            OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
+            RYNO_VERSION="$RYNO_VERSION" \
+            RYNO_TELEMETRY_ENABLED="$RYNO_TELEMETRY_ENABLED" \
             CANARY_SANDBOX="rc-${GITHUB_RUN_ID}" \
-            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
+            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
             bash -s <<'EOF'
           set -euo pipefail
-          mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_COMPUTE_DRIVER=podman\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
-            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
+          mkdir -p "${HOME}/.config/ryno"
+          printf 'RYNO_COMPUTE_DRIVER=podman\nRYNO_TELEMETRY_ENABLED=%s\n' \
+            "$RYNO_TELEMETRY_ENABLED" > "${HOME}/.config/ryno/gateway.env"
           podman info
           curl -LsSf "${INSTALL_SH_URL}" | sh
-          openshell status
-          openshell sandbox create --name "$CANARY_SANDBOX" --detach
-          openshell sandbox exec --name "$CANARY_SANDBOX" --no-tty -- true
-          openshell sandbox delete "$CANARY_SANDBOX"
+          ryno status
+          ryno sandbox create --name "$CANARY_SANDBOX" --detach
+          ryno sandbox exec --name "$CANARY_SANDBOX" --no-tty -- true
+          ryno sandbox delete "$CANARY_SANDBOX"
           EOF
 
       - name: Stop Fedora systemd container
@@ -196,7 +196,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
-      OPENSHELL_INSTALL_METHOD: snap
+      RYNO_INSTALL_METHOD: snap
     timeout-minutes: 20
     steps:
       - name: Install snapd
@@ -222,28 +222,28 @@ jobs:
         run: |
           set -euo pipefail
           sudo systemctl set-environment \
-            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
-          sudo snap list openshell
+            "RYNO_TELEMETRY_ENABLED=${RYNO_TELEMETRY_ENABLED}"
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          sudo snap list ryno
           if sudo snap list docker >/dev/null 2>&1; then
             echo "install.sh unexpectedly installed the Docker snap" >&2
             exit 1
           fi
-          snap info openshell | grep -E '^tracking: +latest/edge$'
+          snap info ryno | grep -E '^tracking: +latest/edge$'
           docker info
-          sudo snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
-          openshell --version
-          openshell.prover --version
-          sudo snap services openshell
-          sudo journalctl -b -u snap.openshell.gateway.service --no-pager |
+          sudo snap connections ryno | grep -E '^docker +ryno:docker +:docker +'
+          ryno --version
+          ryno.prover --version
+          sudo snap services ryno
+          sudo journalctl -b -u snap.ryno.gateway.service --no-pager |
             grep -F "mTLS user authentication enabled"
-          openshell gateway list | grep -F "https://127.0.0.1:17670"
-          openshell status
+          ryno gateway list | grep -F "https://127.0.0.1:17670"
+          ryno status
 
       - name: Check a policy boundary with the Snap prover
         run: |
           set -euo pipefail
-          prover_dir=$(mktemp -d "$HOME/openshell-prover-canary.XXXXXX")
+          prover_dir=$(mktemp -d "$HOME/ryno-prover-canary.XXXXXX")
           trap 'rm -rf "$prover_dir"' EXIT
           cat >"$prover_dir/boundary.yaml" <<'EOF'
           version: 1
@@ -258,7 +258,7 @@ jobs:
             read_only:
               - /usr
           EOF
-          result=$(openshell.prover check "$prover_dir/candidate.yaml" \
+          result=$(ryno.prover check "$prover_dir/candidate.yaml" \
             --boundary "$prover_dir/boundary.yaml")
           grep -q '^result: within_boundary$' <<<"$result"
 
@@ -266,9 +266,9 @@ jobs:
         run: |
           set -euo pipefail
           sandbox="rc-${GITHUB_RUN_ID}"
-          openshell sandbox create --name "$sandbox" --detach
-          openshell sandbox exec --name "$sandbox" --no-tty -- true
-          openshell sandbox delete "$sandbox"
+          ryno sandbox create --name "$sandbox" --detach
+          ryno sandbox exec --name "$sandbox" --no-tty -- true
+          ryno sandbox delete "$sandbox"
 
       - name: Collect Snap diagnostics
         if: failure()
@@ -277,13 +277,13 @@ jobs:
           docker info
           sudo systemctl status docker.service --no-pager
           sudo journalctl -b -u docker.service --no-pager -n 300
-          sudo snap services openshell
-          sudo snap connections openshell
+          sudo snap services ryno
+          sudo snap connections ryno
           sudo snap changes
-          sudo systemctl status snap.openshell.gateway.service --no-pager
-          sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300
+          sudo systemctl status snap.ryno.gateway.service --no-pager
+          sudo journalctl -b -u snap.ryno.gateway.service --no-pager -n 300
           sudo journalctl -b -u snapd.service --no-pager -n 300
-          sudo snap logs openshell.gateway -n=300
+          sudo snap logs ryno.gateway -n=300
           sudo ss -ltnp '( sport = :17670 )'
 
   ubuntu-snap-docker-preflight:
@@ -291,7 +291,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
-      OPENSHELL_INSTALL_METHOD: snap
+      RYNO_INSTALL_METHOD: snap
     timeout-minutes: 20
     steps:
       - name: Install snapd
@@ -314,30 +314,30 @@ jobs:
       - name: Verify installer rejects missing Docker
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh -o install.sh
-          if OPENSHELL_VERSION=dev sh install.sh >install.log 2>&1; then
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh -o install.sh
+          if RYNO_VERSION=dev sh install.sh >install.log 2>&1; then
             echo "install.sh unexpectedly succeeded without Docker" >&2
             cat install.log >&2
             exit 1
           fi
           cat install.log
-          grep -F "Docker is required before installing the OpenShell snap" install.log
+          grep -F "Docker is required before installing the Ryno snap" install.log
           ! sudo snap list docker >/dev/null 2>&1
-          ! sudo snap list openshell >/dev/null 2>&1
+          ! sudo snap list ryno >/dev/null 2>&1
 
       - name: Verify installer rejects Docker snap
         run: |
           set -euo pipefail
           sudo snap install docker
-          if OPENSHELL_VERSION=dev sh install.sh >docker-snap.log 2>&1; then
+          if RYNO_VERSION=dev sh install.sh >docker-snap.log 2>&1; then
             echo "install.sh unexpectedly succeeded with the Docker snap" >&2
             cat docker-snap.log >&2
             exit 1
           fi
           cat docker-snap.log
-          grep -F "the Docker snap is not currently compatible with OpenShell" docker-snap.log
+          grep -F "the Docker snap is not currently compatible with Ryno" docker-snap.log
           sudo snap list docker >/dev/null
-          ! sudo snap list openshell >/dev/null 2>&1
+          ! sudo snap list ryno >/dev/null 2>&1
 
       - name: Collect Snap diagnostics
         if: failure()
@@ -355,8 +355,8 @@ jobs:
     timeout-minutes: 20
     env:
       KIND_CLUSTER_NAME: release-canary-${{ github.run_id }}
-      RELEASE_NAME: openshell
-      RELEASE_NAMESPACE: openshell
+      RELEASE_NAME: ryno
+      RELEASE_NAMESPACE: ryno
       KIND_GATEWAY_NAME: kind
       AGENT_SANDBOX_VERSION: v1.0.3
     steps:
@@ -380,15 +380,15 @@ jobs:
       - name: Install Agent Sandbox controller
         run: bash e2e/support/install-agent-sandbox.sh
 
-      - name: Install OpenShell Helm chart from GHCR OCI
+      - name: Install Ryno Helm chart from GHCR OCI
         run: |
           set -euo pipefail
-          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/ryno/helm-chart \
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
             --set server.auth.allowUnauthenticatedUsers=true \
-            --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \
+            --set "server.telemetryEnabled=${RYNO_TELEMETRY_ENABLED}" \
             --wait --timeout 5m
 
       - name: Verify gateway pod is Ready
@@ -396,7 +396,7 @@ jobs:
           set -euo pipefail
           kubectl wait --namespace "$RELEASE_NAMESPACE" \
             --for=condition=Ready pod \
-            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --selector="app.kubernetes.io/name=ryno,app.kubernetes.io/instance=${RELEASE_NAME}" \
             --timeout=300s
 
       - name: Port-forward gateway service
@@ -427,22 +427,22 @@ jobs:
           sudo apt-get -y --purge remove snapd
           ! command -v snap >/dev/null 2>&1
 
-      - name: Install OpenShell CLI
+      - name: Install Ryno CLI
         run: |
           set -euo pipefail
-          mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/openshell/gateway.env"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          mkdir -p "${HOME}/.config/ryno"
+          printf 'RYNO_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/ryno/gateway.env"
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
 
       - name: Register kind gateway and check status
         run: |
           set -euo pipefail
-          openshell gateway add http://127.0.0.1:8080 --local --name "$KIND_GATEWAY_NAME"
-          openshell status
+          ryno gateway add http://127.0.0.1:8080 --local --name "$KIND_GATEWAY_NAME"
+          ryno status
           sandbox="rc-${GITHUB_RUN_ID}"
-          openshell sandbox create --name "$sandbox" --detach
-          openshell sandbox exec --name "$sandbox" --no-tty -- true
-          openshell sandbox delete "$sandbox"
+          ryno sandbox create --name "$sandbox" --detach
+          ryno sandbox exec --name "$sandbox" --no-tty -- true
+          ryno sandbox delete "$sandbox"
 
       - name: Diagnostics on failure
         if: failure()
@@ -458,11 +458,11 @@ jobs:
           kubectl describe pods --namespace "$RELEASE_NAMESPACE"
           echo "--- pod logs ---"
           kubectl logs --namespace "$RELEASE_NAMESPACE" \
-            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --selector="app.kubernetes.io/name=ryno,app.kubernetes.io/instance=${RELEASE_NAME}" \
             --tail=200 --all-containers --prefix
           echo "--- port-forward log ---"
           cat port-forward.log 2>/dev/null
-          echo "--- openshell gateway list ---"
-          openshell gateway list 2>/dev/null
-          echo "--- openshell version ---"
-          openshell --version 2>/dev/null
+          echo "--- ryno gateway list ---"
+          ryno gateway list 2>/dev/null
+          echo "--- ryno version ---"
+          ryno --version 2>/dev/null

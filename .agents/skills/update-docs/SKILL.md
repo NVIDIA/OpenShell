@@ -11,7 +11,7 @@ Scan recent git history for commits that affect user-facing behavior and draft d
 
 ## Prerequisites
 
-- You must be in the OpenShell git repository.
+- You must be in the Ryno git repository.
 - The published docs tree must exist under `docs/`.
 - Read `docs/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
 
@@ -36,7 +36,7 @@ git log -50 --oneline --no-merges
 Filter to commits that are likely to affect docs. Look for these signals:
 
 1. **Commit type**: `feat`, `fix`, `refactor`, `perf` commits often change behavior. `docs` commits are already doc changes. `chore`, `ci`, `test` commits rarely need doc updates.
-2. **Files changed**: Changes to `crates/openshell-cli/`, `python/`, `proto/`, `deploy/`, gateway config parsing, driver config structs, or policy-related code are high-signal.
+2. **Files changed**: Changes to `crates/ryno-cli/`, `python/`, `proto/`, `deploy/`, gateway config parsing, driver config structs, or policy-related code are high-signal.
 3. **Ignore**: Changes limited to `tests/`, `e2e/`, `.github/`, `tasks/`, or internal-only modules.
 
 ```bash
@@ -50,14 +50,14 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 
 | Code area | Likely doc page(s) |
 |---|---|
-| `crates/openshell-cli/` (gateway commands) | `docs/how-it-works/gateways/overview.mdx` |
-| `crates/openshell-cli/` (sandbox commands) | `docs/how-it-works/sandboxes/overview.mdx` |
-| `crates/openshell-cli/` (provider commands) | `docs/how-it-works/providers/overview.mdx` |
-| `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
-| `crates/openshell-server/src/config_file.rs` or gateway TOML parsing | `docs/how-it-works/gateways/configuration.mdx` |
-| `crates/openshell-server/src/cli.rs` gateway config merge/default behavior | `docs/how-it-works/gateways/configuration.mdx` |
-| `crates/openshell-driver-*/` config structs or driver defaults | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx` |
-| `deploy/helm/openshell/templates/gateway-config.yaml` | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx`, Helm docs if values change |
+| `crates/ryno-cli/` (gateway commands) | `docs/how-it-works/gateways/overview.mdx` |
+| `crates/ryno-cli/` (sandbox commands) | `docs/how-it-works/sandboxes/overview.mdx` |
+| `crates/ryno-cli/` (provider commands) | `docs/how-it-works/providers/overview.mdx` |
+| `crates/ryno-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
+| `crates/ryno-server/src/config_file.rs` or gateway TOML parsing | `docs/how-it-works/gateways/configuration.mdx` |
+| `crates/ryno-server/src/cli.rs` gateway config merge/default behavior | `docs/how-it-works/gateways/configuration.mdx` |
+| `crates/ryno-driver-*/` config structs or driver defaults | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx` |
+| `deploy/helm/ryno/templates/gateway-config.yaml` | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx`, Helm docs if values change |
 | Proxy or policy code | `docs/how-it-works/policies/overview.mdx`, `docs/how-it-works/policies/schema.mdx` |
 | Inference code | `docs/inference/configure.mdx` |
 | `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.mdx` |
@@ -112,7 +112,7 @@ Write the smallest update that tells users exactly what changed and what they ne
 - **Use `keywords` as a comma-separated string**.
 - **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.
-- **Always capitalize OpenShell correctly.** Wrong: openshell, Openshell, openShell.
+- **Always capitalize Ryno correctly.** Wrong: ryno, RYNO.
 - **Do not number section titles.** Wrong: "Section 1: Deploy a Gateway" or "Step 3: Verify." Use plain descriptive titles.
 - **No colons in titles.** Wrong: "Gateways: Deploy and Manage." Write "Deploy and Manage Gateways" instead.
 - **Use colons only to introduce a list.** Do not use colons as general-purpose punctuation between clauses.

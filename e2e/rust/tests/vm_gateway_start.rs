@@ -13,19 +13,19 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{
+use ryno_e2e::harness::cli::{
     run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
     wait_for_sandbox_phase,
 };
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use prost::Message;
 use tokio::time::sleep;
 
 const READY_MARKER: &str = "vm-gateway-start-ready";
 const STOPPED_READY_MARKER: &str = "vm-gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/vm-gateway-start-state";
-const VM_STATE_DIR_ENV: &str = "OPENSHELL_E2E_VM_STATE_DIR";
+const VM_STATE_DIR_ENV: &str = "RYNO_E2E_VM_STATE_DIR";
 
 #[derive(Clone, PartialEq, Message)]
 struct PersistedDriverSandbox {
@@ -85,7 +85,7 @@ async fn wait_for_vm_stopped_marker(
 
 #[tokio::test]
 async fn vm_gateway_restart_preserves_running_and_stopped_intent() {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("vm") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("vm") {
         eprintln!("Skipping VM gateway start test: e2e driver is not vm");
         return;
     }

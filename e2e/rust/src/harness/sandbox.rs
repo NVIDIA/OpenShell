@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 
-use super::binary::{openshell_bin, openshell_cmd};
+use super::binary::{ryno_bin, ryno_cmd};
 use super::output::{extract_field, strip_ansi};
 
 /// Tool-capable workload image used by the E2E harness.
@@ -24,7 +24,7 @@ use super::output::{extract_field, strip_ansi};
 /// Docker and Podman setup build this Noble-based fixture before running the
 /// tests.
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
-pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
+pub const E2E_WORKLOAD_IMAGE: &str = "ryno/e2e-python:dev";
 
 /// Preserve the existing pullable fixture for E2E lanes that cannot build the
 /// local container-engine fixture.
@@ -121,7 +121,7 @@ impl SandboxGuard {
     ///
     /// # Arguments
     ///
-    /// * `args` — Extra arguments to `openshell sandbox create`, including
+    /// * `args` — Extra arguments to `ryno sandbox create`, including
     ///   `-- <command>` if needed.
     ///
     /// # Errors
@@ -153,7 +153,7 @@ impl SandboxGuard {
             );
         }
 
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, create_args);
         if use_test_image {
@@ -167,7 +167,7 @@ impl SandboxGuard {
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
             .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
-            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -232,7 +232,7 @@ impl SandboxGuard {
     /// Unlike [`SandboxGuard::create_keep`], this does not open an attachment,
     /// which lets tests control competing and reconnecting clients directly.
     pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, &[]);
         add_test_image_if_missing(&mut cmd, &[]);
@@ -244,7 +244,7 @@ impl SandboxGuard {
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
             .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
-            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno: {e}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let combined = format!("{stdout}{stderr}");
@@ -281,7 +281,7 @@ impl SandboxGuard {
         command: &[&str],
         ready_marker: &str,
     ) -> Result<Self, String> {
-        let mut create_cmd = openshell_cmd();
+        let mut create_cmd = ryno_cmd();
         create_cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut create_cmd, create_args);
         add_test_image_if_missing(&mut create_cmd, create_args);
@@ -294,7 +294,7 @@ impl SandboxGuard {
         let create_output = timeout(SANDBOX_READY_TIMEOUT, create_cmd.output())
             .await
             .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
-            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno: {e}"))?;
         let create_stdout = String::from_utf8_lossy(&create_output.stdout).to_string();
         let create_stderr = String::from_utf8_lossy(&create_output.stderr).to_string();
         let create_combined = format!("{create_stdout}{create_stderr}");
@@ -310,7 +310,7 @@ impl SandboxGuard {
             format!("could not parse sandbox name from create output:\n{create_combined}")
         })?;
 
-        let mut connect_cmd = openshell_cmd();
+        let mut connect_cmd = ryno_cmd();
         connect_cmd
             .arg("sandbox")
             .arg("connect")
@@ -320,7 +320,7 @@ impl SandboxGuard {
 
         let mut child = connect_cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn openshell connect: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno connect: {e}"))?;
 
         let stdout = child.stdout.take().expect("stdout must be piped");
         let mut reader = BufReader::new(stdout).lines();
@@ -395,8 +395,8 @@ impl SandboxGuard {
     ///
     /// Equivalent to:
     /// ```text
-    /// openshell sandbox create --detach --upload <local>:<dest> [extra_args...]
-    /// openshell sandbox exec <name> -- <command>
+    /// ryno sandbox create --detach --upload <local>:<dest> [extra_args...]
+    /// ryno sandbox exec <name> -- <command>
     /// ```
     ///
     /// The `--no-git-ignore` flag is passed to avoid needing a git repository.
@@ -421,7 +421,7 @@ impl SandboxGuard {
         uploads: &[(&str, &str)],
         command: &[&str],
     ) -> Result<Self, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         add_unique_name_if_missing(&mut cmd, &[]);
         add_test_image_if_missing(&mut cmd, &[]);
@@ -436,7 +436,7 @@ impl SandboxGuard {
             .map_err(|_| {
                 format!("sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}")
             })?
-            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -471,7 +471,7 @@ impl SandboxGuard {
         Ok(guard)
     }
 
-    /// Upload local files to the sandbox via `openshell sandbox upload`.
+    /// Upload local files to the sandbox via `ryno sandbox upload`.
     ///
     /// # Arguments
     ///
@@ -482,7 +482,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the upload command fails.
     pub async fn upload(&self, local_path: &str, dest: &str) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox")
             .arg("upload")
             .arg(&self.name)
@@ -494,7 +494,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno upload: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -516,7 +516,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the upload command fails.
     pub async fn upload_to_workdir(&self, local_path: &str) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox")
             .arg("upload")
             .arg(&self.name)
@@ -527,7 +527,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno upload: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -565,7 +565,7 @@ impl SandboxGuard {
         dest: &str,
         cwd: &std::path::Path,
     ) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox")
             .arg("upload")
             .arg(&self.name)
@@ -577,7 +577,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno upload: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -593,7 +593,7 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Run a one-shot command inside the sandbox via `openshell sandbox exec`.
+    /// Run a one-shot command inside the sandbox via `ryno sandbox exec`.
     ///
     /// Used by tests that need to pre-populate sandbox-side state (create
     /// files, symlinks, directories) without going through the upload flow.
@@ -608,7 +608,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the CLI exits non-zero.
     pub async fn exec(&self, argv: &[&str]) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox")
             .arg("exec")
             .arg("--name")
@@ -623,7 +623,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn openshell exec: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno exec: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -639,7 +639,7 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Download files from the sandbox via `openshell sandbox download`.
+    /// Download files from the sandbox via `ryno sandbox download`.
     ///
     /// # Arguments
     ///
@@ -650,7 +650,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the download command fails.
     pub async fn download(&self, sandbox_path: &str, local_dest: &str) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox")
             .arg("download")
             .arg(&self.name)
@@ -661,7 +661,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn openshell download: {e}"))?;
+            .map_err(|e| format!("failed to spawn ryno download: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -677,7 +677,7 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Spawn `openshell forward start` as a background process.
+    /// Spawn `ryno forward start` as a background process.
     ///
     /// Returns the child process handle. The caller is responsible for killing
     /// it (or it will be killed on drop since `kill_on_drop(true)` is set).
@@ -686,7 +686,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the process cannot be spawned.
     pub fn spawn_forward(&self, port: u16) -> Result<tokio::process::Child, String> {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("forward")
             .arg("start")
             .arg(port.to_string())
@@ -714,7 +714,7 @@ impl SandboxGuard {
         }
 
         // Delete the sandbox.
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.arg("sandbox").arg("delete").arg(&self.name);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -737,7 +737,7 @@ impl Drop for SandboxGuard {
             let _ = child.start_kill();
         }
 
-        let _ = std::process::Command::new(openshell_bin())
+        let _ = std::process::Command::new(ryno_bin())
             .arg("sandbox")
             .arg("delete")
             .arg(&self.name)

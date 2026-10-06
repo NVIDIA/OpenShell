@@ -6,22 +6,22 @@
 //! E2E tests for operator workspace mode.
 //!
 //! The gateway is deployed with `workspace_mode = "operator"` and
-//! `operator_namespace_label = "openshell.ai/e2e-operator-workspace=true"`.
+//! `operator_namespace_label = "ryno.ai/e2e-operator-workspace=true"`.
 //! Namespaces must be pre-provisioned and labeled before sandbox creation.
 //! The gateway discovers valid namespaces via the label selector.
 
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::{ryno_bin, ryno_cmd};
+use ryno_e2e::harness::output::strip_ansi;
 
-const OPERATOR_LABEL: &str = "openshell.ai/e2e-operator-workspace=true";
-const SA_NAME: &str = "openshell-sandbox";
+const OPERATOR_LABEL: &str = "ryno.ai/e2e-operator-workspace=true";
+const SA_NAME: &str = "ryno-sandbox";
 
 fn kube_context() -> String {
-    std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
-        .expect("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE must be set")
+    std::env::var("RYNO_E2E_KUBE_CONTEXT_ACTIVE")
+        .expect("RYNO_E2E_KUBE_CONTEXT_ACTIVE must be set")
 }
 
 async fn kubectl(args: &[&str]) -> (bool, String) {
@@ -45,9 +45,9 @@ async fn kubectl(args: &[&str]) -> (bool, String) {
 }
 
 async fn run_cli(args: &[&str]) -> (bool, String) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = cmd.output().await.expect("failed to spawn openshell");
+    let output = cmd.output().await.expect("failed to spawn ryno");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -95,14 +95,14 @@ async fn provision_operator_namespace(name: &str) {
 async fn install_workspace_chart(namespace: &str) -> (bool, String) {
     let chart = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/helm/openshell-workspace"
+        "/../../deploy/helm/ryno-workspace"
     );
     let output = tokio::process::Command::new("helm")
         .args([
             "--kube-context",
             &kube_context(),
             "install",
-            "openshell-workspace",
+            "ryno-workspace",
             chart,
             "--namespace",
             namespace,
@@ -140,7 +140,7 @@ struct OperatorCleanup {
 
 impl Drop for OperatorCleanup {
     fn drop(&mut self) {
-        let bin = openshell_bin();
+        let bin = ryno_bin();
         for sb in &self.sandboxes {
             let _ = std::process::Command::new(&bin)
                 .args(["sandbox", "delete", sb, "--workspace", &self.workspace])
@@ -153,7 +153,7 @@ impl Drop for OperatorCleanup {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let context = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE").unwrap_or_default();
+        let context = std::env::var("RYNO_E2E_KUBE_CONTEXT_ACTIVE").unwrap_or_default();
         if !context.is_empty() {
             let _ = std::process::Command::new("kubectl")
                 .args([
@@ -172,7 +172,7 @@ impl Drop for OperatorCleanup {
     }
 }
 
-const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:openshell:openshell";
+const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:ryno:ryno";
 
 async fn gateway_can(verb: &str, resource: &str, namespace: &str) -> bool {
     let (_, out) = kubectl(&[
@@ -204,7 +204,7 @@ async fn operator_gateway_has_no_secret_access_without_workspace_chart() {
         );
     }
     assert!(
-        !gateway_can("patch", "secrets/openshell-client-tls", &ns).await,
+        !gateway_can("patch", "secrets/ryno-client-tls", &ns).await,
         "gateway must not patch the client TLS Secret in namespace {ns} without the workspace chart"
     );
 }
@@ -262,7 +262,7 @@ async fn operator_sandbox_in_labeled_namespace() {
         "sandbox CR name should be bare 'op-sb', got: {out}"
     );
 
-    // Verify sandbox is resolvable through the OpenShell control plane.
+    // Verify sandbox is resolvable through the Ryno control plane.
     let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ns]).await;
     assert!(ok, "sandbox list failed: {out}");
     assert!(
@@ -424,7 +424,7 @@ async fn operator_workspace_delete_preserves_namespace() {
         kubectl(&["get", "namespace", &ns, "-o", "jsonpath={.metadata.labels}"]).await;
     assert!(ok, "failed to read namespace labels: {label_out}");
     assert!(
-        label_out.contains("openshell.ai/e2e-operator-workspace"),
+        label_out.contains("ryno.ai/e2e-operator-workspace"),
         "operator label should be intact after workspace delete: {label_out}"
     );
 
@@ -477,7 +477,7 @@ async fn operator_label_removal_blocks_sandbox_creation() {
         "label",
         "namespace",
         &ns,
-        "openshell.ai/e2e-operator-workspace-",
+        "ryno.ai/e2e-operator-workspace-",
     ])
     .await;
     assert!(ok, "failed to remove operator label: {out}");

@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: OpenShell Rust and SDKs
+name: Ryno Rust and SDKs
 
 paths:
   - crates
   - examples
   - sdk/go
   - sdk/typescript/src
-  - python/openshell
+  - python/ryno
 
 paths-ignore:
   # Integration-test targets are not removed by the Rust cfg override.
   - crates/*/tests
-  - python/openshell/_proto
+  - python/ryno/_proto
   - sdk/typescript/src/gen

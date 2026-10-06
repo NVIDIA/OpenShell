@@ -1,0 +1,254 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::jwt::{JwtKeyMaterial, generate_jwt_key};
+use miette::{IntoDiagnostic, Result, WrapErr};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
+};
+use std::net::IpAddr;
+
+/// All PEM-encoded materials produced by [`generate_pki`].
+#[allow(clippy::struct_field_names)]
+pub struct PkiBundle {
+    pub ca_cert_pem: String,
+    #[allow(dead_code)]
+    pub ca_key_pem: String,
+    pub server_cert_pem: String,
+    pub server_key_pem: String,
+    pub client_cert_pem: String,
+    pub client_key_pem: String,
+    /// PKCS#8 PEM Ed25519 private key for minting per-sandbox JWTs.
+    pub jwt_signing_key_pem: String,
+    /// SPKI PEM Ed25519 public key, paired with `jwt_signing_key_pem`.
+    pub jwt_public_key_pem: String,
+    /// Stable identifier embedded in the `kid` header of every minted JWT.
+    pub jwt_key_id: String,
+}
+
+/// Default SANs always included on the server certificate.
+///
+/// Covers the host aliases used by every supported runtime: Kubernetes service DNS,
+/// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
+/// and `host.containers.internal` for Podman containers reaching their host.
+pub const DEFAULT_SERVER_SANS: &[&str] = &[
+    "ryno",
+    "ryno.ryno.svc",
+    "ryno.ryno.svc.cluster.local",
+    "localhost",
+    "ryno.localhost",
+    "*.ryno.localhost",
+    "host.docker.internal",
+    "host.containers.internal",
+    "127.0.0.1",
+    "::1",
+];
+
+/// Generate a complete PKI bundle: CA, server cert, and client cert.
+///
+/// `extra_sans` are additional Subject Alternative Names to add to the server
+/// certificate (e.g. the remote host's IP or hostname for remote deployments).
+///
+/// Certificate validity uses the `rcgen` defaults (1975–4096), which effectively
+/// never expire. This is appropriate for an internal dev-cluster PKI where certs
+/// are ephemeral to the cluster's lifetime.
+pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
+    // --- CA ---
+    let ca_key = KeyPair::generate()
+        .into_diagnostic()
+        .wrap_err("failed to generate CA key")?;
+    let mut ca_params = CertificateParams::new(Vec::<String>::new())
+        .into_diagnostic()
+        .wrap_err("failed to create CA params")?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params
+        .distinguished_name
+        .push(DnType::OrganizationName, "ryno");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "ryno-ca");
+
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .into_diagnostic()
+        .wrap_err("failed to self-sign CA certificate")?;
+
+    // --- Server cert ---
+    let server_key = KeyPair::generate()
+        .into_diagnostic()
+        .wrap_err("failed to generate server key")?;
+    let server_sans = build_server_sans(extra_sans);
+    let mut server_params = CertificateParams::new(Vec::<String>::new())
+        .into_diagnostic()
+        .wrap_err("failed to create server cert params")?;
+    server_params.subject_alt_names = server_sans;
+    server_params.use_authority_key_identifier_extension = true;
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "ryno-server");
+
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .into_diagnostic()
+        .wrap_err("failed to sign server certificate")?;
+
+    // --- User client cert (CLI only; sandboxes use bearer identity) ---
+    let client_key = KeyPair::generate()
+        .into_diagnostic()
+        .wrap_err("failed to generate client key")?;
+    let mut client_params = CertificateParams::new(Vec::<String>::new())
+        .into_diagnostic()
+        .wrap_err("failed to create client cert params")?;
+    client_params.use_authority_key_identifier_extension = true;
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, "ryno-client");
+    client_params
+        .distinguished_name
+        .push(DnType::OrganizationalUnitName, "ryno-user");
+
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .into_diagnostic()
+        .wrap_err("failed to sign client certificate")?;
+
+    // --- JWT signing key (Ed25519, used to mint per-sandbox identity tokens) ---
+    let JwtKeyMaterial {
+        signing_key_pem: jwt_signing_key_pem,
+        public_key_pem: jwt_public_key_pem,
+        kid: jwt_key_id,
+    } = generate_jwt_key().wrap_err("failed to generate JWT signing key")?;
+
+    Ok(PkiBundle {
+        ca_cert_pem: ca_cert.pem(),
+        ca_key_pem: ca_key.serialize_pem(),
+        server_cert_pem: server_cert.pem(),
+        server_key_pem: server_key.serialize_pem(),
+        client_cert_pem: client_cert.pem(),
+        client_key_pem: client_key.serialize_pem(),
+        jwt_signing_key_pem,
+        jwt_public_key_pem,
+        jwt_key_id,
+    })
+}
+
+/// Build the SAN list for the server certificate from defaults + extras.
+fn build_server_sans(extra_sans: &[String]) -> Vec<SanType> {
+    let mut sans = Vec::new();
+
+    for s in DEFAULT_SERVER_SANS {
+        add_san(&mut sans, s);
+    }
+    for s in extra_sans {
+        add_san(&mut sans, s);
+    }
+
+    sans
+}
+
+/// Add a SAN, automatically choosing `IpAddress` or `DnsName` based on the value.
+fn add_san(sans: &mut Vec<SanType>, value: &str) {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        sans.push(SanType::IpAddress(ip));
+    } else if let Ok(dns) = Ia5String::try_from(value) {
+        sans.push(SanType::DnsName(dns));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_pki_produces_valid_pem() {
+        let bundle = generate_pki(&["10.0.0.1".to_string(), "myhost.example.com".to_string()])
+            .expect("generate_pki failed");
+
+        // All PEM strings should be non-empty and contain PEM markers
+        assert!(bundle.ca_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(bundle.ca_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(bundle.server_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.client_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(bundle.client_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.jwt_signing_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.jwt_public_key_pem.contains("BEGIN PUBLIC KEY"));
+        assert_eq!(bundle.jwt_key_id.len(), 32, "kid is 16 bytes hex-encoded");
+    }
+
+    #[test]
+    fn generate_pki_no_extra_sans() {
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn generate_pki_emits_strict_verifier_extensions() {
+        use x509_parser::pem::parse_x509_pem;
+        use x509_parser::prelude::{FromDer, ParsedExtension, X509Certificate};
+
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        let parse = |pem: &str| -> Vec<u8> {
+            parse_x509_pem(pem.as_bytes())
+                .expect("valid PEM")
+                .1
+                .contents
+        };
+        let ca_der = parse(&bundle.ca_cert_pem);
+        let ca = X509Certificate::from_der(&ca_der).expect("valid CA cert").1;
+        let ca_key_usage = ca
+            .key_usage()
+            .expect("readable key usage")
+            .expect("CA has a key usage extension");
+        assert!(ca_key_usage.value.key_cert_sign());
+        assert!(ca_key_usage.value.crl_sign());
+        let ca_ski = ca
+            .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+            .expect("readable SKI")
+            .expect("CA has a Subject Key Identifier");
+
+        for (name, pem) in [
+            ("server", &bundle.server_cert_pem),
+            ("client", &bundle.client_cert_pem),
+        ] {
+            let der = parse(pem);
+            let cert = X509Certificate::from_der(&der).expect("valid leaf cert").1;
+            let aki = cert
+                .get_extension_unique(
+                    &x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER,
+                )
+                .expect("readable AKI")
+                .unwrap_or_else(|| panic!("{name} cert has no Authority Key Identifier"));
+            let (
+                ParsedExtension::AuthorityKeyIdentifier(aki),
+                ParsedExtension::SubjectKeyIdentifier(ski),
+            ) = (aki.parsed_extension(), ca_ski.parsed_extension())
+            else {
+                panic!("{name}: unexpected extension shapes");
+            };
+            let key_id = aki
+                .key_identifier
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} AKI has no key identifier"));
+            assert_eq!(key_id.0, ski.0, "{name} AKI must match the CA SKI");
+        }
+    }
+
+    #[test]
+    fn build_server_sans_includes_defaults_and_extras() {
+        let extras = vec!["192.168.1.100".to_string(), "remote.host".to_string()];
+        let sans = build_server_sans(&extras);
+
+        // Should have all default SANs + 2 extras
+        assert_eq!(sans.len(), DEFAULT_SERVER_SANS.len() + 2);
+    }
+
+    #[test]
+    fn default_server_sans_include_local_container_hostnames() {
+        assert!(DEFAULT_SERVER_SANS.contains(&"host.docker.internal"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"host.containers.internal"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"127.0.0.1"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"::1"));
+    }
+}

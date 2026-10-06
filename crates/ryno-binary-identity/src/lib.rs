@@ -1,0 +1,557 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared executable-identity resolution for RFC 0012 isolation backends.
+//!
+//! Runtime-specific observation remains inside each isolation backend. Once an
+//! observer has an authoritative PID in its procfs view, this crate
+//! canonicalizes the executable path, hashes the live executable object, and
+//! collects its process ancestry. Backends bind the returned identity to the
+//! intercepted connection before constructing a `MediatedConnection`.
+
+use ryno_isolation_interface::contract::{BinaryIdentity, ResolveError};
+#[cfg(target_os = "linux")]
+use ryno_isolation_interface::contract::{ExecutableIdentity, Sha256Digest};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+const EXECUTABLE_DIGEST_CACHE_CAPACITY: usize = 1_024;
+
+/// Resolves executable identity from a Linux procfs process identifier.
+///
+/// The configured scope bounds ancestry and cmdline collection to the observed
+/// PID namespace or a known workload process tree.
+#[derive(Clone, Debug)]
+pub struct ProcfsIdentityResolver {
+    ancestry_scope: AncestryScope,
+    #[cfg(target_os = "linux")]
+    cache: Arc<Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AncestryScope {
+    PidNamespace,
+    ProcessTree(u32),
+}
+
+impl Default for ProcfsIdentityResolver {
+    fn default() -> Self {
+        Self::for_pid_namespace()
+    }
+}
+
+impl ProcfsIdentityResolver {
+    /// Build a resolver that discovers a nested PID namespace's init process
+    /// and never reports host-runtime ancestors outside that namespace.
+    #[must_use]
+    pub fn for_pid_namespace() -> Self {
+        Self {
+            ancestry_scope: AncestryScope::PidNamespace,
+            #[cfg(target_os = "linux")]
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Build a resolver bounded by the workload's trusted process-tree root.
+    #[must_use]
+    pub fn for_process_tree(ancestor_root: u32) -> Self {
+        Self {
+            ancestry_scope: AncestryScope::ProcessTree(ancestor_root),
+            #[cfg(target_os = "linux")]
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Resolve the identity for an authoritative process ID.
+    pub fn resolve(&self, pid: u32) -> Result<BinaryIdentity, ResolveError> {
+        #[cfg(target_os = "linux")]
+        {
+            let ancestor_root = match self.ancestry_scope {
+                AncestryScope::PidNamespace => nested_pid_namespace_init(pid),
+                AncestryScope::ProcessTree(root) => Some(root),
+            };
+            resolve_linux_process(pid, ancestor_root, &self.cache)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.ancestry_scope {
+                AncestryScope::PidNamespace => {}
+                AncestryScope::ProcessTree(ancestor_root) => {
+                    let _ = ancestor_root;
+                }
+            }
+            let _ = pid;
+            Err(ResolveError::Failed(
+                "procfs binary identity is only available on Linux".to_string(),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_process(
+    pid: u32,
+    ancestor_root: Option<u32>,
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+) -> Result<BinaryIdentity, ResolveError> {
+    let (snapshot, mut executable) = open_process_snapshot(pid)?;
+    let mut ancestor_processes = collect_ancestor_processes(&snapshot, ancestor_root)?;
+
+    let mut excluded_paths = ancestor_processes
+        .iter()
+        .map(|(snapshot, _)| snapshot.binary_path.clone())
+        .collect::<Vec<_>>();
+    excluded_paths.push(snapshot.binary_path.clone());
+    let cmdline_paths = cmdline_absolute_paths(&snapshot.cmdline)
+        .into_iter()
+        .chain(
+            ancestor_processes
+                .iter()
+                .flat_map(|(snapshot, _)| cmdline_absolute_paths(&snapshot.cmdline)),
+        )
+        .filter(|path| !excluded_paths.contains(path))
+        .fold(Vec::new(), |mut paths, path| {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            paths
+        });
+
+    let (executable_identity, pending_cache_entry) =
+        resolve_open_executable(&snapshot, &mut executable, cache)?;
+    let mut pending_cache_entries = pending_cache_entry.into_iter().collect::<Vec<_>>();
+    let mut ancestors = Vec::with_capacity(ancestor_processes.len());
+    for (ancestor, executable) in &mut ancestor_processes {
+        let (identity, pending_cache_entry) = resolve_open_executable(ancestor, executable, cache)?;
+        ancestors.push(identity);
+        pending_cache_entries.extend(pending_cache_entry);
+    }
+
+    validate_process_snapshot(pid, &snapshot)?;
+    for (ancestor, _) in &ancestor_processes {
+        validate_process_snapshot(ancestor.pid, ancestor)?;
+    }
+    for (key, digest) in pending_cache_entries {
+        cache_executable_digest(cache, key, digest);
+    }
+
+    Ok(BinaryIdentity {
+        executable: executable_identity,
+        ancestors,
+        cmdline_paths,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_open_executable(
+    snapshot: &ProcessSnapshot,
+    executable: &mut std::fs::File,
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+) -> Result<
+    (
+        ExecutableIdentity,
+        Option<(ExecutableCacheKey, Sha256Digest)>,
+    ),
+    ResolveError,
+> {
+    let key = snapshot.executable_cache_key();
+    let cached_digest = cached_executable_digest(cache, key);
+    let digest = cached_digest.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
+    Ok((
+        ExecutableIdentity {
+            path: snapshot.binary_path.clone(),
+            digest: Some(digest),
+        },
+        cached_digest.is_none().then_some((key, digest)),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessSnapshot {
+    pid: u32,
+    parent_pid: u32,
+    binary_path: std::path::PathBuf,
+    executable_device: u64,
+    executable_inode: u64,
+    executable_size: u64,
+    executable_mtime: i64,
+    executable_mtime_nsec: i64,
+    executable_ctime: i64,
+    executable_ctime_nsec: i64,
+    start_time: u64,
+    cmdline: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExecutableCacheKey {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessSnapshot {
+    fn executable_cache_key(&self) -> ExecutableCacheKey {
+        ExecutableCacheKey {
+            device: self.executable_device,
+            inode: self.executable_inode,
+            size: self.executable_size,
+            mtime: self.executable_mtime,
+            mtime_nsec: self.executable_mtime_nsec,
+            ctime: self.executable_ctime,
+            ctime_nsec: self.executable_ctime_nsec,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cached_executable_digest(
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+    key: ExecutableCacheKey,
+) -> Option<Sha256Digest> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+}
+
+#[cfg(target_os = "linux")]
+fn cache_executable_digest(
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+    key: ExecutableCacheKey,
+    digest: Sha256Digest,
+) {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= EXECUTABLE_DIGEST_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(key, digest);
+}
+
+#[cfg(target_os = "linux")]
+fn open_process_snapshot(pid: u32) -> Result<(ProcessSnapshot, std::fs::File), ResolveError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = format!("/proc/{pid}/exe");
+    let binary_path = executable_path(pid)?;
+    let executable = std::fs::File::open(&path)
+        .map_err(|error| ResolveError::Failed(format!("open {path}: {error}")))?;
+    let metadata = executable
+        .metadata()
+        .map_err(|error| ResolveError::Failed(format!("stat {path}: {error}")))?;
+    let (parent_pid, start_time) = process_stat(pid)?;
+    let snapshot = ProcessSnapshot {
+        pid,
+        parent_pid,
+        binary_path,
+        executable_device: metadata.dev(),
+        executable_inode: metadata.ino(),
+        executable_size: metadata.size(),
+        executable_mtime: metadata.mtime(),
+        executable_mtime_nsec: metadata.mtime_nsec(),
+        executable_ctime: metadata.ctime(),
+        executable_ctime_nsec: metadata.ctime_nsec(),
+        start_time,
+        cmdline: read_process_cmdline(pid)?,
+    };
+    validate_process_snapshot(pid, &snapshot)?;
+    Ok((snapshot, executable))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_process_snapshot(pid: u32, expected: &ProcessSnapshot) -> Result<(), ResolveError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = format!("/proc/{pid}/exe");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| ResolveError::Failed(format!("stat {path}: {error}")))?;
+    let (parent_pid, start_time) = process_stat(pid)?;
+    let current = ProcessSnapshot {
+        pid,
+        parent_pid,
+        binary_path: executable_path(pid)?,
+        executable_device: metadata.dev(),
+        executable_inode: metadata.ino(),
+        executable_size: metadata.size(),
+        executable_mtime: metadata.mtime(),
+        executable_mtime_nsec: metadata.mtime_nsec(),
+        executable_ctime: metadata.ctime(),
+        executable_ctime_nsec: metadata.ctime_nsec(),
+        start_time,
+        cmdline: read_process_cmdline(pid)?,
+    };
+    if &current == expected {
+        Ok(())
+    } else {
+        Err(ResolveError::Failed(format!(
+            "process {pid} changed while its executable identity was collected"
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_stat(pid: u32) -> Result<(u32, u64), ResolveError> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&path)
+        .map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing command field")))?;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next();
+    let parent_pid = fields
+        .next()
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing parent PID")))?
+        .parse()
+        .map_err(|error| ResolveError::Failed(format!("parse {path} parent PID: {error}")))?;
+    let start_time = fields
+        .nth(17)
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing start time")))?
+        .parse()
+        .map_err(|error| ResolveError::Failed(format!("parse {path} start time: {error}")))?;
+    Ok((parent_pid, start_time))
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_cmdline(pid: u32) -> Result<Vec<u8>, ResolveError> {
+    let path = format!("/proc/{pid}/cmdline");
+    std::fs::read(&path).map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))
+}
+
+#[cfg(target_os = "linux")]
+fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    const DELETED_SUFFIX: &[u8] = b" (deleted)";
+
+    let link = format!("/proc/{pid}/exe");
+    let target = std::fs::read_link(&link)
+        .map_err(|error| ResolveError::Failed(format!("read {link}: {error}")))?;
+    let target_missing =
+        matches!(std::fs::metadata(&target), Err(error) if error.kind() == ErrorKind::NotFound);
+    let bytes = target.as_os_str().as_bytes();
+
+    if target_missing && bytes.ends_with(DELETED_SUFFIX) {
+        let stripped = bytes[..bytes.len() - DELETED_SUFFIX.len()].to_vec();
+        return Ok(std::path::PathBuf::from(OsString::from_vec(stripped)));
+    }
+
+    Ok(target)
+}
+
+#[cfg(target_os = "linux")]
+fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Digest, ResolveError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let path = format!("/proc/{pid}/exe");
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let length = executable
+            .read(&mut buffer)
+            .map_err(|error| ResolveError::Failed(format!("hash {path}: {error}")))?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    format!("{:x}", digest.finalize()).parse()
+}
+
+#[cfg(target_os = "linux")]
+fn collect_ancestor_processes(
+    process: &ProcessSnapshot,
+    ancestor_root: Option<u32>,
+) -> Result<Vec<(ProcessSnapshot, std::fs::File)>, ResolveError> {
+    const MAX_DEPTH: usize = 64;
+
+    if ancestor_root == Some(process.pid) {
+        return Ok(Vec::new());
+    }
+
+    let mut ancestors: Vec<(ProcessSnapshot, std::fs::File)> = Vec::new();
+    let mut parent = process.parent_pid;
+    for _ in 0..MAX_DEPTH {
+        if parent == 0 || ancestors.iter().any(|(current, _)| current.pid == parent) {
+            break;
+        }
+
+        // PID 1 is host or guest init rather than workload ancestry unless it
+        // is the explicitly supplied process-tree root.
+        if parent == 1 && ancestor_root != Some(1) {
+            break;
+        }
+
+        let (snapshot, executable) = open_process_snapshot(parent)?;
+        let next_parent = snapshot.parent_pid;
+        ancestors.push((snapshot, executable));
+        if ancestor_root == Some(parent) || parent == 1 {
+            break;
+        }
+        parent = next_parent;
+    }
+    Ok(ancestors)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn nested_pid_namespace_init(pid: u32) -> Option<u32> {
+    const MAX_DEPTH: usize = 64;
+
+    let mut current = pid;
+    for _ in 0..MAX_DEPTH {
+        if namespace_pid(current) == Some(1) {
+            // Host PID 1 is outside every workload. A nested namespace init
+            // has a distinct host PID and is a valid workload ancestry root.
+            return (current != 1).then_some(current);
+        }
+        current = parent_pid(current).filter(|parent| *parent > 0 && *parent != current)?;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_pid(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))?
+        .split_whitespace()
+        .next_back()?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn cmdline_absolute_paths(cmdline: &[u8]) -> Vec<std::path::PathBuf> {
+    cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| argument.first() == Some(&b'/'))
+        .map(|argument| std::path::PathBuf::from(String::from_utf8_lossy(argument).into_owned()))
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    const IDENTITY_HELPER_READY: &str = "identity helper ready\n";
+
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolver_cache_is_owned_and_only_explicit_clones_share_it() {
+        let pid = std::process::id();
+        let first = ProcfsIdentityResolver::for_process_tree(pid);
+        let shared = first.clone();
+        let separate = ProcfsIdentityResolver::for_process_tree(pid);
+        assert!(Arc::ptr_eq(&first.cache, &shared.cache));
+        assert!(!Arc::ptr_eq(&first.cache, &separate.cache));
+        first.resolve(pid).unwrap();
+        assert!(!shared.cache.lock().unwrap().is_empty());
+        assert!(separate.cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolves_current_process_from_live_executable() {
+        let pid = std::process::id();
+        let identity = ProcfsIdentityResolver::for_process_tree(pid)
+            .resolve(pid)
+            .expect("resolve current process");
+
+        assert!(identity.executable.path.is_absolute());
+        assert!(identity.executable.digest.is_some());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for executable identity tests"]
+    fn identity_helper_process() {
+        let mut stdout = std::io::stdout();
+        std::io::Write::write_all(&mut stdout, IDENTITY_HELPER_READY.as_bytes())
+            .expect("signal helper readiness");
+        std::io::Write::flush(&mut stdout).expect("flush helper readiness");
+
+        // Stay alive until the parent closes stdin or ChildGuard terminates us.
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8]);
+    }
+
+    #[test]
+    fn resolves_child_and_hashes_ancestor_chain() {
+        let parent_pid = std::process::id();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::identity_helper_process"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut line = String::new();
+        // Wait until the helper has entered the test before taking the
+        // fail-closed procfs snapshot of the newly spawned process.
+        loop {
+            line.clear();
+            let bytes_read = std::io::BufRead::read_line(&mut child_stdout, &mut line)
+                .expect("read child readiness");
+            assert_ne!(bytes_read, 0, "child exited before signaling readiness");
+            if line == IDENTITY_HELPER_READY {
+                break;
+            }
+        }
+        let child = ChildGuard(child);
+
+        let identity = ProcfsIdentityResolver::for_process_tree(parent_pid)
+            .resolve(child.0.id())
+            .expect("resolve child identity");
+
+        assert!(identity.executable.path.is_absolute());
+        assert!(identity.executable.digest.is_some());
+        let parent = identity.ancestors.last().expect("process-tree root");
+        assert_eq!(parent.path, std::env::current_exe().unwrap());
+        assert!(parent.digest.is_some());
+    }
+
+    #[test]
+    fn process_tree_root_does_not_escape_into_host_ancestry() {
+        let pid = std::process::id();
+        let identity = ProcfsIdentityResolver::for_process_tree(pid)
+            .resolve(pid)
+            .expect("resolve process-tree root");
+
+        assert!(identity.ancestors.is_empty());
+    }
+}

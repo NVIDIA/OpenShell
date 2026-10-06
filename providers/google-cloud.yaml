@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/google-cloud.yaml
-#   openshell provider profile import -f providers/google-cloud.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/google-cloud.yaml
+#   ryno provider profile import -f providers/google-cloud.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -11,19 +11,19 @@
 #
 # Client binaries:   none declared — this profile grants no egress.
 # Reference layout:  any image whose GCP SDKs honour the metadata server. The
-#                    sandbox reaches credentials through OpenShell's GCE metadata
+#                    sandbox reaches credentials through Ryno's GCE metadata
 #                    emulator, so gcloud, google-cloud-* libraries and anything
 #                    else using Application Default Credentials work unmodified.
 # Credential scope:  a gateway-refreshed GCP access token, as GCP_SA_ACCESS_TOKEN
 #                    (service-account JWT flow) or GCP_ADC_ACCESS_TOKEN (gcloud
 #                    ADC flow). Configure the refresh material with
-#                    `openshell provider refresh configure`; the private key and
+#                    `ryno provider refresh configure`; the private key and
 #                    refresh token stay at the gateway and are never injected.
 # Endpoint access:   none. The profile declares no endpoints, so it grants no
 #                    network access on its own. Add the Google API hosts your
 #                    workload needs to the sandbox policy, or import a profile
 #                    that declares them.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      gcloud auth print-access-token
 
 id: google-cloud
@@ -34,7 +34,7 @@ inference_capable: false
 
 credentials:
   # Service account JWT flow: gateway signs a JWT and exchanges it for an
-  # access token. Configure with `openshell provider refresh configure`.
+  # access token. Configure with `ryno provider refresh configure`.
   - name: service_account_token
     description: GCP access token minted from service account JWT
     env_vars: [GCP_SA_ACCESS_TOKEN]
@@ -59,7 +59,7 @@ credentials:
           description: Email for domain-wide delegation (optional)
 
   # ADC OAuth2 flow: gateway exchanges a gcloud ADC refresh token for an
-  # access token. Configure with `openshell provider refresh configure`.
+  # access token. Configure with `ryno provider refresh configure`.
   - name: adc_token
     description: GCP access token from gcloud application default credentials
     env_vars: [GCP_ADC_ACCESS_TOKEN]

@@ -3,7 +3,7 @@
 
 //! Container-engine helpers for Rust e2e tests.
 //!
-//! Most e2e tests should exercise the `OpenShell` gateway contract rather than a
+//! Most e2e tests should exercise the `Ryno` gateway contract rather than a
 //! specific local container runtime. This module keeps small support containers
 //! and container-engine selection aligned between Docker- and Podman-backed
 //! gateway runs.
@@ -19,7 +19,7 @@ use super::sandbox::E2E_WORKLOAD_IMAGE;
 
 #[must_use]
 pub fn e2e_driver() -> Option<String> {
-    std::env::var("OPENSHELL_E2E_DRIVER")
+    std::env::var("RYNO_E2E_DRIVER")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
@@ -39,7 +39,7 @@ pub struct ContainerEngine {
 impl ContainerEngine {
     pub fn from_env() -> Result<Self, String> {
         let resolved = resolve_container_engine(
-            std::env::var("OPENSHELL_E2E_CONTAINER_ENGINE")
+            std::env::var("RYNO_E2E_CONTAINER_ENGINE")
                 .ok()
                 .as_deref(),
             std::env::var("CONTAINER_ENGINE").ok().as_deref(),
@@ -56,9 +56,9 @@ impl ContainerEngine {
     #[must_use]
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
-        if let Ok(value) = std::env::var("OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
+        if let Ok(value) = std::env::var("RYNO_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
             command.env("XDG_CONFIG_HOME", value);
-        } else if std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME").is_some()
+        } else if std::env::var_os("RYNO_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME").is_some()
         {
             command.env_remove("XDG_CONFIG_HOME");
         }
@@ -76,7 +76,7 @@ static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// Builds a container image from a local Dockerfile via the active container
 /// engine and removes it on drop.
 ///
-/// `openshell sandbox create --from` no longer builds local Dockerfiles
+/// `ryno sandbox create --from` no longer builds local Dockerfiles
 /// itself (see the pre-0.1.0 breaking-change notes), so e2e tests that need a
 /// custom image build it out-of-band with this guard and pass the resulting
 /// `tag()` to `--from`.
@@ -93,7 +93,7 @@ impl ImageGuard {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let tag = format!("localhost/openshell-e2e-{label}-{timestamp}-{unique}:latest");
+        let tag = format!("localhost/ryno-e2e-{label}-{timestamp}-{unique}:latest");
         let output = engine
             .command()
             .args([
@@ -142,9 +142,9 @@ impl Drop for ImageGuard {
 
 #[must_use]
 pub fn e2e_network_name() -> Option<String> {
-    std::env::var("OPENSHELL_E2E_NETWORK_NAME")
+    std::env::var("RYNO_E2E_NETWORK_NAME")
         .ok()
-        .or_else(|| std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME").ok())
+        .or_else(|| std::env::var("RYNO_E2E_DOCKER_NETWORK_NAME").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -168,7 +168,7 @@ impl ContainerHttpServer {
         // driver-neutral host alias instead.
         let use_host_port = network.is_none() || is_e2e_driver("podman");
         let mut host = if use_host_port {
-            "host.openshell.internal".to_string()
+            "host.ryno.internal".to_string()
         } else {
             alias.to_string()
         };
@@ -276,7 +276,7 @@ impl ContainerHttpServer {
 /// A generic support container running on the shared e2e container network.
 ///
 /// Unlike [`ContainerHttpServer`], this helper requires the network mode used
-/// by the Docker/Podman gateway lanes (`OPENSHELL_E2E_NETWORK_NAME`), probes
+/// by the Docker/Podman gateway lanes (`RYNO_E2E_NETWORK_NAME`), probes
 /// readiness with a plain TCP connect instead of an HTTP GET (so it can host
 /// non-HTTP fixtures such as forward proxies and TLS servers), and exposes the
 /// container's logs and network IP for test assertions.
@@ -291,7 +291,7 @@ pub struct SupportContainer {
 /// A TCP fixture reachable from host-networked sandbox infrastructure.
 ///
 /// Kubernetes sandboxes reach published fixtures through the chart-provided
-/// `host.openshell.internal` alias. Local Podman supervisors can instead run
+/// `host.ryno.internal` alias. Local Podman supervisors can instead run
 /// fixtures in the host network. Unlike [`SupportContainer`], neither mode
 /// requires the Docker e2e network used by local-container driver tests.
 pub struct HostSupportContainer {
@@ -512,7 +512,7 @@ impl SupportContainer {
     ) -> Result<Self, String> {
         let engine = ContainerEngine::from_env()?;
         let network = e2e_network_name().ok_or_else(|| {
-            "SupportContainer requires OPENSHELL_E2E_NETWORK_NAME (managed gateway network mode)"
+            "SupportContainer requires RYNO_E2E_NETWORK_NAME (managed gateway network mode)"
                 .to_string()
         })?;
 
@@ -810,7 +810,7 @@ fn resolve_container_engine(
 ) -> Result<ResolvedContainerEngine, String> {
     if normalized_env(legacy_selector).is_some() {
         return Err(
-            "OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported; set CONTAINER_ENGINE=docker|podman instead"
+            "RYNO_E2E_CONTAINER_ENGINE is no longer supported; set CONTAINER_ENGINE=docker|podman instead"
                 .to_string(),
         );
     }
@@ -824,7 +824,7 @@ fn resolve_container_engine(
         && explicit != required
     {
         return Err(format!(
-            "CONTAINER_ENGINE={explicit} conflicts with OPENSHELL_E2E_DRIVER={required}; use CONTAINER_ENGINE={required} or unset CONTAINER_ENGINE"
+            "CONTAINER_ENGINE={explicit} conflicts with RYNO_E2E_DRIVER={required}; use CONTAINER_ENGINE={required} or unset CONTAINER_ENGINE"
         ));
     }
 
@@ -991,7 +991,7 @@ mod tests {
         };
 
         let err = resolve(&probe, Some("podman"), None, None).unwrap_err();
-        assert!(err.contains("OPENSHELL_E2E_CONTAINER_ENGINE"));
+        assert!(err.contains("RYNO_E2E_CONTAINER_ENGINE"));
     }
 
     #[test]

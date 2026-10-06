@@ -4,7 +4,7 @@
 #![cfg(feature = "e2e-docker")]
 
 //! Verifies application bearer authorization behavior through an exposed
-//! `OpenShell` service.
+//! `Ryno` service.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -19,8 +19,8 @@ use http_body_util::{BodyExt as _, Empty};
 use hyper::client::conn::http1;
 use hyper::{Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
@@ -31,7 +31,7 @@ use tokio_rustls::TlsConnector;
 use url::Position;
 
 const SERVICE_PORT: &str = "4500";
-const BEARER_TOKEN: &str = "Bearer openshell-e2e-application-token";
+const BEARER_TOKEN: &str = "Bearer ryno-e2e-application-token";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const HEADER_ECHO_SERVER: &str = r#"
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,7 +52,7 @@ ThreadingHTTPServer(("127.0.0.1", 4500), Handler).serve_forever()
 "#;
 
 async fn run_cli(args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     command
         .args(args)
         .stdout(Stdio::piped())
@@ -60,7 +60,7 @@ async fn run_cli(args: &[&str]) -> Result<std::process::Output, String> {
     command
         .output()
         .await
-        .map_err(|error| format!("failed to run openshell: {error}"))
+        .map_err(|error| format!("failed to run ryno: {error}"))
 }
 
 enum ServiceTransport {
@@ -114,10 +114,10 @@ impl ServiceTarget {
 fn e2e_mtls_dir() -> Result<PathBuf, String> {
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .ok_or_else(|| "XDG_CONFIG_HOME is required for an HTTPS service URL".to_string())?;
-    let gateway = std::env::var("OPENSHELL_GATEWAY")
-        .map_err(|_| "OPENSHELL_GATEWAY is required for an HTTPS service URL".to_string())?;
+    let gateway = std::env::var("RYNO_GATEWAY")
+        .map_err(|_| "RYNO_GATEWAY is required for an HTTPS service URL".to_string())?;
     Ok(PathBuf::from(config_home)
-        .join("openshell/gateways")
+        .join("ryno/gateways")
         .join(gateway)
         .join("mtls"))
 }

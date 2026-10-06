@@ -1,12 +1,16 @@
-# OpenShell RFCs
+# Ryno RFCs
 
-Substantial changes to OpenShell should be proposed in writing before implementation begins. New features always start as a GitHub issue using the [feature request template](https://github.com/NVIDIA/OpenShell/issues/new/choose), not as an RFC pull request. RFCs drive nuanced discussions that need structured iteration, broad stakeholder input, and a durable record of the reasoning beyond what issue comments can fully capture.
+> Rename note: the project was previously named OpenShell. The numbered RFC
+> documents below predate the rename and intentionally keep the OpenShell name
+> as a historical record; new RFCs use Ryno.
+
+Substantial changes to Ryno should be proposed in writing before implementation begins. New features always start as a GitHub issue using the [feature request template](https://github.com/NVIDIA/Ryno/issues/new/choose), not as an RFC pull request. RFCs drive nuanced discussions that need structured iteration, broad stakeholder input, and a durable record of the reasoning beyond what issue comments can fully capture.
 
 An RFC provides a consistent way to collect broad feedback, build consensus, and document the decision for future contributors. An RFC is created only when maintainers decide the originating issue needs that level of design review.
 
 ## Start with a GitHub issue
 
-Before writing an RFC, you must open a [GitHub issue](https://github.com/NVIDIA/OpenShell/issues/new/choose) to scope the problem, gauge interest, and get early feedback. For new features, use the feature request template. This helps:
+Before writing an RFC, you must open a [GitHub issue](https://github.com/NVIDIA/Ryno/issues/new/choose) to scope the problem, gauge interest, and get early feedback. For new features, use the feature request template. This helps:
 
 - Validate that the problem is worth solving
 - Surface potential concerns early
@@ -17,7 +21,7 @@ If the ticket shows sufficient interest and maintainers decide the idea needs br
 
 ## RFCs vs other artifacts
 
-OpenShell has several places where design information lives. Use this guide to pick the right one:
+Ryno has several places where design information lives. Use this guide to pick the right one:
 
 | Artifact | Purpose | When to use |
 |----------|---------|-------------|
@@ -62,8 +66,8 @@ authors:
   - "@username"
 state: draft
 links:
-  - https://github.com/NVIDIA/OpenShell/issues/456
-  - https://github.com/NVIDIA/OpenShell/pull/123
+  - https://github.com/NVIDIA/Ryno/issues/456
+  - https://github.com/NVIDIA/Ryno/pull/123
 ---
 ```
 

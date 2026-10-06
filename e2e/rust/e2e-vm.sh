@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e smoke test against an openshell-gateway running the
-# standalone VM compute driver (`openshell-driver-vm`).
+# Run the Rust e2e smoke test against an ryno-gateway running the
+# standalone VM compute driver (`ryno-driver-vm`).
 #
 # Architecture:
-#   * `openshell-sandbox` runs inside a NIC-less guest.
-#   * The host `openshell-supervisor` connects over virtio-vsock and owns
+#   * `ryno-sandbox` runs inside a NIC-less guest.
+#   * The host `ryno-supervisor` connects over virtio-vsock and owns
 #     gateway registration, policy evaluation, DNS, and external networking.
 #   * Readiness is authoritative on the gateway: a sandbox's phase
 #     flips to `Ready` the moment `ConnectSupervisor` registers, and
@@ -20,14 +20,14 @@
 # What the script does:
 #   1. When no prebuilt VM driver is supplied, ensures the VM runtime
 #      (libkrun) and bundled sandbox/supervisor binaries are staged.
-#   2. Builds `openshell-gateway`, `openshell-driver-vm`, the native host
-#      `openshell-supervisor` host control, and the `openshell` CLI with the
-#      embedded runtime as needed. When CI supplies OPENSHELL_GATEWAY_BIN,
-#      OPENSHELL_VM_DRIVER_BIN, OPENSHELL_VM_SUPERVISOR_BIN, or OPENSHELL_BIN,
+#   2. Builds `ryno-gateway`, `ryno-driver-vm`, the native host
+#      `ryno-supervisor` host control, and the `ryno` CLI with the
+#      embedded runtime as needed. When CI supplies RYNO_GATEWAY_BIN,
+#      RYNO_VM_DRIVER_BIN, RYNO_VM_SUPERVISOR_BIN, or RYNO_BIN,
 #      the matching prebuilt binary is reused instead of rebuilt.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
-#   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
+#   4. Writes a per-run gateway config with `[ryno.drivers.vm]`
 #      settings, starts the gateway with `--config <run-state>/gateway.toml`
 #      on a random free port, waits for an authenticated gateway status
 #      request to succeed, then runs the selected Rust e2e tests.
@@ -46,14 +46,14 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 source "${ROOT}/e2e/support/conformance.sh"
 
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
-GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
-DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
-CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
-E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+GATEWAY_BIN="${RYNO_GATEWAY_BIN:-${ROOT}/target/debug/ryno-gateway}"
+DRIVER_BIN="${RYNO_VM_DRIVER_BIN:-${ROOT}/target/debug/ryno-driver-vm}"
+CLI_BIN="${RYNO_BIN:-${ROOT}/target/debug/ryno}"
+E2E_TEST_OVERRIDE="${RYNO_E2E_VM_TEST:-}"
+E2E_FEATURES="${RYNO_E2E_VM_FEATURES-e2e-vm}"
+SANDBOX_IMAGE="${RYNO_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
-# The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
+# The VM driver places `compute-driver.sock` under `[ryno.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
 # in the workspace's `target/` blow the limit on typical developer
 # machines — e.g. a ~100-char `~/.superset/worktrees/.../target/...`
@@ -71,12 +71,12 @@ SANDBOX_PROVISION_TIMEOUT=180
 
 # ── Build prerequisites ──────────────────────────────────────────────
 
-if [ -n "${RUSTC_WRAPPER:-}" ] && [ "${OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER:-0}" != "1" ]; then
-  echo "==> Building without RUSTC_WRAPPER=${RUSTC_WRAPPER} (set OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER=1 to keep it)"
+if [ -n "${RUSTC_WRAPPER:-}" ] && [ "${RYNO_E2E_VM_ALLOW_RUSTC_WRAPPER:-0}" != "1" ]; then
+  echo "==> Building without RUSTC_WRAPPER=${RUSTC_WRAPPER} (set RYNO_E2E_VM_ALLOW_RUSTC_WRAPPER=1 to keep it)"
   unset RUSTC_WRAPPER
 fi
 
-if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
+if [ -z "${RYNO_VM_DRIVER_BIN:-}" ]; then
   mkdir -p "${COMPRESSED_DIR}"
 
   if ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
@@ -89,41 +89,41 @@ if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
   echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
   mise run vm:supervisor
 
-  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+  export RYNO_VM_RUNTIME_COMPRESSED_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
 else
   echo "==> Skipping embedded VM runtime prep; prebuilt VM driver was supplied"
 fi
 
 build_packages=()
-if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-    echo "==> Building driver-free openshell-gateway"
+if [ -z "${RYNO_GATEWAY_BIN:-}" ]; then
+  if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "==> Building driver-free ryno-gateway"
     cargo build \
-      -p openshell-gateway --bin openshell-gateway \
+      -p ryno-gateway --bin ryno-gateway \
       --no-default-features --features telemetry
   else
-    build_packages+=(-p openshell-gateway)
+    build_packages+=(-p ryno-gateway)
   fi
 else
-  echo "==> Using prebuilt openshell-gateway at ${GATEWAY_BIN}"
+  echo "==> Using prebuilt ryno-gateway at ${GATEWAY_BIN}"
 fi
-if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
-  build_packages+=(-p openshell-driver-vm)
+if [ -z "${RYNO_VM_DRIVER_BIN:-}" ]; then
+  build_packages+=(-p ryno-driver-vm)
 else
-  echo "==> Using prebuilt openshell-driver-vm at ${DRIVER_BIN}"
+  echo "==> Using prebuilt ryno-driver-vm at ${DRIVER_BIN}"
 fi
-if [ -z "${OPENSHELL_VM_SUPERVISOR_BIN:-}" ]; then
-  # The VM driver prefers a native sibling `openshell-supervisor`. Build it
+if [ -z "${RYNO_VM_SUPERVISOR_BIN:-}" ]; then
+  # The VM driver prefers a native sibling `ryno-supervisor`. Build it
   # explicitly so a stale target/debug binary cannot disagree with the
   # freshly embedded guest sandbox protocol.
-  build_packages+=(-p openshell-supervisor)
+  build_packages+=(-p ryno-supervisor)
 else
-  echo "==> Using prebuilt VM host supervisor at ${OPENSHELL_VM_SUPERVISOR_BIN}"
+  echo "==> Using prebuilt VM host supervisor at ${RYNO_VM_SUPERVISOR_BIN}"
 fi
-if [ -z "${OPENSHELL_BIN:-}" ]; then
-  build_packages+=(-p openshell-cli)
+if [ -z "${RYNO_BIN:-}" ]; then
+  build_packages+=(-p ryno-cli)
 else
-  echo "==> Using prebuilt openshell CLI at ${CLI_BIN}"
+  echo "==> Using prebuilt ryno CLI at ${CLI_BIN}"
 fi
 
 if [ "${#build_packages[@]}" -gt 0 ]; then
@@ -132,9 +132,9 @@ if [ "${#build_packages[@]}" -gt 0 ]; then
 fi
 
 for pair in \
-  "openshell-gateway:${GATEWAY_BIN}" \
-  "openshell-driver-vm:${DRIVER_BIN}" \
-  "openshell CLI:${CLI_BIN}"; do
+  "ryno-gateway:${GATEWAY_BIN}" \
+  "ryno-driver-vm:${DRIVER_BIN}" \
+  "ryno CLI:${CLI_BIN}"; do
   label="${pair%%:*}"
   path="${pair#*:}"
   if [ ! -x "${path}" ]; then
@@ -142,13 +142,13 @@ for pair in \
     exit 1
   fi
 done
-export OPENSHELL_BIN="${CLI_BIN}"
+export RYNO_BIN="${CLI_BIN}"
 DRIVER_DIR="$(dirname "${DRIVER_BIN}")"
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
+  echo "==> Codesigning ryno-driver-vm (Hypervisor entitlement)"
   codesign \
-    --entitlements "${ROOT}/crates/openshell-driver-vm/entitlements.plist" \
+    --entitlements "${ROOT}/crates/ryno-driver-vm/entitlements.plist" \
     --force \
     -s - \
     "${DRIVER_BIN}"
@@ -171,14 +171,14 @@ mkdir -p "${RUN_STATE_DIR}"
 export XDG_CONFIG_HOME="${RUN_STATE_DIR}/config"
 export XDG_DATA_HOME="${RUN_STATE_DIR}/data"
 
-GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
+GATEWAY_LOG="$(mktemp /tmp/ryno-gateway-e2e.XXXXXX)"
 GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${RUN_STATE_DIR}/gateway.args"
 GATEWAY_CONFIG="${RUN_STATE_DIR}/gateway.toml"
 GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
 JWT_DIR="${RUN_STATE_DIR}/jwt"
 PKI_DIR="${RUN_STATE_DIR}/pki"
-GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
+GATEWAY_NAME="ryno-e2e-vm-${HOST_PORT}"
 DRIVER_PID=""
 DRIVER_LOG="${RUN_STATE_DIR}/vm-driver.log"
 DRIVER_SOCKET="${RUN_STATE_DIR}/compute-driver.sock"
@@ -194,7 +194,7 @@ cleanup() {
   fi
 
   if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
-    echo "Stopping openshell-gateway (pid ${gateway_pid})..."
+    echo "Stopping ryno-gateway (pid ${gateway_pid})..."
     # SIGTERM first; gateway drops ManagedDriverProcess which SIGKILLs
     # the driver and removes the UDS. Wait briefly, then force-kill.
     kill -TERM "${gateway_pid}" 2>/dev/null || true
@@ -241,12 +241,12 @@ trap cleanup EXIT
 
 # ── Launch the gateway + VM driver ───────────────────────────────────
 
-echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
+echo "==> Starting ryno-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
 # Pin `driver_dir` to the workspace `target/debug/` so we always pick up
 # the driver we just cargo-built. Without this, the gateway's
 # `resolve_compute_driver_bin` fallback prefers
-# `~/.local/libexec/openshell/openshell-driver-vm` when present,
+# `~/.local/libexec/ryno/ryno-driver-vm` when present,
 # which silently shadows development builds — a subtle source of
 # stale-binary bugs in e2e runs.
 # `grpc_endpoint` is consumed by the host supervisor. The host alias is
@@ -255,23 +255,23 @@ e2e_generate_gateway_jwt "${JWT_DIR}"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 cat >"${GATEWAY_CONFIG}" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 bind_address = "127.0.0.1:${HOST_PORT}"
 compute_driver = "vm"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
 
-[openshell.gateway.tls]
+[ryno.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"
 key_path = "${PKI_DIR}/server/tls.key"
 client_ca_path = "${PKI_DIR}/ca.crt"
 
-[openshell.gateway.mtls_auth]
+[ryno.gateway.mtls_auth]
 enabled = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${JWT_DIR}/signing.pem"
 public_key_path = "${JWT_DIR}/public.pem"
 kid_path = "${JWT_DIR}/kid"
@@ -279,23 +279,23 @@ gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
 
-[openshell.drivers.vm]
+[ryno.drivers.vm]
 EOF
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   printf 'socket_path = "%s"\n' "${DRIVER_SOCKET}" >>"${GATEWAY_CONFIG}"
 else
   cat >>"${GATEWAY_CONFIG}" <<EOF
-grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
+grpc_endpoint = "https://host.ryno.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
 EOF
 fi
 
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   "${DRIVER_BIN}" \
     --bind-socket "${DRIVER_SOCKET}" \
     --allow-same-uid-peer \
-    --grpc-endpoint "https://host.openshell.internal:${HOST_PORT}" \
+    --grpc-endpoint "https://host.ryno.internal:${HOST_PORT}" \
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
@@ -325,7 +325,7 @@ e2e_register_mtls_gateway \
   "${CLI_GATEWAY_ENDPOINT}" \
   "${HOST_PORT}" \
   "${PKI_DIR}"
-export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+export RYNO_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 
 # ── Wait for gateway readiness ───────────────────────────────────────
 #
@@ -338,7 +338,7 @@ elapsed=0
 last_status_output=""
 while [ "${elapsed}" -lt "${GATEWAY_READY_TIMEOUT}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "ERROR: openshell-gateway exited before becoming ready"
+    echo "ERROR: ryno-gateway exited before becoming ready"
     exit 1
   fi
   if last_status_output="$("${CLI_BIN}" status --output json 2>&1)" &&
@@ -352,14 +352,14 @@ while [ "${elapsed}" -lt "${GATEWAY_READY_TIMEOUT}" ]; do
 done
 
 if [ "${elapsed}" -ge "${GATEWAY_READY_TIMEOUT}" ]; then
-  echo "ERROR: openshell-gateway did not become ready after ${GATEWAY_READY_TIMEOUT}s"
-  echo "=== last openshell status output ==="
+  echo "ERROR: ryno-gateway did not become ready after ${GATEWAY_READY_TIMEOUT}s"
+  echo "=== last ryno status output ==="
   if [ -n "${last_status_output}" ]; then
     printf '%s\n' "${last_status_output}"
   else
     echo "<no output>"
   fi
-  echo "=== end openshell status output ==="
+  echo "=== end ryno status output ==="
   exit 1
 fi
 
@@ -368,8 +368,8 @@ fi
 # The CLI uses the raw endpoint but still resolves matching metadata so it
 # can find the mTLS client bundle.
 
-export OPENSHELL_E2E_DRIVER="vm"
-export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
+export RYNO_E2E_DRIVER="vm"
+export RYNO_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 e2e_export_gateway_restart_metadata \
   "${GATEWAY_BIN}" \
   "${GATEWAY_ARGS_FILE}" \
@@ -380,9 +380,9 @@ e2e_export_gateway_restart_metadata \
 # plus a writable overlay disk. The guest's sandbox supervisor then initializes
 # policy, netns, Landlock, and sshd. On a cold host this is ~15s after image
 # preparation; allow 180s for slower CI runners.
-export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
+export RYNO_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-e2e_run_openshell_conformance "VM"
+e2e_run_ryno_conformance "VM"
 
 # Seed the catalog once for the whole lane. The profiles live in the gateway
 # for as long as it runs, and the import is create-only: a second import of
@@ -394,7 +394,7 @@ run_e2e_test() {
   local test_target="$1"
   shift
 
-  echo "==> Running e2e ${test_target} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
+  echo "==> Running e2e ${test_target} test (features: ${E2E_FEATURES}, endpoint: ${RYNO_GATEWAY_ENDPOINT})"
   cargo test \
     --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
     --features "${E2E_FEATURES}" \

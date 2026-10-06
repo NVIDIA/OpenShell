@@ -10,8 +10,8 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
-HARNESS="${OPENSHELL_AGENT_HARNESS:-}"
-[[ -n "$HARNESS" ]] || { echo "missing required env: OPENSHELL_AGENT_HARNESS" >&2; exit 1; }
+HARNESS="${RYNO_AGENT_HARNESS:-}"
+[[ -n "$HARNESS" ]] || { echo "missing required env: RYNO_AGENT_HARNESS" >&2; exit 1; }
 RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD_DIR="$(cd "$RUNTIME_DIR/.." && pwd)"
 

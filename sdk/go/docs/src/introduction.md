@@ -1,6 +1,6 @@
-# OpenShell Go SDK
+# Ryno Go SDK
 
-The OpenShell Go SDK provides an idiomatic Go client for the OpenShell gateway API. It wraps the underlying gRPC protocol behind typed interfaces, making it straightforward to manage sandboxes, execute commands, handle providers, and more.
+The Ryno Go SDK provides an idiomatic Go client for the Ryno gateway API. It wraps the underlying gRPC protocol behind typed interfaces, making it straightforward to manage sandboxes, execute commands, handle providers, and more.
 
 ## Key Features
 
@@ -29,6 +29,6 @@ Browse the full [API Overview](api/overview.md) to see all 13 interfaces at a gl
 
 ## Related Projects
 
-- [**OpenShell**](https://github.com/NVIDIA/OpenShell) (by NVIDIA): The upstream project that defines the gateway API and sandbox runtime this SDK wraps.
-- [**openshell-sdk-go**](https://github.com/NVIDIA/OpenShell/sdk/go): This SDK's source repository on GitHub.
-- [**pkg.go.dev**](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1): Go package documentation with type signatures and godoc.
+- [**Ryno**](https://github.com/NVIDIA/Ryno) (by NVIDIA): The upstream project that defines the gateway API and sandbox runtime this SDK wraps.
+- [**ryno-sdk-go**](https://github.com/NVIDIA/Ryno/sdk/go): This SDK's source repository on GitHub.
+- [**pkg.go.dev**](https://pkg.go.dev/github.com/NVIDIA/Ryno/sdk/go/ryno/v1): Go package documentation with type signatures and godoc.

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Ryno gateway
+After=network-online.target
+{% block unit %}{% endblock %}
+
+[Service]
+User={{ ryno_gateway_user }}
+Group={{ ryno_gateway_user }}
+Environment=HOME={{ ryno_gateway_home }}
+{% block service %}{% endblock %}
+ExecStart=ryno-gateway --config /etc/ryno/gateway.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

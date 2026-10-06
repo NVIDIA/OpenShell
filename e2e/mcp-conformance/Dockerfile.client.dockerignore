@@ -4,4 +4,4 @@
 .git
 dist
 node_modules
-.openshell-mcp-conformance-*.stamp
+.ryno-mcp-conformance-*.stamp

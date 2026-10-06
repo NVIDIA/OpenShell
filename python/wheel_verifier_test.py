@@ -13,7 +13,7 @@ import pytest
 
 def _load_verifier_module():
     path = Path(__file__).resolve().parents[1] / "tasks/scripts/verify-python-wheel.py"
-    spec = importlib.util.spec_from_file_location("openshell_wheel_verifier", path)
+    spec = importlib.util.spec_from_file_location("ryno_wheel_verifier", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -27,15 +27,15 @@ verifier = _load_verifier_module()
 
 def _wheel_files() -> set[str]:
     files = {
-        "openshell/__init__.py",
-        "openshell/sandbox.py",
-        "openshell/py.typed",
-        "openshell/_proto/__init__.py",
+        "ryno/__init__.py",
+        "ryno/sandbox.py",
+        "ryno/py.typed",
+        "ryno/_proto/__init__.py",
     }
-    for stem in ("datamodel", "openshell", "options", "sandbox"):
-        files.add(f"openshell/_proto/{stem}_pb2.py")
-        files.add(f"openshell/_proto/{stem}_pb2.pyi")
-        files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
+    for stem in ("datamodel", "ryno", "options", "sandbox"):
+        files.add(f"ryno/_proto/{stem}_pb2.py")
+        files.add(f"ryno/_proto/{stem}_pb2.pyi")
+        files.add(f"ryno/_proto/{stem}_pb2_grpc.py")
     return files
 
 
@@ -47,14 +47,14 @@ def _write_wheel(
     files: set[str] | None = None,
     entry_points: str | None = None,
 ) -> Path:
-    wheel = directory / f"openshell-{version}-{tag}.whl"
-    dist_info = f"openshell-{version}.dist-info"
+    wheel = directory / f"ryno-{version}-{tag}.whl"
+    dist_info = f"ryno-{version}.dist-info"
     with ZipFile(wheel, "w") as archive:
         for name in files if files is not None else _wheel_files():
             archive.writestr(name, "")
         archive.writestr(
             f"{dist_info}/METADATA",
-            f"Metadata-Version: 2.4\nName: openshell\nVersion: {version}\n",
+            f"Metadata-Version: 2.4\nName: ryno\nVersion: {version}\n",
         )
         archive.writestr(
             f"{dist_info}/WHEEL",
@@ -80,7 +80,7 @@ def test_requires_exactly_one_wheel_in_directory(tmp_path: Path) -> None:
 
 
 def test_rejects_missing_generated_proto(tmp_path: Path) -> None:
-    files = _wheel_files() - {"openshell/_proto/sandbox_pb2.py"}
+    files = _wheel_files() - {"ryno/_proto/sandbox_pb2.py"}
     wheel = _write_wheel(tmp_path, files=files)
 
     with pytest.raises(ValueError, match=r"sandbox_pb2\.py"):
@@ -88,33 +88,33 @@ def test_rejects_missing_generated_proto(tmp_path: Path) -> None:
 
 
 def test_rejects_bundled_cli(tmp_path: Path) -> None:
-    files = _wheel_files() | {"openshell-1.2.3.data/scripts/openshell"}
+    files = _wheel_files() | {"ryno-1.2.3.data/scripts/ryno"}
     wheel = _write_wheel(tmp_path, files=files)
 
-    with pytest.raises(ValueError, match="contains an openshell executable"):
+    with pytest.raises(ValueError, match="contains an ryno executable"):
         verifier.verify_wheel(wheel)
 
 
 def test_rejects_bundled_windows_cli(tmp_path: Path) -> None:
-    files = _wheel_files() | {"openshell-1.2.3.data/scripts/openshell.exe"}
+    files = _wheel_files() | {"ryno-1.2.3.data/scripts/ryno.exe"}
     wheel = _write_wheel(tmp_path, files=files)
 
-    with pytest.raises(ValueError, match="contains an openshell executable"):
+    with pytest.raises(ValueError, match="contains an ryno executable"):
         verifier.verify_wheel(wheel)
 
 
-def test_rejects_openshell_console_script(tmp_path: Path) -> None:
+def test_rejects_ryno_console_script(tmp_path: Path) -> None:
     wheel = _write_wheel(
         tmp_path,
-        entry_points="[console_scripts]\nopenshell = openshell.cli:main\n",
+        entry_points="[console_scripts]\nryno = ryno.cli:main\n",
     )
 
-    with pytest.raises(ValueError, match="defines an openshell console script"):
+    with pytest.raises(ValueError, match="defines an ryno console script"):
         verifier.verify_wheel(wheel)
 
 
 def test_rejects_native_extension(tmp_path: Path) -> None:
-    files = _wheel_files() | {"openshell/_native.so"}
+    files = _wheel_files() | {"ryno/_native.so"}
     wheel = _write_wheel(tmp_path, files=files)
 
     with pytest.raises(ValueError, match="contains native files"):
@@ -122,7 +122,7 @@ def test_rejects_native_extension(tmp_path: Path) -> None:
 
 
 def test_rejects_bytecode(tmp_path: Path) -> None:
-    files = _wheel_files() | {"openshell/__pycache__/sandbox.cpython-314.pyc"}
+    files = _wheel_files() | {"ryno/__pycache__/sandbox.cpython-314.pyc"}
     wheel = _write_wheel(tmp_path, files=files)
 
     with pytest.raises(ValueError, match="contains Python bytecode"):

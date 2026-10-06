@@ -13,19 +13,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
-use openshell_core::proto::gateway_interceptor::v1::{
+use ryno_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
     ProviderProfileSnapshot, ProviderProfileSnapshotRequest,
     gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
     interceptor_evaluation,
 };
-use openshell_core::proto::{
+use ryno_core::proto::{
     ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
-    UpdateConfigRequest, open_shell_client::OpenShellClient,
+    UpdateConfigRequest, ryno_client::RynoClient,
 };
-use openshell_policy::parse_sandbox_policy;
-use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
+use ryno_policy::parse_sandbox_policy;
+use ryno_providers::{ProviderTypeProfile, normalize_profile_id};
 use policy_hash::{
     HASH_ALGORITHM, canonical_policy_hash, canonical_profile_hash,
     canonical_profile_snapshot_revision, is_v2_digest,
@@ -42,23 +42,23 @@ use tonic::Code;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
-const POLICY_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/policy-signature";
-const POLICY_HASH_ANNOTATION: &str = "openshell.nvidia.com/policy-hash";
-const POLICY_SIGNATURE_KID_ANNOTATION: &str = "openshell.nvidia.com/policy-signature-kid";
+const POLICY_SIGNATURE_ANNOTATION: &str = "ryno.nvidia.com/policy-signature";
+const POLICY_HASH_ANNOTATION: &str = "ryno.nvidia.com/policy-hash";
+const POLICY_SIGNATURE_KID_ANNOTATION: &str = "ryno.nvidia.com/policy-signature-kid";
 const POLICY_RELOAD_CORRELATION_ANNOTATION: &str =
-    "openshell.nvidia.com/policy-reload-correlation-id";
-const PROFILE_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/profile-signature";
-const PROFILE_HASH_ANNOTATION: &str = "openshell.nvidia.com/profile-hash";
-const PROFILE_SIGNATURE_KID_ANNOTATION: &str = "openshell.nvidia.com/profile-signature-kid";
-const POLICY_JWT_ISSUER: &str = "openshell-governance-interceptor";
-const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
+    "ryno.nvidia.com/policy-reload-correlation-id";
+const PROFILE_SIGNATURE_ANNOTATION: &str = "ryno.nvidia.com/profile-signature";
+const PROFILE_HASH_ANNOTATION: &str = "ryno.nvidia.com/profile-hash";
+const PROFILE_SIGNATURE_KID_ANNOTATION: &str = "ryno.nvidia.com/profile-signature-kid";
+const POLICY_JWT_ISSUER: &str = "ryno-governance-interceptor";
+const POLICY_JWT_AUDIENCE: &str = "ryno-governance-policy";
 const POLICY_JWT_SUBJECT: &str = "policy.yaml";
-const PROFILE_JWT_AUDIENCE: &str = "openshell-governance-profile";
+const PROFILE_JWT_AUDIENCE: &str = "ryno-governance-profile";
 const PROFILE_JWT_SUBJECT_PREFIX: &str = "provider-profile:";
 const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
 const RELOAD_CORRELATION_PREFIX: &str = "governance:reload-policy";
-const SERVICE: &str = "openshell.v1.OpenShell";
-const SANDBOX_POLICY_TYPE: &str = "openshell.sandbox.v1.SandboxPolicy";
+const SERVICE: &str = "ryno.v1.Ryno";
+const SANDBOX_POLICY_TYPE: &str = "ryno.sandbox.v1.SandboxPolicy";
 const DEFAULT_POLICY_WATCH_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone)]
@@ -337,10 +337,10 @@ impl GovernanceInterceptorService {
                 ),
             ],
             expected_audience: String::new(),
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
-                "openshell/provider-governance",
-                openshell_core::VERSION,
+            extension: Some(ryno_core::extension_protocol::extension_metadata(
+                ryno_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                "ryno/provider-governance",
+                ryno_core::VERSION,
                 [],
             )),
         }
@@ -558,8 +558,8 @@ impl GatewayInterceptor for GovernanceInterceptorService {
         request: Request<DescribeRequest>,
     ) -> Result<Response<InterceptorManifest>, Status> {
         let manifest = self.manifest();
-        openshell_core::extension_protocol::validate_gateway_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+        ryno_core::extension_protocol::validate_gateway_metadata(
+            ryno_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
             "provider-governance",
             manifest.extension.as_ref(),
             request.into_inner().gateway,
@@ -1237,7 +1237,7 @@ async fn propagate_policy_to_running_sandboxes(
         .connect()
         .await
         .map_err(|err| format!("connect to gateway {gateway_endpoint} failed: {err}"))?;
-    let mut client = OpenShellClient::new(channel);
+    let mut client = RynoClient::new(channel);
     let mut page_token = String::new();
     let correlation_id = format!("{}:{}", RELOAD_CORRELATION_PREFIX, now_secs());
     loop {
@@ -1246,7 +1246,7 @@ async fn propagate_policy_to_running_sandboxes(
                 page_size: 100,
                 page_token,
                 label_selector: String::new(),
-                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                workspace_scope: Some(ryno_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
@@ -1266,7 +1266,7 @@ async fn propagate_policy_to_running_sandboxes(
             let result = client
                 .update_config(UpdateConfigRequest {
                     sandbox: name.clone(),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace_scope: Some(ryno_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
                     policy: Some(policy_state.policy_proto.clone()),

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-prover"
+description = "Formal policy verification for Ryno sandboxes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+vendored-z3 = ["z3/vendored"]
+prebuilt-z3 = ["z3/gh-release"]
+
+[dependencies]
+z3 = { workspace = true }
+ryno-policy-schema = { path = "../ryno-policy-schema" }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+include_dir = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+ryno-core = { path = "../ryno-core" }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

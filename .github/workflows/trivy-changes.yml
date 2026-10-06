@@ -164,7 +164,7 @@ jobs:
           retention-days: 14
 
   result:
-    name: OpenShell / Trivy Changes
+    name: Ryno / Trivy Changes
     needs: [changes, scan]
     if: always()
     runs-on: ubuntu-latest

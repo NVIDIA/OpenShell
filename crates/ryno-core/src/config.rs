@@ -1,0 +1,1658 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Configuration management for `Ryno` components.
+
+use serde::{Deserialize, Deserializer, Serialize, de};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::net::SocketAddr;
+use std::num::{NonZeroI64, NonZeroU64};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration;
+
+// ── Public default constants ────────────────────────────────────────────
+//
+// Canonical source for default values used across multiple crates.
+// Clap `default_value_t` annotations and runtime fallbacks should
+// reference these constants instead of hardcoding literals.
+
+/// Default SSH port inside sandbox containers.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
+
+/// Default gateway server port.
+pub const DEFAULT_SERVER_PORT: u16 = 17670;
+
+/// Default operator-facing name for a gateway installation.
+pub const DEFAULT_GATEWAY_NAME: &str = "ryno";
+
+/// Default container stop timeout in seconds (SIGTERM → SIGKILL).
+pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default cgroup PID limit for local container sandboxes.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
+/// Typed default cgroup PID limit for local container sandboxes.
+#[must_use]
+pub fn default_sandbox_pids_limit() -> Option<NonZeroI64> {
+    NonZeroI64::new(DEFAULT_SANDBOX_PIDS_LIMIT)
+}
+
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "ryno-docker";
+
+/// Default domain used for browser-facing sandbox service URLs.
+pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "ryno.localhost";
+
+/// Gateway posture when a sandbox rejects a candidate policy generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValidationFailureMode {
+    /// Deactivate the previous policy and deny new egress until a valid
+    /// generation is loaded.
+    #[default]
+    FailClosed,
+    /// Keep the last valid generation active when a newer candidate fails
+    /// validation. Startup still fails closed when no valid generation exists.
+    RetainLastValid,
+}
+
+impl PolicyValidationFailureMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::RetainLastValid => "retain_last_valid",
+        }
+    }
+}
+
+impl FromStr for PolicyValidationFailureMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fail_closed" => Ok(Self::FailClosed),
+            "retain_last_valid" => Ok(Self::RetainLastValid),
+            _ => Err(format!(
+                "invalid policy validation failure mode '{value}'; expected fail_closed or retain_last_valid"
+            )),
+        }
+    }
+}
+
+/// Default OCI repository for the supervisor image (no tag).
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/ryno/supervisor";
+
+/// Default OCI repository for the sandbox runtime image (no tag).
+pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/ryno/sandbox";
+
+/// Return the default sandbox runtime image reference with a version-pinned tag.
+#[must_use]
+pub fn default_sandbox_runtime_image() -> String {
+    format!(
+        "{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+/// Return the default supervisor image reference with a version-pinned tag.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    format!(
+        "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+fn default_supervisor_image_tag() -> String {
+    resolve_supervisor_image_tag(&[
+        option_env!("RYNO_IMAGE_TAG").unwrap_or(""),
+        option_env!("IMAGE_TAG").unwrap_or(""),
+        env!("CARGO_PKG_VERSION"),
+    ])
+}
+
+/// Resolve the supervisor image tag from an ordered list of candidates.
+///
+/// Returns the first non-empty, non-`"0.0.0"` candidate, falling back to
+/// `"dev"` when none qualifies. Replaces `+` with `-` for OCI tag
+/// compatibility.
+#[must_use]
+pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .copied()
+        .find(|t| !t.is_empty() && *t != "0.0.0")
+        .unwrap_or("dev")
+        .replace('+', "-")
+}
+
+/// CDI device identifier for requesting all NVIDIA GPUs.
+pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
+/// Normalize a configured compute driver name.
+///
+/// Built-in driver names and custom remote driver names share the same
+/// selection namespace. The normalized value is lowercase ASCII and may contain
+/// letters, digits, `-`, and `_`.
+pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("compute driver name cannot be empty".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(format!(
+            "invalid compute driver name '{value}'. use ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Server configuration.
+///
+/// Built programmatically in [`crate::Config::new`] and the gateway CLI from
+/// the parsed config file, env vars, and CLI flags. It is never deserialized
+/// directly; the on-disk config schema lives in the gateway's `config_file`
+/// module ([`crate::TlsConfig`] and the other nested tables carry their own
+/// `Deserialize` impls for that purpose).
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Operator-assigned name for this gateway installation.
+    pub name: String,
+
+    /// Address to bind the server to.
+    pub bind_address: SocketAddr,
+
+    /// Address to bind the unauthenticated health endpoint to.
+    ///
+    /// When `None`, the dedicated health listener is disabled.
+    pub health_bind_address: Option<SocketAddr>,
+
+    /// Address to bind the Prometheus metrics endpoint to.
+    ///
+    /// When `None`, the dedicated metrics listener is disabled.
+    pub metrics_bind_address: Option<SocketAddr>,
+
+    /// Log level (trace, debug, info, warn, error).
+    pub log_level: String,
+
+    /// Security posture for rejected sandbox policy generations.
+    pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
+    /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
+    pub tls: Option<TlsConfig>,
+
+    /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
+    pub oidc: Option<OidcConfig>,
+
+    /// Gateway user authentication behavior.
+    pub auth: GatewayAuthConfig,
+
+    /// Allow the WebSocket tunnel used by authenticated edge proxies.
+    /// Disabled for local gateways by default.
+    pub enable_websocket_tunnel: bool,
+
+    /// Disabled-by-default gateway interceptor service configs.
+    pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
+
+    /// Ordered provider-profile sources used to build the effective catalog.
+    pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
+
+    /// mTLS user authentication configuration. When enabled, a verified TLS
+    /// client certificate can authenticate CLI/SDK callers as a
+    /// `Principal::User`. This is for local single-user gateways only;
+    /// sandbox identity is always carried by gateway-minted sandbox JWTs.
+    pub mtls_auth: MtlsAuthConfig,
+
+    /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
+    /// loads the signing key from disk and accepts gateway-issued sandbox
+    /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
+    /// flow (issue #1354).
+    pub gateway_jwt: Option<GatewayJwtConfig>,
+
+    /// Database URL for persistence.
+    pub database_url: String,
+
+    /// Explicit compute driver configured for the gateway.
+    /// `None` enables runtime auto-detection.
+    pub compute_driver: Option<String>,
+
+    /// Operator-provided endpoints for named remote compute drivers.
+    ///
+    /// This is populated by CLI/env inputs such as `--compute-driver-socket`.
+    /// TOML-authored endpoints live under `[ryno.drivers.<name>]` and are
+    /// resolved by the gateway config loader.
+    pub compute_driver_endpoints: BTreeMap<String, PathBuf>,
+
+    /// Credential drivers enabled for provider credential storage.
+    pub credential_drivers: Vec<String>,
+
+    /// Optional credential-driver default retained for compatibility. When
+    /// set, it must match the single enabled credential driver.
+    pub default_credential_driver: Option<String>,
+
+    /// TTL for SSH session tokens, in seconds. 0 disables expiry.
+    pub ssh_session_ttl_secs: u64,
+
+    /// Absolute image preparation and initial supervisor startup budget for new
+    /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
+    pub image_preparation_timeout_seconds: u32,
+
+    /// Maximum gRPC requests allowed per rate-limit window.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_requests`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_window_secs: Option<u64>,
+
+    /// Browser-facing sandbox service routing configuration.
+    pub service_routing: ServiceRoutingConfig,
+}
+
+/// Browser-facing sandbox service routing configuration.
+///
+/// Part of the programmatically-built [`Config`]; never deserialized directly.
+#[derive(Debug, Clone)]
+pub struct ServiceRoutingConfig {
+    /// Base domains accepted for `sandbox--service.<domain>` routes.
+    /// The first domain is used when the gateway prints endpoint URLs.
+    pub base_domains: Vec<String>,
+
+    /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
+    /// HTTP for sandbox service hostnames.
+    pub enable_loopback_service_http: bool,
+}
+
+/// TLS configuration.
+///
+/// Two modes are supported:
+/// - **HTTPS with optional mTLS** (`client_ca_path = Some`):
+///   Client certificates are validated against the given CA when presented,
+///   but never required.  Clients may connect with or without a certificate.
+/// - **HTTPS-only** (`client_ca_path = None`):
+///   Server-side TLS only; no client certificates are requested.
+///
+/// In both modes, authentication is handled at the application layer
+/// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Path to the TLS certificate file.
+    pub cert_path: PathBuf,
+
+    /// Path to the TLS private key file.
+    pub key_path: PathBuf,
+
+    /// Path to the CA certificate file for client certificate verification.
+    /// When `Some`, client certs signed by this CA are validated.
+    /// When `None`, the server does not request client certs.
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+
+    /// When `true` and `client_ca_path` is `Some`, the TLS handshake rejects
+    /// connections that do not present a valid client certificate.
+    /// When `false`, client certificates are accepted but not required.
+    #[serde(default)]
+    pub require_client_auth: bool,
+
+    /// Path to an external TLS certificate file (e.g. ACME/publicly-trusted).
+    /// When set, the server uses SNI-based certificate selection: connections
+    /// whose SNI hostname matches `external_server_names` receive this cert,
+    /// all others receive the primary (internal) cert.
+    #[serde(default)]
+    pub external_cert_path: Option<PathBuf>,
+
+    /// Path to the private key for the external TLS certificate.
+    #[serde(default)]
+    pub external_key_path: Option<PathBuf>,
+
+    /// Hostnames that should be served with the external certificate.
+    /// Connections whose SNI matches one of these names receive the external
+    /// cert; all other connections (including those with no SNI) receive the
+    /// primary (internal) cert.
+    #[serde(default)]
+    pub external_server_names: Vec<String>,
+}
+
+/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
+///
+/// When configured, the server validates `authorization: Bearer <JWT>`
+/// headers on gRPC requests against the specified issuer's JWKS endpoint.
+///
+/// The roles claim path is configurable to support different providers:
+/// - Keycloak: `realm_access.roles` (default)
+/// - Entra ID / Okta: `roles`
+/// - Custom: any dot-separated path into the JWT claims
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// OIDC issuer URL (e.g., `https://idp.example.com/realms/ryno`).
+    pub issuer: String,
+
+    /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
+    /// addresses. This is a development-only escape hatch and never permits
+    /// cleartext requests to hostnames or non-loopback addresses.
+    #[serde(default)]
+    pub dangerously_allow_insecure_http: bool,
+
+    /// Additional origins from which JWKS may be loaded. Entries must be
+    /// origins such as `https://www.googleapis.com`, without a path, query,
+    /// credentials, or fragment. The issuer origin is always allowed.
+    #[serde(default)]
+    pub jwks_allowed_origins: Vec<String>,
+
+    /// Expected audience (`aud`) claim. Typically the OIDC client ID.
+    pub audience: String,
+
+    /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
+    #[serde(default = "default_jwks_ttl_secs")]
+    pub jwks_ttl_secs: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Defaults to `realm_access.roles` (Keycloak).
+    /// Examples: `roles` (Entra ID), `groups` (Okta), `custom.path.roles`.
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+
+    /// Role name that grants admin access. Defaults to `ryno-admin`.
+    #[serde(default = "default_admin_role")]
+    pub admin_role: String,
+
+    /// Role name that grants standard user access. Defaults to `ryno-user`.
+    #[serde(default = "default_user_role")]
+    pub user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When non-empty, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
+    #[serde(default)]
+    pub scopes_claim: String,
+}
+
+/// mTLS user authentication for gateway users.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MtlsAuthConfig {
+    /// When true, the gateway maps a verified TLS client certificate into a
+    /// user principal. Sandbox and supervisor clients use bearer identity, so
+    /// this setting is independent of the selected compute driver.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Gateway user authentication settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAuthConfig {
+    /// When true, unauthenticated user/CLI calls are accepted as a local
+    /// developer principal. This is an unsafe local-development escape hatch
+    /// for trusted, non-shared gateways. Sandbox supervisor calls still use
+    /// gateway-minted sandbox JWTs.
+    #[serde(default)]
+    pub allow_unauthenticated_users: bool,
+}
+
+/// One configured gateway interceptor service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorConfig {
+    /// Operator-assigned instance name used in logs and config overrides.
+    pub name: String,
+    /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
+    /// `unix://` endpoints.
+    pub grpc_endpoint: String,
+    /// Optional PEM trust-root bundle for an HTTPS endpoint. The gateway
+    /// loads this file during interceptor initialization.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<PathBuf>,
+    /// Exact JWT audience for this service. When omitted, a kind-scoped value
+    /// is derived from the configured registration name.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Opt out of extension authentication for this interceptor, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
+    /// Deterministic service ordering. Lower values run first.
+    #[serde(default)]
+    pub order: i32,
+    /// Default failure policy for this configured service.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+    /// RFC-style timeout string such as `500ms` or `2s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Maximum accepted encoded `Evaluate` response size.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum JSON patches accepted from one evaluation result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Controls whether manifest bindings are dynamic, allowlisted, or must
+    /// exactly match operator configuration.
+    #[serde(default)]
+    pub binding_policy: GatewayInterceptorBindingPolicy,
+    /// Binding configuration. Its validation and authorization semantics are
+    /// selected by `binding_policy`.
+    #[serde(default)]
+    pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+impl GatewayInterceptorConfig {
+    /// Resolve the configured JWT audience to its deterministic default.
+    pub fn resolved_audience(&self) -> Cow<'_, str> {
+        self.audience
+            .as_deref()
+            .filter(|audience| !audience.is_empty())
+            .map_or_else(
+                || Cow::Owned(format!("urn:ryno:extension:interceptor:{}", self.name)),
+                Cow::Borrowed,
+            )
+    }
+}
+
+/// Operator policy for authorizing interceptor manifest bindings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorBindingPolicy {
+    /// Preserve manifest-controlled binding discovery. Configured bindings
+    /// may narrow or disable manifest declarations.
+    #[default]
+    Dynamic,
+    /// Enable only configured RPC selectors and phases. Extra manifest
+    /// declarations are ignored.
+    Allowlist,
+    /// Require configured and manifest RPC selectors and phases to match.
+    Exact,
+}
+
+/// One configured source in the gateway's effective provider-profile catalog.
+///
+/// Deserialization is hand-written so that the removed `builtin` source is
+/// recognized and rejected with the migration step, rather than reported as an
+/// unknown variant.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayProviderProfileSourceConfig {
+    /// Profiles managed through the provider profile mutation APIs.
+    User,
+    /// Profiles vended by a configured gateway interceptor instance.
+    Interceptor { name: String },
+}
+
+pub(crate) const BUILTIN_PROFILE_SOURCE_REMOVED: &str = "provider profile source type \"builtin\" was removed: provider profiles are import-only. \
+     Remove the entry and import the profiles this gateway needs with \
+     'ryno provider profile import --from providers --global'";
+
+impl<'de> Deserialize<'de> for GatewayProviderProfileSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// Mirrors the public shape, plus the retired `builtin` tag so it can be
+        /// named in the error instead of surfacing as an unknown variant.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Shadow {
+            Builtin,
+            User,
+            Interceptor { name: String },
+        }
+
+        match Shadow::deserialize(deserializer)? {
+            Shadow::Builtin => Err(de::Error::custom(BUILTIN_PROFILE_SOURCE_REMOVED)),
+            Shadow::User => Ok(Self::User),
+            Shadow::Interceptor { name } => Ok(Self::Interceptor { name }),
+        }
+    }
+}
+
+/// Failure behavior when an interceptor evaluation cannot produce a valid
+/// result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorFailurePolicy {
+    FailClosed,
+    FailOpen,
+}
+
+/// Configured binding authorization or dynamic-manifest override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorBindingOverride {
+    /// Binding id from the interceptor manifest.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full selector form: `ryno.v1.Ryno/CreateSandbox`.
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Structured selector service, e.g. `ryno.v1.Ryno`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Structured selector method, e.g. `CreateSandbox`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Narrowed phase set.
+    #[serde(default)]
+    pub phases: Option<Vec<GatewayInterceptorPhaseConfig>>,
+    /// Disable the selected binding.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Binding-specific failure policy override.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+}
+
+/// Config file phase names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorPhaseConfig {
+    ModifyOperation,
+    Validate,
+    PostCommit,
+}
+
+const fn default_jwks_ttl_secs() -> u64 {
+    3600
+}
+
+/// Canonical policy controlling when a driver pulls a sandbox image.
+///
+/// Backends translate this shared vocabulary to their runtime API. `newer` is
+/// supported only by Podman; other backends reject it during configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePullPolicy {
+    /// Always pull, even if a local image is available.
+    Always,
+    /// Pull only when a local image is unavailable.
+    #[default]
+    IfNotPresent,
+    /// Never pull; fail when a local image is unavailable.
+    Never,
+    /// Pull only when the registry image is newer than the local copy.
+    Newer,
+}
+
+impl ImagePullPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::IfNotPresent => "if_not_present",
+            Self::Never => "never",
+            Self::Newer => "newer",
+        }
+    }
+}
+
+impl fmt::Display for ImagePullPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImagePullPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "always" => Ok(Self::Always),
+            "if_not_present" => Ok(Self::IfNotPresent),
+            "never" => Ok(Self::Never),
+            "newer" => Ok(Self::Newer),
+            other => Err(format!(
+                "invalid image pull policy '{other}'; expected one of: always, if_not_present, never, newer"
+            )),
+        }
+    }
+}
+
+/// Canonical `AppArmor` confinement requested for a sandbox container.
+///
+/// Drivers translate this model to their runtime API. An omitted value leaves
+/// the runtime default unchanged; `Unconfined` is explicit because the
+/// supervisor needs mount operations that the default Docker/Podman profile
+/// commonly denies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppArmorProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(String),
+}
+
+impl AppArmorProfile {
+    #[must_use]
+    pub const fn kubernetes_type(&self) -> &'static str {
+        match self {
+            Self::RuntimeDefault => "RuntimeDefault",
+            Self::Unconfined => "Unconfined",
+            Self::Localhost(_) => "Localhost",
+        }
+    }
+
+    #[must_use]
+    pub fn localhost_profile(&self) -> Option<&str> {
+        match self {
+            Self::Localhost(profile) => Some(profile),
+            Self::RuntimeDefault | Self::Unconfined => None,
+        }
+    }
+
+    /// Translate to the OCI `apparmor=<profile>` security option.
+    ///
+    /// `RuntimeDefault` deliberately returns `None`: omitting an OCI option
+    /// asks Docker/Podman to apply their runtime default profile.
+    #[must_use]
+    pub fn oci_security_opt(&self) -> Option<String> {
+        match self {
+            Self::RuntimeDefault => None,
+            Self::Unconfined => Some("apparmor=unconfined".to_string()),
+            Self::Localhost(profile) => Some(format!("apparmor={profile}")),
+        }
+    }
+}
+
+impl fmt::Display for AppArmorProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
+            Self::Unconfined => f.write_str("Unconfined"),
+            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
+        }
+    }
+}
+
+impl FromStr for AppArmorProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "RuntimeDefault" => Ok(Self::RuntimeDefault),
+            "Unconfined" => Ok(Self::Unconfined),
+            other => match other.strip_prefix("Localhost/") {
+                Some("") => Err(
+                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
+                        .to_string(),
+                ),
+                Some(profile) if !profile.contains(char::is_whitespace) => {
+                    Ok(Self::Localhost(profile.to_string()))
+                }
+                Some(_) => {
+                    Err("invalid AppArmor localhost profile; whitespace is not allowed".to_string())
+                }
+                None => Err(format!(
+                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
+                )),
+            },
+        }
+    }
+}
+
+impl Serialize for AppArmorProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AppArmorProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(de::Error::custom)
+    }
+}
+
+/// Common local-driver corporate forward-proxy settings.
+///
+/// This type is `flatten`ed by local compute-driver tables, preserving the
+/// established TOML field names while keeping their safety contract shared.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamProxyConfig {
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub proxy_auth_file: Option<PathBuf>,
+    pub proxy_auth_allow_insecure: Option<bool>,
+    pub proxy_connect_by_hostname: Option<bool>,
+}
+
+impl UpstreamProxyConfig {
+    /// Validate relationships that are independent of the container backend.
+    /// Credential contents are intentionally not read here and are never put
+    /// in an error message; drivers validate and stage them per sandbox.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+
+        let proxy_secure = if let Some(url) = self.https_proxy.as_deref() {
+            parse_upstream_proxy_url(url)
+                .map_err(|err| match err {
+                    UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
+                    UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials; supply them with proxy_auth_file so they are not stored in configuration or runtime metadata".to_string(),
+                    err => format!("https_proxy {err}"),
+                })?
+                .secure
+        } else {
+            false
+        };
+
+        if self
+            .no_proxy
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("no_proxy must not be empty when set; omit it instead".to_string());
+        }
+        if self.no_proxy.is_some() && self.https_proxy.is_none() {
+            return Err("no_proxy is set but no https_proxy is configured".to_string());
+        }
+        if let Some(path) = self.proxy_auth_file.as_ref() {
+            if path.as_os_str().is_empty() {
+                return Err("proxy_auth_file must not be empty when set".to_string());
+            }
+            if self.https_proxy.is_none() {
+                return Err("proxy_auth_file is set but no https_proxy is configured".to_string());
+            }
+            if !proxy_secure && self.proxy_auth_allow_insecure != Some(true) {
+                return Err("proxy_auth_file sends a cleartext Basic credential to an http:// proxy; set proxy_auth_allow_insecure = true to acknowledge that exposure".to_string());
+            }
+        } else if self.proxy_auth_allow_insecure.is_some() {
+            return Err(
+                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
+            );
+        }
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Gateway-minted sandbox JWT configuration.
+///
+/// Points the gateway at the Ed25519 signing key (produced by `certgen`)
+/// and identifies the issuer string embedded in every minted token. The
+/// signing key never leaves the gateway process; the public key is loaded
+/// by the same gateway so it can validate its own tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayJwtConfig {
+    /// Path to the Ed25519 signing key (PKCS#8 PEM).
+    pub signing_key_path: PathBuf,
+    /// Path to the matching public key (SPKI PEM).
+    pub public_key_path: PathBuf,
+    /// Path to the `kid` value (plain text, one line).
+    pub kid_path: PathBuf,
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to
+    /// `ryno`.
+    #[serde(default = "default_gateway_id")]
+    pub gateway_id: String,
+    /// Token lifetime in seconds. Omission selects non-expiring sandbox
+    /// session credentials and the default lifetime for extension tokens.
+    /// Explicit zero is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<NonZeroU64>,
+}
+
+impl GatewayJwtConfig {
+    /// Effective typed extension-token lifetime.
+    pub fn token_ttl(&self) -> Duration {
+        self.ttl_secs.map_or(Duration::from_mins(15), |ttl| {
+            Duration::from_secs(ttl.get())
+        })
+    }
+
+    /// Effective sandbox session-token lifetime. `None` is non-expiring.
+    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
+        self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
+    }
+}
+
+fn default_gateway_id() -> String {
+    "ryno".to_string()
+}
+
+fn default_roles_claim() -> String {
+    "realm_access.roles".to_string()
+}
+
+fn default_admin_role() -> String {
+    "ryno-admin".to_string()
+}
+
+fn default_user_role() -> String {
+    "ryno-user".to_string()
+}
+
+impl Config {
+    /// Create a new config with optional TLS.
+    pub fn new(tls: Option<TlsConfig>) -> Self {
+        Self {
+            name: DEFAULT_GATEWAY_NAME.to_string(),
+            bind_address: default_bind_address(),
+            health_bind_address: None,
+            metrics_bind_address: None,
+            log_level: default_log_level(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            tls,
+            oidc: None,
+            auth: GatewayAuthConfig::default(),
+            enable_websocket_tunnel: false,
+            gateway_interceptors: Vec::new(),
+            provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
+            mtls_auth: MtlsAuthConfig::default(),
+            gateway_jwt: None,
+            database_url: String::new(),
+            compute_driver: None,
+            compute_driver_endpoints: BTreeMap::new(),
+            credential_drivers: Vec::new(),
+            default_credential_driver: None,
+            ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            image_preparation_timeout_seconds: 1800,
+            grpc_rate_limit_requests: None,
+            grpc_rate_limit_window_secs: None,
+            service_routing: ServiceRoutingConfig::default(),
+        }
+    }
+
+    /// Create a new configuration with the gateway installation name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Create a new configuration with the given bind address.
+    #[must_use]
+    pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.bind_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.health_bind_address = Some(addr);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Create a new configuration with the given log level.
+    #[must_use]
+    pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
+        self.log_level = level.into();
+        self
+    }
+
+    /// Create a new configuration with a database URL.
+    #[must_use]
+    pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
+        self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with an explicit compute driver.
+    #[must_use]
+    pub fn with_compute_driver(mut self, driver: impl ToString) -> Self {
+        self.compute_driver = Some(driver.to_string());
+        self
+    }
+
+    /// Register a Unix domain socket endpoint for a named remote driver.
+    #[must_use]
+    pub fn with_compute_driver_endpoint(
+        mut self,
+        name: impl Into<String>,
+        socket: impl Into<PathBuf>,
+    ) -> Self {
+        self.compute_driver_endpoints
+            .insert(name.into(), socket.into());
+        self
+    }
+
+    /// Create a new configuration with the configured credential drivers.
+    #[must_use]
+    pub fn with_credential_drivers<I, S>(mut self, drivers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.credential_drivers = drivers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Create a new configuration with the default credential driver.
+    #[must_use]
+    pub fn with_default_credential_driver(mut self, driver: Option<impl Into<String>>) -> Self {
+        self.default_credential_driver = driver.map(Into::into);
+        self
+    }
+
+    /// Create a new configuration with the SSH session TTL.
+    #[must_use]
+    pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
+        self.ssh_session_ttl_secs = secs;
+        self
+    }
+
+    /// Set the gateway-wide gRPC request rate limit.
+    #[must_use]
+    pub const fn with_grpc_rate_limit(
+        mut self,
+        requests: Option<u64>,
+        window_secs: Option<u64>,
+    ) -> Self {
+        self.grpc_rate_limit_requests = requests;
+        self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set configured gateway interceptors.
+    #[must_use]
+    pub fn with_gateway_interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayInterceptorConfig>,
+    {
+        self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the ordered provider-profile sources used by the gateway.
+    #[must_use]
+    pub fn with_provider_profile_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayProviderProfileSourceConfig>,
+    {
+        self.provider_profile_sources = sources.into_iter().collect();
+        self
+    }
+
+    /// Return the effective gRPC rate limit, if fully configured and enabled.
+    #[must_use]
+    pub fn grpc_rate_limit(&self) -> Option<(u64, Duration)> {
+        let requests = self.grpc_rate_limit_requests?;
+        let window_secs = self.grpc_rate_limit_window_secs?;
+        if requests == 0 || window_secs == 0 {
+            None
+        } else {
+            Some((requests, Duration::from_secs(window_secs)))
+        }
+    }
+    /// Set the OIDC configuration for JWT-based authentication.
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
+        self.oidc = Some(oidc);
+        self
+    }
+
+    /// Derive browser-facing sandbox service domains from gateway server SANs.
+    ///
+    /// Wildcard DNS SANs such as `*.apps.example.com` enable service URLs
+    /// under `apps.example.com`. Non-wildcard DNS names and IP SANs do not
+    /// enable service subdomains.
+    #[must_use]
+    pub fn with_server_sans<I, S>(mut self, sans: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.service_routing.base_domains = service_routing_domains_from_server_sans(sans);
+        self
+    }
+
+    /// Enable or disable plaintext HTTP routing for loopback sandbox service
+    /// hostnames on TLS-enabled gateway listeners.
+    #[must_use]
+    pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
+        self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[must_use]
+    pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
+        self.enable_websocket_tunnel = enabled;
+        self
+    }
+}
+
+impl Default for ServiceRoutingConfig {
+    fn default() -> Self {
+        Self {
+            base_domains: default_service_routing_domains(),
+            enable_loopback_service_http: default_enable_loopback_service_http(),
+        }
+    }
+}
+
+fn default_bind_address() -> SocketAddr {
+    "127.0.0.1:17670".parse().expect("valid default address")
+}
+
+fn default_service_routing_domains() -> Vec<String> {
+    vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
+}
+
+const fn default_enable_loopback_service_http() -> bool {
+    true
+}
+
+fn service_routing_domains_from_server_sans<I, S>(sans: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut domains = Vec::new();
+    for san in sans {
+        if let Some(domain) = service_routing_domain_from_server_san(&san.into())
+            && !domains.contains(&domain)
+        {
+            domains.push(domain);
+        }
+    }
+    for domain in default_service_routing_domains() {
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+fn service_routing_domain_from_server_san(san: &str) -> Option<String> {
+    let san = san.trim().trim_matches('.').to_ascii_lowercase();
+    let domain = san.strip_prefix("*.")?;
+    normalize_service_routing_domain(domain)
+}
+
+fn normalize_service_routing_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim().trim_matches('.');
+    if domain.is_empty() || domain.len() > 253 {
+        return None;
+    }
+    let labels = domain.split('.');
+    if labels.clone().any(|label| !is_dns_label(label)) {
+        return None;
+    }
+    Some(domain.to_string())
+}
+
+fn is_dns_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+const fn default_ssh_session_ttl_secs() -> u64 {
+    86400 // 24 hours
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
+        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
+        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+    };
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    #[test]
+    fn policy_validation_failure_mode_is_secure_by_default() {
+        assert_eq!(
+            Config::new(None).policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
+        );
+        assert_eq!(
+            "retain_last_valid"
+                .parse::<PolicyValidationFailureMode>()
+                .unwrap(),
+            PolicyValidationFailureMode::RetainLastValid
+        );
+        assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
+    }
+
+    #[test]
+    fn compute_driver_name_normalization_accepts_builtin_and_custom_names() {
+        assert_eq!(normalize_compute_driver_name(" VM ").unwrap(), "vm");
+        assert_eq!(
+            normalize_compute_driver_name("Kyma_GPU-1").unwrap(),
+            "kyma_gpu-1"
+        );
+
+        let err = normalize_compute_driver_name("kyma/gpu").unwrap_err();
+        assert!(err.contains("invalid compute driver name"));
+    }
+
+    #[test]
+    fn config_defaults_to_loopback_bind_address() {
+        let expected: SocketAddr = "127.0.0.1:17670".parse().expect("valid address");
+        assert_eq!(Config::new(None).bind_address, expected);
+    }
+
+    #[test]
+    fn config_new_disables_health_bind_by_default() {
+        let cfg = Config::new(None);
+        assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn config_disables_unauthenticated_users_by_default() {
+        let cfg = Config::new(None);
+        assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn config_defaults_to_the_user_provider_profile_source() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.provider_profile_sources,
+            vec![GatewayProviderProfileSourceConfig::User]
+        );
+    }
+
+    #[test]
+    fn builtin_provider_profile_source_is_rejected_with_the_import_step() {
+        let error =
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"builtin"}"#)
+                .expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("ryno provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn user_and_interceptor_provider_profile_sources_still_parse() {
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"user"}"#)
+                .unwrap(),
+            GatewayProviderProfileSourceConfig::User
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(
+                r#"{"type":"interceptor","name":"governance"}"#
+            )
+            .unwrap(),
+            GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn config_defaults_to_internal_credential_storage() {
+        let cfg = Config::new(None);
+        assert!(cfg.credential_drivers.is_empty());
+        assert!(cfg.default_credential_driver.is_none());
+    }
+
+    #[test]
+    fn config_accepts_credential_driver_settings() {
+        let cfg = Config::new(None)
+            .with_credential_drivers(["kubernetes-secrets", "vault"])
+            .with_default_credential_driver(Some("kubernetes-secrets"));
+
+        assert_eq!(
+            cfg.credential_drivers,
+            vec!["kubernetes-secrets".to_string(), "vault".to_string()]
+        );
+        assert_eq!(
+            cfg.default_credential_driver.as_deref(),
+            Some("kubernetes-secrets")
+        );
+    }
+
+    #[test]
+    fn gateway_jwt_omitted_ttl_defaults_extension_and_nonexpiring_session_tokens() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid"
+        }))
+        .expect("gateway JWT config should deserialize with default ttl");
+
+        assert_eq!(cfg.ttl_secs, None);
+        assert_eq!(cfg.token_ttl(), Duration::from_mins(15));
+        assert_eq!(cfg.sandbox_token_ttl(), None);
+
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert!(serialized.get("ttl_secs").is_none());
+    }
+
+    #[test]
+    fn gateway_jwt_positive_ttl_serializes_and_has_effective_duration() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 3600
+        }))
+        .expect("gateway JWT config should deserialize with positive ttl");
+
+        assert_eq!(cfg.token_ttl(), Duration::from_hours(1));
+        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert_eq!(serialized["ttl_secs"], 3600);
+    }
+
+    #[test]
+    fn gateway_jwt_ttl_rejects_zero() {
+        let error = serde_json::from_value::<GatewayJwtConfig>(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 0
+        }))
+        .expect_err("zero TTL must be rejected");
+        assert!(error.to_string().contains("invalid value: integer `0`"));
+    }
+
+    #[test]
+    fn image_pull_policy_uses_canonical_vocabulary() {
+        for (value, expected) in [
+            ("always", ImagePullPolicy::Always),
+            ("if_not_present", ImagePullPolicy::IfNotPresent),
+            ("never", ImagePullPolicy::Never),
+            ("newer", ImagePullPolicy::Newer),
+        ] {
+            assert_eq!(value.parse::<ImagePullPolicy>(), Ok(expected));
+            assert_eq!(expected.to_string(), value);
+            assert_eq!(serde_json::to_value(expected).unwrap(), value);
+        }
+        assert!("missing".parse::<ImagePullPolicy>().is_err());
+        assert!("IfNotPresent".parse::<ImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn app_armor_profiles_round_trip_and_translate_for_each_backend() {
+        for (value, expected, kubernetes_type, localhost_profile, oci_security_opt) in [
+            (
+                "RuntimeDefault",
+                AppArmorProfile::RuntimeDefault,
+                "RuntimeDefault",
+                None,
+                None,
+            ),
+            (
+                "Unconfined",
+                AppArmorProfile::Unconfined,
+                "Unconfined",
+                None,
+                Some("apparmor=unconfined"),
+            ),
+            (
+                "Localhost/ryno-supervisor",
+                AppArmorProfile::Localhost("ryno-supervisor".to_string()),
+                "Localhost",
+                Some("ryno-supervisor"),
+                Some("apparmor=ryno-supervisor"),
+            ),
+        ] {
+            let parsed = value.parse::<AppArmorProfile>().expect("valid profile");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), value);
+            assert_eq!(parsed.kubernetes_type(), kubernetes_type);
+            assert_eq!(parsed.localhost_profile(), localhost_profile);
+            assert_eq!(parsed.oci_security_opt().as_deref(), oci_security_opt);
+
+            let json = serde_json::to_value(&parsed).expect("profile serializes");
+            assert_eq!(json, value);
+            assert_eq!(
+                serde_json::from_value::<AppArmorProfile>(json).expect("profile deserializes"),
+                parsed
+            );
+        }
+
+        for invalid in [
+            "Localhost/",
+            "Localhost/ryno profile",
+            "runtimeDefault",
+            "unconfined",
+            "Unknown",
+        ] {
+            assert!(
+                invalid.parse::<AppArmorProfile>().is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_validation_enforces_cross_field_contract() {
+        let auth_file = Some("/run/secrets/proxy-auth".into());
+        let cases = [
+            ("default", UpstreamProxyConfig::default(), None),
+            (
+                "https auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "acknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "unacknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "no_proxy without proxy",
+                UpstreamProxyConfig {
+                    no_proxy: Some("localhost".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "blank no_proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    no_proxy: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "auth file without proxy",
+                UpstreamProxyConfig {
+                    proxy_auth_file: auth_file,
+                    ..Default::default()
+                },
+                Some("proxy_auth_file"),
+            ),
+            (
+                "ack without auth file",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "hostname mode without proxy",
+                UpstreamProxyConfig {
+                    proxy_connect_by_hostname: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_connect_by_hostname"),
+            ),
+            (
+                "empty proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some(String::new()),
+                    ..Default::default()
+                },
+                Some("https_proxy"),
+            ),
+            (
+                "inline credentials",
+                UpstreamProxyConfig {
+                    https_proxy: Some(
+                        "https://secret-user:secret-password@proxy.example:8443".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Some("must not embed credentials"),
+            ),
+        ];
+
+        for (name, config, expected_error) in cases {
+            match expected_error {
+                None => config
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                Some(expected) => {
+                    let error = match config.validate() {
+                        Ok(()) => panic!("{name} should fail validation"),
+                        Err(error) => error,
+                    };
+                    assert!(error.contains(expected), "{name}: {error}");
+                    assert!(!error.contains("secret-user"), "{name}: {error}");
+                    assert!(!error.contains("secret-password"), "{name}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_defaults_and_builder_use_singular_compute_driver() {
+        let config = Config::new(None);
+        assert_eq!(config.compute_driver, None);
+        assert_eq!(
+            Config::new(None)
+                .with_compute_driver("podman")
+                .compute_driver
+                .as_deref(),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn typed_sandbox_pids_default_matches_positive_constant() {
+        assert_eq!(
+            default_sandbox_pids_limit().map(std::num::NonZeroI64::get),
+            Some(super::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn name_defaults_and_can_be_overridden() {
+        assert_eq!(Config::new(None).name, "ryno");
+        assert_eq!(
+            Config::new(None).with_name("production-us-west").name,
+            "production-us-west"
+        );
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
+    }
+
+    #[test]
+    fn gateway_interceptor_binding_policy_defaults_and_parses_strict_modes() {
+        let defaulted: GatewayInterceptorConfig = serde_json::from_value(serde_json::json!({
+            "name": "governance",
+            "grpc_endpoint": "unix:///tmp/governance.sock"
+        }))
+        .unwrap();
+        let allowlist: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("allowlist")).unwrap();
+        let exact: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("exact")).unwrap();
+
+        assert_eq!(
+            defaulted.binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(
+            defaulted.resolved_audience(),
+            "urn:ryno:extension:interceptor:governance"
+        );
+        let explicitly_empty = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            audience: Some(String::new()),
+            ..GatewayInterceptorConfig::default()
+        };
+        assert_eq!(
+            explicitly_empty.resolved_audience(),
+            "urn:ryno:extension:interceptor:governance"
+        );
+        assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
+        assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);
+    }
+
+    #[test]
+    fn grpc_rate_limit_requires_positive_pair() {
+        assert!(Config::new(None).grpc_rate_limit().is_none());
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), None)
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(0), Some(60))
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert_eq!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), Some(60))
+                .grpc_rate_limit(),
+            Some((10, Duration::from_mins(1)))
+        );
+    }
+
+    #[test]
+    fn service_routing_allows_loopback_plaintext_http_by_default() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
+        );
+        assert!(cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn server_sans_update_preserves_loopback_plaintext_http_flag() {
+        let cfg = Config::new(None)
+            .with_loopback_service_http(false)
+            .with_server_sans(["*.dev.ryno.localhost"]);
+
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "dev.ryno.localhost".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
+        assert!(!cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_routing_domains_are_derived_from_wildcard_server_sans() {
+        let cfg = Config::new(None).with_server_sans([
+            "gateway.example.com",
+            "*.apps.example.com",
+            "127.0.0.1",
+            "*.apps.example.com",
+            "*.dev.example.com.",
+        ]);
+
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                "dev.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_with_health_bind_address_sets_address() {
+        let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
+        let cfg = Config::new(None).with_health_bind_address(addr);
+        assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn supervisor_image_tag_prefers_explicit_build_tags() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+            "1.2.3"
+        );
+        assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
+        assert_eq!(
+            resolve_supervisor_image_tag(&["latest", "", "1.2.3"]),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+    }
+
+    #[test]
+    fn default_supervisor_image_is_version_pinned() {
+        use super::{default_sandbox_runtime_image, default_supervisor_image};
+        let image = default_supervisor_image();
+        assert!(image.starts_with("ghcr.io/nvidia/ryno/supervisor:"));
+        let tag = image.rsplit_once(':').unwrap().1;
+        assert!(!tag.is_empty());
+
+        let sandbox_image = default_sandbox_runtime_image();
+        assert!(sandbox_image.starts_with("ghcr.io/nvidia/ryno/sandbox:"));
+        let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
+        assert!(!sandbox_tag.is_empty());
+    }
+}

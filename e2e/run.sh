@@ -32,7 +32,7 @@ Options:
 
 Omit --vm and --with to run the gateway on the host. Supplying --with without
 --vm selects Fedora for the Podman driver and Ubuntu otherwise. Set
-OPENSHELL_E2E_KEEP=1 to retain state.
+RYNO_E2E_KEEP=1 to retain state.
 EOF
 }
 
@@ -142,7 +142,7 @@ if ! gateway_config="$(resolve_file "${gateway_config_source}")"; then
 fi
 gateway_driver="$(python3 -c '
 import sys, tomllib
-gateway = tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]
+gateway = tomllib.load(open(sys.argv[1], "rb"))["ryno"]["gateway"]
 driver = gateway.get("compute_driver")
 if not driver:
     raise SystemExit("gateway config must explicitly select a compute driver")
@@ -197,12 +197,12 @@ if [ "${mode}" = vm ]; then
 	done
 fi
 
-gateway_ready_timeout=${OPENSHELL_E2E_GATEWAY_READY_TIMEOUT:-600}
+gateway_ready_timeout=${RYNO_E2E_GATEWAY_READY_TIMEOUT:-600}
 if [[ ! ${gateway_ready_timeout} =~ ^[1-9][0-9]*$ ]]; then
-	die "OPENSHELL_E2E_GATEWAY_READY_TIMEOUT must be a positive integer"
+	die "RYNO_E2E_GATEWAY_READY_TIMEOUT must be a positive integer"
 fi
 if ! command -v mise >/dev/null 2>&1; then
-	die "mise is required to build OpenShell"
+	die "mise is required to build Ryno"
 fi
 if ! command -v openssl >/dev/null 2>&1; then
 	die "OpenSSL is required to generate sandbox JWT keys"
@@ -234,40 +234,40 @@ target_dir="$(e2e_cargo_target_dir "${ROOT}" mise x -- cargo)"
 
 ensure_build_nofile_limit
 
-echo "==> Building native host openshell CLI"
-mise x -- cargo build "${cargo_jobs[@]}" -p openshell-cli --bin openshell
-host_cli_bin="${target_dir}/debug/openshell"
+echo "==> Building native host ryno CLI"
+mise x -- cargo build "${cargo_jobs[@]}" -p ryno-cli --bin ryno
+host_cli_bin="${target_dir}/debug/ryno"
 
 echo "==> Preparing ${linux_musl_target} build target"
 mise x -- rustup target add "${linux_musl_target}" >/dev/null
 
-echo "==> Building Linux openshell-sandbox (${linux_musl_target})"
+echo "==> Building Linux ryno-sandbox (${linux_musl_target})"
 mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--release \
 	--target "${linux_musl_target}" \
-	-p openshell-sandbox \
-	--bin openshell-sandbox
-linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/openshell-sandbox"
+	-p ryno-sandbox \
+	--bin ryno-sandbox
+linux_sandbox_bin="${target_dir}/${linux_musl_target}/release/ryno-sandbox"
 
-echo "==> Building Linux openshell-supervisor (${linux_musl_target})"
+echo "==> Building Linux ryno-supervisor (${linux_musl_target})"
 mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 	--release \
 	--target "${linux_musl_target}" \
-	-p openshell-supervisor \
-	--bin openshell-supervisor
-linux_supervisor_bin="${target_dir}/${linux_musl_target}/release/openshell-supervisor"
+	-p ryno-supervisor \
+	--bin ryno-supervisor
+linux_supervisor_bin="${target_dir}/${linux_musl_target}/release/ryno-supervisor"
 
 host_gateway_bin=
 guest_gateway_bin=
 if [ "${mode}" = host ]; then
-	echo "==> Building native host openshell-gateway"
+	echo "==> Building native host ryno-gateway"
 	mise x -- cargo build "${cargo_jobs[@]}" \
-		-p openshell-gateway \
-		--bin openshell-gateway \
+		-p ryno-gateway \
+		--bin ryno-gateway \
 		--features vendored-z3
-	host_gateway_bin="${target_dir}/debug/openshell-gateway"
+	host_gateway_bin="${target_dir}/debug/ryno-gateway"
 else
-	echo "==> Building Linux openshell-gateway (${linux_gateway_zig_target})"
+	echo "==> Building Linux ryno-gateway (${linux_gateway_zig_target})"
 	(
 		eval "$(
 			"${ROOT}/tasks/scripts/setup-zig-cc-wrapper.sh" \
@@ -278,11 +278,11 @@ else
 		mise x -- cargo zigbuild "${cargo_jobs[@]}" \
 			--release \
 			--target "${linux_gateway_zig_target}" \
-			-p openshell-gateway \
-			--bin openshell-gateway \
+			-p ryno-gateway \
+			--bin ryno-gateway \
 			--features vendored-z3
 	)
-	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/openshell-gateway"
+	guest_gateway_bin="${target_dir}/${linux_gateway_rust_target}/release/ryno-gateway"
 fi
 
 expected_binaries=("${host_cli_bin}" "${linux_sandbox_bin}" "${linux_supervisor_bin}")
@@ -298,24 +298,24 @@ for binary in "${expected_binaries[@]}"; do
 	fi
 done
 
-run_parent="${ROOT}/.cache/openshell-e2e/runs"
+run_parent="${ROOT}/.cache/ryno-e2e/runs"
 mkdir -p "${run_parent}"
 run_dir="$(mktemp -d "${run_parent%/}/run.XXXXXX")"
 if ! command -v tar >/dev/null 2>&1; then
 	die "tar is required to package the runtime images"
 fi
-sandbox_runtime_image=localhost/openshell/sandbox:e2e-vm
+sandbox_runtime_image=localhost/ryno/sandbox:e2e-vm
 sandbox_runtime_rootfs="${run_dir}/sandbox-runtime-rootfs"
 sandbox_runtime_archive="${run_dir}/sandbox-runtime.tar"
 mkdir -p "${sandbox_runtime_rootfs}"
-install -m 0555 "${linux_sandbox_bin}" "${sandbox_runtime_rootfs}/openshell-sandbox"
-tar -C "${sandbox_runtime_rootfs}" -cf "${sandbox_runtime_archive}" openshell-sandbox
-supervisor_image=localhost/openshell/supervisor:e2e-vm
+install -m 0555 "${linux_sandbox_bin}" "${sandbox_runtime_rootfs}/ryno-sandbox"
+tar -C "${sandbox_runtime_rootfs}" -cf "${sandbox_runtime_archive}" ryno-sandbox
+supervisor_image=localhost/ryno/supervisor:e2e-vm
 supervisor_rootfs="${run_dir}/supervisor-rootfs"
 supervisor_archive="${run_dir}/supervisor.tar"
 mkdir -p "${supervisor_rootfs}"
-install -m 0555 "${linux_supervisor_bin}" "${supervisor_rootfs}/openshell-supervisor"
-"${ROOT}/tasks/scripts/verify-static-binary.sh" "${supervisor_rootfs}/openshell-supervisor"
+install -m 0555 "${linux_supervisor_bin}" "${supervisor_rootfs}/ryno-supervisor"
+"${ROOT}/tasks/scripts/verify-static-binary.sh" "${supervisor_rootfs}/ryno-supervisor"
 mkdir -p "${supervisor_rootfs}/etc/ssl/certs"
 if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
 	install -m 0444 /etc/ssl/certs/ca-certificates.crt \
@@ -324,11 +324,11 @@ else
 	die "/etc/ssl/certs/ca-certificates.crt is required to package the supervisor image"
 fi
 tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" \
-	openshell-supervisor etc/ssl/certs/ca-certificates.crt
+	ryno-supervisor etc/ssl/certs/ca-certificates.crt
 child_pid=
 runtime_log=
 keep=0
-if [ "${OPENSHELL_E2E_KEEP:-0}" = 1 ]; then
+if [ "${RYNO_E2E_KEEP:-0}" = 1 ]; then
 	keep=1
 fi
 
@@ -396,7 +396,7 @@ jwt_source_dir="${run_dir}/gateway-jwt"
 host_runtime_dir=
 if [ "${mode}" = host ]; then
 	host_runtime_dir="${run_dir}/host-runtime"
-	jwt_source_dir="${host_runtime_dir}/.cache/openshell-e2e/gateway-jwt"
+	jwt_source_dir="${host_runtime_dir}/.cache/ryno-e2e/gateway-jwt"
 fi
 e2e_generate_gateway_jwt "${jwt_source_dir}"
 
@@ -411,33 +411,33 @@ export XDG_DATA_HOME="${run_dir}/host/data"
 export XDG_STATE_HOME="${run_dir}/host/state"
 mkdir -p "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" "${XDG_STATE_HOME}"
 
-gateway_name="openshell-e2e-${mode}-${host_port}"
+gateway_name="ryno-e2e-${mode}-${host_port}"
 gateway_endpoint="http://127.0.0.1:${host_port}"
-export OPENSHELL_GATEWAY_ENDPOINT="${gateway_endpoint}"
-export OPENSHELL_GATEWAY="${gateway_name}"
-export OPENSHELL_BIN="${host_cli_bin}"
+export RYNO_GATEWAY_ENDPOINT="${gateway_endpoint}"
+export RYNO_GATEWAY="${gateway_name}"
+export RYNO_BIN="${host_cli_bin}"
 
 if [ "${mode}" = host ]; then
 	case "${gateway_driver}" in
 	docker)
 		e2e_align_docker_host_with_cli_context
 		docker import \
-			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			--change 'ENTRYPOINT ["/ryno-sandbox"]' \
 			"${sandbox_runtime_archive}" \
 			"${sandbox_runtime_image}" >/dev/null
 		docker import \
-			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
+			--change 'ENTRYPOINT ["/ryno-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
 		docker run --rm --network none "${supervisor_image}" --help >/dev/null
 		;;
 	podman)
 		podman import \
-			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			--change 'ENTRYPOINT ["/ryno-sandbox"]' \
 			"${sandbox_runtime_archive}" \
 			"${sandbox_runtime_image}" >/dev/null
 		podman import \
-			--change 'ENTRYPOINT ["/openshell-supervisor"]' \
+			--change 'ENTRYPOINT ["/ryno-supervisor"]' \
 			"${supervisor_archive}" \
 			"${supervisor_image}" >/dev/null
 		podman run --rm --network none "${supervisor_image}" --help >/dev/null
@@ -457,9 +457,9 @@ if [ "${mode}" = host ]; then
 else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
-	guest_launcher_path=/home/openshell/.cache/openshell-e2e/bin/launch-gateway
-	guest_sandbox_runtime_archive_path=/home/openshell/.cache/openshell-e2e/sandbox-runtime.tar
-	guest_supervisor_archive_path=/home/openshell/.cache/openshell-e2e/supervisor.tar
+	guest_launcher_path=/home/ryno/.cache/ryno-e2e/bin/launch-gateway
+	guest_sandbox_runtime_archive_path=/home/ryno/.cache/ryno-e2e/sandbox-runtime.tar
+	guest_supervisor_archive_path=/home/ryno/.cache/ryno-e2e/supervisor.tar
 	config_payload="$(base64 <"${gateway_config}" | tr -d '\r\n')"
 	jwt_signing_payload="$(base64 <"${jwt_source_dir}/signing.pem" | tr -d '\r\n')"
 	jwt_public_payload="$(base64 <"${jwt_source_dir}/public.pem" | tr -d '\r\n')"
@@ -477,10 +477,10 @@ report_timing() {
 
 phase_started_at=\${SECONDS}
 umask 077
-state_root=/home/openshell/.cache/openshell-e2e
+state_root=/home/ryno/.cache/ryno-e2e
 config_path=\${state_root}/gateway.toml
 jwt_root=\${state_root}/gateway-jwt
-sudo chown -R "\$(id -u):\$(id -g)" /home/openshell/.cache
+sudo chown -R "\$(id -u):\$(id -g)" /home/ryno/.cache
 chmod 0700 "\${state_root}"
 mkdir -p "\${state_root}/xdg/cache" "\${state_root}/xdg/config" "\${state_root}/xdg/data" "\${state_root}/xdg/state" "\${jwt_root}"
 printf '%s' '${config_payload}' | base64 --decode >"\${config_path}"
@@ -498,22 +498,22 @@ phase_started_at=\${SECONDS}
 case '${gateway_driver}' in
 docker)
 	docker import \
-		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		--change 'ENTRYPOINT ["/ryno-sandbox"]' \
 		"${guest_sandbox_runtime_archive_path}" \
 		"${sandbox_runtime_image}" >/dev/null
 	docker import \
-		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
+		--change 'ENTRYPOINT ["/ryno-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
 	docker run --rm --network none "${supervisor_image}" --help >/dev/null
 	;;
 podman)
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
-		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		--change 'ENTRYPOINT ["/ryno-sandbox"]' \
 		"${guest_sandbox_runtime_archive_path}" \
 		"${sandbox_runtime_image}" >/dev/null
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
-		--change 'ENTRYPOINT ["/openshell-supervisor"]' \
+		--change 'ENTRYPOINT ["/ryno-supervisor"]' \
 		"${guest_supervisor_archive_path}" \
 		"${supervisor_image}" >/dev/null
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" run \
@@ -521,8 +521,8 @@ podman)
 	;;
 esac
 report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"
-cd /home/openshell
-exec /usr/local/bin/openshell-gateway \
+cd /home/ryno
+exec /usr/local/bin/ryno-gateway \
 	--config "\${config_path}" \
 	--bind-address 127.0.0.1 \
 	--port ${guest_port} \
@@ -538,7 +538,7 @@ EOF
 		vm_args+=(--with "${configuration}")
 	done
 	vm_args+=(
-		--copy "${guest_gateway_bin}:/usr/local/bin/openshell-gateway"
+		--copy "${guest_gateway_bin}:/usr/local/bin/ryno-gateway"
 		--copy "${guest_launcher}:${guest_launcher_path}"
 		--copy "${sandbox_runtime_archive}:${guest_sandbox_runtime_archive_path}"
 		--copy "${supervisor_archive}:${guest_supervisor_archive_path}"
@@ -554,7 +554,7 @@ EOF
 fi
 
 probe_gateway() {
-	python3 - "${OPENSHELL_BIN}" "${1}" <<'PY'
+	python3 - "${RYNO_BIN}" "${1}" <<'PY'
 import os
 import subprocess
 import sys

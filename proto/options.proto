@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.options.v1;
+package ryno.options.v1;
 
 import "google/protobuf/descriptor.proto";
 

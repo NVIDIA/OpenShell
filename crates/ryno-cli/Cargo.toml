@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-cli"
+description = "Ryno CLI tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno"
+path = "src/main.rs"
+
+[dependencies]
+ryno-bootstrap = { path = "../ryno-bootstrap" }
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-policy = { path = "../ryno-policy" }
+ryno-providers = { path = "../ryno-providers" }
+ryno-sdk = { path = "../ryno-sdk" }
+ryno-tui = { path = "../ryno-tui" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# gRPC client
+tonic = { workspace = true, features = ["tls-native-roots"] }
+
+# CLI
+chrono = "0.4"
+clap = { workspace = true }
+clap_complete = { workspace = true }
+crossterm = { workspace = true }
+# Styling backend shared by dialoguer and indicatif; `color` overrides its
+# global switch so both follow the CLI's --color setting.
+console = "0.15"
+dialoguer = "0.11"
+indicatif = { workspace = true }
+owo-colors = { workspace = true }
+
+# HTTP client (health fallback)
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "aws-lc-rs"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+tower = { workspace = true }
+reqwest = { workspace = true }
+
+# Error handling
+miette = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# File archiving (tar-over-SSH sync)
+tar = "0.4"
+tempfile = "3"
+
+# OIDC/Auth
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
+base64 = { workspace = true }
+
+# WebSocket (Cloudflare tunnel proxy)
+tokio-tungstenite = { workspace = true }
+
+# Streams
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+
+# URL parsing
+url = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+# Tests import the example profiles from providers/ the way an operator
+# would; the feature is test-only and never reaches a release binary.
+ryno-providers = { path = "../ryno-providers", features = ["example-profiles"] }
+futures = { workspace = true }
+ryno-server = { path = "../ryno-server", features = ["test-support"] }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+temp-env = "0.3"
+tokio-stream = { workspace = true }
+url = { workspace = true }

@@ -30,12 +30,12 @@ With no COMMAND, the runner opens an interactive SSH session.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
+if [ "${RYNO_TEST_GUEST_RUNTIME:-}" != 1 ] ||
+	[ ! -d "${RYNO_TEST_GUEST_DISTROS:-}" ] ||
+	[ ! -d "${RYNO_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -d "${RYNO_TEST_GUEST_PROVISIONERS:-}" ] ||
+	[ ! -r "${RYNO_TEST_GUEST_CACHE_LIB:-}" ] ||
+	[ ! -r "${RYNO_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
 fi
@@ -146,16 +146,16 @@ done
 
 if [ "${list}" -eq 1 ]; then
 	echo "Distros:"
-	for entry in "${OPENSHELL_TEST_GUEST_DISTROS}"/*; do
+	for entry in "${RYNO_TEST_GUEST_DISTROS}"/*; do
 		printf '  %s\n' "${entry##*/}"
 	done
 	echo "Configurations:"
-	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
+	for entry in "${RYNO_TEST_GUEST_CONFIGURATIONS}"/*; do
 		[ -f "${entry}" ] || continue
 		printf '  %s\n' "${entry##*/}"
 	done
 	echo "Provisions:"
-	for entry in "${OPENSHELL_TEST_GUEST_PROVISIONERS}"/*; do
+	for entry in "${RYNO_TEST_GUEST_PROVISIONERS}"/*; do
 		if [ -d "${entry}" ]; then
 			printf '  %s\n' "${entry##*/}"
 		fi
@@ -169,18 +169,18 @@ if [ -z "${distro}" ]; then
 	exit 2
 fi
 if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
+	[ ! -r "${RYNO_TEST_GUEST_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
 # Distro profiles contain only trusted values generated into the Nix store.
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
+. "${RYNO_TEST_GUEST_DISTROS}/${distro}"
 
 podman_mode=
 for item in "${configurations[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+		[ ! -f "${RYNO_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -197,7 +197,7 @@ for item in "${configurations[@]}"; do
 done
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
+		[ ! -d "${RYNO_TEST_GUEST_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -330,7 +330,7 @@ if [ "${TEST_GUEST_ACCELERATOR}" = kvm ] &&
 fi
 
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
+. "${RYNO_TEST_GUEST_CACHE_LIB}"
 
 report_timing() {
 	local label=$1
@@ -342,15 +342,15 @@ report_timing() {
 phase_started_at=${SECONDS}
 prepared_image=0
 TEST_GUEST_IMAGE=
-if [ -n "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
-	if [ ! -f "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}" ]; then
-		echo "prepared guest image does not exist: ${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}" >&2
+if [ -n "${RYNO_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
+	if [ ! -f "${RYNO_TEST_GUEST_IMAGE_OVERRIDE}" ]; then
+		echo "prepared guest image does not exist: ${RYNO_TEST_GUEST_IMAGE_OVERRIDE}" >&2
 		exit 2
 	fi
-	TEST_GUEST_IMAGE=${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}
+	TEST_GUEST_IMAGE=${RYNO_TEST_GUEST_IMAGE_OVERRIDE}
 	prepared_image=1
 	echo "==> Using explicit prepared guest image"
-elif [ "${OPENSHELL_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
+elif [ "${RYNO_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
 	cache_root=$(test_vm_cache_root)
 	cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
 	cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
@@ -361,8 +361,8 @@ elif [ "${OPENSHELL_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
 			cache_args+=(--with "${item}")
 		done
 		echo "==> Cache local miss: populating ${cache_entry}"
-		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
-			"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_CACHE_RUNNER}" \
+		RYNO_TEST_GUEST_CACHE_DISABLE=1 \
+			"${TEST_GUEST_BASH}" "${RYNO_TEST_GUEST_CACHE_RUNNER}" \
 			"${cache_args[@]}"
 		if ! test_vm_cache_local_entry_valid \
 			"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
@@ -385,10 +385,10 @@ report_timing "guest image resolution" "${phase_started_at}"
 
 phase_started_at=${SECONDS}
 umask 077
-run_parent=${TMPDIR:-/tmp}/openshell-test-guest
+run_parent=${TMPDIR:-/tmp}/ryno-test-guest
 mkdir -p "${run_parent}"
 run_dir=$(mktemp -d "${run_parent%/}/run.XXXXXX")
-ssh_control_dir=$(mktemp -d /tmp/openshell-test-guest-ssh.XXXXXX)
+ssh_control_dir=$(mktemp -d /tmp/ryno-test-guest-ssh.XXXXXX)
 overlay=${run_dir}/disk.qcow2
 seed=${run_dir}/seed.iso
 vars=${run_dir}/firmware-vars.fd
@@ -458,13 +458,13 @@ ssh-keygen -q -t ed25519 -N "" -f "${private_key}"
 public_key=$(<"${private_key}.pub")
 
 cat >"${run_dir}/meta-data" <<EOF
-instance-id: openshell-test-guest-${distro}-$$-${RANDOM}
-local-hostname: openshell-test-guest
+instance-id: ryno-test-guest-${distro}-$$-${RANDOM}
+local-hostname: ryno-test-guest
 EOF
 cat >"${run_dir}/user-data" <<EOF
 #cloud-config
 users:
-  - name: openshell
+  - name: ryno
     lock_passwd: true
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -511,7 +511,7 @@ for attempt in $(seq 1 5); do
 	: >"${qemu_log}"
 	echo "==> Booting ${distro} (${TEST_GUEST_ARCHITECTURE}) with QEMU/${TEST_GUEST_ACCELERATOR}"
 	"${TEST_GUEST_QEMU}" \
-		-name "openshell-test-${distro}" \
+		-name "ryno-test-${distro}" \
 		-machine "${TEST_GUEST_MACHINE},accel=${TEST_GUEST_ACCELERATOR}" \
 		-cpu "${test_vm_cpu}" \
 		-smp 4 \
@@ -603,7 +603,7 @@ for _ in $(seq 1 "$((ssh_wait_seconds * 4))"); do
 		echo "QEMU exited before SSH became ready" >&2
 		exit 1
 	fi
-	if ssh "${ssh_args[@]}" -o ConnectTimeout=1 openshell@127.0.0.1 true 2>/dev/null; then
+	if ssh "${ssh_args[@]}" -o ConnectTimeout=1 ryno@127.0.0.1 true 2>/dev/null; then
 		ssh_ready=1
 		break
 	fi
@@ -619,7 +619,7 @@ phase_started_at=${SECONDS}
 echo "==> Validating ${distro}"
 # Profile values come from the trusted Nix-generated catalog.
 # shellcheck disable=SC2029
-ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+ssh "${ssh_args[@]}" ryno@127.0.0.1 \
 	"set -eu; set +e; sudo cloud-init status --wait >/dev/null; status=\$?; set -e; [ \"\${status}\" -eq 0 ] || [ \"\${status}\" -eq 2 ]; . /etc/os-release; test \"\${ID}\" = '${TEST_GUEST_OS_ID}'; case \"\${VERSION_ID}\" in '${TEST_GUEST_OS_VERSION}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_GUEST_ARCHITECTURE}'"
 # cloud-init returns 2 when it completes with recoverable errors. Fedora can
 # report that status for an initial transient-hostname warning even though the
@@ -632,21 +632,21 @@ host_key_checking = False
 inventory = ${ansible_inventory}
 interpreter_python = /usr/bin/python3
 retry_files_enabled = False
-roles_path = ${OPENSHELL_TEST_GUEST_PROVISIONERS}
+roles_path = ${RYNO_TEST_GUEST_PROVISIONERS}
 
 [ssh_connection]
 ssh_args = -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
 EOF
 cat >"${ansible_inventory}" <<EOF
 [test_vm]
-guest ansible_host=127.0.0.1 ansible_port=${ssh_port} ansible_user=openshell ansible_ssh_private_key_file=${private_key} ansible_python_interpreter=/usr/bin/python3
+guest ansible_host=127.0.0.1 ansible_port=${ssh_port} ansible_user=ryno ansible_ssh_private_key_file=${private_key} ansible_python_interpreter=/usr/bin/python3
 EOF
 
 if [ "${prepared_image}" -eq 0 ]; then
 	for item in "${configurations[@]}"; do
 		echo "==> Applying configuration: ${item}"
 		ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-			ansible-playbook "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}"
+			ansible-playbook "${RYNO_TEST_GUEST_CONFIGURATIONS}/${item}"
 	done
 else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
@@ -654,8 +654,8 @@ fi
 
 if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	phase_started_at=${SECONDS}
-	artifact_staging_dir=/tmp/openshell-test-guest-artifacts-$$
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+	artifact_staging_dir=/tmp/ryno-test-guest-artifacts-$$
+	ssh "${ssh_args[@]}" ryno@127.0.0.1 \
 		"install -d -m 0700 -- '${artifact_staging_dir}'"
 
 	remote_packages=()
@@ -664,7 +664,7 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 		remote_path=${artifact_staging_dir}/package-${artifact_index}.${TEST_GUEST_PACKAGE_FAMILY}
 		echo "==> Copying package: ${package##*/}"
 		scp -q "${scp_args[@]}" \
-			"${package}" "openshell@127.0.0.1:${remote_path}"
+			"${package}" "ryno@127.0.0.1:${remote_path}"
 		remote_packages+=("${remote_path}")
 		artifact_index=$((artifact_index + 1))
 	done
@@ -673,11 +673,11 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 		printf -v quoted_packages ' %q' "${remote_packages[@]}"
 		case "${TEST_GUEST_PACKAGE_FAMILY}" in
 		deb)
-			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+			ssh "${ssh_args[@]}" ryno@127.0.0.1 \
 				"sudo apt-get update >/dev/null && sudo apt-get install -y --${quoted_packages}"
 			;;
 		rpm)
-			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+			ssh "${ssh_args[@]}" ryno@127.0.0.1 \
 				"sudo dnf install -y --nogpgcheck ${quoted_packages}"
 			;;
 		esac
@@ -692,15 +692,15 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 		remote_path=${artifact_staging_dir}/copy-${artifact_index}
 		echo "==> Copying artifact: ${destination}"
 		scp -q "${scp_args[@]}" \
-			"${source_path}" "openshell@127.0.0.1:${remote_path}"
+			"${source_path}" "ryno@127.0.0.1:${remote_path}"
 		printf -v install_command \
 			'sudo install -D -m %q -- %q %q' \
 			"${mode}" "${remote_path}" "${destination}"
-		ssh "${ssh_args[@]}" openshell@127.0.0.1 "${install_command}"
+		ssh "${ssh_args[@]}" ryno@127.0.0.1 "${install_command}"
 		artifact_index=$((artifact_index + 1))
 	done
 
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+	ssh "${ssh_args[@]}" ryno@127.0.0.1 \
 		"rm -rf -- '${artifact_staging_dir}'"
 	report_timing "artifact transfer" "${phase_started_at}"
 fi
@@ -727,22 +727,22 @@ fi
 # Configuration may change the test user's groups. Close the SSH control
 # connection established before provisioning so subsequent commands start with
 # the guest's current credentials.
-ssh "${ssh_args[@]}" -O exit openshell@127.0.0.1 >/dev/null 2>&1 || true
+ssh "${ssh_args[@]}" -O exit ryno@127.0.0.1 >/dev/null 2>&1 || true
 
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
-	ssh -t "${ssh_args[@]}" "${ssh_forward_args[@]}" openshell@127.0.0.1
+	ssh -t "${ssh_args[@]}" "${ssh_forward_args[@]}" ryno@127.0.0.1
 else
 	printf -v quoted_command '%q ' "${guest_command[@]}"
 	# quoted_command is shell-escaped locally before it reaches the guest.
 	# shellcheck disable=SC2029
 	ssh "${ssh_args[@]}" "${ssh_forward_args[@]}" \
-		openshell@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
+		ryno@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
 fi
 
 echo "==> Shutting down ${distro}"
 if [ "${keep}" -eq 1 ]; then
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 'sudo systemctl poweroff' >/dev/null 2>&1 || true
+	ssh "${ssh_args[@]}" ryno@127.0.0.1 'sudo systemctl poweroff' >/dev/null 2>&1 || true
 	for _ in $(seq 1 120); do
 		if ! kill -0 "${qemu_pid}" 2>/dev/null; then
 			wait "${qemu_pid}" || true

@@ -18,8 +18,8 @@ if [[ -n "${SPIRE_AGENT_ENV_FILE:-}" ]]; then
     source "$SPIRE_AGENT_ENV_FILE"
 fi
 
-GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-openshell-spiffe-demo-gateway}"
-GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/nvidia/openshell/gateway:latest}"
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-ryno-spiffe-demo-gateway}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/nvidia/ryno/gateway:latest}"
 GATEWAY_ID="${GATEWAY_ID:-podman-spiffe-demo}"
 GATEWAY_PORT="${GATEWAY_PORT:-8888}"
 GATEWAY_HEALTH_PORT="${GATEWAY_HEALTH_PORT:-8889}"
@@ -30,13 +30,13 @@ SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE:-}"
 SANDBOX_IMAGE_PULL_POLICY="${SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
 PODMAN_STOP_TIMEOUT_SECS="${PODMAN_STOP_TIMEOUT_SECS:-3}"
 GATEWAY_OIDC_ISSUER="${GATEWAY_OIDC_ISSUER:-}"
-GATEWAY_OIDC_AUDIENCE="${GATEWAY_OIDC_AUDIENCE:-openshell-cli}"
+GATEWAY_OIDC_AUDIENCE="${GATEWAY_OIDC_AUDIENCE:-ryno-cli}"
 GATEWAY_OIDC_JWKS_TTL_SECS="${GATEWAY_OIDC_JWKS_TTL_SECS:-3600}"
 GATEWAY_OIDC_ROLES_CLAIM="${GATEWAY_OIDC_ROLES_CLAIM:-realm_access.roles}"
-GATEWAY_OIDC_ADMIN_ROLE="${GATEWAY_OIDC_ADMIN_ROLE:-openshell-admin}"
-GATEWAY_OIDC_USER_ROLE="${GATEWAY_OIDC_USER_ROLE:-openshell-user}"
+GATEWAY_OIDC_ADMIN_ROLE="${GATEWAY_OIDC_ADMIN_ROLE:-ryno-admin}"
+GATEWAY_OIDC_USER_ROLE="${GATEWAY_OIDC_USER_ROLE:-ryno-user}"
 GATEWAY_OIDC_SCOPES_CLAIM="${GATEWAY_OIDC_SCOPES_CLAIM:-}"
-GATEWAY_OIDC_CLIENT_ID="${GATEWAY_OIDC_CLIENT_ID:-openshell-cli}"
+GATEWAY_OIDC_CLIENT_ID="${GATEWAY_OIDC_CLIENT_ID:-ryno-cli}"
 GATEWAY_OIDC_LOGIN_SCOPES="${GATEWAY_OIDC_LOGIN_SCOPES:-}"
 if [[ -z "${GATEWAY_ALLOW_UNAUTHENTICATED_USERS:-}" ]]; then
     if [[ -n "$GATEWAY_OIDC_ISSUER" ]]; then
@@ -119,7 +119,7 @@ write_gateway_config() {
     fi
     if [[ -n "$GATEWAY_OIDC_ISSUER" ]]; then
         oidc_block="
-[openshell.gateway.oidc]
+[ryno.gateway.oidc]
 issuer = \"$(toml_string_escape "$GATEWAY_OIDC_ISSUER")\"
 audience = \"$(toml_string_escape "$GATEWAY_OIDC_AUDIENCE")\"
 jwks_ttl_secs = ${GATEWAY_OIDC_JWKS_TTL_SECS}
@@ -131,20 +131,20 @@ scopes_claim = \"$(toml_string_escape "$GATEWAY_OIDC_SCOPES_CLAIM")\"
     fi
 
     cat >"$config_path" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_driver = "podman"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = ${GATEWAY_ALLOW_UNAUTHENTICATED_USERS}
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${jwt_dir}/signing.pem"
 public_key_path = "${jwt_dir}/public.pem"
 kid_path = "${jwt_dir}/kid"
@@ -152,7 +152,7 @@ gateway_id = "$(toml_string_escape "$GATEWAY_ID")"
 ttl_secs = 3600
 ${oidc_block}
 
-[openshell.drivers.podman]
+[ryno.drivers.podman]
 socket_path = "${podman_socket_in_container}"
 network_name = "$(toml_string_escape "$PODMAN_NETWORK")"
 grpc_endpoint = "http://${GATEWAY_CONTAINER}:8080"
@@ -183,7 +183,7 @@ run podman run -d \
     --name "$GATEWAY_CONTAINER" \
     --network "$PODMAN_NETWORK" \
     --network-alias "$GATEWAY_CONTAINER" \
-    --label openshell.spiffe-demo=gateway \
+    --label ryno.spiffe-demo=gateway \
     --user 0 \
     --security-opt label=disable \
     -p "127.0.0.1:${GATEWAY_PORT}:8080" \
@@ -191,15 +191,15 @@ run podman run -d \
     -v "$(podman_socket_volume "$PODMAN_SOCKET" "$podman_socket_in_container")" \
     -v "${SPIRE_AGENT_SOCKET_HOST_PATH}:${SPIRE_AGENT_SOCKET_HOST_PATH}:z" \
     -v "${GATEWAY_STATE_DIR}:${GATEWAY_STATE_DIR}:z" \
-    -e "OPENSHELL_GATEWAY_CONFIG=${gateway_config}" \
-    -e "OPENSHELL_DB_URL=sqlite:${GATEWAY_STATE_DIR}/gateway.db?mode=rwc" \
-    -e "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=${SPIRE_AGENT_SOCKET_HOST_PATH}" \
+    -e "RYNO_GATEWAY_CONFIG=${gateway_config}" \
+    -e "RYNO_DB_URL=sqlite:${GATEWAY_STATE_DIR}/gateway.db?mode=rwc" \
+    -e "RYNO_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=${SPIRE_AGENT_SOCKET_HOST_PATH}" \
     -e "XDG_DATA_HOME=${GATEWAY_STATE_DIR}/data" \
     -e "HOME=${GATEWAY_STATE_DIR}" \
     "$GATEWAY_IMAGE" \
     --config "$gateway_config"
 
-if ! wait_for_http "http://127.0.0.1:${GATEWAY_HEALTH_PORT}/readyz" "OpenShell gateway"; then
+if ! wait_for_http "http://127.0.0.1:${GATEWAY_HEALTH_PORT}/readyz" "Ryno gateway"; then
     podman logs "$GATEWAY_CONTAINER" >&2 || true
     exit 1
 fi
@@ -214,15 +214,15 @@ write_gateway_env_line GATEWAY_OIDC_AUDIENCE "$GATEWAY_OIDC_AUDIENCE"
 write_gateway_env_line GATEWAY_OIDC_CLIENT_ID "$GATEWAY_OIDC_CLIENT_ID"
 write_gateway_env_line GATEWAY_OIDC_LOGIN_SCOPES "$GATEWAY_OIDC_LOGIN_SCOPES"
 
-printf "OpenShell gateway container: %s\n" "$GATEWAY_CONTAINER"
-printf "OpenShell gateway endpoint: http://127.0.0.1:%s\n" "$GATEWAY_PORT"
-printf "OpenShell gateway health endpoint: http://127.0.0.1:%s\n" "$GATEWAY_HEALTH_PORT"
-printf "OpenShell gateway config: %s\n" "$gateway_config"
+printf "Ryno gateway container: %s\n" "$GATEWAY_CONTAINER"
+printf "Ryno gateway endpoint: http://127.0.0.1:%s\n" "$GATEWAY_PORT"
+printf "Ryno gateway health endpoint: http://127.0.0.1:%s\n" "$GATEWAY_HEALTH_PORT"
+printf "Ryno gateway config: %s\n" "$gateway_config"
 printf "SPIRE agent Workload API socket: %s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
 if [[ -n "$GATEWAY_OIDC_ISSUER" ]]; then
-    printf "OpenShell gateway OIDC issuer: %s\n" "$GATEWAY_OIDC_ISSUER"
+    printf "Ryno gateway OIDC issuer: %s\n" "$GATEWAY_OIDC_ISSUER"
     printf "Register/login with:\n"
-    printf "  openshell gateway add http://127.0.0.1:%s --name %s --oidc-issuer %s --oidc-client-id %s --oidc-audience %s" \
+    printf "  ryno gateway add http://127.0.0.1:%s --name %s --oidc-issuer %s --oidc-client-id %s --oidc-audience %s" \
         "$GATEWAY_PORT" "$GATEWAY_ID" "$GATEWAY_OIDC_ISSUER" "$GATEWAY_OIDC_CLIENT_ID" "$GATEWAY_OIDC_AUDIENCE"
     if [[ -n "$GATEWAY_OIDC_LOGIN_SCOPES" ]]; then
         printf " --oidc-scopes %s" "$GATEWAY_OIDC_LOGIN_SCOPES"

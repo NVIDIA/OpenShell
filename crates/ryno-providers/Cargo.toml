@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-providers"
+description = "Provider discovery and registry for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Test-only access to the example profiles in `providers/`. Enable it from
+# `[dev-dependencies]` only; it reads the source checkout at run time.
+example-profiles = []
+
+[dependencies]
+prost-types = { workspace = true }
+glob = { workspace = true }
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-policy = { path = "../ryno-policy" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[lints]
+workspace = true

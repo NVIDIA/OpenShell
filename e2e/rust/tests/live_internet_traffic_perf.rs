@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Instant;
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 const DEFAULT_ROUNDS: usize = 10;
@@ -28,12 +28,12 @@ import tempfile
 import time
 import urllib.parse
 
-MODE = os.environ.get("OPENSHELL_LIVE_PERF_MODE", "direct")
+MODE = os.environ.get("RYNO_LIVE_PERF_MODE", "direct")
 TLS = ssl.create_default_context()
-USER_AGENT = "OpenShell-live-Internet-benchmark/1"
+USER_AGENT = "Ryno-live-Internet-benchmark/1"
 
 METADATA_URLS = [
-    "https://raw.githubusercontent.com/NVIDIA/OpenShell/main/README.md",
+    "https://raw.githubusercontent.com/NVIDIA/Ryno/main/README.md",
     "https://pypi.org/pypi/requests/json",
     "https://registry.npmjs.org/typescript/latest",
     "https://docs.python.org/3/",
@@ -145,7 +145,7 @@ def https_reuse():
 def git_clone():
     if shutil.which("git") is None:
         return {"skipped": "git is not installed in the workload image"}
-    with tempfile.TemporaryDirectory(prefix="openshell-live-git-") as directory:
+    with tempfile.TemporaryDirectory(prefix="ryno-live-git-") as directory:
         checkout = os.path.join(directory, "sampleproject")
         command = [
             "git", "-c", "advice.detachedHead=false", "clone", "--quiet",
@@ -201,7 +201,7 @@ metrics = [
     metric("policy_denial", denied_destination),
 ]
 document = {
-    "schema": "openshell.live-internet-perf.v1",
+    "schema": "ryno.live-internet-perf.v1",
     "mode": MODE,
     "total_ms": (time.perf_counter_ns() - started) / 1_000_000,
     "metrics": metrics,
@@ -212,7 +212,7 @@ if any(item["name"] == "policy_denial" and not item["ok"] for item in metrics):
 "#;
 
 fn rounds() -> usize {
-    std::env::var("OPENSHELL_LIVE_PERF_ROUNDS")
+    std::env::var("RYNO_LIVE_PERF_ROUNDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
@@ -263,7 +263,7 @@ async fn run_direct() -> Result<String, String> {
 async fn run_python(mode: &str) -> Result<String, String> {
     let output = tokio::process::Command::new("python3")
         .args(["-c", BENCHMARK])
-        .env("OPENSHELL_LIVE_PERF_MODE", mode)
+        .env("RYNO_LIVE_PERF_MODE", mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -288,8 +288,8 @@ async fn run_sandbox(sandbox: &SandboxGuard) -> Result<String, String> {
         .exec(&[
             "sh",
             "-c",
-            "OPENSHELL_LIVE_PERF_MODE=sandbox python3 -c \"$1\"",
-            "openshell-live-internet-perf",
+            "RYNO_LIVE_PERF_MODE=sandbox python3 -c \"$1\"",
+            "ryno-live-internet-perf",
             BENCHMARK,
         ])
         .await

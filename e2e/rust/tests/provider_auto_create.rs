@@ -14,23 +14,23 @@
 //! placeholder made it all the way through to the sandbox process environment.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`mise run gateway:docker`)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - A running ryno gateway (`mise run gateway:docker`)
+//! - The `ryno` binary (built automatically from the workspace)
 
 use std::process::Stdio;
 use std::sync::Mutex;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::{extract_field, strip_ansi};
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::{extract_field, strip_ansi};
 #[cfg(feature = "e2e-local-container-driver")]
-use openshell_e2e::harness::sandbox::E2E_WORKLOAD_IMAGE;
+use ryno_e2e::harness::sandbox::E2E_WORKLOAD_IMAGE;
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
 static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
 
 fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
-    let legacy = format!("openshell:resolve:env:{key}");
-    let revision_prefix = "openshell:resolve:env:v";
+    let legacy = format!("ryno:resolve:env:{key}");
+    let revision_prefix = "ryno:resolve:env:v";
     let revision_suffix = format!("_{key}");
     output.split_whitespace().any(|token| {
         token == legacy || (token.starts_with(revision_prefix) && token.ends_with(&revision_suffix))
@@ -39,7 +39,7 @@ fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("provider")
         .arg("delete")
         .arg(name)
@@ -50,7 +50,7 @@ async fn delete_provider(name: &str) {
 
 /// Helper: check whether a provider already exists.
 async fn provider_exists(name: &str) -> bool {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("provider")
         .arg("get")
         .arg(name)
@@ -61,7 +61,7 @@ async fn provider_exists(name: &str) -> bool {
 
 /// Helper: delete a sandbox by name, ignoring errors.
 async fn delete_sandbox(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox")
         .arg("delete")
         .arg(name)
@@ -109,7 +109,7 @@ network_policies: {}
 
     // Create a sandbox that prints the ANTHROPIC_API_KEY env var.
     // --auto-providers skips the interactive prompt.
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox").arg("create");
     #[cfg(feature = "e2e-local-container-driver")]
     cmd.arg("--from").arg(E2E_WORKLOAD_IMAGE);
@@ -127,7 +127,7 @@ network_policies: {}
     let output = cmd
         .output()
         .await
-        .expect("failed to spawn openshell sandbox create");
+        .expect("failed to spawn ryno sandbox create");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -137,7 +137,7 @@ network_policies: {}
     // Parse sandbox name for cleanup.
     let sandbox_name = extract_field(&combined, "Created sandbox");
     let exec_output = if let Some(ref name) = sandbox_name {
-        let mut exec_cmd = openshell_cmd();
+        let mut exec_cmd = ryno_cmd();
         exec_cmd
             .args([
                 "sandbox",

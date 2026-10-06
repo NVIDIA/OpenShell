@@ -4,23 +4,23 @@
 title: "Extensibility"
 sidebar-title: "Overview"
 slug: "extensibility/overview"
-description: "Understand how OpenShell adapts to deployment-specific infrastructure, governance, and workload requirements."
-keywords: "OpenShell Extensions, Middleware, Interceptors, Drivers, Isolation Backends, Protocol Negotiation"
+description: "Understand how Ryno adapts to deployment-specific infrastructure, governance, and workload requirements."
+keywords: "Ryno Extensions, Middleware, Interceptors, Drivers, Isolation Backends, Protocol Negotiation"
 ---
 
-![OpenShell extension points. Data plane: the sandboxed agent reaches the supervisor through the isolation backend, and supervisor middleware processes requests before they reach models and APIs. Control plane: you reach the gateway through interceptors, and gateway drivers connect it to runtimes and secret stores.](../images/openshell-extension-points.svg)
+![Ryno extension points. Data plane: the sandboxed agent reaches the supervisor through the isolation backend, and supervisor middleware processes requests before they reach models and APIs. Control plane: you reach the gateway through interceptors, and gateway drivers connect it to runtimes and secret stores.](../images/ryno-extension-points.svg)
 
-Extensibility sits at the core of OpenShell. OpenShell is designed to run
+Extensibility sits at the core of Ryno. Ryno is designed to run
 everywhere and adapt to the infrastructure, governance, and workload
 requirements of each deployment. Its extension points add deployment-specific
 behavior while preserving the same API, policy model, and security boundaries.
 
-You can extend each layer of OpenShell:
+You can extend each layer of Ryno:
 
 - **Control plane:** Gateway interceptors govern API operations.
 - **Data plane:** Middleware processes agent traffic, and isolation backends
   control the sandboxed workload.
-- **Infrastructure:** Drivers connect OpenShell to compute runtimes and secret
+- **Infrastructure:** Drivers connect Ryno to compute runtimes and secret
   stores.
 
 ## Extension Points
@@ -28,7 +28,7 @@ You can extend each layer of OpenShell:
 ### [Middleware](/extensibility/supervisor-middleware)
 
 Supervisor middleware inspects, transforms, or denies allowed HTTP and
-WebSocket traffic. It runs after policy evaluation and before OpenShell injects
+WebSocket traffic. It runs after policy evaluation and before Ryno injects
 provider credentials, so deployments can add content controls and auditing
 without exposing managed secrets.
 
@@ -42,7 +42,7 @@ the gateway retains authentication, persistence, and final validation.
 
 Compute drivers place and manage sandboxes on deployment-specific runtimes.
 Credential drivers connect provider records to the deployment's secret store.
-Together, they adapt OpenShell to the infrastructure it runs on.
+Together, they adapt Ryno to the infrastructure it runs on.
 
 ### [Isolation Backends](/extensibility/isolation-backends)
 
@@ -55,7 +55,7 @@ and runtime-specific isolation inside the provisioned workload.
 Start with the narrowest extension point that owns the behavior you need. Keep
 control-plane governance in an interceptor, infrastructure integration in a
 driver, application traffic processing in middleware, and workload control in
-an isolation backend. Each extension uses a typed contract so OpenShell keeps
+an isolation backend. Each extension uses a typed contract so Ryno keeps
 ownership of authentication, policy enforcement, secrets, and public API
 behavior.
 
@@ -66,7 +66,7 @@ security boundaries.
 ### gRPC and Transports
 
 External extensions implement protobuf-defined gRPC services. The transport
-depends on where the extension runs and which OpenShell components must reach
+depends on where the extension runs and which Ryno components must reach
 it:
 
 | Extension | Integration | Supported transport |
@@ -74,7 +74,7 @@ it:
 | Gateway interceptor | The gateway calls the interceptor service. | TCP with `http://` or `https://`, or a local Unix domain socket with `unix://`. |
 | Supervisor middleware | The gateway discovers the service, and sandbox supervisors evaluate traffic through it. | TCP with `http://` or `https://`. The endpoint must be reachable from both the gateway and supervisors, so Unix sockets are not supported. |
 | Compute or credential driver | The gateway calls an external driver service. | A local Unix domain socket. |
-| OpenShell isolation backend | The supervisor connects to the sandbox boundary through the OpenShell Sandbox Protocol. | A private Unix socket, TLS over TCP, or virtio-vsock selected and provisioned by the compute driver. |
+| Ryno isolation backend | The supervisor connects to the sandbox boundary through the Ryno Sandbox Protocol. | A private Unix socket, TLS over TCP, or virtio-vsock selected and provisioned by the compute driver. |
 
 Use Unix domain sockets when the gateway and extension share a host. Use
 `https://` when a service crosses a host or pod boundary. Plaintext `http://`
@@ -82,38 +82,38 @@ is intended for explicitly enabled development deployments; authenticated
 network extensions use TLS and short-lived gateway-issued credentials. Refer
 to [Authenticating Extensions](#authenticating-extensions) for how services validate those credentials.
 
-The [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor)
-and [content guard middleware example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard)
+The [governance interceptor example](https://github.com/NVIDIA/Ryno/tree/main/examples/governance-interceptor)
+and [content guard middleware example](https://github.com/NVIDIA/Ryno/tree/main/examples/supervisor-middleware-content-guard)
 include complete gRPC services, gateway configuration, and smoke tests. For
 runtime integrations, refer to the first-party
-[Docker compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-docker)
-and [VM compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-vm).
+[Docker compute driver](https://github.com/NVIDIA/Ryno/tree/main/crates/ryno-driver-docker)
+and [VM compute driver](https://github.com/NVIDIA/Ryno/tree/main/crates/ryno-driver-vm).
 
 ### Protocol Negotiation
 
-Before OpenShell uses a compute driver, credential driver, gateway interceptor,
+Before Ryno uses a compute driver, credential driver, gateway interceptor,
 or supervisor middleware service, both peers exchange
-`openshell.extension.v1.PeerMetadata`. The metadata identifies the protocol and
+`ryno.extension.v1.PeerMetadata`. The metadata identifies the protocol and
 implementation versions, supported capabilities, and capabilities required
 from the other peer. Family-specific features remain in their typed protocols.
 
-OpenShell accepts compatible minor versions when both capability requirements
+Ryno accepts compatible minor versions when both capability requirements
 are satisfied. It rejects different major versions, missing metadata, or an
 unmet required capability during startup. Built-in and external service
 extensions follow the same compatibility checks.
 
-Use `openshell gateway info` to inspect the negotiated extension families,
+Use `ryno gateway info` to inspect the negotiated extension families,
 implementation versions, protocol versions, and capabilities active on a
 gateway.
 
 ## Authenticating Extensions
 
-When the gateway has JWT signing configured, OpenShell sends a short-lived bearer token with every call to a [gateway interceptor](/extensibility/gateway-interceptors) or [supervisor middleware](/extensibility/supervisor-middleware) service. Validate it to confirm the call comes from your gateway or one of its sandboxes.
+When the gateway has JWT signing configured, Ryno sends a short-lived bearer token with every call to a [gateway interceptor](/extensibility/gateway-interceptors) or [supervisor middleware](/extensibility/supervisor-middleware) service. Validate it to confirm the call comes from your gateway or one of its sandboxes.
 
 | Claim | Value |
 |---|---|
-| `iss` | `openshell-gateway:<gateway_id>` |
-| `aud` | The registration's `audience`. Defaults to `urn:openshell:extension:interceptor:<name>` or `urn:openshell:extension:middleware:<name>`. |
+| `iss` | `ryno-gateway:<gateway_id>` |
+| `aud` | The registration's `audience`. Defaults to `urn:ryno:extension:interceptor:<name>` or `urn:ryno:extension:middleware:<name>`. |
 | `caller_kind` | `gateway`, or `supervisor` for middleware calls from a sandbox. |
 | `sandbox_id` | The calling sandbox, when `caller_kind` is `supervisor`. |
 
@@ -123,14 +123,14 @@ Get the gateway ID and public signing key (or JWKS) from the gateway operator an
 
 For each request, check that:
 
-- `typ` is `openshell-ext+jwt` and `alg` is `EdDSA`. Pin the algorithm; don't read it from the token.
+- `typ` is `ryno-ext+jwt` and `alg` is `EdDSA`. Pin the algorithm; don't read it from the token.
 - The signature, expiry, and exact audience are valid.
-- `iss` is `openshell-gateway:<gateway_id>`, not the gateway URL.
+- `iss` is `ryno-gateway:<gateway_id>`, not the gateway URL.
 - `caller_kind` and `sandbox_id` match what your service accepts.
 
-OpenShell reuses a token until it rotates, so don't reject a repeated `jti`.
+Ryno reuses a token until it rotates, so don't reject a repeated `jti`.
 
-Services must use `https://` endpoints. OpenShell verifies the certificate and hostname against platform roots, or against `tls_ca_cert_path` for a private CA.
+Services must use `https://` endpoints. Ryno verifies the certificate and hostname against platform roots, or against `tls_ca_cert_path` for a private CA.
 
 ### Confirm the Audience at Startup
 
@@ -138,7 +138,7 @@ Return your expected audience in the `expected_audience` field of your `Describe
 
 ### Run Without Authentication
 
-Set `allow_insecure_transport = true` on a registration to use a plaintext `http://` endpoint with no token. Your service then can't tell OpenShell apart from any other client, and the gateway logs a warning at every startup. Use this only for local development or on a network that already authenticates callers.
+Set `allow_insecure_transport = true` on a registration to use a plaintext `http://` endpoint with no token. Your service then can't tell Ryno apart from any other client, and the gateway logs a warning at every startup. Use this only for local development or on a network that already authenticates callers.
 
 ### Current Limitations
 

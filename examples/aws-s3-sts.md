@@ -1,6 +1,6 @@
 # Manual E2E Test: S3 Access via STS Credentials
 
-This guide walks through an end-to-end test of an OpenShell sandbox accessing
+This guide walks through an end-to-end test of an Ryno sandbox accessing
 AWS S3 using gateway-minted STS temporary credentials with proxy-side SigV4
 re-signing. The sandbox never sees real AWS credentials — the proxy resolves
 placeholders and signs requests on the fly.
@@ -9,20 +9,20 @@ placeholders and signs requests on the fly.
 
 - AWS CLI authenticated (`aws sts get-caller-identity` succeeds)
 - Podman running (`podman info` succeeds)
-- OpenShell built from source with AWS STS refresh and SigV4 signing support
+- Ryno built from source with AWS STS refresh and SigV4 signing support
 
 ## 1. Create AWS test resources
 
 Create an S3 bucket and an IAM role the gateway can assume:
 
 ```shell
-BUCKET="openshell-sts-test-$(date +%s)"
+BUCKET="ryno-sts-test-$(date +%s)"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
 aws s3 mb "s3://${BUCKET}" --region us-east-1
 
 aws iam create-role \
-  --role-name openshell-sts-test-role \
+  --role-name ryno-sts-test-role \
   --assume-role-policy-document '{
     "Version": "2012-10-17",
     "Statement": [{
@@ -33,7 +33,7 @@ aws iam create-role \
   }'
 
 aws iam put-role-policy \
-  --role-name openshell-sts-test-role \
+  --role-name ryno-sts-test-role \
   --policy-name s3-access \
   --policy-document '{
     "Version": "2012-10-17",
@@ -49,7 +49,7 @@ Verify the role works:
 
 ```shell
 aws sts assume-role \
-  --role-arn "arn:aws:iam::${ACCOUNT}:role/openshell-sts-test-role" \
+  --role-arn "arn:aws:iam::${ACCOUNT}:role/ryno-sts-test-role" \
   --role-session-name test \
   --query Credentials.AccessKeyId --output text
 ```
@@ -66,7 +66,7 @@ CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor
 Verify the image exists locally:
 
 ```shell
-podman images | grep "openshell/supervisor.*dev"
+podman images | grep "ryno/supervisor.*dev"
 ```
 
 ## 3. Start the gateway
@@ -86,26 +86,26 @@ Write `.cache/gateway-podman/gateway.toml` in the repo root (adjust JWT paths
 if your gateway cache directory differs):
 
 ```toml
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 compute_driver = "podman"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = ".cache/gateway-podman/tls/jwt/signing.pem"
 public_key_path = ".cache/gateway-podman/tls/jwt/public.pem"
 kid_path = ".cache/gateway-podman/tls/jwt/kid"
 gateway_id = "podman-dev"
 ttl_secs = 3600
 
-[openshell.drivers.podman]
+[ryno.drivers.podman]
 default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
-supervisor_image = "localhost/openshell/supervisor:dev"
+supervisor_image = "localhost/ryno/supervisor:dev"
 image_pull_policy = "if_not_present"
 health_check_interval_secs = 10
 ```
@@ -117,7 +117,7 @@ Start the gateway:
 
 ```shell
 eval "$(aws configure export-credentials --format env)"
-./target/debug/openshell-gateway \
+./target/debug/ryno-gateway \
   --config .cache/gateway-podman/gateway.toml \
   --port 18080 --log-level info --compute-driver podman --disable-tls \
   --db-url "sqlite:.cache/gateway-podman/gateway.db?mode=rwc"
@@ -128,26 +128,26 @@ eval "$(aws configure export-credentials --format env)"
 In a separate terminal:
 
 ```shell
-export OPENSHELL_BASE_URL=http://localhost:18080
+export RYNO_BASE_URL=http://localhost:18080
 
 # Create the provider with the aws-s3 profile. All three credentials are
 # gateway-minted via STS, so no static credential is needed.
-openshell provider create --name s3-test --type aws-s3 --runtime-credentials
+ryno provider create --name s3-test --type aws-s3 --runtime-credentials
 
 # Configure STS refresh
-openshell provider refresh configure s3-test \
+ryno provider refresh configure s3-test \
   --credential-key AWS_ACCESS_KEY_ID \
   --strategy aws-sts-assume-role \
-  --material role_arn="arn:aws:iam::${ACCOUNT}:role/openshell-sts-test-role" \
-  --material session_name="openshell-sandbox" \
+  --material role_arn="arn:aws:iam::${ACCOUNT}:role/ryno-sts-test-role" \
+  --material session_name="ryno-sandbox" \
   --material aws_region="us-east-1"
 
 # Mint the first set of credentials
-openshell provider refresh rotate s3-test \
+ryno provider refresh rotate s3-test \
   --credential-key AWS_ACCESS_KEY_ID
 
 # Verify
-openshell provider refresh status s3-test
+ryno provider refresh status s3-test
 ```
 
 The status should show `refreshed` with an expiry ~1 hour from now.
@@ -161,13 +161,13 @@ egress. Attach the built-in `pypi` profile so `pip` can reach PyPI (or bake
 boto3 into a custom sandbox image):
 
 ```shell
-openshell provider create --name pypi --type pypi --runtime-credentials
+ryno provider create --name pypi --type pypi --runtime-credentials
 
-openshell sandbox create --name s3-smoke \
+ryno sandbox create --name s3-smoke \
   --provider s3-test \
   --provider pypi \
   -- bash -c '
-export AWS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem
+export AWS_CA_BUNDLE=/etc/ryno-tls/ca-bundle.pem
 pip install boto3 -q 2>&1 | tail -1
 python3 -c "
 import boto3
@@ -178,7 +178,7 @@ print(\"Upload...\")
 s3.put_object(
     Bucket=\"'"${BUCKET}"'\",
     Key=\"from-sandbox.txt\",
-    Body=b\"hello from openshell sandbox via STS\"
+    Body=b\"hello from ryno sandbox via STS\"
 )
 print(\"OK\")
 
@@ -198,21 +198,21 @@ print(body.decode())
 ```
 
 All three operations should succeed. The download should print
-`hello from openshell sandbox via STS`.
+`hello from ryno sandbox via STS`.
 
 ### Using curl
 
 ```shell
-openshell sandbox create --name s3-curl \
+ryno sandbox create --name s3-curl \
   --provider s3-test \
   -- bash -c '
 BUCKET="'"${BUCKET}"'"
 REGION="us-east-1"
-CA=/etc/openshell-tls/ca-bundle.pem
+CA=/etc/ryno-tls/ca-bundle.pem
 
 echo "=== Upload ==="
 curl -s --cacert $CA -X PUT -H "Content-Type: text/plain" \
-  -d "hello from openshell sandbox via STS" \
+  -d "hello from ryno sandbox via STS" \
   "https://${BUCKET}.s3.${REGION}.amazonaws.com/from-sandbox.txt" \
   -w "HTTP %{http_code}\n"
 
@@ -246,23 +246,23 @@ The sandbox never saw real AWS credentials — only placeholders.
 
 ### TLS CA trust
 
-The proxy terminates TLS and presents a certificate signed by the OpenShell
-Sandbox CA. Curl needs `--cacert /etc/openshell-tls/ca-bundle.pem` to trust
-it. Python clients need `AWS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem` set
+The proxy terminates TLS and presents a certificate signed by the Ryno
+Sandbox CA. Curl needs `--cacert /etc/ryno-tls/ca-bundle.pem` to trust
+it. Python clients need `AWS_CA_BUNDLE=/etc/ryno-tls/ca-bundle.pem` set
 in the environment.
 
 ## 6. Clean up
 
 ```shell
 # Delete the sandboxes and the pypi provider
-openshell sandbox delete s3-smoke
-openshell sandbox delete s3-curl
-openshell provider delete pypi
+ryno sandbox delete s3-smoke
+ryno sandbox delete s3-curl
+ryno provider delete pypi
 
 # Delete AWS resources
 aws s3 rb "s3://${BUCKET}" --force
-aws iam delete-role-policy --role-name openshell-sts-test-role --policy-name s3-access
-aws iam delete-role --role-name openshell-sts-test-role
+aws iam delete-role-policy --role-name ryno-sts-test-role --policy-name s3-access
+aws iam delete-role --role-name ryno-sts-test-role
 ```
 
 ## Troubleshooting
@@ -272,5 +272,5 @@ aws iam delete-role --role-name openshell-sts-test-role
 | `STS AssumeRole failed: dispatch failure` | Gateway doesn't have AWS credentials | Export credentials before starting: `eval "$(aws configure export-credentials --format env)"` |
 | `Policy discovery sync failed: invalid wire type` | Supervisor image doesn't have updated proto | Rebuild: `CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor` |
 | `CONNECT ... not permitted by policy` | Binary not in profile's `binaries` list | Use curl (in the list) or add your binary path to the policy |
-| `403 AccessDenied` from S3 | IAM role missing permissions, or STS creds expired | Check `openshell provider refresh status`; re-rotate if expired |
+| `403 AccessDenied` from S3 | IAM role missing permissions, or STS creds expired | Check `ryno provider refresh status`; re-rotate if expired |
 | Supervisor uses wrong image | `mise run gateway` places `supervisor_image` in wrong TOML section | Use the hand-written config from step 3 instead of `mise run gateway` |

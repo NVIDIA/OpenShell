@@ -6,7 +6,7 @@
 
 The conformance runner runs in an isolated container and posts the URL of its
 MCP test server to this bridge. The bridge runs the real MCP client inside an
-OpenShell sandbox (via client-through-openshell.sh) and returns its result, so
+Ryno sandbox (via client-through-ryno.sh) and returns its result, so
 the untrusted runner never needs gateway credentials.
 
 Usage: host-bridge.py <port> <repo-root> <log-path>
@@ -26,14 +26,12 @@ from urllib.parse import urlparse
 PORT = int(sys.argv[1])
 ROOT = Path(sys.argv[2])
 LOG_PATH = Path(sys.argv[3])
-TIMEOUT = (
-    int(os.environ.get("OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS", "120")) + 30
-)
+TIMEOUT = int(os.environ.get("RYNO_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS", "120")) + 30
 REQUEST_BODY_TIMEOUT_SECONDS = 10
 MAX_REQUEST_BODY_BYTES = 256 * 1024
-TOKEN_HEADER = "x-openshell-mcp-conformance-token"
-BRIDGE_TOKEN = os.environ["OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN"]
-RUNNER_IP = os.environ["OPENSHELL_MCP_CONFORMANCE_RUNNER_IP"]
+TOKEN_HEADER = "x-ryno-mcp-conformance-token"
+BRIDGE_TOKEN = os.environ["RYNO_MCP_CONFORMANCE_BRIDGE_TOKEN"]
+RUNNER_IP = os.environ["RYNO_MCP_CONFORMANCE_RUNNER_IP"]
 ALLOWED_CONFORMANCE_ENV = frozenset(
     {
         "MCP_CONFORMANCE_SCENARIO",
@@ -52,13 +50,13 @@ HOST_ENV_ALLOWLIST = frozenset(
         "MISE_CONFIG_DIR",
         "MISE_DATA_DIR",
         "MISE_STATE_DIR",
-        "OPENSHELL_BIN",
-        "OPENSHELL_GATEWAY",
-        "OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX",
-        "OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS",
-        "OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT",
-        "OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT_TIMEOUT",
-        "OPENSHELL_PROVISION_TIMEOUT",
+        "RYNO_BIN",
+        "RYNO_GATEWAY",
+        "RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX",
+        "RYNO_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS",
+        "RYNO_MCP_CONFORMANCE_POLICY_WAIT",
+        "RYNO_MCP_CONFORMANCE_POLICY_WAIT_TIMEOUT",
+        "RYNO_PROVISION_TIMEOUT",
         "PATH",
         "RUSTUP_HOME",
         "TMP",
@@ -94,7 +92,7 @@ def subprocess_env(
 ) -> dict[str, str]:
     env = {name: os.environ[name] for name in HOST_ENV_ALLOWLIST if name in os.environ}
     env.update(payload_env)
-    env["OPENSHELL_MCP_CONFORMANCE_EXPECTED_SERVER_HOST"] = expected_server_host
+    env["RYNO_MCP_CONFORMANCE_EXPECTED_SERVER_HOST"] = expected_server_host
     return env
 
 
@@ -212,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
         log(f"running client for {server_url}")
         try:
             result = subprocess.run(
-                ["bash", "e2e/mcp-conformance/client-through-openshell.sh", server_url],
+                ["bash", "e2e/mcp-conformance/client-through-ryno.sh", server_url],
                 cwd=ROOT,
                 env=env,
                 stdin=subprocess.DEVNULL,

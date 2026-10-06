@@ -3,32 +3,32 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Telemetry"
 sidebar-title: "Telemetry"
-description: "What anonymous telemetry OpenShell collects and how to disable it at runtime or compile it out."
+description: "What anonymous telemetry Ryno collects and how to disable it at runtime or compile it out."
 keywords: "Generative AI, Cybersecurity, Telemetry, Privacy, Opt Out, Cargo Features, Observability"
 ---
 
-OpenShell collects anonymous telemetry to help improve the project. The data shows aggregate usage of sandbox, provider, and policy workflows. It is not used to track individual users. Aggregate usage trends are published every two weeks in the [community telemetry reports](https://github.com/NVIDIA/OpenShell/tree/main/telemetry).
+Ryno collects anonymous telemetry to help improve the project. The data shows aggregate usage of sandbox, provider, and policy workflows. It is not used to track individual users. Aggregate usage trends are published every two weeks in the [community telemetry reports](https://github.com/NVIDIA/Ryno/tree/main/telemetry).
 
 ## What Is Collected
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories.
 
-OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
+Ryno telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 
-Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.
+Opting out applies only to telemetry emitted by Ryno. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with Ryno may have their own terms and privacy practices.
 
 ## Disable Telemetry at Runtime
 
-Set `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this setting into sandbox supervisor environments, so sandbox-side telemetry collection is disabled as well.
+Set `RYNO_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. Ryno propagates this setting into sandbox supervisor environments, so sandbox-side telemetry collection is disabled as well.
 
 ## Compile Telemetry Out
 
 Telemetry support is a default-on `telemetry` Cargo feature. Each crate that carries it also defines a `defaults-without-telemetry` alias covering every other default feature. Build telemetry-free artifacts with `--no-default-features --features defaults-without-telemetry`:
 
 ```shell
-cargo build --release -p openshell-gateway --no-default-features --features defaults-without-telemetry
-cargo build --release -p openshell-sandbox --no-default-features --features defaults-without-telemetry
-cargo build --release -p openshell-driver-vm --no-default-features --features defaults-without-telemetry
+cargo build --release -p ryno-gateway --no-default-features --features defaults-without-telemetry
+cargo build --release -p ryno-sandbox --no-default-features --features defaults-without-telemetry
+cargo build --release -p ryno-driver-vm --no-default-features --features defaults-without-telemetry
 ```
 
 The resulting binaries contain no telemetry endpoint, no telemetry HTTP client, and no emission code. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
@@ -41,13 +41,13 @@ The gateway exposes separate Cargo features for its built-in compute drivers: `c
 
 ```shell
 # Docker only, with telemetry support.
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+cargo build --release -p ryno-gateway --no-default-features --features telemetry,compute-driver-docker
 
 # Docker and VM only, with telemetry compiled out.
-cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
+cargo build --release -p ryno-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
 
 # Windows MXC only, with telemetry support and prebuilt Z3.
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,openshell-server/prebuilt-z3
+cargo build --release -p ryno-gateway --no-default-features --features telemetry,compute-driver-mxc,ryno-server/prebuilt-z3
 ```
 
 Regular builds keep their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC and the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.

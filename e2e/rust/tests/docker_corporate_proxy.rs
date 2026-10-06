@@ -27,7 +27,7 @@
 //!    degrading to a direct dial.
 //!
 //! Fixtures run as host processes and are reached by the host-networked
-//! supervisor. `host.openshell.internal` is normalized to the gateway host
+//! supervisor. `host.ryno.internal` is normalized to the gateway host
 //! address, including the CI job-container address when Docker runs on the
 //! host daemon.
 
@@ -36,16 +36,16 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::wait_for_healthy;
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::port::find_free_port;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::wait_for_healthy;
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::host_process::HostPythonFixture;
+use ryno_e2e::harness::port::find_free_port;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
 
-/// The OpenShell alias for the gateway host.
-const HOST_ALIAS: &str = "host.openshell.internal";
+/// The Ryno alias for the gateway host.
+const HOST_ALIAS: &str = "host.ryno.internal";
 const PROXY_USER: &str = "proxyuser";
 const PROXY_PASS: &str = "proxypass";
 
@@ -320,7 +320,7 @@ while True:
 /// A plain HTTP CONNECT proxy that intercepts tunneled destination TLS.
 ///
 /// The proxy presents a corporate-CA-signed certificate for
-/// `host.openshell.internal`, then opens an unverified TLS connection to the
+/// `host.ryno.internal`, then opens an unverified TLS connection to the
 /// real fixture. This lets one test prove both consumers of the configured CA:
 /// inspected traffic is verified by the supervisor, while `tls: skip` traffic
 /// is verified directly by the workload through its combined trust bundle.
@@ -659,7 +659,7 @@ struct GatewayProxyConfig {
 }
 
 fn insert_docker_driver_settings(config: &str, extra: &str) -> Result<String, String> {
-    let table_header = "[openshell.drivers.docker]";
+    let table_header = "[ryno.drivers.docker]";
     let table_start = config
         .find(table_header)
         .ok_or_else(|| format!("gateway config has no {table_header} table"))?;
@@ -683,10 +683,10 @@ fn insert_docker_driver_settings(config: &str, extra: &str) -> Result<String, St
 
 #[test]
 fn proxy_settings_are_inserted_before_nested_driver_tables() {
-    let config = r#"[openshell.drivers.docker]
+    let config = r#"[ryno.drivers.docker]
 socket_path = "/var/run/docker.sock"
 
-[openshell.drivers.docker.resource_admission]
+[ryno.drivers.docker.resource_admission]
 enabled = true
 "#;
 
@@ -696,7 +696,7 @@ enabled = true
         .find("https_proxy = \"http://proxy\"")
         .expect("proxy setting is present");
     let nested_table_position = updated
-        .find("[openshell.drivers.docker.resource_admission]")
+        .find("[ryno.drivers.docker.resource_admission]")
         .expect("nested table is preserved");
 
     assert!(proxy_position < nested_table_position);
@@ -706,8 +706,8 @@ enabled = true
 impl GatewayProxyConfig {
     /// Locate the gateway's `--config` path from the wrapper's args file.
     fn config_path_from_args() -> Result<PathBuf, String> {
-        let args_file = std::env::var("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
-            .map_err(|_| "OPENSHELL_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
+        let args_file = std::env::var("RYNO_E2E_GATEWAY_ARGS_FILE")
+            .map_err(|_| "RYNO_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
         let raw = std::fs::read(&args_file)
             .map_err(|err| format!("read gateway args file '{args_file}': {err}"))?;
         let args: Vec<String> = raw
@@ -722,7 +722,7 @@ impl GatewayProxyConfig {
             .ok_or_else(|| format!("no --config argument in gateway args file '{args_file}'"))
     }
 
-    /// Insert raw TOML lines into `[openshell.drivers.docker]` and restart the
+    /// Insert raw TOML lines into `[ryno.drivers.docker]` and restart the
     /// gateway, without waiting for it to become healthy.
     ///
     /// Used directly by the fail-closed case, which expects the gateway *not*
@@ -821,16 +821,16 @@ impl Drop for GatewayProxyConfig {
 
 /// Skip unless this run owns a Docker gateway it can reconfigure.
 ///
-/// The external-driver lane launches `openshell-driver-docker` from the shell
+/// The external-driver lane launches `ryno-driver-docker` from the shell
 /// wrapper rather than from the gateway, so gateway config changes never reach
 /// the driver and the test would assert against a driver that has no proxy
 /// settings at all.
 fn should_run(label: &str) -> bool {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("docker") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("docker") {
         eprintln!("Skipping {label}: e2e driver is not docker");
         return false;
     }
-    if std::env::var("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
+    if std::env::var("RYNO_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
         eprintln!("Skipping {label}: the external Docker driver is not configured by the gateway");
         return false;
     }
@@ -1159,10 +1159,10 @@ async fn docker_corporate_proxy_rejects_incoherent_configuration() {
     let health = wait_for_healthy(Duration::from_secs(20)).await;
     assert!(
         health.is_err(),
-        "gateway must not serve traffic with an incoherent [openshell.drivers.docker] proxy table"
+        "gateway must not serve traffic with an incoherent [ryno.drivers.docker] proxy table"
     );
 
-    let log_path = std::env::var("OPENSHELL_E2E_GATEWAY_LOG").expect("gateway log path");
+    let log_path = std::env::var("RYNO_E2E_GATEWAY_LOG").expect("gateway log path");
     let log = std::fs::read_to_string(&log_path).expect("read gateway log");
     // The message must name the offending key rather than surfacing as an
     // opaque driver-readiness timeout. Matched loosely on the key names so

@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING
 
 from google.protobuf import duration_pb2
 
-from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
+from ryno._proto import datamodel_pb2, ryno_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox, SandboxClient, WorkspaceClient
+    from ryno import Sandbox, SandboxClient, WorkspaceClient
 
 
 def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
@@ -24,23 +24,23 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
     name = f"replay-{uuid.uuid4().hex[:8]}"
     scope = "default"
     stub = sandbox_client._stub
-    create = openshell_pb2.CreateSandboxRequest(
+    create = ryno_pb2.CreateSandboxRequest(
         name=name,
-        spec=openshell_pb2.SandboxSpec(),
+        spec=ryno_pb2.SandboxSpec(),
         workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
         request_id=str(uuid.uuid4()),
     )
 
     def replay(method, request):
         result, call = method.with_call(request, timeout=60)
-        assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+        assert dict(call.initial_metadata())["ryno-replayed"] == "true"
         return result
 
     try:
         original = stub.CreateSandbox(create, timeout=60).sandbox.metadata.id
         sandbox_client.wait_ready(name, workspace="default", timeout_seconds=300)
         assert replay(stub.CreateSandbox, create).sandbox.metadata.id == original
-        stop = openshell_pb2.StopSandboxRequest(
+        stop = ryno_pb2.StopSandboxRequest(
             name=name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
@@ -48,7 +48,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         stub.StopSandbox(stop, timeout=60)
         sandbox_client.wait_stopped(name, workspace="default", timeout_seconds=120)
         assert replay(stub.StopSandbox, stop).sandbox.metadata.id == original
-        start = openshell_pb2.StartSandboxRequest(
+        start = ryno_pb2.StartSandboxRequest(
             name=name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
@@ -56,7 +56,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         stub.StartSandbox(start, timeout=60)
         sandbox_client.wait_ready(name, workspace="default", timeout_seconds=300)
         assert replay(stub.StartSandbox, start).sandbox.metadata.id == original
-        update = openshell_pb2.UpdateConfigRequest(
+        update = ryno_pb2.UpdateConfigRequest(
             sandbox=name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             setting_key="ocsf_json_enabled",
@@ -65,7 +65,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         )
         updated = stub.UpdateConfig(update, timeout=30)
         assert replay(stub.UpdateConfig, update) == updated
-        delete = openshell_pb2.DeleteSandboxRequest(
+        delete = ryno_pb2.DeleteSandboxRequest(
             name=name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
@@ -142,8 +142,8 @@ def test_sandbox_interactive_exec_honors_tty(
     stderr_sentinel = b"stderr-sentinel"
 
     def exec_interactive(sandbox_name: str, *, tty: bool) -> tuple[bytes, bytes]:
-        request = openshell_pb2.ExecSandboxInput(
-            start=openshell_pb2.ExecSandboxRequest(
+        request = ryno_pb2.ExecSandboxInput(
+            start=ryno_pb2.ExecSandboxRequest(
                 sandbox=sandbox_name,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 command=[
@@ -172,7 +172,7 @@ def test_sandbox_interactive_exec_honors_tty(
             # the complete marker, including its newline, before sending input.
             if not ready.wait(timeout=20) or done.is_set():
                 return
-            yield openshell_pb2.ExecSandboxInput(stdin=stdin_sentinel + b"\n")
+            yield ryno_pb2.ExecSandboxInput(stdin=stdin_sentinel + b"\n")
             done.wait(timeout=30)
 
         stdout = bytearray()
@@ -223,8 +223,8 @@ def test_interactive_exec_drains_output_after_request_eof(
     with sandbox(delete_on_exit=True) as sb:
 
         def requests():
-            yield openshell_pb2.ExecSandboxInput(
-                start=openshell_pb2.ExecSandboxRequest(
+            yield ryno_pb2.ExecSandboxInput(
+                start=ryno_pb2.ExecSandboxRequest(
                     sandbox=sb.sandbox.name,
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                     command=[
@@ -237,7 +237,7 @@ def test_interactive_exec_drains_output_after_request_eof(
                     execution_timeout=duration_pb2.Duration(seconds=20),
                 )
             )
-            yield openshell_pb2.ExecSandboxInput(stdin=b"drained-stdout")
+            yield ryno_pb2.ExecSandboxInput(stdin=b"drained-stdout")
             # End requests before the command emits output. The receive
             # direction must survive long enough to drain both output streams.
 

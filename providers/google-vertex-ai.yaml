@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/google-vertex-ai.yaml
-#   openshell provider profile import -f providers/google-vertex-ai.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/google-vertex-ai.yaml
+#   ryno provider profile import -f providers/google-vertex-ai.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -22,7 +22,7 @@
 #                    bootstrap material and is never injected into the sandbox.
 # Endpoint access:   the aiplatform.googleapis.com regional and replicated hosts,
 #                    read-write, L7 enforced.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      curl -sS -H "Authorization: Bearer $GOOGLE_VERTEX_AI_TOKEN" \
 #                        https://us-central1-aiplatform.googleapis.com/v1/projects/$VERTEX_AI_PROJECT_ID/locations/us-central1/publishers/google/models
 

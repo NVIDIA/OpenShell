@@ -297,7 +297,7 @@ jobs:
           fi
 
   result:
-    name: ${{ inputs.fail-on-findings && 'OpenShell / Codex Security' || 'OpenShell / Codex Security (informational)' }}
+    name: ${{ inputs.fail-on-findings && 'Ryno / Codex Security' || 'Ryno / Codex Security (informational)' }}
     if: ${{ always() }}
     needs: analyze
     runs-on: ubuntu-latest

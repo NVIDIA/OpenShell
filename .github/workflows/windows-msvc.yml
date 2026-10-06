@@ -71,7 +71,7 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Isolate Rust toolchains
         # rust-cache hashes every installed toolchain, including unused runner defaults.
-        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
+        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/ryno-rustup" >> $env:GITHUB_ENV'
       - name: Install Rust toolchain
         # GitHub-hosted runners include rustup. With no toolchain argument,
         # rustup installs the checked-in rust-toolchain.toml configuration:
@@ -136,7 +136,7 @@ jobs:
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Isolate Rust toolchains
-        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
+        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/ryno-rustup" >> $env:GITHUB_ENV'
       - name: Install Rust toolchain
         run: |
           rustup set profile minimal
@@ -194,7 +194,7 @@ jobs:
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Isolate Rust toolchains
-        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
+        run: '"RUSTUP_HOME=$env:RUNNER_TEMP/ryno-rustup" >> $env:GITHUB_ENV'
       - name: Install Rust toolchain
         run: |
           rustup set profile minimal

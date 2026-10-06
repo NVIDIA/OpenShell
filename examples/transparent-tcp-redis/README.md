@@ -1,11 +1,11 @@
 # Transparent TCP Redis
 
-This example connects a Docker-backed OpenShell sandbox to Redis with a native
+This example connects a Docker-backed Ryno sandbox to Redis with a native
 TCP client. It does not use the HTTP forward proxy.
 
 The demo:
 
-1. Starts Redis on the OpenShell-managed Docker network.
+1. Starts Redis on the Ryno-managed Docker network.
 2. Creates a sandbox with an endpoint that explicitly uses `protocol: tcp`.
 3. Resolves the policy hostname to an ephemeral synthetic address.
 4. Opens a native TCP socket and runs Redis `PING`, `SET`, `GET`, and `DEL` commands.
@@ -14,22 +14,22 @@ The demo:
 6. Prints the sandbox log stream, including OCSF DNS and TCP decisions.
 7. Deletes the sandbox and Redis container, including after a failure.
 
-OpenShell authorizes the hostname and port before policy DNS publishes the
-synthetic address. When the client connects, OpenShell maps that address back
+Ryno authorizes the hostname and port before policy DNS publishes the
+synthetic address. When the client connects, Ryno maps that address back
 to the approved endpoint, rechecks the process and policy, and dials a pinned
 real Redis address. A direct connection to the Redis container IP remains
 blocked.
 
 ## Prerequisites
 
-- A Docker-backed OpenShell gateway built from the transparent TCP branch
-- The `openshell` and `docker` commands
+- A Docker-backed Ryno gateway built from the transparent TCP branch
+- The `ryno` and `docker` commands
 - Access to pull `redis:7-alpine`
 
-The Docker compute driver creates and uses the `openshell-docker` bridge by
+The Docker compute driver creates and uses the `ryno-docker` bridge by
 default. The gateway process itself runs on the host; only sandbox supervisors
 and the Redis service join this bridge. If the driver uses another network, set
-`OPENSHELL_DOCKER_NETWORK` to that network's name.
+`RYNO_DOCKER_NETWORK` to that network's name.
 
 ## Run the example
 
@@ -42,13 +42,13 @@ examples/transparent-tcp-redis/demo.sh
 Expected client output includes:
 
 ```text
-policy DNS: redis.openshell.demo -> 198.18.x.x
+policy DNS: redis.ryno.demo -> 198.18.x.x
 PING -> 'PONG'
 SET -> 'OK'
-GET -> 'hello-from-openshell'
+GET -> 'hello-from-ryno'
 DEL -> 1
-BLOCKED (unapproved hostname): openshell-transparent-tcp-redis-demo:6379 -> gaierror
-BLOCKED (wrong port): redis.openshell.demo:6380 -> RuntimeError
+BLOCKED (unapproved hostname): ryno-transparent-tcp-redis-demo:6379 -> gaierror
+BLOCKED (wrong port): redis.ryno.demo:6380 -> RuntimeError
 BLOCKED (direct real-IP dial): 172.x.x.x:6379 -> ConnectionRefusedError
 transparent TCP Redis demo passed
 ```
@@ -83,8 +83,8 @@ Override resource names or the image without editing the files:
 
 ```shell
 SANDBOX_NAME=tcp-redis-demo \
-REDIS_CONTAINER=my-openshell-redis \
+REDIS_CONTAINER=my-ryno-redis \
 REDIS_IMAGE=redis:7-alpine \
-OPENSHELL_DOCKER_NETWORK=openshell-docker \
+RYNO_DOCKER_NETWORK=ryno-docker \
 examples/transparent-tcp-redis/demo.sh
 ```

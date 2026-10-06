@@ -6,7 +6,7 @@ landing-page:
   path: index.mdx
 
 navigation:
-- section: "About NVIDIA OpenShell"
+- section: "About NVIDIA Ryno"
   slug: about
   contents:
   - page: "Overview"

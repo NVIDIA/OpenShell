@@ -42,17 +42,17 @@ impl ManagedGateway {
     /// Load managed gateway controls from the environment.
     ///
     /// Returns `Ok(None)` when the current e2e run does not own the gateway,
-    /// such as `OPENSHELL_GATEWAY_ENDPOINT=http://...` existing-endpoint mode.
+    /// such as `RYNO_GATEWAY_ENDPOINT=http://...` existing-endpoint mode.
     pub fn from_env() -> Result<Option<Self>, String> {
-        let Some(bin) = std::env::var_os("OPENSHELL_E2E_GATEWAY_BIN") else {
+        let Some(bin) = std::env::var_os("RYNO_E2E_GATEWAY_BIN") else {
             return Ok(None);
         };
 
         Ok(Some(Self {
             bin: PathBuf::from(bin),
-            args_file: env_path("OPENSHELL_E2E_GATEWAY_ARGS_FILE")?,
-            log: env_path("OPENSHELL_E2E_GATEWAY_LOG")?,
-            pid_file: env_path("OPENSHELL_E2E_GATEWAY_PID_FILE")?,
+            args_file: env_path("RYNO_E2E_GATEWAY_ARGS_FILE")?,
+            log: env_path("RYNO_E2E_GATEWAY_LOG")?,
+            pid_file: env_path("RYNO_E2E_GATEWAY_PID_FILE")?,
         }))
     }
 
@@ -73,7 +73,7 @@ impl ManagedGateway {
             .map_err(|err| format!("open gateway log '{}': {err}", self.log.display()))?;
         writeln!(
             log,
-            "\n=== starting openshell-gateway from Rust e2e harness ==="
+            "\n=== starting ryno-gateway from Rust e2e harness ==="
         )
         .map_err(|err| format!("write gateway log marker: {err}"))?;
         let stderr = log
@@ -85,7 +85,7 @@ impl ManagedGateway {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .spawn()
-            .map_err(|err| format!("start openshell-gateway '{}': {err}", self.bin.display()))?;
+            .map_err(|err| format!("start ryno-gateway '{}': {err}", self.bin.display()))?;
         let pid = child.id();
         fs::write(&self.pid_file, format!("{pid}\n")).map_err(|err| {
             format!(
@@ -163,7 +163,7 @@ impl Drop for ManagedGateway {
 fn env_path(name: &str) -> Result<PathBuf, String> {
     std::env::var_os(name)
         .map(PathBuf::from)
-        .ok_or_else(|| format!("{name} must be set when OPENSHELL_E2E_GATEWAY_BIN is set"))
+        .ok_or_else(|| format!("{name} must be set when RYNO_E2E_GATEWAY_BIN is set"))
 }
 
 fn process_running(pid: u32) -> Result<bool, String> {

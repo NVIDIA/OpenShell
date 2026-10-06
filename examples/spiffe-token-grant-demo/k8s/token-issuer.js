@@ -14,7 +14,7 @@ const SPIRE_ISSUER =
 const JWT_SVID_AUDIENCE =
   process.env.JWT_SVID_AUDIENCE || "http://token-issuer.default.svc.cluster.local";
 const TRUST_DOMAIN_PREFIX =
-  process.env.TRUST_DOMAIN_PREFIX || "spiffe://openshell.local/openshell/sandbox/";
+  process.env.TRUST_DOMAIN_PREFIX || "spiffe://ryno.local/ryno/sandbox/";
 const ACCESS_TOKEN_ISSUER =
   process.env.ACCESS_TOKEN_ISSUER || "http://token-issuer.default.svc.cluster.local";
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
@@ -105,7 +105,7 @@ async function verifyJwtSvid(jwt) {
     throw new Error(`JWT-SVID audience did not include ${JWT_SVID_AUDIENCE}`);
   }
   if (!String(parsed.payload.sub || "").startsWith(TRUST_DOMAIN_PREFIX)) {
-    throw new Error("JWT-SVID subject was not an OpenShell sandbox SPIFFE ID");
+    throw new Error("JWT-SVID subject was not an Ryno sandbox SPIFFE ID");
   }
   return parsed.payload;
 }

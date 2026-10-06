@@ -13,7 +13,7 @@ clean: true
 inputs:
   - directory: ../../proto
     paths:
-      - ../../proto/openshell.proto
+      - ../../proto/ryno.proto
       - ../../proto/sandbox.proto
       - ../../proto/datamodel.proto
       - ../../proto/options.proto

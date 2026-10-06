@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run an e2e command against a Podman-backed OpenShell gateway.
+# Run an e2e command against a Podman-backed Ryno gateway.
 #
 # Modes:
-#   - OPENSHELL_GATEWAY_ENDPOINT unset:
+#   - RYNO_GATEWAY_ENDPOINT unset:
 #       Build and start an ephemeral standalone gateway with the Podman compute
 #       driver, then run the command against that gateway.
-#   - OPENSHELL_GATEWAY_ENDPOINT=http://host:port:
+#   - RYNO_GATEWAY_ENDPOINT=http://host:port:
 #       Use the existing plaintext gateway endpoint and run the command.
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
@@ -16,10 +16,10 @@
 #
 # Supervisor image overrides:
 #   SUPERVISOR_IMAGE=... (common test-wrapper override)
-#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   RYNO_SUPERVISOR_IMAGE=... (existing compatibility override)
 #   SANDBOX_IMAGE=... (trusted sandbox runtime override)
 #
-# Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
+# Set RYNO_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
 # Podman sandbox stop timeout. The harness default is intentionally shorter
 # than the production driver default to keep CI teardown bounded.
 
@@ -41,13 +41,13 @@ require_container_engine_lane() {
   local label=$2
   local selected_engine selected_driver
 
-  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
-    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+  if [ -n "${RYNO_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: RYNO_E2E_CONTAINER_ENGINE is no longer supported." >&2
     echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
     exit 2
   fi
   selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
-  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${RYNO_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
 
   if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
     echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
@@ -55,13 +55,13 @@ require_container_engine_lane() {
     exit 2
   fi
   if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
-    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
-    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    echo "ERROR: RYNO_E2E_DRIVER=${RYNO_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set RYNO_E2E_DRIVER=${lane} or unset RYNO_E2E_DRIVER." >&2
     exit 2
   fi
 
   export CONTAINER_ENGINE="${lane}"
-  export OPENSHELL_E2E_DRIVER="${lane}"
+  export RYNO_E2E_DRIVER="${lane}"
 }
 
 require_container_engine_lane podman Podman
@@ -71,11 +71,11 @@ PODMAN_XDG_CONFIG_HOME=""
 if [ "${XDG_CONFIG_HOME+x}" = x ]; then
   PODMAN_XDG_CONFIG_HOME_WAS_SET=1
   PODMAN_XDG_CONFIG_HOME="${XDG_CONFIG_HOME}"
-  export OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME="${PODMAN_XDG_CONFIG_HOME}"
-  unset OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME
+  export RYNO_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME="${PODMAN_XDG_CONFIG_HOME}"
+  unset RYNO_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME
 else
-  export OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME=1
-  unset OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME
+  export RYNO_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME=1
+  unset RYNO_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME
 fi
 
 with_podman_config() {
@@ -87,8 +87,8 @@ with_podman_config() {
 }
 
 podman_cmd() {
-  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
-    with_podman_config podman --url "unix://${OPENSHELL_PODMAN_SOCKET}" "$@"
+  if [ -n "${RYNO_PODMAN_SOCKET:-}" ]; then
+    with_podman_config podman --url "unix://${RYNO_PODMAN_SOCKET}" "$@"
   else
     with_podman_config podman "$@"
   fi
@@ -96,24 +96,24 @@ podman_cmd() {
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
-WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-podman.XXXXXX")"
-if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
+WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/ryno-e2e-podman.XXXXXX")"
+if [ "${RYNO_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
   mkdir -p "${WORKDIR}/spiffe"
-  export OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET:-${WORKDIR}/spiffe/gateway.sock}"
-  export OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET}"
-  if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
-    OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+  export RYNO_E2E_GATEWAY_SPIFFE_SOCKET="${RYNO_E2E_GATEWAY_SPIFFE_SOCKET:-${WORKDIR}/spiffe/gateway.sock}"
+  export RYNO_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET="${RYNO_E2E_GATEWAY_SPIFFE_SOCKET}"
+  if [ -z "${RYNO_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
+    RYNO_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
+    export RYNO_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${RYNO_E2E_PROVIDER_SPIFFE_PORT}"
     # Podman supervisors run with host networking, so reach the host-side
     # Workload API fixture over loopback rather than the workload bridge.
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+    export RYNO_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${RYNO_E2E_PROVIDER_SPIFFE_PORT}"
   fi
 fi
 GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
-export OPENSHELL_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
+export RYNO_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
 DRIVER_BIN=""
@@ -128,12 +128,12 @@ PODMAN_NETWORK_MANAGED=0
 PODMAN_SERVICE_PID=""
 PODMAN_SERVICE_LOG="${WORKDIR}/podman-service.log"
 PODMAN_SOCKET=""
-GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
-OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
-OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+GPU_MODE="${RYNO_E2E_PODMAN_GPU:-0}"
+OIDC_MODE="${RYNO_E2E_OIDC_GATEWAY:-0}"
+OIDC_ISSUER="${RYNO_E2E_OIDC_ISSUER:-}"
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
-  echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
+  echo "ERROR: RYNO_E2E_OIDC_ISSUER is required when RYNO_E2E_OIDC_GATEWAY=1" >&2
   exit 2
 fi
 
@@ -150,13 +150,13 @@ cleanup() {
   if command -v podman >/dev/null 2>&1; then
     if [ -n "${PODMAN_NETWORK_NAME}" ]; then
       sandbox_ids="$(podman_cmd ps -aq \
-        --filter "label=openshell.managed=true" \
+        --filter "label=ryno.managed=true" \
         --filter "network=${PODMAN_NETWORK_NAME}" \
         2>/dev/null || true)"
     elif [ -n "${E2E_NAMESPACE}" ]; then
       sandbox_ids="$(podman_cmd ps -aq \
-        --filter "label=openshell.managed=true" \
-        --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+        --filter "label=ryno.managed=true" \
+        --filter "label=ryno.ai/sandbox-namespace=${E2E_NAMESPACE}" \
         2>/dev/null || true)"
     fi
   fi
@@ -175,23 +175,23 @@ cleanup() {
   if [ -n "${sandbox_ids}" ]; then
     for id in ${sandbox_ids}; do
       local sandbox_id
-      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
+      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "ryno.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
         # Only the companion is attached to the test network. Remove it first
         # (it depends on the workload user namespace), then locate the isolated
         # network=none workload by this test sandbox's immutable label.
-        podman_cmd rm -f "openshell-supervisor-${sandbox_id}" >/dev/null 2>&1 || true
+        podman_cmd rm -f "ryno-supervisor-${sandbox_id}" >/dev/null 2>&1 || true
         local workload_ids workload_id
-        workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
-          --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
-          --filter "label=openshell.ai/isolation-role=sandbox" 2>/dev/null || true)"
+        workload_ids="$(podman_cmd ps -aq --filter "label=ryno.managed=true" \
+          --filter "label=ryno.ai/sandbox-id=${sandbox_id}" \
+          --filter "label=ryno.ai/isolation-role=sandbox" 2>/dev/null || true)"
         for workload_id in ${workload_ids}; do
           podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
         done
-        podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
-        podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
+        podman_cmd volume rm "ryno-channel-${sandbox_id}" >/dev/null 2>&1 || true
+        podman_cmd volume rm -f "ryno-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
         local secret_prefix
-        for secret_prefix in openshell-token openshell-proxy-auth openshell-resolver openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+        for secret_prefix in ryno-token ryno-proxy-auth ryno-resolver ryno-tls-ca ryno-tls-cert ryno-tls-key; do
           podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
         done
       fi
@@ -234,8 +234,8 @@ ensure_e2e_podman_network() {
 
   podman_cmd network create \
     --driver bridge \
-    --label openshell.managed=true \
-    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+    --label ryno.managed=true \
+    --label "ryno.ai/sandbox-namespace=${E2E_NAMESPACE}" \
     "${network}" >/dev/null
   PODMAN_NETWORK_MANAGED=1
 }
@@ -264,8 +264,8 @@ default_podman_socket_path() {
 }
 
 ensure_podman_api_socket() {
-  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
-    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
+  if [ -n "${RYNO_PODMAN_SOCKET:-}" ]; then
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${RYNO_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -274,8 +274,8 @@ ensure_podman_api_socket() {
   if [ -n "${default_socket}" ] \
      && [ -S "${default_socket}" ] \
      && with_podman_config podman --url "unix://${default_socket}" info >/dev/null 2>&1; then
-    export OPENSHELL_PODMAN_SOCKET="${default_socket}"
-    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
+    export RYNO_PODMAN_SOCKET="${default_socket}"
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${RYNO_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -287,7 +287,7 @@ ensure_podman_api_socket() {
     echo "ERROR: could not reach the Podman API socket on macOS." >&2
     echo "       Expected socket from 'podman machine inspect': ${default_socket:-<none>}" >&2
     echo "       Ensure 'podman machine start' has been run, or set" >&2
-    echo "       OPENSHELL_PODMAN_SOCKET to a reachable unix socket path." >&2
+    echo "       RYNO_PODMAN_SOCKET to a reachable unix socket path." >&2
     exit 2
   fi
 
@@ -298,8 +298,8 @@ ensure_podman_api_socket() {
   with_podman_config podman system service --time=0 "unix://${PODMAN_SOCKET}" \
     >"${PODMAN_SERVICE_LOG}" 2>&1 &
   PODMAN_SERVICE_PID=$!
-  export OPENSHELL_PODMAN_SOCKET="${PODMAN_SOCKET}"
-  export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
+  export RYNO_PODMAN_SOCKET="${PODMAN_SOCKET}"
+  export CONTAINER_HOST="${CONTAINER_HOST:-unix://${RYNO_PODMAN_SOCKET}}"
 
   local elapsed=0
   local timeout=30
@@ -325,8 +325,8 @@ ensure_podman_api_socket() {
 }
 
 resolve_podman_supervisor_image() {
-  if [ -n "${OPENSHELL_SUPERVISOR_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_SUPERVISOR_IMAGE}"
+  if [ -n "${RYNO_SUPERVISOR_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_SUPERVISOR_IMAGE}"
     return 0
   fi
 
@@ -346,17 +346,17 @@ resolve_podman_supervisor_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${RYNO_REGISTRY:-ghcr.io/nvidia/ryno}"
     printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
 
-  printf '%s\n' "openshell/supervisor:dev"
+  printf '%s\n' "ryno/supervisor:dev"
 }
 
 resolve_podman_sandbox_runtime_image() {
-  if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+  if [ -n "${RYNO_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_SANDBOX_RUNTIME_IMAGE}"
     return 0
   fi
   if [ -n "${SANDBOX_IMAGE:-}" ]; then
@@ -370,19 +370,19 @@ resolve_podman_sandbox_runtime_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${RYNO_REGISTRY:-ghcr.io/nvidia/ryno}"
     printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
 
-  printf '%s\n' "openshell/sandbox:dev"
+  printf '%s\n' "ryno/sandbox:dev"
 }
 
 ensure_podman_supervisor_image() {
   local image=$1
 
-  if [ "${image}" = "openshell/supervisor:dev" ] \
-     && [ -z "${OPENSHELL_SUPERVISOR_IMAGE:-}" ] \
+  if [ "${image}" = "ryno/supervisor:dev" ] \
+     && [ -z "${RYNO_SUPERVISOR_IMAGE:-}" ] \
      && [ -z "${CI:-}" ]; then
     echo "Building local Podman supervisor image ${image}..."
     with_podman_config env CONTAINER_ENGINE=podman IMAGE_TAG=dev \
@@ -405,15 +405,15 @@ ensure_podman_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/RYNO_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 
 ensure_podman_sandbox_runtime_image() {
   local image=$1
 
-  if [ "${image}" = "openshell/sandbox:dev" ] \
-     && [ -z "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ] \
+  if [ "${image}" = "ryno/sandbox:dev" ] \
+     && [ -z "${RYNO_SANDBOX_RUNTIME_IMAGE:-}" ] \
      && [ -z "${CI:-}" ]; then
     echo "Building local Podman sandbox runtime image ${image}..."
     with_podman_config env CONTAINER_ENGINE=podman IMAGE_TAG=dev \
@@ -436,35 +436,35 @@ ensure_podman_sandbox_runtime_image() {
   fi
 
   echo "ERROR: sandbox runtime image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set RYNO_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
   exit 2
 }
 
-if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
-  case "${OPENSHELL_GATEWAY_ENDPOINT}" in
+if [ -n "${RYNO_GATEWAY_ENDPOINT:-}" ]; then
+  case "${RYNO_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT endpoint mode is HTTP-only for e2e." >&2
+      echo "ERROR: RYNO_GATEWAY_ENDPOINT endpoint mode is HTTP-only for e2e." >&2
       echo "       Register a named gateway with mTLS config instead of using a raw HTTPS endpoint." >&2
       exit 2
       ;;
     *)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT must start with http:// for e2e endpoint mode." >&2
+      echo "ERROR: RYNO_GATEWAY_ENDPOINT must start with http:// for e2e endpoint mode." >&2
       exit 2
       ;;
   esac
 
-  GATEWAY_NAME="${OPENSHELL_GATEWAY:-openshell-e2e-podman-endpoint}"
+  GATEWAY_NAME="${RYNO_GATEWAY:-ryno-e2e-podman-endpoint}"
   e2e_register_plaintext_gateway \
     "${XDG_CONFIG_HOME}" \
     "${GATEWAY_NAME}" \
-    "${OPENSHELL_GATEWAY_ENDPOINT}" \
-    "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
-  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
-  export OPENSHELL_E2E_DRIVER="podman"
+    "${RYNO_GATEWAY_ENDPOINT}" \
+    "$(e2e_endpoint_port "${RYNO_GATEWAY_ENDPOINT}")"
+  export RYNO_GATEWAY="${GATEWAY_NAME}"
+  export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-300}"
+  export RYNO_E2E_DRIVER="podman"
 
-  echo "Using existing Podman e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
+  echo "Using existing Podman e2e gateway endpoint: ${RYNO_GATEWAY_ENDPOINT}"
   "$@"
   exit $?
 fi
@@ -484,10 +484,10 @@ if ! podman_cmd info >/dev/null 2>&1; then
 fi
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
-export OPENSHELL_BIN="${CLI_BIN}"
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+export RYNO_BIN="${CLI_BIN}"
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   e2e_build_external_driver \
-    "${ROOT}" openshell-driver-podman openshell-driver-podman DRIVER_BIN
+    "${ROOT}" ryno-driver-podman ryno-driver-podman DRIVER_BIN
 fi
 
 SUPERVISOR_IMAGE="$(resolve_podman_supervisor_image)"
@@ -499,10 +499,10 @@ ensure_podman_sandbox_runtime_image "${SANDBOX_BOUNDARY_IMAGE}"
 echo "Using Podman sandbox runtime image: ${SANDBOX_BOUNDARY_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
-SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
+SANDBOX_IMAGE_REQUEST="${RYNO_E2E_PODMAN_SANDBOX_IMAGE:-${RYNO_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+PODMAN_STOP_TIMEOUT_SECS="${RYNO_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
 if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
+  echo "ERROR: RYNO_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
   exit 2
 fi
 if ! podman_cmd image exists "${SANDBOX_IMAGE_REQUEST}" 2>/dev/null; then
@@ -513,7 +513,7 @@ echo "Using Podman sandbox image: ${SANDBOX_IMAGE_REQUEST}"
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
-export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
+export RYNO_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
@@ -529,11 +529,11 @@ E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"
 PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
 ensure_e2e_podman_network "${PODMAN_NETWORK_NAME}"
 
-export OPENSHELL_E2E_DRIVER="podman"
-export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
-export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
+export RYNO_E2E_DRIVER="podman"
+export RYNO_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
+export RYNO_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
-echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+echo "Starting ryno-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
@@ -542,8 +542,8 @@ e2e_write_podman_gateway_config \
   "${ROOT}" \
   "${PKI_DIR}" \
   "${JWT_DIR}" \
-  "openshell-e2e-podman-${HOST_PORT}" \
-  "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" \
+  "ryno-e2e-podman-${HOST_PORT}" \
+  "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" \
   "${DRIVER_SOCKET}" \
   "${PODMAN_NETWORK_NAME}" \
   "${HOST_PORT}" \
@@ -551,30 +551,30 @@ e2e_write_podman_gateway_config \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
   "${SUPERVISOR_IMAGE}" \
   "${SANDBOX_BOUNDARY_IMAGE}" \
-  "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
-  "${OPENSHELL_PODMAN_SOCKET:-}" \
+  "${RYNO_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
+  "${RYNO_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
-  "${OPENSHELL_OIDC_ISSUER:-}"
+  "${RYNO_OIDC_ISSUER:-}"
 EXTERNAL_DRIVER_GRPC_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS=10
 EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS=true
 EXTERNAL_DRIVER_TLS_CA="${PKI_DIR}/ca.crt"
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   env -i \
   XDG_DATA_HOME="${DRIVER_DATA_HOME}" \
-  OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
-  OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
-  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE_REQUEST}" \
-  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
-  OPENSHELL_HEALTH_CHECK_INTERVAL_SECS="${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
-  OPENSHELL_GRPC_ENDPOINT="${EXTERNAL_DRIVER_GRPC_ENDPOINT}" \
-  OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
-  OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
-  OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
-  OPENSHELL_SANDBOX_RUNTIME_IMAGE="${SANDBOX_BOUNDARY_IMAGE}" \
-  OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
-  OPENSHELL_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
-  OPENSHELL_ENABLE_BIND_MOUNTS="${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}" \
+  RYNO_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
+  RYNO_PODMAN_SOCKET="${RYNO_PODMAN_SOCKET:-}" \
+  RYNO_SANDBOX_IMAGE="${SANDBOX_IMAGE_REQUEST}" \
+  RYNO_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
+  RYNO_HEALTH_CHECK_INTERVAL_SECS="${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
+  RYNO_GRPC_ENDPOINT="${EXTERNAL_DRIVER_GRPC_ENDPOINT}" \
+  RYNO_GATEWAY_PORT="${HOST_PORT}" \
+  RYNO_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
+  RYNO_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
+  RYNO_SANDBOX_RUNTIME_IMAGE="${SANDBOX_BOUNDARY_IMAGE}" \
+  RYNO_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
+  RYNO_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
+  RYNO_ENABLE_BIND_MOUNTS="${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}" \
     "${DRIVER_BIN}" >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -599,7 +599,7 @@ GATEWAY_ARGS=(
 if [ "${OIDC_MODE}" = "1" ]; then
   GATEWAY_ARGS+=(
     --oidc-issuer "${OIDC_ISSUER}"
-    --oidc-audience openshell-cli
+    --oidc-audience ryno-cli
     --oidc-scopes-claim scope
   )
   case "${OIDC_ISSUER}" in
@@ -620,17 +620,17 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
-OPENSHELL_LOCAL_TLS_DIR="${PKI_DIR}" \
-OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
-OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
+RYNO_LOCAL_TLS_DIR="${PKI_DIR}" \
+RYNO_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
+RYNO_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
-GATEWAY_NAME="openshell-e2e-podman-${HOST_PORT}"
+GATEWAY_NAME="ryno-e2e-podman-${HOST_PORT}"
 if [ "${OIDC_MODE}" = "1" ]; then
   CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
-  export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+  export RYNO_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 else
   CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
   e2e_register_mtls_gateway \
@@ -639,15 +639,15 @@ else
     "${CLI_GATEWAY_ENDPOINT}" \
     "${HOST_PORT}" \
     "${PKI_DIR}" \
-    "${OPENSHELL_OIDC_ISSUER:-}"
+    "${RYNO_OIDC_ISSUER:-}"
 fi
 
-export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+export RYNO_GATEWAY="${GATEWAY_NAME}"
+export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-300}"
 
-if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-  export OPENSHELL_E2E_OIDC=1
-  export OPENSHELL_E2E_OIDC_SCOPES=1
+if [ "${OIDC_MODE}" = "1" ] || [ -n "${RYNO_OIDC_ISSUER:-}" ]; then
+  export RYNO_E2E_OIDC=1
+  export RYNO_E2E_OIDC_SCOPES=1
 fi
 
 echo "Waiting for gateway to become healthy..."
@@ -655,7 +655,7 @@ elapsed=0
 timeout=120
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "ERROR: openshell-gateway exited before becoming healthy"
+    echo "ERROR: ryno-gateway exited before becoming healthy"
     exit 1
   fi
   # Keep this loopback probe direct even when ::1 is absent from NO_PROXY.
@@ -682,8 +682,8 @@ if [ "${OIDC_MODE}" = "1" ]; then
     "${CLI_GATEWAY_ENDPOINT}" \
     "${HOST_PORT}" \
     "${OIDC_ISSUER}" \
-    "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
-    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${RYNO_E2E_OIDC_USERNAME:-admin@test}" \
+    "${RYNO_E2E_OIDC_PASSWORD:-admin}" \
     "${PKI_DIR}" \
     "${CLI_BIN}" || exit 1
 fi

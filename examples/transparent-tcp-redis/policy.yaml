@@ -14,7 +14,7 @@ network_policies:
   redis:
     name: redis-native-tcp
     endpoints:
-      - host: redis.openshell.demo
+      - host: redis.ryno.demo
         port: 6379
         protocol: tcp
         allowed_ips:

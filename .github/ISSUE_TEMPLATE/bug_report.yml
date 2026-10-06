@@ -7,17 +7,17 @@ body:
       value: |
         ## Bug Reports
 
-        Describe who encountered the bug, the problem it creates, why it matters, and the observable criteria for a fix. Please check the latest OpenShell release and search existing issues for possible duplicates before filing.
+        Describe who encountered the bug, the problem it creates, why it matters, and the observable criteria for a fix. Please check the latest Ryno release and search existing issues for possible duplicates before filing.
 
-        Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md) instead.
+        Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/NVIDIA/Ryno/blob/main/SECURITY.md) instead.
 
   - type: textarea
     id: user-story
     attributes:
       label: User Story
-      description: Attest that you personally use OpenShell. Describe the specific use case and behavior you directly encountered or need.
+      description: Attest that you personally use Ryno. Describe the specific use case and behavior you directly encountered or need.
       placeholder: |
-        I use OpenShell for <specific use case>.
+        I use Ryno for <specific use case>.
         I directly encountered or need <specific behavior>.
         This affects <outcome>.
     validations:
@@ -28,7 +28,7 @@ body:
     attributes:
       label: Problem Statement
       description: Summarize what is broken or missing in the current behavior. Focus on the issue itself; describe its consequences and current workarounds in Impact / Why This Matters.
-      placeholder: Describe the gap or failure in OpenShell's current behavior and when it occurs.
+      placeholder: Describe the gap or failure in Ryno's current behavior and when it occurs.
     validations:
       required: true
 
@@ -60,9 +60,9 @@ body:
     id: reproduction
     attributes:
       label: Reproduction Steps
-      description: Provide minimal steps using only an OpenShell deployment. Do not install third-party tools solely to reproduce the issue.
+      description: Provide minimal steps using only an Ryno deployment. Do not install third-party tools solely to reproduce the issue.
       placeholder: |
-        1. Run `openshell sandbox create ...`
+        1. Run `ryno sandbox create ...`
         2. ...
     validations:
       required: true
@@ -71,7 +71,7 @@ body:
     id: suggested-ux
     attributes:
       label: Suggested UX (if applicable)
-      description: If the fix changes configuration, CLI, SDK, or another user interaction, show a notional OpenShell example for human review.
+      description: If the fix changes configuration, CLI, SDK, or another user interaction, show a notional Ryno example for human review.
       placeholder: Show the command, configuration, or API interaction you expect.
     validations:
       required: false
@@ -80,11 +80,11 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Include the OpenShell version and relevant OpenShell deployment details.
+      description: Include the Ryno version and relevant Ryno deployment details.
       placeholder: |
-        - OpenShell: v0.x.x (output of `openshell --version`)
+        - Ryno: v0.x.x (output of `ryno --version`)
         - OS: macOS 15.2 / Ubuntu 24.04 / Windows 11 + WSL2
-        - OpenShell deployment mode and runtime: <relevant details>
+        - Ryno deployment mode and runtime: <relevant details>
     validations:
       required: true
 

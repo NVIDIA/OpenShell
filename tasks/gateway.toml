@@ -4,8 +4,8 @@
 # Standalone gateway tasks
 
 ["build:gateway"]
-description = "Build the standalone openshell-gateway binary"
-run = "cargo build -p openshell-gateway --bin openshell-gateway"
+description = "Build the standalone ryno-gateway binary"
+run = "cargo build -p ryno-gateway --bin ryno-gateway"
 hide = true
 
 ["gateway"]

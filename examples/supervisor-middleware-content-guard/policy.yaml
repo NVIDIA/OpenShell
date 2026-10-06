@@ -18,7 +18,7 @@ network_middlewares:
     endpoints:
       include:
         - httpbin.org
-        - host.openshell.internal
+        - host.ryno.internal
 
 network_policies:
   httpbin:
@@ -48,7 +48,7 @@ network_policies:
   guard-responses:
     name: Guard responses
     endpoints:
-      - host: host.openshell.internal
+      - host: host.ryno.internal
         port: 18081
         protocol: rest
         rules:

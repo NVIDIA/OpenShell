@@ -15,7 +15,7 @@ describe('fromConnect', () => {
       { desc: BadRequestSchema, value: { fieldViolations: [{ field: 'name', description: 'invalid' }] } },
       {
         desc: ErrorInfoSchema,
-        value: { reason: 'GATEWAY_NOT_READY', domain: 'openshell.nvidia.com', metadata: { scope: 'test' } },
+        value: { reason: 'GATEWAY_NOT_READY', domain: 'ryno.nvidia.com', metadata: { scope: 'test' } },
       },
       { desc: RetryInfoSchema, value: { retryDelay: { seconds: 1n, nanos: 250000000 } } },
     ]);
@@ -25,7 +25,7 @@ describe('fromConnect', () => {
     expect(error.fieldViolations).toEqual([{ field: 'name', description: 'invalid' }]);
     expect(error.errorInfo).toEqual({
       reason: 'GATEWAY_NOT_READY',
-      domain: 'openshell.nvidia.com',
+      domain: 'ryno.nvidia.com',
       metadata: { scope: 'test' },
     });
     expect(error.retryDelayMs).toBe(1250);

@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "openshell-test-suite-podman"
+name = "ryno-test-suite-podman"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/NVIDIA/Ryno"
 
 [dependencies]
-openshell-conformance = { path = "../../../../crates/openshell-conformance" }
+ryno-conformance = { path = "../../../../crates/ryno-conformance" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.43", features = ["macros", "rt"] }

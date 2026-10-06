@@ -16,7 +16,7 @@
     keycloak_runtime_home: >-
       {{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}
     keycloak_runtime_state_directory: >-
-      {{ '/home/tmachine/.local/share/openshell-keycloak'
+      {{ '/home/tmachine/.local/share/ryno-keycloak'
          if tmachine_container_runtime_is_rootless else keycloak_state_directory }}
 
 - name: Require Keycloak container runtime

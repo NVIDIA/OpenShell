@@ -10,13 +10,13 @@
 //! so the command can read the uploaded content.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`mise run gateway:docker`)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - A running ryno gateway (`mise run gateway:docker`)
+//! - The `ryno` binary (built automatically from the workspace)
 
 use std::fs;
 
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 /// Create a sandbox with `--upload dir:/sandbox/data` and verify directory
 /// uploads preserve the source basename at `/sandbox/data/<dirname>/...`.

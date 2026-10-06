@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Copy Ryno runtime images
+  become: true
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/var/lib/ryno/{{ item.name }}.tar"
+    owner: "{{ ryno_gateway_user }}"
+    group: "{{ ryno_gateway_user }}"
+    mode: "0600"
+  loop:
+    - name: sandbox
+      src: "{{ ryno_sandbox_image }}"
+    - name: supervisor
+      src: "{{ ryno_supervisor_image }}"
+
+- name: Load Ryno runtime images
+  become: true
+  become_user: "{{ ryno_gateway_user }}"
+  ansible.builtin.command:
+    argv:
+      - podman
+      - load
+      - --input
+      - "/var/lib/ryno/{{ item }}.tar"
+  loop:
+    - sandbox
+    - supervisor
+  environment:
+    HOME: "{{ ryno_gateway_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ryno_gateway_uid }}"

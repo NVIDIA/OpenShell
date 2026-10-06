@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the openshell Debian package by staging pre-built binaries alongside
+# Build the ryno Debian package by staging pre-built binaries alongside
 # the authoring tree under deploy/deb/, then invoking dpkg-deb --build.
 #
 # All static content (systemd unit, /etc/default file, maintainer scripts,
@@ -12,22 +12,22 @@
 
 set -euo pipefail
 
-APP_NAME="openshell"
+APP_NAME="ryno"
 
 usage() {
 	cat <<'EOF'
-Build the openshell Debian package.
+Build the ryno Debian package.
 
 Required environment:
-  OPENSHELL_CLI_BINARY        Path to openshell
-  OPENSHELL_GATEWAY_BINARY    Path to openshell-gateway
-  OPENSHELL_PROVER_BINARY     Path to openshell-prover
-  OPENSHELL_DRIVER_VM_BINARY  Path to openshell-driver-vm
-  OPENSHELL_DEB_VERSION       Debian package version
+  RYNO_CLI_BINARY        Path to ryno
+  RYNO_GATEWAY_BINARY    Path to ryno-gateway
+  RYNO_PROVER_BINARY     Path to ryno-prover
+  RYNO_DRIVER_VM_BINARY  Path to ryno-driver-vm
+  RYNO_DEB_VERSION       Debian package version
 
 Optional environment:
-  OPENSHELL_DEB_ARCH          Debian architecture (amd64 or arm64; defaults to host arch)
-  OPENSHELL_OUTPUT_DIR        Output directory (default: artifacts)
+  RYNO_DEB_ARCH          Debian architecture (amd64 or arm64; defaults to host arch)
+  RYNO_OUTPUT_DIR        Output directory (default: artifacts)
 EOF
 }
 
@@ -68,25 +68,25 @@ infer_deb_arch() {
 # Inputs
 # ---------------------------------------------------------------------------
 
-require_env OPENSHELL_CLI_BINARY
-require_env OPENSHELL_GATEWAY_BINARY
-require_env OPENSHELL_PROVER_BINARY
-require_env OPENSHELL_DRIVER_VM_BINARY
-require_env OPENSHELL_DEB_VERSION
+require_env RYNO_CLI_BINARY
+require_env RYNO_GATEWAY_BINARY
+require_env RYNO_PROVER_BINARY
+require_env RYNO_DRIVER_VM_BINARY
+require_env RYNO_DEB_VERSION
 
-OPENSHELL_DEB_ARCH="${OPENSHELL_DEB_ARCH:-$(infer_deb_arch)}"
+RYNO_DEB_ARCH="${RYNO_DEB_ARCH:-$(infer_deb_arch)}"
 
-case "$OPENSHELL_DEB_ARCH" in
+case "$RYNO_DEB_ARCH" in
 amd64 | arm64) ;;
 *)
-	echo "error: OPENSHELL_DEB_ARCH must be amd64 or arm64, got ${OPENSHELL_DEB_ARCH}" >&2
+	echo "error: RYNO_DEB_ARCH must be amd64 or arm64, got ${RYNO_DEB_ARCH}" >&2
 	exit 2
 	;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 src_dir="${repo_root}/deploy/deb"
-output_dir_input="${OPENSHELL_OUTPUT_DIR:-artifacts}"
+output_dir_input="${RYNO_OUTPUT_DIR:-artifacts}"
 case "$output_dir_input" in
 /*) output_dir="$output_dir_input" ;;
 *) output_dir="${repo_root}/${output_dir_input}" ;;
@@ -98,7 +98,7 @@ if [ ! -d "$src_dir" ]; then
 	exit 1
 fi
 
-package_file="${output_dir}/${APP_NAME}_${OPENSHELL_DEB_VERSION}_${OPENSHELL_DEB_ARCH}.deb"
+package_file="${output_dir}/${APP_NAME}_${RYNO_DEB_VERSION}_${RYNO_DEB_ARCH}.deb"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -110,14 +110,17 @@ mkdir -p "$pkgroot/DEBIAN"
 # ---------------------------------------------------------------------------
 
 # Binaries.
-stage_binary "$OPENSHELL_CLI_BINARY"       "$pkgroot/usr/bin/openshell"
-stage_binary "$OPENSHELL_GATEWAY_BINARY"   "$pkgroot/usr/bin/openshell-gateway"
-stage_binary "$OPENSHELL_PROVER_BINARY"    "$pkgroot/usr/bin/openshell-prover"
-stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/openshell-driver-vm"
+stage_binary "$RYNO_CLI_BINARY"       "$pkgroot/usr/bin/ryno"
+stage_binary "$RYNO_GATEWAY_BINARY"   "$pkgroot/usr/bin/ryno-gateway"
+stage_binary "$RYNO_PROVER_BINARY"    "$pkgroot/usr/bin/ryno-prover"
+stage_binary "$RYNO_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/ryno/ryno-driver-vm"
+
+# One-release compat alias for the OpenShell -> Ryno rename.
+ln -s ryno "$pkgroot/usr/bin/openshell"
 
 # Per-user systemd unit. Each user enables it via `systemctl --user`.
-install -D -m 0644 "$src_dir/openshell-gateway.service" \
-	"$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
+install -D -m 0644 "$src_dir/ryno-gateway.service" \
+	"$pkgroot/usr/lib/systemd/user/ryno-gateway.service"
 
 # ---------------------------------------------------------------------------
 # DEBIAN/ control directory
@@ -125,12 +128,12 @@ install -D -m 0644 "$src_dir/openshell-gateway.service" \
 
 # Render control from template.
 sed \
-	-e "s|@VERSION@|${OPENSHELL_DEB_VERSION}|g" \
-	-e "s|@ARCH@|${OPENSHELL_DEB_ARCH}|g" \
+	-e "s|@VERSION@|${RYNO_DEB_VERSION}|g" \
+	-e "s|@ARCH@|${RYNO_DEB_ARCH}|g" \
 	"$src_dir/control.in" >"$pkgroot/DEBIAN/control"
 
 # No conffiles: the package owns no /etc files. Per-user configuration
-# lives under $XDG_CONFIG_HOME/openshell/.
+# lives under $XDG_CONFIG_HOME/ryno/.
 
 # Maintainer scripts.
 install -m 0755 "$src_dir/postinst.sh" "$pkgroot/DEBIAN/postinst"
@@ -141,25 +144,25 @@ install -m 0755 "$src_dir/postrm.sh"   "$pkgroot/DEBIAN/postrm"
 # Documentation
 # ---------------------------------------------------------------------------
 
-doc_dir="$pkgroot/usr/share/doc/openshell"
+doc_dir="$pkgroot/usr/share/doc/ryno"
 mkdir -p "$doc_dir"
 
 if [ -f "${repo_root}/LICENSE" ]; then
 	install -m 0644 "${repo_root}/LICENSE" "$doc_dir/copyright"
 else
 	cat >"$doc_dir/copyright" <<'EOF'
-OpenShell is distributed under the Apache-2.0 license.
+Ryno is distributed under the Apache-2.0 license.
 EOF
 	chmod 0644 "$doc_dir/copyright"
 fi
 
 # Real RFC2822 date so lintian doesn't complain about epoch-zero changelogs.
 gzip -n -9 -c >"$doc_dir/changelog.gz" <<EOF
-openshell (${OPENSHELL_DEB_VERSION}) unstable; urgency=medium
+ryno (${RYNO_DEB_VERSION}) unstable; urgency=medium
 
   * Release build.
 
- -- NVIDIA OpenShell Maintainers <openshell@nvidia.com>  $(date -uR)
+ -- NVIDIA Ryno Maintainers <ryno@nvidia.com>  $(date -uR)
 EOF
 
 # ---------------------------------------------------------------------------

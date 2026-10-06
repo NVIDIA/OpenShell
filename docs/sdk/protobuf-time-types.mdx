@@ -1,10 +1,10 @@
 ---
 title: Protobuf time types
 sidebar-title: "Protobuf Time Types"
-description: Timestamp and duration representation in the OpenShell API
+description: Timestamp and duration representation in the Ryno API
 ---
 
-OpenShell represents absolute times with `google.protobuf.Timestamp` and
+Ryno represents absolute times with `google.protobuf.Timestamp` and
 elapsed times with `google.protobuf.Duration` in its protobuf APIs.
 
 Provider profile YAML and JSON accept canonical duration strings such as
@@ -23,7 +23,7 @@ ending in `s`:
 
 An absent message means that no timestamp or duration was supplied. It is
 different from the Unix epoch (`1970-01-01T00:00:00Z`) and from a zero duration
-(`0s`). OpenShell validates protobuf timestamp and duration bounds at API
+(`0s`). Ryno validates protobuf timestamp and duration bounds at API
 boundaries.
 
 ## Upgrade from scalar time fields
@@ -42,7 +42,7 @@ Before upgrading a gateway with persisted state:
 1. Stop all gateway replicas.
 2. Back up the SQLite database or PostgreSQL database.
 3. Upgrade every gateway replica, client, driver, middleware service, and
-   sandbox supervisor from the same OpenShell release.
+   sandbox supervisor from the same Ryno release.
 4. Start one gateway replica and wait for startup to complete before starting
    the remaining replicas.
 
@@ -57,7 +57,7 @@ fails with the affected object type and ID and rolls back the transaction.
 Legacy sandbox condition transition strings that are not valid RFC 3339 are
 dropped because earlier releases allowed arbitrary driver-provided strings.
 Restore the backup or repair any other reported record with the previous
-OpenShell version before retrying the upgrade.
+Ryno version before retrying the upgrade.
 
 User-facing timeout options and gateway TOML settings keep their existing
 units. The CLI and SDKs convert those values at the protobuf boundary.

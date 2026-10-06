@@ -1,47 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: openshell
-title: OpenShell
-adopt-info: openshell
+name: ryno
+title: Ryno
+adopt-info: ryno
 summary: Safe, sandboxed runtimes for autonomous AI agents
 description: |
-  OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
+  Ryno provides safe, sandboxed runtimes for autonomous AI agents.
   It offers a CLI for managing gateways, sandboxes, and providers with
   policy-enforced egress routing, credential proxying, and privacy-aware
   profile-backed model-provider access.
 
-  The OpenShell snap ships a CLI (`openshell`), a terminal UI
-  (`openshell.term`), a standalone policy prover (`openshell.prover`), and a
-  managed gateway daemon (`openshell.gateway`).
+  The Ryno snap ships a CLI (`ryno`), a terminal UI
+  (`ryno.term`), a standalone policy prover (`ryno.prover`), and a
+  managed gateway daemon (`ryno.gateway`).
 
   **Setup instructions**
 
     1. Install and start Docker using your preferred package source before
-       installing the OpenShell snap. Use a system package or Docker's package
-       repository. The Docker snap is not currently compatible with OpenShell.
+       installing the Ryno snap. Use a system package or Docker's package
+       repository. The Docker snap is not currently compatible with Ryno.
 
        Snap Store installations automatically connect the required interfaces.
 
-       If the OpenShell snap was installed before Docker was running, it may
+       If the Ryno snap was installed before Docker was running, it may
        have hit the systemd start limit when trying to repeatedly start and
        connect to docker. If this is the case, it can be resolved by doing:
 
-         sudo systemctl reset-failed snap.openshell.gateway.service
-         sudo snap restart openshell.gateway
+         sudo systemctl reset-failed snap.ryno.gateway.service
+         sudo snap restart ryno.gateway
 
     2. Give your user the gateway client certificate and register the gateway.
        The gateway requires mTLS; only users holding this certificate can use
        it, so copy it only for trusted users:
 
-         snap services openshell.gateway
-         d=~/snap/openshell/common/.local/state/openshell/tls
+         snap services ryno.gateway
+         d=~/snap/ryno/common/.local/state/ryno/tls
          mkdir -p -m 700 "$d" "$d/client"
-         sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
+         sudo install -o "$USER" -m 600 /var/snap/ryno/common/tls/ca.crt "$d/"
          sudo install -o "$USER" -m 600 -t "$d/client" \
-           /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
-         openshell gateway add https://127.0.0.1:17670 --local --name openshell
-         openshell status
+           /var/snap/ryno/common/tls/client/tls.crt /var/snap/ryno/common/tls/client/tls.key
+         ryno gateway add https://127.0.0.1:17670 --local --name ryno
+         ryno status
 
 base: core24
 grade: stable
@@ -52,10 +52,10 @@ confinement: strict
 # built snap, but that is not required for installations from the snap store.
 assumes: [snapd2.76]
 license: Apache-2.0
-website: https://docs.nvidia.com/openshell/latest/index.html
-source-code: https://github.com/NVIDIA/OpenShell
-issues: https://github.com/NVIDIA/OpenShell/issues
-contact: https://github.com/NVIDIA/OpenShell/security/policy
+website: https://docs.nvidia.com/ryno/latest/index.html
+source-code: https://github.com/NVIDIA/Ryno
+issues: https://github.com/NVIDIA/Ryno/issues
+contact: https://github.com/NVIDIA/Ryno/security/policy
 platforms:
   amd64:
     build-on: [amd64]
@@ -65,8 +65,11 @@ platforms:
     build-for: [arm64]
 
 apps:
-  openshell:
-    command: bin/openshell
+  ryno:
+    command: bin/ryno
+    # One-release compat alias for the OpenShell -> Ryno rename.
+    aliases:
+      - openshell
     environment:
       XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"
       XDG_DATA_HOME: "$SNAP_USER_COMMON/.local/share"
@@ -76,7 +79,7 @@ apps:
       - network
       - system-observe
   term:
-    command: bin/openshell term
+    command: bin/ryno term
     desktop: meta/gui/term.desktop
     environment:
       XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"
@@ -87,13 +90,13 @@ apps:
       - network
       - system-observe
   prover:
-    command: bin/openshell-prover
+    command: bin/ryno-prover
     aliases:
-      - openshell-prover
+      - ryno-prover
     plugs:
       - home
   gateway:
-    command: bin/openshell-gateway-wrapper
+    command: bin/ryno-gateway-wrapper
     daemon: simple
     # refresh-mode: endure prevents snapd from restarting the gateway daemon
     # during snap refreshes, which would kill active sandbox sessions.
@@ -105,7 +108,7 @@ apps:
     # user. The wrapper uses $SNAP_COMMON/gateway.db. Before startup it
     # bootstraps package-managed credentials and validates the selected
     # operator-provided config without creating or rewriting it. A nonempty
-    # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
+    # RYNO_GATEWAY_CONFIG takes precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
@@ -117,7 +120,7 @@ apps:
       - system-observe
 
 parts:
-  openshell:
+  ryno:
     plugin: nil
     source: ./snap/prebuilt
     override-pull: |
@@ -127,7 +130,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in ryno ryno-prover ryno-gateway ryno-sandbox ryno-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -143,24 +146,24 @@ parts:
         exit 1
       fi
 
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell" \
-        "$CRAFT_PART_INSTALL/bin/openshell"
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell-prover" \
-        "$CRAFT_PART_INSTALL/bin/openshell-prover"
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway" \
-        "$CRAFT_PART_INSTALL/bin/openshell-gateway"
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
-        "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway-wrapper" \
-        "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
+      install -D -m 0755 "$CRAFT_PART_SRC/ryno" \
+        "$CRAFT_PART_INSTALL/bin/ryno"
+      install -D -m 0755 "$CRAFT_PART_SRC/ryno-prover" \
+        "$CRAFT_PART_INSTALL/bin/ryno-prover"
+      install -D -m 0755 "$CRAFT_PART_SRC/ryno-gateway" \
+        "$CRAFT_PART_INSTALL/bin/ryno-gateway"
+      install -D -m 0755 "$CRAFT_PART_SRC/ryno-sandbox" \
+        "$CRAFT_PART_INSTALL/bin/ryno-sandbox"
+      install -D -m 0755 "$CRAFT_PART_SRC/ryno-gateway-wrapper" \
+        "$CRAFT_PART_INSTALL/bin/ryno-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PART_SRC/meta/gui/term.desktop" \
         "$CRAFT_PART_INSTALL/meta/gui/term.desktop"
       install -D -m 0644 "$CRAFT_PART_SRC/meta/gui/icon.png" \
         "$CRAFT_PART_INSTALL/meta/gui/icon.png"
       install -D -m 0644 "$CRAFT_PART_SRC/LICENSE" \
-        "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
+        "$CRAFT_PART_INSTALL/usr/share/doc/ryno/LICENSE"
       install -D -m 0644 "$CRAFT_PART_SRC/README.md" \
-        "$CRAFT_PART_INSTALL/usr/share/doc/openshell/README.md"
+        "$CRAFT_PART_INSTALL/usr/share/doc/ryno/README.md"
 
   ssh:
     # Vendor the openssh-client `ssh` binary into the snap so the CLI/TUI

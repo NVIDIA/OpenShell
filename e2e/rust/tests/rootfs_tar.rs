@@ -7,13 +7,13 @@
 //! gzip-compressed.
 //!
 //! Prerequisites:
-//! - A running VM-backed openshell gateway with a default sandbox image configured
+//! - A running VM-backed ryno gateway with a default sandbox image configured
 //! - Docker daemon running (for image build + container export)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - The `ryno` binary (built automatically from the workspace)
 
-use openshell_e2e::harness::container::ContainerEngine;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ContainerEngine;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -43,7 +43,7 @@ fn export_rootfs_tar(engine: &ContainerEngine, tmpdir: &Path, suffix: &str) -> P
     std::fs::write(&dockerfile_path, DOCKERFILE_CONTENT).expect("write Dockerfile");
 
     let tag = format!(
-        "openshell/e2e-rootfs-tar-test-{suffix}:{}",
+        "ryno/e2e-rootfs-tar-test-{suffix}:{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -67,7 +67,7 @@ fn export_rootfs_tar(engine: &ContainerEngine, tmpdir: &Path, suffix: &str) -> P
     // Create a temporary container and export its filesystem as a flat rootfs
     // tar (equivalent to `docker export`).
     let container_name = format!(
-        "openshell-e2e-rootfs-export-{suffix}-{}",
+        "ryno-e2e-rootfs-export-{suffix}-{}",
         std::process::id()
     );
 

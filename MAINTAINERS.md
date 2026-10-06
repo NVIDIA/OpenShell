@@ -1,6 +1,6 @@
 # Maintainers
 
-The current maintainers of OpenShell are listed below.
+The current maintainers of Ryno are listed below.
 
 | Name | GitHub ID | Company/Organization |
 | --- | --- | --- |

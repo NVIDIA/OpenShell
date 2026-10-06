@@ -81,8 +81,8 @@ FROM devtools AS final
 
 ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
-RUN mkdir -p /etc/openshell
-COPY policy.yaml /etc/openshell/policy.yaml
+RUN mkdir -p /etc/ryno
+COPY policy.yaml /etc/ryno/policy.yaml
 COPY bin/gh /usr/local/bin/gh-gator
 COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger
 COPY bin/resolve-gator-review-threads /usr/local/bin/resolve-gator-review-threads

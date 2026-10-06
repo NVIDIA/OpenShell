@@ -14,9 +14,9 @@
 
 use std::process::Stdio;
 
-use openshell_e2e::harness::container::{ContainerEngine, is_e2e_driver};
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::{ContainerEngine, is_e2e_driver};
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const READY_MARKER: &str = "podman-oci-identity-ready";
@@ -59,7 +59,7 @@ impl ImageGuard {
         .map_err(|err| format!("write Containerfile: {err}"))?;
 
         let tag = format!(
-            "localhost/openshell-e2e-podman-oci-identity:{}",
+            "localhost/ryno-e2e-podman-oci-identity:{}",
             std::process::id()
         );
         run_engine(
@@ -136,15 +136,15 @@ fn container_id_for_role(
     sandbox_name: &str,
     role: &str,
 ) -> Result<String, String> {
-    let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
-    let role_filter = format!("label=openshell.ai/isolation-role={role}");
+    let name_filter = format!("label=ryno.ai/sandbox-name={sandbox_name}");
+    let role_filter = format!("label=ryno.ai/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[
             "ps",
             "-aq",
             "--filter",
-            "label=openshell.managed=true",
+            "label=ryno.managed=true",
             "--filter",
             &name_filter,
             "--filter",
@@ -297,8 +297,8 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
         ],
     )
     .unwrap();
-    assert!(!mounts.contains("/etc/openshell/tls"));
-    assert!(!mounts.contains("/.openshell/supervisor"));
-    let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
+    assert!(!mounts.contains("/etc/ryno/tls"));
+    assert!(!mounts.contains("/.ryno/supervisor"));
+    let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.ryno/channel/sandbox/server.key; test ! -r /.ryno/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
     assert!(posture.contains("0000000000000000"));
 }

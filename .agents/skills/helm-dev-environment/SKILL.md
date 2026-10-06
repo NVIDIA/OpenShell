@@ -1,14 +1,14 @@
 ---
 name: helm-dev-environment
-description: Start up, tear down, and configure the local Kubernetes development environment for OpenShell. Uses k3d (Docker-backed k3s) + Skaffold + Helm. Covers cluster lifecycle, optional add-ons (Keycloak OIDC, Envoy Gateway), HA testing, and port mappings. Trigger keywords - local k8s, local cluster, k3d, skaffold, helm dev, start cluster, stop cluster, tear down cluster, delete cluster, create cluster, helm:k3s, helm:skaffold, local dev environment, dev cluster, k8s dev, envoy gateway local, keycloak local, high availability, HA.
+description: Start up, tear down, and configure the local Kubernetes development environment for Ryno. Uses k3d (Docker-backed k3s) + Skaffold + Helm. Covers cluster lifecycle, optional add-ons (Keycloak OIDC, Envoy Gateway), HA testing, and port mappings. Trigger keywords - local k8s, local cluster, k3d, skaffold, helm dev, start cluster, stop cluster, tear down cluster, delete cluster, create cluster, helm:k3s, helm:skaffold, local dev environment, dev cluster, k8s dev, envoy gateway local, keycloak local, high availability, HA.
 metadata:
   internal: true
 ---
 
 # Helm Dev Environment
 
-Set up, run, and tear down the local Kubernetes development environment for OpenShell.
-The stack is: **k3d** (Docker-backed k3s) for the cluster, **Skaffold** for image builds and Helm deploys, and the **OpenShell Helm chart** (`deploy/helm/openshell/`).
+Set up, run, and tear down the local Kubernetes development environment for Ryno.
+The stack is: **k3d** (Docker-backed k3s) for the cluster, **Skaffold** for image builds and Helm deploys, and the **Ryno Helm chart** (`deploy/helm/ryno/`).
 
 ---
 
@@ -39,7 +39,7 @@ does not wait on a large registry pull. Traefik is disabled at cluster creation 
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
-`openshell-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
+`ryno-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
 own `kubeconfig` file. Override with `HELM_K3S_CLUSTER_NAME` to force a specific name
 or share one cluster across worktrees.
 
@@ -57,7 +57,7 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
-### 2. Deploy OpenShell
+### 2. Deploy Ryno
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
 ```bash
@@ -78,11 +78,11 @@ source in the gateway namespace; do not grant approval to the gateway database
 PVC or disable admission to make tests pass.
 
 The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
-and deploys the OpenShell Helm chart. The Kubernetes driver creates a
+and deploys the Ryno Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
-Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
+Pod. One namespace-wide NetworkPolicy denies direct egress from every Ryno
 workload Pod. The
-`pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
+`pkiInitJob` hook (a pre-install Job that runs `ryno-gateway generate-certs`)
 generates gateway and CLI TLS secrets on first install. Supervisor Pods project
 only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
 client certificates and private keys remain outside supervisor and workload Pods.
@@ -108,7 +108,7 @@ task running while using those endpoints.
 ### Viewing local traces
 
 The gateway exports OTLP/gRPC to
-`http://openshell-collector.observability.svc.cluster.local:4317` through the
+`http://ryno-collector.observability.svc.cluster.local:4317` through the
 default Skaffold values. Forward OTLP/gRPC and the trace UI to the host:
 
 ```bash
@@ -125,14 +125,14 @@ trace-context annotation. The same command exposes OTLP/gRPC on
 export only while it is reachable.
 
 The Skaffold profile for HA reverse-proxy development is available from
-`deploy/helm/openshell/`:
+`deploy/helm/ryno/`:
 
 ```bash
 # Two gateway replicas + external PostgreSQL Secret + Envoy Gateway + Gateway API route.
 KUBECONFIG=../../../kubeconfig skaffold run -p high-availability
 ```
 
-The `high-availability` profile expects a Secret named `openshell-ha-pg` in the `openshell`
+The `high-availability` profile expects a Secret named `ryno-ha-pg` in the `ryno`
 namespace with a `uri` key. For local manual testing, either create your own
 PostgreSQL Secret or use the e2e PostgreSQL fixture manifest in
 `e2e/kubernetes/postgres-fixture.yaml`.
@@ -146,7 +146,7 @@ KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
 The BackendTrafficPolicy disables Envoy request and stream-duration timeouts for
-OpenShell's `GRPCRoute`. Keep that policy in `deploy/kube/manifests/envoy-gateway-openshell.yaml`,
+Ryno's `GRPCRoute`. Keep that policy in `deploy/kube/manifests/envoy-gateway-ryno.yaml`,
 not in the Helm chart; it is required for long-lived gRPC create/watch/exec/relay
 streams during gateway rollouts and scale events.
 
@@ -167,33 +167,33 @@ active, so the forwarding task uses local port `8090` for the gateway. In a
 second terminal, confirm that the gateway is registered and active:
 
 ```bash
-openshell gateway list
+ryno gateway list
 ```
 
 **Plaintext (default Skaffold deploy):**
 
 ```bash
-openshell sandbox list
+ryno sandbox list
 ```
 
 **With mTLS enabled** — extract the client cert the PKI hook wrote to the cluster,
 then place it where the CLI expects it. Run once after each fresh install:
 
 ```bash
-mkdir -p ~/.config/openshell/gateways/openshell/mtls
-KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
-  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/openshell/gateways/openshell/mtls/ca.crt
-KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
-  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/openshell/gateways/openshell/mtls/tls.crt
-KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
-  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/openshell/gateways/openshell/mtls/tls.key
+mkdir -p ~/.config/ryno/gateways/ryno/mtls
+KUBECONFIG=kubeconfig kubectl get secret ryno-client-tls -n ryno \
+  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/ryno/gateways/ryno/mtls/ca.crt
+KUBECONFIG=kubeconfig kubectl get secret ryno-client-tls -n ryno \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/ryno/gateways/ryno/mtls/tls.crt
+KUBECONFIG=kubeconfig kubectl get secret ryno-client-tls -n ryno \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/ryno/gateways/ryno/mtls/tls.key
 ```
 
 The server cert SANs include `localhost` and `127.0.0.1`, so hostname verification
 passes over a port-forward without any extra flags:
 
 ```bash
-openshell sandbox list --gateway-endpoint https://localhost:8090
+ryno sandbox list --gateway-endpoint https://localhost:8090
 ```
 
 ---
@@ -230,53 +230,53 @@ profile intentionally includes Envoy Gateway so multi-replica behavior is
 exercised through the same Gateway API path used by reverse-proxy deployments:
 
 ```bash
-cd deploy/helm/openshell
+cd deploy/helm/ryno
 KUBECONFIG=../../../kubeconfig skaffold run -p high-availability
 cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
 `values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+`GRPCRoute` in the `ryno` namespace. The `high-availability` profile
 installs the Envoy Gateway Helm chart and layers both
-`values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
+`values-high-availability.yaml` and `values-gateway.yaml` onto the Ryno
 release.
 
-`deploy/kube/manifests/envoy-gateway-openshell.yaml` creates:
+`deploy/kube/manifests/envoy-gateway-ryno.yaml` creates:
 
 - `GatewayClass/eg`
-- `BackendTrafficPolicy/openshell-grpc-timeouts`
+- `BackendTrafficPolicy/ryno-grpc-timeouts`
 
 The Envoy Gateway proxy Service is usually exposed through the k3d load balancer
 at `http://127.0.0.1:8080`. If the cluster was created with a different
 `HELM_K3S_LB_HOST_PORT`, use that host port instead.
 
 For manual tests against an existing cluster, prefer forwarding the Envoy proxy
-Service rather than `svc/openshell`. That keeps client traffic on the same path
+Service rather than `svc/ryno`. That keeps client traffic on the same path
 as a real reverse proxy while gateway pods rotate behind it:
 
 ```bash
 KUBECONFIG=kubeconfig kubectl get svc -A \
-  -l gateway.envoyproxy.io/owning-gateway-name=openshell
+  -l gateway.envoyproxy.io/owning-gateway-name=ryno
 KUBECONFIG=kubeconfig kubectl -n <envoy-service-namespace> port-forward \
   svc/<envoy-service-name> 8080:80
-openshell gateway add http://127.0.0.1:8080 --name openshell --local
+ryno gateway add http://127.0.0.1:8080 --name ryno --local
 ```
 
 When running e2e tests manually through Envoy, register gateway metadata (as
-above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
-`openshell gateway info` and expect metadata for the active gateway.
+above) instead of relying only on `RYNO_GATEWAY_ENDPOINT`; some tests call
+`ryno gateway info` and expect metadata for the active gateway.
 
 ### Kubernetes E2E Notes
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
-The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
+The kube e2e wrapper creates only one port-forward, to `svc/ryno`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
 
 Use `mise run e2e:kubernetes:ha-rebalancing` for full-suite HA coverage. The
 task creates an external PostgreSQL fixture, installs Envoy Gateway, applies
-`deploy/kube/manifests/envoy-gateway-openshell.yaml`, enables the chart
+`deploy/kube/manifests/envoy-gateway-ryno.yaml`, enables the chart
 `GRPCRoute`, and runs the full Kubernetes e2e suite, including
 `kubernetes_ha_rebalancing`. That coverage validates sandbox create/watch and
 exec through the Envoy proxy while gateway replicas scale up, scale down, and
@@ -286,13 +286,13 @@ path as interactive sessions.
 
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
 chart has `server.hostGatewayIP` set so sandbox pods can resolve
-`host.openshell.internal` back to the test host. The e2e wrapper detects this on
+`host.ryno.internal` back to the test host. The e2e wrapper detects this on
 chart installs; manual reuse may require:
 
 ```bash
-HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:?set host gateway IP}"
-KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
-  --namespace openshell --reuse-values \
+HOST_GATEWAY_IP="${RYNO_E2E_HOST_GATEWAY_IP:?set host gateway IP}"
+KUBECONFIG=kubeconfig helm upgrade ryno deploy/helm/ryno \
+  --namespace ryno --reuse-values \
   --set "server.hostGatewayIP=${HOST_GATEWAY_IP}" \
   --wait --timeout 5m
 ```
@@ -305,7 +305,7 @@ To enable end-to-end TLS between the Gateway proxy and the gateway pod, add
 BackendTLSPolicy values to the Helm install:
 
 ```bash
-helm upgrade --install openshell deploy/helm/openshell \
+helm upgrade --install ryno deploy/helm/ryno \
   --set grpcRoute.enabled=true \
   --set grpcRoute.backendTLSPolicy.enabled=true \
   --set server.tls.enableMtls=false \
@@ -337,14 +337,14 @@ mise run keycloak:k8s:setup
 ```
 
 This deploys Keycloak (`quay.io/keycloak/keycloak:24.0`) into the `keycloak` namespace,
-imports the openshell realm from `scripts/keycloak-realm.json`, generates a short-lived
+imports the ryno realm from `scripts/keycloak-realm.json`, generates a short-lived
 development TLS certificate, and publishes its trust anchor as the
-`openshell-keycloak-ca` ConfigMap in the OpenShell namespace. The command prints a
+`ryno-keycloak-ca` ConfigMap in the Ryno namespace. The command prints a
 port-forward command for acquiring tokens from the CLI. Rerunning setup rotates the
 development certificate and trust anchor; redeploy the gateway afterward so it reloads
 the mounted CA bundle.
 
-Then activate OIDC in the OpenShell Helm chart:
+Then activate OIDC in the Ryno Helm chart:
 1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
 2. Redeploy: `mise run helm:skaffold:run`
 
@@ -358,14 +358,14 @@ mise run keycloak:k8s:teardown
 Skaffold can install SPIRE with the SPIFFE hardened Helm charts. To activate
 SPIFFE JWT-SVIDs for dynamic provider token grants:
 
-1. Uncomment the `spire-crds` and `spire` releases in `deploy/helm/openshell/skaffold.yaml`
-2. Uncomment `#- ci/values-spire.yaml` in the OpenShell release values files
+1. Uncomment the `spire-crds` and `spire` releases in `deploy/helm/ryno/skaffold.yaml`
+2. Uncomment `#- ci/values-spire.yaml` in the Ryno release values files
 3. Redeploy: `mise run helm:skaffold:run`
 
 `ci/values-spire-stack.yaml` configures the local SPIRE trust domain as
-`openshell.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
-annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
-OpenShell mounts the SPIFFE CSI Workload API socket at
+`ryno.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
+annotations to `spiffe://ryno.local/ryno/sandbox/<sandbox-id>`.
+Ryno mounts the SPIFFE CSI Workload API socket at
 `/spiffe-workload-api/spire-agent.sock` only into supervisor Pods for provider token
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
 ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
@@ -390,9 +390,9 @@ addresses fail gateway startup, and hostname verification requires the service
 DNS name in the server certificate SANs.
 
 ```bash
-cd deploy/helm/openshell
+cd deploy/helm/ryno
 skaffold run -p credential-driver-vault
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
+kubectl -n ryno logs statefulset/ryno -c ryno-gateway --tail=200
 ```
 
 ---
@@ -422,15 +422,15 @@ mise run helm:lint
 ```
 
 If Helm reports missing chart dependencies, remove the specific stale subchart
-archive or directory named by the error from `deploy/helm/openshell/charts/`,
+archive or directory named by the error from `deploy/helm/ryno/charts/`,
 then rerun the lint task.
 
 For example, when lint reports `chart metadata is missing these dependencies:
 postgresql`, remove stale PostgreSQL chart artifacts:
 
 ```bash
-rm -f deploy/helm/openshell/charts/postgresql-*.tgz
-rm -rf deploy/helm/openshell/charts/postgresql
+rm -f deploy/helm/ryno/charts/postgresql-*.tgz
+rm -rf deploy/helm/ryno/charts/postgresql
 mise run helm:lint
 ```
 
@@ -443,17 +443,17 @@ for dependencies still declared in `Chart.yaml`.
 
 | Path | Purpose |
 |------|---------|
-| `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
-| `deploy/helm/openshell/values.yaml` | Default Helm values |
-| `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
-| `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
-| `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
-| `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
-| `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
-| `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
-| `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
-| `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
-| `deploy/helm/openshell/ci/values-credential-driver-vault.yaml` | Vault credential-driver validation overlay with HTTPS and private-CA trust |
-| `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
+| `deploy/helm/ryno/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
+| `deploy/helm/ryno/values.yaml` | Default Helm values |
+| `deploy/helm/ryno/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
+| `deploy/helm/ryno/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
+| `deploy/helm/ryno/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
+| `deploy/helm/ryno/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/ryno/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/ryno/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
+| `deploy/helm/ryno/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
+| `deploy/helm/ryno/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
+| `deploy/helm/ryno/ci/values-credential-driver-vault.yaml` | Vault credential-driver validation overlay with HTTPS and private-CA trust |
+| `deploy/kube/manifests/envoy-gateway-ryno.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |

@@ -29,10 +29,10 @@ env:
 
 jobs:
   cli:
-    name: openshell (${{ matrix.triple }})
+    name: ryno (${{ matrix.triple }})
     env:
-      PACKAGE: openshell-cli
-      BINARY: openshell
+      PACKAGE: ryno-cli
+      BINARY: ryno
     strategy:
       matrix:
         include:
@@ -63,10 +63,10 @@ jobs:
           extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
 
   conformance:
-    name: openshell-conformance (${{ matrix.triple }})
+    name: ryno-conformance (${{ matrix.triple }})
     env:
-      PACKAGE: openshell-conformance-cli
-      BINARY: openshell-conformance
+      PACKAGE: ryno-conformance-cli
+      BINARY: ryno-conformance
     strategy:
       matrix:
         include:
@@ -79,10 +79,10 @@ jobs:
     steps: *build_steps
 
   prover:
-    name: openshell-prover (${{ matrix.triple }})
+    name: ryno-prover (${{ matrix.triple }})
     env:
-      PACKAGE: openshell-prover-cli
-      BINARY: openshell-prover
+      PACKAGE: ryno-prover-cli
+      BINARY: ryno-prover
     strategy:
       matrix:
         include:
@@ -97,10 +97,10 @@ jobs:
     steps: *build_steps
 
   gateway:
-    name: openshell-gateway (${{ matrix.triple }})
+    name: ryno-gateway (${{ matrix.triple }})
     env:
-      PACKAGE: openshell-gateway
-      BINARY: openshell-gateway
+      PACKAGE: ryno-gateway
+      BINARY: ryno-gateway
     strategy:
       matrix:
         include:
@@ -122,24 +122,24 @@ jobs:
     strategy:
       matrix:
         include:
-          - package: openshell-sandbox
-            binary: openshell-sandbox
+          - package: ryno-sandbox
+            binary: ryno-sandbox
             triple: x86_64-unknown-linux-musl
             runner: linux-amd64-cpu8
-          - package: openshell-sandbox
-            binary: openshell-sandbox
+          - package: ryno-sandbox
+            binary: ryno-sandbox
             triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
-          - package: openshell-supervisor
-            binary: openshell-supervisor
+          - package: ryno-supervisor
+            binary: ryno-supervisor
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-          - package: openshell-supervisor
-            binary: openshell-supervisor
+          - package: ryno-supervisor
+            binary: ryno-supervisor
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-          - package: openshell-supervisor
-            binary: openshell-supervisor
+          - package: ryno-supervisor
+            binary: ryno-supervisor
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
     runs-on: ${{ matrix.runner }}
@@ -147,10 +147,10 @@ jobs:
     steps: *build_steps
 
   vm-init:
-    name: openshell-vm-init (${{ matrix.triple }})
+    name: ryno-vm-init (${{ matrix.triple }})
     env:
-      PACKAGE: openshell-driver-vm
-      BINARY: openshell-vm-init
+      PACKAGE: ryno-driver-vm
+      BINARY: ryno-vm-init
       EXTRA_CARGO_FLAGS: --no-default-features
     strategy:
       matrix:

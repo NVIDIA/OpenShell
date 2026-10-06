@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Unit tests for SandboxClient against an in-memory OpenShell service. Every
+// Unit tests for SandboxClient against an in-memory Ryno service. Every
 // RPC is stubbed with createRouterTransport, so these exercise request
 // assembly, u64/int64->string rendering, enum lowercasing, fromConnect code
 // mapping, the exec/execStream drain, execInteractive framing, and the
@@ -24,25 +24,25 @@ import {
   STATUS_NAMES,
 } from './client.js';
 import {
-  OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  Ryno,
   SandboxPhase,
   SandboxRestartPolicy,
   ServiceStatus,
-} from './gen/openshell_pb.js';
+} from './gen/ryno_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 import type { ExecInteractiveSession, ExecInteractiveSessionControl } from './index.js';
 
-function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
+function client(impl: Partial<ServiceImpl<typeof Ryno>>): SandboxClient {
   const transport: Transport = createRouterTransport((router) => {
-    router.service(OpenShell, impl);
+    router.service(Ryno, impl);
   });
   return new SandboxClient(transport);
 }
 
-function templateClient(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxTemplateClient {
+function templateClient(impl: Partial<ServiceImpl<typeof Ryno>>): SandboxTemplateClient {
   const transport: Transport = createRouterTransport((router) => {
-    router.service(OpenShell, impl);
+    router.service(Ryno, impl);
   });
   return new SandboxTemplateClient(transport);
 }
@@ -53,7 +53,7 @@ function readySandbox(
   resourceVersion = 7n,
   createdFromWorkloadTemplate?: { name: string; resourceVersion: string },
   workspace = 'default',
-): MessageInitShape<typeof OpenShell.method.getSandbox.output> {
+): MessageInitShape<typeof Ryno.method.getSandbox.output> {
   return {
     sandbox: {
       metadata: { id, name, workspace, labels: { team: 'aire' }, resourceVersion },
@@ -2023,7 +2023,7 @@ describe('enum name maps', () => {
 
 describe('raw escape hatch', () => {
   it('preserves explicit L7 target scope and optional endpoint path on the wire', async () => {
-    const observed: MessageInitShape<typeof OpenShell.method.updateConfig.input>[] = [];
+    const observed: MessageInitShape<typeof Ryno.method.updateConfig.input>[] = [];
     const sandbox = client({
       updateConfig: (req) => {
         observed.push(req);

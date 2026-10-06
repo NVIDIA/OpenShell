@@ -12,8 +12,8 @@ test('public interactive helper drains output after input EOF and verifies compl
   timeout: 300_000,
 }, async () => {
   assert.ok(process.env.XDG_CONFIG_HOME, 'run with the Docker gateway wrapper');
-  assert.ok(process.env.OPENSHELL_GATEWAY, 'run with the Docker gateway wrapper');
-  const dir = join(process.env.XDG_CONFIG_HOME, 'openshell', 'gateways', process.env.OPENSHELL_GATEWAY);
+  assert.ok(process.env.RYNO_GATEWAY, 'run with the Docker gateway wrapper');
+  const dir = join(process.env.XDG_CONFIG_HOME, 'ryno', 'gateways', process.env.RYNO_GATEWAY);
   const metadata = JSON.parse(readFileSync(join(dir, 'metadata.json'), 'utf8'));
   const client = await SandboxClient.connect({
     gateway: metadata.gateway_endpoint,
@@ -28,7 +28,7 @@ test('public interactive helper drains output after input EOF and verifies compl
   const name = `ts-eof-${Date.now().toString(36)}`;
   await client.create({
     name,
-    image: process.env.OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE ?? 'ghcr.io/nvidia/openshell-community/sandboxes/base:latest',
+    image: process.env.RYNO_E2E_DOCKER_SANDBOX_IMAGE ?? 'ghcr.io/nvidia/ryno-community/sandboxes/base:latest',
   });
   try {
     await client.waitReady(name, 180);

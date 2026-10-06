@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Ryno Gateway
+Documentation=https://github.com/NVIDIA/Ryno
+After=default.target
+
+[Service]
+Type=simple
+StateDirectory=ryno/gateway
+Environment=RYNO_LOCAL_TLS_DIR=%h/.local/state/ryno/tls
+EnvironmentFile=-%E/ryno/gateway.env
+ExecStartPre=/usr/bin/ryno-gateway config preflight
+ExecStartPre=/usr/bin/ryno-gateway generate-certs --output-dir ${RYNO_LOCAL_TLS_DIR} --server-san host.ryno.internal
+ExecStart=/usr/bin/ryno-gateway
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

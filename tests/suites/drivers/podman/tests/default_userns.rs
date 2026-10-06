@@ -5,7 +5,7 @@
 
 mod support;
 
-use openshell_conformance::OpenShellRunner;
+use ryno_conformance::RynoRunner;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,22 +13,22 @@ use std::time::Duration;
 use support::assert_podman_gateway;
 
 const SANDBOX_TIMEOUT: Duration = Duration::from_secs(300);
-const PODMAN_TEST_INPUT_DIR_ENV: &str = "OPENSHELL_TEST_INPUT_DIR";
-const PODMAN_TEST_IMAGE_ENV: &str = "OPENSHELL_PODMAN_TEST_IMAGE";
+const PODMAN_TEST_INPUT_DIR_ENV: &str = "RYNO_TEST_INPUT_DIR";
+const PODMAN_TEST_IMAGE_ENV: &str = "RYNO_PODMAN_TEST_IMAGE";
 
 /// Verify that the gateway's user-namespace configuration matches Podman's
 /// direct behavior for the same profile.
 ///
 /// The test runs a short-lived sandbox command and compares its user-namespace
 /// mapping with the direct-Podman reference stored at
-/// `OPENSHELL_TEST_INPUT_DIR/reference-uid-map`. The tmachine pre-test
+/// `RYNO_TEST_INPUT_DIR/reference-uid-map`. The tmachine pre-test
 /// playbook creates that reference in the same gateway-user context. This deliberately
-/// avoids baking a particular Podman mapping into OpenShell's test contract.
+/// avoids baking a particular Podman mapping into Ryno's test contract.
 ///
 #[tokio::test]
 async fn configured_userns_matches_podman_reference() {
-    let mut runner = OpenShellRunner::from_env("podman-userns")
-        .expect("candidate openshell CLI is available");
+    let mut runner = RynoRunner::from_env("podman-userns")
+        .expect("candidate ryno CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         assert_podman_gateway(&runner).await?;

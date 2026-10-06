@@ -19,9 +19,9 @@ const SPIRE_ISSUER =
 const JWT_SVID_AUDIENCE =
   process.env.JWT_SVID_AUDIENCE || "http://token-exchange-issuer.default.svc.cluster.local";
 const SUPERVISOR_TRUST_DOMAIN_PREFIX =
-  process.env.SUPERVISOR_TRUST_DOMAIN_PREFIX || "spiffe://openshell.local/openshell/sandbox/";
+  process.env.SUPERVISOR_TRUST_DOMAIN_PREFIX || "spiffe://ryno.local/ryno/sandbox/";
 const GATEWAY_TRUST_DOMAIN_PREFIX =
-  process.env.GATEWAY_TRUST_DOMAIN_PREFIX || "spiffe://openshell.local/ns/openshell/sa/";
+  process.env.GATEWAY_TRUST_DOMAIN_PREFIX || "spiffe://ryno.local/ns/ryno/sa/";
 const ACCESS_TOKEN_ISSUER =
   process.env.ACCESS_TOKEN_ISSUER || "http://token-exchange-issuer.default.svc.cluster.local";
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
@@ -197,7 +197,7 @@ function issueDemoSubjectToken() {
   return signAccessToken({
     iss: ACCESS_TOKEN_ISSUER,
     sub: DEMO_USER_SUBJECT,
-    aud: ["openshell-gateway", "account"],
+    aud: ["ryno-gateway", "account"],
     scope: "openid profile email",
     demo_token_use: "user_subject",
     iat: now,

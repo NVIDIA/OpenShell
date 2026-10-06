@@ -405,7 +405,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
                         "display-name": "Dev",
                         "path": "../docs/index.yml",
                         "slug": "dev",
-                        "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
+                        "announcement": {"message": "Ryno 0.1.0 is coming soon."},
                     }
                 ]
             }
@@ -446,7 +446,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             "display-name": "Dev",
             "path": "./versions/dev.yml",
             "slug": "dev",
-            "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
+            "announcement": {"message": "Ryno 0.1.0 is coming soon."},
         },
     ]
     assert "announcement" not in docs_yml
@@ -460,7 +460,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
                         "display-name": "Dev",
                         "path": "../docs/index.yml",
                         "slug": "dev",
-                        "announcement": {"message": "OpenShell 0.1.0 is released."},
+                        "announcement": {"message": "Ryno 0.1.0 is released."},
                     }
                 ]
             }
@@ -483,8 +483,8 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
     )
 
     versions = read_yaml(fern / "docs.yml")["versions"]
-    assert versions[0]["announcement"] == {"message": "OpenShell 0.1.0 is released."}
-    assert versions[1]["announcement"] == {"message": "OpenShell 0.1.0 is coming soon."}
+    assert versions[0]["announcement"] == {"message": "Ryno 0.1.0 is released."}
+    assert versions[1]["announcement"] == {"message": "Ryno 0.1.0 is coming soon."}
 
 
 def test_sync_docs_clears_updated_badge_and_preserves_other_badges(
@@ -1055,19 +1055,19 @@ def test_sync_replaces_latest_redirects_with_snapshot(
     target_config = website / "fern" / "docs.yml"
     aliases = [
         {
-            "source": "/openshell/tutorials",
-            "destination": "/openshell/latest/tutorials",
+            "source": "/ryno/tutorials",
+            "destination": "/ryno/latest/tutorials",
         },
         {
-            "source": "/openshell/tutorials/:path*",
-            "destination": "/openshell/latest/tutorials/:path*",
+            "source": "/ryno/tutorials/:path*",
+            "destination": "/ryno/latest/tutorials/:path*",
         },
     ]
     preserved = [
         # Source ownership wins over the destination channel.
-        {"source": "/openshell/dev/retired", "destination": "/openshell/latest"},
-        {"source": "/openshell/v0.0.116/old", "destination": "/openshell/v0.0.116/new"},
-        {"source": "/openshell/:path*.html", "destination": "/openshell/:path*"},
+        {"source": "/ryno/dev/retired", "destination": "/ryno/latest"},
+        {"source": "/ryno/v0.0.116/old", "destination": "/ryno/v0.0.116/new"},
+        {"source": "/ryno/:path*.html", "destination": "/ryno/:path*"},
     ]
     old_aliases = [
         {
@@ -1080,7 +1080,7 @@ def test_sync_replaces_latest_redirects_with_snapshot(
     ]
     stale = [
         {
-            "source": rule["source"].replace("/openshell/", "/openshell/latest/", 1),
+            "source": rule["source"].replace("/ryno/", "/ryno/latest/", 1),
             "destination": rule["destination"],
         }
         for rule in old_aliases
@@ -1135,17 +1135,17 @@ def test_dev_sync_updates_own_and_shared_redirects_only(tmp_path: Path) -> None:
     source_config = source / "fern" / "docs.yml"
     target_config = website / "fern" / "docs.yml"
     latest = {
-        "source": "/openshell/latest/index.html",
-        "destination": "/openshell/latest",
+        "source": "/ryno/latest/index.html",
+        "destination": "/ryno/latest",
     }
-    dev = {"source": "/openshell/dev/old", "destination": "/openshell/dev/new#section"}
+    dev = {"source": "/ryno/dev/old", "destination": "/ryno/dev/new#section"}
     shared = {
-        "source": "/openshell/:path*/index.html",
-        "destination": "/openshell/:path*",
+        "source": "/ryno/:path*/index.html",
+        "destination": "/ryno/:path*",
     }
     stale = {
-        "source": "/openshell/dev/removed",
-        "destination": "/openshell/dev/deleted",
+        "source": "/ryno/dev/removed",
+        "destination": "/ryno/dev/deleted",
     }
     sdw.write_yaml(target_config, {"versions": [], "redirects": [latest, stale]})
     sdw.write_yaml(source_config, {"versions": [], "redirects": [dev, shared]})

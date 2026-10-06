@@ -3,9 +3,9 @@
 
 # Agent Task
 
-You are running inside an OpenShell sandbox. Your job has two steps. Each
+You are running inside an Ryno sandbox. Your job has two steps. Each
 step starts with a `curl` call that the L7 proxy will deny; for each
-denial, read `/etc/openshell/skills/policy_advisor.md`, draft a narrow
+denial, read `/etc/ryno/skills/policy_advisor.md`, draft a narrow
 proposal, submit it to `http://policy.local/v1/proposals`, wait on
 `GET /v1/proposals/{chunk_id}/wait?timeout=300`, then retry.
 
@@ -29,7 +29,7 @@ proposal, submit it to `http://policy.local/v1/proposals`, wait on
    `"error": "policy_denied"`. Read the body — it tells you which layer
    denied you, which method/path was missing, and where to learn more.
 
-2. Read `/etc/openshell/skills/policy_advisor.md` and follow it. Submit
+2. Read `/etc/ryno/skills/policy_advisor.md` and follow it. Submit
    the narrowest possible proposal to `http://policy.local/v1/proposals`
    — exact host (`raw.githubusercontent.com`), exact port (443), exact
    method (`GET`), exact path (`/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json`),
@@ -62,11 +62,11 @@ proposal, submit it to `http://policy.local/v1/proposals`, wait on
    field):
 
    ```
-   # OpenShell policy advisor demo
+   # Ryno policy advisor demo
 
    Run id: {{RUN_ID}}
 
-   Written from inside an OpenShell sandbox after a narrowly-scoped
+   Written from inside an Ryno sandbox after a narrowly-scoped
    policy proposal was reviewed by the developer.
    ```
 

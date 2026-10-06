@@ -8,8 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
-AGENT_ARG="${OPENSHELL_AGENT_DIR:-}"
+RYNO_BIN="${RYNO_BIN:-ryno}"
+AGENT_ARG="${RYNO_AGENT_DIR:-}"
 GATEWAY_OVERRIDE=""
 SANDBOX_NAME_OVERRIDE=""
 SANDBOX_FROM_OVERRIDE=""
@@ -19,10 +19,10 @@ CODEX_PROVIDER_OVERRIDE="${GATOR_CODEX_PROVIDER:-}"
 CODEX_PROVIDER_PROFILE_OVERRIDE="${GATOR_CODEX_PROVIDER_PROFILE:-}"
 CODEX_ACCESS_KEY_OVERRIDE="${GATOR_CODEX_ACCESS_CREDENTIAL_KEY:-}"
 CODEX_LOCAL_BIN="${GATOR_CODEX_LOCAL_BIN:-}"
-RUN_MODE_OVERRIDE="${OPENSHELL_AGENT_RUN_MODE:-}"
-POLL_INTERVAL_OVERRIDE="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-}"
-MAX_TRANSIENT_FAILURES_OVERRIDE="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-}"
-RESET_REFRESH="${OPENSHELL_AGENT_RESET_REFRESH:-0}"
+RUN_MODE_OVERRIDE="${RYNO_AGENT_RUN_MODE:-}"
+POLL_INTERVAL_OVERRIDE="${RYNO_AGENT_POLL_INTERVAL_SECONDS:-}"
+MAX_TRANSIENT_FAILURES_OVERRIDE="${RYNO_AGENT_MAX_TRANSIENT_FAILURES:-}"
+RESET_REFRESH="${RYNO_AGENT_RESET_REFRESH:-0}"
 KEEP_SANDBOX=0
 
 usage() {
@@ -54,7 +54,7 @@ fail() {
 }
 
 log() {
-    echo "openshell-agent-launcher: $*" >&2
+    echo "ryno-agent-launcher: $*" >&2
 }
 
 require_cmd() {
@@ -165,9 +165,9 @@ MANIFEST_FILE="$AGENT_DIR/agent.yaml"
 [[ -f "$MANIFEST_FILE" ]] || fail "missing agent manifest: $MANIFEST_FILE"
 
 require_cmd ruby
-require_cmd "$OPENSHELL_BIN"
+require_cmd "$RYNO_BIN"
 
-CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/openshell-agent-config.XXXXXX")"
+CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/ryno-agent-config.XXXXXX")"
 cleanup_config() {
     rm -f "$CONFIG_FILE"
 }
@@ -301,8 +301,8 @@ expand_home_path() {
     esac
 }
 
-openshell_cmd() {
-    "$OPENSHELL_BIN" --gateway "$GATEWAY" "$@"
+ryno_cmd() {
+    "$RYNO_BIN" --gateway "$GATEWAY" "$@"
 }
 
 upsert_provider() {
@@ -310,15 +310,15 @@ upsert_provider() {
     local type="$2"
     shift 2
 
-    if openshell_cmd provider get "$name" >/dev/null 2>&1; then
-        openshell_cmd provider update "$name" "$@" >/dev/null
+    if ryno_cmd provider get "$name" >/dev/null 2>&1; then
+        ryno_cmd provider update "$name" "$@" >/dev/null
     else
-        openshell_cmd provider create --name "$name" --type "$type" "$@" >/dev/null
+        ryno_cmd provider create --name "$name" --type "$type" "$@" >/dev/null
     fi
 }
 
 provider_exists() {
-    openshell_cmd provider get "$1" >/dev/null 2>&1
+    ryno_cmd provider get "$1" >/dev/null 2>&1
 }
 
 import_provider_profile() {
@@ -326,12 +326,12 @@ import_provider_profile() {
     local profile_file="$2"
     local import_output current_profile resource_version update_dir update_file
 
-    openshell_cmd profile delete "$profile_id" >/dev/null 2>&1 || true
-    if import_output="$(openshell_cmd profile import --file "$profile_file" 2>&1)"; then
+    ryno_cmd profile delete "$profile_id" >/dev/null 2>&1 || true
+    if import_output="$(ryno_cmd profile import --file "$profile_file" 2>&1)"; then
         return 0
     fi
     if [[ "$import_output" == *"already exists"* ]]; then
-        if ! current_profile="$(openshell_cmd profile export \
+        if ! current_profile="$(ryno_cmd profile export \
             --output json "$profile_id")"; then
             echo "failed to export existing provider profile: $profile_id" >&2
             return 1
@@ -343,7 +343,7 @@ import_provider_profile() {
             return 1
         }
 
-        update_dir="$(mktemp -d "${TMPDIR:-/tmp}/openshell-provider-profile-XXXXXX")"
+        update_dir="$(mktemp -d "${TMPDIR:-/tmp}/ryno-provider-profile-XXXXXX")"
         update_file="$update_dir/profile.yaml"
         ruby -ryaml - "$profile_file" "$resource_version" "$update_file" <<'RUBY'
 profile_file, resource_version, update_file = ARGV
@@ -351,7 +351,7 @@ profile = YAML.load_file(profile_file) || {}
 profile["resource_version"] = Integer(resource_version, 10)
 File.write(update_file, YAML.dump(profile))
 RUBY
-        if openshell_cmd profile update "$profile_id" \
+        if ryno_cmd profile update "$profile_id" \
             --file "$update_file" >/dev/null; then
             rm -f "$update_file"
             rmdir "$update_dir"
@@ -491,18 +491,18 @@ configure_provider_refresh() {
 
     local status_output
     local rotate_output
-    status_output="$(openshell_cmd provider refresh status "$provider_name" --credential-key "$credential_key" 2>&1 || true)"
+    status_output="$(ryno_cmd provider refresh status "$provider_name" --credential-key "$credential_key" 2>&1 || true)"
     if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
         echo "Preserving existing gateway refresh state for $provider_name/$credential_key. Use --reset-refresh to replace it from host auth."
     else
-        openshell_cmd "${args[@]}" >/dev/null
+        ryno_cmd "${args[@]}" >/dev/null
         echo "Configured gateway refresh for $provider_name/$credential_key."
     fi
-    if ! rotate_output="$(openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" 2>&1)"; then
+    if ! rotate_output="$(ryno_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" 2>&1)"; then
         if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
             echo "Gateway refresh rotation failed; resetting $provider_name/$credential_key from host auth and retrying once." >&2
-            openshell_cmd "${args[@]}" >/dev/null
-            openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null
+            ryno_cmd "${args[@]}" >/dev/null
+            ryno_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null
         else
             printf '%s\n' "$rotate_output" >&2
             return 1
@@ -542,9 +542,9 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     esac
 done
 
-PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent.XXXXXX")"
+PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/ryno-agent.XXXXXX")"
 PAYLOAD_DIR="$PAYLOAD_PARENT/payload"
-PAYLOAD_IMAGE_DIR="/etc/openshell/agent-payload"
+PAYLOAD_IMAGE_DIR="/etc/ryno/agent-payload"
 cleanup_payload() {
     rm -rf "$PAYLOAD_PARENT"
 }
@@ -640,18 +640,18 @@ prepare_immutable_sandbox_source() {
         tar -xf -
     )
 
-    rm -rf "$build_context/openshell-agent-payload"
-    mkdir -p "$build_context/openshell-agent-payload"
-    cp -R "$PAYLOAD_DIR/." "$build_context/openshell-agent-payload/"
+    rm -rf "$build_context/ryno-agent-payload"
+    mkdir -p "$build_context/ryno-agent-payload"
+    cp -R "$PAYLOAD_DIR/." "$build_context/ryno-agent-payload/"
 
     if [[ -L "$build_context/.dockerignore" ]]; then
         rm -f "$build_context/.dockerignore"
     fi
 
     {
-        printf '\n# OpenShell staged immutable agent payload\n'
-        printf '!openshell-agent-payload\n'
-        printf '!openshell-agent-payload/**\n'
+        printf '\n# Ryno staged immutable agent payload\n'
+        printf '!ryno-agent-payload\n'
+        printf '!ryno-agent-payload/**\n'
     } >> "$build_context/.dockerignore"
 
     local rel_dockerfile
@@ -668,7 +668,7 @@ final_user = lines[final_stage_start..].reverse.find { |line| line.strip.start_w
 File.open(dockerfile_path, "a") do |file|
   file.puts
   file.puts "USER root"
-  file.puts "COPY openshell-agent-payload/ #{payload_image_dir}/"
+  file.puts "COPY ryno-agent-payload/ #{payload_image_dir}/"
   file.puts "RUN chmod -R a+rX #{payload_image_dir}"
   file.puts "RUN chmod -R a-w #{payload_image_dir}"
   file.puts final_user if final_user
@@ -679,7 +679,7 @@ RUBY
     # auto-detection can choose Podman while the gateway uses Docker (or vice
     # versa), leaving the image unavailable to the gateway.
     local gateway_info
-    if ! gateway_info="$("$OPENSHELL_BIN" --gateway "$GATEWAY" gateway info --output json)"; then
+    if ! gateway_info="$("$RYNO_BIN" --gateway "$GATEWAY" gateway info --output json)"; then
         fail "failed to determine compute driver for gateway '$GATEWAY'"
     fi
     local gateway_engine
@@ -703,7 +703,7 @@ RUBY
     # Source after setting CONTAINER_ENGINE so the helper validates the
     # gateway-selected engine instead of auto-detecting another engine.
     source "$ROOT_DIR/tasks/scripts/container-engine.sh"
-    local image_tag="openshell/agent-${AGENT_ID}:$(date +%s)"
+    local image_tag="ryno/agent-${AGENT_ID}:$(date +%s)"
     log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE."
     ce_build --load --file "$build_dockerfile" --tag "$image_tag" "$build_context"
     SANDBOX_FROM="$image_tag"
@@ -716,7 +716,7 @@ log "Configuring gateway settings."
 for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
     key_var="SETTING_${setting_index}_KEY"
     value_var="SETTING_${setting_index}_VALUE"
-    openshell_cmd settings set --global --key "${!key_var}" --value "${!value_var}" --yes >/dev/null
+    ryno_cmd settings set --global --key "${!key_var}" --value "${!value_var}" --yes >/dev/null
 done
 
 PROVIDER_ARGS=()
@@ -773,7 +773,7 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     if [[ "${!refresh_enabled_var}" == "true" ]] && provider_exists "$provider_name"; then
         if [[ "$RESET_REFRESH" == "1" ]]; then
             log "Resetting refresh-owned provider credential '$provider_name/${!refresh_key_var}'."
-            openshell_cmd provider refresh delete "$provider_name" \
+            ryno_cmd provider refresh delete "$provider_name" \
                 --credential-key "${!refresh_key_var}" >/dev/null
             upsert_provider "$provider_name" "$profile_id" "${provider_credential_args[@]}"
         else
@@ -791,12 +791,12 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
 done
 
 HARNESS_ENV_ARGS=(
-    "OPENSHELL_AGENT_ID=$AGENT_ID"
-    "OPENSHELL_AGENT_HARNESS=$HARNESS"
-    "OPENSHELL_AGENT_RUN_MODE=$RUN_MODE"
-    "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
-    "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
-    "OPENSHELL_AGENT_PAYLOAD_VERSION=$AGENT_PAYLOAD_VERSION"
+    "RYNO_AGENT_ID=$AGENT_ID"
+    "RYNO_AGENT_HARNESS=$HARNESS"
+    "RYNO_AGENT_RUN_MODE=$RUN_MODE"
+    "RYNO_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
+    "RYNO_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
+    "RYNO_AGENT_PAYLOAD_VERSION=$AGENT_PAYLOAD_VERSION"
 )
 
 case "$HARNESS" in
@@ -809,8 +809,8 @@ case "$HARNESS" in
 esac
 
 SANDBOX_CREATE_CMD=(
-    env -u OPENSHELL_SANDBOX_POLICY
-    "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox create
+    env -u RYNO_SANDBOX_POLICY
+    "$RYNO_BIN" --gateway "$GATEWAY" sandbox create
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
     "${PROVIDER_ARGS[@]}"

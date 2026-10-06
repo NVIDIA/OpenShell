@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Google"
 sidebar-title: "Google"
-description: "Authenticate with Google Cloud APIs and Vertex AI inside OpenShell sandboxes."
+description: "Authenticate with Google Cloud APIs and Vertex AI inside Ryno sandboxes."
 keywords: "Generative AI, Google Cloud, Vertex AI, GCP, OAuth2, Credentials, Sandbox"
 ---
 
@@ -20,14 +20,14 @@ Import the `google-cloud` profile first; a gateway serves only the profiles you
 imported:
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml --global
+ryno profile import --url https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/google-cloud.yaml --global
 ```
 
 If you already have `gcloud` configured with Application Default Credentials,
 create a provider with automatic credential refresh in one command:
 
 ```shell
-openshell provider create \
+ryno provider create \
   --name my-gcp \
   --type google-cloud \
   --from-gcloud-adc \
@@ -49,7 +49,7 @@ Use credentials from `gcloud auth application-default login`. The gateway
 exchanges the refresh token for short-lived access tokens automatically.
 
 ```shell
-openshell provider create \
+ryno provider create \
   --name my-gcp \
   --type google-cloud \
   --config project_id=my-project \
@@ -60,7 +60,7 @@ openshell provider create \
 Configure credential refresh with the ADC JSON fields:
 
 ```shell
-openshell provider refresh configure my-gcp \
+ryno provider refresh configure my-gcp \
   --credential-key GCP_ADC_ACCESS_TOKEN \
   --strategy oauth2-refresh-token \
   --material client_id=YOUR_CLIENT_ID \
@@ -76,7 +76,7 @@ Find these values in your ADC file at
 Trigger the first token mint:
 
 ```shell
-openshell provider refresh rotate my-gcp \
+ryno provider refresh rotate my-gcp \
   --credential-key GCP_ADC_ACCESS_TOKEN
 ```
 
@@ -87,7 +87,7 @@ exchanges them for access tokens using the `google-service-account-jwt`
 strategy.
 
 ```shell
-openshell provider create \
+ryno provider create \
   --name my-gcp \
   --type google-cloud \
   --config project_id=my-project \
@@ -96,7 +96,7 @@ openshell provider create \
 ```
 
 ```shell
-openshell provider refresh configure my-gcp \
+ryno provider refresh configure my-gcp \
   --credential-key GCP_SA_ACCESS_TOKEN \
   --strategy google-service-account-jwt \
   --material client_email=sa@my-project.iam.gserviceaccount.com \
@@ -105,7 +105,7 @@ openshell provider refresh configure my-gcp \
 ```
 
 ```shell
-openshell provider refresh rotate my-gcp \
+ryno provider refresh rotate my-gcp \
   --credential-key GCP_SA_ACCESS_TOKEN
 ```
 
@@ -153,7 +153,7 @@ honor the injected metadata discovery variables below. Requests require the
 The endpoint serves project ID, service-account email, scopes, and token
 placeholders, including recursive service-account discovery.
 
-OpenShell reserves `127.0.0.1:8174` for this service. Connections to this
+Ryno reserves `127.0.0.1:8174` for this service. Connections to this
 address reach the emulator even if a workload binds its own listener there.
 Requests to the host's cloud metadata service remain blocked; the emulator does not forward requests to
 `metadata.google.internal` or `169.254.169.254`.
@@ -182,10 +182,10 @@ permissions for. Add the target API hosts to your sandbox network policy:
 
 Attach `my-gcp` to the sandbox first. Because the `google-cloud` profile has no
 endpoints, each API endpoint must bind to that provider instance. Without the
-binding, OpenShell withholds its access token from the sandbox.
+binding, Ryno withholds its access token from the sandbox.
 The metadata token endpoint returns HTTP `503` when no bound access token is
 available or the token has expired. Attach the provider, add a credential
-binding, and check `openshell provider refresh status my-gcp` before testing
+binding, and check `ryno provider refresh status my-gcp` before testing
 token discovery.
 
 ```yaml
@@ -211,9 +211,9 @@ For a running sandbox, export its base policy. Remove the metadata header above
 the `---` line, add the endpoint and binaries shown above, then apply the file:
 
 ```shell
-openshell policy get my-sandbox --base > sandbox-policy.yaml
+ryno policy get my-sandbox --base > sandbox-policy.yaml
 # Edit sandbox-policy.yaml to add the gcp_apis rule shown above.
-openshell policy set my-sandbox --policy sandbox-policy.yaml --wait
+ryno policy set my-sandbox --policy sandbox-policy.yaml --wait
 ```
 
 ## Network Policy
@@ -226,11 +226,11 @@ above for an example.
 ## Vertex AI
 
 The `google-vertex-ai` provider gives selected sandboxes access to native
-Google Vertex AI endpoints. OpenShell keeps refresh bootstrap material at the
+Google Vertex AI endpoints. Ryno keeps refresh bootstrap material at the
 gateway, rotates short-lived access tokens, and resolves token placeholders
 only at endpoints authorized by the provider profile.
 
-OpenShell does not choose a model or transform a request. The workload uses the
+Ryno does not choose a model or transform a request. The workload uses the
 native Vertex endpoint and request format for its selected model.
 
 ### Prerequisites
@@ -245,7 +245,7 @@ native Vertex endpoint and request format for its selected model.
 Import the `google-vertex-ai` profile first:
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml --global
+ryno profile import --url https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/google-vertex-ai.yaml --global
 ```
 
 #### Service Account Key
@@ -253,7 +253,7 @@ openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShel
 Create the provider with the JSON key as gateway-only bootstrap material:
 
 ```shell
-openshell provider create \
+ryno provider create \
   --name vertex-prod \
   --type google-vertex-ai \
   --credential GOOGLE_SERVICE_ACCOUNT_KEY="$(cat /path/to/key.json)" \
@@ -264,7 +264,7 @@ openshell provider create \
 Configure gateway-managed refresh:
 
 ```shell
-openshell provider refresh configure vertex-prod \
+ryno provider refresh configure vertex-prod \
   --credential-key GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN \
   --strategy google-service-account-jwt \
   --material client_email="sa@my-gcp-project.iam.gserviceaccount.com" \
@@ -282,7 +282,7 @@ For local development:
 ```shell
 gcloud auth application-default login
 
-openshell provider create \
+ryno provider create \
   --name vertex-local \
   --type google-vertex-ai \
   --from-gcloud-adc \
@@ -301,7 +301,7 @@ file and refresh token do not enter the sandbox.
 | `VERTEX_AI_PROJECT_ID` | Yes | — | GCP project ID exposed as non-secret workload configuration. |
 | `VERTEX_AI_REGION` | No | `us-central1` | Vertex location exposed as non-secret workload configuration. |
 
-When the provider is attached, OpenShell also projects standard project and
+When the provider is attached, Ryno also projects standard project and
 location aliases such as `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID`,
 `CLOUD_ML_REGION`, and `VERTEX_LOCATION`.
 
@@ -310,7 +310,7 @@ location aliases such as `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID`,
 Attach it while creating a sandbox:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --from registry.example.com/team/agent:1.0 \
   --name vertex-agent \
   --provider vertex-local
@@ -319,7 +319,7 @@ openshell sandbox create \
 Or attach it to an existing sandbox:
 
 ```shell
-openshell sandbox provider attach vertex-agent vertex-local
+ryno sandbox provider attach vertex-agent vertex-local
 ```
 
 Launch a new process after runtime attachment so it receives the provider
@@ -332,7 +332,7 @@ Claude models use Vertex's publisher-model endpoint. Run a request from a new
 sandbox process:
 
 ```shell
-openshell sandbox exec vertex-agent -- sh -lc '
+ryno sandbox exec vertex-agent -- sh -lc '
   token=${GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN:-$GOOGLE_VERTEX_AI_TOKEN}
   curl -X POST \
     -H "Authorization: Bearer $token" \
@@ -352,16 +352,16 @@ regional `<location>-aiplatform.googleapis.com` form.
 
 Gemini and third-party models use their documented native or
 OpenAI-compatible Vertex endpoints. Configure the model, URL, streaming mode,
-and timeout in the client. OpenShell does not rewrite them.
+and timeout in the client. Ryno does not rewrite them.
 
 ### Verify and Troubleshoot Vertex AI
 
 Inspect the attachment and effective policy:
 
 ```shell
-openshell sandbox provider list vertex-agent
-openshell policy get vertex-agent --full
-openshell provider refresh status vertex-local
+ryno sandbox provider list vertex-agent
+ryno policy get vertex-agent --full
+ryno provider refresh status vertex-local
 ```
 
 Common failures:

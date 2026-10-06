@@ -3,15 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Sandbox Policies"
 sidebar-title: "Manage Policies"
-description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, apply a global policy, and troubleshoot policy problems."
+description: "Use the Ryno CLI to set, inspect, change, verify, and roll back sandbox policies, apply a global policy, and troubleshoot policy problems."
 keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revision"
 position: 3
 ---
 
-This page shows how to use the OpenShell CLI to manage a sandbox's policy, from
+This page shows how to use the Ryno CLI to manage a sandbox's policy, from
 setting a policy when you create a sandbox to changing it while the sandbox
 runs, confirming that the change took effect, and rolling it back. Run
-`openshell policy --help` for every command and option.
+`ryno policy --help` for every command and option.
 
 ## Create a Sandbox with a Policy
 
@@ -19,19 +19,19 @@ Pass a policy file when you create a sandbox. Filesystem, Landlock, and process
 settings take effect only when the sandbox starts, so set them here:
 
 ```shell
-openshell sandbox create --name my-sandbox --policy ./policy.yaml
+ryno sandbox create --name my-sandbox --policy ./policy.yaml
 ```
 
 The rest of this page refers to this sandbox as `my-sandbox`. If you omit the
-sandbox name from an `openshell policy` command, the CLI uses the sandbox you
+sandbox name from an `ryno policy` command, the CLI uses the sandbox you
 most recently created, connected to, or ran a command in, and prints its name.
 
 To use the same file for every sandbox you create, set
-`OPENSHELL_SANDBOX_POLICY` instead of passing `--policy`:
+`RYNO_SANDBOX_POLICY` instead of passing `--policy`:
 
 ```shell
-export OPENSHELL_SANDBOX_POLICY="$PWD/policy.yaml"
-openshell sandbox create --name my-sandbox
+export RYNO_SANDBOX_POLICY="$PWD/policy.yaml"
+ryno sandbox create --name my-sandbox
 ```
 
 Without either, the sandbox uses a policy from its image or the restrictive
@@ -39,16 +39,16 @@ Without either, the sandbox uses a policy from its image or the restrictive
 
 ## Ship a Policy in an Image
 
-To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:
+To include a policy in a sandbox image, add it at `/etc/ryno/policy.yaml`:
 
 ```dockerfile
-COPY policy.yaml /etc/openshell/policy.yaml
+COPY policy.yaml /etc/ryno/policy.yaml
 ```
 
-OpenShell uses the image policy only when the sandbox has no saved policy, so a
-`--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence. If the image
+Ryno uses the image policy only when the sandbox has no saved policy, so a
+`--policy` file or `RYNO_SANDBOX_POLICY` takes precedence. If the image
 policy is invalid, the sandbox does not start until you [replace it with a valid
-policy](#a-new-sandbox-stays-in-provisioning). OpenShell
+policy](#a-new-sandbox-stays-in-provisioning). Ryno
 does not fall back to the default policy.
 
 ## Inspect the Current Policy
@@ -60,8 +60,8 @@ a global policy is active, both views show the global policy. `--base` shows the
 base policy, and `--full` shows the effective policy:
 
 ```shell
-openshell policy get my-sandbox --base
-openshell policy get my-sandbox --full
+ryno policy get my-sandbox --base
+ryno policy get my-sandbox --full
 ```
 
 Edit from the base policy, because provider rules belong to their providers, not
@@ -72,18 +72,18 @@ To save the effective policy as a YAML file, for example to review it or to
 check it with the [policy prover](/how-it-works/policies/prover):
 
 ```shell
-openshell sandbox get my-sandbox --policy-only > effective-policy.yaml
+ryno sandbox get my-sandbox --policy-only > effective-policy.yaml
 ```
 
 To see each revision of the policy and whether the sandbox loaded it:
 
 ```shell
-openshell policy list my-sandbox
+ryno policy list my-sandbox
 ```
 
 ## Add or Remove Network Access
 
-`openshell policy update` adds or removes network rules on a running sandbox. It
+`ryno policy update` adds or removes network rules on a running sandbox. It
 changes only the `network_policies` section, so you do not need a complete
 policy file.
 
@@ -91,7 +91,7 @@ For example, to let `curl` in the sandbox make read-only requests to the GitHub
 API:
 
 ```shell
-openshell policy update my-sandbox \
+ryno policy update my-sandbox \
   --rule-name github_readonly \
   --binary /usr/bin/curl \
   --add-endpoint api.github.com:443:read-only:rest:enforce \
@@ -111,20 +111,20 @@ The command fails if the list does not match the rule's binaries, so a new
 permission cannot reach a binary you did not name:
 
 ```shell
-openshell policy update my-sandbox \
+ryno policy update my-sandbox \
   --rule-name github_readonly \
   --binary /usr/bin/curl \
   --add-allow 'api.github.com:443:POST:/repos/*/*/issues' \
   --wait
 ```
 
-Because this endpoint uses the `read-only` preset, OpenShell first replaces the
+Because this endpoint uses the `read-only` preset, Ryno first replaces the
 preset with equivalent explicit rules, then adds yours. `--rule-name` refers to
 the rule's key under `network_policies`, which can differ from its `name` field.
 Use `--add-deny` the same way to block a request. To remove the rule:
 
 ```shell
-openshell policy update my-sandbox --remove-rule github_readonly --wait
+ryno policy update my-sandbox --remove-rule github_readonly --wait
 ```
 
 To preview a change without applying it, replace `--wait` with `--dry-run`. A
@@ -135,7 +135,7 @@ providers add keep the destination.
 
 ## Replace the Complete Policy
 
-`openshell policy set` replaces the whole policy. Use it for changes that
+`ryno policy set` replaces the whole policy. Use it for changes that
 `policy update` cannot make, such as middleware, GraphQL, MCP, or JSON-RPC
 rules, `tls: skip`, credential bindings, or request signing. The new file
 replaces every section, so start from the current base policy.
@@ -145,18 +145,18 @@ replaces every section, so start from the current base policy.
 Print the base policy:
 
 ```shell
-openshell policy get my-sandbox --base
+ryno policy get my-sandbox --base
 ```
 
 The command prints revision details followed by the policy. Save only the policy
 YAML as `policy.yaml`, then edit the sections you want to change. Keep
-everything else, including filesystem paths that OpenShell added when the
+everything else, including filesystem paths that Ryno added when the
 sandbox started.
 
 Submit the edited file and wait for the result:
 
 ```shell
-openshell policy set my-sandbox --policy policy.yaml --wait
+ryno policy set my-sandbox --policy policy.yaml --wait
 ```
 
 </Tab>
@@ -165,14 +165,14 @@ Save the base policy as JSON:
 
 ```shell
 set -o pipefail
-openshell policy get my-sandbox --base --output json \
+ryno policy get my-sandbox --base --output json \
   | jq -e '.policy' > base-policy.json
 ```
 
 Edit `base-policy.json`, then submit it and wait for the result:
 
 ```shell
-openshell policy set my-sandbox --policy base-policy.json --wait
+ryno policy set my-sandbox --policy base-policy.json --wait
 ```
 
 </Tab>
@@ -182,24 +182,24 @@ The next section describes how each part of the new policy takes effect.
 
 ## How Changes Take Effect
 
-When you apply a change with `openshell policy update` or
-`openshell policy set`, the network sections of the policy take effect in the
+When you apply a change with `ryno policy update` or
+`ryno policy set`, the network sections of the policy take effect in the
 running sandbox. The startup sections do not:
 
 | Change | Effect on a running sandbox | Required action |
 |---|---|---|
 | Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
-| Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
+| Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `ryno policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
 | Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
-| Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
+| Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | Ryno rejects the change after the workload starts. | Recreate the sandbox. |
 
-When new network rules take effect, OpenShell closes connections that were
+When new network rules take effect, Ryno closes connections that were
 opened under the previous rules, including HTTP keep-alive connections, tunnels,
 WebSocket connections, and long-lived streams. Clients must reconnect, and their
 next requests are checked against the new rules.
 
-OpenShell validates every change twice before it takes effect:
+Ryno validates every change twice before it takes effect:
 
 ```mermaid
 flowchart TD
@@ -227,7 +227,7 @@ starts, so changing them requires a new sandbox. Save the base policy as
 described in [Replace the Complete Policy](#replace-the-complete-policy), and
 edit these settings in the file.
 
-When the policy allows network access, OpenShell adds the system paths that
+When the policy allows network access, Ryno adds the system paths that
 sandbox processes need, so list only the paths your workload requires. [Baseline
 Filesystem
 Paths](/how-it-works/policies/default-policy#baseline-filesystem-paths) lists
@@ -241,12 +241,12 @@ you need before you delete it.
 Delete the sandbox and create a new one with the edited file:
 
 ```shell
-openshell sandbox delete my-sandbox
-openshell sandbox create --name my-sandbox --policy ./policy.yaml
+ryno sandbox delete my-sandbox
+ryno sandbox create --name my-sandbox --policy ./policy.yaml
 ```
 
 If the delete command reports that cleanup is pending, wait until
-`openshell sandbox get my-sandbox` no longer finds the sandbox before you create
+`ryno sandbox get my-sandbox` no longer finds the sandbox before you create
 the new one.
 
 ## Verify a Change
@@ -262,33 +262,33 @@ that the policy was unchanged, or that a newer change replaced yours before it
 loaded. Confirm the result:
 
 ```shell
-openshell policy list my-sandbox
-openshell policy get my-sandbox --full
+ryno policy list my-sandbox
+ryno policy get my-sandbox --full
 ```
 
 The latest revision should show `Loaded`, and the effective policy should
 contain your change.
 
 Then test one request that should be allowed and one that should be blocked.
-Confirm that a denial comes from OpenShell, as a `policy_denied` response or a
+Confirm that a denial comes from Ryno, as a `policy_denied` response or a
 sandbox log entry, rather than from the destination service or a missing client
 tool.
 
 ## Roll Back to an Earlier Revision
 
 To restore an earlier policy, find the revision in
-`openshell policy list my-sandbox` and print its base policy. For example, for
+`ryno policy list my-sandbox` and print its base policy. For example, for
 revision 2:
 
 ```shell
-openshell policy get my-sandbox --rev 2 --base
+ryno policy get my-sandbox --rev 2 --base
 ```
 
 Save the policy YAML from the output as `previous-base.yaml`, review it, and
 submit it as a new revision:
 
 ```shell
-openshell policy set my-sandbox --policy previous-base.yaml --wait
+ryno policy set my-sandbox --policy previous-base.yaml --wait
 ```
 
 Rolling back restores only the policy. It does not restore provider profiles,
@@ -304,10 +304,10 @@ role:
 
 | Task | Command |
 |---|---|
-| Inspect the current global policy. | `openshell policy get --global --full` |
-| Apply a reviewed complete policy. | `openshell policy set --global --policy ./global-policy.yaml` |
-| View global policy history. | `openshell policy list --global` |
-| Remove the global policy and restore normal policy selection. | `openshell policy delete --global` |
+| Inspect the current global policy. | `ryno policy get --global --full` |
+| Apply a reviewed complete policy. | `ryno policy set --global --policy ./global-policy.yaml` |
+| View global policy history. | `ryno policy list --global` |
+| Remove the global policy and restore normal policy selection. | `ryno policy delete --global` |
 
 The set and delete commands ask for confirmation, because each one changes the
 network access of every sandbox on the gateway. Running sandboxes load a new
@@ -322,12 +322,12 @@ restored.
 
 ### A Request Is Denied
 
-OpenShell logs each denied connection with the destination, binary, and reason,
+Ryno logs each denied connection with the destination, binary, and reason,
 and each denied request with its method, path, and reason. Check the sandbox log
 first:
 
 ```shell
-openshell logs my-sandbox --since 10m --source sandbox
+ryno logs my-sandbox --since 10m --source sandbox
 ```
 
 Do not filter this log with `--level warn`, which hides policy events. Compare
@@ -344,9 +344,9 @@ code in the response to find the cause:
 
 ### A Change Fails to Load
 
-`openshell policy list my-sandbox` shows a revision that the sandbox rejected as
+`ryno policy list my-sandbox` shows a revision that the sandbox rejected as
 `Failed`, with a shortened error. Run
-`openshell policy get my-sandbox --rev <N>` to see the full error. What happens
+`ryno policy get my-sandbox --rev <N>` to see the full error. What happens
 to network access depends on the failure mode described in [How Changes Take
 Effect](#how-changes-take-effect). With the default, `fail_closed`, the sandbox
 blocks network traffic until a valid policy loads. Fix the error and submit the
@@ -355,7 +355,7 @@ revision](#roll-back-to-an-earlier-revision).
 
 ### A New Sandbox Stays in Provisioning
 
-`openshell sandbox create` rejects an invalid policy file. If a new sandbox's
+`ryno sandbox create` rejects an invalid policy file. If a new sandbox's
 configuration fails when it starts, for example because its image policy is
 invalid or its providers conflict, the sandbox stays in `Provisioning` and its
 workload does not start. Its `ConfigurationReady` condition shows the reason
@@ -363,19 +363,19 @@ workload does not start. Its `ConfigurationReady` condition shows the reason
 check the sandbox log for the specific error:
 
 ```shell
-openshell sandbox get my-sandbox --output json
+ryno sandbox get my-sandbox --output json
 ```
 
 The same repair window applies when the gateway refuses an image-policy upload or a policy update that adds baseline filesystem paths with `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. After the gateway acknowledges the rejection report, startup waits two seconds, reads a fresh configuration, and retries. If your repair reaches the gateway before that report, startup immediately reads the repaired configuration. The sandbox log records the gateway's reason; repeated refusals of the same write, status code, and configuration are logged once. Authentication and authorization failures still stop startup.
 
-You have 300 seconds to fix the configuration after the supervisor starts admission. Image preparation has its own deadline and does not consume that repair time. Replace the policy with `openshell policy set`, or fix the provider configuration. Until the workload first starts, you can also change filesystem, Landlock, and process settings. Each effective change to the policy, providers, or settings restarts the 300 seconds; writing an unchanged value does not.
+You have 300 seconds to fix the configuration after the supervisor starts admission. Image preparation has its own deadline and does not consume that repair time. Replace the policy with `ryno policy set`, or fix the provider configuration. Until the workload first starts, you can also change filesystem, Landlock, and process settings. Each effective change to the policy, providers, or settings restarts the 300 seconds; writing an unchanged value does not.
 
 If the time runs out, the sandbox moves to `Error` with the reason
 `ProvisioningTimedOut`. Fixing the configuration does not restart it. After you
 fix it, start the sandbox again. Admission gets a new 300-second window after preparation:
 
 ```shell
-openshell sandbox start my-sandbox
+ryno sandbox start my-sandbox
 ```
 
 ## Next Steps

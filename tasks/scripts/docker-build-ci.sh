@@ -30,7 +30,7 @@ exec ce_build \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.ci \
-  -t "openshell/ci:${IMAGE_TAG:-dev}" \
+  -t "ryno/ci:${IMAGE_TAG:-dev}" \
   --provenance=false \
   "$@" \
   ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \

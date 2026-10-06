@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# OpenShell gateway — docker-compose setup (Docker compute driver)
+# Ryno gateway — docker-compose setup (Docker compute driver)
 #
 # Prerequisites:
 #   - Docker Desktop (Windows / macOS) or Docker Engine + Compose plugin (Linux)
-#   - The openshell CLI installed on your workstation
+#   - The ryno CLI installed on your workstation
 #
 # Quick start:
 #
@@ -13,24 +13,24 @@
 #        docker compose up -d
 #
 #   2. Register the gateway with the CLI (one-time):
-#        openshell gateway add http://localhost:8080 --name openshell-docker
+#        ryno gateway add http://localhost:8080 --name ryno-docker
 #
 #   3. Configure an AI provider (example: Anthropic):
 #        ANTHROPIC_API_KEY=sk-ant-... \
-#          openshell provider create --type anthropic --from-existing
+#          ryno provider create --type anthropic --from-existing
 #
 #   4. Create a sandboxed agent — Claude Code:
-#        openshell sandbox create -- claude
+#        ryno sandbox create -- claude
 #      For OpenClaw, use NemoClaw: https://github.com/NVIDIA/NemoClaw
 #
 # Sandbox containers are managed by the gateway, not by this Compose file.
-# Each `openshell sandbox create` call launches a fresh container; the gateway
+# Each `ryno sandbox create` call launches a fresh container; the gateway
 # tracks their lifecycle.
 #
 # Configuration:
 #   All gateway and driver settings live in gateway.toml in this directory.
 #   Three values cannot be expressed in the TOML file and remain as env vars:
-#     - OPENSHELL_DB_URL  (explicitly blocked from the config file to prevent
+#     - RYNO_DB_URL  (explicitly blocked from the config file to prevent
 #                          secrets from being committed to VCS)
 #     - XDG_DATA_HOME / HOME  (OS-level path-resolution vars outside the
 #                               gateway config schema)
@@ -43,7 +43,7 @@
 #   gateway settings.
 #
 # Data directory note:
-#   /var/lib/openshell is bind-mounted at the SAME absolute path in both the
+#   /var/lib/ryno is bind-mounted at the SAME absolute path in both the
 #   host and the container.  This is required so that the supervisor binary
 #   extracted from the supervisor image can be passed to Docker as a host-side
 #   bind-mount source when sandbox containers are created.  Named volumes
@@ -51,15 +51,15 @@
 #   host filesystem, not the container filesystem.
 #
 # Linux note:
-#   host.docker.internal and host.openshell.internal are not automatically
+#   host.docker.internal and host.ryno.internal are not automatically
 #   added on Linux Docker.  Add the following under the gateway service:
 #     extra_hosts:
 #       - "host.docker.internal:host-gateway"
-#       - "host.openshell.internal:host-gateway"
+#       - "host.ryno.internal:host-gateway"
 
 services:
   gateway:
-    image: ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG:-latest}
+    image: ghcr.io/nvidia/ryno/gateway:${IMAGE_TAG:-latest}
     restart: unless-stopped
 
     # Clear the default CMD so gateway.toml owns all settings (see note above).
@@ -71,7 +71,7 @@ services:
     # --privileged; it only needs read/write access to /var/run/docker.sock.
     #
     # Run as UID 0 so the gateway can:
-    #   - write the extracted supervisor binary to /var/lib/openshell
+    #   - write the extracted supervisor binary to /var/lib/ryno
     #   - access /var/run/docker.sock (typically owned by root or the docker group)
     # Distroless images have no /etc/passwd, so the numeric UID must be used.
     # This is appropriate for local development.  Production deployments
@@ -81,9 +81,9 @@ services:
     ports:
       # gRPC / control-plane API. The Docker supervisor uses host networking
       # and reaches this primary loopback endpoint through the published port.
-      - "127.0.0.1:${OPENSHELL_PORT:-8080}:8080"
+      - "127.0.0.1:${RYNO_PORT:-8080}:8080"
       # Health endpoint  (GET /healthz, GET /readyz)
-      - "127.0.0.1:${OPENSHELL_HEALTH_PORT:-8081}:8081"
+      - "127.0.0.1:${RYNO_HEALTH_PORT:-8081}:8081"
 
     volumes:
       # Docker socket — lets the gateway create and manage sandbox containers.
@@ -92,13 +92,13 @@ services:
       # Data directory — must be a bind-mount with source == target so that
       # paths written inside the container are resolvable by Docker when it
       # creates sandbox containers (see note above).
-      # /var/lib/openshell is intentionally not namespaced to a sub-path
-      # (e.g. /var/lib/openshell/gateway): the path must match exactly on
+      # /var/lib/ryno is intentionally not namespaced to a sub-path
+      # (e.g. /var/lib/ryno/gateway): the path must match exactly on
       # both the host and inside the container, and a single gateway per host
       # is the expected topology.
       - type: bind
-        source: /var/lib/openshell
-        target: /var/lib/openshell
+        source: /var/lib/ryno
+        target: /var/lib/ryno
         bind:
           create_host_path: true
 
@@ -107,22 +107,22 @@ services:
       # docker-compose.yml file (deploy/docker/), not the CWD of the caller.
       - type: bind
         source: ./gateway.toml
-        target: /etc/openshell/gateway.toml
+        target: /etc/ryno/gateway.toml
         read_only: true
 
     environment:
       # Point the gateway at the TOML config file mounted above.
-      OPENSHELL_GATEWAY_CONFIG: /etc/openshell/gateway.toml
+      RYNO_GATEWAY_CONFIG: /etc/ryno/gateway.toml
 
       # Database URL cannot be set in the TOML config file — it is explicitly
       # blocked there to prevent credential-bearing URLs (e.g. postgresql://user:pass@host/db)
       # from being committed to VCS.  A plain SQLite path contains no credentials, so it
       # is safe to include here.  Swap this for a real DSN via an env file or secret if
       # you switch to an external database.
-      OPENSHELL_DB_URL: "sqlite:/var/lib/openshell/gateway.db?mode=rwc"
+      RYNO_DB_URL: "sqlite:/var/lib/ryno/gateway.db?mode=rwc"
 
       # XDG path variables are OS-level; they are not part of the gateway config
       # schema.  Setting them ensures the extracted supervisor binary lands in the
       # bind-mounted directory so its path is resolvable by the host Docker daemon.
-      XDG_DATA_HOME: /var/lib/openshell
-      HOME: /var/lib/openshell
+      XDG_DATA_HOME: /var/lib/ryno
+      HOME: /var/lib/ryno

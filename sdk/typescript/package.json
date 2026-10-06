@@ -1,13 +1,13 @@
 {
-  "name": "@nvidia/openshell-sdk",
+  "name": "@nvidia/ryno-sdk",
   "version": "0.0.0",
-  "description": "Official TypeScript SDK for the OpenShell gateway.",
+  "description": "Official TypeScript SDK for the Ryno gateway.",
   "license": "Apache-2.0",
   "type": "module",
-  "homepage": "https://github.com/NVIDIA/OpenShell",
+  "homepage": "https://github.com/NVIDIA/Ryno",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NVIDIA/OpenShell.git",
+    "url": "git+https://github.com/NVIDIA/Ryno.git",
     "directory": "sdk/typescript"
   },
   "publishConfig": {

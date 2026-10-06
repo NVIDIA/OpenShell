@@ -1,15 +1,15 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "OpenShell Security Best Practices for Controls, Risks, and Configuration Guidance"
+title: "Ryno Security Best Practices for Controls, Risks, and Configuration Guidance"
 sidebar-title: "Security Best Practices"
 slug: "security/best-practices"
-description: "A guide to every configurable security control in OpenShell: defaults, what you can change, and the risks of each choice."
+description: "A guide to every configurable security control in Ryno: defaults, what you can change, and the risks of each choice."
 keywords: "Generative AI, Cybersecurity, Security, Policy, Sandbox, Landlock, Seccomp"
 position: 1
 ---
 
-OpenShell enforces sandbox security across four layers: network, filesystem, process, and provider credentials.
+Ryno enforces sandbox security across four layers: network, filesystem, process, and provider credentials.
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/how-it-works/policies/schema).
@@ -22,13 +22,13 @@ If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw), its [Security Best Pr
 
 ## Enforcement Layers
 
-OpenShell applies security controls at two enforcement points.
-OpenShell locks static controls at sandbox creation and requires destroying and recreating the sandbox to change them.
-You can update dynamic controls on a running sandbox with `openshell policy update` or `openshell policy set`.
+Ryno applies security controls at two enforcement points.
+Ryno locks static controls at sandbox creation and requires destroying and recreating the sandbox to change them.
+You can update dynamic controls on a running sandbox with `ryno policy update` or `ryno policy set`.
 
 | Layer | What it protects | Enforcement point | Changeable at runtime |
 | --- | --- | --- | --- |
-| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
+| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `ryno policy update`, `ryno policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
 | Provider credentials | Credential exposure and unauthorized service access. | Network policy plus profile endpoint binding and proxy substitution | Yes. Attach or detach providers and update dynamic policy. |
@@ -46,9 +46,9 @@ If no `network_policies` entry matches the destination host, port, and calling b
 | Aspect | Detail |
 |---|---|
 | Default | All egress denied. Only endpoints listed in `network_policies` can receive traffic. |
-| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`openshell policy update` for incremental changes, `openshell policy set` for full replacement). |
+| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`ryno policy update` for incremental changes, `ryno policy set` for full replacement). |
 | Risk if relaxed | Each allowed endpoint is a potential data exfiltration path. The agent can send workspace content, credentials, or conversation history to any reachable host. |
-| Recommendation | Add only endpoints the agent needs for its task. Start with a minimal policy and use denied-request logs (`openshell logs <name> --source sandbox`) to identify missing endpoints. |
+| Recommendation | Add only endpoints the agent needs for its task. Start with a minimal policy and use denied-request logs (`ryno logs <name> --source sandbox`) to identify missing endpoints. |
 
 ### Network Namespace Isolation
 
@@ -59,9 +59,9 @@ Even if a process ignores proxy environment variables, it can only reach the pro
 | Aspect | Detail |
 |---|---|
 | Default | Always active. The sandbox cannot bypass the proxy at the network level. |
-| What you can change | This is not a user-facing knob. OpenShell always enforces it in proxy mode. |
+| What you can change | This is not a user-facing knob. Ryno always enforces it in proxy mode. |
 | Risk if bypassed | Without network namespace isolation, a process could connect directly to the internet, bypassing all policy enforcement. |
-| Recommendation | No action needed. OpenShell enforces this automatically. |
+| Recommendation | No action needed. Ryno enforces this automatically. |
 
 ### User Namespace Isolation
 
@@ -71,17 +71,17 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 
 | Aspect | Detail |
 |---|---|
-| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in `[openshell.drivers.kubernetes]` to enable cluster-wide. |
+| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in `[ryno.drivers.kubernetes]` to enable cluster-wide. |
 | What you can change | Enable cluster-wide through Helm or gateway config. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
 | Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
-| Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
+| Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. Ryno logs a warning when both GPU and user namespaces are active on the same sandbox. |
 | Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |
 
 ### Binary Identity Binding
 
-OpenShell binds each connection to executable identity observed by the trusted isolation boundary.
+Ryno binds each connection to executable identity observed by the trusted isolation boundary.
 Network policy can authorize either the connection-owning executable or one of its executable ancestors.
-OpenShell pins every authorization-capable path to its first runtime-observed SHA256 digest (trust on first use), and a later digest mismatch triggers an immediate deny.
+Ryno pins every authorization-capable path to its first runtime-observed SHA256 digest (trust on first use), and a later digest mismatch triggers an immediate deny.
 Missing or conflicting integrity evidence also fails closed. Command-line paths remain diagnostic context and never authorize access.
 
 | Aspect | Detail |
@@ -100,7 +100,7 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 | Default | Endpoints without a `protocol` field apply no request rules. The proxy checks host, port, and binary, still terminates TLS and parses HTTP requests, and requires the request authority to match the destination, but it allows any HTTP method and path. Non-HTTP traffic is relayed without inspection. `protocol: tcp` endpoints also apply no request rules, and `tls: skip` endpoints relay traffic without terminating TLS. Provider-credentialed endpoints reject uninspected modes unless an operator explicitly opts in. |
 | What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, `protocol: websocket` to inspect RFC 6455 upgrade handshakes and client text messages, or `protocol: graphql` to inspect GraphQL-over-HTTP operation type, operation name, and root fields. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket messages. Pair inspected protocols with `rules` or access presets (`full`, `read-only`, `read-write`). REST endpoints that need credential placeholders in supported text request bodies can set `request_body_credential_rewrite: true`. Set `allow_uninspected_credentials: true` only as an explicit exception for credentialed traffic that cannot use an inspected path. |
 | Risk if relaxed | Endpoints without request rules allow the agent to send any request or data to the destination after the connection is permitted. The proxy does not restrict HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
-| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Use `protocol: tcp` for native non-HTTP clients such as databases, and refer to [Allow Native TCP](/how-it-works/policies/network-rules#allow-native-tcp) for when to add `tls: skip`. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
+| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require Ryno-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Use `protocol: tcp` for native non-HTTP clients such as databases, and refer to [Allow Native TCP](/how-it-works/policies/network-rules#allow-native-tcp) for when to add `tls: skip`. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
 
 ### Enforcement Mode (`audit` vs `enforce`)
 
@@ -121,7 +121,7 @@ This enables credential injection and L7 inspection without explicit configurati
 
 | Aspect | Detail |
 |---|---|
-| Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
+| Default | Auto-detect and terminate. Ryno generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
 | Risk if relaxed | `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. A provider-credentialed endpoint also requires the explicit `allow_uninspected_credentials: true` exception. |
@@ -139,7 +139,7 @@ After OPA policy allows a connection, the proxy resolves DNS and rejects undecla
 
 ### Operator Approval
 
-When the agent requests an endpoint not in the policy, OpenShell blocks it and surfaces the request in the TUI for operator review.
+When the agent requests an endpoint not in the policy, Ryno blocks it and surfaces the request in the TUI for operator review.
 The system merges approved endpoints into the sandbox's policy as a new durable revision.
 
 | Aspect | Detail |
@@ -188,7 +188,7 @@ The policy separates filesystem paths into read-only and read-write groups.
 
 ### Path Validation
 
-OpenShell validates policies before they take effect.
+Ryno validates policies before they take effect.
 
 | Constraint | Behavior |
 |---|---|
@@ -215,7 +215,7 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 ### Seccomp Filters
 
-OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization, then the child process receives the broader runtime seccomp filter after privilege drop.
+Ryno applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization, then the child process receives the broader runtime seccomp filter after privilege drop.
 
 | Aspect | Detail |
 |---|---|
@@ -223,9 +223,9 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 | Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
-| What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
+| What you can change | This is not a user-facing knob. Ryno enforces it automatically. |
 | Risk if relaxed | The blocked syscalls support container escape (`mount`, `pivot_root`, `move_mount`, namespace creation), cross-process observation (`ptrace`, `process_vm_readv`, `pidfd_*`), raw kernel bypass (`bpf`, `io_uring_setup`, `perf_event_open`), and filter evasion (`seccomp`, `userfaultfd`). |
-| Recommendation | No action needed. OpenShell enforces this automatically. |
+| Recommendation | No action needed. Ryno enforces this automatically. |
 
 ### Enforcement Application Order
 

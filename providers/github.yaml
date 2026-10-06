@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/github.yaml
-#   openshell provider profile import -f providers/github.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/github.yaml
+#   ryno provider profile import -f providers/github.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -16,7 +16,7 @@
 #                    header to the endpoints below and nowhere else.
 # Endpoint access:   api.github.com REST and GraphQL read-only; github.com
 #                    clone/fetch only. Push (git-receive-pack) stays denied.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw
 
 id: github

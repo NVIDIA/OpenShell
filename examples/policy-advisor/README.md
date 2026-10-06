@@ -3,7 +3,7 @@
 
 # Policy Advisor CTF -- Mechanistic Mode
 
-A capture-the-flag challenge that walks you through OpenShell's policy
+A capture-the-flag challenge that walks you through Ryno's policy
 recommendation pipeline.  You start with a sandbox that only allows traffic to
 `api.anthropic.com`.  A Python script tries to reach 7 endpoints -- and fails.
 The sandbox proxy detects each denial, the sandbox-side mechanistic mapper
@@ -67,8 +67,8 @@ SSRF override allows the connection.
 
 ### Prerequisites
 
-- A running OpenShell gateway (`mise run gateway:docker` or a remote gateway)
-- The `openshell` CLI installed
+- A running Ryno gateway (`mise run gateway:docker` or a remote gateway)
+- The `ryno` CLI installed
 - Two terminal windows
 
 ### 1. Open the TUI
@@ -77,7 +77,7 @@ In your **first terminal**, launch the interactive TUI so you can watch
 denials arrive and approve recommendations:
 
 ```bash
-openshell term
+ryno term
 ```
 
 ### 2. Create the sandbox and run the CTF
@@ -86,7 +86,7 @@ In your **second terminal**, create the sandbox with the restrictive policy,
 upload the script, and run it -- all in one command:
 
 ```bash
-openshell sandbox create \
+ryno sandbox create \
   --name advisor-ctf \
   --policy examples/policy-advisor/sandbox-policy.yaml \
   --upload examples/policy-advisor/ctf.py \
@@ -134,15 +134,15 @@ Once all 7 gates are unlocked the script prints a victory banner.
 - **Dry run** -- run `python3 ctf.py --dry-run` to see the gate list without
   making any network requests.
 - **Flush interval** -- the denial aggregator flushes every 10 seconds by
-  default.  Set `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS=5` in the sandbox
+  default.  Set `RYNO_DENIAL_FLUSH_INTERVAL_SECS=5` in the sandbox
   environment for faster feedback during the demo.
 - **CLI alternative** -- you can approve drafts from the CLI instead of the
   TUI:
 
   ```bash
-   openshell rule get advisor-ctf                    # list pending
-   openshell rule approve advisor-ctf --chunk-id ID  # approve one
-   openshell rule approve-all advisor-ctf             # approve all
+   ryno rule get advisor-ctf                    # list pending
+   ryno rule approve advisor-ctf --chunk-id ID  # approve one
+   ryno rule approve-all advisor-ctf             # approve all
   ```
 
 - **Gate 3 shows per-binary tracking** -- curl hits its own endpoint, producing
@@ -154,5 +154,5 @@ Once all 7 gates are unlocked the script prints a victory banner.
 ## Cleanup
 
 ```bash
-openshell sandbox delete advisor-ctf
+ryno sandbox delete advisor-ctf
 ```

@@ -27,9 +27,9 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::process::Stdio;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::{extract_field, strip_ansi};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 const SPARSE_POLICY: &str = include_str!(concat!(
@@ -150,12 +150,12 @@ struct CliResult {
     exit_code: Option<i32>,
 }
 
-/// Run an `openshell` CLI command and return the result.
+/// Run an `ryno` CLI command and return the result.
 async fn run_cli(args: &[&str]) -> CliResult {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell command");
+    let output = cmd.output().await.expect("spawn ryno command");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = strip_ansi(&format!("{stdout}{stderr}"));

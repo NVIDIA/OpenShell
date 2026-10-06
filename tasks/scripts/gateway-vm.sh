@@ -3,8 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start a standalone openshell-gateway backed by the VM compute driver
-# (openshell-driver-vm) for local manual testing.
+# Start a standalone ryno-gateway backed by the VM compute driver
+# (ryno-driver-vm) for local manual testing.
 #
 # Invocation:
 #   mise run gateway:vm
@@ -14,20 +14,20 @@
 # - Gateway installation and CLI registration name "vm-dev"
 # - Persistent gateway state (SQLite DB) under .cache/gateway-vm
 # - Per-sandbox VM driver state (rootfs + compute-driver.sock) under
-#   /tmp/openshell-vm-driver-<user>-<gateway-name> so the AF_UNIX socket
+#   /tmp/ryno-vm-driver-<user>-<gateway-name> so the AF_UNIX socket
 #   path stays under macOS SUN_LEN
 #
 # Common overrides:
-#   OPENSHELL_SERVER_PORT=18091 mise run gateway:vm
-#   OPENSHELL_VM_GATEWAY_NAME=my-vm-gateway mise run gateway:vm
-#   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
-#   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
+#   RYNO_SERVER_PORT=18091 mise run gateway:vm
+#   RYNO_VM_GATEWAY_NAME=my-vm-gateway mise run gateway:vm
+#   RYNO_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
+#   RYNO_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
 #   mise run gateway:vm -- --gpu
 #
-# This script also writes ~/.config/openshell/active_gateway so the
-# `openshell` CLI automatically targets this gateway in subsequent shells.
-# No need to run `openshell gateway select`. Inside this repo you can
-# override per-developer with OPENSHELL_GATEWAY in `.env` (mise loads it).
+# This script also writes ~/.config/ryno/active_gateway so the
+# `ryno` CLI automatically targets this gateway in subsequent shells.
+# No need to run `ryno gateway select`. Inside this repo you can
+# override per-developer with RYNO_GATEWAY in `.env` (mise loads it).
 # An explicit `--gateway` / `--gateway-endpoint` flag still wins.
 
 set -euo pipefail
@@ -35,23 +35,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
-PORT="${OPENSHELL_SERVER_PORT:-18081}"
-GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
-STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
-SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
-VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
+PORT="${RYNO_SERVER_PORT:-18081}"
+GATEWAY_NAME="${RYNO_VM_GATEWAY_NAME:-vm-dev}"
+STATE_DIR="${RYNO_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
+SANDBOX_NAMESPACE="${RYNO_SANDBOX_NAMESPACE:-vm-dev}"
+SANDBOX_IMAGE="${RYNO_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+VM_BOOTSTRAP_IMAGE="${RYNO_VM_BOOTSTRAP_IMAGE:-}"
+SANDBOX_IMAGE_PULL_POLICY="${RYNO_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
 # VM currently has no image-pull-policy setting in its driver configuration; unlike
 # Docker, Podman, and Kubernetes launch paths it intentionally does not normalize this input.
-LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+LOG_LEVEL="${RYNO_LOG_LEVEL:-info}"
+GATEWAY_BIN="${ROOT}/target/debug/ryno-gateway"
 DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
-DRIVER_DIR="${OPENSHELL_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
+DRIVER_DIR="${RYNO_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
 COMPRESSED_DIR_DEFAULT="${ROOT}/target/vm-runtime-compressed"
-COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR_DEFAULT}}"
-VM_HOST_GATEWAY_DEFAULT="${OPENSHELL_VM_HOST_GATEWAY:-host.containers.internal}"
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://${VM_HOST_GATEWAY_DEFAULT}:${PORT}}"
+COMPRESSED_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR_DEFAULT}}"
+VM_HOST_GATEWAY_DEFAULT="${RYNO_VM_HOST_GATEWAY:-host.containers.internal}"
+GRPC_ENDPOINT="${RYNO_GRPC_ENDPOINT:-http://${VM_HOST_GATEWAY_DEFAULT}:${PORT}}"
 
 normalize_arch() {
   case "$1" in
@@ -96,7 +96,7 @@ append_local_otlp_config_if_available() {
 
   cat >>"${config_path}" <<'EOF'
 
-[openshell.gateway.otlp]
+[ryno.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
 EOF
   echo "OTLP trace export enabled for http://127.0.0.1:4317."
@@ -163,7 +163,7 @@ register_gateway_metadata() {
   local config_home gateway_dir
 
   config_home="$(gateway_config_home)"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
+  gateway_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
   chmod 700 "${gateway_dir}" 2>/dev/null || true
@@ -178,20 +178,20 @@ register_gateway_metadata() {
 }
 EOF
   chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
-  chown_invoking_user "${config_home}/openshell"
+  chown_invoking_user "${config_home}/ryno"
 }
 
-# Mirror what `openshell gateway select <name>` does: write the gateway name
-# to $XDG_CONFIG_HOME/openshell/active_gateway. The CLI picks it up as the
-# default target when neither --gateway nor OPENSHELL_GATEWAY is set.
+# Mirror what `ryno gateway select <name>` does: write the gateway name
+# to $XDG_CONFIG_HOME/ryno/active_gateway. The CLI picks it up as the
+# default target when neither --gateway nor RYNO_GATEWAY is set.
 save_active_gateway() {
   local name=$1
   local config_home active_gateway_path
   config_home="$(gateway_config_home)"
-  active_gateway_path="${config_home}/openshell/active_gateway"
+  active_gateway_path="${config_home}/ryno/active_gateway"
   mkdir -p "$(dirname "${active_gateway_path}")"
   printf '%s' "${name}" >"${active_gateway_path}"
-  chown_invoking_user "${config_home}/openshell"
+  chown_invoking_user "${config_home}/ryno"
 }
 
 check_supervisor_cross_toolchain() {
@@ -227,7 +227,7 @@ check_supervisor_cross_toolchain() {
   fi
 }
 
-VM_GPU="$(normalize_bool "${OPENSHELL_VM_GPU:-false}")"
+VM_GPU="$(normalize_bool "${RYNO_VM_GPU:-false}")"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -240,7 +240,7 @@ while [ "$#" -gt 0 ]; do
         echo "ERROR: --gpu-mem-mib requires a value" >&2
         exit 2
       fi
-      export OPENSHELL_VM_GPU_MEM_MIB="$2"
+      export RYNO_VM_GPU_MEM_MIB="$2"
       shift 2
       ;;
     --gpu-vcpus)
@@ -248,7 +248,7 @@ while [ "$#" -gt 0 ]; do
         echo "ERROR: --gpu-vcpus requires a value" >&2
         exit 2
       fi
-      export OPENSHELL_VM_GPU_VCPUS="$2"
+      export RYNO_VM_GPU_VCPUS="$2"
       shift 2
       ;;
     -h|--help)
@@ -263,18 +263,18 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "${VM_GPU}" = "true" ]; then
-  export OPENSHELL_VM_GPU="true"
+  export RYNO_VM_GPU="true"
 else
-  unset OPENSHELL_VM_GPU
+  unset RYNO_VM_GPU
 fi
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_VM_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+  echo "ERROR: RYNO_VM_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
 fi
 
 if port_is_in_use "${PORT}"; then
-  echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
+  echo "ERROR: port ${PORT} is already in use; free it or set RYNO_SERVER_PORT" >&2
   exit 2
 fi
 
@@ -286,10 +286,10 @@ STATE_LABEL="$(printf '%s' "${GATEWAY_NAME}" | tr -cs '[:alnum:]._-' '-')"
 if [ -z "${STATE_LABEL}" ]; then
   STATE_LABEL="vm-dev"
 fi
-VM_DRIVER_STATE_DIR_DEFAULT="${OPENSHELL_VM_DRIVER_STATE_ROOT:-/tmp}/openshell-vm-driver-${USER:-user}-${STATE_LABEL}"
-VM_DRIVER_STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFAULT}}"
+VM_DRIVER_STATE_DIR_DEFAULT="${RYNO_VM_DRIVER_STATE_ROOT:-/tmp}/ryno-vm-driver-${USER:-user}-${STATE_LABEL}"
+VM_DRIVER_STATE_DIR="${RYNO_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFAULT}}"
 
-DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
+DISABLE_TLS="$(normalize_bool "${RYNO_DISABLE_TLS:-true}")"
 
 # Build prerequisites: VM runtime artifacts + bundled sandbox/supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
@@ -299,30 +299,30 @@ if [ ! -d "${COMPRESSED_DIR}" ] \
   mise run vm:setup
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ] || [ ! -f "${COMPRESSED_DIR}/openshell-supervisor.zst" ]; then
+if [ ! -f "${COMPRESSED_DIR}/ryno-sandbox.zst" ] || [ ! -f "${COMPRESSED_DIR}/ryno-supervisor.zst" ]; then
   check_supervisor_cross_toolchain
   echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
   mise run vm:supervisor
 fi
 
-export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${COMPRESSED_DIR}"
+export RYNO_VM_RUNTIME_COMPRESSED_DIR="${COMPRESSED_DIR}"
 
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-echo "==> Building openshell-gateway, openshell-driver-vm, and native control supervisor"
+echo "==> Building ryno-gateway, ryno-driver-vm, and native control supervisor"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-gateway -p openshell-driver-vm -p openshell-supervisor
+  -p ryno-gateway -p ryno-driver-vm -p ryno-supervisor
 
 if [ "$(uname -s)" = "Darwin" ]; then
-  echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
+  echo "==> Codesigning ryno-driver-vm (Hypervisor entitlement)"
   codesign \
-    --entitlements "${ROOT}/crates/openshell-driver-vm/entitlements.plist" \
+    --entitlements "${ROOT}/crates/ryno-driver-vm/entitlements.plist" \
     --force \
     -s - \
-    "${DRIVER_DIR}/openshell-driver-vm"
+    "${DRIVER_DIR}/ryno-driver-vm"
 fi
 
 TLS_DIR="${STATE_DIR}/tls"
@@ -331,31 +331,31 @@ echo "==> Generating local gateway credentials"
   --output-dir "${TLS_DIR}" \
   --server-san "127.0.0.1" \
   --server-san "localhost" \
-  --server-san "host.openshell.internal"
+  --server-san "host.ryno.internal"
 
 mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
 chmod 700 "${VM_DRIVER_STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 name = "${GATEWAY_NAME}"
 compute_driver = "vm"
 disable_tls = ${DISABLE_TLS}
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
 
-[openshell.drivers.vm]
+[ryno.drivers.vm]
 default_image = "${SANDBOX_IMAGE}"
 bootstrap_image = "${VM_BOOTSTRAP_IMAGE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
@@ -366,26 +366,26 @@ EOF
 # VM proxy settings become protected supervisor argv inside the guest. The
 # auth file content is copied into a 0600 overlay file by the driver and is
 # never printed by this task.
-if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY+x}" ]]; then
-  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_VM_UPSTREAM_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${RYNO_VM_UPSTREAM_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_VM_UPSTREAM_NO_PROXY+x}" ]]; then
-  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_NO_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_VM_UPSTREAM_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${RYNO_VM_UPSTREAM_NO_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE+x}" ]]; then
-  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_VM_UPSTREAM_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${RYNO_VM_UPSTREAM_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
-  printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  printf 'proxy_auth_allow_insecure = %s\n' "${RYNO_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
-  printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  printf 'proxy_connect_by_hostname = %s\n' "${RYNO_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT+x}" ]]; then
-  printf 'provider_spiffe_workload_api_tcp_endpoint = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT+x}" ]]; then
+  printf 'provider_spiffe_workload_api_tcp_endpoint = "%s"\n' "$(toml_escape "${RYNO_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP+x}" ]]; then
-  printf 'provider_spiffe_allow_guest_tcp = %s\n' "${OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP}" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_PROVIDER_SPIFFE_ALLOW_GUEST_TCP+x}" ]]; then
+  printf 'provider_spiffe_allow_guest_tcp = %s\n' "${RYNO_PROVIDER_SPIFFE_ALLOW_GUEST_TCP}" >>"${CONFIG_PATH}"
 fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
@@ -399,14 +399,14 @@ echo "  gateway:    ${GATEWAY_NAME}"
 echo "  endpoint:   ${GATEWAY_ENDPOINT}"
 echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  state dir:  ${STATE_DIR}"
-echo "  driver:     ${DRIVER_DIR}/openshell-driver-vm"
+echo "  driver:     ${DRIVER_DIR}/ryno-driver-vm"
 echo "  driver dir: ${VM_DRIVER_STATE_DIR}"
 echo "  gpu:        ${VM_GPU}"
 echo "  image:      ${SANDBOX_IMAGE}"
 echo
 echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway"
-echo "by default — just run \`openshell <command>\`. Override with --gateway"
-echo "or by setting OPENSHELL_GATEWAY (e.g. in .env)."
+echo "by default — just run \`ryno <command>\`. Override with --gateway"
+echo "or by setting RYNO_GATEWAY (e.g. in .env)."
 echo
 
 GATEWAY_ARGS=(

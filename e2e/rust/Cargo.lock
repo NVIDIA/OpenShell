@@ -886,40 +886,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openshell-e2e"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bollard",
- "bytes",
- "futures-util",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jsonwebtoken",
- "nix",
- "noyalib",
- "prost",
- "rand",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serial_test",
- "sha1",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tower",
- "url",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,6 +1163,40 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryno-e2e"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bollard",
+ "bytes",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jsonwebtoken",
+ "nix",
+ "noyalib",
+ "prost",
+ "rand",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "url",
+]
 
 [[package]]
 name = "ryu"

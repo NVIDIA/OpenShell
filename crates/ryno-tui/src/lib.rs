@@ -1,0 +1,3435 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+mod app;
+mod clipboard;
+mod event;
+pub mod theme;
+mod ui;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures::{StreamExt, stream};
+use miette::{IntoDiagnostic, Result};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ryno_bootstrap::list_gateways_with_source;
+use ryno_core::auth::EdgeAuthInterceptor;
+use ryno_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
+use ryno_core::proto::ryno_client::RynoClient;
+use ryno_core::proto::{SandboxPhase, SandboxRestartPolicy};
+use tokio::sync::mpsc;
+use tonic::Code;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+use app::{App, Focus, GatewayEntry, LogLine, Screen};
+use event::{Event, EventHandler};
+
+/// Duration to show the splash screen before auto-dismissing.
+const SPLASH_DURATION: Duration = Duration::from_secs(3);
+const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
+const PROVIDER_PROFILE_PAGE_SIZE: i32 = 100;
+const DRAFT_COUNT_REFRESH_CONCURRENCY: usize = 16;
+
+type ProviderProfileCache = HashMap<(String, String), ryno_core::proto::ProviderProfile>;
+type TuiClient = RynoClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
+
+#[derive(Debug)]
+pub(crate) struct ListRefreshResult {
+    generation: u64,
+    gateway_name: String,
+    workspace: String,
+    all_workspaces: bool,
+    workspaces: Result<Vec<String>, String>,
+    providers: Result<ProviderListRefresh, String>,
+    sandboxes: Result<Vec<ryno_core::proto::Sandbox>, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DraftCountsRefreshResult {
+    generation: u64,
+    gateway_name: String,
+    workspace: String,
+    all_workspaces: bool,
+    sandboxes: Vec<(String, String)>,
+    counts: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ProviderListRefresh {
+    providers: Vec<ryno_core::proto::Provider>,
+    profiles: ProviderProfileCache,
+    workspace_profiles: Vec<ryno_core::proto::ProviderProfile>,
+}
+
+fn list_workspace_scope(
+    workspace: impl Into<String>,
+    all_workspaces: bool,
+) -> ryno_core::proto::WorkspaceSelector {
+    if all_workspaces {
+        ryno_core::proto::all_workspaces_selector()
+    } else {
+        ryno_core::proto::workspace_selector(workspace)
+    }
+}
+
+// Re-export for use by the CLI crate.
+pub use theme::ThemeMode;
+
+/// Launch the `Ryno` TUI.
+///
+/// `channel` must be a connected gRPC channel to the `Ryno` gateway.
+/// `theme_mode` selects the color theme: `Auto` detects the terminal
+/// background, `Dark`/`Light` forces a specific palette.
+pub async fn run(
+    channel: Channel,
+    interceptor: EdgeAuthInterceptor,
+    gateway_name: &str,
+    endpoint: &str,
+    workspace: &str,
+    theme_mode: ThemeMode,
+) -> Result<()> {
+    // Detect theme *before* entering raw/alternate-screen mode.
+    // The OSC 11 query temporarily enters raw mode itself; calling it
+    // after our own enable_raw_mode() would conflict.
+    let detected_theme = theme::detect(theme_mode);
+
+    let client = RynoClient::with_interceptor(channel, interceptor);
+    let mut app = App::new(
+        client,
+        gateway_name.to_string(),
+        endpoint.to_string(),
+        workspace.to_string(),
+        detected_theme,
+    );
+
+    enable_raw_mode().into_diagnostic()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).into_diagnostic()?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+
+    let mut events = EventHandler::new(Duration::from_secs(2));
+
+    refresh_gateway_list(&mut app);
+    refresh_health(&mut app).await;
+    refresh_global_settings(&mut app).await;
+    spawn_list_refresh(&mut app, events.sender());
+
+    while app.running {
+        terminal
+            .draw(|frame| ui::draw(frame, &mut app))
+            .into_diagnostic()?;
+
+        match events.next().await {
+            Some(Event::Key(key)) => {
+                app.handle_key(key);
+                // Handle async actions triggered by key presses.
+                if app.pending_gateway_switch.is_some() {
+                    handle_gateway_switch(&mut app, events.sender()).await;
+                }
+                if app.pending_log_fetch {
+                    app.pending_log_fetch = false;
+                    spawn_log_stream(&mut app, events.sender());
+                }
+                if app.pending_sandbox_delete {
+                    app.pending_sandbox_delete = false;
+                    handle_sandbox_delete(&mut app, events.sender()).await;
+                }
+                if app.pending_create_sandbox {
+                    app.pending_create_sandbox = false;
+                    spawn_create_sandbox(&mut app, events.sender());
+                    start_anim_ticker(&mut app, events.sender());
+                }
+                // --- Provider CRUD ---
+                if app.pending_provider_create {
+                    app.pending_provider_create = false;
+                    spawn_create_provider(&app, events.sender());
+                    start_anim_ticker(&mut app, events.sender());
+                }
+                if app.pending_provider_get {
+                    app.pending_provider_get = false;
+                    spawn_get_provider(&app, events.sender());
+                }
+                if app.pending_provider_update {
+                    app.pending_provider_update = false;
+                    spawn_update_provider(&app, events.sender());
+                }
+                if app.pending_provider_delete {
+                    app.pending_provider_delete = false;
+                    spawn_delete_provider(&app, events.sender());
+                }
+                // --- Global settings CRUD ---
+                if app.pending_setting_set {
+                    app.pending_setting_set = false;
+                    spawn_set_global_setting(&app, events.sender());
+                }
+                if app.pending_setting_delete {
+                    app.pending_setting_delete = false;
+                    spawn_delete_global_setting(&app, events.sender());
+                }
+                // --- Sandbox settings CRUD ---
+                if app.pending_sandbox_setting_set {
+                    app.pending_sandbox_setting_set = false;
+                    spawn_set_sandbox_setting(&app, events.sender());
+                }
+                if app.pending_sandbox_setting_delete {
+                    app.pending_sandbox_setting_delete = false;
+                    spawn_delete_sandbox_setting(&app, events.sender());
+                }
+                if app.pending_sandbox_detail {
+                    app.pending_sandbox_detail = false;
+                    fetch_sandbox_detail(&mut app).await;
+                }
+                if app.pending_shell_connect {
+                    app.pending_shell_connect = false;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
+                }
+                // --- Draft actions ---
+                if app.pending_draft_approve {
+                    app.pending_draft_approve = false;
+                    spawn_draft_approve(&app, events.sender());
+                }
+                if app.pending_draft_reject {
+                    app.pending_draft_reject = false;
+                    spawn_draft_reject(&app, events.sender());
+                }
+                if app.pending_draft_approve_all {
+                    app.pending_draft_approve_all = false;
+                    let snapshot = std::mem::take(&mut app.approve_all_confirm_chunks);
+                    spawn_draft_approve_all(&app, snapshot, events.sender());
+                }
+                if app.pending_workspace_refresh {
+                    app.pending_workspace_refresh = false;
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
+                }
+            }
+            Some(Event::ListRefreshCompleted(result)) => {
+                apply_list_refresh(&mut app, result);
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
+            }
+            Some(Event::DraftCountsRefreshCompleted(result)) => {
+                apply_sandbox_draft_counts_refresh(&mut app, result);
+            }
+            Some(Event::LogLines(lines)) => {
+                app.sandbox_log_lines.extend(lines);
+                if app.log_autoscroll {
+                    app.sandbox_log_scroll = app.log_autoscroll_offset();
+                    // Pin cursor to the last visible line during autoscroll.
+                    let filtered_len = app.filtered_log_lines().len();
+                    let visible = filtered_len
+                        .saturating_sub(app.sandbox_log_scroll)
+                        .min(app.log_viewport_height);
+                    app.log_cursor = visible.saturating_sub(1);
+                }
+            }
+            Some(Event::CreateResult(result)) => {
+                // Buffer the result — don't close yet. The Redraw handler
+                // will finalize once MIN_CREATING_DISPLAY has elapsed.
+                if let Some(form) = app.create_form.as_mut() {
+                    form.create_result = Some(result);
+                }
+            }
+            Some(Event::ProviderCreateResult(result)) => {
+                // Buffer the result for min-display handling in Redraw.
+                if let Some(form) = app.create_provider_form.as_mut() {
+                    form.create_result = Some(result);
+                }
+            }
+            Some(Event::ProviderDetailFetched(result)) => match result {
+                Ok(provider) => {
+                    app.provider_detail = Some(app.provider_detail_from_provider(&provider));
+                }
+                Err(msg) => {
+                    app.status_text = format!("get provider failed: {msg}");
+                }
+            },
+            Some(Event::ProviderUpdateResult(result)) => match result {
+                Ok(name) => {
+                    app.update_provider_form = None;
+                    app.status_text = format!("Updated provider: {name}");
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
+                }
+                Err(msg) => {
+                    if let Some(form) = app.update_provider_form.as_mut() {
+                        form.status = Some(format!("Failed: {msg}"));
+                    }
+                }
+            },
+            Some(Event::ProviderDeleteResult(result)) => match result {
+                Ok(true) => {
+                    app.status_text = "Provider deleted.".to_string();
+                    app.cancel_list_refresh();
+                    spawn_list_refresh(&mut app, events.sender());
+                }
+                Ok(false) => {
+                    app.status_text = "Provider not found.".to_string();
+                }
+                Err(msg) => {
+                    app.status_text = format!("delete provider failed: {msg}");
+                }
+            },
+            Some(Event::DraftActionResult(result)) => {
+                match result {
+                    Ok(msg) => {
+                        app.status_text = msg;
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("draft action failed: {msg}");
+                    }
+                }
+                // Refresh draft chunks + counts immediately after any action.
+                refresh_draft_chunks(&mut app).await;
+                app.cancel_draft_counts_refresh();
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
+            }
+            Some(Event::GlobalSettingsFetched(result)) => match result {
+                Ok((settings, revision)) => {
+                    app.apply_global_settings(settings, revision);
+                }
+                Err(msg) => {
+                    app.status_text = format!("failed to fetch global settings: {msg}");
+                }
+            },
+            Some(Event::GlobalSettingSetResult(result)) => {
+                app.setting_edit = None;
+                match result {
+                    Ok(rev) => {
+                        app.global_settings_revision = rev;
+                        app.status_text = "Global setting updated.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("set setting failed: {msg}");
+                    }
+                }
+                refresh_global_settings(&mut app).await;
+            }
+            Some(Event::GlobalSettingDeleteResult(result)) => match result {
+                Ok(rev) => {
+                    app.global_settings_revision = rev;
+                    app.status_text = "Global setting deleted.".to_string();
+                    refresh_global_settings(&mut app).await;
+                }
+                Err(msg) => {
+                    app.status_text = format!("delete setting failed: {msg}");
+                }
+            },
+            Some(Event::SandboxSettingSetResult(result)) => {
+                app.sandbox_setting_edit = None;
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting updated.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("set sandbox setting failed: {msg}");
+                    }
+                }
+                // Re-fetch sandbox settings to reflect the change.
+                fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::SandboxSettingDeleteResult(result)) => {
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting deleted.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("delete sandbox setting failed: {msg}");
+                    }
+                }
+                fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::ForwardWarnings(warnings)) => {
+                app.status_text = format!("port forward issues: {}", warnings.join("; "));
+            }
+            Some(Event::Mouse(mouse)) => match mouse.kind {
+                MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
+                    app.scroll_logs(-3);
+                }
+                MouseEventKind::ScrollDown if app.focus == Focus::SandboxLogs => {
+                    app.scroll_logs(3);
+                }
+                MouseEventKind::ScrollUp if app.focus == Focus::SandboxPolicy => {
+                    app.scroll_policy(-3);
+                }
+                MouseEventKind::ScrollDown if app.focus == Focus::SandboxPolicy => {
+                    app.scroll_policy(3);
+                }
+                _ => {}
+            },
+            Some(Event::Tick) => {
+                // Auto-dismiss splash after SPLASH_DURATION.
+                if app.screen == Screen::Splash
+                    && let Some(start) = app.splash_start
+                    && start.elapsed() >= SPLASH_DURATION
+                {
+                    app.dismiss_splash();
+                }
+
+                refresh_gateway_list(&mut app);
+                refresh_health(&mut app).await;
+                refresh_global_settings(&mut app).await;
+                spawn_list_refresh(&mut app, events.sender());
+
+                // Refresh per-sandbox draft counts for badges (dashboard + detail).
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
+
+                // Auto-refresh sandbox detail (policy, settings, drafts) on
+                // every tick when viewing a sandbox.  The gRPC call is
+                // lightweight and ensures settings changes, global policy
+                // changes, and policy version bumps are reflected live.
+                if app.screen == Screen::Sandbox {
+                    refresh_sandbox_policy(&mut app).await;
+                    refresh_draft_chunks(&mut app).await;
+                }
+            }
+            Some(Event::Redraw) => {
+                // Check if a buffered sandbox CreateResult is ready to finalize.
+                if let Some(form) = app.create_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok((name, create_workspace))) => {
+                                app.create_form = None;
+                                let ports = std::mem::take(&mut app.pending_forward_ports);
+                                let command = std::mem::take(&mut app.pending_exec_command);
+                                let port_info = if ports.is_empty() {
+                                    String::new()
+                                } else {
+                                    let list = ports
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!(" (forwarding port(s) {list})")
+                                };
+                                app.status_text = format!("Created sandbox: {name}{port_info}");
+
+                                // If a command was specified, suspend TUI and exec it.
+                                if !command.is_empty() {
+                                    handle_exec_command(
+                                        &mut app,
+                                        &mut terminal,
+                                        &mut events,
+                                        &name,
+                                        &command,
+                                        &create_workspace,
+                                    )
+                                    .await?;
+                                }
+                                app.cancel_list_refresh();
+                                spawn_list_refresh(&mut app, events.sender());
+                            }
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_form.as_mut() {
+                                    form.phase = app::CreatePhase::Form;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                // Check if a buffered provider CreateResult is ready to finalize.
+                if let Some(form) = app.create_provider_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_provider_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok(name)) => {
+                                app.create_provider_form = None;
+                                app.status_text = format!("Created provider: {name}");
+                                app.cancel_list_refresh();
+                                spawn_list_refresh(&mut app, events.sender());
+                            }
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_provider_form.as_mut() {
+                                    form.phase = app::CreateProviderPhase::EnterKey;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            Some(Event::Resize(_, _)) => {} // ratatui handles resize on next draw
+            None => break,
+        }
+    }
+
+    // Cancel any running background tasks.
+    app.cancel_log_stream();
+    app.stop_anim();
+
+    disable_raw_mode().into_diagnostic()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .into_diagnostic()?;
+    terminal.show_cursor().into_diagnostic()?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gateway discovery and switching
+// ---------------------------------------------------------------------------
+
+/// Refresh the list of known gateways from disk.
+fn refresh_gateway_list(app: &mut App) {
+    if let Ok(gateways) = list_gateways_with_source() {
+        app.gateways = gateways
+            .into_iter()
+            .map(|m| GatewayEntry {
+                source: Some(m.source),
+                name: m.metadata.name,
+                endpoint: m.metadata.gateway_endpoint,
+                is_remote: m.metadata.is_remote,
+            })
+            .collect();
+
+        // Keep selection in bounds.
+        if app.gateway_selected >= app.gateways.len() && !app.gateways.is_empty() {
+            app.gateway_selected = app.gateways.len() - 1;
+        }
+
+        // If the active gateway appears in the list, move cursor to it on first load.
+        if let Some(idx) = app.gateways.iter().position(|g| g.name == app.gateway_name) {
+            // Only snap the cursor when it's still at 0 (initial state).
+            if app.gateway_selected == 0 {
+                app.gateway_selected = idx;
+            }
+        }
+    }
+}
+
+/// Handle a pending gateway switch requested by the user.
+async fn handle_gateway_switch(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(name) = app.pending_gateway_switch.take() else {
+        return;
+    };
+
+    // Look up the endpoint from the gateway list.
+    let endpoint = match app.gateways.iter().find(|g| g.name == name) {
+        Some(g) => g.endpoint.clone(),
+        None => return,
+    };
+
+    match connect_to_gateway(&name, &endpoint).await {
+        Ok((channel, interceptor)) => {
+            app.client = RynoClient::with_interceptor(channel, interceptor);
+            app.gateway_name = name;
+            app.endpoint = endpoint;
+            app.reset_sandbox_state();
+            refresh_health(app).await;
+            refresh_global_settings(app).await;
+            spawn_list_refresh(app, tx);
+        }
+        Err(e) => {
+            app.status_text = format!("switch failed: {e}");
+        }
+    }
+}
+
+/// Build a gRPC channel and auth interceptor for a gateway.
+///
+/// Checks gateway metadata for the auth mode and loads the appropriate
+/// credentials (mTLS certs or OIDC bearer token).
+async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, EdgeAuthInterceptor)> {
+    let meta = ryno_bootstrap::get_gateway_metadata(name);
+
+    if meta.as_ref().and_then(|m| m.auth_mode.as_deref()) == Some("oidc") {
+        let bundle = ryno_bootstrap::oidc_token::load_oidc_token(name).ok_or_else(|| {
+            miette::miette!(
+                "No OIDC token for gateway '{name}'.\n\
+                     Authenticate with: ryno gateway login"
+            )
+        })?;
+        if ryno_bootstrap::oidc_token::is_token_expired(&bundle) {
+            miette::bail!(
+                "OIDC token for gateway '{name}' has expired.\n\
+                 Re-authenticate with: ryno gateway login"
+            );
+        }
+        let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
+        let channel = build_oidc_channel(name, endpoint).await?;
+        Ok((channel, interceptor))
+    } else {
+        let channel = build_mtls_channel(name, endpoint).await?;
+        Ok((channel, EdgeAuthInterceptor::noop()))
+    }
+}
+
+/// Build an HTTPS channel for OIDC-authenticated gateways.
+///
+/// Tries mTLS client certs for the transport layer when available (the server
+/// may still require them alongside the bearer token), falls back to CA-only
+/// or system roots.
+async fn build_oidc_channel(name: &str, endpoint: &str) -> Result<Channel> {
+    let mtls_dir = gateway_mtls_dir(name);
+
+    let tls_config = mtls_dir.as_ref().map_or_else(
+        || ClientTlsConfig::new().with_enabled_roots(),
+        |dir| {
+            let ca = std::fs::read(dir.join("ca.crt")).ok();
+            let cert = std::fs::read(dir.join("tls.crt")).ok();
+            let key = std::fs::read(dir.join("tls.key")).ok();
+
+            match (ca, cert, key) {
+                (Some(ca), Some(cert), Some(key)) => ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(ca))
+                    .identity(Identity::from_pem(cert, key)),
+                (Some(ca), _, _) => {
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca))
+                }
+                _ => ClientTlsConfig::new().with_enabled_roots(),
+            }
+        },
+    );
+
+    Endpoint::from_shared(endpoint.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?
+        .connect()
+        .await
+        .into_diagnostic()
+}
+
+/// Build a gRPC channel using mTLS client certificates.
+async fn build_mtls_channel(name: &str, endpoint: &str) -> Result<Channel> {
+    let mtls_dir = gateway_mtls_dir(name)
+        .ok_or_else(|| miette::miette!("cannot determine config directory for gateway {name}"))?;
+
+    let ca = std::fs::read(mtls_dir.join("ca.crt"))
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("missing CA cert for gateway {name}"))?;
+    let cert = std::fs::read(mtls_dir.join("tls.crt"))
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("missing client cert for gateway {name}"))?;
+    let key = std::fs::read(mtls_dir.join("tls.key"))
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("missing client key for gateway {name}"))?;
+
+    let tls_config = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca))
+        .identity(Identity::from_pem(cert, key));
+
+    Endpoint::from_shared(endpoint.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?
+        .connect()
+        .await
+        .into_diagnostic()
+}
+
+/// Resolve the mTLS cert directory for a gateway.
+fn gateway_mtls_dir(name: &str) -> Option<PathBuf> {
+    let config_dir = ryno_core::paths::xdg_config_dir().ok()?;
+    Some(
+        config_dir
+            .join("ryno")
+            .join("gateways")
+            .join(name)
+            .join("mtls"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox actions
+// ---------------------------------------------------------------------------
+
+/// Spawn a background task that streams logs for the currently selected sandbox.
+///
+/// Uses `WatchSandbox` with `follow_logs: true` for live streaming. Initial
+/// history is fetched via `GetSandboxLogs`, then live events are appended.
+fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    // Cancel any previous stream.
+    app.cancel_log_stream();
+
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+    let workspace = app.selected_sandbox_workspace();
+
+    let mut client = app.client.clone();
+    let handle = tokio::spawn(async move {
+        // Phase 1: Fetch initial history via unary RPC.
+        let req = ryno_core::proto::GetSandboxLogsRequest {
+            sandbox: sandbox_name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            lines: 500,
+            since_time: None,
+            sources: vec![],
+            min_level: String::new(),
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
+            Ok(Ok(resp)) => {
+                let logs = resp.into_inner().logs;
+                let lines: Vec<LogLine> = logs.into_iter().map(proto_to_log_line).collect();
+                if !lines.is_empty() {
+                    let _ = tx.send(Event::LogLines(lines));
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::LogLines(vec![LogLine {
+                    timestamp_ms: 0,
+                    level: "ERROR".into(),
+                    source: String::new(),
+                    target: String::new(),
+                    message: format!("Failed to fetch logs: {}", e.message()),
+                    fields: HashMap::default(),
+                }]));
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(Event::LogLines(vec![LogLine {
+                    timestamp_ms: 0,
+                    level: "ERROR".into(),
+                    source: String::new(),
+                    target: String::new(),
+                    message: "Timed out fetching logs.".into(),
+                    fields: HashMap::default(),
+                }]));
+                return;
+            }
+        }
+
+        // Phase 2: Stream live logs via WatchSandbox.
+        let req = ryno_core::proto::WatchSandboxRequest {
+            sandbox: sandbox_name,
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            follow_status: false,
+            follow_logs: true,
+            follow_events: false,
+            log_tail_lines: 0, // Don't re-fetch tail, we already have history.
+            ..Default::default()
+        };
+
+        // Silently stop — user can re-enter logs.
+        let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await
+        else {
+            return;
+        };
+
+        let mut stream = resp.into_inner();
+        while let Ok(Some(event)) = stream.message().await {
+            if let Some(ryno_core::proto::sandbox_stream_event::Payload::Log(log)) = event.payload {
+                let line = proto_to_log_line(log);
+                let _ = tx.send(Event::LogLines(vec![line]));
+            }
+        }
+    });
+
+    app.log_stream_handle = Some(handle);
+}
+
+/// Convert a proto `SandboxLogLine` to our display `LogLine`.
+fn proto_to_log_line(log: ryno_core::proto::SandboxLogLine) -> LogLine {
+    let source = if log.source.is_empty() {
+        "gateway".to_string()
+    } else {
+        log.source
+    };
+    LogLine {
+        timestamp_ms: log
+            .event_time
+            .as_ref()
+            .and_then(|value| ryno_core::time::timestamp_to_millis(value).ok())
+            .unwrap_or_default(),
+        level: log.level,
+        source,
+        target: log.target,
+        message: log.message,
+        fields: log.fields,
+    }
+}
+
+/// Delete the currently selected sandbox.
+async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    // Stop any active port forwards before deleting (mirrors CLI behavior).
+    let workspace = app.selected_sandbox_workspace();
+    if let Ok(stopped) = ryno_core::forward::stop_forwards_for_sandbox(&workspace, &sandbox_name)
+        && !stopped.is_empty()
+    {
+        let ports: Vec<String> = stopped.iter().map(ToString::to_string).collect();
+        app.status_text = format!(
+            "stopped port forwards [{}] for sandbox {sandbox_name}",
+            ports.join(", ")
+        );
+    }
+
+    let req = ryno_core::proto::DeleteSandboxRequest {
+        workspace_scope: Some(ryno_core::proto::workspace_selector(workspace)),
+        request_id: String::new(),
+        allow_missing: true,
+        name: sandbox_name,
+    };
+    match app.client.delete_sandbox(req).await {
+        Ok(response) => {
+            use ryno_core::proto::DeletionOutcome;
+            app.status_text = match response.into_inner().outcome() {
+                DeletionOutcome::Completed => "sandbox deleted".into(),
+                DeletionOutcome::Accepted => "sandbox deletion accepted; cleanup is pending".into(),
+                DeletionOutcome::AlreadyAbsent => "sandbox already deleted".into(),
+                DeletionOutcome::Unspecified => {
+                    "delete failed: unsupported deletion outcome".into()
+                }
+            };
+            app.cancel_log_stream();
+            app.screen = Screen::Dashboard;
+            app.focus = Focus::Sandboxes;
+            app.cancel_list_refresh();
+            spawn_list_refresh(app, tx);
+        }
+        Err(e) => {
+            app.status_text = format!("delete failed: {}", e.message());
+            app.screen = Screen::Dashboard;
+            app.focus = Focus::Sandboxes;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox detail + policy rendering
+// ---------------------------------------------------------------------------
+
+/// Fetch sandbox details (policy + providers) when entering the sandbox screen.
+///
+/// Uses `GetSandbox` for metadata/providers, then `GetSandboxConfig` for the
+/// current live policy (which may have been updated since creation).
+async fn fetch_sandbox_detail(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    let req = ryno_core::proto::GetSandboxRequest {
+        workspace_scope: Some(ryno_core::proto::workspace_selector(
+            app.selected_sandbox_workspace(),
+        )),
+        name: sandbox_name.clone(),
+    };
+
+    // Step 1: Fetch sandbox metadata (providers, sandbox ID).
+    let found =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
+            Ok(Ok(resp)) => {
+                if let Some(sandbox) = resp.into_inner().sandbox {
+                    if let Some(spec) = &sandbox.spec {
+                        app.sandbox_providers_list.clone_from(&spec.providers);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to fetch sandbox detail: {}", e.message());
+                false
+            }
+            Err(_) => {
+                app.status_text = "sandbox detail request timed out".to_string();
+                false
+            }
+        };
+
+    // Step 2: Fetch the current live policy (includes updates since creation).
+    if found {
+        let policy_req = ryno_core::proto::GetSandboxConfigRequest {
+            name: sandbox_name,
+            workspace_scope: Some(ryno_core::proto::workspace_selector(
+                app.selected_sandbox_workspace(),
+            )),
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            app.client.get_sandbox_config(policy_req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                if let Some(mut policy) = inner.policy {
+                    // Use the version from the policy history, not from the
+                    // policy proto's own version field (which is always 1).
+                    policy.version = inner.version;
+                    app.policy_lines = render_policy_lines(&policy, &app.theme);
+                    app.sandbox_policy = Some(policy);
+                }
+                // Populate sandbox settings and policy source from the same response.
+                app.sandbox_policy_is_global =
+                    inner.policy_source == ryno_core::proto::PolicySource::Global as i32;
+                app.sandbox_global_policy_version = inner.global_policy_version;
+                app.apply_sandbox_settings(inner.settings);
+            }
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to fetch sandbox policy: {}", e.message());
+            }
+            Err(_) => {
+                app.status_text = "sandbox policy request timed out".to_string();
+            }
+        }
+    }
+
+    app.policy_scroll = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Shell connect (suspend TUI, launch SSH, resume)
+// ---------------------------------------------------------------------------
+
+/// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
+///
+/// This replicates the `ryno sandbox connect` flow but uses `Command::status()`
+/// instead of `exec()` so the TUI process survives.
+async fn handle_shell_connect(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    events: &mut EventHandler,
+) -> Result<()> {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return Ok(()),
+    };
+
+    let workspace = app.selected_sandbox_workspace();
+    let session = {
+        let req = ryno_core::proto::CreateSshSessionRequest {
+            sandbox: sandbox_name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                app.status_text = format!("SSH session failed: {}", e.message());
+                return Ok(());
+            }
+            Err(_) => {
+                app.status_text = "SSH session request timed out".to_string();
+                return Ok(());
+            }
+        }
+    };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("gateway returned invalid SSH session response: {err}");
+        return Ok(());
+    }
+
+    // Step 3: Resolve gateway address (handle loopback override).
+    #[allow(clippy::cast_possible_truncation)]
+    let gateway_port_u16 = session.gateway_port as u16;
+    let (gateway_host, gateway_port) =
+        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+
+    // Step 4: Build the ProxyCommand using our own binary.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.status_text = format!("failed to find executable: {e}");
+            return Ok(());
+        }
+    };
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &sandbox_name,
+        &workspace,
+        &session.token,
+        &app.gateway_name,
+    );
+    // Step 5: Build the SSH command.
+    let mut command = std::process::Command::new("ssh");
+    command
+        .arg("-o")
+        .arg(format!("ProxyCommand={proxy_command}"))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-tt")
+        .arg("-o")
+        .arg("RequestTTY=force")
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("sandbox")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    // Step 6: Cancel log stream and pause event handler before suspending.
+    app.cancel_log_stream();
+    app.cancel_list_refresh();
+    events.pause();
+    // Wait for the reader task to finish its current poll cycle (tick_rate = 2s max).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
+
+    // Step 8: Spawn SSH as child process and wait.
+    let status = tokio::task::spawn_blocking(move || command.status()).await;
+    match &status {
+        Ok(Ok(s)) if !s.success() => {
+            app.status_text = format!("ssh exited with status {s}");
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to launch ssh: {e}");
+        }
+        Err(e) => {
+            app.status_text = format!("shell task failed: {e}");
+        }
+        _ => {
+            app.status_text = format!("Disconnected from {sandbox_name}");
+        }
+    }
+
+    // Step 9: Resume and draw the TUI before accepting new terminal input.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .into_diagnostic()?;
+    events.discard_pending();
+    events.resume();
+    spawn_list_refresh(app, events.sender());
+
+    Ok(())
+}
+
+/// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
+///
+/// Mirrors `handle_shell_connect` but passes the user's command to SSH
+/// instead of opening an interactive shell.  The TUI is suspended while
+/// the command runs; press Ctrl-C to stop and return to the TUI.
+async fn handle_exec_command(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    events: &mut EventHandler,
+    sandbox_name: &str,
+    command: &[String],
+    workspace: &str,
+) -> Result<()> {
+    let session = {
+        let req = ryno_core::proto::CreateSshSessionRequest {
+            sandbox: sandbox_name.to_string(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.to_string())),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                app.status_text = format!("exec: SSH session failed: {}", e.message());
+                return Ok(());
+            }
+            Err(_) => {
+                app.status_text = "exec: SSH session timed out".to_string();
+                return Ok(());
+            }
+        }
+    };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
+        return Ok(());
+    }
+
+    // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
+    #[allow(clippy::cast_possible_truncation)]
+    let gateway_port_u16 = session.gateway_port as u16;
+    let (gateway_host, gateway_port) =
+        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.status_text = format!("exec: failed to find executable: {e}");
+            return Ok(());
+        }
+    };
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        sandbox_name,
+        workspace,
+        &session.token,
+        &app.gateway_name,
+    );
+
+    // Step 3: Build SSH command — same flags as handle_shell_connect but with
+    // the parsed command appended. Each argument is escaped individually so the
+    // remote shell parses it correctly.
+    let command_str = build_exec_command(command);
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.arg("-o")
+        .arg(format!("ProxyCommand={proxy_command}"))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-tt")
+        .arg("-o")
+        .arg("RequestTTY=force")
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("sandbox")
+        .arg(command_str)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    // Step 4: Suspend TUI.
+    app.cancel_log_stream();
+    app.cancel_list_refresh();
+    events.pause();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
+
+    // Step 5: Run command — blocks until user Ctrl-C's or command exits.
+    let status = tokio::task::spawn_blocking(move || ssh.status()).await;
+    match &status {
+        Ok(Ok(s)) if !s.success() => {
+            app.status_text = format!("command exited with status {s}");
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to launch command: {e}");
+        }
+        Err(e) => {
+            app.status_text = format!("exec task failed: {e}");
+        }
+        _ => {
+            app.status_text = format!("Command finished on {sandbox_name}");
+        }
+    }
+
+    // Step 6: Resume TUI.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    events.discard_pending();
+    events.resume();
+    spawn_list_refresh(app, events.sender());
+
+    Ok(())
+}
+
+// SSH utility functions are shared via ryno_core::forward.
+use ryno_core::forward::{
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response,
+};
+
+fn build_exec_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
+fn render_policy_lines(
+    policy: &ryno_core::proto::SandboxPolicy,
+    theme: &theme::Theme,
+) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+
+    let t = theme;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // --- Filesystem Access ---
+    if let Some(fs) = &policy.filesystem {
+        lines.push(Line::from(Span::styled("Filesystem Access", t.heading)));
+
+        if !fs.read_only.is_empty() {
+            let paths = fs.read_only.join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("  Read-only:  ", t.muted),
+                Span::styled(paths, t.text),
+            ]));
+        }
+
+        if !fs.read_write.is_empty() {
+            let paths = fs.read_write.join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("  Read-write: ", t.muted),
+                Span::styled(paths, t.text),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    // --- Network Rules ---
+    if !policy.network_policies.is_empty() {
+        // Sort keys for deterministic display.
+        let mut rule_names: Vec<&String> = policy.network_policies.keys().collect();
+        rule_names.sort();
+
+        let header = format!("Network Rules ({})", rule_names.len());
+        lines.push(Line::from(Span::styled(header, t.heading)));
+        lines.push(Line::from(""));
+
+        for name in rule_names {
+            let Some(rule) = policy.network_policies.get(name) else {
+                continue;
+            };
+
+            // Skip rules with no endpoints (useless policies).
+            if rule.endpoints.is_empty() {
+                continue;
+            }
+
+            // Rule header — include L7/TLS/allowed_ips annotation if any endpoint has it.
+            let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
+            let has_allowed_ips = rule.endpoints.iter().any(|e| !e.allowed_ips.is_empty());
+            let mut annotations = Vec::new();
+            if has_l7 {
+                // Use the first L7 endpoint's protocol for the label.
+                if let Some(proto) = rule
+                    .endpoints
+                    .iter()
+                    .find(|e| !e.protocol.is_empty())
+                    .map(|e| e.protocol.to_uppercase())
+                {
+                    annotations.push(format!("L7 {proto}"));
+                }
+            }
+            if has_allowed_ips {
+                annotations.push("private IP".to_string());
+            }
+
+            let title = if annotations.is_empty() {
+                format!("  {name}")
+            } else {
+                format!("  {name} ({})", annotations.join(", "))
+            };
+            lines.push(Line::from(Span::styled(title, t.accent)));
+
+            // Endpoints.
+            for ep in &rule.endpoints {
+                // Render address: host:port, *:port (hostless), host, or *
+                let addr = if !ep.host.is_empty() && ep.port > 0 {
+                    format!("    {}:{}", ep.host, ep.port)
+                } else if !ep.host.is_empty() {
+                    format!("    {}", ep.host)
+                } else if ep.port > 0 {
+                    format!("    *:{}", ep.port)
+                } else {
+                    "    *".to_string()
+                };
+                lines.push(Line::from(Span::styled(addr, t.text)));
+
+                // Allowed IPs (CIDR allowlist for private IP access).
+                if !ep.allowed_ips.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("      Allowed IPs: ", t.muted),
+                        Span::styled(ep.allowed_ips.join(", "), t.text),
+                    ]));
+                }
+
+                // L7 allow rules.
+                for l7 in &ep.rules {
+                    if let Some(allow) = &l7.allow {
+                        let method = if allow.method.is_empty() {
+                            "*"
+                        } else {
+                            &allow.method
+                        };
+                        let target = if !allow.path.is_empty() {
+                            &allow.path
+                        } else if !allow.command.is_empty() {
+                            &allow.command
+                        } else {
+                            "*"
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("      Allow: ", t.muted),
+                            Span::styled(format!("{method:<6} {target}"), t.text),
+                        ]));
+                    }
+                }
+
+                // Access preset (if set instead of explicit rules).
+                if ep.access != 0 && ep.rules.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("      Access: ", t.muted),
+                        Span::styled(
+                            ryno_policy::network_access_preset_to_str(ep.access)
+                                .unwrap_or("unknown"),
+                            t.text,
+                        ),
+                    ]));
+                }
+            }
+
+            // Binaries.
+            let binary_paths: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
+            if !binary_paths.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    Binaries: ", t.muted),
+                    Span::styled(binary_paths.join(", "), t.text),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    // If nothing was rendered, add a placeholder.
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No policy data available.",
+            t.muted,
+        )));
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// Animation helper
+// ---------------------------------------------------------------------------
+
+/// Spawn a fast animation ticker (~7 fps) and store the handle on the app.
+fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    let anim_tx = tx;
+    app.anim_handle = Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(140)).await;
+            if anim_tx.send(Event::Redraw).is_err() {
+                break;
+            }
+        }
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Create sandbox (simplified — uses pre-selected provider names)
+// ---------------------------------------------------------------------------
+
+fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some((name, image, selected_providers, ports)) = app.create_form_data() else {
+        return;
+    };
+
+    // Stash ports so we can include them in the status text.
+    app.pending_forward_ports.clone_from(&ports);
+
+    let endpoint = app.endpoint.clone();
+    let gateway_name = app.gateway_name.clone();
+    let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
+    let workspace = app.current_workspace.clone();
+
+    tokio::spawn(async move {
+        let has_custom_image = !image.is_empty();
+        let template = if has_custom_image {
+            Some(ryno_core::proto::SandboxTemplate {
+                image,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        // For custom images, provide a restrictive default policy so the
+        // server has a baseline. The server ensures process identity is set
+        // to "sandbox". For the default image, let the server apply the
+        // sandbox's own default policy.
+        let policy = if has_custom_image {
+            Some(ryno_policy::restrictive_default_policy())
+        } else {
+            None
+        };
+
+        let req = ryno_core::proto::CreateSandboxRequest {
+            request_id: String::new(),
+            name,
+            spec: Some(ryno_core::proto::SandboxSpec {
+                providers: selected_providers,
+                template,
+                policy,
+                ..Default::default()
+            }),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            await_main_process_attachment: false,
+            workload_template: String::new(),
+            service_exposures: Vec::new(),
+        };
+
+        let sandbox_name =
+            match tokio::time::timeout(Duration::from_secs(30), client.create_sandbox(req)).await {
+                Ok(Ok(resp)) => resp.into_inner().sandbox.map_or_else(
+                    || "unknown".to_string(),
+                    |s| {
+                        let name = s.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    },
+                ),
+                Ok(Err(e)) => {
+                    let _ = tx.send(Event::CreateResult(Err(e.message().to_string())));
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::CreateResult(Err("request timed out".to_string())));
+                    return;
+                }
+            };
+
+        // If ports or command are set, wait for Ready before finishing.
+        if need_ready {
+            let mut attempts = 0;
+            let _sandbox_id = loop {
+                attempts += 1;
+                if attempts > 150 {
+                    let _ = tx.send(Event::CreateResult(Err(
+                        "timed out waiting for sandbox to be ready".to_string(),
+                    )));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let req = ryno_core::proto::GetSandboxRequest {
+                    name: sandbox_name.clone(),
+                    workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+                };
+                // Retry on transient errors.
+                if let Ok(resp) = client.get_sandbox(req).await
+                    && let Some(sandbox) = resp.into_inner().sandbox
+                {
+                    if sandbox.phase() == SandboxPhase::Ready as i32 {
+                        break sandbox.object_id().to_string();
+                    }
+                    if sandbox.phase() == SandboxPhase::Error as i32 {
+                        let _ = tx.send(Event::CreateResult(Err(
+                            "sandbox entered error state".to_string()
+                        )));
+                        return;
+                    }
+                }
+            };
+
+            // Start port forwards if requested.
+            if !ports.is_empty() {
+                let forward_warnings = start_port_forwards(
+                    &mut client,
+                    &endpoint,
+                    &gateway_name,
+                    &sandbox_name,
+                    &workspace,
+                    &ports,
+                )
+                .await;
+                if !forward_warnings.is_empty() {
+                    let _ = tx.send(Event::ForwardWarnings(forward_warnings));
+                }
+            }
+        }
+
+        let _ = tx.send(Event::CreateResult(Ok((sandbox_name, workspace))));
+    });
+}
+
+/// Start SSH port forwards for a sandbox that is already Ready.
+///
+/// This is called from within the create-sandbox task so the pacman animation
+/// keeps running while forwards are being established.
+async fn start_port_forwards(
+    client: &mut TuiClient,
+    endpoint: &str,
+    gateway_name: &str,
+    sandbox_name: &str,
+    workspace: &str,
+    specs: &[ryno_core::forward::ForwardSpec],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Create SSH session.
+    let session = {
+        let req = ryno_core::proto::CreateSshSessionRequest {
+            sandbox: sandbox_name.to_string(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.to_string())),
+        };
+        match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                warnings.push(format!("SSH session failed for forwards: {}", e.message()));
+                return warnings;
+            }
+            Err(_) => {
+                warnings.push("SSH session timed out for forwards".to_string());
+                return warnings;
+            }
+        }
+    };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        warnings.push(format!(
+            "gateway returned invalid SSH session response for forwards: {err}"
+        ));
+        return warnings;
+    }
+
+    // Resolve gateway address.
+    #[allow(clippy::cast_possible_truncation)]
+    let gateway_port_u16 = session.gateway_port as u16;
+    let (gateway_host, gateway_port) =
+        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
+
+    // Build ProxyCommand.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!("failed to find executable for forwards: {e}"));
+            return warnings;
+        }
+    };
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        sandbox_name,
+        workspace,
+        &session.token,
+        gateway_name,
+    );
+
+    // Start a forward for each spec.
+    for spec in specs {
+        let ssh_forward_arg = spec.ssh_forward_arg();
+        let port_val = spec.port;
+        let bind_addr = spec.bind_addr.clone();
+
+        let mut command = std::process::Command::new("ssh");
+        command
+            .arg("-o")
+            .arg(format!("ProxyCommand={proxy_command}"))
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("GlobalKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ConnectTimeout=15")
+            .arg("-N")
+            .arg("-f")
+            .arg("-o")
+            .arg(format!(
+                "SetEnv=RYNO_FORWARD_SANDBOX_ID={}",
+                session.sandbox_id
+            ))
+            .arg("-L")
+            .arg(&ssh_forward_arg)
+            .arg("sandbox")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let sid = session.sandbox_id.clone();
+        let name = sandbox_name.to_string();
+
+        // Use spawn (not status) so we don't block if SSH hangs during auth.
+        // SSH with -f forks to background after auth, but if auth stalls the
+        // parent process blocks indefinitely.  We use spawn + wait_with_timeout
+        // to avoid freezing the create flow.
+        let result = tokio::task::spawn_blocking(move || {
+            match command.spawn() {
+                Ok(mut child) => {
+                    // Wait up to 20 seconds for SSH to authenticate and fork.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status.success()),
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = child.kill();
+                                    return Err("timed out".to_string());
+                                }
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(true)) => {
+                if let Some(pid) =
+                    ryno_core::forward::find_ssh_forward_pid(workspace, &name, &sid, port_val)
+                {
+                    let _ = ryno_core::forward::write_forward_pid(
+                        workspace, &name, port_val, pid, &sid, &bind_addr,
+                    );
+                }
+            }
+            Ok(Ok(false)) => {
+                warnings.push(format!("SSH forward exited with error for port {port_val}"));
+            }
+            Ok(Err(e)) => {
+                warnings.push(format!("forward failed for port {port_val}: {e}"));
+            }
+            Err(e) => {
+                warnings.push(format!("forward task panicked for port {port_val}: {e}"));
+            }
+        }
+    }
+
+    warnings
+}
+
+// ---------------------------------------------------------------------------
+// Provider CRUD
+// ---------------------------------------------------------------------------
+
+/// Create a provider on the gateway.
+fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some(form) = &app.create_provider_form else {
+        return;
+    };
+
+    let ptype = form
+        .types
+        .get(form.type_cursor)
+        .cloned()
+        .unwrap_or_default();
+    let name = if form.name.is_empty() {
+        ptype.clone()
+    } else {
+        form.name.clone()
+    };
+    let credentials = form.discovered_credentials.clone().unwrap_or_default();
+    let workspace = app.current_workspace.clone();
+    let config: HashMap<String, String> = form
+        .config
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    tokio::spawn(async move {
+        // Try with the chosen name, retry with suffix on collision.
+        for attempt in 0..5u32 {
+            let provider_name = if attempt == 0 {
+                name.clone()
+            } else {
+                format!("{name}-{attempt}")
+            };
+
+            let req = ryno_core::proto::CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(ryno_core::proto::Provider {
+                    metadata: Some(ryno_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: provider_name.clone(),
+                        created_time: None,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.clone(),
+                        deletion_time: None,
+                    }),
+                    r#type: ptype.clone(),
+                    credentials: credentials.clone(),
+                    config: config.clone(),
+                    credential_expiration_times: HashMap::default(),
+                    profile_workspace: workspace.clone(),
+                    credential_handles: HashMap::default(),
+                }),
+                workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            };
+
+            match client.create_provider(req).await {
+                Ok(resp) => {
+                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| {
+                        let name = p.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    });
+                    let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
+                    return;
+                }
+                Err(status) if status.code() == Code::AlreadyExists => {
+                    // Retry with a different name.
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::ProviderCreateResult(Err(e.message().to_string())));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Event::ProviderCreateResult(Err(
+            "name collision after 5 attempts".to_string(),
+        )));
+    });
+}
+
+/// Fetch a single provider's details.
+fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_provider_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let workspace = app.selected_provider_workspace();
+
+    tokio::spawn(async move {
+        let req = ryno_core::proto::GetProviderRequest {
+            name,
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
+            Ok(Ok(resp)) => {
+                if let Some(provider) = resp.into_inner().provider {
+                    let _ = tx.send(Event::ProviderDetailFetched(Ok(Box::new(provider))));
+                } else {
+                    let _ = tx.send(Event::ProviderDetailFetched(Err(
+                        "provider not found in response".to_string(),
+                    )));
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderDetailFetched(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderDetailFetched(Err(
+                    "request timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+/// Update a provider's credentials.
+fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some(form) = &app.update_provider_form else {
+        return;
+    };
+
+    let name = form.provider_name.clone();
+    let ptype = form.provider_type.clone();
+    let cred_key = form.credential_key.clone();
+    let new_value = form.new_value.clone();
+    let workspace = app.selected_provider_workspace();
+    let mut config: HashMap<String, String> = form
+        .config
+        .iter()
+        .filter(|(k, v)| form.original_config.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    form.original_config
+        .keys()
+        .filter(|k| !form.config.contains_key(*k))
+        .for_each(|key| {
+            config.insert(key.clone(), String::new());
+        });
+
+    tokio::spawn(async move {
+        let mut credentials = HashMap::new();
+        if !new_value.is_empty() {
+            credentials.insert(cred_key, new_value);
+        }
+
+        let req = ryno_core::proto::UpdateProviderRequest {
+            request_id: String::new(),
+            provider: Some(ryno_core::proto::Provider {
+                metadata: Some(ryno_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.clone(),
+                    created_time: None,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.clone(),
+                    deletion_time: None,
+                }),
+                r#type: ptype,
+                credentials,
+                config,
+                credential_expiration_times: HashMap::default(),
+                profile_workspace: String::new(),
+                credential_handles: HashMap::default(),
+            }),
+            credential_expiration_times: HashMap::default(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            clear_credential_expiration_keys: Vec::new(),
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
+            Ok(Ok(_)) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Ok(name)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Err(
+                    "request timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+/// Delete a provider by name.
+fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_provider_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let workspace = app.selected_provider_workspace();
+
+    tokio::spawn(async move {
+        let req = ryno_core::proto::DeleteProviderRequest {
+            request_id: String::new(),
+            allow_missing: true,
+            name,
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
+            Ok(Ok(resp)) => {
+                let outcome = resp.into_inner().outcome();
+                let result = match outcome {
+                    ryno_core::proto::DeletionOutcome::Completed => Ok(true),
+                    ryno_core::proto::DeletionOutcome::AlreadyAbsent => Ok(false),
+                    _ => {
+                        Err("gateway returned an unsupported provider deletion outcome".to_string())
+                    }
+                };
+                let _ = tx.send(Event::ProviderDeleteResult(result));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderDeleteResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderDeleteResult(Err(
+                    "request timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Draft approval / rejection
+// ---------------------------------------------------------------------------
+
+/// Approve the currently selected draft chunk.
+fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let (chunk_id, review_token) = match app.draft_chunks.get(abs) {
+        Some(c) => (c.id.clone(), c.review_token.clone()),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
+
+    tokio::spawn(async move {
+        let req = ryno_core::proto::ApproveDraftChunkRequest {
+            request_id: String::new(),
+            sandbox: name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            chunk_id,
+            review_token,
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Approved '{}' -> policy v{}",
+                    rule_name, inner.policy_version
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+/// Reject the currently selected draft chunk.
+fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let chunk_id = match app.draft_chunks.get(abs) {
+        Some(c) => c.id.clone(),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
+
+    tokio::spawn(async move {
+        let req = ryno_core::proto::RejectDraftChunkRequest {
+            request_id: String::new(),
+            sandbox: name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            chunk_id,
+            reason: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
+            Ok(Ok(_)) => {
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Rejected '{rule_name}'"
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(
+                    Err("reject timed out".to_string()),
+                ));
+            }
+        }
+    });
+}
+
+/// Approve all pending draft chunks via the bulk `ApproveAllDraftChunks` RPC.
+///
+/// Uses the server-side bulk endpoint which respects the `security_notes`
+/// safety gate — security-flagged chunks are skipped unless explicitly
+/// included. The `snapshot` parameter is retained for the confirmation
+/// modal count display but is not iterated for per-chunk approval.
+fn spawn_draft_approve_all(
+    app: &App,
+    snapshot: Vec<ryno_core::proto::PolicyChunk>,
+    tx: mpsc::UnboundedSender<Event>,
+) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let workspace = app.selected_sandbox_workspace();
+
+    tokio::spawn(async move {
+        let approvals = snapshot
+            .into_iter()
+            .map(|chunk| ryno_core::proto::DraftChunkApproval {
+                chunk_id: chunk.id,
+                review_token: chunk.review_token,
+            })
+            .collect();
+        let req = ryno_core::proto::ApproveAllDraftChunksRequest {
+            request_id: String::new(),
+            sandbox: name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            include_security_flagged: false,
+            approvals,
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            client.approve_all_draft_chunks(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let msg = format_draft_approve_all_result(&inner);
+                let _ = tx.send(Event::DraftActionResult(Ok(msg)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve-all timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+fn format_draft_approve_all_result(
+    result: &ryno_core::proto::ApproveAllDraftChunksResponse,
+) -> String {
+    if result.chunks_skipped > 0 {
+        format!(
+            "Approved {} chunks, skipped {}; review remaining pending chunks -> policy v{}",
+            result.chunks_approved, result.chunks_skipped, result.policy_version
+        )
+    } else {
+        format!(
+            "Approved {} chunks -> policy v{}",
+            result.chunks_approved, result.policy_version
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data refresh
+// ---------------------------------------------------------------------------
+
+fn spawn_list_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    if let Some(handle) = app.list_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
+        }
+        app.list_refresh_handle.take();
+    }
+
+    app.list_refresh_generation = app.list_refresh_generation.wrapping_add(1);
+    let generation = app.list_refresh_generation;
+    let gateway_name = app.gateway_name.clone();
+    let refresh_workspace = app.current_workspace.clone();
+    let all_workspaces = app.all_workspaces;
+    let client = app.client.clone();
+    let handle = tokio::spawn(async move {
+        let (workspaces, providers, sandboxes) = tokio::join!(
+            fetch_workspaces(client.clone()),
+            fetch_providers(client.clone(), refresh_workspace.clone(), all_workspaces),
+            fetch_sandboxes(client, refresh_workspace.clone(), all_workspaces),
+        );
+        let _ = tx.send(Event::ListRefreshCompleted(ListRefreshResult {
+            generation,
+            gateway_name,
+            workspace: refresh_workspace,
+            all_workspaces,
+            workspaces,
+            providers,
+            sandboxes,
+        }));
+    });
+    app.list_refresh_handle = Some(handle);
+}
+
+fn apply_list_refresh(app: &mut App, result: ListRefreshResult) {
+    if result.generation != app.list_refresh_generation {
+        return;
+    }
+    app.list_refresh_handle.take();
+    if result.gateway_name != app.gateway_name {
+        return;
+    }
+    if result.workspace != app.current_workspace {
+        return;
+    }
+    if result.all_workspaces != app.all_workspaces {
+        return;
+    }
+    app.cancel_draft_counts_refresh();
+
+    match result.workspaces {
+        Ok(workspaces) => app.workspace_names = workspaces,
+        Err(message) => app.status_text = message,
+    }
+    match result.providers {
+        Ok(providers) => apply_provider_refresh(app, providers),
+        Err(message) => app.status_text = message,
+    }
+    match result.sandboxes {
+        Ok(sandboxes) => apply_sandbox_refresh(app, sandboxes),
+        Err(message) => app.status_text = message,
+    }
+}
+
+async fn fetch_workspaces(mut client: TuiClient) -> std::result::Result<Vec<String>, String> {
+    let mut workspace_names = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = ryno_core::proto::ListWorkspacesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.list_workspaces(req)).await {
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                workspace_names.extend(
+                    response
+                        .workspaces
+                        .into_iter()
+                        .filter_map(|workspace| workspace.metadata.map(|metadata| metadata.name)),
+                );
+                if response.next_page_token.is_empty() {
+                    return Ok(workspace_names);
+                }
+                page_token = response.next_page_token;
+            }
+            Ok(Err(e)) => {
+                return Err(format!("failed to list workspaces: {}", e.message()));
+            }
+            Err(_) => {
+                return Err("list workspaces timed out".to_string());
+            }
+        }
+    }
+}
+
+fn provider_profile_query_workspace(provider: &ryno_core::proto::Provider) -> &str {
+    if provider.profile_workspace.is_empty() {
+        provider.object_workspace()
+    } else {
+        &provider.profile_workspace
+    }
+}
+
+fn provider_profile_cache_workspace<'a>(
+    query_workspace: &'a str,
+    profile: &ryno_core::proto::ProviderProfile,
+) -> &'a str {
+    if profile.scope == PROVIDER_PROFILE_SCOPE_WORKSPACE {
+        query_workspace
+    } else {
+        ""
+    }
+}
+
+fn cache_provider_profile(
+    profiles: &mut ProviderProfileCache,
+    query_workspace: &str,
+    profile: ryno_core::proto::ProviderProfile,
+) {
+    let profile_workspace = provider_profile_cache_workspace(query_workspace, &profile).to_string();
+    profiles.insert((profile_workspace, profile.id.clone()), profile);
+}
+
+fn cached_provider_profile(
+    profiles: &ProviderProfileCache,
+    provider: &ryno_core::proto::Provider,
+) -> Option<ryno_core::proto::ProviderProfile> {
+    let profile_id = provider.r#type.clone();
+    profiles
+        .get(&(
+            provider_profile_query_workspace(provider).to_string(),
+            profile_id.clone(),
+        ))
+        .or_else(|| profiles.get(&(String::new(), profile_id)))
+        .cloned()
+}
+
+async fn fetch_providers(
+    mut client: TuiClient,
+    current_workspace: String,
+    all_workspaces: bool,
+) -> std::result::Result<ProviderListRefresh, String> {
+    let mut providers = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = ryno_core::proto::ListProvidersRequest {
+            page_size: 100,
+            page_token,
+            workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.list_providers(req)).await {
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                providers.extend(response.providers);
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = response.next_page_token;
+            }
+            Ok(Err(e)) => {
+                return Err(format!("failed to list providers: {}", e.message()));
+            }
+            Err(_) => {
+                return Err("list providers timed out".to_string());
+            }
+        }
+    }
+
+    let mut workspaces: std::collections::HashSet<String> = providers
+        .iter()
+        .map(|provider| provider_profile_query_workspace(provider).to_string())
+        // Legacy provider records can decode without an object workspace. Do not
+        // turn that missing context into a platform-scoped profile request.
+        .filter(|workspace| !workspace.is_empty())
+        .collect();
+    if !all_workspaces {
+        workspaces.insert(current_workspace.clone());
+    }
+    let mut profiles = HashMap::new();
+    let mut workspace_profiles = Vec::new();
+    for ws in &workspaces {
+        let client = client.clone();
+        let workspace = ws.clone();
+        if let Some(listed) = collect_provider_profile_pages(move |page_token| {
+            let mut client = client.clone();
+            let workspace = workspace.clone();
+            async move {
+                let req = ryno_core::proto::ListProviderProfilesRequest {
+                    workspace_scope: Some(ryno_core::proto::workspace_selector(workspace)),
+                    page_size: PROVIDER_PROFILE_PAGE_SIZE,
+                    page_token,
+                };
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.list_provider_profiles(req),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => {
+                        let response = response.into_inner();
+                        Some((response.profiles, response.next_page_token))
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .await
+        {
+            if !all_workspaces && ws == &current_workspace {
+                workspace_profiles.clone_from(&listed);
+            }
+            for profile in listed {
+                cache_provider_profile(&mut profiles, ws, profile);
+            }
+        }
+    }
+
+    Ok(ProviderListRefresh {
+        providers,
+        profiles,
+        workspace_profiles,
+    })
+}
+
+fn apply_provider_refresh(app: &mut App, refresh: ProviderListRefresh) {
+    let ProviderListRefresh {
+        providers,
+        profiles,
+        workspace_profiles,
+    } = refresh;
+    app.provider_profiles = workspace_profiles;
+    app.sync_create_provider_types();
+
+    app.provider_count = providers.len();
+    app.provider_entries = providers
+        .iter()
+        .cloned()
+        .map(|provider| app::ProviderListEntry {
+            profile: cached_provider_profile(&profiles, &provider),
+            provider,
+        })
+        .collect();
+    app.provider_names = providers
+        .iter()
+        .map(|p| app::provider_name(p).to_string())
+        .collect();
+    app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
+    app.provider_cred_keys = providers
+        .iter()
+        .map(|p| {
+            p.credentials
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+    app.provider_workspaces = providers
+        .iter()
+        .map(|p| p.object_workspace().to_string())
+        .collect();
+    if app.provider_selected >= app.provider_count && app.provider_count > 0 {
+        app.provider_selected = app.provider_count - 1;
+    }
+}
+
+async fn collect_provider_profile_pages<F, Fut>(
+    mut fetch_page: F,
+) -> Option<Vec<ryno_core::proto::ProviderProfile>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Option<(Vec<ryno_core::proto::ProviderProfile>, String)>>,
+{
+    let mut profiles = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let (page, next_page_token) = fetch_page(page_token).await?;
+        profiles.extend(page);
+        if next_page_token.is_empty() {
+            return Some(profiles);
+        }
+        page_token = next_page_token;
+    }
+}
+
+async fn refresh_global_settings(app: &mut App) {
+    if !app.global_settings_access_denied {
+        let req = ryno_core::proto::GetGatewayConfigRequest {};
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
+        match result {
+            Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+                app.deny_global_settings_access();
+            }
+            Ok(Err(status)) => {
+                app.status_text = format!("failed to fetch global settings: {}", status.message());
+            }
+            Err(_) => {
+                app.status_text = "get gateway settings timed out".to_string();
+            }
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                app.apply_global_settings(inner.settings, inner.settings_revision);
+            }
+        }
+    }
+
+    if app.global_policy_access_denied {
+        return;
+    }
+
+    // Check for an active global policy only while the caller can read it.
+    let policy_req = ryno_core::proto::ListSandboxPoliciesRequest {
+        page_size: 1,
+        page_token: String::new(),
+        global: true,
+        sandbox: String::new(),
+        workspace_scope: None,
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        app.client.list_sandbox_policies(policy_req),
+    )
+    .await
+    {
+        Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+            app.deny_global_policy_access();
+        }
+        Ok(Err(status)) => {
+            app.status_text = format!("failed to fetch global policy: {}", status.message());
+        }
+        Err(_) => {
+            app.status_text = "list global policies timed out".to_string();
+        }
+        Ok(Ok(resp)) => {
+            let revisions = resp.into_inner().revisions;
+            if let Some(latest) = revisions.first() {
+                let status =
+                    ryno_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
+                app.global_policy_active = status == ryno_core::proto::PolicyStatus::Loaded;
+                app.global_policy_version = latest.version;
+            } else {
+                app.global_policy_active = false;
+                app.global_policy_version = 0;
+            }
+        }
+    }
+}
+
+fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(ref edit) = app.setting_edit else {
+        return;
+    };
+    let Some(entry) = app.global_settings.get(edit.index) else {
+        return;
+    };
+
+    let key = entry.key.clone();
+    let raw = edit.input.trim().to_string();
+    let kind = entry.kind;
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        // Build the typed SettingValue from the validated input.
+        use ryno_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
+
+        let value = match kind {
+            ryno_core::settings::SettingValueKind::Bool => {
+                if let Some(v) = ryno_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
+                }
+            }
+            ryno_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            }
+            ryno_core::settings::SettingValueKind::String => setting_value::Value::StringValue(raw),
+        };
+
+        let req = UpdateConfigRequest {
+            setting_key: key,
+            setting_value: Some(SettingValue { value: Some(value) }),
+            global: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => Event::GlobalSettingSetResult(Ok(resp.into_inner().settings_revision)),
+            Ok(Err(e)) => Event::GlobalSettingSetResult(Err(e.message().to_string())),
+            Err(_) => Event::GlobalSettingSetResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let idx = app
+        .confirm_setting_delete
+        .unwrap_or(app.global_settings_selected);
+    let Some(entry) = app.global_settings.get(idx) else {
+        return;
+    };
+
+    let key = entry.key.clone();
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use ryno_core::proto::UpdateConfigRequest;
+
+        let req = UpdateConfigRequest {
+            setting_key: key,
+            delete_setting: true,
+            global: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => {
+                Event::GlobalSettingDeleteResult(Ok(resp.into_inner().settings_revision))
+            }
+            Ok(Err(e)) => Event::GlobalSettingDeleteResult(Err(e.message().to_string())),
+            Err(_) => Event::GlobalSettingDeleteResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(ref edit) = app.sandbox_setting_edit else {
+        return;
+    };
+    let Some(entry) = app.sandbox_settings.get(edit.index) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let raw = edit.input.trim().to_string();
+    let kind = entry.kind;
+    let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
+
+    tokio::spawn(async move {
+        use ryno_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
+
+        let value = match kind {
+            ryno_core::settings::SettingValueKind::Bool => {
+                if let Some(v) = ryno_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
+                }
+            }
+            ryno_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            }
+            ryno_core::settings::SettingValueKind::String => setting_value::Value::StringValue(raw),
+        };
+
+        let req = UpdateConfigRequest {
+            sandbox: name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            setting_key: key,
+            setting_value: Some(SettingValue { value: Some(value) }),
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => Event::SandboxSettingSetResult(Ok(resp.into_inner().settings_revision)),
+            Ok(Err(e)) => Event::SandboxSettingSetResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingSetResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let idx = app
+        .sandbox_confirm_setting_delete
+        .unwrap_or(app.sandbox_settings_selected);
+    let Some(entry) = app.sandbox_settings.get(idx) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
+
+    tokio::spawn(async move {
+        use ryno_core::proto::UpdateConfigRequest;
+
+        let req = UpdateConfigRequest {
+            sandbox: name.clone(),
+            workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+            setting_key: key,
+            delete_setting: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => {
+                Event::SandboxSettingDeleteResult(Ok(resp.into_inner().settings_revision))
+            }
+            Ok(Err(e)) => Event::SandboxSettingDeleteResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingDeleteResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+async fn refresh_health(app: &mut App) {
+    let req = ryno_core::proto::HealthRequest {};
+    let result = tokio::time::timeout(Duration::from_secs(5), app.client.health(req)).await;
+    match result {
+        Ok(Ok(resp)) => {
+            let status = resp.into_inner().status;
+            app.status_text = match status {
+                1 => "Healthy".to_string(),
+                2 => "Degraded".to_string(),
+                3 => "Unhealthy".to_string(),
+                _ => format!("Unknown ({status})"),
+            };
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("error: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "timeout".to_string();
+        }
+    }
+}
+
+async fn fetch_sandboxes(
+    mut client: TuiClient,
+    current_workspace: String,
+    all_workspaces: bool,
+) -> std::result::Result<Vec<ryno_core::proto::Sandbox>, String> {
+    let mut page_token = String::new();
+    let mut sandboxes = Vec::new();
+    loop {
+        let req = ryno_core::proto::ListSandboxesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+            workspace_scope: Some(list_workspace_scope(&current_workspace, all_workspaces)),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), client.list_sandboxes(req)).await;
+        match result {
+            Ok(Err(e)) => {
+                return Err(format!("failed to list sandboxes: {}", e.message()));
+            }
+            Err(_) => {
+                return Err("list sandboxes timed out".to_string());
+            }
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                sandboxes.extend(response.sandboxes);
+                if response.next_page_token.is_empty() {
+                    return Ok(sandboxes);
+                }
+                page_token = response.next_page_token;
+            }
+        }
+    }
+}
+
+fn sandbox_notes(sandbox: &ryno_core::proto::Sandbox, forwards: String) -> String {
+    sandbox_notes_for_view(sandbox, forwards, false)
+}
+
+fn sandbox_notes_for_view(
+    sandbox: &ryno_core::proto::Sandbox,
+    forwards: String,
+    detail: bool,
+) -> String {
+    if let Some(record) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        && record.timeout_time.is_some()
+    {
+        let cleanup = if record.cleanup_completed_time.is_some() {
+            "compute reclaimed"
+        } else {
+            "compute cleanup pending"
+        };
+        let mut notes =
+            if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                format!("Image preparation timed out; {cleanup}")
+            } else {
+                format!("Provisioning timed out; {cleanup}")
+            };
+        if !forwards.is_empty() {
+            notes.push_str("; ");
+            notes.push_str(&forwards);
+        }
+        return notes;
+    }
+    let rejection = sandbox.status.as_ref().and_then(|status| {
+        status.conditions.iter().find(|condition| {
+            matches!(condition.r#type.as_str(), "ConfigurationReady" | "Ready")
+                && condition.status == "False"
+                && condition.reason == "ConfigurationInvalid"
+        })
+    });
+    let Some(rejection) = rejection else {
+        return forwards;
+    };
+    let mut notes = if detail {
+        format!(
+            "Invalid config: {}",
+            rejection
+                .message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else {
+        "Invalid config".to_string()
+    };
+    if !forwards.is_empty() {
+        notes.push_str("; ");
+        notes.push_str(&forwards);
+    }
+    notes
+}
+
+fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<ryno_core::proto::Sandbox>) {
+    app.sandbox_count = sandboxes.len();
+    app.sandbox_ids = sandboxes
+        .iter()
+        .map(|s| s.object_id().to_string())
+        .collect();
+    app.sandbox_names = sandboxes
+        .iter()
+        .map(|s| s.object_name().to_string())
+        .collect();
+    app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_restart_policies = sandboxes
+        .iter()
+        .map(|s| {
+            match s
+                .spec
+                .as_ref()
+                .and_then(|spec| SandboxRestartPolicy::try_from(spec.restart_policy).ok())
+            {
+                Some(SandboxRestartPolicy::OnFailure) => "on-failure",
+                Some(SandboxRestartPolicy::Always) => "always",
+                _ => "never",
+            }
+            .to_string()
+        })
+        .collect();
+    app.sandbox_restart_counts = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().map_or(0, |status| status.restart_count))
+        .collect();
+    app.sandbox_exit_codes = sandboxes
+        .iter()
+        .map(|s| s.status.as_ref().and_then(|status| status.exit_code))
+        .collect();
+    app.sandbox_next_restart_at = sandboxes
+        .iter()
+        .map(|s| {
+            format_timestamp(
+                s.status
+                    .as_ref()
+                    .and_then(|status| status.next_restart_time.as_ref())
+                    .and_then(|time| ryno_core::time::timestamp_to_millis(time).ok())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    app.sandbox_images = sandboxes
+        .iter()
+        .map(|s| {
+            s.spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .map(|t| t.image.as_str())
+                .filter(|img| !img.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        })
+        .collect();
+    app.sandbox_ages = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| ryno_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_age)
+        })
+        .collect();
+    app.sandbox_created = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| ryno_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_timestamp)
+        })
+        .collect();
+
+    app.sandbox_policy_versions = sandboxes
+        .iter()
+        .map(ryno_core::proto::Sandbox::current_policy_version)
+        .collect();
+
+    // Show configuration blockers before active port forwards in NOTES.
+    let forwards = ryno_core::forward::list_forwards().unwrap_or_default();
+    app.sandbox_notes = sandboxes
+        .iter()
+        .map(|s| {
+            let name = s.object_name();
+            let forwards =
+                ryno_core::forward::build_sandbox_notes(s.object_workspace(), name, &forwards);
+            sandbox_notes(s, forwards)
+        })
+        .collect();
+
+    app.sandbox_detail_notes = sandboxes
+        .iter()
+        .map(|s| {
+            let forwards = ryno_core::forward::build_sandbox_notes(
+                s.object_workspace(),
+                s.object_name(),
+                &forwards,
+            );
+            sandbox_notes_for_view(s, forwards, true)
+        })
+        .collect();
+
+    // Build LABELS column from metadata.
+    app.sandbox_labels = sandboxes
+        .iter()
+        .map(|s| {
+            s.object_labels()
+                .as_ref()
+                .map(app::format_labels)
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_annotations = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map(|metadata| app::format_annotations(&metadata.annotations))
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_workspaces = sandboxes
+        .iter()
+        .map(|s| s.object_workspace().to_string())
+        .collect();
+
+    if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
+        app.sandbox_selected = app.sandbox_count - 1;
+    }
+}
+
+/// Re-fetch only the sandbox policy when a version change is detected.
+///
+/// Unlike `fetch_sandbox_detail()`, this skips the `GetSandbox` metadata call
+/// and preserves the current scroll position so the user isn't disrupted.
+async fn refresh_sandbox_policy(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+    let workspace = app.selected_sandbox_workspace();
+
+    let policy_req = ryno_core::proto::GetSandboxConfigRequest {
+        name: sandbox_name,
+        workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        app.client.get_sandbox_config(policy_req),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            if let Some(mut policy) = inner.policy {
+                // Use the version from the policy history, not from the
+                // policy proto's own version field (which is always 1).
+                policy.version = inner.version;
+                app.policy_lines = render_policy_lines(&policy, &app.theme);
+                app.sandbox_policy = Some(policy);
+            }
+            // Refresh settings and policy source alongside the policy.
+            app.sandbox_policy_is_global =
+                inner.policy_source == ryno_core::proto::PolicySource::Global as i32;
+            app.apply_sandbox_settings(inner.settings);
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to refresh sandbox policy: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "sandbox policy refresh timed out".to_string();
+        }
+    }
+}
+
+async fn refresh_draft_chunks(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+
+    let req = ryno_core::proto::GetDraftPolicyRequest {
+        sandbox: sandbox_name,
+        workspace_scope: Some(ryno_core::proto::workspace_selector(
+            app.selected_sandbox_workspace(),
+        )),
+        status_filter: String::new(),
+    };
+
+    if let Ok(Ok(resp)) =
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await
+    {
+        let inner = resp.into_inner();
+        app.draft_chunks = inner.chunks;
+        app.draft_version = inner.draft_version;
+        if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+            app.draft_selected = app.draft_chunks.len() - 1;
+        }
+    }
+}
+
+/// Start a bounded, non-overlapping background refresh of pending draft counts.
+fn spawn_sandbox_draft_counts_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    if let Some(handle) = app.draft_counts_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
+        }
+        app.draft_counts_refresh_handle.take();
+    }
+
+    let sandboxes: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if sandboxes.is_empty() {
+        app.sandbox_draft_counts.clear();
+        return;
+    }
+
+    app.draft_counts_refresh_generation = app.draft_counts_refresh_generation.wrapping_add(1);
+    let generation = app.draft_counts_refresh_generation;
+    let gateway_name = app.gateway_name.clone();
+    let workspace = app.current_workspace.clone();
+    let all_workspaces = app.all_workspaces;
+    let client = app.client.clone();
+    let refresh_sandboxes = sandboxes.clone();
+    let handle = tokio::spawn(async move {
+        let counts = fetch_sandbox_draft_counts(client, refresh_sandboxes).await;
+        let _ = tx.send(Event::DraftCountsRefreshCompleted(
+            DraftCountsRefreshResult {
+                generation,
+                gateway_name,
+                workspace,
+                all_workspaces,
+                sandboxes,
+                counts,
+            },
+        ));
+    });
+    app.draft_counts_refresh_handle = Some(handle);
+}
+
+async fn fetch_sandbox_draft_counts(
+    client: TuiClient,
+    sandboxes: Vec<(String, String)>,
+) -> Vec<usize> {
+    let count = sandboxes.len();
+    let results = stream::iter(sandboxes.into_iter().enumerate().map(
+        |(index, (name, workspace))| {
+            let mut client = client.clone();
+            async move {
+                let req = ryno_core::proto::GetDraftPolicyRequest {
+                    sandbox: name,
+                    status_filter: "pending".to_string(),
+                    workspace_scope: Some(ryno_core::proto::workspace_selector(workspace.clone())),
+                };
+                let count = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.get_draft_policy(req),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => resp.into_inner().chunks.len(),
+                    _ => 0,
+                };
+                (index, count)
+            }
+        },
+    ))
+    .buffer_unordered(DRAFT_COUNT_REFRESH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut counts = vec![0; count];
+    for (index, value) in results {
+        counts[index] = value;
+    }
+    counts
+}
+
+fn apply_sandbox_draft_counts_refresh(app: &mut App, result: DraftCountsRefreshResult) {
+    if result.generation != app.draft_counts_refresh_generation {
+        return;
+    }
+    app.draft_counts_refresh_handle.take();
+    if (
+        result.gateway_name.as_str(),
+        result.workspace.as_str(),
+        result.all_workspaces,
+    ) != (
+        app.gateway_name.as_str(),
+        app.current_workspace.as_str(),
+        app.all_workspaces,
+    ) {
+        return;
+    }
+    let current: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if result.sandboxes == current {
+        app.sandbox_draft_counts = result.counts;
+    }
+}
+
+fn phase_label(phase: i32) -> String {
+    match phase {
+        x if x == SandboxPhase::Provisioning as i32 => "Provisioning",
+        x if x == SandboxPhase::Ready as i32 => "Ready",
+        x if x == SandboxPhase::Error as i32 => "Error",
+        x if x == SandboxPhase::Deleting as i32 => "Deleting",
+        x if x == SandboxPhase::Stopping as i32 => "Stopping",
+        x if x == SandboxPhase::Stopped as i32 => "Stopped",
+        x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Completed as i32 => "Completed",
+        _ => "Unknown",
+    }
+    .to_string()
+}
+
+fn format_age(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 {
+        return String::from("-");
+    }
+    let created_secs = epoch_ms / 1000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().cast_signed());
+    let diff = now - created_secs;
+    if diff < 0 {
+        return String::from("-");
+    }
+    let diff = diff.cast_unsigned();
+    if diff < 60 {
+        format!("{diff}s")
+    } else if diff < 3600 {
+        format!("{}m", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
+    } else {
+        format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exec_command_tests {
+    use super::build_exec_command;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn run_command(command: &str, stdin: &[u8]) -> std::process::Output {
+        let args = shell_words::split(command).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &build_exec_command(&args)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn quoted_script_runs_and_reads_stdin() {
+        let output = run_command(r#"/bin/sh -c "echo GOOD; read x; echo $x""#, b"entered\n");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"GOOD\nentered\n");
+    }
+
+    #[test]
+    fn arguments_remain_literal_at_remote_shell_boundary() {
+        let output = run_command(
+            r#"printf '%s\n' 'hello world' "" "it's" a\ b $HOME '$(echo BAD)' ';' '|' '>' '*.txt'"#,
+            b"",
+        );
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"hello world\n\nit's\na b\n$HOME\n$(echo BAD)\n;\n|\n>\n*.txt\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod draft_approve_all_message_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_chunks_are_not_assumed_to_be_security_flagged() {
+        let message =
+            format_draft_approve_all_result(&ryno_core::proto::ApproveAllDraftChunksResponse {
+                policy_version: 7,
+                chunks_approved: 2,
+                chunks_skipped: 1,
+                ..Default::default()
+            });
+
+        assert_eq!(
+            message,
+            "Approved 2 chunks, skipped 1; review remaining pending chunks -> policy v7"
+        );
+        assert!(!message.contains("security-flagged"));
+    }
+}
+
+#[cfg(test)]
+mod phase_label_tests {
+    use super::*;
+
+    #[test]
+    fn phase_label_covers_stop_and_start_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
+        assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
+        assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
+    }
+}
+
+/// Format epoch milliseconds as a human-readable UTC timestamp: `YYYY-MM-DD HH:MM`.
+fn format_timestamp(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 {
+        return String::from("-");
+    }
+    let secs = epoch_ms / 1000;
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}")
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+#[allow(clippy::unreadable_literal)]
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod provider_profile_workspace_tests {
+    use super::*;
+    use ryno_core::proto::datamodel::v1::ObjectMeta;
+    use ryno_core::proto::{Provider, ProviderProfile};
+
+    #[test]
+    fn platform_profile_queries_through_provider_workspace() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                workspace: "team-a".to_string(),
+                ..ObjectMeta::default()
+            }),
+            profile_workspace: String::new(),
+            ..Provider::default()
+        };
+
+        assert_eq!(provider_profile_query_workspace(&provider), "team-a");
+    }
+
+    #[test]
+    fn cached_profile_round_trip_covers_static_platform_and_workspace_scopes() {
+        let cases = [
+            ("", "", "static profile with platform provider scope"),
+            ("team-a", "", "static profile with workspace provider scope"),
+            ("", "platform", "platform profile"),
+            ("team-a", "workspace", "workspace profile"),
+            (
+                "",
+                "workspace",
+                "legacy provider with empty profile_workspace and workspace-scoped profile",
+            ),
+        ];
+
+        for (provider_workspace, response_scope, label) in cases {
+            let provider = Provider {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                r#type: "claude-code".to_string(),
+                profile_workspace: provider_workspace.to_string(),
+                ..Provider::default()
+            };
+            let profile = ProviderProfile {
+                id: "claude-code".to_string(),
+                scope: response_scope.to_string(),
+                ..ProviderProfile::default()
+            };
+            let mut profiles = ProviderProfileCache::new();
+
+            cache_provider_profile(&mut profiles, "team-a", profile);
+
+            assert!(
+                cached_provider_profile(&profiles, &provider).is_some(),
+                "{label} did not survive cache insertion and lookup"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_profile_pagination_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn profile_fetch_continues_until_page_two_is_collected() {
+        let requested_tokens = Arc::new(Mutex::new(Vec::new()));
+        let tokens = Arc::clone(&requested_tokens);
+
+        let profiles = collect_provider_profile_pages(move |page_token| {
+            let tokens = Arc::clone(&tokens);
+            async move {
+                tokens.lock().unwrap().push(page_token.clone());
+                match page_token.as_str() {
+                    "" => Some((
+                        (0..PROVIDER_PROFILE_PAGE_SIZE)
+                            .map(|index| ryno_core::proto::ProviderProfile {
+                                id: format!("profile-{index}"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        "next".to_string(),
+                    )),
+                    "next" => Some((
+                        vec![ryno_core::proto::ProviderProfile {
+                            id: "page-two-profile".to_string(),
+                            ..Default::default()
+                        }],
+                        String::new(),
+                    )),
+                    _ => panic!("unexpected profile page token {page_token}"),
+                }
+            }
+        })
+        .await
+        .expect("all pages should load");
+
+        assert_eq!(
+            *requested_tokens.lock().unwrap(),
+            vec![String::new(), "next".to_string()]
+        );
+        assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
+        assert_eq!(profiles.last().unwrap().id, "page-two-profile");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_notes_tests {
+    use super::sandbox_notes;
+    use ryno_core::proto::{Sandbox, SandboxCondition, SandboxStatus};
+
+    #[test]
+    fn provisioning_timeout_notes_distinguish_pending_and_completed_cleanup() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(ryno_core::proto::SandboxProvisioning {
+                    timeout_time: ryno_core::time::timestamp_from_millis(300_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, "fwd:8080".into()),
+            "Provisioning timed out; compute cleanup pending; fwd:8080"
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .cleanup_completed_time = ryno_core::time::timestamp_from_millis(301_000).ok();
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Provisioning timed out; compute reclaimed"
+        );
+    }
+
+    #[test]
+    fn preparation_timeout_notes_identify_the_expired_phase() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                provisioning: Some(ryno_core::proto::SandboxProvisioning {
+                    preparation_deadline: ryno_core::time::timestamp_from_millis(1_800_000).ok(),
+                    timeout_time: ryno_core::time::timestamp_from_millis(1_800_000).ok(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, String::new()),
+            "Image preparation timed out; compute cleanup pending"
+        );
+    }
+
+    #[test]
+    fn configuration_rejection_precedes_forwards_and_clears_after_repair() {
+        let condition = SandboxCondition {
+            r#type: "ConfigurationReady".into(),
+            status: "False".into(),
+            reason: "ConfigurationInvalid".into(),
+            message: "credentialed endpoint requires\nL7 inspection".into(),
+            ..Default::default()
+        };
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![
+                    condition.clone(),
+                    SandboxCondition {
+                        r#type: "Ready".into(),
+                        ..condition
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_notes(&sandbox, "fwd:8080".into()),
+            "Invalid config; fwd:8080"
+        );
+        assert_eq!(
+            super::sandbox_notes_for_view(&sandbox, "fwd:8080".into(), true),
+            "Invalid config: credentialed endpoint requires L7 inspection; fwd:8080"
+        );
+        // Older gateways can expose only Ready; retain the note there too.
+        sandbox.status.as_mut().unwrap().conditions.remove(0);
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "Invalid config");
+        sandbox.status.as_mut().unwrap().conditions[0]
+            .message
+            .clear();
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "Invalid config");
+        sandbox.status.as_mut().unwrap().conditions[0].status = "True".into();
+        assert_eq!(sandbox_notes(&sandbox, "fwd:8080".into()), "fwd:8080");
+        sandbox.status = None;
+        assert_eq!(sandbox_notes(&sandbox, String::new()), "");
+    }
+}

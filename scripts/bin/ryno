@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+BINARY="$TARGET_DIR/debug/ryno"
+STATE_FILE="$PROJECT_ROOT/.cache/ryno-build.state"
+CALLER_PWD="$PWD"
+
+# ---------------------------------------------------------------------------
+# Fingerprint-based rebuild check
+#
+# Collect dirty files from git, filter to paths in the ryno-cli dependency
+# closure, hash their contents, and compare against a persisted state file. We
+# also track HEAD so that branch switches / pulls are detected.
+# ---------------------------------------------------------------------------
+
+needs_build=0
+
+if [[ ! -x "$BINARY" ]]; then
+  needs_build=1
+else
+  cd "$PROJECT_ROOT"
+
+  # Current HEAD commit (detects branch switches, pulls, rebases)
+  current_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+
+  # Collect dirty (modified, staged, untracked) files
+  changed_files=()
+  while IFS= read -r path; do
+    changed_files+=("$path")
+  done < <(
+    {
+      git diff --name-only 2>/dev/null
+      git diff --name-only --cached 2>/dev/null
+      git ls-files --others --exclude-standard 2>/dev/null
+    } | sort -u
+  )
+
+  # Filter to paths that can affect the ryno-cli binary
+  matches_cli() {
+    local path=$1
+    case "$path" in
+      Cargo.toml|Cargo.lock|proto/*)
+        return 0 ;;
+      crates/ryno-cli/*|crates/ryno-core/*|crates/ryno-bootstrap/*)
+        return 0 ;;
+      crates/ryno-prover/*)
+        return 0 ;;
+      crates/ryno-policy/*|crates/ryno-providers/*|crates/ryno-tui/*)
+        return 0 ;;
+      *)
+        return 1 ;;
+    esac
+  }
+
+  # Compute a composite fingerprint of matching dirty files
+  payload=""
+  for path in "${changed_files[@]}"; do
+    matches_cli "$path" || continue
+    if [[ -e "$path" ]]; then
+      digest=$(shasum -a 256 "$path" | cut -d ' ' -f 1)
+    else
+      digest="__MISSING__"
+    fi
+    payload+="${path}:${digest}"$'\n'
+  done
+
+  if [[ -n "$payload" ]]; then
+    current_fingerprint=$(printf '%s' "$payload" | shasum -a 256 | cut -d ' ' -f 1)
+  else
+    current_fingerprint=""
+  fi
+
+  # Load previous state
+  previous_head=""
+  previous_fingerprint=""
+  if [[ -f "$STATE_FILE" ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        head) previous_head=$value ;;
+        fingerprint) previous_fingerprint=$value ;;
+      esac
+    done < "$STATE_FILE"
+  fi
+
+  # Decide whether to rebuild
+  if [[ "$current_head" != "$previous_head" ]]; then
+    needs_build=1
+  elif [[ "$current_fingerprint" != "$previous_fingerprint" ]]; then
+    needs_build=1
+  fi
+fi
+
+if [[ "$needs_build" == "1" ]]; then
+  echo "Recompiling ryno..." >&2
+  build_args=(--package ryno-cli --quiet)
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists z3 >/dev/null 2>&1; then
+    z3_prefix=""
+    if command -v brew >/dev/null 2>&1; then
+      z3_prefix=$(brew --prefix z3 2>/dev/null || true)
+    fi
+
+    for candidate in "$z3_prefix" /opt/homebrew/opt/z3 /usr/local/opt/z3; do
+      if [[ -n "$candidate" && -f "$candidate/include/z3.h" && -d "$candidate/lib" ]]; then
+        echo "Using local Z3 from ${candidate} for CLI build." >&2
+        export Z3_SYS_Z3_HEADER="${candidate}/include/z3.h"
+        export Z3_LIBRARY_PATH_OVERRIDE="${candidate}/lib"
+        break
+      fi
+    done
+  fi
+  cargo build "${build_args[@]}"
+  # Persist state after successful build
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cd "$PROJECT_ROOT"
+  new_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+  # Recompute fingerprint of remaining dirty files (build may not change them)
+  post_files=()
+  while IFS= read -r path; do
+    post_files+=("$path")
+  done < <(
+    {
+      git diff --name-only 2>/dev/null
+      git diff --name-only --cached 2>/dev/null
+      git ls-files --others --exclude-standard 2>/dev/null
+    } | sort -u
+  )
+
+  matches_cli() {
+    local path=$1
+    case "$path" in
+      Cargo.toml|Cargo.lock|proto/*)
+        return 0 ;;
+      crates/ryno-cli/*|crates/ryno-core/*|crates/ryno-bootstrap/*)
+        return 0 ;;
+      crates/ryno-prover/*)
+        return 0 ;;
+      crates/ryno-policy/*|crates/ryno-providers/*|crates/ryno-tui/*)
+        return 0 ;;
+      *)
+        return 1 ;;
+    esac
+  }
+
+  post_payload=""
+  for path in "${post_files[@]}"; do
+    matches_cli "$path" || continue
+    if [[ -e "$path" ]]; then
+      digest=$(shasum -a 256 "$path" | cut -d ' ' -f 1)
+    else
+      digest="__MISSING__"
+    fi
+    post_payload+="${path}:${digest}"$'\n'
+  done
+
+  if [[ -n "$post_payload" ]]; then
+    new_fingerprint=$(printf '%s' "$post_payload" | shasum -a 256 | cut -d ' ' -f 1)
+  else
+    new_fingerprint=""
+  fi
+
+  cat > "$STATE_FILE" <<EOF
+head=${new_head}
+fingerprint=${new_fingerprint}
+EOF
+fi
+
+cd "$CALLER_PWD"
+exec "$BINARY" "$@"

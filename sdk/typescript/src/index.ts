@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Public API surface for @nvidia/openshell-sdk.
+// Public API surface for @nvidia/ryno-sdk.
 //
 export type {
   ConnectOptions,
@@ -55,8 +55,8 @@ export type {
 } from './client.js';
 export {
   errorCode,
-  OpenShellClient,
   Pager,
+  RynoClient,
   SandboxClient,
   SandboxTemplateClient,
   ServiceAuthorizationMode,

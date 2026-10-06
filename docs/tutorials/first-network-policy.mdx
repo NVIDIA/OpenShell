@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Write Your First Sandbox Network Policy"
 sidebar-title: "First Network Policy"
-description: "Learn how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
+description: "Learn how Ryno network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
 keywords: "Generative AI, Cybersecurity, Tutorial, Policy, Network Policy, Sandbox, Security"
 ---
 
-This tutorial shows how OpenShell's network policy system works in under five minutes. You create a sandbox, watch a request get blocked by the default-deny policy, apply a fine-grained L7 rule, and verify that reads are allowed while writes are blocked, all without restarting anything.
+This tutorial shows how Ryno's network policy system works in under five minutes. You create a sandbox, watch a request get blocked by the default-deny policy, apply a fine-grained L7 rule, and verify that reads are allowed while writes are blocked, all without restarting anything.
 
 After completing this tutorial, you understand:
 
@@ -18,12 +18,12 @@ After completing this tutorial, you understand:
 
 ## Prerequisites
 
-- A working OpenShell installation with an active gateway. Refer to [Installation](/about/installation) before proceeding.
+- A working Ryno installation with an active gateway. Refer to [Installation](/about/installation) before proceeding.
 - Docker Desktop running on your machine.
 - A user-owned workload image with `curl` installed.
 
 <Tip>
-To run every step of this tutorial, you can also use the automated demo script at the [examples/sandbox-policy-quickstart](https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart) directory in the NVIDIA OpenShell repository. It runs the full walkthrough in under a minute but without any user interaction.
+To run every step of this tutorial, you can also use the automated demo script at the [examples/sandbox-policy-quickstart](https://github.com/NVIDIA/Ryno/blob/main/examples/sandbox-policy-quickstart) directory in the NVIDIA Ryno repository. It runs the full walkthrough in under a minute but without any user interaction.
 
 ```shell
 bash examples/sandbox-policy-quickstart/demo.sh
@@ -38,7 +38,7 @@ bash examples/sandbox-policy-quickstart/demo.sh
 Start by creating a sandbox with no network policies. This gives you a clean environment to observe default-deny behavior.
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name demo \
   --from registry.example.com/team/agent-tools:1.0 \
   --no-auto-providers
@@ -68,7 +68,7 @@ The request fails. By default, all outbound network traffic is denied. The sandb
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
-Leave this sandbox shell open and switch to a second terminal on your host for the next steps. The remaining `openshell` commands (checking logs and applying the policy) run on your host, not inside the sandbox.
+Leave this sandbox shell open and switch to a second terminal on your host for the next steps. The remaining `ryno` commands (checking logs and applying the policy) run on your host, not inside the sandbox.
 
 <Note>
 Keep the interactive sandbox shell open for the rest of the tutorial. Exiting it stops the sandbox's main process, and with the default restart policy the sandbox is not reconnectable afterward. Add `--no-keep` at creation time if you want the sandbox deleted automatically when you exit.
@@ -80,7 +80,7 @@ Keep the interactive sandbox shell open for the rest of the tutorial. Exiting it
 Every denied connection produces a structured log entry. In your second (host) terminal, query the sandbox logs to confirm the denial and inspect the reason.
 
 ```shell
-openshell logs demo --since 5m --source sandbox
+ryno logs demo --since 5m --source sandbox
 ```
 
 You see a line like:
@@ -96,7 +96,7 @@ Every denied connection is logged with the destination, the binary that attempte
 To allow the sandbox to reach the GitHub API, add a network rule that grants `curl` read-only access. Run this command from your host terminal:
 
 ```shell
-openshell policy update demo \
+ryno policy update demo \
   --rule-name github_api \
   --binary /usr/bin/curl \
   --add-endpoint api.github.com:443:read-only:rest:enforce \
@@ -120,7 +120,7 @@ network_policies:
       - path: /usr/bin/curl
 ```
 
-To see the complete policy, run `openshell policy get demo --base`.
+To see the complete policy, run `ryno policy get demo --base`.
 
 `--wait` waits until the sandbox reports a result for the new policy revision. No restart is required, because network rules reload while the sandbox runs.
 
@@ -170,7 +170,7 @@ The connection succeeded because `api.github.com` is allowed, but the proxy insp
 Request-level (L7) denials are logged separately from connection-level denials. The log entry includes the exact HTTP method and path that the proxy rejected. Run this from your second (host) terminal, leaving the sandbox shell open:
 
 ```shell
-openshell logs demo --since 5m --source sandbox
+ryno logs demo --since 5m --source sandbox
 ```
 
 ```text
@@ -189,7 +189,7 @@ To log violations without blocking requests, set `enforcement: audit` instead of
 Delete the sandbox to free resources. This stops all processes and purges any injected credentials.
 
 ```shell
-openshell sandbox delete demo
+ryno sandbox delete demo
 ```
 
 <Tip>
@@ -205,5 +205,5 @@ bash examples/sandbox-policy-quickstart/demo.sh
 
 ## Next Steps
 
-- To understand how OpenShell evaluates network rules, refer to [Sandbox Policies](/how-it-works/policies/overview).
+- To understand how Ryno evaluates network rules, refer to [Sandbox Policies](/how-it-works/policies/overview).
 - To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [GitHub Sandbox](/tutorials/github-push-access).

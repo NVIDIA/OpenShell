@@ -1,35 +1,35 @@
 ---
 name: tui-development
-description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, openshell-tui, tui development, tui feature, tui bug.
+description: Guide for developing the Ryno TUI — a ratatui-based terminal UI for the Ryno platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, ryno-tui, tui development, tui feature, tui bug.
 metadata:
   internal: true
 ---
 
-# OpenShell TUI Development Guide
+# Ryno TUI Development Guide
 
-Comprehensive reference for any agent working on the OpenShell TUI.
+Comprehensive reference for any agent working on the Ryno TUI.
 
 ## 1. Overview
 
-The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `openshell` CLI, but with a live, interactive dashboard.
+The Ryno TUI is a ratatui-based terminal UI for the Ryno platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `ryno` CLI, but with a live, interactive dashboard.
 
-- **Launched via:** `openshell term` or `mise run term`
-- **Crate:** `crates/openshell-tui/`
+- **Launched via:** `ryno term` or `mise run term`
+- **Crate:** `crates/ryno-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.area()` for the drawable terminal area
   - `crossterm` (workspace version) — terminal backend and event polling
-  - `tonic` with TLS — gRPC client for the OpenShell gateway
+  - `tonic` with TLS — gRPC client for the Ryno gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
-  - `openshell-core` — proto-generated types (`OpenShellClient`, request/response structs)
-  - `openshell-bootstrap` — gateway discovery (`list_gateways()`)
-- **Theme:** Adaptive dark/light via `Theme` struct — NVIDIA-branded green accents. Controlled by `--theme` flag, `OPENSHELL_THEME` env var, or auto-detection.
+  - `ryno-core` — proto-generated types (`RynoClient`, request/response structs)
+  - `ryno-bootstrap` — gateway discovery (`list_gateways()`)
+- **Theme:** Adaptive dark/light via `Theme` struct — NVIDIA-branded green accents. Controlled by `--theme` flag, `RYNO_THEME` env var, or auto-detection.
 
 ## 2. Domain Object Hierarchy
 
 The data model follows a strict hierarchy: **Gateway > Workspace > Sandboxes/Providers/Settings > Logs**.
 
 ```
-Gateway (discovered via openshell_bootstrap::list_gateways())
+Gateway (discovered via ryno_bootstrap::list_gateways())
   ├── Global Settings (fetched via GetGatewayConfig)
   ├── Global Policy indicator (fetched via ListSandboxPolicies global=true)
   ├── Workspaces (fetched via ListWorkspaces)
@@ -43,7 +43,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
         └── Logs (fetched via GetSandboxLogs + streamed via WatchSandbox)
 ```
 
-- **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, local/remote flag, and source label.
+- **Gateways** are discovered from on-disk config via `ryno_bootstrap::list_gateways()`. Each gateway has a name, endpoint, local/remote flag, and source label.
 - **Workspaces** are fetched via `ListWorkspaces`. The user cycles through workspaces with `[w]`, or views all workspaces at once. The current workspace scopes provider and sandbox lists.
 - **Provider Profiles** are fetched per-workspace via `ListProviderProfiles`. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
 - **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. The TUI supports profile-backed create, update, and delete operations.
@@ -55,7 +55,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell v<version> │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
+ Ryno v<version> │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -144,8 +144,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
-- Sandbox detail: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
+- Dashboard: ` >_ Ryno v<version> | Current Gateway: ryno [local] (Healthy) | Workspace: default | Dashboard`
+- Sandbox detail: ` >_ Ryno v<version> | Current Gateway: ryno [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -170,7 +170,7 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection. The NOTES column summarizes active `ConfigurationInvalid` readiness conditions as `Invalid config` before port forwards and clears the note on refresh after repair. Full diagnostics remain available through `openshell sandbox get <name> -o json`. Timed-out provisioning attempts show `Provisioning timed out` with cleanup pending or compute reclaimed, preserving port forwards. The sandbox detail pane wraps the full configuration error in its Notes field.
+**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection. The NOTES column summarizes active `ConfigurationInvalid` readiness conditions as `Invalid config` before port forwards and clears the note on refresh after repair. Full diagnostics remain available through `ryno sandbox get <name> -o json`. Timed-out provisioning attempts show `Provisioning timed out` with cleanup pending or compute reclaimed, preserving port forwards. The sandbox detail pane wraps the full configuration error in its Notes field.
 
 **Providers**: Fetched via `ListProviders` in the background collection-refresh task. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`. Follow each list RPC's `next_page_token` until empty.
 
@@ -226,14 +226,14 @@ tokio::time::timeout(Duration::from_secs(5), client.health(req)).await
 
 ### Theme System (`theme.rs`)
 
-Colors and styles are defined in `crates/openshell-tui/src/theme.rs` via the `Theme` struct. The TUI supports dark and light terminal backgrounds.
+Colors and styles are defined in `crates/ryno-tui/src/theme.rs` via the `Theme` struct. The TUI supports dark and light terminal backgrounds.
 
 #### Theme selection
 
 Theme mode is controlled by three mechanisms (highest priority first):
 
-1. `--theme dark|light|auto` CLI flag on `openshell term`
-2. `OPENSHELL_THEME` environment variable
+1. `--theme dark|light|auto` CLI flag on `ryno term`
+2. `RYNO_THEME` environment variable
 3. Auto-detection via `COLORFGBG` env var (falls back to dark)
 
 The `ThemeMode` enum (`Auto`, `Dark`, `Light`) is resolved at startup via `theme::detect()` before entering raw mode.
@@ -315,18 +315,18 @@ The `confirm_delete` flag in `App` gates destructive key handling — while true
 
 ### CLI parity
 
-TUI actions should parallel `openshell` CLI commands so users have familiar mental models:
+TUI actions should parallel `ryno` CLI commands so users have familiar mental models:
 
 | CLI Command | TUI Equivalent |
 | --- | --- |
-| `openshell sandbox list` | Sandbox table on Dashboard |
-| `openshell sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
-| `openshell sandbox create` | `[c]` on sandbox panel to open create form |
-| `openshell sandbox connect` | `[s]` on sandbox policy view to launch SSH shell |
-| `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `openshell provider list` | Provider table on Dashboard (middle pane) |
-| `openshell provider create` | `[c]` on provider panel |
-| `openshell status` | Status in title bar + gateway list |
+| `ryno sandbox list` | Sandbox table on Dashboard |
+| `ryno sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
+| `ryno sandbox create` | `[c]` on sandbox panel to open create form |
+| `ryno sandbox connect` | `[s]` on sandbox policy view to launch SSH shell |
+| `ryno logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `ryno provider list` | Provider table on Dashboard (middle pane) |
+| `ryno provider create` | `[c]` on provider panel |
+| `ryno status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
@@ -414,25 +414,25 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 
 | File | Purpose |
 | --- | --- |
-| `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, background collection refresh (`spawn_list_refresh`), gRPC calls (`refresh_global_settings`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
-| `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
-| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `ListRefreshCompleted`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
-| `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
-| `crates/openshell-tui/src/clipboard.rs` | Clipboard copy support for log lines |
-| `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar` (with workspace display), `draw_nav_bar`, `draw_command_bar`, screen routing, shared setting-edit overlay, modal helpers |
-| `crates/openshell-tui/src/ui/dashboard.rs` | Dashboard screen — 3-pane vertical layout: gateway list (25%) + provider/settings middle pane (25%) + sandbox table (50%) |
-| `crates/openshell-tui/src/ui/providers.rs` | Provider list table with profile-aware columns: Name, Category, Type, Credentials, Workspace |
-| `crates/openshell-tui/src/ui/global_settings.rs` | Global settings table: Key, Type, Value. Includes edit overlay, confirm-set, and confirm-delete popups |
-| `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image, Workspace, Notes |
-| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, restart policy/status, providers, policy version |
-| `crates/openshell-tui/src/ui/sandbox_policy.rs` | Policy viewer — rendered policy lines with scroll support, tab title |
-| `crates/openshell-tui/src/ui/sandbox_settings.rs` | Sandbox settings table: Key, Type, Value, Scope. Includes edit overlay and confirm popups |
-| `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter, visual selection mode, clipboard copy |
-| `crates/openshell-tui/src/ui/sandbox_draft.rs` | Draft policy recommendations — chunk list, detail popup, approve/reject/approve-all flows |
-| `crates/openshell-tui/src/ui/create_sandbox.rs` | Create sandbox modal form with name, image, command, providers, ports |
-| `crates/openshell-tui/src/ui/create_provider.rs` | Create provider modal, provider detail popup, update provider form |
-| `crates/openshell-tui/src/ui/splash.rs` | Splash/boot screen |
+| `crates/ryno-tui/Cargo.toml` | Crate manifest — dependencies on `ryno-core`, `ryno-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
+| `crates/ryno-tui/src/lib.rs` | Entry point. Event loop, background collection refresh (`spawn_list_refresh`), gRPC calls (`refresh_global_settings`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
+| `crates/ryno-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
+| `crates/ryno-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `ListRefreshCompleted`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/ryno-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
+| `crates/ryno-tui/src/clipboard.rs` | Clipboard copy support for log lines |
+| `crates/ryno-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar` (with workspace display), `draw_nav_bar`, `draw_command_bar`, screen routing, shared setting-edit overlay, modal helpers |
+| `crates/ryno-tui/src/ui/dashboard.rs` | Dashboard screen — 3-pane vertical layout: gateway list (25%) + provider/settings middle pane (25%) + sandbox table (50%) |
+| `crates/ryno-tui/src/ui/providers.rs` | Provider list table with profile-aware columns: Name, Category, Type, Credentials, Workspace |
+| `crates/ryno-tui/src/ui/global_settings.rs` | Global settings table: Key, Type, Value. Includes edit overlay, confirm-set, and confirm-delete popups |
+| `crates/ryno-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image, Workspace, Notes |
+| `crates/ryno-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, restart policy/status, providers, policy version |
+| `crates/ryno-tui/src/ui/sandbox_policy.rs` | Policy viewer — rendered policy lines with scroll support, tab title |
+| `crates/ryno-tui/src/ui/sandbox_settings.rs` | Sandbox settings table: Key, Type, Value, Scope. Includes edit overlay and confirm popups |
+| `crates/ryno-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter, visual selection mode, clipboard copy |
+| `crates/ryno-tui/src/ui/sandbox_draft.rs` | Draft policy recommendations — chunk list, detail popup, approve/reject/approve-all flows |
+| `crates/ryno-tui/src/ui/create_sandbox.rs` | Create sandbox modal form with name, image, command, providers, ports |
+| `crates/ryno-tui/src/ui/create_provider.rs` | Create provider modal, provider detail popup, update provider form |
+| `crates/ryno-tui/src/ui/splash.rs` | Splash/boot screen |
 
 ### Module dependency flow
 
@@ -462,18 +462,18 @@ lib.rs (event loop, gRPC, async tasks, capability fetch)
 
 ### Dependency constraints
 
-- **`openshell-tui` cannot depend on `openshell-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
+- **`ryno-tui` cannot depend on `ryno-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
 - Gateway authentication supports both mTLS and OIDC. `connect_to_gateway()` reads gateway metadata to determine the auth mode, then builds an `EdgeAuthInterceptor` (bearer token for OIDC, noop for mTLS).
-- mTLS certs are read from `~/.config/openshell/gateways/<name>/mtls/` (ca.crt, tls.crt, tls.key).
-- OIDC tokens are loaded via `openshell_bootstrap::oidc_token::load_oidc_token()` and checked for expiry.
+- mTLS certs are read from `~/.config/ryno/gateways/<name>/mtls/` (ca.crt, tls.crt, tls.key).
+- OIDC tokens are loaded via `ryno_bootstrap::oidc_token::load_oidc_token()` and checked for expiry.
 
 ### Proto generated code
 
-Proto types come from `openshell-core` which generates them from `OUT_DIR` via `include!`. They are **not** checked into the repo. Import paths look like:
+Proto types come from `ryno-core` which generates them from `OUT_DIR` via `include!`. They are **not** checked into the repo. Import paths look like:
 
 ```rust
-use openshell_core::proto::openshell_client::OpenShellClient;
-use openshell_core::proto::{
+use ryno_core::proto::ryno_client::RynoClient;
+use ryno_core::proto::{
     all_workspaces_selector, workspace_selector, GetSandboxLogsRequest,
     ListSandboxesRequest, ...
 };
@@ -484,7 +484,7 @@ use openshell_core::proto::{
 - `DeleteSandboxRequest` uses `name` for the primary sandbox and an explicit
   workspace selector:
   ```rust
-  let req = openshell_core::proto::DeleteSandboxRequest {
+  let req = ryno_core::proto::DeleteSandboxRequest {
       name: sandbox_name,
       workspace_scope: Some(workspace_selector(workspace)),
       allow_missing: true,
@@ -496,7 +496,7 @@ use openshell_core::proto::{
   outcomes as unconfirmed, not completed.
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
-  let req = openshell_core::proto::WatchSandboxRequest {
+  let req = ryno_core::proto::WatchSandboxRequest {
       sandbox: sandbox_name,
       follow_status: false,
       follow_logs: true,
@@ -592,7 +592,7 @@ For sandbox settings, globally-managed entries (scope = global) are blocked from
 
 ```bash
 # Build the crate
-cargo build -p openshell-tui
+cargo build -p ryno-tui
 
 # Run the TUI against the active gateway
 mise run term
@@ -601,10 +601,10 @@ mise run term
 mise run term:dev
 
 # Format
-cargo fmt -p openshell-tui
+cargo fmt -p ryno-tui
 
 # Lint
-cargo clippy -p openshell-tui
+cargo clippy -p ryno-tui
 ```
 
 ### Pre-commit
@@ -628,7 +628,7 @@ mise run gateway:docker
 For Kubernetes Helm deployments:
 
 ```bash
-helm upgrade --install openshell deploy/helm/openshell --namespace openshell
+helm upgrade --install ryno deploy/helm/ryno --namespace ryno
 ```
 
 For Kubernetes, pick up new sandbox images after changing sandbox code by deleting the pod manually so it gets recreated:
@@ -639,7 +639,7 @@ kubectl delete pod <pod-name> -n <namespace>
 
 ### Adding a new gRPC call
 
-1. Check the proto definitions in `openshell-core` for available RPCs and message types.
+1. Check the proto definitions in `ryno-core` for available RPCs and message types.
 2. Add the call in `lib.rs` following the existing pattern (timeout wrapper, error handling, state update).
 3. If the call is triggered by a key press, add a `pending_*` flag to `App` and handle it in the event loop.
 4. If the call returns streaming data, spawn it as a background task and send results via `Event` variants.

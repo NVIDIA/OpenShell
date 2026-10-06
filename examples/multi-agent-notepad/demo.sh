@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
 PROMPTS_DIR="${SCRIPT_DIR}/prompts"
 
-OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
+RYNO_BIN="${RYNO_BIN:-ryno}"
 DEMO_TOPIC="${DEMO_TOPIC:-How should teams evaluate sandboxed coding agents?}"
 DEMO_AGENT_COUNT="${DEMO_AGENT_COUNT:-5}"
 DEMO_AGENT_IMAGE="${DEMO_AGENT_IMAGE:-}"
@@ -23,7 +23,7 @@ DEMO_KEEP_SANDBOXES="${DEMO_KEEP_SANDBOXES:-0}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-oauth-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-memory-${DEMO_RUN_ID}}"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-codex-github.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryno-codex-github.XXXXXX")"
 POLICY_FILE="${TMP_DIR}/policy.yaml"
 PAYLOAD_DIR="${TMP_DIR}/payload"
 RUNNER_FILE="${PAYLOAD_DIR}/demo-runner.sh"
@@ -68,15 +68,15 @@ cleanup() {
 
     if [[ "$DEMO_KEEP_SANDBOXES" != "1" ]]; then
         for i in $(seq 1 "$DEMO_AGENT_COUNT"); do
-            "$OPENSHELL_BIN" sandbox delete "mn-${SANDBOX_TAG}-a${i}" >/dev/null 2>&1 || true
+            "$RYNO_BIN" sandbox delete "mn-${SANDBOX_TAG}-a${i}" >/dev/null 2>&1 || true
         done
-        "$OPENSHELL_BIN" sandbox delete "mn-${SANDBOX_TAG}-sum" >/dev/null 2>&1 || true
+        "$RYNO_BIN" sandbox delete "mn-${SANDBOX_TAG}-sum" >/dev/null 2>&1 || true
     else
         printf "\n${YELLOW}Keeping sandboxes because DEMO_KEEP_SANDBOXES=1.${RESET}\n"
     fi
 
-    "$OPENSHELL_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
     if [[ $status -ne 0 ]]; then
         printf "\n${YELLOW}Logs kept at: %s${RESET}\n" "$LOG_DIR"
@@ -91,7 +91,7 @@ require_command() {
 }
 
 validate_env() {
-    require_command "$OPENSHELL_BIN"
+    require_command "$RYNO_BIN"
     require_command jq
     require_command sed
 
@@ -107,8 +107,8 @@ validate_env() {
     [[ "$DEMO_BRANCH" =~ ^[A-Za-z0-9._-]+$ ]] || fail "DEMO_BRANCH may contain only letters, numbers, '.', '_', and '-'"
     info "GitHub repo ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}@${DEMO_BRANCH} and token present"
 
-    info "checking OpenShell gateway is reachable..."
-    "$OPENSHELL_BIN" status >/dev/null 2>&1 || fail "OpenShell gateway is not reachable; run: mise run gateway:docker"
+    info "checking Ryno gateway is reachable..."
+    "$RYNO_BIN" status >/dev/null 2>&1 || fail "Ryno gateway is not reachable; run: mise run gateway:docker"
 
     export CODEX_AUTH_ACCESS_TOKEN
     export CODEX_AUTH_REFRESH_TOKEN
@@ -139,17 +139,17 @@ write_runner() {
 }
 
 create_providers() {
-    "$OPENSHELL_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
-    "$OPENSHELL_BIN" provider create \
+    "$RYNO_BIN" provider create \
         --name "$DEMO_CODEX_PROVIDER_NAME" \
         --type codex \
         --credential CODEX_AUTH_ACCESS_TOKEN \
         --credential CODEX_AUTH_REFRESH_TOKEN \
         --credential CODEX_AUTH_ACCOUNT_ID >/dev/null
 
-    "$OPENSHELL_BIN" provider create \
+    "$RYNO_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
         --type github \
         --credential "GITHUB_TOKEN=$DEMO_GITHUB_TOKEN" >/dev/null
@@ -159,7 +159,7 @@ run_sandbox() {
     local name="$1"
     shift
     [[ -n "$DEMO_AGENT_IMAGE" ]] || fail "set DEMO_AGENT_IMAGE to an OCI image containing Codex, curl, and bash"
-    "$OPENSHELL_BIN" sandbox create \
+    "$RYNO_BIN" sandbox create \
         --name "$name" \
         --from "$DEMO_AGENT_IMAGE" \
         --provider "$DEMO_CODEX_PROVIDER_NAME" \

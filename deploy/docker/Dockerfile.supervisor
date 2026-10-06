@@ -12,6 +12,6 @@ FROM gcr.io/distroless/base-nossl-debian13@sha256:af5cb8dd589b8520b8c06bebb9efb7
 
 ARG TARGETARCH
 
-COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-supervisor /openshell-supervisor
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/ryno-supervisor /ryno-supervisor
 
-ENTRYPOINT ["/openshell-supervisor"]
+ENTRYPOINT ["/ryno-supervisor"]

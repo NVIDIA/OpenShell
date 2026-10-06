@@ -37,7 +37,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -49,43 +49,43 @@ jobs:
       - name: Download CLI artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-${{ matrix.cli_target }}
+          name: ryno-${{ matrix.cli_target }}
           path: package-binaries/
 
       - name: Download gateway artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-gateway-${{ matrix.gnu_target }}
+          name: ryno-gateway-${{ matrix.gnu_target }}
           path: package-binaries/
 
       - name: Download prover artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-prover-${{ matrix.cli_target }}
+          name: ryno-prover-${{ matrix.cli_target }}
           path: package-binaries/
 
       - name: Download VM driver artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-driver-vm-${{ matrix.gnu_target }}
+          name: ryno-driver-vm-${{ matrix.gnu_target }}
           path: package-binaries/
 
       - name: Configure package inputs
         run: |
           set -euo pipefail
-          chmod +x package-binaries/openshell{,-gateway,-prover,-driver-vm}
+          chmod +x package-binaries/ryno{,-gateway,-prover,-driver-vm}
           ls -lah package-binaries
 
       - name: Build Debian package
         run: |
           set -euo pipefail
-          OPENSHELL_CLI_BINARY="${PWD}/package-binaries/openshell" \
-          OPENSHELL_GATEWAY_BINARY="${PWD}/package-binaries/openshell-gateway" \
-          OPENSHELL_PROVER_BINARY="${PWD}/package-binaries/openshell-prover" \
-          OPENSHELL_DRIVER_VM_BINARY="${PWD}/package-binaries/openshell-driver-vm" \
-          OPENSHELL_DEB_VERSION="${INPUTS_DEB_VERSION}" \
-          OPENSHELL_DEB_ARCH="${{ matrix.deb_arch }}" \
-          OPENSHELL_OUTPUT_DIR=artifacts \
+          RYNO_CLI_BINARY="${PWD}/package-binaries/ryno" \
+          RYNO_GATEWAY_BINARY="${PWD}/package-binaries/ryno-gateway" \
+          RYNO_PROVER_BINARY="${PWD}/package-binaries/ryno-prover" \
+          RYNO_DRIVER_VM_BINARY="${PWD}/package-binaries/ryno-driver-vm" \
+          RYNO_DEB_VERSION="${INPUTS_DEB_VERSION}" \
+          RYNO_DEB_ARCH="${{ matrix.deb_arch }}" \
+          RYNO_OUTPUT_DIR=artifacts \
             tasks/scripts/package-deb.sh
         env:
           INPUTS_DEB_VERSION: ${{ inputs['deb-version'] }}

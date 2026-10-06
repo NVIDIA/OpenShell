@@ -10,7 +10,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 out="${tmpdir}/out"
 err="${tmpdir}/err"
 
-export OPENSHELL_INSTALL_SH_TEST=1
+export RYNO_INSTALL_SH_TEST=1
 # shellcheck source=../../install.sh
 . "${ROOT}/install.sh"
 
@@ -18,7 +18,7 @@ assert_glibc_preflight_passes() {
   local name=$1
   local ldd_output=$2
 
-  if ! (export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1 OPENSHELL_TEST_LDD_OUTPUT="$ldd_output"; require_linux_package_glibc) >"$out" 2>"$err"; then
+  if ! (export RYNO_TEST_GETCONF_UNAVAILABLE=1 RYNO_TEST_LDD_OUTPUT="$ldd_output"; require_linux_package_glibc) >"$out" 2>"$err"; then
     echo "FAIL: ${name}" >&2
     cat "$err" >&2 || true
     exit 1
@@ -45,36 +45,36 @@ assert_glibc_preflight_fails() {
 }
 
 setup_glibc_227() {
-  export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
-  export OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.27"
+  export RYNO_TEST_GETCONF_UNAVAILABLE=1
+  export RYNO_TEST_LDD_OUTPUT="ldd (GNU libc) 2.27"
 }
 
 setup_missing_glibc() {
-  export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
-  export OPENSHELL_TEST_LDD_UNAVAILABLE=1
+  export RYNO_TEST_GETCONF_UNAVAILABLE=1
+  export RYNO_TEST_LDD_UNAVAILABLE=1
 }
 
 setup_getconf_musl() {
-  export OPENSHELL_TEST_LDD_UNAVAILABLE=1
-  export OPENSHELL_TEST_GETCONF_OUTPUT="musl libc"
+  export RYNO_TEST_LDD_UNAVAILABLE=1
+  export RYNO_TEST_GETCONF_OUTPUT="musl libc"
 }
 
 setup_ldd_musl() {
-  export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
-  export OPENSHELL_TEST_LDD_OUTPUT="musl libc (x86_64)"
+  export RYNO_TEST_GETCONF_UNAVAILABLE=1
+  export RYNO_TEST_LDD_OUTPUT="musl libc (x86_64)"
 }
 
 assert_glibc_preflight_passes "glibc 2.28 passes" "glibc 2.28"
 assert_glibc_preflight_passes "glibc 2.31 passes" "glibc 2.31"
 assert_glibc_preflight_passes "glibc 2.35 passes" "ldd (GNU libc) 2.35"
 
-if ! (export OPENSHELL_TEST_LDD_UNAVAILABLE=1 OPENSHELL_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
+if ! (export RYNO_TEST_LDD_UNAVAILABLE=1 RYNO_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
   echo "FAIL: getconf glibc fallback passes" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 
-if ! (export OPENSHELL_TEST_LDD_OUTPUT="not ldd" OPENSHELL_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
+if ! (export RYNO_TEST_LDD_OUTPUT="not ldd" RYNO_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
   echo "FAIL: unparseable ldd output falls back to getconf" >&2
   cat "$err" >&2 || true
   exit 1
@@ -82,26 +82,26 @@ fi
 
 assert_glibc_preflight_fails \
   "glibc 2.27 fails" \
-  "OpenShell Linux packages require glibc >= 2.28; detected glibc 2.27." \
+  "Ryno Linux packages require glibc >= 2.28; detected glibc 2.27." \
   setup_glibc_227
 
 assert_glibc_preflight_fails \
   "missing glibc detection fails" \
-  "OpenShell Linux packages require glibc >= 2.28; could not detect glibc." \
+  "Ryno Linux packages require glibc >= 2.28; could not detect glibc." \
   setup_missing_glibc
 
 assert_glibc_preflight_fails \
   "musl detection fails" \
-  "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
+  "Ryno Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_getconf_musl
 
 assert_glibc_preflight_fails \
   "ldd musl fallback fails" \
-  "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
+  "Ryno Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
 # snap_state: 0 = no snap command, 1 = snap command only,
-# installed = the OpenShell snap is already installed.
+# installed = the Ryno snap is already installed.
 assert_linux_package_method() {
   local name=$1
   local install_method=$2
@@ -113,8 +113,8 @@ assert_linux_package_method() {
   local actual
 
   (
-    export OPENSHELL_INSTALL_METHOD="$install_method"
-    export OPENSHELL_VERSION="$requested_version"
+    export RYNO_INSTALL_METHOD="$install_method"
+    export RYNO_VERSION="$requested_version"
     has_cmd() {
       case "$1" in
         snap) [ "$snap_state" != "0" ] ;;
@@ -123,7 +123,7 @@ assert_linux_package_method() {
         *) return 1 ;;
       esac
     }
-    snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
+    snap() { [ "$*" = "list ryno" ] && [ "$snap_state" = "installed" ]; }
     linux_package_method
   ) >"$out"
   actual="$(cat "$out")"
@@ -148,18 +148,18 @@ assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1
 assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
 assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
 
-if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
-  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD should be rejected" >&2
+if (RYNO_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
+  echo "FAIL: unsupported RYNO_INSTALL_METHOD should be rejected" >&2
   exit 1
 fi
-if ! grep -Fq "unsupported OPENSHELL_INSTALL_METHOD=flatpak" "$err"; then
-  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD was not explained" >&2
+if ! grep -Fq "unsupported RYNO_INSTALL_METHOD=flatpak" "$err"; then
+  echo "FAIL: unsupported RYNO_INSTALL_METHOD was not explained" >&2
   cat "$err" >&2
   exit 1
 fi
 
 if ! (
-  find_existing_native_openshell_bin() { return 1; }
+  find_existing_native_ryno_bin() { return 1; }
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
   echo "FAIL: Snap install without an existing native installation should continue" >&2
@@ -172,15 +172,15 @@ assert_native_to_snap_blocked() {
   local version=$2
 
   if (
-    find_existing_native_openshell_bin() { printf '%s\n' /usr/bin/openshell; }
-    existing_openshell_version() { printf '%s\n' "$version"; }
+    find_existing_native_ryno_bin() { printf '%s\n' /usr/bin/ryno; }
+    existing_ryno_version() { printf '%s\n' "$version"; }
     UPGRADE_NOTICE_ACK=""
     guard_native_to_snap_transition
   ) >"$out" 2>"$err"; then
     echo "FAIL: ${name}: expected native-to-Snap transition to be blocked" >&2
     exit 1
   fi
-  if ! grep -Fq "detected existing non-snap OpenShell ${version} at /usr/bin/openshell" "$err"; then
+  if ! grep -Fq "detected existing non-snap Ryno ${version} at /usr/bin/ryno" "$err"; then
     echo "FAIL: ${name}: missing native installation warning" >&2
     cat "$err" >&2 || true
     exit 1
@@ -196,8 +196,8 @@ assert_native_to_snap_blocked "old native install" v0.0.36
 assert_native_to_snap_blocked "current native install" v1.2.3
 
 if ! (
-  find_existing_native_openshell_bin() { printf '%s\n' /usr/local/bin/openshell; }
-  existing_openshell_version() { printf '%s\n' v1.2.3; }
+  find_existing_native_ryno_bin() { printf '%s\n' /usr/local/bin/ryno; }
+  existing_ryno_version() { printf '%s\n' v1.2.3; }
   UPGRADE_NOTICE_ACK=1
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
@@ -205,7 +205,7 @@ if ! (
   cat "$err" >&2 || true
   exit 1
 fi
-if ! grep -Fq "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set" "$err"; then
+if ! grep -Fq "continuing because RYNO_ACK_BREAKING_UPGRADE=1 is set" "$err"; then
   echo "FAIL: acknowledged native-to-Snap transition was not reported" >&2
   cat "$err" >&2 || true
   exit 1
@@ -222,7 +222,7 @@ fi
 out="$(mktemp)"
 err="$(mktemp)"
 
-if ! OPENSHELL_VERSION=dev openshell_snap_channel >"$out" 2>"$err"; then
+if ! RYNO_VERSION=dev ryno_snap_channel >"$out" 2>"$err"; then
   echo "FAIL: dev must select the latest/edge Snap channel" >&2
   cat "$err" >&2 || true
   exit 1
@@ -237,26 +237,26 @@ if [ -s "$err" ]; then
   exit 1
 fi
 
-if ! OPENSHELL_VERSION="" openshell_snap_channel >"$out" 2>"$err"; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+if ! RYNO_VERSION="" ryno_snap_channel >"$out" 2>"$err"; then
+  echo "FAIL: unset RYNO_VERSION must select the latest/stable Snap channel" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [ "$(cat "$out")" != "latest/stable" ]; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+  echo "FAIL: unset RYNO_VERSION must select the latest/stable Snap channel" >&2
   exit 1
 fi
 if [ -s "$err" ]; then
-  echo "FAIL: unset OPENSHELL_VERSION must not warn about an ignored version" >&2
+  echo "FAIL: unset RYNO_VERSION must not warn about an ignored version" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 
-if (OPENSHELL_VERSION=v1.2.3 openshell_snap_channel) >"$out" 2>"$err"; then
+if (RYNO_VERSION=v1.2.3 ryno_snap_channel) >"$out" 2>"$err"; then
   echo "FAIL: pinned release must not select a Snap channel" >&2
   exit 1
 fi
-if ! grep -Fq "Snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
+if ! grep -Fq "Snap installs do not support RYNO_VERSION=v1.2.3" "$err"; then
   echo "FAIL: pinned release Snap rejection was not explained" >&2
   cat "$err" >&2
   exit 1
@@ -266,7 +266,7 @@ rm -f "$out" "$err"
 assert_snap_install_flow() {
   local name=$1
   local docker_present=$2
-  local openshell_present=$3
+  local ryno_present=$3
   local requested_version=$4
   local expected=$5
   local calls
@@ -282,7 +282,7 @@ assert_snap_install_flow() {
     snap() {
       case "${1:-}:${2:-}" in
         list:docker) return 1 ;;
-        list:openshell) [ "$openshell_present" = "1" ] ;;
+        list:ryno) [ "$ryno_present" = "1" ] ;;
         *) command snap "$@" ;;
       esac
     }
@@ -294,7 +294,7 @@ assert_snap_install_flow() {
     wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
     info() { :; }
     export TARGET_USER=test-user
-    export OPENSHELL_VERSION="$requested_version"
+    export RYNO_VERSION="$requested_version"
     install_linux_snap
   ) >"$out"
   calls="$(cat "$out")"
@@ -312,18 +312,18 @@ assert_snap_install_flow \
   "existing Docker is reused" \
   1 0 "" \
   "wait:docker
-root:snap install openshell --channel=latest/stable
-root:snap restart openshell.gateway
+root:snap install ryno --channel=latest/stable
+root:snap restart ryno.gateway
 wait:gateway-listener
 register:gateway
 wait:gateway-status"
 
 assert_snap_install_flow \
-  "existing OpenShell snap is refreshed" \
+  "existing Ryno snap is refreshed" \
   1 1 "" \
   "wait:docker
-root:snap refresh openshell --channel=latest/stable
-root:snap restart openshell.gateway
+root:snap refresh ryno --channel=latest/stable
+root:snap restart ryno.gateway
 wait:gateway-listener
 register:gateway
 wait:gateway-status"
@@ -374,12 +374,12 @@ assert_snap_install_rejected() {
 assert_snap_install_rejected \
   "missing Docker" \
   0 0 \
-  "Docker is required before installing the OpenShell snap"
+  "Docker is required before installing the Ryno snap"
 
 assert_snap_install_rejected \
   "Docker snap" \
   1 1 \
-  "the Docker snap is not currently compatible with OpenShell"
+  "the Docker snap is not currently compatible with Ryno"
 
 attempts_file="${tmpdir}/docker-attempts"
 root_probes_file="${tmpdir}/docker-root-probes"
@@ -399,7 +399,7 @@ if ! (
   }
   sleep() { :; }
   info() { :; }
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_docker_daemon
+  RYNO_INSTALL_DOCKER_TIMEOUT=3 wait_for_docker_daemon
 ) >"$out" 2>"$err"; then
   echo "FAIL: Docker readiness should succeed after retries" >&2
   cat "$err" >&2 || true
@@ -420,7 +420,7 @@ if (
   snap() { return 1; }
   sleep() { :; }
   info() { :; }
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_docker_daemon
+  RYNO_INSTALL_DOCKER_TIMEOUT=2 wait_for_docker_daemon
 ) >"$out" 2>"$err"; then
   echo "FAIL: Docker readiness timeout should fail" >&2
   exit 1
@@ -431,7 +431,7 @@ if ! grep -Fq "Docker daemon did not become reachable within 2s" "$err"; then
   exit 1
 fi
 
-if ! grep -Fq '/snap/bin/openshell' "${ROOT}/install.sh"; then
+if ! grep -Fq '/snap/bin/ryno' "${ROOT}/install.sh"; then
   echo "FAIL: Snap installs must use the Snap CLI explicitly" >&2
   exit 1
 fi
@@ -453,7 +453,7 @@ if ! (
 fi
 registration_calls="$(cat "$registration_calls_file")"
 if [ "$registration_calls" != "copy:client-bundle
-target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]; then
+target:/snap/bin/ryno gateway add https://127.0.0.1:17670 --local --name ryno" ]; then
   echo "FAIL: mTLS Snap gateway registration must copy the client bundle and use HTTPS" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
@@ -472,7 +472,7 @@ if ! (
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
-if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
+if [ "$registration_calls" != "target:/snap/bin/ryno gateway add http://127.0.0.1:17670 --local --name ryno" ]; then
   echo "FAIL: legacy Snap gateway registration must use HTTP without copying certificates" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
@@ -493,7 +493,7 @@ assert_snap_listener_probe() {
     curl() { printf '%s\n' "$*"; }
     snap_gateway_uses_mtls() { [ "$uses_mtls" = "1" ]; }
     info() { :; }
-    OPENSHELL_SNAP_TLS_DIR=/tls
+    RYNO_SNAP_TLS_DIR=/tls
     wait_for_snap_gateway_listener >/dev/null
     printf '%s\n' "$_last_output"
   )"
@@ -514,16 +514,16 @@ printf 'ca\n' >"${snap_tls_src}/ca.crt"
 printf 'cert\n' >"${snap_tls_src}/client/tls.crt"
 printf 'key\n' >"${snap_tls_src}/client/tls.key"
 snap_user_home="${tmpdir}/snap-user-home"
-mkdir -p "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client"
-printf 'old key\n' >"${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
-chmod 644 "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
+mkdir -p "${snap_user_home}/snap/ryno/common/.local/state/ryno/tls/client"
+printf 'old key\n' >"${snap_user_home}/snap/ryno/common/.local/state/ryno/tls/client/tls.key"
+chmod 644 "${snap_user_home}/snap/ryno/common/.local/state/ryno/tls/client/tls.key"
 (
   as_root() { "$@"; }
   as_target_user() { "$@"; }
   TARGET_HOME="$snap_user_home"
-  OPENSHELL_SNAP_TLS_DIR="$snap_tls_src" copy_snap_client_bundle
+  RYNO_SNAP_TLS_DIR="$snap_tls_src" copy_snap_client_bundle
 )
-snap_user_tls="${snap_user_home}/snap/openshell/common/.local/state/openshell/tls"
+snap_user_tls="${snap_user_home}/snap/ryno/common/.local/state/ryno/tls"
 for file in ca.crt client/tls.crt client/tls.key; do
   if ! cmp -s "${snap_tls_src}/${file}" "${snap_user_tls}/${file}"; then
     echo "FAIL: Snap client bundle copy missing ${file}" >&2
@@ -587,12 +587,12 @@ run_listener_wait() {
     dump_local_gateway_diagnostics() { echo "gateway diagnostics" >&2; }
     TARGET_HOME="${tmpdir}/listener-home"
     PLATFORM=linux
-    OPENSHELL_INSTALL_GATEWAY_TIMEOUT=5 wait_for_local_gateway_listener "$@"
+    RYNO_INSTALL_GATEWAY_TIMEOUT=5 wait_for_local_gateway_listener "$@"
   ) >"$out" 2>"$err" && return 1
   wc -c <"$sleeps_file" | tr -d ' '
 }
 
-listener_mtls_dir="${tmpdir}/listener-home/.config/openshell/gateways/openshell/mtls"
+listener_mtls_dir="${tmpdir}/listener-home/.config/ryno/gateways/ryno/mtls"
 mkdir -p "$listener_mtls_dir"
 : >"${listener_mtls_dir}/ca.crt"
 : >"${listener_mtls_dir}/tls.crt"
@@ -605,7 +605,7 @@ if [ "$(run_listener_wait "$restarting_unit" user_gateway_service_failed)" != "0
   echo "FAIL: a failed gateway service must stop the listener wait immediately" >&2
   exit 1
 fi
-if [ "$(tail -n 1 "$err")" != "openshell: error: the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway" ]; then
+if [ "$(tail -n 1 "$err")" != "ryno: error: the ryno-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart ryno-gateway" ]; then
   echo "FAIL: a failed gateway service must end with the service error" >&2
   cat "$err" >&2
   exit 1
@@ -641,12 +641,12 @@ if [ "$(PLATFORM=linux local_gateway_endpoint)" != "https://127.0.0.1:17670" ]; 
 fi
 
 cat >"${tmpdir}/checksums" <<'EOF'
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-dev-x86_64.rpm
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-gateway-dev-x86_64.rpm
-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-prover-dev-x86_64.rpm
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ryno-dev-x86_64.rpm
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ryno-gateway-dev-x86_64.rpm
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  ryno-prover-dev-x86_64.rpm
 EOF
 
-if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-prover)" != "openshell-prover-dev-x86_64.rpm" ]; then
+if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 ryno-prover)" != "ryno-prover-dev-x86_64.rpm" ]; then
   echo "FAIL: RPM prover package selection" >&2
   exit 1
 fi
@@ -673,13 +673,13 @@ gh() {
         *"git/matching-refs/tags/v"*)
           printf '%s\n' v2.0.0-pre.1 v1.0.0-pre.2 v0.1.0-pre.9
           ;;
-        *"?name=openshell-v2.0.0-pre.1-linux-amd64-deb"*)
+        *"?name=ryno-v2.0.0-pre.1-linux-amd64-deb"*)
           [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '999\n'
           ;;
-        *"?name=openshell-v1.0.0-pre.2-linux-amd64-deb"*)
+        *"?name=ryno-v1.0.0-pre.2-linux-amd64-deb"*)
           [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '101\n'
           ;;
-        *"?name=openshell-v0.1.0-pre.9-linux-amd64-deb"*)
+        *"?name=ryno-v0.1.0-pre.9-linux-amd64-deb"*)
           [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '123456\n'
           ;;
         *"actions/runs/999"*) printf 'false\n' ;;
@@ -704,7 +704,7 @@ gh() {
   esac
 }
 
-resolved_prerelease="$(OPENSHELL_VERSION=pre resolve_release_tag)"
+resolved_prerelease="$(RYNO_VERSION=pre resolve_release_tag)"
 if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
   echo "FAIL: pre alias resolved to ${resolved_prerelease}, expected v1.0.0-pre.2" >&2
   exit 1
@@ -714,7 +714,7 @@ if ! grep -Fq 'git/matching-refs/tags/v' "$mock_gh_log"; then
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq 'actions/artifacts?name=openshell-v1.0.0-pre.2-linux-amd64-deb' "$mock_gh_log"; then
+if ! grep -Fq 'actions/artifacts?name=ryno-v1.0.0-pre.2-linux-amd64-deb' "$mock_gh_log"; then
   echo "FAIL: pre alias did not query the platform artifact by name" >&2
   cat "$mock_gh_log" >&2
   exit 1
@@ -736,7 +736,7 @@ if grep -Fq -- '--paginate' "$mock_gh_log"; then
   exit 1
 fi
 
-if (MOCK_NO_PRERELEASE=1 OPENSHELL_VERSION=pre resolve_release_tag) >"$out" 2>"$err"; then
+if (MOCK_NO_PRERELEASE=1 RYNO_VERSION=pre resolve_release_tag) >"$out" 2>"$err"; then
   echo "FAIL: pre alias should fail when no unexpired prerelease artifacts exist" >&2
   exit 1
 fi
@@ -758,12 +758,12 @@ if ! grep -Fq 'select(.expired == false)' "$mock_gh_log"; then
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq 'actions/artifacts?name=openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
+if ! grep -Fq 'actions/artifacts?name=ryno-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
   echo "FAIL: prerelease lookup did not select the current platform artifact" >&2
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq 'run download 123456 --repo NVIDIA/OpenShell --name openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
+if ! grep -Fq 'run download 123456 --repo NVIDIA/Ryno --name ryno-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
   echo "FAIL: prerelease download did not select the current platform artifact" >&2
   cat "$mock_gh_log" >&2
   exit 1
@@ -779,7 +779,7 @@ fi
 for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
   : >"${RELEASE_ASSET_DIR}/${asset}"
 done
-prerelease_formula="${tmpdir}/openshell.rb"
+prerelease_formula="${tmpdir}/ryno.rb"
 printf '%s\n' \
   "  url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_CLI_ASSET}\"" \
   "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_GATEWAY_ASSET}\"" \

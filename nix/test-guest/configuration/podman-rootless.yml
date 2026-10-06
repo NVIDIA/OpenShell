@@ -37,6 +37,6 @@
 
     - name: Record rootless Podman mode
       ansible.builtin.copy:
-        dest: /etc/openshell-test-guest/podman-mode
+        dest: /etc/ryno-test-guest/podman-mode
         content: "rootless\n"
         mode: "0644"

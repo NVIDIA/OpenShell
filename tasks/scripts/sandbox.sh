@@ -6,7 +6,7 @@
 # Create or reconnect to the persistent "dev" sandbox on the active gateway.
 #
 # Start a gateway first with `mise run gateway:docker`, a package-managed
-# openshell-gateway service, or a registered remote gateway.
+# ryno-gateway service, or a registered remote gateway.
 #
 # Provisions an "anthropic" provider from $ANTHROPIC_API_KEY when available.
 
@@ -18,10 +18,10 @@ read -r -a CMD <<< "${usage_command:-claude}"
 # -------------------------------------------------------------------
 # 1. Ensure a gateway is reachable
 # -------------------------------------------------------------------
-if ! openshell status >/dev/null 2>&1; then
-  echo "No reachable OpenShell gateway." >&2
+if ! ryno status >/dev/null 2>&1; then
+  echo "No reachable Ryno gateway." >&2
   echo "Start one in another shell with: mise run gateway:docker" >&2
-  echo "Or register/select an existing gateway with: openshell gateway add <endpoint>" >&2
+  echo "Or register/select an existing gateway with: ryno gateway add <endpoint>" >&2
   exit 2
 fi
 
@@ -30,7 +30,7 @@ fi
 # -------------------------------------------------------------------
 need_create=1
 
-if openshell sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
+if ryno sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
   need_create=0
 fi
 
@@ -42,13 +42,13 @@ ensure_anthropic_provider() {
     return
   fi
 
-  if openshell provider get anthropic >/dev/null 2>&1; then
+  if ryno provider get anthropic >/dev/null 2>&1; then
     # Provider already registered — nothing to do.
     return
   fi
 
   echo "Registering anthropic provider..."
-  openshell provider create \
+  ryno provider create \
     --name anthropic \
     --type claude-code \
     --credential "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
@@ -60,14 +60,14 @@ ensure_anthropic_provider
 # 4. Create or connect to the sandbox
 # -------------------------------------------------------------------
 PROVIDER_ARGS=()
-if openshell provider get anthropic >/dev/null 2>&1; then
+if ryno provider get anthropic >/dev/null 2>&1; then
   PROVIDER_ARGS+=(--provider anthropic)
 fi
 
 if [[ "${need_create}" == "1" ]]; then
   echo "Creating sandbox '${SANDBOX_NAME}'..."
-  openshell sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" --tty -- "${CMD[@]}"
+  ryno sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" --tty -- "${CMD[@]}"
 else
   echo "Connecting to existing sandbox '${SANDBOX_NAME}'..."
-  openshell sandbox connect "${SANDBOX_NAME}"
+  ryno sandbox connect "${SANDBOX_NAME}"
 fi

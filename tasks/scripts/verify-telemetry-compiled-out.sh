@@ -4,7 +4,7 @@
 
 # Verify whether telemetry emission code is present in a compiled binary.
 #
-# The `telemetry` Cargo feature (default-on, defined in openshell-core) gates the
+# The `telemetry` Cargo feature (default-on, defined in ryno-core) gates the
 # telemetry endpoint, HTTP client, and emission code. Building with
 # --no-default-features must produce a binary that contains none of it. This
 # guard inspects a built binary for telemetry markers that only exist when the
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # Markers that appear only in compiled-in telemetry emission code. Sourced from
-# crates/openshell-core/src/telemetry.rs (DEFAULT_ENDPOINT host and CLIENT_ID).
+# crates/ryno-core/src/telemetry.rs (DEFAULT_ENDPOINT host and CLIENT_ID).
 # Keep in sync with that file; the `present` positive control fails loudly if a
 # marker goes stale, so the `absent` checks can never become silently vacuous.
 MARKERS=(

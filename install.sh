@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install OpenShell from a GitHub release.
+# Install Ryno from a GitHub release.
 #
 # Linux installs either the Debian or RPM packages from the selected release.
 # Apple Silicon macOS installs the generated Homebrew formula, so Homebrew owns
@@ -10,22 +10,22 @@
 #
 set -e
 
-APP_NAME="openshell"
-REPO="NVIDIA/OpenShell"
+APP_NAME="ryno"
+REPO="NVIDIA/Ryno"
 GITHUB_URL="https://github.com/${REPO}"
-RELEASE_TAG="${OPENSHELL_VERSION:-}"
+RELEASE_TAG="${RYNO_VERSION:-}"
 RELEASE_ASSET_DIR=""
-CHECKSUMS_NAME="openshell-checksums-sha256.txt"
+CHECKSUMS_NAME="ryno-checksums-sha256.txt"
 LOCAL_GATEWAY_PORT="17670"
-HOMEBREW_TAP="nvidia/openshell"
-HOMEBREW_FORMULA_NAME="openshell"
-HOMEBREW_CLI_ASSET="openshell-aarch64-apple-darwin.tar.gz"
-HOMEBREW_GATEWAY_ASSET="openshell-gateway-aarch64-apple-darwin.tar.gz"
-HOMEBREW_DRIVER_VM_ASSET="openshell-driver-vm-aarch64-apple-darwin.tar.gz"
-HOMEBREW_PROVER_ASSET="openshell-prover-aarch64-apple-darwin.tar.gz"
+HOMEBREW_TAP="nvidia/ryno"
+HOMEBREW_FORMULA_NAME="ryno"
+HOMEBREW_CLI_ASSET="ryno-aarch64-apple-darwin.tar.gz"
+HOMEBREW_GATEWAY_ASSET="ryno-gateway-aarch64-apple-darwin.tar.gz"
+HOMEBREW_DRIVER_VM_ASSET="ryno-driver-vm-aarch64-apple-darwin.tar.gz"
+HOMEBREW_PROVER_ASSET="ryno-prover-aarch64-apple-darwin.tar.gz"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
-UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
+UPGRADE_NOTICE_ACK="${RYNO_ACK_BREAKING_UPGRADE:-}"
 
 info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -42,41 +42,41 @@ error() {
 
 usage() {
   cat <<EOF
-install.sh - Install OpenShell
+install.sh - Install Ryno
 
 USAGE:
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh -o install.sh
+    curl -fsSL https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh -o install.sh
     sh install.sh
 
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | sh
 
 OPTIONS:
     --help       Print this help message
 
 ENVIRONMENT VARIABLES:
-    OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
-                        Set OPENSHELL_VERSION=dev to install the rolling dev build.
-                        Set OPENSHELL_VERSION=pre to install the latest prerelease.
+    RYNO_VERSION   Release tag to install (default: latest tagged release).
+                        Set RYNO_VERSION=dev to install the rolling dev build.
+                        Set RYNO_VERSION=pre to install the latest prerelease.
                         Prereleases require an authenticated GitHub CLI session.
-    OPENSHELL_ACK_BREAKING_UPGRADE
+    RYNO_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 or non-snap installation.
-    OPENSHELL_INSTALL_METHOD
+    RYNO_INSTALL_METHOD
                         Linux package to install: snap, deb, or rpm. Unset
                         selects deb or rpm from the host package manager.
 
 NOTES:
-    When OPENSHELL_VERSION is unset, this resolves the latest tagged release
+    When RYNO_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
     x86_64/aarch64, depending on the host package manager. Set
-    OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
-    that already have the OpenShell snap keep refreshing it. Snap installs use
+    RYNO_INSTALL_METHOD=snap to install the Ryno snap instead; hosts
+    that already have the Ryno snap keep refreshing it. Snap installs use
     latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The OpenShell snap requires a running
+    explicit release tags or prereleases. The Ryno snap requires a running
     Docker Engine installed from a system package or Docker's package
-    repository. The Docker snap is not currently compatible with OpenShell.
+    repository. The Docker snap is not currently compatible with Ryno.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -159,12 +159,12 @@ version_at_least_major_minor() {
 }
 
 getconf_gnu_libc_version() {
-  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_UNAVAILABLE:-0}" = "1" ]; then
+  if [ "${RYNO_INSTALL_SH_TEST:-0}" = "1" ] && [ "${RYNO_TEST_GETCONF_UNAVAILABLE:-0}" = "1" ]; then
     return 127
   fi
 
-  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_OUTPUT+x}" = "x" ]; then
-    printf '%s\n' "$OPENSHELL_TEST_GETCONF_OUTPUT"
+  if [ "${RYNO_INSTALL_SH_TEST:-0}" = "1" ] && [ "${RYNO_TEST_GETCONF_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$RYNO_TEST_GETCONF_OUTPUT"
     return 0
   fi
 
@@ -172,12 +172,12 @@ getconf_gnu_libc_version() {
 }
 
 ldd_version_output() {
-  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_UNAVAILABLE:-0}" = "1" ]; then
+  if [ "${RYNO_INSTALL_SH_TEST:-0}" = "1" ] && [ "${RYNO_TEST_LDD_UNAVAILABLE:-0}" = "1" ]; then
     return 127
   fi
 
-  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_OUTPUT+x}" = "x" ]; then
-    printf '%s\n' "$OPENSHELL_TEST_LDD_OUTPUT"
+  if [ "${RYNO_INSTALL_SH_TEST:-0}" = "1" ] && [ "${RYNO_TEST_LDD_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$RYNO_TEST_LDD_OUTPUT"
     return 0
   fi
 
@@ -220,15 +220,15 @@ require_linux_package_glibc() {
     0)
       ;;
     2)
-      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected musl or unsupported libc."
+      error "Ryno Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected musl or unsupported libc."
       ;;
     *)
-      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; could not detect glibc."
+      error "Ryno Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; could not detect glibc."
       ;;
   esac
 
   if ! version_at_least_major_minor "$_glibc_version" "$LINUX_PACKAGE_GLIBC_MIN_VERSION"; then
-    error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected glibc ${_glibc_version}.
+    error "Ryno Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected glibc ${_glibc_version}.
 Please use a newer distribution or container environment."
   fi
 }
@@ -253,8 +253,8 @@ installed_version_needs_breaking_upgrade_notice() {
   ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
 }
 
-find_existing_native_openshell_bin() {
-  _path="$(command -v openshell 2>/dev/null || true)"
+find_existing_native_ryno_bin() {
+  _path="$(command -v ryno 2>/dev/null || true)"
   case "$_path" in
     /snap/*) ;;
     *)
@@ -266,10 +266,10 @@ find_existing_native_openshell_bin() {
   esac
 
   for _candidate in \
-    "${TARGET_HOME:-}/.local/bin/openshell" \
-    /usr/local/bin/openshell \
-    /usr/bin/openshell \
-    /opt/homebrew/bin/openshell; do
+    "${TARGET_HOME:-}/.local/bin/ryno" \
+    /usr/local/bin/ryno \
+    /usr/bin/ryno \
+    /opt/homebrew/bin/ryno; do
     if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then
       printf '%s\n' "$_candidate"
       return 0
@@ -279,7 +279,7 @@ find_existing_native_openshell_bin() {
   return 1
 }
 
-existing_openshell_version() {
+existing_ryno_version() {
   _bin="$1"
   _output="$("$_bin" --version 2>/dev/null | sed -n '1p' || true)"
   printf '%s\n' "$_output" | awk '
@@ -299,32 +299,32 @@ print_breaking_upgrade_notice() {
   _version="$2"
 
   if [ -n "$_version" ]; then
-    warn "detected existing OpenShell ${_version} at ${_bin}"
+    warn "detected existing Ryno ${_version} at ${_bin}"
   else
-    warn "detected an existing OpenShell installation at ${_bin}"
+    warn "detected an existing Ryno installation at ${_bin}"
   fi
 
   cat >&2 <<EOF
 
-OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
-state created by earlier releases. Before installing OpenShell ${RELEASE_TAG}, back up
+Ryno ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
+state created by earlier releases. Before installing Ryno ${RELEASE_TAG}, back up
 any files, artifacts, and configuration you need from existing sandboxes.
 
 Then clean up the old runtime with the currently installed CLI:
 
-    openshell sandbox delete --all
-    openshell gateway destroy
+    ryno sandbox delete --all
+    ryno gateway destroy
 
-Run these commands before upgrading because 'openshell gateway destroy' is not
-available in OpenShell ${BREAKING_RELEASE_VERSION} and later.
+Run these commands before upgrading because 'ryno gateway destroy' is not
+available in Ryno ${BREAKING_RELEASE_VERSION} and later.
 
 After cleanup, rerun this installer or follow the installation guide:
 
-    https://docs.nvidia.com/openshell/latest/about/installation
+    https://docs.nvidia.com/ryno/latest/about/installation
 
 If you have already backed up and cleaned up the old runtime, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | RYNO_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
@@ -332,20 +332,20 @@ EOF
 guard_breaking_upgrade() {
   target_uses_breaking_gateway_model || return 0
 
-  _bin="$(find_existing_native_openshell_bin || true)"
+  _bin="$(find_existing_native_ryno_bin || true)"
   [ -n "$_bin" ] || return 0
 
-  _version="$(existing_openshell_version "$_bin")"
+  _version="$(existing_ryno_version "$_bin")"
   installed_version_needs_breaking_upgrade_notice "$_version" || return 0
 
   print_breaking_upgrade_notice "$_bin" "$_version"
 
   if [ "$UPGRADE_NOTICE_ACK" = "1" ]; then
-    warn "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set"
+    warn "continuing because RYNO_ACK_BREAKING_UPGRADE=1 is set"
     return 0
   fi
 
-  error "manual cleanup is required before upgrading from this OpenShell installation"
+  error "manual cleanup is required before upgrading from this Ryno installation"
 }
 
 print_native_to_snap_notice() {
@@ -353,14 +353,14 @@ print_native_to_snap_notice() {
   _version="$2"
 
   if [ -n "$_version" ]; then
-    warn "detected existing non-snap OpenShell ${_version} at ${_bin}"
+    warn "detected existing non-snap Ryno ${_version} at ${_bin}"
   else
-    warn "detected an existing non-snap OpenShell installation at ${_bin}"
+    warn "detected an existing non-snap Ryno installation at ${_bin}"
   fi
 
   cat >&2 <<EOF
 
-The OpenShell snap keeps gateway and CLI state in snap-specific directories and
+The Ryno snap keeps gateway and CLI state in snap-specific directories and
 does not import state from a non-snap installation. Before installing the snap,
 back up anything you need and clean up sandboxes and runtime resources managed
 by the existing installation.
@@ -373,38 +373,38 @@ For older installations that provide these commands, run:
 Stop the non-snap gateway service and remove the native package or manual
 installation before continuing. For package and service instructions, see:
 
-    https://docs.nvidia.com/openshell/latest/about/installation
+    https://docs.nvidia.com/ryno/latest/about/installation
 
 If you have already backed up and cleaned up the non-snap installation, rerun with:
 
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | RYNO_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
 
 guard_native_to_snap_transition() {
-  _bin="$(find_existing_native_openshell_bin || true)"
+  _bin="$(find_existing_native_ryno_bin || true)"
   [ -n "$_bin" ] || return 0
 
-  _version="$(existing_openshell_version "$_bin")"
+  _version="$(existing_ryno_version "$_bin")"
   print_native_to_snap_notice "$_bin" "$_version"
 
   if [ "$UPGRADE_NOTICE_ACK" = "1" ]; then
-    warn "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set"
+    warn "continuing because RYNO_ACK_BREAKING_UPGRADE=1 is set"
     return 0
   fi
 
-  error "manual cleanup is required before replacing this non-snap OpenShell installation"
+  error "manual cleanup is required before replacing this non-snap Ryno installation"
 }
 
 resolve_release_tag() {
-  if [ "${OPENSHELL_VERSION:-}" = "pre" ]; then
+  if [ "${RYNO_VERSION:-}" = "pre" ]; then
     resolve_latest_prerelease_tag
     return 0
   fi
 
-  if [ -n "${OPENSHELL_VERSION:-}" ]; then
-    echo "$OPENSHELL_VERSION"
+  if [ -n "${RYNO_VERSION:-}" ]; then
+    echo "$RYNO_VERSION"
     return 0
   fi
 
@@ -445,7 +445,7 @@ resolve_latest_prerelease_tag() {
   }
 
   for _tag in $_release_tags; do
-    _artifact_name="openshell-${_tag}-${_artifact_platform}"
+    _artifact_name="ryno-${_tag}-${_artifact_platform}"
     info "checking ${_tag} for ${_artifact_platform}..."
     _run_ids="$(gh api \
       "repos/${REPO}/actions/artifacts?name=${_artifact_name}&per_page=100" \
@@ -505,7 +505,7 @@ prepare_prerelease_assets() {
   is_prerelease_tag "$RELEASE_TAG" || return 0
   require_prerelease_github_access
 
-  _artifact_name="openshell-${RELEASE_TAG}-$(prerelease_artifact_platform)"
+  _artifact_name="ryno-${RELEASE_TAG}-$(prerelease_artifact_platform)"
   info "locating ${_artifact_name}..."
   _run_id="$(gh api \
     "repos/${REPO}/actions/artifacts?name=${_artifact_name}&per_page=100" \
@@ -659,20 +659,20 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  case "${OPENSHELL_INSTALL_METHOD:-}" in
+  case "${RYNO_INSTALL_METHOD:-}" in
     snap | deb | rpm)
-      echo "$OPENSHELL_INSTALL_METHOD"
+      echo "$RYNO_INSTALL_METHOD"
       return 0
       ;;
     '') ;;
-    *) error "unsupported OPENSHELL_INSTALL_METHOD=${OPENSHELL_INSTALL_METHOD}; use snap, deb, or rpm" ;;
+    *) error "unsupported RYNO_INSTALL_METHOD=${RYNO_INSTALL_METHOD}; use snap, deb, or rpm" ;;
   esac
 
   # Keep refreshing an existing snap install instead of adding a second
   # gateway on the same port.
-  case "${OPENSHELL_VERSION:-}" in
+  case "${RYNO_VERSION:-}" in
     '' | dev)
-      if has_cmd snap && snap list openshell >/dev/null 2>&1; then
+      if has_cmd snap && snap list ryno >/dev/null 2>&1; then
         echo "snap"
         return 0
       fi
@@ -761,7 +761,7 @@ find_deb_asset() {
   _arch="$2"
 
   awk -v arch="$_arch" '
-    $2 ~ "^\\*?openshell[-_].*[-_]" arch "\\.deb$" {
+    $2 ~ "^\\*?ryno[-_].*[-_]" arch "\\.deb$" {
       sub("^\\*", "", $2)
       print $2
       exit
@@ -775,17 +775,17 @@ find_rpm_asset() {
   _package="$3"
 
   case "$_package" in
-    openshell)
-      _dev_name="openshell-dev-${_arch}.rpm"
-      _fallback_re="^openshell-[0-9].*\\.${_arch}\\.rpm$"
+    ryno)
+      _dev_name="ryno-dev-${_arch}.rpm"
+      _fallback_re="^ryno-[0-9].*\\.${_arch}\\.rpm$"
       ;;
-    openshell-gateway)
-      _dev_name="openshell-gateway-dev-${_arch}.rpm"
-      _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
+    ryno-gateway)
+      _dev_name="ryno-gateway-dev-${_arch}.rpm"
+      _fallback_re="^ryno-gateway-[0-9].*\\.${_arch}\\.rpm$"
       ;;
-    openshell-prover)
-      _dev_name="openshell-prover-dev-${_arch}.rpm"
-      _fallback_re="^openshell-prover-[0-9].*\\.${_arch}\\.rpm$"
+    ryno-prover)
+      _dev_name="ryno-prover-dev-${_arch}.rpm"
+      _fallback_re="^ryno-prover-[0-9].*\\.${_arch}\\.rpm$"
       ;;
     *)
       error "unknown RPM package selector: ${_package}"
@@ -920,18 +920,18 @@ patch_prerelease_homebrew_formula_urls() {
 }
 
 start_user_gateway() {
-  info "restarting openshell-gateway user service as ${TARGET_USER}..."
+  info "restarting ryno-gateway user service as ${TARGET_USER}..."
 
   if ! as_target_user systemctl --user daemon-reload; then
     info "could not reach the user systemd manager for ${TARGET_USER}"
-    info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
-    info "then register it with: openshell gateway add https://127.0.0.1:17670 --local --name openshell"
+    info "restart the gateway later with: systemctl --user enable ryno-gateway && systemctl --user restart ryno-gateway"
+    info "then register it with: ryno gateway add https://127.0.0.1:17670 --local --name ryno"
     return 0
   fi
 
-  as_target_user systemctl --user enable openshell-gateway
-  as_target_user systemctl --user restart openshell-gateway
-  as_target_user systemctl --user is-active --quiet openshell-gateway
+  as_target_user systemctl --user enable ryno-gateway
+  as_target_user systemctl --user restart ryno-gateway
+  as_target_user systemctl --user is-active --quiet ryno-gateway
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
@@ -943,7 +943,7 @@ start_user_gateway() {
 # after a failure. A unit that is starting or running does not match, even if
 # it failed before it was restarted.
 user_gateway_service_failed() {
-  _unit_state="$(as_target_user systemctl --user show openshell-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
+  _unit_state="$(as_target_user systemctl --user show ryno-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
   case "$_unit_state" in
     *ActiveState=failed* | *SubState=auto-restart*) return 0 ;;
   esac
@@ -951,7 +951,7 @@ user_gateway_service_failed() {
 }
 
 dump_local_gateway_diagnostics() {
-  _lines="${OPENSHELL_INSTALL_LOG_LINES:-80}"
+  _lines="${RYNO_INSTALL_LOG_LINES:-80}"
   case "$_lines" in
     "" | *[!0-9]*)
       _lines=80
@@ -979,15 +979,15 @@ dump_local_gateway_diagnostics() {
 dump_snap_gateway_diagnostics() {
   _lines="$1"
 
-  info "OpenShell snap service status:"
-  as_root snap services openshell >&2 || true
-  info "OpenShell snap connections:"
-  as_root snap connections openshell >&2 || true
+  info "Ryno snap service status:"
+  as_root snap services ryno >&2 || true
+  info "Ryno snap connections:"
+  as_root snap connections ryno >&2 || true
   if has_cmd journalctl; then
-    info "last ${_lines} lines from the OpenShell snap gateway journal:"
-    as_root journalctl -b -u snap.openshell.gateway.service --no-pager -n "$_lines" >&2 || true
+    info "last ${_lines} lines from the Ryno snap gateway journal:"
+    as_root journalctl -b -u snap.ryno.gateway.service --no-pager -n "$_lines" >&2 || true
   fi
-  as_root snap logs openshell.gateway -n="$_lines" >&2 || true
+  as_root snap logs ryno.gateway -n="$_lines" >&2 || true
 }
 
 dump_homebrew_gateway_diagnostics() {
@@ -999,8 +999,8 @@ dump_homebrew_gateway_diagnostics() {
   as_target_user brew services info "${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}" >&2 || true
 
   for _log_file in \
-    "${_brew_prefix}/var/log/openshell/openshell-gateway.err.log" \
-    "${_brew_prefix}/var/log/openshell/openshell-gateway.out.log"; do
+    "${_brew_prefix}/var/log/ryno/ryno-gateway.err.log" \
+    "${_brew_prefix}/var/log/ryno/ryno-gateway.out.log"; do
     if [ -f "$_log_file" ]; then
       info "last ${_lines} lines from ${_log_file}:"
       tail -n "$_lines" "$_log_file" >&2 || true
@@ -1014,15 +1014,15 @@ dump_user_service_gateway_diagnostics() {
   _lines="$1"
 
   if has_cmd systemctl; then
-    info "openshell-gateway user service status:"
-    as_target_user systemctl --user status openshell-gateway --no-pager >&2 || true
+    info "ryno-gateway user service status:"
+    as_target_user systemctl --user status ryno-gateway --no-pager >&2 || true
   fi
 
   if has_cmd journalctl; then
-    info "last ${_lines} lines from openshell-gateway user journal:"
-    as_target_user journalctl --user -u openshell-gateway --no-pager -n "$_lines" >&2 || true
+    info "last ${_lines} lines from ryno-gateway user journal:"
+    as_target_user journalctl --user -u ryno-gateway --no-pager -n "$_lines" >&2 || true
   else
-    info "journalctl not found; cannot dump openshell-gateway user journal"
+    info "journalctl not found; cannot dump ryno-gateway user journal"
   fi
 }
 
@@ -1030,12 +1030,12 @@ dump_user_service_gateway_diagnostics() {
 # that already failed does not run out the full timeout.
 wait_for_local_gateway_listener() {
   _failed_check="${1:-}"
-  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _timeout="${RYNO_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
   _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
-  _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
+  _mtls_dir="${TARGET_HOME}/.config/ryno/gateways/ryno/mtls"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
@@ -1056,23 +1056,23 @@ wait_for_local_gateway_listener() {
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
   if [ "$_service_failed" -eq 1 ]; then
-    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+    error "the ryno-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart ryno-gateway"
   fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
 wait_for_local_gateway_status() {
-  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _timeout="${RYNO_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _status_output=""
-  _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
+  _register_bin="${RYNO_REGISTER_BIN:-ryno}"
 
-  info "waiting for openshell status to report connected..."
+  info "waiting for ryno status to report connected..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
     if _status_output="$(as_target_user env NO_COLOR=1 "$_register_bin" status 2>&1)"; then
       case "$_status_output" in
         *"Version:"*)
-          info "openshell status reports connected"
+          info "ryno status reports connected"
           return 0
           ;;
       esac
@@ -1083,7 +1083,7 @@ wait_for_local_gateway_status() {
 
   [ -z "$_status_output" ] || printf '%s\n' "$_status_output" >&2
   dump_local_gateway_diagnostics
-  error "openshell status did not report connected within ${_timeout}s"
+  error "ryno status did not report connected within ${_timeout}s"
 }
 
 remove_local_gateway_registration_from() {
@@ -1096,34 +1096,34 @@ remove_local_gateway_registration_from() {
   as_target_user sh -c '
     config_dir=$1
     rm -rf "${config_dir}/gateways/local"
-    mkdir -p "${config_dir}/gateways/openshell"
+    mkdir -p "${config_dir}/gateways/ryno"
     rm -f \
-      "${config_dir}/gateways/openshell/metadata.json" \
-      "${config_dir}/gateways/openshell/edge_token" \
-      "${config_dir}/gateways/openshell/cf_token" \
-      "${config_dir}/gateways/openshell/oidc_token.json"
+      "${config_dir}/gateways/ryno/metadata.json" \
+      "${config_dir}/gateways/ryno/edge_token" \
+      "${config_dir}/gateways/ryno/cf_token" \
+      "${config_dir}/gateways/ryno/oidc_token.json"
     active="${config_dir}/active_gateway"
     active_name="$(cat "$active" 2>/dev/null || true)"
-    if [ "$active_name" = "local" ] || [ "$active_name" = "openshell" ]; then
+    if [ "$active_name" = "local" ] || [ "$active_name" = "ryno" ]; then
       rm -f "$active"
     fi
   ' sh "$_config_dir"
 }
 
 remove_local_gateway_registration() {
-  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+  remove_local_gateway_registration_from "${TARGET_HOME}/.config/ryno"
 }
 
 remove_snap_gateway_registration() {
   remove_local_gateway_registration_from \
-    "${TARGET_HOME}/snap/openshell/common/.config/openshell"
+    "${TARGET_HOME}/snap/ryno/common/.config/ryno"
 }
 
 register_local_gateway() {
-  _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
+  _register_bin="${RYNO_REGISTER_BIN:-ryno}"
   _endpoint="$(local_gateway_endpoint)"
 
-  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
+  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name ryno 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
     return 0
   else
@@ -1134,7 +1134,7 @@ register_local_gateway() {
     *"already exists"*)
       info "local gateway already exists; removing and re-adding it..."
       remove_local_gateway_registration
-      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell
+      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name ryno
       ;;
     *)
       printf '%s\n' "$_add_output" >&2
@@ -1206,19 +1206,19 @@ install_linux_rpm() {
     error "failed to download ${CHECKSUMS_NAME} for ${RELEASE_TAG}"
   }
 
-  _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
+  _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" ryno)"
   if [ -z "$_rpm_file" ]; then
-    error "no openshell RPM package found for architecture: ${_arch}"
+    error "no ryno RPM package found for architecture: ${_arch}"
   fi
 
-  _gateway_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-gateway)"
+  _gateway_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" ryno-gateway)"
   if [ -z "$_gateway_rpm_file" ]; then
-    error "no openshell-gateway RPM package found for architecture: ${_arch}"
+    error "no ryno-gateway RPM package found for architecture: ${_arch}"
   fi
 
-  _prover_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-prover)"
+  _prover_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" ryno-prover)"
   if [ -z "$_prover_rpm_file" ]; then
-    error "no openshell-prover RPM package found for architecture: ${_arch}"
+    error "no ryno-prover RPM package found for architecture: ${_arch}"
   fi
 
   info "selected ${_rpm_file}, ${_gateway_rpm_file}, and ${_prover_rpm_file}"
@@ -1246,16 +1246,16 @@ install_linux_rpm() {
   start_user_gateway
 }
 
-openshell_snap_channel() {
-  case "${OPENSHELL_VERSION:-}" in
+ryno_snap_channel() {
+  case "${RYNO_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
     '') printf '%s\n' "latest/stable" ;;
-    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+    *) error "Snap installs do not support RYNO_VERSION=${RYNO_VERSION}; use a native package" ;;
   esac
 }
 
 wait_for_docker_daemon() {
-  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _timeout="${RYNO_INSTALL_DOCKER_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
 
@@ -1278,11 +1278,11 @@ wait_for_docker_daemon() {
 }
 
 # Copy the snap gateway's client bundle into the target user's snap state
-# directory, where `openshell gateway add --local` imports it. Root only reads
+# directory, where `ryno gateway add --local` imports it. Root only reads
 # the source files; the target user writes the copies into their own home.
 copy_snap_client_bundle() {
-  _src="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
-  _dst="${TARGET_HOME}/snap/openshell/common/.local/state/openshell/tls"
+  _src="${RYNO_SNAP_TLS_DIR:-/var/snap/ryno/common/tls}"
+  _dst="${TARGET_HOME}/snap/ryno/common/.local/state/ryno/tls"
 
   as_target_user mkdir -p "${_dst}/client"
   as_target_user chmod 700 "$_dst" "${_dst}/client"
@@ -1296,11 +1296,11 @@ copy_snap_client_bundle() {
 # Snap revisions that require mTLS ship the post-refresh hook that migrates
 # older plaintext configs.
 snap_gateway_uses_mtls() {
-  [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
+  [ -e "${RYNO_SNAP_DIR:-/snap/ryno/current}/meta/hooks/post-refresh" ]
 }
 
 register_snap_gateway() {
-  _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
+  _register_bin="${RYNO_REGISTER_BIN:-/snap/bin/ryno}"
 
   if snap_gateway_uses_mtls; then
     _endpoint="https://127.0.0.1:${LOCAL_GATEWAY_PORT}"
@@ -1308,10 +1308,10 @@ register_snap_gateway() {
     copy_snap_client_bundle
   else
     _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
-    warn "this OpenShell snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
+    warn "this Ryno snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
   fi
 
-  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
+  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name ryno 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
     return 0
   else
@@ -1322,7 +1322,7 @@ register_snap_gateway() {
     *"already exists"*)
       info "local gateway already exists; removing and re-adding it..."
       remove_snap_gateway_registration
-      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell
+      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name ryno
       ;;
     *)
       printf '%s\n' "$_add_output" >&2
@@ -1334,10 +1334,10 @@ register_snap_gateway() {
 # The mTLS gateway rejects TLS handshakes without a client certificate, so
 # probe it with the root-owned client bundle.
 wait_for_snap_gateway_listener() {
-  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _timeout="${RYNO_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
-  _tls_dir="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+  _tls_dir="${RYNO_SNAP_TLS_DIR:-/var/snap/ryno/common/tls}"
 
   if snap_gateway_uses_mtls; then
     _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
@@ -1370,33 +1370,33 @@ install_linux_snap() {
   set_linux_target_runtime_dir
 
   if snap list docker >/dev/null 2>&1; then
-    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
+    error "the Docker snap is not currently compatible with Ryno because its AppArmor confinement prevents Ryno's hardened containers from starting.
 Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
   fi
   if ! has_cmd docker; then
-    error "Docker is required before installing the OpenShell snap.
-Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
+    error "Docker is required before installing the Ryno snap.
+Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with Ryno."
   fi
   info "using existing Docker installation"
   wait_for_docker_daemon
 
-  _channel="$(openshell_snap_channel)"
-  if snap list openshell >/dev/null 2>&1; then
-    info "refreshing OpenShell snap from ${_channel}..."
-    as_root snap refresh openshell --channel="$_channel"
-    warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+  _channel="$(ryno_snap_channel)"
+  if snap list ryno >/dev/null 2>&1; then
+    info "refreshing Ryno snap from ${_channel}..."
+    as_root snap refresh ryno --channel="$_channel"
+    warn "restarting the Ryno gateway to use the refreshed snap; active sandbox sessions will be interrupted"
   else
-    info "installing OpenShell snap from ${_channel}..."
-    as_root snap install openshell --channel="$_channel"
+    info "installing Ryno snap from ${_channel}..."
+    as_root snap install ryno --channel="$_channel"
   fi
 
-  as_root snap restart openshell.gateway
+  as_root snap restart ryno.gateway
 
-  info "installed OpenShell snap from ${_channel}"
+  info "installed Ryno snap from ${_channel}"
   wait_for_snap_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_snap_gateway
-  OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
+  RYNO_REGISTER_BIN="/snap/bin/ryno"
   wait_for_local_gateway_status
 }
 
@@ -1407,11 +1407,11 @@ install_macos_homebrew() {
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
   prepare_prerelease_assets "$_tmpdir"
-  _formula_file="${_tmpdir}/openshell.rb"
-  _formula_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/openshell.rb"
+  _formula_file="${_tmpdir}/ryno.rb"
+  _formula_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/ryno.rb"
 
   info "downloading Homebrew formula from ${_formula_url}..."
-  download_release_asset "$RELEASE_TAG" "openshell.rb" "$_formula_file" || {
+  download_release_asset "$RELEASE_TAG" "ryno.rb" "$_formula_file" || {
     error "failed to download ${_formula_url}; the selected release may not include a Homebrew formula"
   }
   chmod 0644 "$_formula_file"
@@ -1428,25 +1428,25 @@ install_macos_homebrew() {
 
   _formula_ref="${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}"
 
-  if as_target_user brew list --formula openshell >/dev/null 2>&1; then
-    info "reinstalling OpenShell with Homebrew..."
+  if as_target_user brew list --formula ryno >/dev/null 2>&1; then
+    info "reinstalling Ryno with Homebrew..."
     as_target_user brew reinstall --formula "$_formula_ref"
   else
-    info "installing OpenShell with Homebrew..."
+    info "installing Ryno with Homebrew..."
     as_target_user brew install --formula "$_formula_ref"
   fi
 
-  info "restarting OpenShell Homebrew service..."
+  info "restarting Ryno Homebrew service..."
   if ! as_target_user brew services restart "$_formula_ref"; then
-    warn "could not restart the OpenShell Homebrew service"
+    warn "could not restart the Ryno Homebrew service"
     info "restart it later with: brew services restart ${_formula_ref}"
-    info "then register it with: openshell gateway add $(local_gateway_endpoint) --local --name openshell"
+    info "then register it with: ryno gateway add $(local_gateway_endpoint) --local --name ryno"
     return 0
   fi
 
   _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
-  if [ -n "$_brew_prefix" ] && [ -x "${_brew_prefix}/bin/openshell" ]; then
-    OPENSHELL_REGISTER_BIN="${_brew_prefix}/bin/openshell"
+  if [ -n "$_brew_prefix" ] && [ -x "${_brew_prefix}/bin/ryno" ]; then
+    RYNO_REGISTER_BIN="${_brew_prefix}/bin/ryno"
   fi
 
   info "registering local gateway as ${TARGET_USER}..."
@@ -1514,6 +1514,6 @@ main() {
   esac
 }
 
-if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" != "1" ]; then
+if [ "${RYNO_INSTALL_SH_TEST:-0}" != "1" ]; then
   main "$@"
 fi

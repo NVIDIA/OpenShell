@@ -3,7 +3,7 @@
 
 //! E2E tests for GraphQL L7 inspection through transparent interception.
 //!
-//! The upstream server deliberately does not implement GraphQL. `OpenShell`
+//! The upstream server deliberately does not implement GraphQL. `Ryno`
 //! parses and enforces GraphQL before forwarding, so any HTTP server that
 //! accepts POST /graphql is enough to prove allowed requests reach upstream
 //! and denied requests are stopped by the sandbox proxy.
@@ -12,11 +12,11 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::container::ContainerHttpServer;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ContainerHttpServer;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const TEST_SERVER_ALIAS: &str = "graphql-l7.openshell.test";
+const TEST_SERVER_ALIAS: &str = "graphql-l7.ryno.test";
 
 async fn start_test_server() -> Result<ContainerHttpServer, String> {
     let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer

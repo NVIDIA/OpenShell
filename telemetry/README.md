@@ -1,6 +1,6 @@
-# OpenShell Community Telemetry Reports
+# Ryno Community Telemetry Reports
 
-OpenShell collects anonymous, aggregate usage telemetry (see the [Telemetry section](../README.md#telemetry) of the main README for what's collected and how to opt out). We publish periodic summaries of the trends here so the community can see how the project is being used.
+Ryno collects anonymous, aggregate usage telemetry (see the [Telemetry section](../README.md#telemetry) of the main README for what's collected and how to opt out). We publish periodic summaries of the trends here so the community can see how the project is being used.
 
 Numbers are aggregate counts only — no user data, code, prompts, or command contents are collected. Each report covers one two-week period and, where available, compares against the prior period. Reports are listed newest first.
 

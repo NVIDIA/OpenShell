@@ -3,13 +3,13 @@
 
 //! Driver-agnostic sandbox lifecycle conformance tests.
 
-use openshell_conformance::{OpenShellRunner, SANDBOX_LIFECYCLE_SCENARIO};
+use ryno_conformance::{RynoRunner, SANDBOX_LIFECYCLE_SCENARIO};
 
 /// Exercise stop, start, and stopped-deletion behavior through the candidate CLI.
 #[tokio::test]
 async fn sandbox_lifecycle() {
-    let mut runner = OpenShellRunner::from_env(SANDBOX_LIFECYCLE_SCENARIO.name)
-        .expect("candidate openshell CLI is available");
+    let mut runner = RynoRunner::from_env(SANDBOX_LIFECYCLE_SCENARIO.name)
+        .expect("candidate ryno CLI is available");
 
     let result = async {
         runner.check_gateway_status().await?;

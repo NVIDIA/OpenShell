@@ -13,7 +13,7 @@ from email.parser import Parser
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-PROTO_STEMS = ("datamodel", "openshell", "options", "sandbox")
+PROTO_STEMS = ("datamodel", "ryno", "options", "sandbox")
 BYTECODE_SUFFIXES = (".pyc", ".pyo")
 NATIVE_SUFFIXES = (".dll", ".dylib", ".exe", ".pyd", ".so")
 
@@ -30,15 +30,15 @@ def _find_wheel(path: Path) -> Path:
 
 def _required_files() -> set[str]:
     files = {
-        "openshell/__init__.py",
-        "openshell/sandbox.py",
-        "openshell/py.typed",
-        "openshell/_proto/__init__.py",
+        "ryno/__init__.py",
+        "ryno/sandbox.py",
+        "ryno/py.typed",
+        "ryno/_proto/__init__.py",
     }
     for stem in PROTO_STEMS:
-        files.add(f"openshell/_proto/{stem}_pb2.py")
-        files.add(f"openshell/_proto/{stem}_pb2.pyi")
-        files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
+        files.add(f"ryno/_proto/{stem}_pb2.py")
+        files.add(f"ryno/_proto/{stem}_pb2.pyi")
+        files.add(f"ryno/_proto/{stem}_pb2_grpc.py")
     return files
 
 
@@ -63,13 +63,10 @@ def verify_wheel(path: Path, expected_version: str | None = None) -> Path:
         scripts = sorted(
             name
             for name in names
-            if not name.endswith("/")
-            and Path(name).name in {"openshell", "openshell.exe"}
+            if not name.endswith("/") and Path(name).name in {"ryno", "ryno.exe"}
         )
         if scripts:
-            raise ValueError(
-                f"wheel contains an openshell executable: {', '.join(scripts)}"
-            )
+            raise ValueError(f"wheel contains an ryno executable: {', '.join(scripts)}")
 
         entry_points = [
             name for name in names if name.endswith(".dist-info/entry_points.txt")
@@ -86,8 +83,8 @@ def verify_wheel(path: Path, expected_version: str | None = None) -> Path:
                 raise ValueError(
                     "wheel contains invalid entry point metadata"
                 ) from error
-            if parser.has_option("console_scripts", "openshell"):
-                raise ValueError("wheel defines an openshell console script")
+            if parser.has_option("console_scripts", "ryno"):
+                raise ValueError("wheel defines an ryno console script")
 
         bytecode_files = sorted(
             name for name in names if name.endswith(BYTECODE_SUFFIXES)
@@ -103,12 +100,12 @@ def verify_wheel(path: Path, expected_version: str | None = None) -> Path:
 
         metadata_name = _single_member(names, ".dist-info/METADATA")
         metadata = Parser().parsestr(archive.read(metadata_name).decode())
-        if metadata["Name"] != "openshell":
+        if metadata["Name"] != "ryno":
             raise ValueError(f"unexpected distribution name: {metadata['Name']}")
 
         version = metadata["Version"]
         filename_version = wheel.name.removesuffix("-py3-none-any.whl").removeprefix(
-            "openshell-"
+            "ryno-"
         )
         if version != filename_version:
             raise ValueError(
@@ -130,7 +127,7 @@ def verify_wheel(path: Path, expected_version: str | None = None) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify the OpenShell Python wheel")
+    parser = argparse.ArgumentParser(description="Verify the Ryno Python wheel")
     parser.add_argument(
         "path", type=Path, help="Wheel file or directory containing one wheel"
     )

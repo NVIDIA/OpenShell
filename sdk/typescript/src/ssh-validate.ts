@@ -3,7 +3,7 @@
 
 // Trust-boundary validation for CreateSshSession responses. The gateway's
 // values are interpolated into an OpenSSH `ProxyCommand` that OpenSSH runs
-// through `/bin/sh -c` on the caller's workstation, so proto/openshell.proto
+// through `/bin/sh -c` on the caller's workstation, so proto/ryno.proto
 // (CreateSshSessionResponse) says clients MUST reject responses outside the
 // specified character sets and ranges. This enforces exactly that contract at
 // the SDK edge so no consumer has to rediscover the invariant.

@@ -33,7 +33,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/ryno-driver-vm/runtime/pins.env" 2>/dev/null || true
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
@@ -281,7 +281,7 @@ if $ALL_GOOD; then
     echo ""
     echo "All libraries are portable!"
     echo ""
-    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+    echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"
 else
     echo ""
     echo "Warning: Some libraries have non-portable paths"

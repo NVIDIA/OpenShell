@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,27 +22,27 @@ use tokio::task::JoinHandle;
 
 const PROFILE_ID: &str = "e2e-credential-gating";
 const PROVIDER_NAME: &str = "e2e-credential-gating";
-const TEST_HOST: &str = "host.openshell.internal";
+const TEST_HOST: &str = "host.ryno.internal";
 const TOKEN_ENV: &str = "E2E_GATING_TOKEN";
 const TEST_SECRET: &str = "e2e-gating-secret-value";
-const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+const PLACEHOLDER_PREFIX: &str = "ryno:resolve:env:";
 const KEY_PRESENCE_SCRIPT: &str = r#"if [ "${E2E_GATING_TOKEN+x}" != x ]; then
   echo TOKEN_ABSENT
 else
   case "$E2E_GATING_TOKEN" in
-    openshell:resolve:env:*) echo TOKEN_PLACEHOLDER ;;
+    ryno:resolve:env:*) echo TOKEN_PLACEHOLDER ;;
     *) echo TOKEN_UNSAFE ;;
   esac
 fi"#;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 async fn run_cli(args: &[&str]) -> (bool, String) {
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command.output().await.expect("spawn openshell CLI");
+    let output = command.output().await.expect("spawn ryno CLI");
     (
         output.status.success(),
         format!(

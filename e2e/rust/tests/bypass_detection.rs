@@ -9,7 +9,7 @@
 
 #![cfg(feature = "e2e")]
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 /// Python script that attempts a raw TCP connect bypassing the proxy.
 ///

@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render the OpenShell client policy for a conformance server URL.
+"""Render the Ryno client policy for a conformance server URL.
 
 Parses the server URL into host/port/path, substitutes them into
 policy-template.yaml, writes the rendered policy, and prints the (possibly
 rewritten) URL the client should connect to. Used both to seed the reusable
 client sandbox with a placeholder policy and to install the per-scenario policy
-in client-through-openshell.sh.
+in client-through-ryno.sh.
 
 Usage: render-policy.py <server-url> <policy-file> <policy-template> <mcp-version>
 """
@@ -42,7 +42,7 @@ host = parsed.hostname
 if not host:
     raise SystemExit(f"conformance server URL is missing a host: {raw_url}")
 
-expected_host = os.environ.get("OPENSHELL_MCP_CONFORMANCE_EXPECTED_SERVER_HOST")
+expected_host = os.environ.get("RYNO_MCP_CONFORMANCE_EXPECTED_SERVER_HOST")
 if expected_host:
     try:
         actual_ip = ip_address(host)
@@ -52,7 +52,7 @@ if expected_host:
     except ValueError as err:
         raise SystemExit(
             "conformance server URL host must be an IP address when "
-            "OPENSHELL_MCP_CONFORMANCE_EXPECTED_SERVER_HOST is set"
+            "RYNO_MCP_CONFORMANCE_EXPECTED_SERVER_HOST is set"
         ) from err
     if actual_ip != expected_ip:
         raise SystemExit(
@@ -61,7 +61,7 @@ if expected_host:
         )
 
 target_host = (
-    "host.openshell.internal" if host in {"localhost", "127.0.0.1", "::1"} else host
+    "host.ryno.internal" if host in {"localhost", "127.0.0.1", "::1"} else host
 )
 port = parsed.port or (443 if parsed.scheme == "https" else 80)
 path = parsed.path or "/"

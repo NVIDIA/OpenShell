@@ -2,7 +2,7 @@
 
 Accessor: `client.Health()`
 
-Check the health status of the connected OpenShell gateway.
+Check the health status of the connected Ryno gateway.
 
 ## Check
 

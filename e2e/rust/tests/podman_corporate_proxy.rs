@@ -27,15 +27,15 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::wait_for_healthy;
-use openshell_e2e::harness::container::{ContainerEngine, HostSupportContainer};
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::port::find_free_port;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::wait_for_healthy;
+use ryno_e2e::harness::container::{ContainerEngine, HostSupportContainer};
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::port::find_free_port;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
 
-const HOST_ALIAS: &str = "host.openshell.internal";
+const HOST_ALIAS: &str = "host.ryno.internal";
 
 const PROXY_USER: &str = "proxyuser";
 const PROXY_PASS: &str = "proxypass";
@@ -44,7 +44,7 @@ const ALLOWED_MARKER: &str = "corp-proxy-e2e-allowed-upstream";
 const DENIED_MARKER: &str = "corp-proxy-e2e-denied-upstream";
 const READY_MARKER: &str = "corp-proxy-e2e-workload-done";
 
-const SECRET_PREFIX: &str = "openshell-proxy-auth-";
+const SECRET_PREFIX: &str = "ryno-proxy-auth-";
 
 /// A forward proxy that requires Basic auth and logs every CONNECT it sees.
 ///
@@ -415,7 +415,7 @@ network_policies:
 /// Appends corporate-proxy keys to the harness-generated gateway TOML and
 /// restores the original file when dropped.
 ///
-/// The `[openshell.drivers.podman]` table is the last one the harness writes,
+/// The `[ryno.drivers.podman]` table is the last one the harness writes,
 /// so appending bare keys lands in that table without introducing a duplicate
 /// table header.
 struct GatewayProxyConfig {
@@ -427,8 +427,8 @@ struct GatewayProxyConfig {
 impl GatewayProxyConfig {
     /// Locate the gateway's `--config` path from the wrapper's args file.
     fn config_path_from_args() -> Result<PathBuf, String> {
-        let args_file = std::env::var("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
-            .map_err(|_| "OPENSHELL_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
+        let args_file = std::env::var("RYNO_E2E_GATEWAY_ARGS_FILE")
+            .map_err(|_| "RYNO_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
         let raw = std::fs::read(&args_file)
             .map_err(|err| format!("read gateway args file '{args_file}': {err}"))?;
         let args: Vec<String> = raw
@@ -475,7 +475,7 @@ impl GatewayProxyConfig {
         // generated config may add driver subtables (for example
         // `resource_admission`) before the gateway JWT and auth tables, so a
         // gateway-table marker is not a reliable boundary.
-        let podman_table = b"[openshell.drivers.podman]";
+        let podman_table = b"[ryno.drivers.podman]";
         let table_start = original
             .windows(podman_table.len())
             .position(|window| window == podman_table)
@@ -665,7 +665,7 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, allowed_port: u16, deni
 #[tokio::test]
 #[serial(corporate_proxy)]
 async fn podman_corporate_proxy_routes_approved_tls_egress() {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("podman") {
         eprintln!("Skipping corporate proxy test: e2e driver is not podman");
         return;
     }
@@ -812,7 +812,7 @@ fn assert_https_proxied_egress(
 #[tokio::test]
 #[serial(corporate_proxy)]
 async fn podman_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("podman") {
         eprintln!("Skipping https corporate proxy test: e2e driver is not podman");
         return;
     }

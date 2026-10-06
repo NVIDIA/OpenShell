@@ -6,8 +6,8 @@
   hosts: all
   gather_facts: false
   vars:
-    podman_reference_image: "{{ openshell_podman_reference_image }}"
-    podman_reference_uid_map: /var/lib/openshell-test-inputs/podman/reference-uid-map
+    podman_reference_image: "{{ ryno_podman_reference_image }}"
+    podman_reference_uid_map: /var/lib/ryno-test-inputs/podman/reference-uid-map
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -35,17 +35,17 @@
         podman_reference_home: "{{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}"
         podman_reference_uid: "{{ tmachine_container_runtime_tmachine_uid.stdout if tmachine_container_runtime_is_rootless else '0' }}"
 
-    - name: Read OpenShell gateway configuration
+    - name: Read Ryno gateway configuration
       become: true
       ansible.builtin.slurp:
-        src: /etc/openshell/gateway.toml
-      register: openshell_gateway_config
+        src: /etc/ryno/gateway.toml
+      register: ryno_gateway_config
 
     - name: Require unconfigured Podman user namespaces
       ansible.builtin.assert:
         that:
           - >-
-            (openshell_gateway_config.content | b64decode)
+            (ryno_gateway_config.content | b64decode)
             is not regex('(?m)^\\s*(userns|uidmap|gidmap)\\s*=')
         fail_msg: >-
           The Podman default-userns suite requires gateway.toml to omit userns,

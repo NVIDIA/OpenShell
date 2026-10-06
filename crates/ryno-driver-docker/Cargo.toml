@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-driver-docker"
+description = "Docker compute driver for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno-driver-docker"
+path = "src/main.rs"
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false, features = ["driver-extraction"] }
+ryno-isolation-interface = { path = "../ryno-isolation-interface" }
+ryno-sandbox-backend = { path = "../ryno-sandbox-backend" }
+ryno-otel = { path = "../ryno-otel" }
+
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost-types = { workspace = true }
+bollard = { version = "0.20" }
+url = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+rustix = { workspace = true }
+libc = "0.2"
+tar = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+ryno-otel-test-support = { path = "../ryno-otel-test-support" }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+prost-types = { workspace = true }
+temp-env = "0.3"
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

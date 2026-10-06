@@ -17,9 +17,9 @@ from pathlib import Path
 
 import grpc
 
-from openshell._proto import openshell_pb2_grpc
+from ryno._proto import ryno_pb2_grpc
 
-KEYCLOAK_REALM = "openshell"
+KEYCLOAK_REALM = "ryno"
 
 
 def _xdg_config_home() -> Path:
@@ -33,15 +33,15 @@ def keycloak_url() -> str:
     requested from the same base URL the server was configured with
     (typically the host IP, not localhost).
     """
-    if url := os.environ.get("OPENSHELL_KEYCLOAK_URL"):
+    if url := os.environ.get("RYNO_KEYCLOAK_URL"):
         return url
-    if issuer := os.environ.get("OPENSHELL_E2E_OIDC_ISSUER"):
+    if issuer := os.environ.get("RYNO_E2E_OIDC_ISSUER"):
         idx = issuer.find("/realms/")
         if idx > 0:
             return issuer[:idx]
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
+    cluster_name = os.environ.get("RYNO_GATEWAY", "ryno")
     metadata_path = (
-        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
+        _xdg_config_home() / "ryno" / "gateways" / cluster_name / "metadata.json"
     )
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text())
@@ -60,11 +60,11 @@ TOKEN_ENDPOINT = (
 
 def _gateway_endpoint() -> tuple[str, bool]:
     """Read the active gateway endpoint from metadata."""
-    if endpoint := os.environ.get("OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT"):
+    if endpoint := os.environ.get("RYNO_E2E_OIDC_GATEWAY_ENDPOINT"):
         return endpoint, endpoint.startswith("https://")
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
+    cluster_name = os.environ.get("RYNO_GATEWAY", "ryno")
     metadata_path = (
-        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
+        _xdg_config_home() / "ryno" / "gateways" / cluster_name / "metadata.json"
     )
     metadata = json.loads(metadata_path.read_text())
     endpoint = metadata["gateway_endpoint"]
@@ -73,8 +73,8 @@ def _gateway_endpoint() -> tuple[str, bool]:
 
 
 def _mtls_dir() -> Path:
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
-    return _xdg_config_home() / "openshell" / "gateways" / cluster_name / "mtls"
+    cluster_name = os.environ.get("RYNO_GATEWAY", "ryno")
+    return _xdg_config_home() / "ryno" / "gateways" / cluster_name / "mtls"
 
 
 def _token_request(data: dict[str, str]) -> str:
@@ -90,7 +90,7 @@ def get_token(
     username: str,
     password: str,
     *,
-    client_id: str = "openshell-cli",
+    client_id: str = "ryno-cli",
     scopes: str | None = None,
 ) -> str:
     """Get an access token from Keycloak via password grant."""
@@ -107,7 +107,7 @@ def get_token(
 
 def get_ci_token(
     *,
-    client_id: str = "openshell-ci",
+    client_id: str = "ryno-ci",
     client_secret: str = "ci-test-secret",
 ) -> str:
     """Get an access token via client credentials grant."""
@@ -129,7 +129,7 @@ def grpc_channel() -> grpc.Channel:
     target = f"{host}:{port}"
 
     if is_tls:
-        if ca_path := os.environ.get("OPENSHELL_E2E_GATEWAY_CA_CERT"):
+        if ca_path := os.environ.get("RYNO_E2E_GATEWAY_CA_CERT"):
             creds = grpc.ssl_channel_credentials(
                 root_certificates=Path(ca_path).read_bytes()
             )
@@ -146,10 +146,10 @@ def grpc_channel() -> grpc.Channel:
 
 def stub_with_token(
     token: str,
-) -> tuple[openshell_pb2_grpc.OpenShellStub, list[tuple[str, str]]]:
+) -> tuple[ryno_pb2_grpc.RynoStub, list[tuple[str, str]]]:
     """Create a gRPC stub that injects a Bearer token."""
     channel = grpc_channel()
-    return openshell_pb2_grpc.OpenShellStub(channel), [
+    return ryno_pb2_grpc.RynoStub(channel), [
         ("authorization", f"Bearer {token}")
     ]
 

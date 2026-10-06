@@ -150,7 +150,7 @@ jobs:
           fi
 
   result:
-    name: ${{ inputs.fail-on-findings && 'OpenShell / CodeQL' || 'OpenShell / CodeQL (informational)' }}
+    name: ${{ inputs.fail-on-findings && 'Ryno / CodeQL' || 'Ryno / CodeQL (informational)' }}
     if: always()
     needs: analyze
     runs-on: ubuntu-latest

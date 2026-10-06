@@ -1,0 +1,31 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify copied development artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ ryno_development_cli_bin }}"
+    - "{{ ryno_development_gateway_bin }}"
+    - "{{ ryno_development_sandbox_archive }}"
+  register: ryno_development_artifacts
+
+- name: Require copied development artifacts
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required development artifact: {{ item.item }}"
+  loop: "{{ ryno_development_artifacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish development Ryno installation
+  ansible.builtin.set_fact:
+    ryno_install_source: development
+    ryno_cli_bin: "{{ ryno_development_cli_bin }}"
+    ryno_gateway_bin: "{{ ryno_development_gateway_bin }}"
+    ryno_gateway_service: "{{ ryno_development_gateway_service }}"
+    ryno_gateway_endpoint: "{{ ryno_development_gateway_endpoint }}"
+    ryno_supervisor_source: archive
+    ryno_supervisor_archive: "{{ ryno_development_sandbox_archive }}"
+    ryno_supervisor_image: "{{ ryno_development_supervisor_image }}"

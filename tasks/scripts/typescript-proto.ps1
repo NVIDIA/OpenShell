@@ -12,7 +12,7 @@ $sdkRoot = Join-Path $repository 'sdk\typescript'
 $sourceTemplate = Join-Path $sdkRoot 'buf.gen.yaml'
 $buf = (Resolve-Path (Join-Path $sdkRoot 'node_modules\.bin\buf.cmd')).Path
 $plugin = (Resolve-Path (Join-Path $sdkRoot 'node_modules\.bin\protoc-gen-es.cmd')).Path
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "openshell-ts-proto-$([guid]::NewGuid().ToString('N'))"
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) "ryno-ts-proto-$([guid]::NewGuid().ToString('N'))"
 $windowsTemplate = Join-Path $temporaryRoot 'buf.gen.windows.yaml'
 $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 if (-not [IO.Path]::GetFullPath($temporaryRoot).StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) {
@@ -46,7 +46,7 @@ try {
 finally {
     if (
         (Test-Path -LiteralPath $temporaryRoot) -and
-        (Split-Path -Leaf $temporaryRoot) -like 'openshell-ts-proto-*'
+        (Split-Path -Leaf $temporaryRoot) -like 'ryno-ts-proto-*'
     ) {
         $resolvedTemp = (Resolve-Path -LiteralPath $temporaryRoot).ProviderPath
         if (-not $resolvedTemp.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-supervisor-process"
+description = "Process access and gateway session runtime for the Ryno supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ryno-core = { path = "../ryno-core" }
+ryno-isolation-interface = { path = "../ryno-isolation-interface" }
+ryno-ocsf = { path = "../ryno-ocsf" }
+
+anyhow = { workspace = true }
+async-trait = "0.1"
+base64 = { workspace = true }
+bytes = { workspace = true }
+hex = "0.4"
+miette = { workspace = true }
+nix = { workspace = true }
+rand = "0.10"
+russh = "0.63.1"
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ryno-ocsf = { path = "../ryno-ocsf", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -11,11 +11,11 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::container::ContainerHttpServer;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ContainerHttpServer;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const SERVER_ALIAS: &str = "mcp-sessionless.openshell.test";
+const SERVER_ALIAS: &str = "mcp-sessionless.ryno.test";
 
 const SERVER_SCRIPT: &str = r#"
 import json
@@ -76,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
             result = {
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "openshell-profile-fixture", "version": "1"},
+                "serverInfo": {"name": "ryno-profile-fixture", "version": "1"},
             }
         elif method == "notifications/initialized" and version != SESSIONLESS_VERSION:
             self.reply(202, b"")
@@ -89,12 +89,12 @@ class Handler(BaseHTTPRequestHandler):
                 "cacheScope": "private",
                 "_meta": {
                     "io.modelcontextprotocol/serverInfo": {
-                        "name": "openshell-sessionless-fixture", "version": "1"
+                        "name": "ryno-sessionless-fixture", "version": "1"
                     }
                 },
             }
         elif method == "tools/call":
-            # Both tool names work upstream; OpenShell owns the policy denial.
+            # Both tool names work upstream; Ryno owns the policy denial.
             result = {
                 "content": [{"type": "text", "text": params["name"]}],
                 "isError": False,
@@ -155,7 +155,7 @@ def post(request_id, method, params, version):
         params["_meta"] = {
             "io.modelcontextprotocol/protocolVersion": version,
             "io.modelcontextprotocol/clientCapabilities": {},
-            "io.modelcontextprotocol/clientInfo": {"name": "openshell-e2e", "version": "1"},
+            "io.modelcontextprotocol/clientInfo": {"name": "ryno-e2e", "version": "1"},
         }
         headers["Mcp-Method"] = method
         if method == "tools/call":
@@ -221,7 +221,7 @@ for version in SELECTED_VERSIONS:
         status, _, body = post(1, "initialize", {
             "protocolVersion": version,
             "capabilities": {},
-            "clientInfo": {"name": "openshell-e2e", "version": "1"},
+            "clientInfo": {"name": "ryno-e2e", "version": "1"},
         }, version)
         assert status == 200, (version, "initialize", status, body)
         assert json.loads(body)["result"]["protocolVersion"] == version, body
@@ -360,7 +360,7 @@ async fn legacy_and_multi_version_profiles_authorize_tools_through_sandbox() {
     ] {
         // Each scenario starts with fresh upstream receipts. Its distinct alias
         // avoids the sessionless test's fixture, and cleanup precedes alias reuse.
-        let server = start_server("mcp-profiles.openshell.test", versions)
+        let server = start_server("mcp-profiles.ryno.test", versions)
             .await
             .unwrap_or_else(|err| panic!("{versions:?}: start MCP fixture: {err}"));
         let mut sandbox = run_client(&server, versions, PROFILE_CLIENT_SCRIPT)

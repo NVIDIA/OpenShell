@@ -4217,973 +4217,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openshell-binary-identity"
-version = "0.0.0"
-dependencies = [
- "openshell-isolation-interface",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "openshell-bootstrap"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "miette",
- "openshell-core",
- "rcgen",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
- "x509-parser",
-]
-
-[[package]]
-name = "openshell-cli"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap",
- "clap_complete",
- "console",
- "crossterm 0.28.1",
- "dialoguer",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "indicatif",
- "miette",
- "nix 0.29.0",
- "noyalib",
- "oauth2",
- "openshell-bootstrap",
- "openshell-core",
- "openshell-policy",
- "openshell-providers",
- "openshell-sdk",
- "openshell-server",
- "openshell-tui",
- "owo-colors",
- "prost",
- "prost-types",
- "rcgen",
- "reqwest 0.12.28",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tar",
- "temp-env",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "openshell-conformance"
-version = "0.0.0"
-dependencies = [
- "rand 0.9.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "openshell-conformance-cli"
-version = "0.0.0"
-dependencies = [
- "clap",
- "openshell-conformance",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "openshell-core"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "glob",
- "ipnet",
- "jsonwebtoken",
- "miette",
- "nix 0.29.0",
- "openshell-extension-core",
- "openshell-policy-schema",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "rcgen",
- "reqwest 0.12.28",
- "rustix 1.1.4",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tonic-types",
- "tracing",
- "url",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "openshell-driver-db-credstore"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "aws-lc-rs",
- "base64 0.22.1",
- "futures",
- "openshell-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "toml",
- "tonic",
-]
-
-[[package]]
-name = "openshell-driver-docker"
-version = "0.0.0"
-dependencies = [
- "bollard",
- "bytes",
- "clap",
- "futures",
- "http 1.4.0",
- "libc",
- "miette",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-otel",
- "openshell-otel-test-support",
- "openshell-sandbox-backend",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost-types",
- "rand 0.9.4",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "temp-env",
- "tempfile",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "openshell-driver-kubernetes"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "clap",
- "futures",
- "http 1.4.0",
- "http-body-util",
- "k8s-openapi",
- "kube",
- "kube-runtime",
- "miette",
- "notify",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-otel",
- "openshell-otel-test-support",
- "openshell-policy",
- "openshell-sandbox-backend",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost",
- "prost-types",
- "rand 0.9.4",
- "rcgen",
- "serde",
- "serde_json",
- "temp-env",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openshell-driver-kubernetes-secrets"
-version = "0.0.0"
-dependencies = [
- "clap",
- "futures",
- "k8s-openapi",
- "kube",
- "miette",
- "openshell-core",
- "serde",
- "sha2 0.10.9",
- "tokio",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openshell-driver-mxc"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "futures",
- "noyalib",
- "openshell-core",
- "openshell-ocsf",
- "openshell-policy",
- "openshell-supervisor-network",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "uuid",
- "windows",
-]
-
-[[package]]
-name = "openshell-driver-podman"
-version = "0.0.0"
-dependencies = [
- "clap",
- "futures",
- "http 1.4.0",
- "http-body-util",
- "hyper",
- "hyper-util",
- "miette",
- "nix 0.29.0",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-otel",
- "openshell-otel-test-support",
- "openshell-sandbox-backend",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost-types",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "tar",
- "temp-env",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "openshell-driver-vault"
-version = "0.0.0"
-dependencies = [
- "clap",
- "futures",
- "miette",
- "openshell-core",
- "rcgen",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "openshell-driver-vm"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "bollard",
- "clap",
- "flate2",
- "futures",
- "http 1.4.0",
- "libc",
- "libloading",
- "miette",
- "nix 0.29.0",
- "oci-client",
- "openshell-core",
- "openshell-driver-podman",
- "openshell-isolation-interface",
- "openshell-otel",
- "openshell-otel-test-support",
- "openshell-policy",
- "openshell-sandbox-backend",
- "openshell-vfio",
- "opentelemetry",
- "opentelemetry_sdk",
- "polling",
- "prost",
- "prost-types",
- "rand 0.9.4",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "temp-env",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "zstd",
-]
-
-[[package]]
-name = "openshell-extension-core"
-version = "0.0.0"
-dependencies = [
- "http 1.4.0",
- "hyper-util",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
-]
-
-[[package]]
-name = "openshell-gateway"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "hyper-util",
- "miette",
- "nix 0.29.0",
- "openshell-core",
- "openshell-driver-docker",
- "openshell-driver-kubernetes",
- "openshell-driver-mxc",
- "openshell-driver-podman",
- "openshell-otel",
- "openshell-policy",
- "openshell-server",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tonic",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "openshell-gateway-interceptors"
-version = "0.0.0"
-dependencies = [
- "json-patch 1.4.0",
- "metrics",
- "openshell-core",
- "openshell-extension-core",
- "prost",
- "prost-reflect",
- "prost-types",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openshell-isolation-interface"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "libc",
- "openshell-core",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
-]
-
-[[package]]
-name = "openshell-ocsf"
-version = "0.0.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "serde_repr",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "openshell-otel"
-version = "0.0.0"
-dependencies = [
- "futures",
- "http 1.4.0",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "thiserror 2.0.20",
- "tokio",
- "tonic",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openshell-otel-test-support"
-version = "0.0.0"
-dependencies = [
- "openshell-otel",
- "opentelemetry-proto",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "openshell-policy"
-version = "0.0.0"
-dependencies = [
- "hickory-proto",
- "miette",
- "openshell-core",
- "openshell-policy-schema",
- "prost-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "openshell-policy-schema"
-version = "0.0.0"
-dependencies = [
- "miette",
- "noyalib",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "openshell-prover"
-version = "0.0.0"
-dependencies = [
- "glob",
- "include_dir",
- "miette",
- "noyalib",
- "openshell-core",
- "openshell-policy-schema",
- "owo-colors",
- "regorus",
- "serde",
- "serde_json",
- "z3",
-]
-
-[[package]]
-name = "openshell-prover-cli"
-version = "0.0.0"
-dependencies = [
- "clap",
- "nix 0.29.0",
- "openshell-prover",
- "serde",
- "serde_json",
- "signal-hook",
-]
-
-[[package]]
-name = "openshell-providers"
-version = "0.0.0"
-dependencies = [
- "glob",
- "noyalib",
- "openshell-core",
- "openshell-policy",
- "prost-types",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "url",
-]
-
-[[package]]
-name = "openshell-sandbox"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "clap",
- "hex",
- "ipnet",
- "landlock",
- "libc",
- "miette",
- "nix 0.29.0",
- "openshell-binary-identity",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-ocsf",
- "openshell-policy",
- "openshell-sandbox-backend",
- "rand 0.10.2",
- "rcgen",
- "russh-sftp",
- "rustix 1.1.4",
- "rustls",
- "rustls-pemfile",
- "seccompiler",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "openshell-sandbox-backend"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "hyper-util",
- "libc",
- "openshell-core",
- "openshell-isolation-interface",
- "prost",
- "protoc-bin-vendored",
- "rcgen",
- "rustix 1.1.4",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "openshell-sdk"
-version = "0.0.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "futures",
- "hyper",
- "hyper-util",
- "miette",
- "oauth2",
- "openshell-core",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "tonic",
- "tower",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "openshell-server"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "aws-config",
- "aws-sdk-sts",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap",
- "futures",
- "futures-util",
- "glob",
- "hex",
- "hmac 0.12.1",
- "http 1.4.0",
- "http-body 1.0.1",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ipnet",
- "jsonwebtoken",
- "k8s-openapi",
- "kube",
- "libc",
- "metrics",
- "metrics-exporter-prometheus",
- "miette",
- "nix 0.29.0",
- "notify",
- "openshell-bootstrap",
- "openshell-core",
- "openshell-driver-db-credstore",
- "openshell-driver-kubernetes-secrets",
- "openshell-driver-vault",
- "openshell-extension-core",
- "openshell-gateway-interceptors",
- "openshell-ocsf",
- "openshell-otel",
- "openshell-policy",
- "openshell-prover",
- "openshell-providers",
- "openshell-supervisor-middleware",
- "openshell-supervisor-middleware-builtins",
- "opentelemetry",
- "opentelemetry_sdk",
- "petname",
- "pin-project-lite",
- "prost",
- "prost-reflect",
- "prost-types",
- "protoc-bin-vendored",
- "rand 0.9.4",
- "rcgen",
- "reqwest 0.12.28",
- "rsa 0.9.10",
- "russh",
- "rustix 1.1.4",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2",
- "spiffe",
- "sqlx",
- "sqlx-core",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "toml",
- "tonic",
- "tonic-prost-build",
- "tower",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "uuid",
- "wiremock",
- "x509-parser",
-]
-
-[[package]]
-name = "openshell-server-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "openshell-supervisor"
-version = "0.0.0"
-dependencies = [
- "clap",
- "futures",
- "miette",
- "nix 0.29.0",
- "openshell-core",
- "openshell-extension-core",
- "openshell-isolation-interface",
- "openshell-ocsf",
- "openshell-policy",
- "openshell-sandbox-backend",
- "openshell-supervisor-middleware",
- "openshell-supervisor-middleware-builtins",
- "openshell-supervisor-network",
- "openshell-supervisor-process",
- "prost",
- "prost-types",
- "rustix 1.1.4",
- "rustls",
- "serde",
- "serde_json",
- "socket2",
- "temp-env",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tonic",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "openshell-supervisor-middleware"
-version = "0.0.0"
-dependencies = [
- "futures",
- "miette",
- "openshell-core",
- "openshell-extension-core",
- "openshell-supervisor-middleware-builtins",
- "prost",
- "prost-types",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "openshell-supervisor-middleware-builtins"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "miette",
- "openshell-core",
- "prost-types",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
-name = "openshell-supervisor-network"
-version = "0.0.0"
-dependencies = [
- "apollo-parser",
- "async-trait",
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-runtime-api",
- "base64 0.22.1",
- "bytes",
- "flate2",
- "futures",
- "glob",
- "hex",
- "hickory-proto",
- "http 1.4.0",
- "ipnet",
- "libc",
- "miette",
- "noyalib",
- "openshell-binary-identity",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-ocsf",
- "openshell-policy",
- "openshell-policy-schema",
- "openshell-supervisor-middleware",
- "openshell-supervisor-middleware-builtins",
- "prost-types",
- "rcgen",
- "regorus",
- "reqwest 0.12.28",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha1 0.10.6",
- "sha2 0.10.9",
- "spiffe",
- "temp-env",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tungstenite 0.26.2",
- "tonic",
- "tower-mcp-types",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "webpki-roots",
-]
-
-[[package]]
-name = "openshell-supervisor-process"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "hex",
- "libc",
- "miette",
- "nix 0.29.0",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-ocsf",
- "rand 0.10.2",
- "russh",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "openshell-tui"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "crossterm 0.28.1",
- "futures",
- "indexmap",
- "miette",
- "openshell-bootstrap",
- "openshell-core",
- "openshell-policy",
- "openshell-providers",
- "owo-colors",
- "ratatui",
- "serde",
- "shell-words",
- "terminal-colorsaurus",
- "tokio",
- "tonic",
- "url",
-]
-
-[[package]]
-name = "openshell-vfio"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
 name = "openssh"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6835,6 +5868,973 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ryno-binary-identity"
+version = "0.0.0"
+dependencies = [
+ "ryno-isolation-interface",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "ryno-bootstrap"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "miette",
+ "rcgen",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "x509-parser",
+]
+
+[[package]]
+name = "ryno-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "console",
+ "crossterm 0.28.1",
+ "dialoguer",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indicatif",
+ "miette",
+ "nix 0.29.0",
+ "noyalib",
+ "oauth2",
+ "owo-colors",
+ "prost",
+ "prost-types",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-bootstrap",
+ "ryno-core",
+ "ryno-policy",
+ "ryno-providers",
+ "ryno-sdk",
+ "ryno-server",
+ "ryno-tui",
+ "serde",
+ "serde_json",
+ "tar",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "ryno-conformance"
+version = "0.0.0"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ryno-conformance-cli"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "ryno-conformance",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ryno-core"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "glob",
+ "ipnet",
+ "jsonwebtoken",
+ "miette",
+ "nix 0.29.0",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-extension-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tonic-types",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "ryno-driver-db-credstore"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "futures",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+]
+
+[[package]]
+name = "ryno-driver-docker"
+version = "0.0.0"
+dependencies = [
+ "bollard",
+ "bytes",
+ "clap",
+ "futures",
+ "http 1.4.0",
+ "libc",
+ "miette",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost-types",
+ "rand 0.9.4",
+ "rustix 1.1.4",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-otel",
+ "ryno-otel-test-support",
+ "ryno-sandbox-backend",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "ryno-driver-kubernetes"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "k8s-openapi",
+ "kube",
+ "kube-runtime",
+ "miette",
+ "notify",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "rcgen",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-otel",
+ "ryno-otel-test-support",
+ "ryno-policy",
+ "ryno-sandbox-backend",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ryno-driver-kubernetes-secrets"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "miette",
+ "ryno-core",
+ "serde",
+ "sha2 0.10.9",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ryno-driver-mxc"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "noyalib",
+ "rustls",
+ "ryno-core",
+ "ryno-ocsf",
+ "ryno-policy",
+ "ryno-supervisor-network",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
+ "windows",
+]
+
+[[package]]
+name = "ryno-driver-podman"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "miette",
+ "nix 0.29.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost-types",
+ "rustix 1.1.4",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-otel",
+ "ryno-otel-test-support",
+ "ryno-sandbox-backend",
+ "serde",
+ "serde_json",
+ "tar",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-driver-vault"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustls",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "ryno-driver-vm"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "bollard",
+ "clap",
+ "flate2",
+ "futures",
+ "http 1.4.0",
+ "libc",
+ "libloading",
+ "miette",
+ "nix 0.29.0",
+ "oci-client",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "polling",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "rustix 1.1.4",
+ "ryno-core",
+ "ryno-driver-podman",
+ "ryno-isolation-interface",
+ "ryno-otel",
+ "ryno-otel-test-support",
+ "ryno-policy",
+ "ryno-sandbox-backend",
+ "ryno-vfio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "zstd",
+]
+
+[[package]]
+name = "ryno-extension-core"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+]
+
+[[package]]
+name = "ryno-gateway"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "miette",
+ "nix 0.29.0",
+ "rustix 1.1.4",
+ "ryno-core",
+ "ryno-driver-docker",
+ "ryno-driver-kubernetes",
+ "ryno-driver-mxc",
+ "ryno-driver-podman",
+ "ryno-otel",
+ "ryno-policy",
+ "ryno-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "ryno-gateway-interceptors"
+version = "0.0.0"
+dependencies = [
+ "json-patch 1.4.0",
+ "metrics",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "ryno-core",
+ "ryno-extension-core",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ryno-isolation-interface"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "rustix 1.1.4",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
+name = "ryno-ocsf"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-otel"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "http 1.4.0",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ryno-otel-test-support"
+version = "0.0.0"
+dependencies = [
+ "opentelemetry-proto",
+ "ryno-otel",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ryno-policy"
+version = "0.0.0"
+dependencies = [
+ "hickory-proto",
+ "miette",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ryno-policy-schema"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "noyalib",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ryno-prover"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "include_dir",
+ "miette",
+ "noyalib",
+ "owo-colors",
+ "regorus",
+ "ryno-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+ "z3",
+]
+
+[[package]]
+name = "ryno-prover-cli"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "nix 0.29.0",
+ "ryno-prover",
+ "serde",
+ "serde_json",
+ "signal-hook",
+]
+
+[[package]]
+name = "ryno-providers"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "noyalib",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
+name = "ryno-sandbox"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "hex",
+ "ipnet",
+ "landlock",
+ "libc",
+ "miette",
+ "nix 0.29.0",
+ "rand 0.10.2",
+ "rcgen",
+ "russh-sftp",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-binary-identity",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-ocsf",
+ "ryno-policy",
+ "ryno-sandbox-backend",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-sandbox-backend"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "libc",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "miette",
+ "oauth2",
+ "reqwest 0.12.28",
+ "rustls",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tower",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "ryno-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures",
+ "futures-util",
+ "glob",
+ "hex",
+ "hmac 0.12.1",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ipnet",
+ "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
+ "libc",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "miette",
+ "nix 0.29.0",
+ "notify",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "petname",
+ "pin-project-lite",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rand 0.9.4",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rsa 0.9.10",
+ "russh",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-bootstrap",
+ "ryno-core",
+ "ryno-driver-db-credstore",
+ "ryno-driver-kubernetes-secrets",
+ "ryno-driver-vault",
+ "ryno-extension-core",
+ "ryno-gateway-interceptors",
+ "ryno-ocsf",
+ "ryno-otel",
+ "ryno-policy",
+ "ryno-prover",
+ "ryno-providers",
+ "ryno-supervisor-middleware",
+ "ryno-supervisor-middleware-builtins",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "spiffe",
+ "sqlx",
+ "sqlx-core",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "toml",
+ "tonic",
+ "tonic-prost-build",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+ "x509-parser",
+]
+
+[[package]]
+name = "ryno-server-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "ryno-supervisor"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "nix 0.29.0",
+ "prost",
+ "prost-types",
+ "rustix 1.1.4",
+ "rustls",
+ "ryno-core",
+ "ryno-extension-core",
+ "ryno-isolation-interface",
+ "ryno-ocsf",
+ "ryno-policy",
+ "ryno-sandbox-backend",
+ "ryno-supervisor-middleware",
+ "ryno-supervisor-middleware-builtins",
+ "ryno-supervisor-network",
+ "ryno-supervisor-process",
+ "serde",
+ "serde_json",
+ "socket2",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-supervisor-middleware"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "miette",
+ "prost",
+ "prost-types",
+ "ryno-core",
+ "ryno-extension-core",
+ "ryno-supervisor-middleware-builtins",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "ryno-supervisor-middleware-builtins"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "miette",
+ "prost-types",
+ "regex",
+ "ryno-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "ryno-supervisor-network"
+version = "0.0.0"
+dependencies = [
+ "apollo-parser",
+ "async-trait",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "base64 0.22.1",
+ "bytes",
+ "flate2",
+ "futures",
+ "glob",
+ "hex",
+ "hickory-proto",
+ "http 1.4.0",
+ "ipnet",
+ "libc",
+ "miette",
+ "noyalib",
+ "prost-types",
+ "rcgen",
+ "regorus",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "ryno-binary-identity",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-ocsf",
+ "ryno-policy",
+ "ryno-policy-schema",
+ "ryno-supervisor-middleware",
+ "ryno-supervisor-middleware-builtins",
+ "serde",
+ "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "spiffe",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tower-mcp-types",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ryno-supervisor-process"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "hex",
+ "libc",
+ "miette",
+ "nix 0.29.0",
+ "rand 0.10.2",
+ "russh",
+ "ryno-core",
+ "ryno-isolation-interface",
+ "ryno-ocsf",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-tui"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "crossterm 0.28.1",
+ "futures",
+ "indexmap",
+ "miette",
+ "owo-colors",
+ "ratatui",
+ "ryno-bootstrap",
+ "ryno-core",
+ "ryno-policy",
+ "ryno-providers",
+ "serde",
+ "shell-words",
+ "terminal-colorsaurus",
+ "tokio",
+ "tonic",
+ "url",
+]
+
+[[package]]
+name = "ryno-vfio"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
 
 [[package]]
 name = "ryu"

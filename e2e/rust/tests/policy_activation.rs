@@ -8,10 +8,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
-use openshell_e2e::harness::cli::run_cli;
-use openshell_e2e::harness::container::{ContainerEngine, ImageGuard};
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::{ryno_bin, ryno_cmd};
+use ryno_e2e::harness::cli::run_cli;
+use ryno_e2e::harness::container::{ContainerEngine, ImageGuard};
+use ryno_e2e::harness::output::strip_ansi;
 
 const MARKER: &str = "/sandbox/activation-count";
 const WORKLOAD: &str = "echo started >> /sandbox/activation-count; exec sleep infinity";
@@ -43,7 +43,7 @@ struct Resources {
 impl Drop for Resources {
     fn drop(&mut self) {
         // Deletion drains asynchronously; retry dependencies on panic as well.
-        let bin = openshell_bin();
+        let bin = ryno_bin();
         let _ = std::process::Command::new(&bin)
             .args(["sandbox", "delete", &self.sandbox])
             .stdout(Stdio::null())
@@ -89,9 +89,9 @@ fn role_container_id(engine: &ContainerEngine, name: &str, role: &str) -> String
             "ps",
             "--quiet",
             "--filter",
-            &format!("label=openshell.ai/sandbox-name={name}"),
+            &format!("label=ryno.ai/sandbox-name={name}"),
             "--filter",
-            &format!("label=openshell.ai/isolation-role={role}"),
+            &format!("label=ryno.ai/isolation-role={role}"),
         ])
         .output()
         .expect("find sandbox container");
@@ -157,7 +157,7 @@ async fn invalid_image_provider_bundle_waits_for_repair_before_launch() {
     std::fs::write(context.path().join("Dockerfile"), r#"FROM public.ecr.aws/docker/library/python:3.13-slim
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/* \
     && groupadd sandbox && useradd -m -g sandbox sandbox && mkdir -p /sandbox && chown sandbox:sandbox /sandbox
-COPY policy.yaml /etc/openshell/policy.yaml
+COPY policy.yaml /etc/ryno/policy.yaml
 WORKDIR /sandbox
 USER sandbox
 CMD ["sh", "-c", "echo started >> /sandbox/activation-count; exec sleep infinity"]
@@ -239,7 +239,7 @@ binaries:
         "ACTIVATION_TOKEN=activation-test-not-a-real-secret",
     ])
     .await;
-    let mut create = openshell_cmd()
+    let mut create = ryno_cmd()
         .args([
             "sandbox",
             "create",

@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: sandboxNamespace defaulting
+templates:
+  - templates/gateway-config.yaml
+  - templates/networkpolicy.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/serviceaccount.yaml
+release:
+  name: ryno
+  namespace: my-namespace
+
+tests:
+  - it: defaults the Kubernetes driver namespace to release namespace
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[ryno\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*='
+
+  - it: uses explicit sandboxNamespace for the Kubernetes driver
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[ryno\.drivers\.kubernetes\].*?namespace\s*=\s*"other-ns"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*='
+
+  - it: defaults NetworkPolicy namespace to release namespace
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+
+  - it: uses explicit sandboxNamespace for NetworkPolicy
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+
+  - it: uses explicit sandboxNamespace for sandbox RBAC
+    template: templates/role.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: grants PVC admission reads only when caller driver config is enabled
+    template: templates/role.yaml
+    set:
+      server.drivers.kubernetes.allowDriverConfig: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+
+  - it: uses explicit sandboxNamespace for sandbox RoleBinding
+    template: templates/rolebinding.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+
+  - it: uses explicit sandboxNamespace for sandbox ServiceAccount
+    template: templates/serviceaccount.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+        documentIndex: 1
+
+  - it: omits workspace resources in gateway-only mode
+    set:
+      workspaceResources.enabled: false
+      networkPolicy.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: templates/gateway-config.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/networkpolicy.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/role.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/rolebinding.yaml

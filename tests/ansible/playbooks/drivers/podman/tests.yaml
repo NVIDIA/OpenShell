@@ -6,8 +6,8 @@
   hosts: all
   gather_facts: false
   vars:
-    podman_test_root: /var/lib/openshell-driver-tests/podman
-    podman_test_input_dir: /var/lib/openshell-test-inputs/podman
+    podman_test_root: /var/lib/ryno-driver-tests/podman
+    podman_test_input_dir: /var/lib/ryno-test-inputs/podman
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -34,28 +34,28 @@
     - name: Install Podman test bundle
       become: true
       ansible.builtin.unarchive:
-        src: "{{ openshell_podman_test_bundle }}"
+        src: "{{ ryno_podman_test_bundle }}"
         dest: "{{ podman_test_root }}"
         owner: tmachine
         group: tmachine
 
-    - name: Remove any previous OpenShell gateway registration
+    - name: Remove any previous Ryno gateway registration
       ansible.builtin.command:
-        argv: [/usr/local/bin/openshell, gateway, remove, tmachine]
+        argv: [/usr/local/bin/ryno, gateway, remove, tmachine]
       changed_when: false
       failed_when: false
 
-    - name: Register the configured OpenShell gateway
+    - name: Register the configured Ryno gateway
       ansible.builtin.command:
-        argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
+        argv: [/usr/local/bin/ryno, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
 
     - name: Run Podman archive tests
       ansible.builtin.command:
         argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --no-capture]
       environment:
-        OPENSHELL_BIN: /usr/local/bin/openshell
-        OPENSHELL_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
-        OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default('') }}"
+        RYNO_BIN: /usr/local/bin/ryno
+        RYNO_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
+        RYNO_PODMAN_TEST_IMAGE: "{{ ryno_podman_test_image | default('') }}"
       register: podman_test_result
       changed_when: false
       failed_when: false
@@ -68,13 +68,13 @@
       ansible.builtin.debug:
         var: podman_test_result.stdout_lines
 
-    - name: Capture OpenShell gateway journal after Podman test failure
+    - name: Capture Ryno gateway journal after Podman test failure
       become: true
       ansible.builtin.command:
         argv:
           - journalctl
           - --unit
-          - openshell-gateway.service
+          - ryno-gateway.service
           - --no-pager
           - --lines
           - "200"
@@ -83,7 +83,7 @@
       when: podman_test_result.rc != 0
       register: podman_gateway_journal
 
-    - name: Show OpenShell gateway journal after Podman test failure
+    - name: Show Ryno gateway journal after Podman test failure
       ansible.builtin.debug:
         var: podman_gateway_journal.stdout_lines
       when: podman_test_result.rc != 0

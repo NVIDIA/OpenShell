@@ -1,7 +1,7 @@
-# OpenShell Agents
+# Ryno Agents
 
 `scripts/agents/` contains repository-owned agent launchers. An agent is a
-manifest plus prompt assets that the shared launcher turns into an OpenShell
+manifest plus prompt assets that the shared launcher turns into an Ryno
 sandbox run. Agents do not own harness implementations. Harness-specific setup
 and execution live in `runtime/harnesses/<name>/`.
 
@@ -74,7 +74,7 @@ Manifest paths support these prefixes:
    manifest-declared subagent variables such as `{{REVIEWER_COMMAND}}`.
 9. Query the gateway's compute driver, then build a temporary image context
    with its Docker or Podman image store. The image bakes the rendered payload
-   into `/etc/openshell/agent-payload`.
+   into `/etc/ryno/agent-payload`.
 10. Apply manifest-declared gateway settings.
 11. Resolve provider profile IDs by scanning `profile_paths` in order.
 12. Import each provider profile into the gateway. If an active profile already
@@ -85,20 +85,20 @@ Manifest paths support these prefixes:
      to the sandbox.
 15. Configure and rotate refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from the resulting image reference, with the
+16. Run `ryno sandbox create` from the resulting image reference, with the
     runtime entrypoint persisted as the detached canonical main process.
 17. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
     gateway to delete it after the canonical process exits.
-18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
+18. Inside the sandbox, run `/etc/ryno/agent-payload/runtime/entrypoint.sh`.
 19. The runtime entrypoint starts
-    `/etc/openshell/agent-payload/runtime/supervisor.sh`.
+    `/etc/ryno/agent-payload/runtime/supervisor.sh`.
 20. The supervisor invokes
-    `/etc/openshell/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
+    `/etc/ryno/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
     bounded child execution.
 21. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
 
-The payload directory is baked into the image under `/etc/openshell`, which the
+The payload directory is baked into the image under `/etc/ryno`, which the
 gator filesystem policy mounts read-only for agent processes. Prompts, skills,
 subagent definitions, and runtime scripts are agent guts, not workspace state.
 Agents should write session artifacts, checkouts, temporary files, and future
@@ -108,14 +108,14 @@ memory records under `/sandbox` or `/tmp` instead.
 
 Agents can run in `once` or `watch` mode. In `once` mode the supervisor runs one
 harness cycle and exits with the harness result unless the agent emits an
-`OPENSHELL_AGENT_RESULT` sentinel.
+`RYNO_AGENT_RESULT` sentinel.
 
 In `watch` mode the sandbox stays alive while the supervisor repeatedly runs
 bounded harness cycles. The harness must not sleep or poll indefinitely. Instead,
 it performs one reconciliation cycle, then prints a final-line sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running. The agent will inspect them next cycle."}
+RYNO_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running. The agent will inspect them next cycle."}
 ```
 
 Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
@@ -123,7 +123,7 @@ Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, an
 without keeping the harness connected, then launches a fresh harness cycle inside
 the same sandbox. During active harness cycles and long sleeps, it prints a
 heartbeat every 60 seconds by default so operators can distinguish deliberate
-work or waiting from a stuck launch. Set `OPENSHELL_AGENT_HEARTBEAT_SECONDS=0`
+work or waiting from a stuck launch. Set `RYNO_AGENT_HEARTBEAT_SECONDS=0`
 to disable heartbeats or another integer to change the interval. In `watch`
 mode, missing or malformed result sentinels and harness transport failures are
 retried indefinitely with bounded backoff; only `complete` and
@@ -132,15 +132,15 @@ to upstream model errors while leaving durable state ownership to the agent
 domain.
 
 The supervisor writes an atomic current snapshot to
-`/sandbox/.openshell-agent/status.json` and keeps the latest 100 supervisor
-transitions in `/sandbox/.openshell-agent/history.jsonl`. Each record identifies
+`/sandbox/.ryno-agent/status.json` and keeps the latest 100 supervisor
+transitions in `/sandbox/.ryno-agent/history.jsonl`. Each record identifies
 the cycle, supervisor state, harness exit code, and structured agent result.
 Agents should include a concise `notes` field in every result to capture their
 human-readable current diagnosis, notable issues or questions, and next useful
 action. The supervisor caps notes at 2,048 characters and records a diagnostic
 placeholder when an agent omits them. Override the state directory, history
-limit, or notes limit with `OPENSHELL_AGENT_STATE_DIR`,
-`OPENSHELL_AGENT_STATE_HISTORY_LIMIT`, or `OPENSHELL_AGENT_MAX_NOTES_LENGTH`.
+limit, or notes limit with `RYNO_AGENT_STATE_DIR`,
+`RYNO_AGENT_STATE_HISTORY_LIMIT`, or `RYNO_AGENT_MAX_NOTES_LENGTH`.
 
 The shared runtime does not prescribe the durable state store. Gator uses GitHub
 labels, comments, reviews, and checks. Other agents can use a repository branch,
@@ -159,19 +159,19 @@ skip the preserve-first path and intentionally replace gateway refresh material
 from the host credential source before rotating.
 
 Long-lived harnesses must not persist revision-scoped provider placeholders such
-as `openshell:resolve:env:v123_TOKEN` into files they reuse across refreshes.
-Persist the current-name alias, for example `openshell:resolve:env:TOKEN`, so the
+as `ryno:resolve:env:v123_TOKEN` into files they reuse across refreshes.
+Persist the current-name alias, for example `ryno:resolve:env:TOKEN`, so the
 sandbox proxy resolves the latest gateway-refreshed credential on each request.
 
 ## Subagents
 
 The launcher injects subagent definitions under
-`/etc/openshell/agent-payload/subagents/`.
+`/etc/ryno/agent-payload/subagents/`.
 Prompt templates should refer to the generic command instead of a harness-specific
 script:
 
 ```shell
-bash /etc/openshell/agent-payload/runtime/subagent.sh <subagent-id> < task.md
+bash /etc/ryno/agent-payload/runtime/subagent.sh <subagent-id> < task.md
 ```
 
 The shared subagent dispatcher forwards the task to the active harness adapter.

@@ -1,8 +1,8 @@
 {
-  "name": "openshell-lint-mermaid",
+  "name": "ryno-lint-mermaid",
   "private": true,
   "version": "0.0.0",
-  "description": "Mermaid diagram validation for OpenShell docs. Not published.",
+  "description": "Mermaid diagram validation for Ryno docs. Not published.",
   "type": "module",
   "dependencies": {
     "jsdom": "^25.0.1",

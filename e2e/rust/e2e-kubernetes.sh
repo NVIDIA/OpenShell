@@ -2,30 +2,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e suite against an OpenShell gateway deployed on Kubernetes
-# via Helm. Set OPENSHELL_E2E_KUBE_CONTEXT to target an existing cluster;
+# Run the Rust e2e suite against an Ryno gateway deployed on Kubernetes
+# via Helm. Set RYNO_E2E_KUBE_CONTEXT to target an existing cluster;
 # otherwise an ephemeral k3d cluster is created and torn down by
-# with-kube-gateway.sh. Set OPENSHELL_E2E_KUBE_TEST to scope to a single
+# with-kube-gateway.sh. Set RYNO_E2E_KUBE_TEST to scope to a single
 # integration test for local debugging.
 #
 # Features: the default set includes `e2e-host-gateway` so tests that rely on
-# the sandbox-side `host.openshell.internal` alias compile and run. The
+# the sandbox-side `host.ryno.internal` alias compile and run. The
 # wrapper detects the cluster's host-routable IP and wires it into the chart
 # via `server.hostGatewayIP`. Targeting a cluster where the test host is
-# unreachable from pods? Set OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the
+# unreachable from pods? Set RYNO_E2E_KUBERNETES_FEATURES=e2e to drop the
 # alias-dependent tests entirely.
 #
 # Results: `run_suite` writes a JUnit + HTML report under `results/`. Set
-# `OPENSHELL_E2E_REPORT_NAME` to name it per run when invoking this script repeatedly.
+# `RYNO_E2E_REPORT_NAME` to name it per run when invoking this script repeatedly.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
+RUN_WITH_GATEWAY_COMMAND="__ryno_run_kubernetes_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
-E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES-e2e,e2e-host-gateway,e2e-kubernetes}"
+E2E_FEATURES="${RYNO_E2E_KUBERNETES_FEATURES-e2e,e2e-host-gateway,e2e-kubernetes}"
 
 # Fixed output path of the `e2e-kubernetes` nextest profile (`.config/nextest.toml`).
 JUNIT_XML="${ROOT}/results/e2e-kubernetes.xml"
@@ -49,14 +49,14 @@ render_html() {
 # Docker and Podman build their local gateway and CLI together in the shared
 # gateway wrapper. Kubernetes consumes published gateway images, so only its
 # local CLI needs to be built when CI has not supplied a prebuilt one.
-if [ -z "${OPENSHELL_BIN:-}" ]; then
-  cargo build -p openshell-cli
-  export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
+if [ -z "${RYNO_BIN:-}" ]; then
+  cargo build -p ryno-cli
+  export RYNO_BIN="${ROOT}/target/debug/ryno"
 fi
 
 test_filter=()
-if [ -n "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
-  test_filter+=(--test "${OPENSHELL_E2E_KUBE_TEST}")
+if [ -n "${RYNO_E2E_KUBE_TEST:-}" ]; then
+  test_filter+=(--test "${RYNO_E2E_KUBE_TEST}")
 fi
 
 is_operator_workspace_mode() {
@@ -69,13 +69,13 @@ run_conformance() {
     return 0
   fi
 
-  e2e_run_openshell_conformance "Kubernetes"
+  e2e_run_ryno_conformance "Kubernetes"
 }
 
-# `OPENSHELL_E2E_REPORT_NAME` (default `e2e-kubernetes`) names the report
+# `RYNO_E2E_REPORT_NAME` (default `e2e-kubernetes`) names the report
 # `results/<name>.{xml,html}` and its heading, so repeated runs do not clobber.
 run_suite() {
-  local name="${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}"
+  local name="${RYNO_E2E_REPORT_NAME:-e2e-kubernetes}"
   local report="${ROOT}/results/${name}.xml"
   local status=0
   "${ROOT}/e2e/with-kube-gateway.sh" \
@@ -108,12 +108,12 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
 fi
 
 # Credential-driver mode: run once per storage backend, each with its own report.
-if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
-   && [ -z "${OPENSHELL_E2E_CREDENTIAL_DRIVER:-}" ]; then
-  OPENSHELL_E2E_CREDENTIAL_DRIVER=kubernetes-secrets \
-    OPENSHELL_E2E_REPORT_NAME=e2e-kubernetes-secrets run_suite
-  OPENSHELL_E2E_CREDENTIAL_DRIVER=vault \
-    OPENSHELL_E2E_REPORT_NAME=e2e-kubernetes-vault run_suite
+if [ "${RYNO_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+   && [ -z "${RYNO_E2E_CREDENTIAL_DRIVER:-}" ]; then
+  RYNO_E2E_CREDENTIAL_DRIVER=kubernetes-secrets \
+    RYNO_E2E_REPORT_NAME=e2e-kubernetes-secrets run_suite
+  RYNO_E2E_CREDENTIAL_DRIVER=vault \
+    RYNO_E2E_REPORT_NAME=e2e-kubernetes-vault run_suite
 else
   run_suite
 fi

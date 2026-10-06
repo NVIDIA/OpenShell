@@ -359,7 +359,7 @@ ruby -ryaml -e '
 rg -Fq 'manifest.fetch("resources", [])' "$GATOR_DIR/../run.sh"
 rg -Fq 'Gator payload version: {{PAYLOAD_VERSION}}' \
     "$GATOR_DIR/prompts/gator.md"
-rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \
+rg -q 'review-feedback-ledger NVIDIA Ryno <pr-number>' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'Every prior Gator finding is a durable review disposition' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"

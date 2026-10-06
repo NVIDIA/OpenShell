@@ -29,15 +29,15 @@
 #     see the prover-validation and TUI-inbox work).
 #
 # Prereqs:
-#   - A running gateway and the openshell CLI built from this branch.
+#   - A running gateway and the ryno CLI built from this branch.
 #     The simplest local path is `mise run helm:skaffold:run`, then
-#     `cargo build -p openshell-cli` and start the port-forward with its
+#     `cargo build -p ryno-cli` and start the port-forward with its
 #     output redirected so kubectl's "Handling connection for 8090" lines
 #     don't bleed into your terminal:
-#       KUBECONFIG=kubeconfig kubectl -n openshell \
-#           port-forward svc/openshell 8090:8080 >/dev/null 2>&1 &
+#       KUBECONFIG=kubeconfig kubectl -n ryno \
+#           port-forward svc/ryno 8090:8080 >/dev/null 2>&1 &
 #   - The agent-proposals feature flag enabled. Run once:
-#       openshell settings set --global \
+#       ryno settings set --global \
 #           --key agent_policy_proposals_enabled --value true --yes
 #
 # Runs in ~10s on a warm cluster (most of which is sandbox SSH bring-up).
@@ -48,11 +48,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNNER_SOURCE="${SCRIPT_DIR}/sandbox-runner.sh"
 
-if [[ -z "${OPENSHELL_BIN:-}" ]]; then
-    if [[ -x "${REPO_ROOT}/target/debug/openshell" ]]; then
-        OPENSHELL_BIN="${REPO_ROOT}/target/debug/openshell"
+if [[ -z "${RYNO_BIN:-}" ]]; then
+    if [[ -x "${REPO_ROOT}/target/debug/ryno" ]]; then
+        RYNO_BIN="${REPO_ROOT}/target/debug/ryno"
     else
-        OPENSHELL_BIN="openshell"
+        RYNO_BIN="ryno"
     fi
 fi
 
@@ -80,7 +80,7 @@ SSH_HOST=""
 cleanup() {
     local status=$?
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
-        "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
+        "$RYNO_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
     fi
     if [[ -n "$TMP_DIR" && $status -eq 0 ]]; then
         rm -rf "$TMP_DIR"
@@ -98,22 +98,22 @@ preflight() {
     # gateway configured, etc.) surfaces a real error instead of an empty
     # pipeline that `set -euo pipefail` silently exits on.
     local raw_settings
-    if ! raw_settings="$("$OPENSHELL_BIN" settings get --global --json 2>&1)"; then
-        fail "openshell could not reach the gateway. CLI output:
+    if ! raw_settings="$("$RYNO_BIN" settings get --global --json 2>&1)"; then
+        fail "ryno could not reach the gateway. CLI output:
 ${raw_settings}
 
 If you just deployed via skaffold, you probably still need:
-  KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 &
-  $OPENSHELL_BIN gateway add http://localhost:8090 --name local
-  $OPENSHELL_BIN gateway select local
-  unset OPENSHELL_GATEWAY  # if the CLI warns about it overriding"
+  KUBECONFIG=kubeconfig kubectl -n ryno port-forward svc/ryno 8090:8080 &
+  $RYNO_BIN gateway add http://localhost:8090 --name local
+  $RYNO_BIN gateway select local
+  unset RYNO_GATEWAY  # if the CLI warns about it overriding"
     fi
     local enabled
     enabled="$(printf '%s' "$raw_settings" \
         | jq -r '.settings.agent_policy_proposals_enabled // "<unset>"')"
     if [[ "$enabled" != "true" ]]; then
         fail "agent_policy_proposals_enabled must be true. Run:
-  $OPENSHELL_BIN settings set --global --key agent_policy_proposals_enabled --value true --yes"
+  $RYNO_BIN settings set --global --key agent_policy_proposals_enabled --value true --yes"
     fi
     ok "agent_policy_proposals_enabled=true"
 }
@@ -123,15 +123,15 @@ create_sandbox() {
     TMP_DIR="$(mktemp -d)"
     SSH_CONFIG="${TMP_DIR}/ssh_config"
 
-    "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" sandbox create \
+    "$RYNO_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
+    "$RYNO_BIN" sandbox create \
         --name "$SANDBOX" \
         --upload "${RUNNER_SOURCE}:/sandbox/runner.sh" \
         --no-git-ignore \
         --no-auto-providers \
         | sed 's/^/  /'
 
-    "$OPENSHELL_BIN" sandbox ssh-config "$SANDBOX" > "$SSH_CONFIG"
+    "$RYNO_BIN" sandbox ssh-config "$SANDBOX" > "$SSH_CONFIG"
     SSH_HOST="$(awk '/^Host / { print $2; exit }' "$SSH_CONFIG")"
     [[ -n "$SSH_HOST" ]] || fail "could not parse SSH config"
 
@@ -178,7 +178,7 @@ run_flow_a_approve() {
     # Brief settle so the in-sandbox wait registers before we approve.
     sleep 0.3
     info "approving from host..."
-    "$OPENSHELL_BIN" rule approve "$SANDBOX" --chunk-id "$chunk_id" \
+    "$RYNO_BIN" rule approve "$SANDBOX" --chunk-id "$chunk_id" \
         | sed 's/^/    /'
 
     wait "$wait_pid" || fail "in-sandbox /wait exited non-zero"
@@ -218,7 +218,7 @@ run_flow_b_reject() {
 
     sleep 0.3
     info "rejecting from host with --reason..."
-    "$OPENSHELL_BIN" rule reject "$SANDBOX" \
+    "$RYNO_BIN" rule reject "$SANDBOX" \
         --chunk-id "$chunk_id" \
         --reason "$guidance" \
         | sed 's/^/    /'

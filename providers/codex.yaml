@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/codex.yaml
-#   openshell provider profile import -f providers/codex.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/codex.yaml
+#   ryno provider profile import -f providers/codex.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -20,7 +20,7 @@
 # Endpoint access:   api.openai.com and chatgpt.com for inference,
 #                    auth.openai.com for token refresh, ab.chatgpt.com for the
 #                    CLI's experiment lookups.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      codex exec 'reply with OK'
 
 id: codex

@@ -1,5 +1,5 @@
 {
-  "realm": "openshell",
+  "realm": "ryno",
   "enabled": true,
   "sslRequired": "none",
   "registrationAllowed": false,
@@ -15,16 +15,16 @@
   "roles": {
     "realm": [
       {
-        "name": "openshell-admin",
-        "description": "Full administrative access to OpenShell"
+        "name": "ryno-admin",
+        "description": "Full administrative access to Ryno"
       },
       {
-        "name": "openshell-user",
-        "description": "Standard user access to OpenShell"
+        "name": "ryno-user",
+        "description": "Standard user access to Ryno"
       }
     ]
   },
-  "defaultRoles": ["openshell-user"],
+  "defaultRoles": ["ryno-user"],
   "clientScopes": [
     {
       "name": "openid",
@@ -269,8 +269,8 @@
       }
     },
     {
-      "name": "openshell:all",
-      "description": "Full access to all OpenShell resources",
+      "name": "ryno:all",
+      "description": "Full access to all Ryno resources",
       "protocol": "openid-connect",
       "attributes": {
         "include.in.token.scope": "true",
@@ -280,8 +280,8 @@
   ],
   "clients": [
     {
-      "clientId": "openshell-cli",
-      "name": "OpenShell CLI",
+      "clientId": "ryno-cli",
+      "name": "Ryno CLI",
       "description": "Public client for interactive CLI login (Authorization Code + PKCE)",
       "enabled": true,
       "publicClient": true,
@@ -297,12 +297,12 @@
       "fullScopeAllowed": true,
       "protocolMappers": [
         {
-          "name": "openshell-cli audience",
+          "name": "ryno-cli audience",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "consentRequired": false,
           "config": {
-            "included.client.audience": "openshell-cli",
+            "included.client.audience": "ryno-cli",
             "id.token.claim": "true",
             "access.token.claim": "true",
             "introspection.token.claim": "true"
@@ -310,11 +310,11 @@
         }
       ],
       "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr"],
-      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "workspace:read", "workspace:write", "openshell:all"]
+      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "workspace:read", "workspace:write", "ryno:all"]
     },
     {
-      "clientId": "openshell-ci",
-      "name": "OpenShell CI",
+      "clientId": "ryno-ci",
+      "name": "Ryno CI",
       "description": "Confidential client for CI/automation (Client Credentials grant)",
       "enabled": true,
       "publicClient": false,
@@ -326,19 +326,19 @@
       "fullScopeAllowed": true,
       "protocolMappers": [
         {
-          "name": "openshell-ci audience",
+          "name": "ryno-ci audience",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "consentRequired": false,
           "config": {
-            "included.client.audience": "openshell-cli",
+            "included.client.audience": "ryno-cli",
             "id.token.claim": "true",
             "access.token.claim": "true",
             "introspection.token.claim": "true"
           }
         }
       ],
-      "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr", "openshell:all"]
+      "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr", "ryno:all"]
     }
   ],
   "users": [
@@ -356,7 +356,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["openshell-admin", "openshell-user"]
+      "realmRoles": ["ryno-admin", "ryno-user"]
     },
     {
       "username": "user@test",
@@ -372,7 +372,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["openshell-user"]
+      "realmRoles": ["ryno-user"]
     },
     {
       "username": "user-b@test",
@@ -388,7 +388,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["openshell-user"]
+      "realmRoles": ["ryno-user"]
     }
   ]
 }

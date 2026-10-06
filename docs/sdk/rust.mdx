@@ -3,15 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Rust SDK"
 sidebar-title: "Rust"
-description: "Install the OpenShell Rust SDK, connect to a gateway, and manage a sandbox asynchronously."
-keywords: "OpenShell, SDK, Rust, Cargo, Tonic, gRPC, Sandbox"
+description: "Install the Ryno Rust SDK, connect to a gateway, and manage a sandbox asynchronously."
+keywords: "Ryno, SDK, Rust, Cargo, Tonic, gRPC, Sandbox"
 position: 2
 ---
 
-The Rust SDK is the asynchronous gateway client used by the OpenShell CLI and
+The Rust SDK is the asynchronous gateway client used by the Ryno CLI and
 TUI. Its curated API covers common sandbox operations, while `raw` exposes the
 generated Tonic clients for the complete RPC surface. Use the SDK and gateway
-from the same OpenShell release when possible.
+from the same Ryno release when possible.
 
 ## Install the SDK
 
@@ -19,8 +19,8 @@ The Rust SDK is currently consumed from source. Pin the dependency to the same
 release tag as your gateway:
 
 ```shell
-cargo add openshell-sdk \
-  --git https://github.com/NVIDIA/OpenShell \
+cargo add ryno-sdk \
+  --git https://github.com/NVIDIA/Ryno \
   --tag <release-tag>
 cargo add tokio --features macros,rt-multi-thread
 ```
@@ -31,9 +31,9 @@ cargo add tokio --features macros,rt-multi-thread
 transport and no authentication:
 
 ```rust
-use openshell_sdk::{ClientConfig, OpenShellClient};
+use ryno_sdk::{ClientConfig, RynoClient};
 
-let client = OpenShellClient::connect(
+let client = RynoClient::connect(
     ClientConfig::new("http://127.0.0.1:8080"),
 )
 .await?;
@@ -45,11 +45,11 @@ println!("gateway status: {:?}", health.status);
 For an OIDC gateway, attach a bearer token and use HTTPS:
 
 ```rust
-use openshell_sdk::{AuthConfig, ClientConfig, OpenShellClient};
+use ryno_sdk::{AuthConfig, ClientConfig, RynoClient};
 
-let client = OpenShellClient::connect(ClientConfig {
+let client = RynoClient::connect(ClientConfig {
     gateway: "https://gateway.example.com".to_string(),
-    auth: Some(AuthConfig::oidc(std::env::var("OPENSHELL_TOKEN")?)),
+    auth: Some(AuthConfig::oidc(std::env::var("RYNO_TOKEN")?)),
     ..Default::default()
 })
 .await?;
@@ -68,13 +68,13 @@ workspace.
 ```rust
 use std::time::Duration;
 
-use openshell_sdk::{
-    ClientConfig, DeleteOptions, ExecOptions, OpenShellClient, SandboxSpec,
+use ryno_sdk::{
+    ClientConfig, DeleteOptions, ExecOptions, RynoClient, SandboxSpec,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = OpenShellClient::connect(
+    let client = RynoClient::connect(
         ClientConfig::new("http://127.0.0.1:8080"),
     )
     .await?;
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = client
         .exec(
             &sandbox.name,
-            &["python".into(), "-c".into(), "print('hello from OpenShell')".into()],
+            &["python".into(), "-c".into(), "print('hello from Ryno')".into()],
             ExecOptions::default(),
         )
         .await?;
@@ -126,4 +126,4 @@ requests.
 
 - Review [Gateway Authentication](/how-it-works/gateways/authentication) for transport and identity choices.
 - Review [API Errors](/sdk/api-errors) for the gateway error model.
-- See the [Rust SDK source documentation](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-sdk) for modules and advanced transport behavior.
+- See the [Rust SDK source documentation](https://github.com/NVIDIA/Ryno/tree/main/crates/ryno-sdk) for modules and advanced transport behavior.

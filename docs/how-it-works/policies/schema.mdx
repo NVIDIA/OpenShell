@@ -9,7 +9,7 @@ position: 7
 ---
 
 This reference defines the sandbox policy schema. A policy is a YAML file of at
-most 4 MiB. OpenShell rejects a policy that contains unknown fields or duplicate
+most 4 MiB. Ryno rejects a policy that contains unknown fields or duplicate
 keys.
 
 ## Top-Level Fields
@@ -47,7 +47,7 @@ Effect](/how-it-works/policies/manage-policies#how-changes-take-effect).
 When `filesystem_policy` is omitted, `include_workdir` is `true`. When
 `filesystem_policy` is present, `include_workdir` defaults to `false`. Paths
 that are not listed are inaccessible. When the effective policy has at least one
-network rule, OpenShell also adds the baseline paths described in [Default
+network rule, Ryno also adds the baseline paths described in [Default
 Policy](/how-it-works/policies/default-policy#baseline-filesystem-paths).
 
 These defaults and the filesystem path restrictions below also apply when the supervisor or standalone proxy loads local policy files directly. Local loading enforces the same non-root process identities as typed policy. It rejects invalid filesystem, Landlock, and process field types, unknown fields in those sections, and explicit `null` JSON-RPC or MCP options. Network settings must also use the declared types: for example, `allow_encoded_slash: "true"` and an array-valued deny-rule `method` are rejected. A rejected reload keeps the active OPA policy and its generation unchanged.
@@ -88,10 +88,10 @@ and skipped.
 | `run_as_user` | string | Driver default | `sandbox` or a numeric UID for the workload. |
 | `run_as_group` | string | Driver default | `sandbox` or a numeric GID for the workload. |
 
-A numeric ID must be from `1` through `4294967294`, so OpenShell rejects root.
+A numeric ID must be from `1` through `4294967294`, so Ryno rejects root.
 Each field is independent, so you can set one and let the compute driver choose the other. Docker and Podman use these fields to select the workload identity from the policy passed at creation; omitted fields use the image's `USER`. Kubernetes uses the identity configured for its driver.
 
-MicroVM preserves the driver's resolved overlay owner. An explicit numeric selector must match that owner; `sandbox` names the guest account reconciled to that owner. A conflicting selector fails before the workload starts, and omitted fields accept the driver default. `openshell sandbox get <name>` reports the resolved UID:GID in its `WorkloadIdentity` condition. This condition reports identity selection, not workload readiness. Sandbox policy updates cannot change process selectors; global policy updates must still match the resolved identity. Ordinary exec uses the same identity as the canonical process.
+MicroVM preserves the driver's resolved overlay owner. An explicit numeric selector must match that owner; `sandbox` names the guest account reconciled to that owner. A conflicting selector fails before the workload starts, and omitted fields accept the driver default. `ryno sandbox get <name>` reports the resolved UID:GID in its `WorkloadIdentity` condition. This condition reports identity selection, not workload readiness. Sandbox policy updates cannot change process selectors; global policy updates must still match the resolved identity. Ordinary exec uses the same identity as the canonical process.
 
 ```yaml showLineNumbers={false}
 process:
@@ -102,7 +102,7 @@ process:
 ## Network Policies
 
 A map of named rules. The key is the rule's name. Each rule allows every listed
-binary to reach every listed endpoint. For how OpenShell evaluates rules, and
+binary to reach every listed endpoint. For how Ryno evaluates rules, and
 for examples, refer to [Network Rules](/how-it-works/policies/network-rules).
 
 | Field | Type | Required | Description |
@@ -111,7 +111,7 @@ for examples, refer to [Network Rules](/how-it-works/policies/network-rules).
 | `endpoints` | list of endpoint objects | No | Destinations the rule allows. |
 | `binaries` | list of binary objects | No | Executables the rule applies to. An empty list matches no binary. |
 
-Rule keys cannot start with `_provider_`, which OpenShell reserves for rules
+Rule keys cannot start with `_provider_`, which Ryno reserves for rules
 that providers contribute.
 
 ### Endpoint Object
@@ -140,12 +140,12 @@ private addresses only through `allowed_ips`.
 Network policy never authorizes an outbound endpoint whose destination is
 loopback, link-local, or unspecified, including the cloud metadata address
 `169.254.169.254`. This does not prevent a workload from connecting to a
-sandbox-local service listening on loopback. `openshell policy update` rejects
+sandbox-local service listening on loopback. `ryno policy update` rejects
 an `allowed_ips` entry that overlaps the blocked ranges, and in a complete
-policy such an entry blocks every connection to the endpoint. OpenShell also
+policy such an entry blocks every connection to the endpoint. Ryno also
 blocks the Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250,
 and 10255 on endpoints that use an exact hostname, an IP address, or
-`allowed_ips`. A rule for `host.openshell.internal` can still reach services on
+`allowed_ips`. A rule for `host.ryno.internal` can still reach services on
 the gateway host.
 
 #### Inspection Fields
@@ -153,7 +153,7 @@ the gateway host.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `graphql`, `mcp`, and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
-| `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
+| `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so Ryno cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
 | `rules` | list | None | Allow rules. |
@@ -172,7 +172,7 @@ the gateway host.
 | `signing_service` | string | None | AWS service name, such as `bedrock` or `s3`. Required with `credential_signing`. |
 | `signing_region` | string | From hostname | AWS region override, such as `us-east-1`. |
 
-Credential placeholders use the form `openshell:resolve:env:KEY`. Body rewriting
+Credential placeholders use the form `ryno:resolve:env:KEY`. Body rewriting
 applies to UTF-8 JSON, form, and text bodies of up to 256 KiB, and cannot be
 combined with `credential_signing`. Signing requires an attached provider with
 AWS credentials. Refer to [AWS SigV4](/how-it-works/providers/aws) and [Static
@@ -198,7 +198,7 @@ network_policies:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `persisted_queries` | string | `deny` | GraphQL hash-only queries: `deny` or `allow_registered`. |
-| `graphql_persisted_queries` | map | None | Trusted persisted-query registry, keyed by hash or saved-query ID. With `allow_registered`, OpenShell denies hash-only queries that are not in the registry. |
+| `graphql_persisted_queries` | map | None | Trusted persisted-query registry, keyed by hash or saved-query ID. With `allow_registered`, Ryno denies hash-only queries that are not in the registry. |
 | `graphql_max_body_bytes` | integer | `65536` | Maximum GraphQL request body size for inspection. |
 | `mcp.versions` | list of strings | `["2025-11-25"]` | Allowed MCP revisions. Refer to [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | `65536` | Maximum MCP request body size for inspection. |
@@ -208,7 +208,7 @@ network_policies:
 
 #### Endpoint Constraints
 
-OpenShell rejects an endpoint that breaks these rules:
+Ryno rejects an endpoint that breaks these rules:
 
 - `access` and `rules` cannot be combined. `rest`, `websocket`, and `graphql`
   endpoints need one of them. `mcp` and `json-rpc` endpoints need `rules`,
@@ -288,7 +288,7 @@ deny_rules:
 | `path` | string | Yes | Path glob of the upgrade request, not message content. |
 | `query` | map | No | Query parameter matchers of the upgrade request. |
 
-OpenShell does not inspect binary frames or messages from the server.
+Ryno does not inspect binary frames or messages from the server.
 
 ```yaml showLineNumbers={false}
 rules:
@@ -368,7 +368,7 @@ deny_rules:
     tool: send_email
 ```
 
-OpenShell uses the `tower-mcp-types` library to inspect each request under its
+Ryno uses the `tower-mcp-types` library to inspect each request under its
 MCP revision. It checks the JSON-RPC structure, whether a client can send the
 method in that revision, and the parameter types of known methods. It rejects a
 body that repeats a key within any JSON object, and a method that MCP defines
@@ -404,7 +404,7 @@ Here, `tools/call` is the JSON-RPC method, and `search_web` is the tool name in 
 
 #### Core MCP Methods
 
-The following list covers client-to-server requests and notifications that OpenShell inspects over HTTP. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that accept those methods over HTTP in the client-to-server direction.
+The following list covers client-to-server requests and notifications that Ryno inspects over HTTP. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that accept those methods over HTTP in the client-to-server direction.
 
 | Methods or notifications | MCP revisions |
 |---|---|
@@ -418,7 +418,7 @@ The following list covers client-to-server requests and notifications that OpenS
 | `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`, `notifications/tasks/status` | `2025-11-25` only; experimental. |
 | `server/discover`, `subscriptions/listen` | `2026-07-28` only. |
 
-For `2026-07-28` HTTP requests, cancel a request by closing its response stream. OpenShell rejects `notifications/cancelled` over HTTP in that revision.
+For `2026-07-28` HTTP requests, cancel a request by closing its response stream. Ryno rejects `notifications/cancelled` over HTTP in that revision.
 
 MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
 
@@ -434,18 +434,18 @@ mcp:
   versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell selects each request's revision from its `MCP-Protocol-Version`
-header. When the header is absent, OpenShell selects `2025-03-26`, so an
+Ryno selects each request's revision from its `MCP-Protocol-Version`
+header. When the header is absent, Ryno selects `2025-03-26`, so an
 endpoint whose clients omit the header must allow `2025-03-26`. A duplicate,
 empty, or unsupported header value returns `400`, and a supported revision that
 the endpoint does not allow returns `403`.
 
-OpenShell inspects each request under its selected revision only. For example,
+Ryno inspects each request under its selected revision only. For example,
 only `2025-03-26` accepts JSON-RPC batches, with at most 64 messages each, and
 later revisions reject a request body that is a JSON array.
 
 Under the 2025 revisions, a client starts with a single `initialize` request
-that proposes a revision in its body, so OpenShell does not check that request's
+that proposes a revision in its body, so Ryno does not check that request's
 revision against `mcp.versions`. An endpoint that allows only `2026-07-28`
 rejects `initialize`.
 
@@ -456,9 +456,9 @@ allow its traffic without MCP inspection.
 
 Use the response's error code and detail to distinguish a protocol problem from a policy denial:
 
-- `unsupported_mcp_protocol_version` (`400`) means this OpenShell build does not support the header's revision. Configure the client to use a revision that OpenShell and the server support and that `mcp.versions` permits.
+- `unsupported_mcp_protocol_version` (`400`) means this Ryno build does not support the header's revision. Configure the client to use a revision that Ryno and the server support and that `mcp.versions` permits.
 - `mcp_protocol_version_not_allowed` (`403`) means the selected revision is supported but excluded by the endpoint policy. Use a compatible revision the policy permits, or ask the policy owner to review `mcp.versions`.
-- A detail that names the missing-header fallback means OpenShell selected `2025-03-26`, even if the policy defaults to `2025-11-25`. Send the client/server revision explicitly in `MCP-Protocol-Version`; the policy must permit it.
+- A detail that names the missing-header fallback means Ryno selected `2025-03-26`, even if the policy defaults to `2025-11-25`. Send the client/server revision explicitly in `MCP-Protocol-Version`; the policy must permit it.
 - `invalid_mcp_request` (`400`) can mean the method is unavailable in the selected revision. For example, `tasks/get` is unavailable in `2025-06-18`. Use a method available in that revision, or configure the client and server to use a compatible revision that includes it and is permitted by policy. Adding an allow rule or enabling `allow_all_known_mcp_methods` cannot override this protocol check.
 - A rule denial (`403` under `enforcement: enforce`) requires a policy review. An extension method needs an exact method allow rule; a denied tool call may need a matching tool selector. An explicit deny rule takes precedence, so adding an allow rule cannot override it. Ask the policy owner to review the relevant allow or deny rule.
 
@@ -470,25 +470,25 @@ carries the client's protocol version and capabilities. A client can call
 `subscriptions/listen` to receive notifications on that request's response
 stream. Each HTTP `POST` carries one JSON-RPC request or extension notification.
 
-OpenShell checks each `2026-07-28` request for the following:
+Ryno checks each `2026-07-28` request for the following:
 
 - `params._meta` contains `io.modelcontextprotocol/protocolVersion` set to
   `2026-07-28`, and `io.modelcontextprotocol/clientCapabilities`. Extension
   requests need this metadata too.
-- The `MCP-Protocol-Version` header is `2026-07-28`. Without it, OpenShell
+- The `MCP-Protocol-Version` header is `2026-07-28`. Without it, Ryno
   selects `2025-03-26` and rejects the request.
 - The `Mcp-Method` header equals the JSON-RPC `method`.
 - For `tools/call` and `prompts/get`, the `Mcp-Name` header equals
-  `params.name`. For `resources/read`, it equals `params.uri`. OpenShell decodes
+  `params.name`. For `resources/read`, it equals `params.uri`. Ryno decodes
   a `=?base64?...?=` value before comparing it.
 
 A request with missing or invalid metadata, or with a missing, duplicate, or
-mismatched `Mcp-Method` or `Mcp-Name` header, returns `400`. OpenShell also
+mismatched `Mcp-Method` or `Mcp-Name` header, returns `400`. Ryno also
 rejects `initialize`, `notifications/initialized`, `notifications/cancelled`,
 JSON-RPC responses from the client, and batches. A request that uses an HTTP
 method other than `POST` returns `405`.
 
-OpenShell repeats these checks after middleware changes a request. A middleware
+Ryno repeats these checks after middleware changes a request. A middleware
 that replaces the body of a `2026-07-28` request must also update `Mcp-Method`
 and `Mcp-Name` to match the new body.
 
@@ -496,7 +496,7 @@ An extension notification needs `MCP-Protocol-Version: 2026-07-28` and an allow
 rule that names its `method` exactly, such as `method: vendor/notice`. It does
 not need `params._meta`, `Mcp-Method`, or `Mcp-Name`.
 
-OpenShell forwards `Mcp-Param-*` headers without comparing them with tool
+Ryno forwards `Mcp-Param-*` headers without comparing them with tool
 arguments.
 
 ### JSON-RPC Rules
@@ -506,7 +506,7 @@ arguments.
 | `method` | string | Yes | Exact method name, or `*` for all methods. Other globs are rejected. |
 
 Parameters are not matched. One denied call denies an entire batched request.
-OpenShell rejects a body that repeats a key within any JSON object.
+Ryno rejects a body that repeats a key within any JSON object.
 
 ```yaml showLineNumbers={false}
 rules:
@@ -525,7 +525,7 @@ deny_rules:
 A binary matches the executable that opens the connection or any of its parent
 processes. Scripts run as their interpreter, so list the interpreter, such as
 `/usr/bin/python3.12`, for a Python script. List the executable's real path, not
-a symlink to it. OpenShell records a hash of each executable the first time it
+a symlink to it. Ryno records a hash of each executable the first time it
 takes part in a connection, and denies later connections if the file changes.
 Refer to [Binary
 Matching](/how-it-works/policies/network-rules#binary-matching).
@@ -537,7 +537,7 @@ network rules allow, in ascending `order`.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `middleware` | string | Yes | Built-in middleware, such as `openshell/regex`, or the name of a service registered with the gateway. |
+| `middleware` | string | Yes | Built-in middleware, such as `ryno/regex`, or the name of a service registered with the gateway. |
 | `endpoints.include` | list of strings | Yes | Host patterns the middleware applies to. |
 | `endpoints.exclude` | list of strings | No | Host patterns to skip. Takes precedence over `include`. |
 | `order` | integer | No | Run order. Lower values run first. Values must be unique. Defaults to `0`. |
@@ -553,7 +553,7 @@ Middleware](/extensibility/supervisor-middleware).
 ```yaml showLineNumbers={false}
 network_middlewares:
   regex-redactor:
-    middleware: openshell/regex
+    middleware: ryno/regex
     order: 10
     config:
       mode: redact

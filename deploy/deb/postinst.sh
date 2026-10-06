@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# postinst for openshell.
+# postinst for ryno.
 #
 # The packaged systemd unit is user-scope (installed under
 # /usr/lib/systemd/user/) so dpkg cannot enable or start it on the user's
 # behalf. Each user opts in by running:
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now openshell-gateway
+#   systemctl --user enable --now ryno-gateway
 #
 # Tell any running per-user systemd manager to re-scan its unit search
 # path so already-logged-in users see the new unit without restarting

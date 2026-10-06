@@ -104,7 +104,7 @@ _publish_multiarch_podman() {
 
       # Tag with a platform-specific suffix for manifest assembly.
       local platform_tag="${IMAGE_TAG}-${platform//\//-}"
-      ce tag "openshell/${component}:${IMAGE_TAG}" "${full_image}:${platform_tag}"
+      ce tag "ryno/${component}:${IMAGE_TAG}" "${full_image}:${platform_tag}"
       ce push "${full_image}:${platform_tag}"
       ce manifest add "${manifest_name}" "${full_image}:${platform_tag}"
     done

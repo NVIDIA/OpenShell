@@ -4,11 +4,11 @@
 # TUI tasks
 
 [term]
-description = "Launch the OpenShell TUI"
-run = "openshell term"
+description = "Launch the Ryno TUI"
+run = "ryno term"
 hide = true
 
 ["term:dev"]
-description = "Launch the OpenShell TUI with hot-reload on file changes"
-run = "cargo watch -s 'openshell term'"
+description = "Launch the Ryno TUI with hot-reload on file changes"
+run = "cargo watch -s 'ryno term'"
 hide = true

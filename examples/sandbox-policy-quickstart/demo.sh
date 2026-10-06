@@ -24,7 +24,7 @@ cleanup() {
     rm -f "$SSH_CONFIG"
     printf '\n'
     step "Cleaning up"
-    openshell sandbox delete "$SANDBOX_NAME" 2>/dev/null || true
+    ryno sandbox delete "$SANDBOX_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -50,7 +50,7 @@ run() {
     return "${PIPESTATUS[0]}"
 }
 
-# Keep only OCSF network and HTTP policy decisions from `openshell logs`.
+# Keep only OCSF network and HTTP policy decisions from `ryno logs`.
 policy_events() {
     grep -E '(NET|HTTP):[A-Z]+ .*(ALLOWED|DENIED)'
 }
@@ -84,14 +84,14 @@ wait_for_ssh() {
 # ------------------------------------------------------------------
 
 step "1/7  Creating sandbox \"${SANDBOX_NAME}\" (default-deny networking)"
-run openshell sandbox create \
+run ryno sandbox create \
     --name "$SANDBOX_NAME" \
     --no-auto-providers \
     --no-tty \
     -- echo "sandbox ready"
 
 step "Connecting to sandbox"
-openshell sandbox ssh-config "$SANDBOX_NAME" > "$SSH_CONFIG"
+ryno sandbox ssh-config "$SANDBOX_NAME" > "$SSH_CONFIG"
 SSH_HOST=$(awk '/^Host / { print $2; exit }' "$SSH_CONFIG")
 wait_for_ssh
 
@@ -109,8 +109,8 @@ printf "  ${RED}✗ Blocked by default-deny policy.${RESET}\n"
 
 step "3/7  Checking deny log"
 sleep 2
-printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
-openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
+printf "  ${BOLD}\$ ryno logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
+ryno logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
     | policy_events \
     | colorize_logs \
     | sed 's/^/  /'
@@ -118,7 +118,7 @@ openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
 # ------------------------------------------------------------------
 
 step "4/7  Adding a read-only GitHub API rule"
-run openshell policy update "$SANDBOX_NAME" \
+run ryno policy update "$SANDBOX_NAME" \
     --rule-name github_api \
     --binary /usr/bin/curl \
     --add-endpoint api.github.com:443:read-only:rest:enforce \
@@ -151,8 +151,8 @@ printf "  ${YELLOW}%s${RESET}\n" "$RESPONSE"
 step "7/7  Checking L7 deny log"
 sleep 2
 # Policy events are INFO-level OCSF records, so a --level warn filter hides them.
-printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
-openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
+printf "  ${BOLD}\$ ryno logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
+ryno logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
     | policy_events \
     | colorize_logs \
     | sed 's/^/  /'

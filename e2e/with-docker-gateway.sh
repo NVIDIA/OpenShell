@@ -2,26 +2,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run an e2e command against a Docker-backed OpenShell gateway.
+# Run an e2e command against a Docker-backed Ryno gateway.
 #
 # Modes:
-#   - OPENSHELL_GATEWAY_ENDPOINT unset:
+#   - RYNO_GATEWAY_ENDPOINT unset:
 #       Build and start an ephemeral standalone gateway with the Docker compute
 #       driver, then run the command against that gateway.
-#   - OPENSHELL_GATEWAY_ENDPOINT=http://host:port:
+#   - RYNO_GATEWAY_ENDPOINT=http://host:port:
 #       Use the existing plaintext gateway endpoint and run the command.
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
 #
 # Sandbox image overrides:
-#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
-#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
+#   RYNO_E2E_DOCKER_SANDBOX_IMAGE=...
+#   RYNO_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=always|if_not_present|never
 #   SANDBOX_IMAGE=... (trusted sandbox runtime override)
 # Supervisor image overrides:
 #   SUPERVISOR_IMAGE=... (common test-wrapper override)
-#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
-#   OPENSHELL_DOCKER_SUPERVISOR_IMAGE=... (Docker-specific override)
+#   RYNO_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   RYNO_DOCKER_SUPERVISOR_IMAGE=... (Docker-specific override)
 #
 # The default sandbox image uses a mutable tag. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to
@@ -45,13 +45,13 @@ require_container_engine_lane() {
   local label=$2
   local selected_engine selected_driver
 
-  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
-    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+  if [ -n "${RYNO_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: RYNO_E2E_CONTAINER_ENGINE is no longer supported." >&2
     echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
     exit 2
   fi
   selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
-  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${RYNO_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
 
   if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
     echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
@@ -59,13 +59,13 @@ require_container_engine_lane() {
     exit 2
   fi
   if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
-    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
-    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    echo "ERROR: RYNO_E2E_DRIVER=${RYNO_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set RYNO_E2E_DRIVER=${lane} or unset RYNO_E2E_DRIVER." >&2
     exit 2
   fi
 
   export CONTAINER_ENGINE="${lane}"
-  export OPENSHELL_E2E_DRIVER="${lane}"
+  export RYNO_E2E_DRIVER="${lane}"
 }
 
 require_container_engine_lane docker Docker
@@ -107,7 +107,7 @@ fi
 e2e_align_docker_host_with_cli_context
 
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
-WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
+WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/ryno-e2e-gateway.XXXXXX")"
 GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
@@ -123,12 +123,12 @@ E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
-GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
-OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
-OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+GPU_MODE="${RYNO_E2E_DOCKER_GPU:-0}"
+OIDC_MODE="${RYNO_E2E_OIDC_GATEWAY:-0}"
+OIDC_ISSUER="${RYNO_E2E_OIDC_ISSUER:-}"
 
 if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
-  echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
+  echo "ERROR: RYNO_E2E_OIDC_ISSUER is required when RYNO_E2E_OIDC_GATEWAY=1" >&2
   exit 2
 fi
 
@@ -151,8 +151,8 @@ cleanup() {
      && command -v docker >/dev/null 2>&1; then
     local ids
     ids=$(docker ps -aq \
-      --filter "label=openshell.ai/managed-by=openshell" \
-      --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+      --filter "label=ryno.ai/managed-by=ryno" \
+      --filter "label=ryno.ai/sandbox-namespace=${E2E_NAMESPACE}" \
       2>/dev/null || true)
     if [ -n "${ids}" ]; then
       echo "=== sandbox container logs (preserved for debugging) ==="
@@ -169,8 +169,8 @@ cleanup() {
   if [ -n "${E2E_NAMESPACE}" ] && command -v docker >/dev/null 2>&1; then
     local stale
     stale=$(docker ps -aq \
-      --filter "label=openshell.ai/managed-by=openshell" \
-      --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+      --filter "label=ryno.ai/managed-by=ryno" \
+      --filter "label=ryno.ai/sandbox-namespace=${E2E_NAMESPACE}" \
       2>/dev/null || true)
     if [ -n "${stale}" ]; then
       # shellcheck disable=SC2086
@@ -213,8 +213,8 @@ ensure_e2e_docker_network() {
   docker network create \
     --driver bridge \
     --attachable \
-    --label openshell.ai/managed-by=openshell \
-    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+    --label ryno.ai/managed-by=ryno \
+    --label "ryno.ai/sandbox-namespace=${E2E_NAMESPACE}" \
     "${network}" >/dev/null
   DOCKER_NETWORK_MANAGED=1
 }
@@ -244,7 +244,7 @@ connect_current_container_to_docker_network() {
 
   local connect_err="${WORKDIR}/docker-network-connect.err"
   if ! docker network connect \
-    --alias host.openshell.internal \
+    --alias host.ryno.internal \
     "${network}" \
     "${container}" 2>"${connect_err}"; then
     if ! grep -qi "already exists" "${connect_err}"; then
@@ -267,31 +267,31 @@ connect_current_container_to_docker_network() {
   GATEWAY_HOST_ALIAS_IP="${container_ip}"
 }
 
-if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
-  case "${OPENSHELL_GATEWAY_ENDPOINT}" in
+if [ -n "${RYNO_GATEWAY_ENDPOINT:-}" ]; then
+  case "${RYNO_GATEWAY_ENDPOINT}" in
     http://*) ;;
     https://*)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT endpoint mode is HTTP-only for e2e." >&2
+      echo "ERROR: RYNO_GATEWAY_ENDPOINT endpoint mode is HTTP-only for e2e." >&2
       echo "       Register a named gateway with mTLS config instead of using a raw HTTPS endpoint." >&2
       exit 2
       ;;
     *)
-      echo "ERROR: OPENSHELL_GATEWAY_ENDPOINT must start with http:// for e2e endpoint mode." >&2
+      echo "ERROR: RYNO_GATEWAY_ENDPOINT must start with http:// for e2e endpoint mode." >&2
       exit 2
       ;;
   esac
 
-  GATEWAY_NAME="${OPENSHELL_GATEWAY:-openshell-e2e-endpoint}"
+  GATEWAY_NAME="${RYNO_GATEWAY:-ryno-e2e-endpoint}"
   e2e_register_plaintext_gateway \
     "${XDG_CONFIG_HOME}" \
     "${GATEWAY_NAME}" \
-    "${OPENSHELL_GATEWAY_ENDPOINT}" \
-    "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
-  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
-  export OPENSHELL_E2E_DRIVER="docker"
+    "${RYNO_GATEWAY_ENDPOINT}" \
+    "$(e2e_endpoint_port "${RYNO_GATEWAY_ENDPOINT}")"
+  export RYNO_GATEWAY="${GATEWAY_NAME}"
+  export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-180}"
+  export RYNO_E2E_DRIVER="docker"
 
-  echo "Using existing e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
+  echo "Using existing e2e gateway endpoint: ${RYNO_GATEWAY_ENDPOINT}"
   "$@"
   exit $?
 fi
@@ -318,13 +318,13 @@ if [ "${GPU_MODE}" = "1" ]; then
 fi
 
 resolve_docker_supervisor_image() {
-  if [ -n "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE}"
+  if [ -n "${RYNO_DOCKER_SUPERVISOR_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_DOCKER_SUPERVISOR_IMAGE}"
     return 0
   fi
 
-  if [ -n "${OPENSHELL_SUPERVISOR_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_SUPERVISOR_IMAGE}"
+  if [ -n "${RYNO_SUPERVISOR_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_SUPERVISOR_IMAGE}"
     return 0
   fi
 
@@ -344,22 +344,22 @@ resolve_docker_supervisor_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${RYNO_REGISTRY:-ghcr.io/nvidia/ryno}"
     printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
 
-  printf '%s\n' "openshell/supervisor:dev"
+  printf '%s\n' "ryno/supervisor:dev"
 }
 
 resolve_docker_sandbox_runtime_image() {
-  if [ -n "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE}"
+  if [ -n "${RYNO_DOCKER_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_DOCKER_SANDBOX_RUNTIME_IMAGE}"
     return 0
   fi
 
-  if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
-    printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+  if [ -n "${RYNO_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${RYNO_SANDBOX_RUNTIME_IMAGE}"
     return 0
   fi
   if [ -n "${SANDBOX_IMAGE:-}" ]; then
@@ -373,12 +373,12 @@ resolve_docker_sandbox_runtime_image() {
       exit 2
     fi
 
-    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    local registry="${RYNO_REGISTRY:-ghcr.io/nvidia/ryno}"
     printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
     return 0
   fi
 
-  printf '%s\n' "openshell/sandbox:dev"
+  printf '%s\n' "ryno/sandbox:dev"
 }
 
 docker_pull_with_retry() {
@@ -410,7 +410,7 @@ docker_pull_with_retry() {
 build_local_docker_supervisor_image_if_required() {
   local image=$1
 
-  if [ "${image}" != "openshell/supervisor:dev" ]; then
+  if [ "${image}" != "ryno/supervisor:dev" ]; then
     return 0
   fi
 
@@ -431,7 +431,7 @@ build_local_docker_supervisor_image_if_required() {
 build_local_docker_sandbox_runtime_image_if_required() {
   local image=$1
 
-  if [ "${image}" != "openshell/sandbox:dev" ]; then
+  if [ "${image}" != "ryno/sandbox:dev" ]; then
     return 0
   fi
 
@@ -462,7 +462,7 @@ ensure_docker_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/RYNO_SUPERVISOR_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -479,7 +479,7 @@ ensure_docker_sandbox_runtime_image() {
   fi
 
   echo "ERROR: sandbox runtime image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set RYNO_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -519,10 +519,10 @@ ensure_sandbox_image_available() {
 }
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
-export OPENSHELL_BIN="${CLI_BIN}"
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+export RYNO_BIN="${CLI_BIN}"
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   e2e_build_external_driver \
-    "${ROOT}" openshell-driver-docker openshell-driver-docker DRIVER_BIN
+    "${ROOT}" ryno-driver-docker ryno-driver-docker DRIVER_BIN
 fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
@@ -536,8 +536,8 @@ ensure_docker_sandbox_runtime_image "${SANDBOX_RUNTIME_IMAGE}"
 echo "Using Docker sandbox runtime image: ${SANDBOX_RUNTIME_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
-SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}}"
+SANDBOX_IMAGE="${RYNO_E2E_DOCKER_SANDBOX_IMAGE:-${RYNO_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+SANDBOX_IMAGE_PULL_POLICY="${RYNO_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${RYNO_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}}"
 if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
   echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
   exit 2
@@ -556,10 +556,10 @@ GATEWAY_BIND_IP="127.0.0.1"
 SUPERVISOR_GATEWAY_HOST="127.0.0.1"
 
 ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
-export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
-export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
-export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
-export OPENSHELL_E2E_DRIVER="docker"
+export RYNO_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
+export RYNO_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
+export RYNO_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
+export RYNO_E2E_DRIVER="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
   # Container jobs use the host Docker daemon. The host-networked supervisor
@@ -580,10 +580,10 @@ if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
 else
   e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 fi
-export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
+export RYNO_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 GATEWAY_ENDPOINT="https://${SUPERVISOR_GATEWAY_HOST}:${HOST_PORT}"
 
-echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+echo "Starting ryno-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
@@ -602,18 +602,18 @@ toml_string() {
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 {
-  printf '[openshell]\nversion = 2\n\n'
-  printf '[openshell.gateway]\nlog_level = "info"\n'
+  printf '[ryno]\nversion = 2\n\n'
+  printf '[ryno.gateway]\nlog_level = "info"\n'
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
+  e2e_write_gateway_jwt_config "${JWT_DIR}" "ryno-e2e-docker-${HOST_PORT}"
   if [ "${OIDC_MODE}" != "1" ]; then
     e2e_write_gateway_mtls_auth_config
-    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
+    if [ -n "${RYNO_OIDC_ISSUER:-}" ]; then
+      e2e_write_gateway_oidc_config "${RYNO_OIDC_ISSUER}"
     fi
   fi
-  printf '[openshell.drivers.docker]\n'
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  printf '[ryno.drivers.docker]\n'
+  if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
     printf 'allow_driver_config = true\n'
@@ -624,12 +624,12 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'enable_bind_mounts = true\n'
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    printf '\n[openshell.drivers.docker.resource_admission]\n'
+    printf '\n[ryno.drivers.docker.resource_admission]\n'
     printf 'enabled = false\n'
   fi
 } > "${GATEWAY_CONFIG}"
 
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
@@ -666,7 +666,7 @@ GATEWAY_ARGS=(
 if [ "${OIDC_MODE}" = "1" ]; then
   GATEWAY_ARGS+=(
     --oidc-issuer "${OIDC_ISSUER}"
-    --oidc-audience openshell-cli
+    --oidc-audience ryno-cli
     --oidc-scopes-claim scope
   )
   case "${OIDC_ISSUER}" in
@@ -691,10 +691,10 @@ e2e_export_gateway_restart_metadata \
 GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
-GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
+GATEWAY_NAME="ryno-e2e-docker-${HOST_PORT}"
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 if [ "${OIDC_MODE}" = "1" ]; then
-  export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+  export RYNO_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 else
   e2e_register_mtls_gateway \
     "${XDG_CONFIG_HOME}" \
@@ -702,15 +702,15 @@ else
     "${CLI_GATEWAY_ENDPOINT}" \
     "${HOST_PORT}" \
     "${PKI_DIR}" \
-    "${OPENSHELL_OIDC_ISSUER:-}"
+    "${RYNO_OIDC_ISSUER:-}"
 fi
 
-export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
+export RYNO_GATEWAY="${GATEWAY_NAME}"
+export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-180}"
 
-if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-  export OPENSHELL_E2E_OIDC=1
-  export OPENSHELL_E2E_OIDC_SCOPES=1
+if [ "${OIDC_MODE}" = "1" ] || [ -n "${RYNO_OIDC_ISSUER:-}" ]; then
+  export RYNO_E2E_OIDC=1
+  export RYNO_E2E_OIDC_SCOPES=1
 fi
 
 echo "Waiting for gateway to become healthy..."
@@ -718,7 +718,7 @@ elapsed=0
 timeout=120
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "ERROR: openshell-gateway exited before becoming healthy"
+    echo "ERROR: ryno-gateway exited before becoming healthy"
     exit 1
   fi
   if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
@@ -744,8 +744,8 @@ if [ "${OIDC_MODE}" = "1" ]; then
     "${CLI_GATEWAY_ENDPOINT}" \
     "${HOST_PORT}" \
     "${OIDC_ISSUER}" \
-    "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
-    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${RYNO_E2E_OIDC_USERNAME:-admin@test}" \
+    "${RYNO_E2E_OIDC_PASSWORD:-admin}" \
     "${PKI_DIR}" \
     "${CLI_BIN}" || exit 1
 fi

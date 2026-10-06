@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# One-time setup for the openshell-driver-vm runtime.
+# One-time setup for the ryno-driver-vm runtime.
 #
 # Downloads pre-built runtime artifacts (libkrun, libkrunfw, umoci)
 # from the vm-runtime GitHub Release, or builds them from source when
 # --from-source is set.
 # After obtaining the runtime, compresses the artifacts for embedding into the
-# openshell-driver-vm binary.
+# ryno-driver-vm binary.
 #
 # Usage:
 #   ./vm-setup.sh                   # download pre-built (default, ~30s)
@@ -22,7 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
-CLI_BIN="${ROOT}/scripts/bin/openshell"
+CLI_BIN="${ROOT}/scripts/bin/ryno"
 
 FROM_SOURCE="${FROM_SOURCE:-0}"
 
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--from-source]"
             echo ""
-            echo "Set up the openshell-driver-vm runtime (libkrun, libkrunfw, umoci)."
+            echo "Set up the ryno-driver-vm runtime (libkrun, libkrunfw, umoci)."
             echo ""
             echo "Options:"
             echo "  --from-source   Build runtime from source instead of downloading (~15-45min)"
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 PLATFORM="$(detect_platform)"
-echo "==> openshell-driver-vm setup"
+echo "==> ryno-driver-vm setup"
 echo "    Platform: ${PLATFORM}"
 echo "    Mode:     $([ "$FROM_SOURCE" = "1" ] && echo "build from source" || echo "download pre-built")"
 echo ""
@@ -95,7 +95,7 @@ fi
 
 # ── Validate ────────────────────────────────────────────────────────────
 
-OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
+OUTPUT_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
 # Check that we have the essential compressed artifacts
 missing=0

@@ -10,17 +10,17 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
 RUNNER_SOURCE="${SCRIPT_DIR}/sandbox-runner.sh"
 
-if [[ -z "${OPENSHELL_BIN:-}" ]]; then
-    if [[ -x "${REPO_ROOT}/target/debug/openshell" ]]; then
-        OPENSHELL_BIN="${REPO_ROOT}/target/debug/openshell"
+if [[ -z "${RYNO_BIN:-}" ]]; then
+    if [[ -x "${REPO_ROOT}/target/debug/ryno" ]]; then
+        RYNO_BIN="${REPO_ROOT}/target/debug/ryno"
     else
-        OPENSHELL_BIN="openshell"
+        RYNO_BIN="ryno"
     fi
 fi
 
 DEMO_BRANCH="${DEMO_BRANCH:-main}"
 DEMO_RUN_ID="${DEMO_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-DEMO_FILE_DIR="${DEMO_FILE_DIR:-openshell-policy-advisor-validation}"
+DEMO_FILE_DIR="${DEMO_FILE_DIR:-ryno-policy-advisor-validation}"
 DEMO_FILE_PATH="${DEMO_FILE_PATH:-${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md}"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-pav-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-validation-${DEMO_RUN_ID}}"
@@ -58,12 +58,12 @@ cleanup() {
     local status=$?
 
     if [[ "$DEMO_KEEP_SANDBOX" != "1" ]]; then
-        "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
+        "$RYNO_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
     else
         printf "\n${YELLOW}Keeping sandbox because DEMO_KEEP_SANDBOX=1: %s${RESET}\n" "$DEMO_SANDBOX_NAME"
     fi
 
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
     if [[ -z "$TMP_DIR" ]]; then
         return
@@ -114,7 +114,7 @@ validate_env() {
     require_command curl
     require_command jq
     require_command ssh
-    require_command "$OPENSHELL_BIN"
+    require_command "$RYNO_BIN"
 
     [[ -f "$RUNNER_SOURCE" ]] || fail "missing sandbox runner: $RUNNER_SOURCE"
     [[ -n "${DEMO_GITHUB_OWNER:-}" ]] || fail "set DEMO_GITHUB_OWNER"
@@ -144,11 +144,11 @@ github_api_status() {
 }
 
 check_gateway() {
-    step "Checking active OpenShell gateway"
-    if ! "$OPENSHELL_BIN" status >/dev/null 2>&1; then
-        fail "active OpenShell gateway is not reachable; start one separately, for example: mise run cluster"
+    step "Checking active Ryno gateway"
+    if ! "$RYNO_BIN" status >/dev/null 2>&1; then
+        fail "active Ryno gateway is not reachable; start one separately, for example: mise run cluster"
     fi
-    "$OPENSHELL_BIN" status | sed 's/^/  /'
+    "$RYNO_BIN" status | sed 's/^/  /'
 }
 
 check_github_access() {
@@ -194,8 +194,8 @@ check_github_access() {
 
 create_provider() {
     step "Creating temporary GitHub provider"
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" provider create \
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
         --type github \
         --credential GITHUB_TOKEN
@@ -204,18 +204,18 @@ create_provider() {
 check_agent_proposals_enabled() {
     step "Checking agent-driven policy proposal opt-in"
     local value
-    value="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+    value="$("$RYNO_BIN" settings get --global --json 2>/dev/null \
         | jq -r '.settings.agent_policy_proposals_enabled // "<unset>"')"
     if [[ "$value" != "true" ]]; then
         fail "agent_policy_proposals_enabled must be true before running this test.
 Enable it with:
-  $OPENSHELL_BIN settings set --global --key agent_policy_proposals_enabled --value true --yes"
+  $RYNO_BIN settings set --global --key agent_policy_proposals_enabled --value true --yes"
     fi
     info "${GREEN}agent_policy_proposals_enabled=true${RESET}"
 }
 
 create_temp_workspace() {
-    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent-policy.XXXXXX")"
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryno-agent-policy.XXXXXX")"
     POLICY_FILE="${TMP_DIR}/policy.yaml"
     SSH_CONFIG="${TMP_DIR}/ssh_config"
 }
@@ -223,8 +223,8 @@ create_temp_workspace() {
 create_sandbox() {
     step "Creating sandbox with read-only GitHub L7 policy"
     cp "$POLICY_TEMPLATE" "$POLICY_FILE"
-    "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" sandbox create \
+    "$RYNO_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" sandbox create \
         --name "$DEMO_SANDBOX_NAME" \
         --provider "$DEMO_GITHUB_PROVIDER_NAME" \
         --policy "$POLICY_FILE" \
@@ -235,7 +235,7 @@ create_sandbox() {
 
 connect_ssh() {
     step "Connecting to sandbox over SSH"
-    "$OPENSHELL_BIN" sandbox ssh-config "$DEMO_SANDBOX_NAME" > "$SSH_CONFIG"
+    "$RYNO_BIN" sandbox ssh-config "$DEMO_SANDBOX_NAME" > "$SSH_CONFIG"
     SSH_HOST="$(awk '/^Host / { print $2; exit }' "$SSH_CONFIG")"
     [[ -n "$SSH_HOST" ]] || fail "could not find Host entry in sandbox SSH config"
 
@@ -267,7 +267,7 @@ http_body() {
 run_policy_local_checks() {
     step "Checking sandbox-local skill and policy.local"
     sandbox_exec /sandbox/policy-validation-runner.sh check-skill >/dev/null
-    info "${GREEN}Skill installed:${RESET} /etc/openshell/skills/policy_advisor.md"
+    info "${GREEN}Skill installed:${RESET} /etc/ryno/skills/policy_advisor.md"
 
     local output
     output="$(sandbox_exec /sandbox/policy-validation-runner.sh current-policy)"
@@ -304,7 +304,7 @@ capture_initial_denial() {
     status="$(printf '%s\n' "$output" | http_status)"
     body="$(printf '%s\n' "$output" | http_body)"
 
-    [[ "$status" == "403" ]] || fail "expected OpenShell HTTP 403, got HTTP $status"
+    [[ "$status" == "403" ]] || fail "expected Ryno HTTP 403, got HTTP $status"
     printf '%s\n' "$body" | jq -e '.error == "policy_denied"' >/dev/null \
         || fail "expected structured policy_denied body"
     printf '%s\n' "$body" | jq -e '.layer == "l7" and .protocol == "rest" and .method == "PUT"' >/dev/null \
@@ -333,8 +333,8 @@ submit_and_approve() {
     printf '%s\n' "$body" | jq -r '"Proposal submitted: \(.accepted_chunks) accepted, \(.rejected_chunks) rejected"' | sed 's/^/  /'
 
     step "Approving pending draft rule from outside the sandbox"
-    "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending | sed 's/^/  /'
-    "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" | sed 's/^/  /'
+    "$RYNO_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending | sed 's/^/  /'
+    "$RYNO_BIN" rule approve-all "$DEMO_SANDBOX_NAME" | sed 's/^/  /'
 }
 
 print_success_summary() {
@@ -379,7 +379,7 @@ retry_until_allowed() {
 
 show_logs() {
     step "Policy decision trace"
-    "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 5m -n 50 2>&1 \
+    "$RYNO_BIN" logs "$DEMO_SANDBOX_NAME" --since 5m -n 50 2>&1 \
         | grep -E 'HTTP:PUT|CONFIG:LOADED|ReportPolicyStatus' \
         | tail -n 8 \
         | sed 's/^/  /' || true

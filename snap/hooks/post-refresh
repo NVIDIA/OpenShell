@@ -20,7 +20,7 @@ elif [ -L "$config_file" ]; then
 	exit 0
 elif [ -f "$config_file" ]; then
 	grep -Eq "$insecure" "$config_file" || exit 0
-	echo "openshell: removing insecure gateway config to use the mTLS default" >&2
+	echo "ryno: removing insecure gateway config to use the mTLS default" >&2
 elif [ -e "$config_file" ]; then
 	exit 0
 fi

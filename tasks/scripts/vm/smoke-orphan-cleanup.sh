@@ -15,15 +15,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 
-PORT="${OPENSHELL_SERVER_PORT:-8091}"
+PORT="${RYNO_SERVER_PORT:-8091}"
 XDG="${TMPDIR:-/tmp}/vm-orphan-xdg-$$"
-STATE_DIR="${TMPDIR:-/tmp}/openshell-vm-orphan-$$"
+STATE_DIR="${TMPDIR:-/tmp}/ryno-vm-orphan-$$"
 LOG="${TMPDIR:-/tmp}/vm-orphan-$$.log"
 
 cleanup_stray() {
     # Best-effort: kill anything left over from our sandbox ids so repeated
     # runs don't accumulate.
-    pkill -9 -f "openshell-vm-orphan-$$" 2>/dev/null || true
+    pkill -9 -f "ryno-vm-orphan-$$" 2>/dev/null || true
     rm -rf "$XDG" "$STATE_DIR" 2>/dev/null || true
     # Preserve the gateway log only on failure so operators can diagnose.
     if [ "${EXIT_CODE:-0}" -ne 0 ]; then
@@ -36,14 +36,14 @@ trap cleanup_stray EXIT
 
 build_binaries() {
     echo "==> Ensuring binaries are built"
-    if [ ! -x "$ROOT/target/debug/openshell-gateway" ] || [ ! -x "$ROOT/target/debug/openshell-driver-vm" ]; then
-        cargo build -p openshell-gateway -p openshell-driver-vm >&2
+    if [ ! -x "$ROOT/target/debug/ryno-gateway" ] || [ ! -x "$ROOT/target/debug/ryno-driver-vm" ]; then
+        cargo build -p ryno-gateway -p ryno-driver-vm >&2
     fi
     if [ "$(uname -s)" = "Darwin" ]; then
         codesign \
-            --entitlements "$ROOT/crates/openshell-driver-vm/entitlements.plist" \
+            --entitlements "$ROOT/crates/ryno-driver-vm/entitlements.plist" \
             --force -s - \
-            "$ROOT/target/debug/openshell-driver-vm" >/dev/null 2>&1 || true
+            "$ROOT/target/debug/ryno-driver-vm" >/dev/null 2>&1 || true
     fi
 }
 
@@ -53,25 +53,25 @@ start_gateway() {
     echo "==> Starting gateway on port $PORT (state=$STATE_DIR, health=$health_port)"
     mkdir -p "$STATE_DIR"
     cat >"$config" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 compute_driver = "vm"
 disable_tls = true
 
-[openshell.drivers.vm]
+[ryno.drivers.vm]
 grpc_endpoint = "http://host.containers.internal:$PORT"
 driver_dir = "$ROOT/target/debug"
 state_dir = "$STATE_DIR"
 EOF
-    OPENSHELL_SERVER_PORT="$PORT" \
-    OPENSHELL_HEALTH_PORT="$health_port" \
-    OPENSHELL_DB_URL="sqlite:$STATE_DIR/openshell.db" \
-    OPENSHELL_COMPUTE_DRIVER=vm \
-    OPENSHELL_GATEWAY_CONFIG="$config" \
-    OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$ROOT/target/vm-runtime-compressed" \
-    nohup "$ROOT/target/debug/openshell-gateway" --disable-tls \
+    RYNO_SERVER_PORT="$PORT" \
+    RYNO_HEALTH_PORT="$health_port" \
+    RYNO_DB_URL="sqlite:$STATE_DIR/ryno.db" \
+    RYNO_COMPUTE_DRIVER=vm \
+    RYNO_GATEWAY_CONFIG="$config" \
+    RYNO_VM_RUNTIME_COMPRESSED_DIR="$ROOT/target/vm-runtime-compressed" \
+    nohup "$ROOT/target/debug/ryno-gateway" --disable-tls \
         > "$LOG" 2>&1 &
     GATEWAY_PID=$!
     echo "gateway pid=$GATEWAY_PID"
@@ -96,18 +96,18 @@ EOF
 create_sandbox() {
     echo "==> Creating sandbox (long-running)"
     mkdir -p "$XDG"
-    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" gateway add \
+    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/ryno" gateway add \
         --name vm-orphan http://127.0.0.1:"$PORT" >/dev/null
-    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" gateway select vm-orphan >/dev/null
+    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/ryno" gateway select vm-orphan >/dev/null
 
     # Run the CLI in the background; it blocks waiting for sleep to finish.
-    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" sandbox create \
+    XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/ryno" sandbox create \
         --name "orphan-$$" -- sleep 99999 \
         > "$LOG.create" 2>&1 &
     CLI_PID=$!
 
     for _ in $(seq 1 60); do
-        if pgrep -f "openshell-vm-orphan-$$|$STATE_DIR/sandboxes/" >/dev/null 2>&1; then
+        if pgrep -f "ryno-vm-orphan-$$|$STATE_DIR/sandboxes/" >/dev/null 2>&1; then
             echo "sandbox came up (cli pid=$CLI_PID)"
             return 0
         fi
@@ -184,7 +184,7 @@ main() {
     local overall=0
 
     # Clean starting state.
-    pkill -9 -f 'openshell-gateway|openshell-driver-vm' 2>/dev/null || true
+    pkill -9 -f 'ryno-gateway|ryno-driver-vm' 2>/dev/null || true
     sleep 1
 
     if ! run_scenario TERM "graceful SIGTERM"; then

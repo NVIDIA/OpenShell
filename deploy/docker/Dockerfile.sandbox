@@ -13,10 +13,10 @@ ARG TARGETARCH
 
 # Keep the binary root-owned for image-volume mounts and executable by the
 # sandbox runtime's non-root UID.
-COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/ryno-sandbox /ryno-sandbox
 
 # Drivers may override this identity to match the admitted workload. Keep the
 # standalone image non-root by default.
 USER 65532:65532
 
-ENTRYPOINT ["/openshell-sandbox"]
+ENTRYPOINT ["/ryno-sandbox"]

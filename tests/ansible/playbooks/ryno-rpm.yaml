@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install Ryno RPM packages
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Copy Ryno RPM packages
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "/var/tmp/{{ item.name }}.rpm"
+        mode: "0644"
+      loop:
+        - { name: ryno, src: "{{ ryno_rpm }}" }
+        - { name: ryno-gateway, src: "{{ ryno_gateway_rpm }}" }
+
+    - name: Install Ryno RPM packages
+      become: true
+      ansible.builtin.dnf:
+        name:
+          - /var/tmp/ryno.rpm
+          - /var/tmp/ryno-gateway.rpm
+        state: present
+        disable_gpg_check: true
+        allow_downgrade: true
+
+    - name: Prepare packaged Ryno gateway
+      ansible.builtin.include_role:
+        name: ryno_packaged_gateway

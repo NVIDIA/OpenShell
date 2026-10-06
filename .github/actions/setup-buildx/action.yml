@@ -8,7 +8,7 @@ description: >
 inputs:
   name:
     description: Builder instance name
-    default: openshell
+    default: ryno
   buildkitd-config:
     description: >
       Path to a buildkitd.toml to configure the builder with (e.g. the

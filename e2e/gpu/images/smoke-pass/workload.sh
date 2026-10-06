@@ -5,4 +5,4 @@
 
 set -euo pipefail
 
-echo "OPENSHELL_GPU_WORKLOAD_SUCCESS smoke-pass"
+echo "RYNO_GPU_WORKLOAD_SUCCESS smoke-pass"

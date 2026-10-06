@@ -1,0 +1,132 @@
+{{- if include "ryno.clusterRbacCreate" . }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ryno.clusterRoleName" . }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get"]
+  {{- if and (ne $workspaceMode "shared") .Values.server.drivers.kubernetes.allowDriverConfig }}
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
+  {{- end }}
+  # Validate projected ServiceAccount tokens during sandbox bootstrap and
+  # internal gateway peer authentication.
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+  # Read namespace annotations for OpenShift SCC UID/GID range resolution.
+  # Managed/operator modes additionally need list+watch for cluster-wide
+  # namespace discovery. Managed mode needs create+delete for namespace
+  # lifecycle.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
+      {{- if ne $workspaceMode "shared" }}
+      - list
+      - watch
+      {{- end }}
+      {{- if eq $workspaceMode "managed" }}
+      - create
+      - delete
+      {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  # Cluster-wide sandbox CRD access for managed/operator workspace modes.
+  - apiGroups:
+      - agents.x-k8s.io
+    resources:
+      - sandboxes
+      - sandboxes/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - watch
+  {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  # Operator-mode namespaces receive Secret permissions from the ryno-workspace
+  # chart Role instead.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # Bootstrap and image-pull Secrets are generation-scoped. Recovery deletes
+    # them by exact name.
+    verbs: ["create", "delete"]
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  # ServiceAccount creation in managed namespaces.
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - create
+      - get
+  {{- if .Values.networkPolicy.enabled }}
+  # Apply gateway-only SSH ingress isolation in managed namespaces.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - create
+      - patch
+      - update
+  {{- end }}
+  {{- end }}
+{{- end }}

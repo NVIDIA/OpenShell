@@ -9,9 +9,9 @@ use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_bin;
-use openshell_e2e::harness::cli::run_cli;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_bin;
+use ryno_e2e::harness::cli::run_cli;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
 struct ProviderGuard {
@@ -21,7 +21,7 @@ struct ProviderGuard {
 
 impl Drop for ProviderGuard {
     fn drop(&mut self) {
-        let binary = openshell_bin();
+        let binary = ryno_bin();
         for _ in 0..20 {
             let deleted = std::process::Command::new(&binary)
                 .args(["provider", "delete", &self.provider])
@@ -96,7 +96,7 @@ async fn provider_file_open_update_and_detach() -> Result<(), String> {
     .await?;
 
     let mut sandbox = SandboxGuard::create(&["--provider", &provider, "--no-tty"]).await?;
-    let path = format!("/run/openshell/providers/{provider}/client.toml");
+    let path = format!("/run/ryno/providers/{provider}/client.toml");
     let environment_path = sandbox.exec(&["printenv", "ACME_CONFIG_FILE"]).await?;
     if !environment_path.contains(&path) {
         return Err(format!(

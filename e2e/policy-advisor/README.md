@@ -6,7 +6,7 @@
 Deterministic, no-LLM exercise of the agent-driven policy loop:
 
 1. Start a sandbox with a read-only GitHub L7 policy.
-2. From inside the sandbox, attempt a GitHub contents PUT and assert OpenShell
+2. From inside the sandbox, attempt a GitHub contents PUT and assert Ryno
    returns a structured `policy_denied` 403.
 3. Submit a narrow `addRule` proposal through `http://policy.local/v1/proposals`.
 4. Approve the draft from the host and retry until the write succeeds.
@@ -22,13 +22,13 @@ Run against an ephemeral Docker gateway:
 
 ```bash
 DEMO_GITHUB_OWNER=<your-handle> \
-DEMO_GITHUB_REPO=openshell-policy-demo \
+DEMO_GITHUB_REPO=ryno-policy-demo \
 e2e/with-docker-gateway.sh bash -lc '
-  target/debug/openshell settings set --global \
+  target/debug/ryno settings set --global \
     --key agent_policy_proposals_enabled \
     --value true \
     --yes
-  OPENSHELL_BIN="$PWD/target/debug/openshell" bash e2e/policy-advisor/test.sh
+  RYNO_BIN="$PWD/target/debug/ryno" bash e2e/policy-advisor/test.sh
 '
 ```
 
@@ -36,16 +36,16 @@ To keep the sandbox for debugging, start a local gateway first with
 `mise run gateway:docker`, then run:
 
 ```bash
-target/debug/openshell settings set --global \
+target/debug/ryno settings set --global \
   --key agent_policy_proposals_enabled \
   --value true \
   --yes
 
-OPENSHELL_GATEWAY=docker-dev \
-OPENSHELL_BIN="$PWD/target/debug/openshell" \
+RYNO_GATEWAY=docker-dev \
+RYNO_BIN="$PWD/target/debug/ryno" \
 DEMO_KEEP_SANDBOX=1 \
 DEMO_GITHUB_OWNER=<your-handle> \
-DEMO_GITHUB_REPO=openshell-policy-demo \
+DEMO_GITHUB_REPO=ryno-policy-demo \
 bash e2e/policy-advisor/test.sh
 ```
 
@@ -59,13 +59,13 @@ The `mechanistic-proposal` and `new-hostname-proposal` conformance scenarios
 check draft generation for a denied IP address and for a hostname absent from
 policy. The `policy-local` scenario uses `policy.local` to inspect policy, submit
 a narrow permission request, and read the resulting proposal. Run them against a configured gateway
-with `--openshell-bin` pointing to the CLI under test:
+with `--ryno-bin` pointing to the CLI under test:
 
 ```bash
-openshell-conformance run mechanistic-proposal new-hostname-proposal policy-local --openshell-bin target/debug/openshell
+ryno-conformance run mechanistic-proposal new-hostname-proposal policy-local --ryno-bin target/debug/ryno
 ```
 
-Run `openshell-conformance list` to see all scenario names. A manual
+Run `ryno-conformance list` to see all scenario names. A manual
 `Integration Tests` workflow run can select the `policy-advisor` testsuite to
 run only these three scenarios against an installed candidate. Set
 `artifact-run-id` to the candidate build's workflow run ID and `test-matrix` to:

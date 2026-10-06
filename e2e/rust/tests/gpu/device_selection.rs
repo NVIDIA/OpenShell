@@ -8,10 +8,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::{ContainerEngine, e2e_driver};
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 use serial_test::serial;
 use tokio::time::timeout;
@@ -19,7 +19,7 @@ use tokio::time::timeout;
 const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 const CDI_GPU_DEVICE_PREFIX: &str = "nvidia.com/gpu=";
-const GPU_PROBE_IMAGE_ENV: &str = "OPENSHELL_E2E_GPU_PROBE_IMAGE";
+const GPU_PROBE_IMAGE_ENV: &str = "RYNO_E2E_GPU_PROBE_IMAGE";
 const DEFAULT_GPU_PROBE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:noble-20251013";
 
 fn gpu_lines(output: &str) -> Vec<String> {
@@ -319,14 +319,14 @@ async fn sandbox_gpu_lines(gpu_device: Option<&str>) -> Vec<String> {
 }
 
 async fn sandbox_create_output(args: &[&str]) -> String {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox").arg("create").args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = timeout(SANDBOX_CREATE_TIMEOUT, cmd.output())
         .await
         .expect("sandbox create should complete before timeout")
-        .expect("openshell command should spawn");
+        .expect("ryno command should spawn");
 
     assert!(
         !output.status.success(),

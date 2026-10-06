@@ -13,7 +13,7 @@ Use a specific GitHub issue to plan and implement a scoped change. Direct user i
 
 1. Run `gh issue view <id> --json number,title,body,state,labels,comments,assignees` and inspect the repository's current `state:*` labels and descriptions with `gh label list`. Infer whether triage, validation, and human acceptance have happened. Do not hard-code label names or change disposition as part of building.
 2. Read the issue, comments, linked PRs, and current code. Check for an active owner or implementation. If the issue concerns a vulnerability, use `review-security-issue` and `fix-security-issue` instead.
-3. Confirm that the User Story attests to the human operator's first-hand OpenShell use and gives a specific use case. If the issue lacks this, ask the operator before proceeding with planning or implementation. For a bug, require reproduction using only an OpenShell deployment; do not install third-party tools solely to demonstrate the problem.
+3. Confirm that the User Story attests to the human operator's first-hand Ryno use and gives a specific use case. If the issue lacks this, ask the operator before proceeding with planning or implementation. For a bug, require reproduction using only an Ryno deployment; do not install third-party tools solely to demonstrate the problem.
 4. If the user's direct request starts before the normal issue disposition, briefly report the discrepancy and continue with the authorized phase. Stop only when information needed to do the work is actually unavailable or a conflicting owner needs resolution.
 
 ## Plan

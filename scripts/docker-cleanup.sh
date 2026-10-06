@@ -4,10 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Clean up stale Docker images, volumes, and build cache that are not in use
-# by the currently deployed OpenShell cluster.
+# by the currently deployed Ryno cluster.
 #
 # Preserves:
-#   - Current openshell/* :dev images (and 127.0.0.1:5000 registry mirrors)
+#   - Current ryno/* :dev images (and 127.0.0.1:5000 registry mirrors)
 #   - Images actively used by running containers
 #   - Common base/infrastructure images (registry, k3s, alpine, rust, python, etc.)
 #   - Volumes attached to running containers
@@ -79,8 +79,8 @@ fi
 # Any tagged image whose repository starts with one of these is kept.
 # ---------------------------------------------------------------------------
 CURRENT_IMAGE_PREFIXES=(
-  "openshell/"
-  "127.0.0.1:5000/openshell/"
+  "ryno/"
+  "127.0.0.1:5000/ryno/"
 )
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ KEEP_IMAGE_PREFIXES=(
 should_keep_image() {
   local repo="$1"
 
-  # Keep current OpenShell images
+  # Keep current Ryno images
   for prefix in "${CURRENT_IMAGE_PREFIXES[@]}"; do
     if [[ "$repo" == "$prefix"* ]]; then
       return 0
@@ -137,7 +137,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo
 elif [[ "$FORCE" != true ]]; then
   echo -e "${BOLD}This will remove stale images, unused volumes, and build cache.${RESET}"
-  echo "The currently deployed OpenShell images and running containers are preserved."
+  echo "The currently deployed Ryno images and running containers are preserved."
   echo
   read -r -p "Continue? [y/N] " confirm
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then

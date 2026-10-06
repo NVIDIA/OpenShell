@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Managing Certificates"
 sidebar-title: "Managing Certificates"
-description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
+description: "Configure the Ryno Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
 keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
 position: 4
 ---
 
-The OpenShell gateway uses TLS for transport to sandbox supervisors. Supervisor Pods receive the gateway CA, not a client certificate or private key, and authenticate RPCs with sandbox JWTs. The generated client certificate can authenticate user clients when gateway mTLS user authentication is enabled; shared deployments can instead configure OIDC or a trusted access proxy. The Helm chart supports two ways to provision and manage the certificate bundle:
+The Ryno gateway uses TLS for transport to sandbox supervisors. Supervisor Pods receive the gateway CA, not a client certificate or private key, and authenticate RPCs with sandbox JWTs. The generated client certificate can authenticate user clients when gateway mTLS user authentication is enabled; shared deployments can instead configure OIDC or a trusted access proxy. The Helm chart supports two ways to provision and manage the certificate bundle:
 
 | Mode | When to use |
 |---|---|
@@ -43,22 +43,22 @@ Verify the cert-manager pods are running:
 kubectl -n cert-manager get pods
 ```
 
-## Install OpenShell with cert-manager PKI
+## Install Ryno with cert-manager PKI
 
 Pass the cert-manager values override when installing or upgrading the chart:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set certManager.enabled=true
 ```
 
 The chart creates a self-signed CA, issues server and client certificates from it, and cert-manager handles renewal before expiry.
 The chart also runs a pre-install hook in JWT-only mode to create the gateway's
 sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
-certificate Secrets and is mounted at `/etc/openshell-jwt`.
+certificate Secrets and is mounted at `/etc/ryno-jwt`.
 
 ## Using a real Issuer for the server certificate
 
@@ -69,23 +69,23 @@ overrides the `issuerRef` on the server `Certificate` resource to point at a
 real `Issuer` or `ClusterIssuer` instead, for example a LetsEncrypt/ACME issuer:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set certManager.enabled=true \
   --set certManager.serverIssuerRef.name=letsencrypt-prod \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
-  --set certManager.serverDnsNames[0]=openshell.example.com
+  --set certManager.serverDnsNames[0]=ryno.example.com
 ```
 
 ### Dual certificate architecture
 
 When `serverIssuerRef` is set, the chart creates **two** server certificates:
 
-1. **Internal certificate** (`openshell-server-tls`): signed by the chart CA
+1. **Internal certificate** (`ryno-server-tls`): signed by the chart CA
    with internal SANs (`*.svc.cluster.local`, `localhost`, etc.).
-2. **External certificate** (`openshell-server-external-tls`): signed by the
+2. **External certificate** (`ryno-server-external-tls`): signed by the
    configured issuer (e.g. ACME) with only the hostnames from
    `certManager.serverDnsNames`.
 

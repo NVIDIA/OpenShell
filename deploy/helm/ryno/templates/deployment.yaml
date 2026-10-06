@@ -1,0 +1,18 @@
+{{- include "ryno.validateValues" . }}
+{{- if eq (include "ryno.workloadKind" .) "deployment" }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ryno.fullname" . }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ryno.selectorLabels" . | nindent 6 }}
+  template:
+    {{- include "ryno.gatewayPodTemplate" . | nindent 4 }}
+{{- end }}

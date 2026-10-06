@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The GNU-linked gateway binary is staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
+#   deploy/docker/.build/prebuilt-binaries/<arch>/ryno-gateway
 #
 # Distroless Debian provides the glibc runtime required by the binary.
 
@@ -15,10 +15,10 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/ryno-gateway /usr/local/bin/ryno-gateway
 
 USER 1000:1000
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+ENTRYPOINT ["/usr/local/bin/ryno-gateway"]
 CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

@@ -1,6 +1,6 @@
 # Fern documentation site
 
-OpenShell uses [Fern](https://buildwithfern.com/) to validate, preview, and publish the documentation at [docs.nvidia.com/openshell](https://docs.nvidia.com/openshell/). This directory contains the site configuration and presentation files. The documentation content lives in `docs/`.
+Ryno uses [Fern](https://buildwithfern.com/) to validate, preview, and publish the documentation at [docs.nvidia.com/ryno](https://docs.nvidia.com/ryno/). This directory contains the site configuration and presentation files. The documentation content lives in `docs/`.
 
 ## Repository layout
 
@@ -59,7 +59,7 @@ The `dev` snapshot also owns the shared Fern configuration, components, assets, 
 
 A `dev` sync copies the top-level `announcement` from the source `fern/docs.yml`. This announcement is the global fallback, and removing it from the source removes it from `docs-website`. Each snapshot sync copies the source version announcement only to the channel being updated. A version announcement overrides the global announcement for that version, so Release Dev cannot change the `latest` announcement and Release Tag cannot change the `dev` announcement.
 
-Redirects are synchronized with their mutable snapshot. A redirect whose source starts with `/openshell/dev/` or `/openshell/latest/` belongs to that channel. An unversioned alias to a versioned destination belongs to the destination channel; other shared rules belong to `dev`. Each sync replaces that channel's rules, including removing rules absent from the source. A stable release updates `latest` redirects only when it promotes `latest`, so an older maintenance release cannot roll back live routing. Redirects owned by other versions remain unchanged.
+Redirects are synchronized with their mutable snapshot. A redirect whose source starts with `/ryno/dev/` or `/ryno/latest/` belongs to that channel. An unversioned alias to a versioned destination belongs to the destination channel; other shared rules belong to `dev`. Each sync replaces that channel's rules, including removing rules absent from the source. A stable release updates `latest` redirects only when it promotes `latest`, so an older maintenance release cannot roll back live routing. Redirects owned by other versions remain unchanged.
 
 ## Manual maintenance and publishing
 

@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.sandbox.v1;
+package ryno.sandbox.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/duration.proto";
@@ -14,7 +14,7 @@ import "datamodel.proto";
 // Conventions:
 // - This file owns messages exchanged between the gateway and the sandbox
 //   supervisor/runtime.
-// - Public sandbox resource types live in `openshell.proto`.
+// - Public sandbox resource types live in `ryno.proto`.
 // - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
 
 // Sandbox security policy configuration.
@@ -192,11 +192,11 @@ message NetworkEndpoint {
   // protocol "rest" when both surfaces live under api.example.com:443.
   // Empty means all paths.
   string path = 15;
-  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // When true on a "rest" endpoint, Ryno rewrites credential placeholders
   // inside client-to-server WebSocket text messages after an allowed HTTP 101
   // upgrade. Defaults to false.
   bool websocket_credential_rewrite = 16;
-  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // When true on a "rest" endpoint, Ryno rewrites credential placeholders
   // inside supported textual HTTP request bodies before forwarding upstream.
   // Defaults to false.
   bool request_body_credential_rewrite = 17;
@@ -223,7 +223,7 @@ message NetworkEndpoint {
   // endpointless provider profile. Profiles that already define endpoints
   // continue to use those profile endpoints as their credential boundary.
   NetworkCredentialBinding credential_binding = 24;
-  // Explicitly permits credential-bearing traffic to use paths that OpenShell
+  // Explicitly permits credential-bearing traffic to use paths that Ryno
   // cannot inspect or rewrite. Defaults to false. This is a security-sensitive
   // escape hatch and must be explicitly approved.
   bool allow_uninspected_credentials = 25;
@@ -233,7 +233,7 @@ message NetworkEndpoint {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// top-level NetworkEndpoint fields. Ryno owns the supported revision
 // profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
@@ -249,14 +249,14 @@ message McpOptions {
   // Source:
   // - https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
   optional bool strict_tool_names = 1;
-  // Method-layer default for MCP endpoints. When true, OpenShell allows parsed
+  // Method-layer default for MCP endpoints. When true, Ryno allows parsed
   // MCP-family methods at the method layer unless a tool-name policy narrows
   // tools/call. When unset or false, explicit method rules are required.
   optional bool allow_all_known_mcp_methods = 2;
   // Exact MCP protocol revisions accepted by the endpoint's policy schema.
   // Authors may omit this field. Because proto3 repeated fields do not retain
   // presence, omission reaches protobuf ingress as an empty list. Checked
-  // normalization materializes OpenShell's pinned default revision
+  // normalization materializes Ryno's pinned default revision
   // "2025-11-25" before producing canonical downstream state, which is always
   // nonempty.
   //
@@ -354,7 +354,7 @@ message NetworkBinary {
 // Request to get sandbox settings by sandbox name.
 message GetSandboxConfigRequest {
   // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  ryno.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string name = 1;
 }
 
@@ -470,7 +470,7 @@ message SupervisorMiddlewareService {
   // name before sending sandbox config.
   string audience = 6;
   // Operator opt-out from extension authentication for this registration.
-  // When true the service may use a plaintext endpoint and OpenShell attaches
+  // When true the service may use a plaintext endpoint and Ryno attaches
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;

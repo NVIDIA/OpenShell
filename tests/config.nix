@@ -84,14 +84,14 @@ let
       {
         name = "k3s";
         use_galaxy = false;
-        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        playbooks = [ "ansible/playbooks/ryno-k3s.yaml" ];
         inputs = {
           agent_sandbox_version = "0.5.0";
-          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
-          openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
-          openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
-          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
-          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          ryno_cli_binary = "../artifacts/binaries/${muslTarget}/ryno";
+          ryno_gateway_image = "../artifacts/images/ryno-gateway-tmachine.tar";
+          ryno_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+          ryno_sandbox_image = "../artifacts/images/ryno-sandbox-tmachine.tar";
+          ryno_supervisor_image = "../artifacts/images/ryno-supervisor-tmachine.tar";
         };
       }
       {
@@ -104,37 +104,37 @@ let
         name = "binaries";
         use_galaxy = false;
         playbooks = [
-          "ansible/playbooks/openshell.yaml"
+          "ansible/playbooks/ryno.yaml"
           "ansible/playbooks/gateway.yaml"
         ];
         inputs = {
-          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
-          openshell_gateway_binary = "../artifacts/binaries/${gnuTarget}/openshell-gateway";
-          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          ryno_cli_binary = "../artifacts/binaries/${muslTarget}/ryno";
+          ryno_gateway_binary = "../artifacts/binaries/${gnuTarget}/ryno-gateway";
+          ryno_supervisor_image = "../artifacts/images/ryno-supervisor-tmachine.tar";
+          ryno_sandbox_image = "../artifacts/images/ryno-sandbox-tmachine.tar";
         };
       }
       {
         name = "deb";
         use_galaxy = false;
         playbooks = [
-          "ansible/playbooks/openshell-deb.yaml"
+          "ansible/playbooks/ryno-deb.yaml"
         ];
         inputs = {
-          openshell_deb = "../artifacts/packages/openshell.deb";
-          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          ryno_deb = "../artifacts/packages/ryno.deb";
+          ryno_supervisor_image = "../artifacts/images/ryno-supervisor-tmachine.tar";
+          ryno_sandbox_image = "../artifacts/images/ryno-sandbox-tmachine.tar";
         };
       }
       {
         name = "rpm";
         use_galaxy = false;
-        playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];
+        playbooks = [ "ansible/playbooks/ryno-rpm.yaml" ];
         inputs = {
-          openshell_rpm = "../artifacts/packages/rpm/openshell.rpm";
-          openshell_gateway_rpm = "../artifacts/packages/rpm/openshell-gateway.rpm";
-          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+          ryno_rpm = "../artifacts/packages/rpm/ryno.rpm";
+          ryno_gateway_rpm = "../artifacts/packages/rpm/ryno-gateway.rpm";
+          ryno_supervisor_image = "../artifacts/images/ryno-supervisor-tmachine.tar";
+          ryno_sandbox_image = "../artifacts/images/ryno-sandbox-tmachine.tar";
         };
       }
     ];
@@ -150,14 +150,14 @@ let
         name = "conformance";
         playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
         inputs = {
-          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+          ryno_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/ryno-conformance-tests.tar";
         };
       }
       {
         name = "policy-advisor";
         playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
         inputs = {
-          openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+          ryno_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/ryno-conformance-tests.tar";
         };
       }
       {
@@ -172,8 +172,8 @@ let
         name = "e2e-podman";
         playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
         inputs = {
-          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
-          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
+          ryno_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/ryno-podman-e2e-tests.tar";
+          ryno_podman_e2e_workload_image = "../artifacts/images/ryno-e2e-python-dev.tar";
         };
       }
       {
@@ -189,13 +189,13 @@ let
           "ansible/playbooks/drivers/podman/tests.yaml"
         ];
         inputs = {
-          openshell_podman_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-tests.tar";
-          # Match OpenShell's compiled-in default so direct Podman and
-          # OpenShell containers resolve the same workload image metadata.
-          openshell_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
-          openshell_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
-          openshell_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
-          openshell_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
+          ryno_podman_test_bundle = "../artifacts/test-archives/${muslTarget}/ryno-podman-tests.tar";
+          # Match Ryno's compiled-in default so direct Podman and
+          # Ryno containers resolve the same workload image metadata.
+          ryno_podman_reference_image = "nvcr.io/nvidia/base/ubuntu:24.04";
+          ryno_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
+          ryno_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
+          ryno_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
         };
       }
     ];

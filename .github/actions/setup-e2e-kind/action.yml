@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Setup E2E kind
-description: Create a kind cluster and preload OpenShell images for E2E tests
+description: Create a kind cluster and preload Ryno images for E2E tests
 
 inputs:
   cluster-name:
     description: kind cluster name
     required: true
   image-tag:
-    description: OpenShell image tag to load
+    description: Ryno image tag to load
     required: true
   images:
-    description: Space-separated OpenShell image components to load
+    description: Space-separated Ryno image components to load
     required: false
     default: gateway sandbox supervisor
   registry:
     description: Container registry and namespace
     required: false
-    default: ghcr.io/nvidia/openshell
+    default: ghcr.io/nvidia/ryno
   registry-username:
     description: Registry username
     required: true
@@ -60,7 +60,7 @@ runs:
         kind get kubeconfig --name "$CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
         chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
 
-    - name: Load OpenShell images into kind
+    - name: Load Ryno images into kind
       shell: bash
       env:
         CLUSTER_NAME: ${{ inputs.cluster-name }}
@@ -72,10 +72,10 @@ runs:
         for component in $IMAGE_COMPONENTS; do
           case "$component" in
             gateway | sandbox | supervisor) ;;
-            *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
+            *) echo "ERROR: unsupported Ryno image component: $component" >&2; exit 1 ;;
           esac
           image="${REGISTRY}/${component}:${IMAGE_TAG}"
-          archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
+          archive="${RUNNER_TEMP:-/tmp}/ryno-${component}-linux-amd64.tar"
           docker pull --platform linux/amd64 "$image"
           docker image save --platform linux/amd64 --output "$archive" "$image"
           kind load image-archive "$archive" --name "$CLUSTER_NAME"
@@ -88,7 +88,7 @@ runs:
         SANDBOX_IMAGE: nvcr.io/nvidia/base/ubuntu:24.04
       run: |
         set -euo pipefail
-        archive="${RUNNER_TEMP:-/tmp}/openshell-default-sandbox-linux-amd64.tar"
+        archive="${RUNNER_TEMP:-/tmp}/ryno-default-sandbox-linux-amd64.tar"
         docker pull --platform linux/amd64 "$SANDBOX_IMAGE"
         docker image inspect "$SANDBOX_IMAGE" --format 'default sandbox image: {{join .RepoDigests ", "}}'
         docker image save --platform linux/amd64 --output "$archive" "$SANDBOX_IMAGE"

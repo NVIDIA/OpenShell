@@ -25,7 +25,7 @@ template, err := client.SandboxTemplates().Create(ctx, "default", &v1.SandboxWor
     },
     Spec: v1.SandboxWorkloadTemplateSpec{
         Workload: &v1.SandboxWorkloadConfig{
-            Image: "nvcr.io/nvidia/openshell:latest",
+            Image: "nvcr.io/nvidia/ryno:latest",
             Environment: map[string]string{
                 "NVIDIA_VISIBLE_DEVICES": "all",
             },

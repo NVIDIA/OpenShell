@@ -3,9 +3,9 @@
 
 //! Driver-agnostic sandbox file-transfer conformance tests.
 
-use openshell_conformance::{
+use ryno_conformance::{
     FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, OpenShellRunner, Scenario,
+    FILE_TRANSFER_ROUND_TRIP_SCENARIO, RynoRunner, Scenario,
 };
 
 /// Exercise file and directory round trips through the candidate CLI.
@@ -27,8 +27,8 @@ async fn path_safety() {
 }
 
 async fn run(scenario: Scenario) {
-    let mut runner = OpenShellRunner::from_env(scenario.name)
-        .expect("candidate openshell CLI is available");
+    let mut runner = RynoRunner::from_env(scenario.name)
+        .expect("candidate ryno CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         scenario.run(&mut runner).await

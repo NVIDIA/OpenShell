@@ -17,9 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use futures_util::future::BoxFuture;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::port::find_free_port;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::port::find_free_port;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -30,9 +30,9 @@ use tonic::body::Body as TonicBody;
 use tonic::codegen::{Body, http};
 use tonic::{Request, Response, Status};
 
-const TRUST_DOMAIN: &str = "openshell-e2e.test";
-const ISSUER: &str = "https://spiffe.openshell-e2e.test";
-const KEY_ID: &str = "openshell-e2e-test-key";
+const TRUST_DOMAIN: &str = "ryno-e2e.test";
+const ISSUER: &str = "https://spiffe.ryno-e2e.test";
+const KEY_ID: &str = "ryno-e2e-test-key";
 const USER_SUBJECT_TOKEN: &str = "stored-user-token";
 const INTERMEDIATE_TOKEN: &str = "intermediate-token";
 const FINAL_ACCESS_TOKEN: &str = "final-access-token";
@@ -289,8 +289,8 @@ async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle 
     };
     let endpoint = path.to_string_lossy();
     if endpoint.starts_with("tcp:") {
-        let listen = std::env::var("OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN")
-            .expect("OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN must be set for TCP SPIFFE fixture");
+        let listen = std::env::var("RYNO_E2E_PROVIDER_SPIFFE_LISTEN")
+            .expect("RYNO_E2E_PROVIDER_SPIFFE_LISTEN must be set for TCP SPIFFE fixture");
         let listener = TcpListener::bind(&listen)
             .await
             .expect("bind TCP SPIFFE Workload API fixture");
@@ -414,11 +414,11 @@ async fn start_protected_target(port: u16) -> FixtureHandle {
 }
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let output = openshell_cmd()
+    let output = ryno_cmd()
         .args(args)
         .output()
         .await
-        .map_err(|err| format!("spawn openshell: {err}"))?;
+        .map_err(|err| format!("spawn ryno: {err}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
@@ -426,7 +426,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
         Ok(combined)
     } else {
         Err(format!(
-            "openshell {:?} failed with {:?}:\n{combined}",
+            "ryno {:?} failed with {:?}:\n{combined}",
             args,
             output.status.code()
         ))
@@ -434,7 +434,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
 }
 
 async fn run_cli_ignore_error(args: &[&str]) {
-    let _ = openshell_cmd().args(args).output().await;
+    let _ = ryno_cmd().args(args).output().await;
 }
 
 async fn sandbox_logs(sandbox_name: &str) -> String {
@@ -444,8 +444,8 @@ async fn sandbox_logs(sandbox_name: &str) -> String {
 }
 
 async fn podman_exec_capture(container_name: &str, args: &[&str]) -> String {
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return "OPENSHELL_PODMAN_SOCKET is not set".to_string();
+    let Ok(socket) = std::env::var("RYNO_PODMAN_SOCKET") else {
+        return "RYNO_PODMAN_SOCKET is not set".to_string();
     };
     let mut cmd = Command::new("podman");
     cmd.arg("--url")
@@ -466,8 +466,8 @@ async fn podman_exec_capture(container_name: &str, args: &[&str]) -> String {
 }
 
 async fn podman_logs_capture(container_name: &str) -> String {
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return "OPENSHELL_PODMAN_SOCKET is not set".to_string();
+    let Ok(socket) = std::env::var("RYNO_PODMAN_SOCKET") else {
+        return "RYNO_PODMAN_SOCKET is not set".to_string();
     };
     let mut cmd = Command::new("podman");
     cmd.arg("--url").arg(format!("unix://{socket}")).args([
@@ -490,8 +490,8 @@ async fn podman_logs_capture(container_name: &str) -> String {
 
 async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
     let sandbox_logs = sandbox_logs(sandbox_name).await;
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return format!("Sandbox logs:\n{sandbox_logs}\nOPENSHELL_PODMAN_SOCKET is not set");
+    let Ok(socket) = std::env::var("RYNO_PODMAN_SOCKET") else {
+        return format!("Sandbox logs:\n{sandbox_logs}\nRYNO_PODMAN_SOCKET is not set");
     };
     let container_name = match podman_container_name_for_sandbox(&socket, sandbox_name).await {
         Ok(name) => name,
@@ -505,7 +505,7 @@ async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
         &[
             "python3",
             "-c",
-            "import socket; print(socket.getaddrinfo('host.openshell.internal', 0, type=socket.SOCK_STREAM))",
+            "import socket; print(socket.getaddrinfo('host.ryno.internal', 0, type=socket.SOCK_STREAM))",
         ],
     )
     .await;
@@ -515,7 +515,7 @@ async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
             "python3",
             "-c",
             &format!(
-                "import socket; s=socket.create_connection(('host.openshell.internal', {target_port}), 2); print('connected', s.getpeername()); s.close()"
+                "import socket; s=socket.create_connection(('host.ryno.internal', {target_port}), 2); print('connected', s.getpeername()); s.close()"
             ),
         ],
     )
@@ -528,7 +528,7 @@ async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
          --- podman env ---\n{env}\n\
          --- /etc/hosts ---\n{hosts}\n\
          --- ps -ef ---\n{processes}\n\
-         --- resolve host.openshell.internal ---\n{resolve_host}\n\
+         --- resolve host.ryno.internal ---\n{resolve_host}\n\
          --- protected target TCP probe ---\n{target_probe}\n\
          --- podman logs ---\n{container_logs}"
     )
@@ -567,7 +567,7 @@ credentials:
         credential: subject_token
         subject_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
 endpoints:
-  - host: host.openshell.internal
+  - host: host.ryno.internal
     port: {target_port}
     protocol: rest
     access: read-write
@@ -604,9 +604,9 @@ async fn podman_container_name_for_sandbox(
         .arg(format!("unix://{socket}"))
         .arg("ps")
         .arg("--filter")
-        .arg(format!("label=openshell.ai/sandbox-name={sandbox_name}"))
+        .arg(format!("label=ryno.ai/sandbox-name={sandbox_name}"))
         .arg("--filter")
-        .arg("label=openshell.io/isolation-role=sandbox")
+        .arg("label=ryno.io/isolation-role=sandbox")
         .arg("--format")
         .arg("{{.Names}}");
     apply_podman_config_env(&mut cmd);
@@ -640,21 +640,21 @@ async fn podman_container_name_for_sandbox(
 }
 
 fn apply_podman_config_env(cmd: &mut Command) {
-    if std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME").is_some() {
+    if std::env::var_os("RYNO_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME").is_some() {
         cmd.env_remove("XDG_CONFIG_HOME");
-    } else if let Some(value) = std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
+    } else if let Some(value) = std::env::var_os("RYNO_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
         cmd.env("XDG_CONFIG_HOME", value);
     }
 }
 
 async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<String, String> {
-    let url = format!("http://host.openshell.internal:{target_port}/resource");
+    let url = format!("http://host.ryno.internal:{target_port}/resource");
     let script = format!(
         "import urllib.request; print(urllib.request.urlopen({url:?}, timeout=5).read().decode())"
     );
     let mut last_output = String::new();
     for _ in 0..20 {
-        let output = openshell_cmd()
+        let output = ryno_cmd()
             .args([
                 "sandbox",
                 "exec",
@@ -668,7 +668,7 @@ async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<Strin
             ])
             .output()
             .await
-            .map_err(|err| format!("spawn openshell sandbox exec: {err}"))?;
+            .map_err(|err| format!("spawn ryno sandbox exec: {err}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{stdout}{stderr}");
@@ -689,12 +689,12 @@ async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<Strin
 #[tokio::test]
 async fn podman_provider_token_exchange_injects_bearer_header() {
     let gateway_socket = PathBuf::from(
-        std::env::var("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET")
-            .expect("OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET must be set by e2e-podman.sh"),
+        std::env::var("RYNO_E2E_GATEWAY_SPIFFE_SOCKET")
+            .expect("RYNO_E2E_GATEWAY_SPIFFE_SOCKET must be set by e2e-podman.sh"),
     );
     let provider_socket = PathBuf::from(
-        std::env::var("OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET")
-            .expect("OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET must be set by e2e-podman.sh"),
+        std::env::var("RYNO_E2E_PROVIDER_SPIFFE_SOCKET")
+            .expect("RYNO_E2E_PROVIDER_SPIFFE_SOCKET must be set by e2e-podman.sh"),
     );
 
     let profile_type = format!("podman-token-exchange-e2e-{}", std::process::id());
@@ -702,8 +702,8 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     let token_port = find_free_port();
     let target_port = find_free_port();
     let token_endpoint = format!("http://127.0.0.1:{token_port}/token");
-    let gateway_subject = format!("spiffe://{TRUST_DOMAIN}/openshell/gateway");
-    let supervisor_subject = format!("spiffe://{TRUST_DOMAIN}/openshell/sandbox/e2e");
+    let gateway_subject = format!("spiffe://{TRUST_DOMAIN}/ryno/gateway");
+    let supervisor_subject = format!("spiffe://{TRUST_DOMAIN}/ryno/sandbox/e2e");
 
     let _gateway_spiffe = start_spiffe_workload_api(&gateway_socket, &gateway_subject).await;
     let _provider_spiffe = start_spiffe_workload_api(&provider_socket, &supervisor_subject).await;

@@ -174,7 +174,7 @@ class NavCheck:
 
 
 def redirect_prefix(fern_config: dict, nav_file: Path, config_dir: Path) -> str | None:
-    """Return the URL prefix, such as /openshell/dev, for the checked docs version."""
+    """Return the URL prefix, such as /ryno/dev, for the checked docs version."""
     instances = fern_config.get("instances") or []
     url = instances[0].get("url", "") if instances else ""
     base = "/" + url.split("/", 1)[1].strip("/") if "/" in url else ""

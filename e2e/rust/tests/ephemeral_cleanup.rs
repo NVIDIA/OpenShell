@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
-use openshell_e2e::harness::cli::run_cli;
-use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
-use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, unique_sandbox_name};
+use ryno_e2e::harness::binary::{ryno_bin, ryno_cmd};
+use ryno_e2e::harness::cli::run_cli;
+use ryno_e2e::harness::container::{ContainerEngine, e2e_driver};
+use ryno_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, unique_sandbox_name};
 use serial_test::serial;
 use tokio::time::{Instant, sleep};
 
@@ -26,7 +26,7 @@ struct DeleteOnFailure {
 impl Drop for DeleteOnFailure {
     fn drop(&mut self) {
         if self.armed {
-            let _ = Command::new(openshell_bin())
+            let _ = Command::new(ryno_bin())
                 .args(["sandbox", "delete", &self.name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -59,7 +59,7 @@ fn driver_resources_present(sandbox_id: &str) -> Result<bool, String> {
                 "ps",
                 "-aq",
                 "--filter",
-                &format!("label=openshell.ai/sandbox-id={sandbox_id}"),
+                &format!("label=ryno.ai/sandbox-id={sandbox_id}"),
             ]);
             Ok(!command_output(command)?.is_empty())
         }
@@ -70,15 +70,15 @@ fn driver_resources_present(sandbox_id: &str) -> Result<bool, String> {
                 "pods,sandboxes.agents.x-k8s.io",
                 "--all-namespaces",
                 "--selector",
-                &format!("openshell.ai/sandbox-id={sandbox_id}"),
+                &format!("ryno.ai/sandbox-id={sandbox_id}"),
                 "--output=name",
             ]);
             Ok(!command_output(command)?.is_empty())
         }
         Some("vm") => {
-            let state_dir = std::env::var_os("OPENSHELL_E2E_VM_STATE_DIR")
+            let state_dir = std::env::var_os("RYNO_E2E_VM_STATE_DIR")
                 .map(PathBuf::from)
-                .ok_or("OPENSHELL_E2E_VM_STATE_DIR must be set for VM resource checks")?;
+                .ok_or("RYNO_E2E_VM_STATE_DIR must be set for VM resource checks")?;
             Ok(state_dir.join("sandboxes").join(sandbox_id).exists())
         }
         other => Err(format!(
@@ -96,7 +96,7 @@ async fn run_detached_ephemeral_cleanup(exit_code: i32) -> Result<(), String> {
     let release_path = format!("/sandbox/.ephemeral-release-{name}");
     let script =
         format!("while [ ! -e '{release_path}' ]; do sleep 0.1; done; sleep 1; exit {exit_code}");
-    let mut create = openshell_cmd();
+    let mut create = ryno_cmd();
     create.args([
         "sandbox",
         "create",

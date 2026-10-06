@@ -191,9 +191,9 @@ jobs:
             await postDiscussionComment([
               `@${discussionAuthor} has been vouched by @${commenter}.`,
               '',
-              'You can now submit pull requests to OpenShell. Welcome aboard.',
+              'You can now submit pull requests to Ryno. Welcome aboard.',
               '',
-              'Please read [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) before submitting.',
+              'Please read [CONTRIBUTING.md](https://github.com/NVIDIA/Ryno/blob/main/CONTRIBUTING.md) before submitting.',
             ].join('\n'));
 
             await closeDiscussion();

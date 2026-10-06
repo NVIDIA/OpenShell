@@ -3,14 +3,14 @@
 
 //! Installed-artifact policy advisor conformance.
 
-use openshell_conformance::{
-    MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, OpenShellRunner,
+use ryno_conformance::{
+    MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, RynoRunner,
     POLICY_LOCAL_SCENARIO, Scenario,
 };
 
 async fn run(scenario: &'static Scenario) {
     let mut runner =
-        OpenShellRunner::from_env(scenario.name).expect("candidate openshell CLI is available");
+        RynoRunner::from_env(scenario.name).expect("candidate ryno CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         scenario.run(&mut runner).await

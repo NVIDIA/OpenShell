@@ -1,10 +1,10 @@
-# @nvidia/openshell-sdk
+# @nvidia/ryno-sdk
 
-TypeScript client for the OpenShell gateway — thin, idiomatic bindings generated from the OpenShell protobufs.
+TypeScript client for the Ryno gateway — thin, idiomatic bindings generated from the Ryno protobufs.
 
 Distributed via GitHub Packages. A public npm release under the same name follows once the npm org is in place; the install specifier and API are unchanged across that move.
 
-Use the SDK and gateway from the same OpenShell release when possible. The raw
+Use the SDK and gateway from the same Ryno release when possible. The raw
 types and RPC descriptors are generated from the protobuf definitions in that
 release; curated methods remain compatible while those RPC contracts remain
 compatible.
@@ -20,17 +20,17 @@ Published to GitHub Packages, so point the `@nvidia` scope at it with a project 
 Authenticate with a GitHub token that has `read:packages`, then:
 
 ```shell
-npm install @nvidia/openshell-sdk
+npm install @nvidia/ryno-sdk
 ```
 
 ## Usage
 
 ```ts
-import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { RynoClient } from '@nvidia/ryno-sdk'
 
-const client = await OpenShellClient.connect({
+const client = await RynoClient.connect({
   gateway: 'https://gateway.example.com',
-  oidcToken: process.env.OPENSHELL_TOKEN,
+  oidcToken: process.env.RYNO_TOKEN,
 })
 
 const sandbox = await client.sandbox.create({
@@ -70,16 +70,16 @@ the client's lifetime. For long-running service automation, use the renewable
 client-credentials provider:
 
 ```ts
-import { clientCredentials, OpenShellClient } from '@nvidia/openshell-sdk'
+import { clientCredentials, RynoClient } from '@nvidia/ryno-sdk'
 
-const client = await OpenShellClient.connect({
+const client = await RynoClient.connect({
   gateway,
   oidcTokenProvider: clientCredentials({
-    issuer: 'https://idp.example.com/realms/openshell',
-    clientId: 'openshell-service',
-    clientSecret: () => process.env.OPENSHELL_OIDC_CLIENT_SECRET!,
+    issuer: 'https://idp.example.com/realms/ryno',
+    clientId: 'ryno-service',
+    clientSecret: () => process.env.RYNO_OIDC_CLIENT_SECRET!,
     scopes: ['sandbox:read', 'sandbox:write'],
-    audience: 'openshell-gateway',
+    audience: 'ryno-gateway',
   }),
 })
 ```
@@ -109,7 +109,7 @@ await client.sandbox.create({
 directly — same API, one less hop:
 
 ```ts
-import { SandboxClient } from '@nvidia/openshell-sdk'
+import { SandboxClient } from '@nvidia/ryno-sdk'
 
 const sandbox = await SandboxClient.connect({ gateway, oidcToken })
 await sandbox.create({ image })
@@ -192,9 +192,9 @@ own image, environment, resource, and driver-specific settings; sandbox creation
 from a template can still attach labels, providers, and create-time policy.
 
 ```ts
-import { OpenShellClient, type SandboxWorkloadTemplate } from '@nvidia/openshell-sdk'
+import { RynoClient, type SandboxWorkloadTemplate } from '@nvidia/ryno-sdk'
 
-const client = await OpenShellClient.connect({ gateway, oidcToken })
+const client = await RynoClient.connect({ gateway, oidcToken })
 
 const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
   {
@@ -240,7 +240,7 @@ for await (const page of pages) {
 
 ## Surface and roadmap
 
-The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
+The SDK's goal is agent parity: anything the Ryno gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
 - `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
@@ -253,15 +253,15 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 
 ### Advanced: raw escape hatch
 
-`client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
+`client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/ryno-sdk/raw`.
 
 ```ts
 import { create } from '@bufbuild/protobuf'
-import { OpenShellClient } from '@nvidia/openshell-sdk'
-import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
-import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
+import { RynoClient } from '@nvidia/ryno-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/ryno-sdk/raw'
+import type { GetGatewayConfigResponse } from '@nvidia/ryno-sdk/raw'
 
-const client = await OpenShellClient.connect({ gateway, oidcToken })
+const client = await RynoClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})

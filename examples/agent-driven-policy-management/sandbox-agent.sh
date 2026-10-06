@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Runs inside the sandbox. Bootstraps Codex from the credentials injected by
-# the openshell provider, then drives the agent-task prompt to completion.
+# the ryno provider, then drives the agent-task prompt to completion.
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ require_env DEMO_GITHUB_TOKEN
 # Make the GitHub token visible to Codex's tool loop under the conventional name.
 export GITHUB_TOKEN="$DEMO_GITHUB_TOKEN"
 
-# Codex looks for ~/.codex/auth.json. The OpenShell provider only injects env
+# Codex looks for ~/.codex/auth.json. The Ryno provider only injects env
 # vars, so we materialize the file Codex expects from those credentials.
 mkdir -p "$HOME/.codex"
 node - <<'NODE'
@@ -36,8 +36,8 @@ const idToken = [
   b64u({
     iss: "https://auth.openai.com",
     aud: "codex",
-    sub: "openshell-policy-demo",
-    email: "demo@openshell.local",
+    sub: "ryno-policy-demo",
+    email: "demo@ryno.local",
     iat: now,
     exp: now + 3600,
   }),
@@ -61,10 +61,10 @@ chmod 600 "$HOME/.codex/auth.json"
 WORK="$(mktemp -d)"
 cd "$WORK"
 
-# Disable Codex's internal bubblewrap sandbox — OpenShell is already the
+# Disable Codex's internal bubblewrap sandbox — Ryno is already the
 # security boundary, and bwrap can't create nested user namespaces inside the
-# OpenShell sandbox container without extra capabilities. The "danger" framing
-# is from Codex's perspective on a developer host; here the OpenShell network
+# Ryno sandbox container without extra capabilities. The "danger" framing
+# is from Codex's perspective on a developer host; here the Ryno network
 # policy and filesystem constraints are doing the actual containment.
 #
 # Cap Codex's reasoning effort at the lower end. The demo task is mechanical

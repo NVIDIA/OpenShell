@@ -9,19 +9,19 @@
 version: v2
 modules:
   - path: proto
-  - path: crates/openshell-server/proto
+  - path: crates/ryno-server/proto
 lint:
   use:
     - STANDARD
   except:
     # Flat proto/ layout: all files live in one directory with nested
-    # packages (openshell.v1, openshell.sandbox.v1, ...). Adopting these
-    # would require restructuring the tree into openshell/<svc>/v1/ and
+    # packages (ryno.v1, ryno.sandbox.v1, ...). Adopting these
+    # would require restructuring the tree into ryno/<svc>/v1/ and
     # updating every Rust/Python/TS codegen path and import.
     - DIRECTORY_SAME_PACKAGE
     - PACKAGE_DIRECTORY_MATCH
-    # Established API shape: services are unsuffixed (OpenShell, not
-    # OpenShellService) and RPCs reuse shared request/response messages with
+    # Established API shape: services are unsuffixed (Ryno, not
+    # RynoService) and RPCs reuse shared request/response messages with
     # short names. Renaming these is a breaking change across the codebase.
     - RPC_REQUEST_RESPONSE_UNIQUE
     - RPC_REQUEST_STANDARD_NAME

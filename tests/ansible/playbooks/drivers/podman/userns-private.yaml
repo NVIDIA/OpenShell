@@ -5,7 +5,7 @@
 - import_playbook: userns-profile.yaml
   vars:
     podman_userns_profile: private
-    podman_userns_config: "{{ openshell_podman_userns_private_config }}"
+    podman_userns_config: "{{ ryno_podman_userns_private_config }}"
     podman_userns_reference_args:
       # Podman infers a private namespace from explicit maps; its CLI rejects
       # combining --userns private with --uidmap/--gidmap.

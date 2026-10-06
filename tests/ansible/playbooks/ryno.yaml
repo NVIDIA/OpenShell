@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install Ryno
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install Ryno CLI
+      become: true
+      ansible.builtin.copy:
+        src: "{{ ryno_cli_binary }}"
+        dest: /usr/local/bin/ryno
+        mode: "0755"
+
+    - name: Install Ryno gateway
+      become: true
+      ansible.builtin.copy:
+        src: "{{ ryno_gateway_binary }}"
+        dest: /usr/local/bin/ryno-gateway
+        mode: "0755"

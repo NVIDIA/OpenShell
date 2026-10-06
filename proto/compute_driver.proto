@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.compute.v1;
+package ryno.compute.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
@@ -15,10 +15,10 @@ import "sandbox.proto";
 //
 // Conventions:
 // - This file owns driver-native request, response, and observation types.
-// - Compute drivers must not import or return the public `openshell.v1.Sandbox`
+// - Compute drivers must not import or return the public `ryno.v1.Sandbox`
 //   resource model.
 // - The gateway translates between these driver-native messages and
-//   the public OpenShell API resource model.
+//   the public Ryno API resource model.
 // - Capability fields are additive. Drivers and gateways must ignore unknown
 //   fields so independently versioned external drivers remain
 //   forward-compatible.
@@ -67,7 +67,7 @@ service ComputeDriver {
 
 message GetCapabilitiesRequest {
   // Gateway protocol metadata. Drivers must reject unmet requirements.
-  openshell.extension.v1.PeerMetadata gateway = 1;
+  ryno.extension.v1.PeerMetadata gateway = 1;
 }
 
 message GetCapabilitiesResponse {
@@ -88,7 +88,7 @@ message GetCapabilitiesResponse {
   // start, and authentication responses for gateway-side binding checks.
   bool supports_sandbox_authentication = 7;
   // Whether the driver reports runtime readiness itself. When false, the
-  // gateway waits for the standard OpenShell supervisor session in addition
+  // gateway waits for the standard Ryno supervisor session in addition
   // to the driver's platform-ready observation.
   bool driver_reports_runtime_readiness = 8;
   // Static portable resource request forms supported by this configured driver.
@@ -101,7 +101,7 @@ message GetCapabilitiesResponse {
   // the driver does not support rootfs tar sources.
   uint64 rootfs_tar_max_bytes = 11;
   // Compute extension protocol metadata. Required for protocol negotiation.
-  openshell.extension.v1.PeerMetadata extension = 12;
+  ryno.extension.v1.PeerMetadata extension = 12;
   // Versioned effective operator admission policy (v1: followed by JSON).
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
@@ -110,7 +110,7 @@ message GetCapabilitiesResponse {
 
 message AuthenticateSandboxRequest {
   // Opaque credential whose format and verification are owned by the driver.
-  string credential = 1 [(openshell.options.v1.secret) = true];
+  string credential = 1 [(ryno.options.v1.secret) = true];
 }
 
 message AuthenticateSandboxResponse {
@@ -150,7 +150,7 @@ message GpuResourceCapabilities {
 // Driver-owned sandbox model used for create requests and platform observations.
 //
 // This intentionally omits gateway-owned lifecycle fields such as the public
-// `openshell.v1.SandboxPhase` and persisted metadata. The gateway derives and
+// `ryno.v1.SandboxPhase` and persisted metadata. The gateway derives and
 // stores those fields after translating driver observations.
 message DriverSandbox {
   // Stable sandbox ID assigned by the gateway.
@@ -180,7 +180,7 @@ message DriverSandboxSpec {
   // Canonical effective policy supplied to the driver for validation and
   // provisioning. Drivers that enforce policy outside the standard supervisor
   // use GetSandboxConfig to fetch later revisions.
-  openshell.sandbox.v1.SandboxPolicy policy = 7;
+  ryno.sandbox.v1.SandboxPolicy policy = 7;
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
   ResourceRequirements resource_requirements = 9;
@@ -192,7 +192,7 @@ message DriverSandboxSpec {
   // the Kubernetes driver ignores this field and relies on its projected
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
-  string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  string sandbox_token = 11 [(ryno.options.v1.secret) = true];
   // Exact canonical command forwarded to the supervisor without shell parsing.
   repeated string command = 12;
   // Allocate a retained pseudo-terminal for the canonical process.
@@ -207,7 +207,7 @@ message DriverSandboxSpec {
   // Opaque, gateway-created launch credentials. The driver must split this
   // material between the host supervisor and workload-side sandbox runtime;
   // it must never expose the supervisor bearer tokens to the workload.
-  bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
+  bytes launch_authentication = 16 [(ryno.options.v1.secret) = true];
 }
 
 // Identity inputs admitted by the gateway before workload provisioning.
@@ -303,7 +303,7 @@ message DriverResourceRequirements {
 
 // Raw status observed directly from the compute platform.
 //
-// The gateway derives the public `openshell.v1.SandboxPhase` from these
+// The gateway derives the public `ryno.v1.SandboxPhase` from these
 // conditions plus `deleting`.
 message DriverSandboxStatus {
   // Compute-platform sandbox object name.
@@ -414,8 +414,8 @@ message StartSandboxRequest {
   // Compute-runtime name used by the driver.
   string name = 2;
   // Fresh launch credentials for start-from-stopped. Empty only for drivers
-  // that do not implement the OpenShell Sandbox Protocol.
-  bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
+  // that do not implement the Ryno Sandbox Protocol.
+  bytes launch_authentication = 3 [(ryno.options.v1.secret) = true];
   // Stable identity of this gateway start transition. Retries of the same
   // transition carry the same generation ID; a later start uses a new ID.
   string generation_id = 4;

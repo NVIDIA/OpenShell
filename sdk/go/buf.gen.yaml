@@ -9,24 +9,24 @@
 version: v2
 
 inputs:
-  - proto_file: proto/openshell.proto
+  - proto_file: proto/ryno.proto
 
 plugins:
   - local: protoc-gen-go
     out: sdk/go
     include_imports: true
     opt:
-      - module=github.com/NVIDIA/OpenShell/sdk/go
-      - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
-      - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
-      - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
-      - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - module=github.com/NVIDIA/Ryno/sdk/go
+      - Mryno.proto=github.com/NVIDIA/Ryno/sdk/go/proto/rynov1
+      - Mdatamodel.proto=github.com/NVIDIA/Ryno/sdk/go/proto/datamodelv1
+      - Msandbox.proto=github.com/NVIDIA/Ryno/sdk/go/proto/sandboxv1
+      - Moptions.proto=github.com/NVIDIA/Ryno/sdk/go/proto/optionsv1
   - local: protoc-gen-go-grpc
     out: sdk/go
     include_imports: true
     opt:
-      - module=github.com/NVIDIA/OpenShell/sdk/go
-      - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
-      - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
-      - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
-      - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - module=github.com/NVIDIA/Ryno/sdk/go
+      - Mryno.proto=github.com/NVIDIA/Ryno/sdk/go/proto/rynov1
+      - Mdatamodel.proto=github.com/NVIDIA/Ryno/sdk/go/proto/datamodelv1
+      - Msandbox.proto=github.com/NVIDIA/Ryno/sdk/go/proto/sandboxv1
+      - Moptions.proto=github.com/NVIDIA/Ryno/sdk/go/proto/optionsv1

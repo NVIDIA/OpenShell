@@ -44,14 +44,14 @@ run_supervisor() {
     local output_file="$3"
 
     set +e
-    OPENSHELL_AGENT_HARNESS=test \
-        OPENSHELL_AGENT_RUN_MODE="$mode" \
-        OPENSHELL_AGENT_POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-1}" \
-        OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=2 \
-        OPENSHELL_AGENT_HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-0}" \
-        OPENSHELL_AGENT_STATE_DIR="${OPENSHELL_AGENT_TEST_STATE_DIR:-$payload_dir/state}" \
-        OPENSHELL_AGENT_STATE_HISTORY_LIMIT="${OPENSHELL_AGENT_STATE_HISTORY_LIMIT:-100}" \
-        OPENSHELL_AGENT_TEST_STATE="${OPENSHELL_AGENT_TEST_STATE:-}" \
+    RYNO_AGENT_HARNESS=test \
+        RYNO_AGENT_RUN_MODE="$mode" \
+        RYNO_AGENT_POLL_INTERVAL_SECONDS="${RYNO_AGENT_POLL_INTERVAL_SECONDS:-1}" \
+        RYNO_AGENT_MAX_TRANSIENT_FAILURES=2 \
+        RYNO_AGENT_HEARTBEAT_SECONDS="${RYNO_AGENT_HEARTBEAT_SECONDS:-0}" \
+        RYNO_AGENT_STATE_DIR="${RYNO_AGENT_TEST_STATE_DIR:-$payload_dir/state}" \
+        RYNO_AGENT_STATE_HISTORY_LIMIT="${RYNO_AGENT_STATE_HISTORY_LIMIT:-100}" \
+        RYNO_AGENT_TEST_STATE="${RYNO_AGENT_TEST_STATE:-}" \
         bash "$payload_dir/runtime/supervisor.sh" > "$output_file" 2>&1
     local status=$?
     set -e
@@ -73,7 +73,7 @@ test_watch_retries_missing_sentinel_until_complete() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then
     count="$(cat "$state_file")"
@@ -84,13 +84,13 @@ if [[ "$count" -lt 3 ]]; then
     printf "%s\n" "ERROR: stream disconnected before completion" >&2
     exit 1
 fi
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
+    RYNO_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
     assert_contains "$tmp/output" "transient watch failure 1"
     assert_contains "$tmp/output" "transient watch failure 2"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch retries missing sentinel until complete\n'
 }
 
@@ -98,7 +98,7 @@ test_watch_retries_invalid_status_until_complete() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then
     count="$(cat "$state_file")"
@@ -106,15 +106,15 @@ fi
 count=$((count + 1))
 printf "%s\n" "$count" > "$state_file"
 if [[ "$count" -lt 2 ]]; then
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"nonsense\",\"reason\":\"bad\"}"
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"nonsense\",\"reason\":\"bad\"}"
     exit 0
 fi
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
-    assert_contains "$tmp/output" "invalid OPENSHELL_AGENT_RESULT status: nonsense"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    RYNO_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/output" "invalid RYNO_AGENT_RESULT status: nonsense"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch retries invalid status until complete\n'
 }
 
@@ -122,7 +122,7 @@ test_watch_retries_malformed_terminal_json_until_complete() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then
     count="$(cat "$state_file")"
@@ -130,15 +130,15 @@ fi
 count=$((count + 1))
 printf "%s\n" "$count" > "$state_file"
 if [[ "$count" -lt 2 ]]; then
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\""
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\""
     exit 0
 fi
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
-    assert_contains "$tmp/output" "malformed OPENSHELL_AGENT_RESULT JSON"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    RYNO_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/output" "malformed RYNO_AGENT_RESULT JSON"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch retries malformed terminal JSON until complete\n'
 }
 
@@ -146,7 +146,7 @@ test_watch_retries_failed_alias_until_complete() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then
     count="$(cat "$state_file")"
@@ -154,27 +154,27 @@ fi
 count=$((count + 1))
 printf "%s\n" "$count" > "$state_file"
 if [[ "$count" -lt 2 ]]; then
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"failed\",\"reason\":\"legacy\"}"
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"failed\",\"reason\":\"legacy\"}"
     exit 0
 fi
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
-    assert_contains "$tmp/output" "invalid OPENSHELL_AGENT_RESULT status: failed"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    RYNO_AGENT_TEST_STATE="$tmp/state" run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/output" "invalid RYNO_AGENT_RESULT status: failed"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch retries failed alias until complete\n'
 }
 
 test_watch_terminal_failure_exits() {
     local tmp
     tmp="$(mktemp -d)"
-    make_payload "$tmp/payload" 'printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"terminal_failure\",\"reason\":\"fatal\"}"'
+    make_payload "$tmp/payload" 'printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"terminal_failure\",\"reason\":\"fatal\"}"'
 
     if run_supervisor "$tmp/payload" watch "$tmp/output"; then
         fail "watch mode succeeded after terminal failure"
     fi
-    assert_contains "$tmp/output" "openshell-agent: terminal failure (fatal)"
+    assert_contains "$tmp/output" "ryno-agent: terminal failure (fatal)"
     printf 'ok - watch terminal failure exits\n'
 }
 
@@ -182,7 +182,7 @@ test_watch_transient_failure_honors_next_poll_seconds() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then
     count="$(cat "$state_file")"
@@ -190,17 +190,17 @@ fi
 count=$((count + 1))
 printf "%s\n" "$count" > "$state_file"
 if [[ "$count" -lt 2 ]]; then
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"transient_failure\",\"reason\":\"github_transport_eof\",\"next_poll_seconds\":1}"
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"transient_failure\",\"reason\":\"github_transport_eof\",\"next_poll_seconds\":1}"
     exit 0
 fi
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/state" \
-        OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=10 \
+    RYNO_AGENT_TEST_STATE="$tmp/state" \
+        RYNO_AGENT_POLL_INTERVAL_SECONDS=10 \
         run_supervisor "$tmp/payload" watch "$tmp/output"
     assert_contains "$tmp/output" "transient watch failure 1 (github_transport_eof); retrying in 1s"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch transient failure honors next_poll_seconds\n'
 }
 
@@ -209,19 +209,19 @@ test_watch_prints_active_cycle_heartbeat() {
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
 sleep 2
-printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
 '
 
-    OPENSHELL_AGENT_HEARTBEAT_SECONDS=1 run_supervisor "$tmp/payload" watch "$tmp/output"
-    assert_contains "$tmp/output" "openshell-agent: still running watch cycle 1 with harness test after 1s"
-    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    RYNO_AGENT_HEARTBEAT_SECONDS=1 run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/output" "ryno-agent: still running watch cycle 1 with harness test after 1s"
+    assert_contains "$tmp/output" "ryno-agent: complete (done)"
     printf 'ok - watch prints active cycle heartbeat\n'
 }
 
 test_persists_agent_notes_and_terminal_state() {
     local tmp
     tmp="$(mktemp -d)"
-    make_payload "$tmp/payload" 'printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The current head is ready. No further action is needed.\"}"'
+    make_payload "$tmp/payload" 'printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The current head is ready. No further action is needed.\"}"'
 
     run_supervisor "$tmp/payload" once "$tmp/output"
     assert_contains "$tmp/payload/state/status.json" '"supervisor_state":"terminal"'
@@ -235,20 +235,20 @@ test_bounds_state_history() {
     local tmp
     tmp="$(mktemp -d)"
     make_payload "$tmp/payload" '
-state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+state_file="${RYNO_AGENT_TEST_STATE:?}"
 count=0
 if [[ -f "$state_file" ]]; then count="$(cat "$state_file")"; fi
 count=$((count + 1))
 printf "%s\n" "$count" > "$state_file"
 if [[ "$count" -lt 2 ]]; then
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"waiting\",\"reason\":\"checks_pending\",\"next_poll_seconds\":1,\"notes\":\"Checks are still running. Gator will inspect them next cycle.\"}"
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"waiting\",\"reason\":\"checks_pending\",\"next_poll_seconds\":1,\"notes\":\"Checks are still running. Gator will inspect them next cycle.\"}"
 else
-    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The work is complete.\"}"
+    printf "%s\n" "RYNO_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The work is complete.\"}"
 fi
 '
 
-    OPENSHELL_AGENT_TEST_STATE="$tmp/count" \
-        OPENSHELL_AGENT_STATE_HISTORY_LIMIT=2 \
+    RYNO_AGENT_TEST_STATE="$tmp/count" \
+        RYNO_AGENT_STATE_HISTORY_LIMIT=2 \
         run_supervisor "$tmp/payload" watch "$tmp/output"
     [[ "$(wc -l < "$tmp/payload/state/history.jsonl")" -eq 2 ]] || fail "expected bounded history"
     assert_contains "$tmp/payload/state/history.jsonl" '"cycle":2'

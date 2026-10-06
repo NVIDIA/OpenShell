@@ -1,0 +1,8 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[ryno]
+version = 2
+
+[ryno.drivers.{{ ryno_gateway_driver }}]
+sandbox_runtime_image = "docker.io/ryno/sandbox:tmachine"
+supervisor_image = "docker.io/ryno/supervisor:tmachine"

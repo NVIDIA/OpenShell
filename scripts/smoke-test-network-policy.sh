@@ -10,9 +10,9 @@
 # credential injection, and L4/L7 enforcement. Uses GitHub's API as the target.
 #
 # Prerequisites:
-#   - A running OpenShell gateway (`openshell status` shows Healthy)
+#   - A running Ryno gateway (`ryno status` shows Healthy)
 #   - GITHUB_TOKEN or GH_TOKEN env var set with a valid GitHub token
-#   - The `openshell` CLI on PATH
+#   - The `ryno` CLI on PATH
 #
 # Usage:
 #   GITHUB_TOKEN=ghp_xxx ./scripts/smoke-test-network-policy.sh
@@ -111,7 +111,7 @@ if [[ -z "$TOKEN" ]]; then
 fi
 echo "  Token is set"
 
-if ! openshell status >/dev/null 2>&1; then
+if ! ryno status >/dev/null 2>&1; then
     echo -e "${RED}Error: No healthy gateway. Run: mise run gateway:docker${RESET}"
     exit 1
 fi
@@ -138,13 +138,13 @@ create_sandbox() {
     local provider_flag=("$@")
 
     echo "  Creating sandbox: $name"
-    openshell sandbox create --name "$name" "${provider_flag[@]}" \
+    ryno sandbox create --name "$name" "${provider_flag[@]}" \
         -- sh -c "echo Ready && sleep 3600" >/dev/null 2>&1 &
     local pid=$!
 
     local attempts=0
     while [[ $attempts -lt 40 ]]; do
-        if openshell sandbox list 2>/dev/null | grep -q "$name.*Ready"; then
+        if ryno sandbox list 2>/dev/null | grep -q "$name.*Ready"; then
             echo "  Sandbox $name is Ready"
             SANDBOXES+=("$name")
             # Kill the blocking create process (sandbox stays alive by default)
@@ -171,7 +171,7 @@ sandbox_exec() {
     shift
 
     local ssh_config
-    ssh_config=$(openshell sandbox ssh-config "$name" 2>/dev/null)
+    ssh_config=$(ryno sandbox ssh-config "$name" 2>/dev/null)
     local ssh_host
     ssh_host=$(echo "$ssh_config" | grep "^Host " | awk '{print $2}')
     local ssh_config_file="$POLICY_DIR/ssh_config_${name}"
@@ -293,9 +293,9 @@ YAML
 
 header "Phase 0: Provider Setup"
 
-openshell provider delete "$PROVIDER_NAME" >/dev/null 2>&1 || true
+ryno provider delete "$PROVIDER_NAME" >/dev/null 2>&1 || true
 
-if openshell provider create \
+if ryno provider create \
     --name "$PROVIDER_NAME" \
     --type github \
     --credential "GITHUB_TOKEN=$TOKEN" >/dev/null 2>&1; then
@@ -314,7 +314,7 @@ header "Phase 1: L4 Allow/Deny (TLS auto-terminated, credential injection)"
 SB1="smoke-l4"
 if create_sandbox "$SB1" --provider "$PROVIDER_NAME"; then
     echo "  Setting L4-only policy..."
-    openshell policy set "$SB1" --policy "$POLICY_L4" >/dev/null 2>&1
+    ryno policy set "$SB1" --policy "$POLICY_L4" >/dev/null 2>&1
     echo "  Waiting for policy propagation (15s)..."
     sleep 15
 
@@ -349,7 +349,7 @@ header "Phase 2: L7 Enforcement (read-only, TLS auto-terminated)"
 SB2="smoke-l7"
 if create_sandbox "$SB2" --provider "$PROVIDER_NAME"; then
     echo "  Setting L7 read-only policy..."
-    openshell policy set "$SB2" --policy "$POLICY_L7_RO" >/dev/null 2>&1
+    ryno policy set "$SB2" --policy "$POLICY_L7_RO" >/dev/null 2>&1
     echo "  Waiting for policy propagation (15s)..."
     sleep 15
 
@@ -384,12 +384,12 @@ header "Phase 3: Credential Injection (provider attached, TLS auto-terminated)"
 SB3="smoke-cred"
 if create_sandbox "$SB3" --provider "$PROVIDER_NAME"; then
     echo "  Setting L7 full policy..."
-    openshell policy set "$SB3" --policy "$POLICY_CRED" >/dev/null 2>&1
+    ryno policy set "$SB3" --policy "$POLICY_CRED" >/dev/null 2>&1
     echo "  Waiting for policy propagation (15s)..."
     sleep 15
 
     # Test 5: Credential injection — curl /user using the placeholder env var.
-    # The sandbox process sees GITHUB_TOKEN=openshell:resolve:env:GITHUB_TOKEN
+    # The sandbox process sees GITHUB_TOKEN=ryno:resolve:env:GITHUB_TOKEN
     # in its environment. When curl sends this as an Authorization header,
     # the proxy's SecretResolver rewrites the placeholder to the real token.
     echo "  Running: curl /user -H 'Authorization: token \$GITHUB_TOKEN'"
@@ -414,7 +414,7 @@ header "Phase 4: tls: skip (raw tunnel, no MITM)"
 SB4="smoke-skip"
 if create_sandbox "$SB4" --provider "$PROVIDER_NAME"; then
     echo "  Setting tls: skip policy..."
-    openshell policy set "$SB4" --policy "$POLICY_SKIP" >/dev/null 2>&1
+    ryno policy set "$SB4" --policy "$POLICY_SKIP" >/dev/null 2>&1
     echo "  Waiting for policy propagation (15s)..."
     sleep 15
 
@@ -462,20 +462,20 @@ if [[ ${#SANDBOXES[@]} -gt 0 ]]; then
     done
     echo ""
     echo "Inspect logs with:"
-    echo "  openshell logs <name> --source sandbox"
+    echo "  ryno logs <name> --source sandbox"
     echo ""
 
     read -r -p "Delete all smoke test sandboxes and provider? [y/N] " answer
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         echo ""
         for sb in "${SANDBOXES[@]}"; do
-            openshell sandbox delete "$sb" >/dev/null 2>&1 && echo "  Deleted $sb" || true
+            ryno sandbox delete "$sb" >/dev/null 2>&1 && echo "  Deleted $sb" || true
         done
-        openshell provider delete "$PROVIDER_NAME" >/dev/null 2>&1 && echo "  Deleted provider $PROVIDER_NAME" || true
+        ryno provider delete "$PROVIDER_NAME" >/dev/null 2>&1 && echo "  Deleted provider $PROVIDER_NAME" || true
     else
         echo "  Sandboxes left running. Clean up manually:"
-        echo "  openshell sandbox delete --all"
-        echo "  openshell provider delete $PROVIDER_NAME"
+        echo "  ryno sandbox delete --all"
+        echo "  ryno provider delete $PROVIDER_NAME"
     fi
 fi
 

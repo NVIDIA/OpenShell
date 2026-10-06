@@ -3,7 +3,7 @@
 The SDK ships a `fake` package that provides an in-memory implementation of all client interfaces. Use it in your test suites to exercise SDK interactions without a real gateway.
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/fake"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/fake"
 ```
 
 The fake client follows the same pattern as `k8s.io/client-go/kubernetes/fake`: it maintains in-memory stores, supports watch event broadcasting, and returns the same `StatusError` codes as the real client.

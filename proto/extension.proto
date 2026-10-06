@@ -3,9 +3,9 @@
 
 syntax = "proto3";
 
-package openshell.extension.v1;
+package ryno.extension.v1;
 
-// Version of an OpenShell extension protocol contract.
+// Version of an Ryno extension protocol contract.
 //
 // The major version changes when peers cannot safely interoperate. Minor
 // versions add optional fields or capabilities and remain compatible when both
@@ -20,7 +20,7 @@ message PeerMetadata {
   // Extension-family protocol contract version, distinct from the build.
   ProtocolVersion protocol_version = 1;
 
-  // Stable human-readable implementation identity, such as "openshell/docker".
+  // Stable human-readable implementation identity, such as "ryno/docker".
   string implementation_name = 2;
 
   // Implementation or build version used only for diagnostics.

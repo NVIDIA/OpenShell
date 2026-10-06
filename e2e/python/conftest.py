@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell import Sandbox, SandboxClient, WorkspaceClient
+from ryno import Sandbox, SandboxClient, WorkspaceClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -51,7 +51,7 @@ def _gateway_config_guard(
 
 @pytest.fixture(scope="session")
 def cluster_name() -> str | None:
-    return os.environ.get("OPENSHELL_GATEWAY")
+    return os.environ.get("RYNO_GATEWAY")
 
 
 @pytest.fixture(scope="session")
@@ -80,7 +80,7 @@ def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
             raise
 
     pytest.fail(
-        "openshell-server persistence is not initialized (missing sqlite objects table); "
+        "ryno-server persistence is not initialized (missing sqlite objects table); "
         "redeploy the active cluster and rerun e2e sandbox tests"
     )
 

@@ -7,7 +7,7 @@ set -euo pipefail
 # Verify a binary is a genuine, complete, fully static executable.
 #
 # Callers pass binaries that must run without a dynamic loader, such as the
-# musl sandbox runtime (openshell-sandbox). It is executed from inside
+# musl sandbox runtime (ryno-sandbox). It is executed from inside
 # arbitrary workload images (Docker extraction, Podman image volumes, the
 # Kubernetes copy-self path), so any dynamic linkage breaks it on musl-based
 # images and on images whose glibc is older than the build host's. Other

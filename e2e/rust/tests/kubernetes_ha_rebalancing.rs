@@ -9,10 +9,10 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::port::{find_free_port, wait_for_port};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::port::{find_free_port, wait_for_port};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
@@ -32,11 +32,11 @@ struct KubeTarget {
 impl KubeTarget {
     fn from_env() -> Self {
         Self {
-            context: required_env("OPENSHELL_E2E_KUBE_CONTEXT"),
-            namespace: std::env::var("OPENSHELL_E2E_KUBE_NAMESPACE")
-                .unwrap_or_else(|_| "openshell".to_string()),
-            release: std::env::var("OPENSHELL_E2E_KUBE_RELEASE")
-                .unwrap_or_else(|_| "openshell".to_string()),
+            context: required_env("RYNO_E2E_KUBE_CONTEXT"),
+            namespace: std::env::var("RYNO_E2E_KUBE_NAMESPACE")
+                .unwrap_or_else(|_| "ryno".to_string()),
+            release: std::env::var("RYNO_E2E_KUBE_RELEASE")
+                .unwrap_or_else(|_| "ryno".to_string()),
         }
     }
 
@@ -273,7 +273,7 @@ async fn exec_through_pod(
     let port_forward = PortForward::start(kube, pod).await?;
     let endpoint = format!("http://127.0.0.1:{}", port_forward.port);
 
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("--gateway-endpoint")
         .arg(&endpoint)
         .args([
@@ -292,7 +292,7 @@ async fn exec_through_pod(
     let output = cmd
         .output()
         .await
-        .map_err(|err| format!("failed to spawn openshell exec via {pod}: {err}"))?;
+        .map_err(|err| format!("failed to spawn ryno exec via {pod}: {err}"))?;
 
     let combined = strip_ansi(&format!(
         "{}{}",
@@ -310,7 +310,7 @@ async fn exec_through_pod(
 }
 
 async fn exec_through_configured_gateway(sandbox_name: &str, marker: &str) -> Result<(), String> {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args([
         "sandbox",
         "exec",
@@ -327,7 +327,7 @@ async fn exec_through_configured_gateway(sandbox_name: &str, marker: &str) -> Re
     let output = cmd
         .output()
         .await
-        .map_err(|err| format!("failed to spawn openshell exec via configured gateway: {err}"))?;
+        .map_err(|err| format!("failed to spawn ryno exec via configured gateway: {err}"))?;
 
     let combined = strip_ansi(&format!(
         "{}{}",
@@ -397,7 +397,7 @@ fn sha256_file(path: &Path) -> String {
 }
 
 fn upload_command(sandbox_name: &str, local_path: &Path, dest: &str) -> Command {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox")
         .arg("upload")
         .arg(sandbox_name)
@@ -408,7 +408,7 @@ fn upload_command(sandbox_name: &str, local_path: &Path, dest: &str) -> Command 
 }
 
 fn download_command(sandbox_name: &str, sandbox_path: &str, local_dest: &Path) -> Command {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox")
         .arg("download")
         .arg(sandbox_name)

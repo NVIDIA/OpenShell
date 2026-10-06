@@ -8,7 +8,7 @@ authors = ["Simon Scatton <sscatton@nvidia.com>"]
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
-repository = "https://github.com/NVIDIA/OpenShell"
+repository = "https://github.com/NVIDIA/Ryno"
 
 [dependencies]
 anyhow = { version = "1.0.100", default-features = false, features = ["std"] }

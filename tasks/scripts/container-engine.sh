@@ -109,7 +109,7 @@ _ce_auto_detect_engine() {
 
 _ce_required_engine_from_e2e_driver() {
   local driver
-  driver="$(_ce_lower "${OPENSHELL_E2E_DRIVER:-}")"
+  driver="$(_ce_lower "${RYNO_E2E_DRIVER:-}")"
 
   case "${driver}" in
     docker|podman)
@@ -160,8 +160,8 @@ _ce_required_engine_from_local_cluster() {
 }
 
 _detect_container_engine() {
-  if [[ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]]; then
-    _ce_error "OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported; set CONTAINER_ENGINE=docker|podman instead"
+  if [[ -n "${RYNO_E2E_CONTAINER_ENGINE:-}" ]]; then
+    _ce_error "RYNO_E2E_CONTAINER_ENGINE is no longer supported; set CONTAINER_ENGINE=docker|podman instead"
   fi
 
   case "${CONTAINER_ENGINE_TARGET:-}" in
@@ -189,12 +189,12 @@ _detect_container_engine() {
   fi
 
   if [[ -n "${e2e_required}" && -n "${local_cluster_required}" && "${e2e_required}" != "${local_cluster_required}" ]]; then
-    _ce_error "OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} requires ${e2e_required}, but CONTAINER_ENGINE_TARGET=local-k8s-cluster requires ${local_cluster_required}"
+    _ce_error "RYNO_E2E_DRIVER=${RYNO_E2E_DRIVER} requires ${e2e_required}, but CONTAINER_ENGINE_TARGET=local-k8s-cluster requires ${local_cluster_required}"
   fi
 
   if [[ -n "${explicit_engine}" ]]; then
     if [[ -n "${e2e_required}" && "${explicit_engine}" != "${e2e_required}" ]]; then
-      _ce_error "CONTAINER_ENGINE=${explicit_engine} conflicts with OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER}; use CONTAINER_ENGINE=${e2e_required} or unset CONTAINER_ENGINE"
+      _ce_error "CONTAINER_ENGINE=${explicit_engine} conflicts with RYNO_E2E_DRIVER=${RYNO_E2E_DRIVER}; use CONTAINER_ENGINE=${e2e_required} or unset CONTAINER_ENGINE"
     fi
     if [[ -n "${local_cluster_required}" && "${explicit_engine}" != "${local_cluster_required}" ]]; then
       _ce_error "CONTAINER_ENGINE=${explicit_engine} conflicts with CONTAINER_ENGINE_TARGET=local-k8s-cluster; active local cluster requires ${local_cluster_required}"
@@ -356,7 +356,7 @@ ce_info_arch() {
     format='{{.Host.Arch}}'
   fi
 
-  info_error_file="$(mktemp "${TMPDIR:-/tmp}/openshell-ce-info.XXXXXX")"
+  info_error_file="$(mktemp "${TMPDIR:-/tmp}/ryno-ce-info.XXXXXX")"
   if ! info_output=$("${_CE_BIN}" info --format "${format}" 2>"${info_error_file}"); then
     echo "Error: failed to query ${CONTAINER_ENGINE} architecture with '${_CE_BIN} info':" >&2
     if [[ -n "${info_output}" ]]; then
@@ -523,7 +523,7 @@ _ce_log_detected() {
       echo "[container-engine] using ${CONTAINER_ENGINE} (set via CONTAINER_ENGINE env)" >&2
       ;;
     e2e-driver)
-      echo "[container-engine] using ${CONTAINER_ENGINE} (required by OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER})" >&2
+      echo "[container-engine] using ${CONTAINER_ENGINE} (required by RYNO_E2E_DRIVER=${RYNO_E2E_DRIVER})" >&2
       ;;
     local-k8s-cluster)
       echo "[container-engine] using ${CONTAINER_ENGINE} (required by CONTAINER_ENGINE_TARGET=local-k8s-cluster)" >&2

@@ -46,7 +46,7 @@ export function CommandTerminal({ command }: { command: string }) {
         </div>
         <div style={{ minWidth: "max-content", whiteSpace: "nowrap" }}>
           <span style={{ color: "#76B900", userSelect: "none" }}>$ </span>
-          <span>openshell sandbox create</span>
+          <span>ryno sandbox create</span>
         </div>
       </div>
     </div>

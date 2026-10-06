@@ -4,8 +4,8 @@
 [workspace]
 
 [package]
-name = "openshell-supervisor-middleware-content-guard"
-description = "Example OpenShell supervisor middleware service"
+name = "ryno-supervisor-middleware-content-guard"
+description = "Example Ryno supervisor middleware service"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -14,14 +14,14 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-openshell-core = { path = "../../crates/openshell-core", default-features = false }
+ryno-core = { path = "../../crates/ryno-core", default-features = false }
 prost-types = "0.14"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport"] }
 
 [dev-dependencies]
-openshell-policy = { path = "../../crates/openshell-policy" }
+ryno-policy = { path = "../../crates/ryno-policy" }
 
 [[bin]]
 name = "supervisor-middleware-content-guard"

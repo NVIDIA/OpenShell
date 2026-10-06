@@ -1,0 +1,1035 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+mod helpers;
+
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
+use ryno_bootstrap::{load_last_sandbox, save_last_sandbox};
+use ryno_cli::run;
+use ryno_cli::tls::TlsOptions;
+use ryno_core::proto::ryno_server::{Ryno, RynoServer};
+use ryno_core::proto::{
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
+    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, NetworkEndpoint, NetworkPolicyRule, PolicyStatus, ProviderResponse,
+    Sandbox, SandboxPolicy, SandboxPolicyRevision, SandboxResponse, SandboxStreamEvent,
+    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+};
+use std::sync::Arc;
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
+use tonic::{Response, Status};
+
+// ── mock Ryno server ─────────────────────────────────────────────
+
+/// Records which sandbox name was requested via `get_sandbox`.
+#[derive(Clone, Default)]
+struct SandboxState {
+    last_get_name: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct TestRyno {
+    state: SandboxState,
+}
+
+#[tonic::async_trait]
+impl Ryno for TestRyno {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            ryno_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<ryno_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<ryno_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<ryno_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<ryno_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<ryno_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn health(
+        &self,
+        _request: tonic::Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        Ok(Response::new(HealthResponse {
+            status: ServiceStatus::Healthy.into(),
+            version: "test".to_string(),
+        }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<ryno_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn create_sandbox(
+        &self,
+        _request: tonic::Request<CreateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Ok(Response::new(SandboxResponse::default()))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<ryno_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<ryno_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox(
+        &self,
+        request: tonic::Request<GetSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let request = request.into_inner();
+        let name = request.name.clone();
+        *self.state.last_get_name.lock().await = Some(name.clone());
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(Sandbox {
+                metadata: Some(ryno_core::proto::datamodel::v1::ObjectMeta {
+                    id: "test-id".to_string(),
+                    name,
+                    created_time: None,
+                    labels: std::collections::HashMap::new(),
+                    resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
+                    workspace: String::new(),
+                    deletion_time: None,
+                }),
+                ..Default::default()
+            }),
+            service_urls: std::collections::HashMap::new(),
+        }))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _request: tonic::Request<ListSandboxesRequest>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    unimplemented_sandbox_template_rpcs!();
+
+    async fn list_sandbox_providers(
+        &self,
+        _request: tonic::Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        Ok(Response::new(ListSandboxProvidersResponse::default()))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        _request: tonic::Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        Ok(Response::new(AttachSandboxProviderResponse::default()))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        _request: tonic::Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        Ok(Response::new(DetachSandboxProviderResponse::default()))
+    }
+
+    async fn delete_sandbox(
+        &self,
+        _request: tonic::Request<DeleteSandboxRequest>,
+    ) -> Result<Response<DeleteSandboxResponse>, Status> {
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: ryno_core::proto::DeletionOutcome::Completed.into(),
+        }))
+    }
+
+    async fn get_sandbox_config(
+        &self,
+        request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        let req = request.into_inner();
+        assert!(!req.name.is_empty());
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy: Some(SandboxPolicy {
+                version: 1,
+                network_policies: [
+                    (
+                        "user_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "user_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.user.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: ryno_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: ryno_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "_provider_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "_provider_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.provider.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: ryno_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: ryno_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            version: 9,
+            policy_hash: "sha256:effective-policy".to_string(),
+            config_revision: 42,
+            policy_source: ryno_core::proto::PolicySource::Sandbox.into(),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
+        ))
+    }
+
+    async fn get_sandbox_provider_environment(
+        &self,
+        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        Ok(Response::new(
+            GetSandboxProviderEnvironmentResponse::default(),
+        ))
+    }
+
+    async fn create_ssh_session(
+        &self,
+        _request: tonic::Request<CreateSshSessionRequest>,
+    ) -> Result<Response<CreateSshSessionResponse>, Status> {
+        Ok(Response::new(CreateSshSessionResponse::default()))
+    }
+
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<ryno_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            ryno_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<ryno_core::proto::GetServiceRequest>,
+    ) -> Result<Response<ryno_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<ryno_core::proto::ListServicesRequest>,
+    ) -> Result<Response<ryno_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<ryno_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<ryno_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_ssh_session(
+        &self,
+        _request: tonic::Request<ryno_core::proto::RevokeSshSessionRequest>,
+    ) -> Result<Response<ryno_core::proto::RevokeSshSessionResponse>, Status> {
+        Ok(Response::new(
+            ryno_core::proto::RevokeSshSessionResponse::default(),
+        ))
+    }
+
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn create_provider(
+        &self,
+        _request: tonic::Request<CreateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Ok(Response::new(ProviderResponse::default()))
+    }
+
+    async fn get_provider(
+        &self,
+        _request: tonic::Request<GetProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Ok(Response::new(ProviderResponse::default()))
+    }
+
+    async fn list_providers(
+        &self,
+        _request: tonic::Request<ListProvidersRequest>,
+    ) -> Result<Response<ListProvidersResponse>, Status> {
+        Ok(Response::new(ListProvidersResponse::default()))
+    }
+
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<ryno_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<ryno_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<ryno_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_provider_profiles(
+        &self,
+        _request: tonic::Request<ryno_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<ryno_core::proto::UpdateProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<ryno_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<ryno_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _request: tonic::Request<ryno_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<ryno_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_provider(
+        &self,
+        _request: tonic::Request<UpdateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Ok(Response::new(ProviderResponse::default()))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<ryno_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<ryno_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<ryno_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<ryno_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<ryno_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<ryno_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<ryno_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider(
+        &self,
+        _request: tonic::Request<DeleteProviderRequest>,
+    ) -> Result<Response<DeleteProviderResponse>, Status> {
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: ryno_core::proto::DeletionOutcome::Completed.into(),
+        }))
+    }
+
+    type WatchSandboxStream =
+        tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
+    type ExecSandboxStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
+
+    async fn watch_sandbox(
+        &self,
+        _request: tonic::Request<WatchSandboxRequest>,
+    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn exec_sandbox(
+        &self,
+        _request: tonic::Request<ExecSandboxRequest>,
+    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_config(
+        &self,
+        _request: tonic::Request<ryno_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<ryno_core::proto::UpdateConfigResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_sandbox_policy_status(
+        &self,
+        request: tonic::Request<GetSandboxPolicyStatusRequest>,
+    ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+        let req = request.into_inner();
+        assert_eq!(req.sandbox, "my-sandbox");
+        assert_eq!(req.version, 3);
+        assert!(!req.global);
+
+        let policy = SandboxPolicy {
+            version: 1,
+            network_policies: std::iter::once((
+                "api".to_string(),
+                NetworkPolicyRule {
+                    name: "api".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        enforcement: ryno_core::proto::NetworkEnforcementMode::Enforce as i32,
+                        access: ryno_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        Ok(Response::new(GetSandboxPolicyStatusResponse {
+            revision: Some(SandboxPolicyRevision {
+                version: 7,
+                policy_hash: "sha256:test-policy".to_string(),
+                status: PolicyStatus::Loaded.into(),
+                created_time: ryno_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                loaded_time: ryno_core::time::timestamp_from_millis(1_700_000_000_500).ok(),
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            active_version: 7,
+        }))
+    }
+
+    async fn list_sandbox_policies(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ListSandboxPoliciesRequest>,
+    ) -> Result<Response<ryno_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_policy_status(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ReportPolicyStatusRequest>,
+    ) -> Result<Response<ryno_core::proto::ReportPolicyStatusResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_sandbox_logs(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetSandboxLogsRequest>,
+    ) -> Result<Response<ryno_core::proto::GetSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn push_sandbox_logs(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ryno_core::proto::PushSandboxLogsRequest>>,
+    ) -> Result<Response<ryno_core::proto::PushSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn submit_policy_analysis(
+        &self,
+        _request: tonic::Request<ryno_core::proto::SubmitPolicyAnalysisRequest>,
+    ) -> Result<Response<ryno_core::proto::SubmitPolicyAnalysisResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_policy(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetDraftPolicyRequest>,
+    ) -> Result<Response<ryno_core::proto::GetDraftPolicyResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_draft_chunk(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ApproveDraftChunkRequest>,
+    ) -> Result<Response<ryno_core::proto::ApproveDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn reject_draft_chunk(
+        &self,
+        _request: tonic::Request<ryno_core::proto::RejectDraftChunkRequest>,
+    ) -> Result<Response<ryno_core::proto::RejectDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_all_draft_chunks(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ApproveAllDraftChunksRequest>,
+    ) -> Result<Response<ryno_core::proto::ApproveAllDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn edit_draft_chunk(
+        &self,
+        _request: tonic::Request<ryno_core::proto::EditDraftChunkRequest>,
+    ) -> Result<Response<ryno_core::proto::EditDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn undo_draft_chunk(
+        &self,
+        _request: tonic::Request<ryno_core::proto::UndoDraftChunkRequest>,
+    ) -> Result<Response<ryno_core::proto::UndoDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn clear_draft_chunks(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ClearDraftChunksRequest>,
+    ) -> Result<Response<ryno_core::proto::ClearDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_history(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetDraftHistoryRequest>,
+    ) -> Result<Response<ryno_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<ryno_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<ryno_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<ryno_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<ryno_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ryno_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ryno_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type PeerRelayStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ryno_core::proto::PeerRelayFrame, Status>>;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ryno_core::proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type ForwardTcpStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ryno_core::proto::TcpForwardFrame, Status>>;
+
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ryno_core::proto::TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<ryno_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<ryno_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<ryno_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<ryno_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<ryno_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<ryno_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<ryno_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<ryno_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<ryno_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<ryno_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<ryno_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<ryno_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<ryno_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+}
+
+struct TestServer {
+    endpoint: String,
+    tls: TlsOptions,
+    ryno: TestRyno,
+    _dir: TempDir,
+}
+
+async fn run_server() -> TestServer {
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+
+    let identity = Identity::from_pem(server_cert, server_key);
+    let client_ca = TlsCertificate::from_pem(ca_cert.clone());
+    let tls_config = ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(client_ca);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+
+    let ryno = TestRyno::default();
+    let svc_ryno = ryno.clone();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls_config)
+            .unwrap()
+            .add_service(RynoServer::new(svc_ryno))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.crt");
+    let cert_path = dir.path().join("tls.crt");
+    let key_path = dir.path().join("tls.key");
+    std::fs::write(&ca_path, ca_cert).unwrap();
+    std::fs::write(&cert_path, client_cert).unwrap();
+    std::fs::write(&key_path, client_key).unwrap();
+
+    let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
+    let endpoint = format!("https://localhost:{}", addr.port());
+
+    TestServer {
+        endpoint,
+        tls,
+        ryno,
+        _dir: dir,
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────
+
+/// Verify that `sandbox_get` works through a real gRPC round-trip and that the
+/// mock records the correct name.
+#[tokio::test]
+async fn sandbox_get_sends_correct_name() {
+    let ts = run_server().await;
+
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
+
+    let recorded = ts.ryno.state.last_get_name.lock().await.clone();
+    assert_eq!(
+        recorded.as_deref(),
+        Some("my-sandbox"),
+        "mock should have recorded the requested sandbox name"
+    );
+}
+
+/// `sandbox_get` with `policy_only` calls `GetSandboxConfig` and prints YAML from the response.
+#[tokio::test]
+async fn sandbox_get_policy_only_round_trip() {
+    let ts = run_server().await;
+
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        true,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get with policy_only should succeed");
+
+    let recorded = ts.ryno.state.last_get_name.lock().await.clone();
+    assert_eq!(recorded.as_deref(), Some("my-sandbox"));
+}
+
+/// End-to-end: save a last-used sandbox, load it back, then call `sandbox_get`
+/// with the resolved name. This validates the persistence + gRPC wiring.
+#[tokio::test]
+async fn sandbox_get_with_persisted_last_sandbox() {
+    let ts = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+
+    // Persist a last-used sandbox for "integration-cluster".
+    save_last_sandbox("integration-cluster", "default", "persisted-sb")
+        .expect("save_last_sandbox should succeed");
+
+    // Resolve the name (simulates what the CLI does in main.rs).
+    let resolved = load_last_sandbox("integration-cluster", "default")
+        .expect("load_last_sandbox should return the saved name");
+    assert_eq!(resolved, "persisted-sb");
+
+    // Call sandbox_get with the resolved name.
+    run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
+        .await
+        .expect("sandbox_get should succeed");
+
+    let recorded = ts.ryno.state.last_get_name.lock().await.clone();
+    assert_eq!(
+        recorded.as_deref(),
+        Some("persisted-sb"),
+        "the persisted sandbox name should flow through to the gRPC request"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_full_json_cli_prints_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Full,
+        "json",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["version"], 9);
+    assert_eq!(json["active_version"], 9);
+    assert_eq!(json["hash"], "sha256:effective-policy");
+    assert_eq!(json["status"], "effective");
+    assert_eq!(json["config_revision"], 42);
+    assert_eq!(json["policy_source"], "sandbox");
+    assert_eq!(
+        json["policy"]["network_policies"]["_provider_api"]["name"],
+        "_provider_api"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["_provider_api"]["endpoints"][0]["host"],
+        "api.provider.example.com"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Base,
+        "json",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get --base should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get --base should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["status"], "effective");
+    assert!(
+        json["policy"]["network_policies"]
+            .get("_provider_api")
+            .is_none(),
+        "base policy output must omit provider-composed policy entries"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_explicit_revision_uses_stored_policy_status() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        3,
+        run::PolicyGetView::Full,
+        "json",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get --rev should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get --rev should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["version"], 7);
+    assert_eq!(json["active_version"], 7);
+    assert_eq!(json["hash"], "sha256:test-policy");
+    assert_eq!(json["status"], "loaded");
+    assert_eq!(json["policy"]["network_policies"]["api"]["name"], "api");
+    assert_eq!(
+        json["policy"]["network_policies"]["api"]["endpoints"][0]["host"],
+        "api.example.com"
+    );
+}
+
+/// Verify that an explicit name takes precedence over the persisted one.
+#[tokio::test]
+async fn explicit_name_takes_precedence_over_persisted() {
+    let ts = run_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+
+    // Persist one name, but supply a different one explicitly.
+    save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
+
+    run::sandbox_get(
+        &ts.endpoint,
+        "explicit-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
+
+    let recorded = ts.ryno.state.last_get_name.lock().await.clone();
+    assert_eq!(
+        recorded.as_deref(),
+        Some("explicit-sandbox"),
+        "explicit name should be used, not the persisted one"
+    );
+}

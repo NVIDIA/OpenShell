@@ -1,6 +1,6 @@
 # Architecture
 
-This page explains how the OpenShell Go SDK is structured internally. Understanding the design helps you navigate the API surface and write idiomatic code.
+This page explains how the Ryno Go SDK is structured internally. Understanding the design helps you navigate the API surface and write idiomatic code.
 
 ## Client Hierarchy
 
@@ -50,16 +50,16 @@ The `Config` struct controls:
 
 ## Proto Isolation
 
-The SDK never exposes protobuf-generated types in its public API. Instead, it defines its own Go types (in `openshell/v1/`) and converts to/from proto at the gRPC boundary.
+The SDK never exposes protobuf-generated types in its public API. Instead, it defines its own Go types (in `ryno/v1/`) and converts to/from proto at the gRPC boundary.
 
 This means:
 
-- Your code imports `openshell/v1`, not `proto/openshellv1`
+- Your code imports `ryno/v1`, not `proto/rynov1`
 - You work with plain Go structs, not proto messages
-- Proto schema changes in upstream OpenShell do not break your code (the SDK adapts internally)
+- Proto schema changes in upstream Ryno do not break your code (the SDK adapts internally)
 - You can use standard Go patterns (json.Marshal, fmt.Sprintf, reflect) on SDK types without proto constraints
 
-The conversion layer lives in `openshell/v1/internal/converter/` and is not part of the public API.
+The conversion layer lives in `ryno/v1/internal/converter/` and is not part of the public API.
 
 ## Sub-Client Pattern
 
@@ -103,7 +103,7 @@ auth, err := v1.RefreshableToken(tokenSource, opts...)
 
 ## gRPC Layer
 
-Underneath, the SDK communicates with the OpenShell gateway over gRPC. The single `OpenShell` service in `proto/openshell.proto` defines all RPCs. The SDK maps each interface method to one or more RPCs:
+Underneath, the SDK communicates with the Ryno gateway over gRPC. The single `Ryno` service in `proto/ryno.proto` defines all RPCs. The SDK maps each interface method to one or more RPCs:
 
 | Pattern | Example |
 |---------|---------|
@@ -129,7 +129,7 @@ See the [Error Handling](error-handling.md) guide for the complete list of error
 
 ## Fake Client
 
-For testing, the SDK provides `openshell/v1/fake` with an in-memory implementation of `ClientInterface`. The fake client supports fixture seeding, watch events, and health simulation:
+For testing, the SDK provides `ryno/v1/fake` with an in-memory implementation of `ClientInterface`. The fake client supports fixture seeding, watch events, and health simulation:
 
 ```go
 fc := fake.NewClient()

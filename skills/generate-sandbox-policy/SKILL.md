@@ -157,7 +157,7 @@ You may need to go back and forth a few times. Keep the loop tight:
 
 ## Step 3: Read the Policy Schema
 
-Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
+Read the published [policy schema reference](https://docs.nvidia.com/ryno/latest/how-it-works/policies/schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
 Key sections to reference:
 - **Policy Schema Reference** — top-level structure
@@ -169,9 +169,9 @@ Key sections to reference:
 - **Network Middleware** - top-level middleware configs, ordering, host selection, and failure behavior
 - **Validation Rules** — what combinations are valid/invalid
 
-When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md).
+When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/ryno/latest/extensibility/supervisor-middleware.md).
 
-For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview) and the [default policy reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
+For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/ryno/latest/how-it-works/policies/overview) and the [default policy reference](https://docs.nvidia.com/ryno/latest/how-it-works/policies/default-policy). The default policy is built into the Ryno runtime and applies when no explicit policy is supplied.
 
 Validate the intended provider combination as well as the authored policy.
 An image endpoint can become credentialed after provider composition and block
@@ -213,8 +213,8 @@ Do not "fix" a rejected value — including the removed `terminate` and `passthr
 
 Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests, final HTTP responses, or client WebSocket text messages. Request middleware runs after network and L7 policy admission and before provider credential injection. Response middleware runs on the matching final response before it returns to the sandbox.
 
-- Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
-- Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
+- Use `ryno/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
+- Use an operator-owned middleware name only when it is already registered under `[[ryno.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
 - Confirm that the implementation advertises the requested binding: `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, or `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A host match alone does not enable inspection.
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
@@ -344,7 +344,7 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 
 Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
 
-The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
+The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. Ryno handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/ryno/latest/how-it-works/providers/google.md).
 
 ```yaml
 # Example: Pin an internal service to a known private IP range
@@ -423,7 +423,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
 | **Broad middleware host selector** | "This middleware attaches independently of the admitting network rule to every matching destination, then runs only for operation bindings its implementation advertises. Narrow `endpoints.include` or add exclusions if the attachment is not required for every matching host." |
-| **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
+| **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic Ryno cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 
 Format breadth warnings clearly in the output, e.g.:
 
@@ -504,7 +504,7 @@ The `filesystem_policy` and `landlock` sections above are sensible defaults.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their
-environment. Gateway inference is configured separately through `openshell
+environment. Gateway inference is configured separately through `ryno
 inference set/get`. The generated `network_policies` block is the primary
 output.
 
@@ -516,7 +516,7 @@ to the same ID on image files, mounted volumes, or devices.
 
 For MicroVM, numeric selectors must match the resolved owner of the sandbox's writable overlay. User and group are checked independently; either mismatch prevents startup. If the owner UID:GID is unknown, omit the selectors or use `sandbox` so the driver retains that identity. Do not choose another numeric identity or suggest that the policy can change an existing overlay's owner. For example, with an owner of `1000:1000`, a request for UID `10000` must be rejected with an explanation and the omission/`sandbox` alternatives, rather than generating a policy that the VM cannot start.
 
-If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
+If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `ryno sandbox create --policy <path>` or set via the `RYNO_SANDBOX_POLICY` env var.
 
 ### Mode C: Present Only (no file write)
 
@@ -525,7 +525,7 @@ Show the generated policy YAML with:
 1. **Summary** — what the policy allows and denies, in plain language
 2. **The YAML** — the complete `network_policies` block, ready to paste
 3. **Integration guidance**:
-   - Save to a local file and pass via `openshell sandbox create --policy <path>` or set `OPENSHELL_SANDBOX_POLICY=<path>`
+   - Save to a local file and pass via `ryno sandbox create --policy <path>` or set `RYNO_SANDBOX_POLICY=<path>`
    - For production: configure via the gateway
 4. **Caveats** — any assumptions made, anything the user should verify
 
@@ -640,9 +640,9 @@ private_services:
 
 ## Additional Resources
 
-- [Policy schema](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
-- [Default policy](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy)
-- [Supervisor middleware](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md)
-- Default policy: built into the OpenShell runtime
+- [Policy schema](https://docs.nvidia.com/ryno/latest/how-it-works/policies/schema)
+- [Sandbox policies](https://docs.nvidia.com/ryno/latest/how-it-works/policies/overview)
+- [Default policy](https://docs.nvidia.com/ryno/latest/how-it-works/policies/default-policy)
+- [Supervisor middleware](https://docs.nvidia.com/ryno/latest/extensibility/supervisor-middleware.md)
+- Default policy: built into the Ryno runtime
 - For translation examples from real API docs, see [examples.md](examples.md)

@@ -5,7 +5,7 @@
 """
 Policy Advisor CTF  --  Mechanistic Mode
 
-A capture-the-flag challenge that exercises OpenShell's policy recommendation
+A capture-the-flag challenge that exercises Ryno's policy recommendation
 pipeline.  Run this inside a sandbox with the restrictive policy, then use the
 TUI to approve mechanistic recommendations and unlock each gate.
 
@@ -120,7 +120,7 @@ GATES: list[dict] = [
         "url": "https://api.github.com/zen",
         "method": "GET",
         "headers": {
-            "User-Agent": "openshell-ctf",
+            "User-Agent": "ryno-ctf",
             "Accept": "application/vnd.github+json",
         },
         "body": None,
@@ -134,7 +134,7 @@ GATES: list[dict] = [
         "port": 443,
         "url": "https://icanhazdadjoke.com/",
         "method": "GET",
-        "headers": {"Accept": "application/json", "User-Agent": "openshell-ctf"},
+        "headers": {"Accept": "application/json", "User-Agent": "ryno-ctf"},
         "body": None,
         "hint": "Laughter unlocks the fourth seal.",
         "extract": lambda d: json.loads(d).get("joke", "?")[:120],
@@ -146,7 +146,7 @@ GATES: list[dict] = [
         "port": 443,
         "url": "https://catfact.ninja/fact",
         "method": "GET",
-        "headers": {"Accept": "application/json", "User-Agent": "openshell-ctf"},
+        "headers": {"Accept": "application/json", "User-Agent": "ryno-ctf"},
         "body": None,
         "hint": "Answer the Sphinx's riddle.",
         "extract": lambda d: json.loads(d).get("fact", "?")[:120],
@@ -159,7 +159,7 @@ GATES: list[dict] = [
         "port": 443,
         "url": "https://internal.corp.example.com/",
         "method": "GET",
-        "headers": {"User-Agent": "openshell-ctf"},
+        "headers": {"User-Agent": "ryno-ctf"},
         "body": None,
         "hint": "Reach behind the firewall -- this host resolves to a private IP.",
         "extract": lambda d: f"page length = {len(d)} bytes",
@@ -490,7 +490,7 @@ def run_ctf() -> int:
     log("INFO", f"Retry interval: {RETRY_INTERVAL}s between attempts")
     log(
         "INFO",
-        "Tip: open the TUI now if you haven't  ->  openshell term",
+        "Tip: open the TUI now if you haven't  ->  ryno term",
     )
     print()
 

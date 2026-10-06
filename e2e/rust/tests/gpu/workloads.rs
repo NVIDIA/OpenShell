@@ -7,16 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
-use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use ryno_e2e::harness::output::{extract_field, strip_ansi};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde::Deserialize;
 use serial_test::serial;
 use tokio::time::timeout;
 
-const WORKLOAD_MANIFEST_ENV: &str = "OPENSHELL_E2E_WORKLOAD_MANIFEST";
-const GPU_WORKLOAD_SUCCESS_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_SUCCESS";
-const GPU_WORKLOAD_FAILURE_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_FAILURE";
+const WORKLOAD_MANIFEST_ENV: &str = "RYNO_E2E_WORKLOAD_MANIFEST";
+const GPU_WORKLOAD_SUCCESS_MARKER: &str = "RYNO_GPU_WORKLOAD_SUCCESS";
+const GPU_WORKLOAD_FAILURE_MARKER: &str = "RYNO_GPU_WORKLOAD_FAILURE";
 const WORKLOAD_SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 const WORKLOAD_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 

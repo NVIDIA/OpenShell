@@ -15,9 +15,9 @@ struct ProtoJsonCodec {
 }
 
 impl ProtoJsonCodec {
-    fn openshell() -> Result<Self, String> {
-        let pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)
-            .map_err(|err| format!("decode OpenShell protobuf descriptor set: {err}"))?;
+    fn ryno() -> Result<Self, String> {
+        let pool = DescriptorPool::decode(ryno_core::FILE_DESCRIPTOR_SET)
+            .map_err(|err| format!("decode Ryno protobuf descriptor set: {err}"))?;
         Ok(Self {
             pool: Arc::new(pool),
         })
@@ -59,27 +59,27 @@ impl ProtoJsonCodec {
     }
 }
 
-fn openshell_codec() -> Result<&'static ProtoJsonCodec, String> {
+fn ryno_codec() -> Result<&'static ProtoJsonCodec, String> {
     static CODEC: OnceLock<ProtoJsonCodec> = OnceLock::new();
 
     if let Some(codec) = CODEC.get() {
         return Ok(codec);
     }
 
-    let codec = ProtoJsonCodec::openshell()?;
+    let codec = ProtoJsonCodec::ryno()?;
     let _ = CODEC.set(codec);
     CODEC
         .get()
-        .ok_or_else(|| "initialize OpenShell protobuf codec".to_string())
+        .ok_or_else(|| "initialize Ryno protobuf codec".to_string())
 }
 
 pub(crate) fn decode_message_to_json<M>(type_name: &str, message: &M) -> Result<Value, String>
 where
     M: prost::Message,
 {
-    openshell_codec()?.decode_message_to_json(type_name, message)
+    ryno_codec()?.decode_message_to_json(type_name, message)
 }
 
 pub(crate) fn encode_json_to_message(type_name: &str, value: &Value) -> Result<Vec<u8>, String> {
-    openshell_codec()?.encode_json_to_message(type_name, value)
+    ryno_codec()?.encode_json_to_message(type_name, value)
 }

@@ -4,7 +4,7 @@
 [workspace]
 
 [package]
-name = "openshell-governance-interceptor-example"
+name = "ryno-governance-interceptor-example"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -12,9 +12,9 @@ license = "Apache-2.0"
 
 [dependencies]
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-openshell-core = { path = "../../crates/openshell-core", default-features = false }
-openshell-policy = { path = "../../crates/openshell-policy" }
-openshell-providers = { path = "../../crates/openshell-providers" }
+ryno-core = { path = "../../crates/ryno-core", default-features = false }
+ryno-policy = { path = "../../crates/ryno-policy" }
+ryno-providers = { path = "../../crates/ryno-providers" }
 prost = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 prost-types = "0.14"

@@ -5,7 +5,7 @@
 # Build libkrun and libkrunfw from source on Linux.
 #
 # This script builds libkrun (VMM) and libkrunfw (kernel firmware) from source
-# with OpenShell's custom kernel configuration for sandbox enforcement.
+# with Ryno's custom kernel configuration for sandbox enforcement.
 #
 # In addition to the platform's native .so artifacts, this script exports
 # kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
@@ -29,11 +29,11 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/ryno-driver-vm/runtime/pins.env" 2>/dev/null || true
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
-KERNEL_CONFIG="${ROOT}/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig"
+KERNEL_CONFIG="${ROOT}/crates/ryno-driver-vm/runtime/kernel/ryno.kconfig"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "Error: This script only runs on Linux" >&2
@@ -148,8 +148,8 @@ fi
 
 # Copy custom kernel config fragment
 if [ -f "$KERNEL_CONFIG" ]; then
-  cp "$KERNEL_CONFIG" openshell.kconfig
-  echo "    Applied custom kernel config fragment: openshell.kconfig"
+  cp "$KERNEL_CONFIG" ryno.kconfig
+  echo "    Applied custom kernel config fragment: ryno.kconfig"
 else
   echo "Warning: Custom kernel config not found at ${KERNEL_CONFIG}" >&2
   echo "    Building with default config (sandbox networking may lack required kernel features)" >&2
@@ -195,9 +195,9 @@ else
   echo "    Phase 1: kernel source tree and .config already present, skipping"
 fi
 
-# Phase 2: merge the openshell fragment on top
-if [ -f openshell.kconfig ]; then
-  echo "    Phase 2: merging openshell.kconfig fragment..."
+# Phase 2: merge the ryno fragment on top
+if [ -f ryno.kconfig ]; then
+  echo "    Phase 2: merging ryno.kconfig fragment..."
 
   # merge_config.sh must be called with ARCH set so it finds the right Kconfig
   # entry points. -m means "merge into existing .config" (vs starting fresh).
@@ -205,7 +205,7 @@ if [ -f openshell.kconfig ]; then
     "${KERNEL_SOURCES}/scripts/kconfig/merge_config.sh" \
     -m -O "${KERNEL_SOURCES}" \
     "${KERNEL_SOURCES}/.config" \
-    openshell.kconfig
+    ryno.kconfig
 
   # Re-run olddefconfig to fill in any new symbols introduced by the fragment.
   make -C "${KERNEL_SOURCES}" ARCH="${KARCH}" olddefconfig
@@ -450,4 +450,4 @@ echo "    Artifacts:"
 ls -lah "$OUTPUT_DIR"/*.so*
 
 echo ""
-echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"

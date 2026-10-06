@@ -876,7 +876,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openshell-conformance"
+name = "ryno-conformance"
 version = "0.0.0"
 dependencies = [
  "rand",
@@ -887,7 +887,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-e2e"
+name = "ryno-e2e"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -920,11 +920,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-test-feature-provider-refresh-keycloak"
+name = "ryno-test-feature-provider-refresh-keycloak"
 version = "0.0.0"
 dependencies = [
- "openshell-conformance",
- "openshell-e2e",
+ "ryno-conformance",
+ "ryno-e2e",
  "serde_json",
  "tempfile",
  "tokio",

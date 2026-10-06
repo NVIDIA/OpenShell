@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[ryno]
+version = 2
+
+[ryno.gateway]
+bind_address = "{{ ryno_gateway_bind_address }}"
+compute_driver = "{{ ryno_gateway_driver }}"
+disable_tls = true
+log_level = "debug"
+
+[ryno.gateway.auth]
+allow_unauthenticated_users = true
+
+[ryno.gateway.gateway_jwt]
+signing_key_path = "/var/lib/ryno/pki/jwt/signing.pem"
+public_key_path = "/var/lib/ryno/pki/jwt/public.pem"
+kid_path = "/var/lib/ryno/pki/jwt/kid"
+gateway_id = "tmachine"
+
+{% block driver %}{% endblock %}

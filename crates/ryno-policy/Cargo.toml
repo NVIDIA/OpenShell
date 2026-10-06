@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-policy"
+description = "Shared sandbox policy parsing and defaults for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hickory-proto = { workspace = true }
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-policy-schema = { path = "../ryno-policy-schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+miette = { workspace = true }
+prost-types = { workspace = true }
+
+[lints]
+workspace = true

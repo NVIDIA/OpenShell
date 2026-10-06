@@ -8,8 +8,8 @@ keywords: "Generative AI, Cybersecurity, Inference, Provider Profiles, Credentia
 position: 8
 ---
 
-OpenShell grants model-provider access through provider profiles and sandbox
-attachments. The workload calls the provider's native API. OpenShell evaluates
+Ryno grants model-provider access through provider profiles and sandbox
+attachments. The workload calls the provider's native API. Ryno evaluates
 the request against the profile-derived network policy and substitutes the real
 credential only at an endpoint authorized by that profile.
 
@@ -24,13 +24,13 @@ This keeps the complete access contract in one place:
 
 ## Define and Attach a Hosted Provider
 
-Start from the [NVIDIA example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/nvidia.yaml),
+Start from the [NVIDIA example profile](https://github.com/NVIDIA/Ryno/blob/main/providers/nvidia.yaml),
 review its access, and import an edited copy under a new ID. A new gateway has
 no profiles to export. Download the example so you can add the Python paths
 used by this workload:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/nvidia.yaml -o nvidia-native.yaml
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/nvidia.yaml -o nvidia-native.yaml
 ```
 
 In `nvidia-native.yaml`, change `id` to `nvidia-native`, give the profile a
@@ -53,15 +53,15 @@ Lint and import the complete edited profile, then create a provider from its
 new ID:
 
 ```shell
-openshell profile lint -f nvidia-native.yaml
-openshell profile import -f nvidia-native.yaml
+ryno profile lint -f nvidia-native.yaml
+ryno profile import -f nvidia-native.yaml
 
-openshell provider create \
+ryno provider create \
   --name nvidia-prod \
   --type nvidia-native \
   --from-existing
 
-openshell sandbox create \
+ryno sandbox create \
   --name inference-demo \
   --from registry.example.com/team/python-agent:1.0 \
   --provider nvidia-prod \
@@ -97,14 +97,14 @@ does not select or rewrite a model.
 The gateway resolves a provider against the profiles you imported, so a provider
 whose profile is missing fails at sandbox creation with a message naming the
 profile and the import command. Treat the example profiles in
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers) as
+[`providers/`](https://github.com/NVIDIA/Ryno/tree/main/providers) as
 starting templates you copy and adapt, not as defaults.
 
 ## Attach a Provider to a Running Sandbox
 
 ```shell
-openshell sandbox provider attach inference-demo nvidia-prod --wait
-openshell sandbox provider list inference-demo
+ryno sandbox provider attach inference-demo nvidia-prod --wait
+ryno sandbox provider list inference-demo
 ```
 
 Running sandboxes poll for provider and effective-policy changes. `--wait`
@@ -112,7 +112,7 @@ confirms the sandbox has applied the attachment. Launch a new process so it
 receives the new credential placeholder:
 
 ```shell
-openshell sandbox exec --name inference-demo -- python app.py
+ryno sandbox exec --name inference-demo -- python app.py
 ```
 
 An already-running process does not gain new environment variables. Credential
@@ -122,7 +122,7 @@ Use `--wait` to confirm that change before relying on it.
 Detach the provider to revoke its policy and credential access:
 
 ```shell
-openshell sandbox provider detach inference-demo nvidia-prod --wait
+ryno sandbox provider detach inference-demo nvidia-prod --wait
 ```
 
 ## Use a Custom or Self-hosted Endpoint
@@ -144,7 +144,7 @@ category: inference
 inference_capable: true
 credentials: []
 endpoints:
-  - host: host.openshell.internal
+  - host: host.ryno.internal
     port: 11434
     protocol: rest
     access: read-write
@@ -161,15 +161,15 @@ binaries:
 Import the profile, create an instance, and attach it:
 
 ```shell
-openshell profile lint -f ollama-openai.yaml
-openshell profile import -f ollama-openai.yaml
-openshell provider create --name ollama --type ollama-openai
+ryno profile lint -f ollama-openai.yaml
+ryno profile import -f ollama-openai.yaml
+ryno provider create --name ollama --type ollama-openai
 
-openshell sandbox create \
+ryno sandbox create \
   --name ollama-client \
   --from registry.example.com/team/python-agent:1.0 \
   --provider ollama \
-  --env OPENAI_BASE_URL=http://host.openshell.internal:11434/v1 \
+  --env OPENAI_BASE_URL=http://host.ryno.internal:11434/v1 \
   -- python app.py
 ```
 
@@ -192,14 +192,14 @@ response = client.chat.completions.create(
 
 For an authenticated alternate endpoint, declare a credential in the custom
 profile, bind it to that endpoint, and create the provider from the original
-credential source. OpenShell never exports stored credential values.
+credential source. Ryno never exports stored credential values.
 
 ## Verify Access
 
 Inspect the effective policy, including provider-derived entries:
 
 ```shell
-openshell policy get inference-demo --full
+ryno policy get inference-demo --full
 ```
 
 Then run a native request from a new sandbox process. A successful request
@@ -208,9 +208,9 @@ and upstream service behavior.
 
 If the request is denied:
 
-- Confirm the provider is attached with `openshell sandbox provider list`.
+- Confirm the provider is attached with `ryno sandbox provider list`.
 - Confirm the caller binary and native endpoint appear in
-  `openshell policy get <sandbox> --full`.
+  `ryno policy get <sandbox> --full`.
 - If the provider was attached after the process started, launch a new process.
 - If the sandbox uses a gateway global policy override, add the native endpoint
   there because a global override suppresses provider-derived policy layers.
@@ -220,8 +220,8 @@ If the request is denied:
 
 ## Migrate from Managed Inference Routes
 
-OpenShell removed the workspace-global managed inference route and the
-`openshell inference` commands. Upgrades remove stored route records. Provider
+Ryno removed the workspace-global managed inference route and the
+`ryno inference` commands. Upgrades remove stored route records. Provider
 records, provider refresh configuration, and existing sandbox attachments are
 preserved. Import the profile each preserved provider refers to before the first
 sandbox creation after the upgrade, and give new setups an explicit profile under
@@ -229,7 +229,7 @@ their own ID.
 
 The old route cannot be converted automatically. It applied one provider and
 model to every sandbox in a workspace, while provider attachments intentionally
-grant access to selected sandboxes. OpenShell cannot infer which sandboxes
+grant access to selected sandboxes. Ryno cannot infer which sandboxes
 should receive that authority.
 
 ### Now
@@ -237,15 +237,15 @@ should receive that authority.
 Earlier releases configured one shared route:
 
 ```shell
-openshell provider create --name nvidia-prod --type nvidia --from-existing
-openshell inference set \
+ryno provider create --name nvidia-prod --type nvidia --from-existing
+ryno inference set \
   --provider nvidia-prod \
   --model nvidia/nemotron-3-super-120b-a12b \
   --timeout 300
 ```
 
 Clients called a managed virtual endpoint, supplied a placeholder key and
-model, and relied on OpenShell to rewrite the request.
+model, and relied on Ryno to rewrite the request.
 
 ### After
 
@@ -253,18 +253,18 @@ Export the old provider type's profile, edit its ID and access contract, import
 it, and create a replacement provider from the original credential source:
 
 ```shell
-openshell profile export nvidia -o yaml > nvidia-native.yaml
+ryno profile export nvidia -o yaml > nvidia-native.yaml
 # Edit id, display_name, endpoints, and binaries in nvidia-native.yaml.
-openshell profile lint -f nvidia-native.yaml
-openshell profile import -f nvidia-native.yaml
-openshell provider create \
+ryno profile lint -f nvidia-native.yaml
+ryno profile import -f nvidia-native.yaml
+ryno provider create \
   --name nvidia-native-prod \
   --type nvidia-native \
   --from-existing
-openshell sandbox provider attach inference-demo nvidia-native-prod --wait
+ryno sandbox provider attach inference-demo nvidia-native-prod --wait
 ```
 
-OpenShell does not export stored credential values or change a provider's
+Ryno does not export stored credential values or change a provider's
 profile type in place. If the original credential source is unavailable, import
 the original profile at its own ID so the preserved provider keeps resolving
 while you arrange credential rotation into the replacement provider.
@@ -279,13 +279,13 @@ Update each workload to:
 
 Launch a new process after attachment and verify a native request before
 upgrading production workloads. Code that still calls the retired managed
-virtual endpoint fails DNS resolution because OpenShell no longer resolves or
+virtual endpoint fails DNS resolution because Ryno no longer resolves or
 trusts that host.
 
 ### Migration Checklist
 
 Before upgrading, record the old provider, model, and timeout with the previous
-release's `openshell inference get`. Identify actual consumers, export and edit
+release's `ryno inference get`. Identify actual consumers, export and edit
 the source profile, import it under a new ID, and create the replacement
 provider from the original credential source. Attach it only to those
 sandboxes, migrate their clients, and test the native path while the old route
@@ -299,7 +299,7 @@ Special cases require additional work:
 
 - A provider with an alternate `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` needs
   an endpoint-bearing custom profile for that host.
-- Host-local services need `host.openshell.internal` or a reachable LAN/service
+- Host-local services need `host.ryno.internal` or a reachable LAN/service
   hostname, not `127.0.0.1` or `localhost`.
 - Google Vertex AI clients must use the native Vertex endpoint and
   authentication behavior. See [Google](/how-it-works/providers/google#vertex-ai).

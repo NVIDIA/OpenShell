@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared CLI helpers for e2e tests that need to invoke `openshell` commands
+//! Shared CLI helpers for e2e tests that need to invoke `ryno` commands
 //! and poll for readiness.
 
 use std::future::Future;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
-use super::binary::openshell_cmd;
+use super::binary::ryno_cmd;
 use super::output::strip_ansi;
 
 async fn poll_with_diagnostics<F, Fut>(timeout: Duration, mut attempt: F) -> Result<(), String>
@@ -32,10 +32,10 @@ where
 }
 
 pub async fn run_cli(args: &[&str]) -> (String, i32) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell");
+    let output = cmd.output().await.expect("spawn ryno");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
@@ -113,7 +113,7 @@ pub async fn wait_for_sandbox_exec_contains(
     timeout: Duration,
 ) -> Result<(), String> {
     poll_with_diagnostics(timeout, || async {
-        let mut cmd = openshell_cmd();
+        let mut cmd = ryno_cmd();
         cmd.args(["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"])
             .args(command)
             .stdout(Stdio::piped())
@@ -128,7 +128,7 @@ pub async fn wait_for_sandbox_exec_contains(
             }
             Err(err) => (
                 false,
-                format!("failed to spawn openshell sandbox exec: {err}"),
+                format!("failed to spawn ryno sandbox exec: {err}"),
             ),
         };
         (ready, last_output)

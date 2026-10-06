@@ -41,14 +41,14 @@ let
   ];
 
   provisionerRoles = [
-    "openshell-development"
-    "openshell-rpm"
+    "ryno-development"
+    "ryno-rpm"
     "gateway-podman"
   ];
 
   mkDistroProfile =
     name: distro:
-    pkgs.writeText "openshell-test-guest-${name}" ''
+    pkgs.writeText "ryno-test-guest-${name}" ''
       TEST_GUEST_IMAGE_DRV=${builtins.unsafeDiscardStringContext distro.image.drvPath}
       TEST_GUEST_IMAGE_URL=${pkgs.lib.escapeShellArg distro.imageUrl}
       TEST_GUEST_IMAGE_HASH=${pkgs.lib.escapeShellArg distro.imageHash}
@@ -59,14 +59,14 @@ let
       export TEST_GUEST_OS_ID TEST_GUEST_OS_VERSION TEST_GUEST_PACKAGE_FAMILY
     '';
 
-  distroCatalog = pkgs.linkFarm "openshell-test-guest-distros" (
+  distroCatalog = pkgs.linkFarm "ryno-test-guest-distros" (
     pkgs.lib.mapAttrsToList (name: distro: {
       inherit name;
       path = mkDistroProfile name distro;
     }) distros
   );
 
-  configurationCatalog = pkgs.linkFarm "openshell-test-guest-configurations" (
+  configurationCatalog = pkgs.linkFarm "ryno-test-guest-configurations" (
     (pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations)
     ++ (map (name: {
       name = "tasks/${name}";
@@ -74,7 +74,7 @@ let
     }) configurationTasks)
   );
 
-  provisionerCatalog = pkgs.linkFarm "openshell-test-guest-provisioners" (
+  provisionerCatalog = pkgs.linkFarm "ryno-test-guest-provisioners" (
     map (name: {
       inherit name;
       path = ./provisioners/roles/${name};
@@ -97,14 +97,14 @@ let
   ];
 
   runtimeEnvironment = ''
-    export OPENSHELL_TEST_GUEST_RUNTIME=1
-    export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
-    export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
-    export OPENSHELL_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
-    export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
-    export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
-    export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
-    export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
+    export RYNO_TEST_GUEST_RUNTIME=1
+    export RYNO_TEST_GUEST_DISTROS=${distroCatalog}
+    export RYNO_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
+    export RYNO_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
+    export RYNO_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
+    export RYNO_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
+    export RYNO_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
+    export RYNO_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
     export TEST_GUEST_FIRMWARE_CODE=${firmwarePkgs.OVMF.firmware}
@@ -117,7 +117,7 @@ let
   '';
 
   runner = pkgs.writeShellApplication {
-    name = "openshell-test-guest";
+    name = "ryno-test-guest";
     inherit runtimeInputs;
     text = runtimeEnvironment + ''
       exec ${pkgs.bash}/bin/bash ${./run.sh} "$@"
@@ -125,7 +125,7 @@ let
   };
 
   cacheRunner = pkgs.writeShellApplication {
-    name = "openshell-test-guest-cache";
+    name = "ryno-test-guest-cache";
     inherit runtimeInputs;
     text = runtimeEnvironment + ''
       exec ${pkgs.bash}/bin/bash ${./cache.sh} "$@"
@@ -135,13 +135,13 @@ in
 {
   app = {
     type = "app";
-    program = "${runner}/bin/openshell-test-guest";
+    program = "${runner}/bin/ryno-test-guest";
     meta.description = "Boot and configure a disposable distro guest";
   };
 
   cacheApp = {
     type = "app";
-    program = "${cacheRunner}/bin/openshell-test-guest-cache";
+    program = "${cacheRunner}/bin/ryno-test-guest-cache";
     meta.description = "Ensure a prepared test guest disk is available locally or in OCI";
   };
 }

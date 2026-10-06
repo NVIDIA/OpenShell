@@ -4,7 +4,7 @@
 
 # Download pre-built VM kernel runtime artifacts from the capability-free
 # vm-runtime GitHub
-# Release and stage them for the openshell-driver-vm cargo build.
+# Release and stage them for the ryno-driver-vm cargo build.
 #
 # This script is used by driver release CI and can also be used locally
 # to avoid building libkrun/libkrunfw from source.
@@ -14,8 +14,8 @@
 #
 # Environment:
 #   VM_RUNTIME_RELEASE_TAG  - GitHub Release tag (default: vm-runtime)
-#   GITHUB_REPOSITORY       - owner/repo (default: NVIDIA/OpenShell)
-#   OPENSHELL_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
+#   GITHUB_REPOSITORY       - owner/repo (default: NVIDIA/Ryno)
+#   RYNO_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
 #
 # Platforms: linux-aarch64, linux-x86_64, darwin-aarch64
 
@@ -24,11 +24,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/ryno-driver-vm/runtime/pins.env" 2>/dev/null || true
 
 RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime}"
-REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
-OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
+REPO="${GITHUB_REPOSITORY:-NVIDIA/Ryno}"
+OUTPUT_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── Auto-detect platform (detect_platform from _lib.sh) ─────────────────
@@ -47,8 +47,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Environment:"
             echo "  VM_RUNTIME_RELEASE_TAG              Release tag (default: vm-runtime)"
-            echo "  GITHUB_REPOSITORY                   owner/repo (default: NVIDIA/OpenShell)"
-            echo "  OPENSHELL_VM_RUNTIME_COMPRESSED_DIR Output directory"
+            echo "  GITHUB_REPOSITORY                   owner/repo (default: NVIDIA/Ryno)"
+            echo "  RYNO_VM_RUNTIME_COMPRESSED_DIR Output directory"
             exit 0
             ;;
         *)
@@ -119,7 +119,7 @@ ls -lah "$EXTRACT_DIR"
 
 # ── Compress individual files for embedding ─────────────────────────────
 # The cargo build expects individual .zst files (libkrun.so.zst, etc.)
-# in OPENSHELL_VM_RUNTIME_COMPRESSED_DIR. The downloaded tarball contains
+# in RYNO_VM_RUNTIME_COMPRESSED_DIR. The downloaded tarball contains
 # the raw libraries, so we re-compress each one.
 
 echo ""
@@ -132,4 +132,4 @@ ls -lah "$OUTPUT_DIR"
 echo ""
 echo "==> Done."
 echo ""
-echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"

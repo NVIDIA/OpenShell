@@ -3,23 +3,23 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Workspaces"
 sidebar-title: "Workspaces"
-description: "Create OpenShell workspaces, assign members, and understand platform and workspace roles."
+description: "Create Ryno workspaces, assign members, and understand platform and workspace roles."
 keywords: "Generative AI, Cybersecurity, Workspaces, Access Control, RBAC, OIDC, Membership, CLI"
 position: 3
 ---
 
-An OpenShell workspace is an access and resource isolation boundary. Sandboxes,
+An Ryno workspace is an access and resource isolation boundary. Sandboxes,
 sandbox workload templates, providers, provider profiles, services, policies,
 and settings belong to a workspace and are not visible to members of other
 workspaces.
 
 The CLI targets the `default` workspace unless you set `--workspace` or
-`OPENSHELL_WORKSPACE`. The logical OpenShell workspace described here is
+`RYNO_WORKSPACE`. The logical Ryno workspace described here is
 separate from the `/sandbox` filesystem directory inside a sandbox.
 
 ## Understand the Role Model
 
-OpenShell combines an identity-provider role with a membership record for each
+Ryno combines an identity-provider role with a membership record for each
 workspace.
 
 | Role | Assignment | Access |
@@ -37,7 +37,7 @@ When the gateway enables scope enforcement through `scopes_claim`, the token
 must also contain the scope required by the operation. Common scopes include
 `workspace:read`, `workspace:write`, `sandbox:read`, `sandbox:write`,
 `provider:read`, `provider:write`, `config:read`, and `config:write`.
-`openshell:all` satisfies every scope requirement. For OIDC and scope
+`ryno:all` satisfies every scope requirement. For OIDC and scope
 configuration, refer to [Gateway Authentication](/how-it-works/gateways/authentication).
 
 The following table summarizes common operations.
@@ -69,8 +69,8 @@ Use the identity validated by the gateway when an administrator needs your
 membership subject.
 
 ```shell
-openshell whoami
-openshell whoami --output json
+ryno whoami
+ryno whoami --output json
 ```
 
 The `subject` field is the stable identity used in workspace membership
@@ -86,14 +86,14 @@ OIDC users to that workspace automatically.
 Create a workspace:
 
 ```shell
-openshell workspace create --name team-ml
+ryno workspace create --name team-ml
 ```
 
-Ask the intended Workspace Admin to run `openshell whoami`, then add the
+Ask the intended Workspace Admin to run `ryno whoami`, then add the
 reported subject:
 
 ```shell
-openshell workspace member add \
+ryno workspace member add \
   --workspace team-ml \
   --subject 'oidc-subject-for-admin' \
   --role admin
@@ -102,7 +102,7 @@ openshell workspace member add \
 The Workspace Admin can add Workspace Users:
 
 ```shell
-openshell workspace member add \
+ryno workspace member add \
   --workspace team-ml \
   --subject 'oidc-subject-for-user' \
   --role user
@@ -117,9 +117,9 @@ All members can inspect membership in their workspace. Workspace Admins and
 Platform Admins can remove members.
 
 ```shell
-openshell workspace member list --workspace team-ml
+ryno workspace member list --workspace team-ml
 
-openshell workspace member remove \
+ryno workspace member remove \
   --workspace team-ml \
   --subject 'oidc-subject-for-user'
 ```
@@ -139,20 +139,20 @@ Pass `--workspace` to scope a resource operation. The flag is global, so it
 can appear before or after the subcommand.
 
 ```shell
-openshell sandbox list --workspace team-ml
-openshell provider list --workspace team-ml
-openshell sandbox create \
+ryno sandbox list --workspace team-ml
+ryno provider list --workspace team-ml
+ryno sandbox create \
   --workspace team-ml \
   --name research \
   --from registry.example.com/team/agent-tools:1.0 \
   -- bash
 ```
 
-Set a default for the current shell with `OPENSHELL_WORKSPACE`:
+Set a default for the current shell with `RYNO_WORKSPACE`:
 
 ```shell
-export OPENSHELL_WORKSPACE=team-ml
-openshell sandbox list
+export RYNO_WORKSPACE=team-ml
+ryno sandbox list
 ```
 
 When `--workspace` is omitted, the CLI intentionally selects the `default`
@@ -162,9 +162,9 @@ or all workspaces.
 Platform Admins can opt into cross-workspace list operations:
 
 ```shell
-openshell sandbox list --all-workspaces
-openshell provider list --all-workspaces
-openshell service list --all-workspaces
+ryno sandbox list --all-workspaces
+ryno provider list --all-workspaces
+ryno service list --all-workspaces
 ```
 
 Workspace-scoped public requests use the `workspace_scope` field with a
@@ -204,8 +204,8 @@ configuration.
 
 ## Diagnose Access Denials
 
-If `openshell workspace list` returns no rows, the authenticated subject has no
-workspace memberships. Run `openshell whoami` and send the `subject` value to
+If `ryno workspace list` returns no rows, the authenticated subject has no
+workspace memberships. Run `ryno whoami` and send the `subject` value to
 a Platform Admin.
 
 Workspace authorization errors include a copyable membership command. A
@@ -214,7 +214,7 @@ Admin access, the denial suggests `--role admin`; only a Platform Admin can run
 that assignment successfully.
 
 If the membership is correct but the request is still denied, inspect `roles`
-and `scopes` with `openshell whoami --output json`. Confirm that the token has
+and `scopes` with `ryno whoami --output json`. Confirm that the token has
 the configured OIDC user role and, when scope enforcement is enabled, the
 scope required by the operation.
 
@@ -224,13 +224,13 @@ Only a Platform Admin can delete a workspace. The `default` workspace cannot
 be deleted.
 
 ```shell
-openshell workspace delete team-ml
+ryno workspace delete team-ml
 ```
 
 A custom workspace must not contain sandboxes, sandbox workload templates,
 providers, provider profiles, services, SSH sessions, settings, policies, draft
 policy chunks, or credential refresh state. Remove those resources before
-retrying deletion. OpenShell removes membership records as part of successful
+retrying deletion. Ryno removes membership records as part of successful
 workspace deletion.
 
 ## Next Steps

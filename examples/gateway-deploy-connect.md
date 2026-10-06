@@ -1,10 +1,10 @@
 # Deploying and Connecting to a Gateway
 
-Deploy or register an OpenShell gateway, verify it is reachable, and run your first sandbox. This example covers Helm-managed Kubernetes gateways, existing gateway endpoints, and Cloudflare-fronted deployments.
+Deploy or register an Ryno gateway, verify it is reachable, and run your first sandbox. This example covers Helm-managed Kubernetes gateways, existing gateway endpoints, and Cloudflare-fronted deployments.
 
 ## Prerequisites
 
-- OpenShell CLI installed (`openshell`)
+- Ryno CLI installed (`ryno`)
 - A reachable gateway endpoint, or access to a Kubernetes cluster where you can install the Helm chart
 - For Kubernetes installs, a CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces
 
@@ -13,9 +13,9 @@ Deploy or register an OpenShell gateway, verify it is reachable, and run your fi
 Install the gateway into a Kubernetes cluster you manage:
 
 ```bash
-kubectl create namespace openshell
-helm upgrade --install openshell deploy/helm/openshell \
-  --namespace openshell \
+kubectl create namespace ryno
+helm upgrade --install ryno deploy/helm/ryno \
+  --namespace ryno \
   --set server.disableTls=true \
   --set service.type=ClusterIP
 ```
@@ -23,8 +23,8 @@ helm upgrade --install openshell deploy/helm/openshell \
 For local evaluation, forward the service and register the forwarded endpoint:
 
 ```bash
-kubectl -n openshell port-forward svc/openshell 8080:8080
-openshell gateway add http://127.0.0.1:8080 --local --name local
+kubectl -n ryno port-forward svc/ryno 8080:8080
+ryno gateway add http://127.0.0.1:8080 --local --name local
 ```
 
 Production deployments should keep TLS enabled or place the gateway behind a trusted TLS-terminating ingress, load balancer, or access proxy.
@@ -34,13 +34,13 @@ Production deployments should keep TLS enabled or place the gateway behind a tru
 Register a gateway that is already running:
 
 ```bash
-openshell gateway add https://gateway.example.com --name production
+ryno gateway add https://gateway.example.com --name production
 ```
 
 Verify the gateway:
 
 ```bash
-openshell status
+ryno status
 ```
 
 Expected output:
@@ -54,14 +54,14 @@ Version: <version>
 ## Create a Sandbox
 
 ```bash
-openshell sandbox create --name hello -- echo "it works"
-openshell sandbox connect hello
+ryno sandbox create --name hello -- echo "it works"
+ryno sandbox connect hello
 ```
 
 Clean up the sandbox when finished:
 
 ```bash
-openshell sandbox delete hello
+ryno sandbox delete hello
 ```
 
 ## Edge-Authenticated Gateway
@@ -69,7 +69,7 @@ openshell sandbox delete hello
 For gateways running behind a reverse proxy that handles authentication, such as Cloudflare Access, register the endpoint and authenticate via browser:
 
 ```bash
-openshell gateway add https://gateway.example.com
+ryno gateway add https://gateway.example.com
 ```
 
 This opens your browser for the proxy's login flow. After authentication, the CLI stores a bearer token and sets the gateway as active.
@@ -77,7 +77,7 @@ This opens your browser for the proxy's login flow. After authentication, the CL
 To re-authenticate after token expiry:
 
 ```bash
-openshell gateway login
+ryno gateway login
 ```
 
 ### How Edge-Authenticated Connections Differ
@@ -97,19 +97,19 @@ This is transparent to the user. CLI commands work the same regardless of whethe
 List all registered gateways:
 
 ```bash
-openshell gateway select
+ryno gateway select
 ```
 
 Switch the active gateway:
 
 ```bash
-openshell gateway select production
+ryno gateway select production
 ```
 
 Override the active gateway for a single command:
 
 ```bash
-openshell status -g production
+ryno status -g production
 ```
 
 ## Troubleshooting
@@ -117,14 +117,14 @@ openshell status -g production
 Check gateway registration details:
 
 ```bash
-openshell gateway info
-openshell status
+ryno gateway info
+ryno status
 ```
 
 For Helm deployments, inspect the release and gateway workload:
 
 ```bash
-helm -n openshell status openshell
-kubectl -n openshell get statefulset,pod,svc,pvc
-kubectl -n openshell logs statefulset/openshell --tail=100
+helm -n ryno status ryno
+kubectl -n ryno get statefulset,pod,svc,pvc
+kubectl -n ryno logs statefulset/ryno --tail=100
 ```

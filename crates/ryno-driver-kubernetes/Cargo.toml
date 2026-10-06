@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-driver-kubernetes"
+description = "Kubernetes compute driver for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno-driver-kubernetes"
+path = "src/main.rs"
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-isolation-interface = { path = "../ryno-isolation-interface" }
+ryno-sandbox-backend = { path = "../ryno-sandbox-backend" }
+ryno-otel = { path = "../ryno-otel" }
+ryno-policy = { path = "../ryno-policy" }
+
+opentelemetry = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+kube = { workspace = true }
+kube-runtime = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+notify = "8"
+rand = { workspace = true }
+rcgen = { workspace = true }
+
+[dev-dependencies]
+ryno-otel-test-support = { path = "../ryno-otel-test-support" }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

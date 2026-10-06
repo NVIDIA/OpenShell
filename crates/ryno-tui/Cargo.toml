@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-tui"
+description = "Ryno interactive TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-bootstrap = { path = "../ryno-bootstrap" }
+ryno-policy = { path = "../ryno-policy" }
+ryno-providers = { path = "../ryno-providers" }
+
+base64 = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+terminal-colorsaurus = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["tls-native-roots"] }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+serde = { workspace = true }
+url = { workspace = true }
+indexmap = { workspace = true }
+shell-words = { workspace = true }
+
+[lints]
+workspace = true

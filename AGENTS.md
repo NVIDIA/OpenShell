@@ -1,19 +1,19 @@
 # Agent Instructions
 
-This file is the primary instruction surface for agents contributing to OpenShell. It is injected into your context on every interaction — keep that in mind when proposing changes to it.
+This file is the primary instruction surface for agents contributing to Ryno. It is injected into your context on every interaction — keep that in mind when proposing changes to it.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, task reference, project structure, and the full agent skills table.
 
 ## Project Identity
 
-OpenShell is built agent-first. We design systems and use agents to implement them — this is not vibe coding. The product provides safe, sandboxed runtimes for autonomous AI agents, and the project itself is built using the same agent-driven workflows it enables.
+Ryno is built agent-first. We design systems and use agents to implement them — this is not vibe coding. The product provides safe, sandboxed runtimes for autonomous AI agents, and the project itself is built using the same agent-driven workflows it enables.
 
 ## Skills
 
-OpenShell has two skill collections:
+Ryno has two skill collections:
 
-- `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
-- `.agents/skills/` contains internal contributor and maintainer workflows for developing OpenShell. Your repository-aware harness can discover and load them natively.
+- `skills/` contains public, installable skills for using and operating Ryno. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
+- `.agents/skills/` contains internal contributor and maintainer workflows for developing Ryno. Your repository-aware harness can discover and load them natively.
 
 Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
@@ -21,52 +21,52 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 
 | Path | Components | Purpose |
 |------|-----------|---------|
-| `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
-| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
-| `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
-| `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
-| `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
-| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
-| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
-| `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
-| `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
-| `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
-| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
-| `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
-| `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
-| `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
-| `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
-| `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
-| `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
-| `crates/openshell-providers/` | Provider management | Credential provider backends |
-| `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
-| `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
-| `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
-| `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
-| `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
-| `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
-| `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
-| `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
-| `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
-| `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
-| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
-| `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
-| `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
-| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
-| `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
-| `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
-| `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `crates/ryno-cli/` | CLI binary | User-facing command-line interface |
+| `crates/ryno-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
+| `crates/ryno-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
+| `crates/ryno-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
+| `crates/ryno-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/ryno-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
+| `crates/ryno-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
+| `crates/ryno-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
+| `crates/ryno-sandbox-backend/` | Ryno sandbox backend | `RynoRuntimeBackend` and the authenticated Ryno Sandbox Protocol shared with `ryno-sandbox` |
+| `crates/ryno-policy/` | Policy engine | Filesystem, network, and process constraints |
+| `crates/ryno-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/ryno-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
+| `crates/ryno-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
+| `crates/ryno-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/ryno-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
+| `crates/ryno-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/ryno-core/` | Shared core | Common types, configuration, error handling |
+| `crates/ryno-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
+| `crates/ryno-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
+| `crates/ryno-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@ryno/sdk` |
+| `crates/ryno-providers/` | Provider management | Credential provider backends |
+| `crates/ryno-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
+| `crates/ryno-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for Ryno-managed K8s Secret storage |
+| `crates/ryno-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
+| `crates/ryno-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
+| `crates/ryno-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
+| `crates/ryno-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
+| `crates/ryno-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
+| `crates/ryno-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/ryno-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
+| `crates/ryno-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/ryno-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
+| `crates/ryno-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
+| `crates/ryno-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
+| `crates/ryno-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
+| `crates/ryno-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
+| `crates/ryno-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
+| `crates/ryno-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
+| `python/ryno/` | Python SDK | Python bindings and CLI packaging |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
-| `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
-| `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
+| `skills/` | Public agent skills | Installable workflows for using and operating Ryno |
+| `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing Ryno |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
 
 ## Public API Conventions
@@ -77,7 +77,7 @@ design, and schema evolution.
 
 ## Sandbox Logging (OCSF)
 
-When adding or modifying log emissions in `openshell-sandbox`, determine whether the event should use OCSF structured logging or plain `tracing`.
+When adding or modifying log emissions in `ryno-sandbox`, determine whether the event should use OCSF structured logging or plain `tracing`.
 
 ### When to use OCSF
 
@@ -126,7 +126,7 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 ### Example: adding a new network event
 
 ```rust
-use openshell_ocsf::{
+use ryno_ocsf::{
     ocsf_emit, NetworkActivityBuilder, ActivityId, ActionId,
     DispositionId, Endpoint, Process, SeverityId, StatusId,
 };
@@ -162,8 +162,8 @@ ocsf_emit!(event);
 
 - On latency-sensitive TCP streams, disable Nagle's algorithm so small
   request/response frames don't stall on delayed ACKs. Use
-  `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
-  already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
+  `ryno_core::net::set_tcp_nodelay_best_effort` on an accepted or
+  already-connected stream, or `ryno_core::net::connect_tcp_nodelay_best_effort`
   when dialing.
 - This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
   behavior, not wire latency.
@@ -181,11 +181,11 @@ ocsf_emit!(event);
 
 ## Go SDK (`sdk/go/`)
 
-- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
+- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/Ryno/sdk/go`.
 - Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
 - Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
-- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
-- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
+- Domain types in `sdk/go/ryno/v1/types/` must not import proto packages.
+- Converters in `sdk/go/ryno/v1/internal/converter/` deep-copy slices and maps at boundaries.
 - Tests use bufconn for in-process gRPC and testify for assertions.
 
 ## TypeScript SDK (`sdk/typescript/`)
@@ -193,7 +193,7 @@ ocsf_emit!(event);
 - Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
 - Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
 - Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
-- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
+- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/ryno-sdk/raw`.
 - The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
 
 ## Python
@@ -206,7 +206,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `ryno-cli`), update the `debug-ryno-cluster` skill in `skills/debug-ryno-cluster/SKILL.md` to reflect those changes.
 
 ## Skill Maintenance
 

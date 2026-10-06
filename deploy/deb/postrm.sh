@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# postrm for openshell.
+# postrm for ryno.
 set -e
 
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then

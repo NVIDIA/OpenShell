@@ -8,7 +8,7 @@
 use std::io::Write as _;
 use std::process::Stdio;
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 const BENCHMARK: &str = r#"
@@ -21,7 +21,7 @@ import statistics
 import time
 
 HOST = "example.com"
-ITERATIONS = int(os.environ.get("OPENSHELL_INET_PERF_ITERATIONS", "20"))
+ITERATIONS = int(os.environ.get("RYNO_INET_PERF_ITERATIONS", "20"))
 
 def percentile(values, fraction):
     values = sorted(values)
@@ -126,7 +126,7 @@ network_policies:
 async fn run_host_benchmark() -> Result<String, String> {
     let output = tokio::process::Command::new("python3")
         .args(["-c", BENCHMARK])
-        .env("OPENSHELL_INET_PERF_ITERATIONS", "20")
+        .env("RYNO_INET_PERF_ITERATIONS", "20")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -159,8 +159,8 @@ async fn benchmark_complete_internet_path() {
             .exec(&[
                 "sh",
                 "-c",
-                "OPENSHELL_INET_PERF_ITERATIONS=20 python3 -c \"$1\"",
-                "openshell-internet-perf",
+                "RYNO_INET_PERF_ITERATIONS=20 python3 -c \"$1\"",
+                "ryno-internet-perf",
                 BENCHMARK,
             ])
             .await

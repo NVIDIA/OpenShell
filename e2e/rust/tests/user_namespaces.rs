@@ -5,7 +5,7 @@
 
 //! E2E test: verify Kubernetes user namespace pod spec generation.
 //!
-//! Enables `OPENSHELL_ENABLE_USER_NAMESPACES` on the gateway, triggers sandbox
+//! Enables `RYNO_ENABLE_USER_NAMESPACES` on the gateway, triggers sandbox
 //! creation, and inspects the resulting pod spec to confirm:
 //!   1. `spec.hostUsers` is `false`
 //!   2. The container security context requests no added capabilities and
@@ -18,12 +18,12 @@
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openshell_e2e::harness::binary::openshell_cmd;
+use ryno_e2e::harness::binary::ryno_cmd;
 use tokio::process::Child;
 
 async fn kubectl(args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("docker")
-        .args(["exec", "openshell-cluster-openshell", "kubectl"])
+        .args(["exec", "ryno-cluster-ryno", "kubectl"])
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -42,17 +42,17 @@ async fn kubectl(args: &[&str]) -> Result<String, String> {
 
 async fn set_user_namespaces(enable: bool) -> Result<(), String> {
     let env_arg = if enable {
-        "OPENSHELL_ENABLE_USER_NAMESPACES=true"
+        "RYNO_ENABLE_USER_NAMESPACES=true"
     } else {
-        "OPENSHELL_ENABLE_USER_NAMESPACES-"
+        "RYNO_ENABLE_USER_NAMESPACES-"
     };
 
     kubectl(&[
         "set",
         "env",
-        "statefulset/openshell",
+        "statefulset/ryno",
         "-n",
-        "openshell",
+        "ryno",
         env_arg,
     ])
     .await?;
@@ -60,9 +60,9 @@ async fn set_user_namespaces(enable: bool) -> Result<(), String> {
     kubectl(&[
         "rollout",
         "status",
-        "statefulset/openshell",
+        "statefulset/ryno",
         "-n",
-        "openshell",
+        "ryno",
         "--timeout=120s",
     ])
     .await?;
@@ -74,7 +74,7 @@ async fn set_user_namespaces(enable: bool) -> Result<(), String> {
 }
 
 async fn delete_sandbox(name: &str) {
-    let _ = kubectl(&["delete", "sandbox", name, "-n", "openshell"]).await;
+    let _ = kubectl(&["delete", "sandbox", name, "-n", "ryno"]).await;
 }
 
 fn unique_sandbox_name() -> String {
@@ -98,7 +98,7 @@ async fn wait_for_sandbox(name: &str, timeout_secs: u64) -> Result<(), String> {
             "sandbox",
             name,
             "-n",
-            "openshell",
+            "ryno",
             "-o",
             "jsonpath={.metadata.name}",
         ])
@@ -125,7 +125,7 @@ async fn wait_for_sandbox_pod(name: &str, timeout_secs: u64) -> Result<(), Strin
             "pod",
             name,
             "-n",
-            "openshell",
+            "ryno",
             "-o",
             "jsonpath={.metadata.name}",
         ])
@@ -143,19 +143,19 @@ async fn wait_for_sandbox_pod(name: &str, timeout_secs: u64) -> Result<(), Strin
 }
 
 // Disabled by default — not reachable from any project-controlled cluster
-// and brittle by design. See https://github.com/NVIDIA/OpenShell/issues/1597
+// and brittle by design. See https://github.com/NVIDIA/Ryno/issues/1597
 // for the tracking issue context. Re-enable with `cargo test -- --ignored`
 // after the issues below are addressed.
 //
 // Blocking issues:
-//   1. `kubectl` is invoked as `docker exec openshell-cluster-openshell kubectl`.
+//   1. `kubectl` is invoked as `docker exec ryno-cluster-ryno kubectl`.
 //      No setup in the repo (helm-k3s-local.sh, e2e/with-kube-gateway.sh, the
 //      CI kind workflow) creates a docker container with that name; only an
 //      external OpenShift/manual setup matches it.
 //   2. The test mutates the gateway StatefulSet via `kubectl set env`, which
 //      triggers a pod rollout mid-test. The wrapper's `kubectl port-forward`
 //      to the old pod is disrupted during the rollout, and the test's
-//      `openshell sandbox create` is spawned without capturing stderr, so
+//      `ryno sandbox create` is spawned without capturing stderr, so
 //      transient connection failures surface as a generic "sandbox did not
 //      appear within 60s" with no actionable signal.
 #[ignore = "broken: hardcoded docker exec container name + brittle mid-test gateway rollout (see header)"]
@@ -171,7 +171,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
     // Start sandbox creation in the background. The pod may never become
     // ready in DinD environments, so we spawn the CLI and inspect the pod
     // spec independently.
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("sandbox")
         .arg("create")
         .arg("--name")
@@ -181,7 +181,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         .arg("infinity");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().expect("failed to spawn openshell create");
+    let mut child = cmd.spawn().expect("failed to spawn ryno create");
 
     if let Err(e) = wait_for_sandbox(&sandbox_name, 60).await {
         stop_child(&mut child).await;
@@ -204,7 +204,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         "pod",
         &sandbox_name,
         "-n",
-        "openshell",
+        "ryno",
         "-o",
         "jsonpath={.spec.hostUsers}",
     ])
@@ -216,7 +216,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         "pod",
         &sandbox_name,
         "-n",
-        "openshell",
+        "ryno",
         "-o",
         "jsonpath={.spec.containers[?(@.name=='agent')].securityContext.capabilities.add}",
     ])
@@ -226,7 +226,7 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         "pod",
         &sandbox_name,
         "-n",
-        "openshell",
+        "ryno",
         "-o",
         "jsonpath={.spec.containers[?(@.name=='agent')].securityContext.capabilities.drop}",
     ])

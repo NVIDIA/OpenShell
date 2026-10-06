@@ -34,7 +34,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -144,9 +144,9 @@ jobs:
       fail-on-codex-findings: true
       fail-on-static-findings: false
       images: |
-        ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
-        ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
-        ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/ryno/gateway:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/ryno/sandbox:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/ryno/supervisor:${{ needs.compute-versions.outputs.source_sha }}
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -210,7 +210,7 @@ jobs:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   vm-e2e:
     needs: [compute-versions, build-binaries, build-vm-driver]
@@ -221,7 +221,7 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   protobuf-compatibility:
     name: Protobuf Compatibility
@@ -323,13 +323,13 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: ${{ needs.compute-versions.outputs.python_version }}
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RYNO: ${{ needs.compute-versions.outputs.python_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -507,29 +507,29 @@ jobs:
           set -euo pipefail
           cd release
           sha256sum -- \
-            openshell-x86_64-unknown-linux-musl.tar.gz \
-            openshell-aarch64-unknown-linux-musl.tar.gz \
-            openshell-aarch64-apple-darwin.tar.gz \
-            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
-            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
-            openshell_*.deb \
-            openshell-*.rpm \
-            *.whl > openshell-checksums-sha256.txt
-          cat openshell-checksums-sha256.txt
+            ryno-x86_64-unknown-linux-musl.tar.gz \
+            ryno-aarch64-unknown-linux-musl.tar.gz \
+            ryno-aarch64-apple-darwin.tar.gz \
+            ryno-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            ryno-driver-vm-aarch64-apple-darwin.tar.gz \
+            ryno_*.deb \
+            ryno-*.rpm \
+            *.whl > ryno-checksums-sha256.txt
+          cat ryno-checksums-sha256.txt
           sha256sum -- \
-            openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
-            openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
-          cat openshell-gateway-checksums-sha256.txt
+            ryno-gateway-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-gateway-aarch64-unknown-linux-gnu.tar.gz \
+            ryno-gateway-aarch64-apple-darwin.tar.gz > ryno-gateway-checksums-sha256.txt
+          cat ryno-gateway-checksums-sha256.txt
           sha256sum -- \
-            openshell-sandbox-x86_64-unknown-linux-musl.tar.gz \
-            openshell-sandbox-aarch64-unknown-linux-musl.tar.gz > openshell-sandbox-checksums-sha256.txt
-          cat openshell-sandbox-checksums-sha256.txt
+            ryno-sandbox-x86_64-unknown-linux-musl.tar.gz \
+            ryno-sandbox-aarch64-unknown-linux-musl.tar.gz > ryno-sandbox-checksums-sha256.txt
+          cat ryno-sandbox-checksums-sha256.txt
           sha256sum -- \
-            openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz > openshell-supervisor-checksums-sha256.txt
-          cat openshell-supervisor-checksums-sha256.txt
+            ryno-supervisor-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-supervisor-aarch64-unknown-linux-gnu.tar.gz > ryno-supervisor-checksums-sha256.txt
+          cat ryno-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
         run: |
@@ -537,8 +537,8 @@ jobs:
           python3 tasks/scripts/release.py generate-homebrew-formula \
             --release-tag "${RELEASE_TAG}" \
             --release-dir release \
-            --output release/openshell.rb
-          cat release/openshell.rb
+            --output release/ryno.rb
+          cat release/ryno.rb
 
       - name: Attest release artifacts
         id: attest
@@ -567,7 +567,7 @@ jobs:
               throw err;
             }
             for (const asset of release.data.assets) {
-              if (asset.name === 'openshell-driver-vm-checksums-sha256.txt') {
+              if (asset.name === 'ryno-driver-vm-checksums-sha256.txt') {
                 core.info(`Deleting removed VM checksum asset: ${asset.name}`);
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
               }
@@ -577,55 +577,55 @@ jobs:
         if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          name: OpenShell ${{ env.RELEASE_TAG }}
+          name: Ryno ${{ env.RELEASE_TAG }}
           prerelease: false
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           body: |
-            ## OpenShell ${{ env.RELEASE_TAG }}
+            ## Ryno ${{ env.RELEASE_TAG }}
 
             ### Quick install
 
             ```bash
-            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
+            curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | RYNO_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
           files: |
-            release/openshell-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-aarch64-apple-darwin.tar.gz
-            release/openshell_*.deb
-            release/openshell-*.rpm
+            release/ryno-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-aarch64-apple-darwin.tar.gz
+            release/ryno_*.deb
+            release/ryno-*.rpm
             release/*.snap
-            release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-gateway-aarch64-apple-darwin.tar.gz
-            release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
-            release/openshell-prover-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-prover-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-prover-aarch64-apple-darwin.tar.gz
+            release/ryno-gateway-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-gateway-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-gateway-aarch64-apple-darwin.tar.gz
+            release/ryno-sandbox-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-sandbox-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-supervisor-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-apple-darwin.tar.gz
+            release/ryno-prover-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-prover-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-prover-aarch64-apple-darwin.tar.gz
             release/*.whl
-            release/openshell.rb
-            release/openshell-checksums-sha256.txt
-            release/openshell-gateway-checksums-sha256.txt
-            release/openshell-sandbox-checksums-sha256.txt
-            release/openshell-supervisor-checksums-sha256.txt
-            release/openshell-prover-checksums-sha256.txt
+            release/ryno.rb
+            release/ryno-checksums-sha256.txt
+            release/ryno-gateway-checksums-sha256.txt
+            release/ryno-sandbox-checksums-sha256.txt
+            release/ryno-supervisor-checksums-sha256.txt
+            release/ryno-prover-checksums-sha256.txt
 
       - name: Upload amd64 Debian prerelease package
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}-linux-amd64-deb
+          name: ryno-${{ env.RELEASE_TAG }}-linux-amd64-deb
           path: |
-            release/openshell_*_amd64.deb
-            release/openshell-checksums-sha256.txt
+            release/ryno_*_amd64.deb
+            release/ryno-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 
@@ -633,10 +633,10 @@ jobs:
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}-linux-arm64-deb
+          name: ryno-${{ env.RELEASE_TAG }}-linux-arm64-deb
           path: |
-            release/openshell_*_arm64.deb
-            release/openshell-checksums-sha256.txt
+            release/ryno_*_arm64.deb
+            release/ryno-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 
@@ -644,10 +644,10 @@ jobs:
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}-linux-x86_64-rpm
+          name: ryno-${{ env.RELEASE_TAG }}-linux-x86_64-rpm
           path: |
-            release/openshell-*.x86_64.rpm
-            release/openshell-checksums-sha256.txt
+            release/ryno-*.x86_64.rpm
+            release/ryno-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 
@@ -655,10 +655,10 @@ jobs:
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}-linux-aarch64-rpm
+          name: ryno-${{ env.RELEASE_TAG }}-linux-aarch64-rpm
           path: |
-            release/openshell-*.aarch64.rpm
-            release/openshell-checksums-sha256.txt
+            release/ryno-*.aarch64.rpm
+            release/ryno-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 
@@ -666,16 +666,16 @@ jobs:
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}-macos-arm64
+          name: ryno-${{ env.RELEASE_TAG }}-macos-arm64
           path: |
-            release/openshell-aarch64-apple-darwin.tar.gz
-            release/openshell-gateway-aarch64-apple-darwin.tar.gz
-            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
-            release/openshell-prover-aarch64-apple-darwin.tar.gz
-            release/openshell.rb
-            release/openshell-checksums-sha256.txt
-            release/openshell-gateway-checksums-sha256.txt
-            release/openshell-prover-checksums-sha256.txt
+            release/ryno-aarch64-apple-darwin.tar.gz
+            release/ryno-gateway-aarch64-apple-darwin.tar.gz
+            release/ryno-driver-vm-aarch64-apple-darwin.tar.gz
+            release/ryno-prover-aarch64-apple-darwin.tar.gz
+            release/ryno.rb
+            release/ryno-checksums-sha256.txt
+            release/ryno-gateway-checksums-sha256.txt
+            release/ryno-prover-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 
@@ -702,7 +702,7 @@ jobs:
           VERSION: ${{ needs.compute-versions.outputs.semver }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          REGISTRY="ghcr.io/nvidia/ryno"
           for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
@@ -768,12 +768,12 @@ jobs:
           VERSION: ${{ needs.compute-versions.outputs.semver }}
         run: |
           set -euo pipefail
-          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          ref="ghcr.io/nvidia/ryno/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           oras push "${ref}" \
-            --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
+            --artifact-type application/vnd.nvidia.ryno.qualification.v1 \
             --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
             --annotation "org.opencontainers.image.version=${VERSION}" \
-            qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
+            qualification-summary.json:application/vnd.nvidia.ryno.qualification.summary.v1+json
 
           echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
 
@@ -805,7 +805,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -833,7 +833,7 @@ jobs:
 
       - name: Publish
         env:
-          OPENSHELL_NPM_VERSION: ${{ needs.compute-versions.outputs.npm_version }}
+          RYNO_NPM_VERSION: ${{ needs.compute-versions.outputs.npm_version }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mise run sdk:ts:publish
 

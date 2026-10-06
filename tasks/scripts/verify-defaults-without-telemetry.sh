@@ -22,9 +22,9 @@ set -euo pipefail
 # Crates that define the alias. Each must forward `telemetry` and define
 # `defaults-without-telemetry`.
 CRATES=(
-  openshell-gateway
-  openshell-supervisor
-  openshell-driver-vm
+  ryno-gateway
+  ryno-supervisor
+  ryno-driver-vm
 )
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -67,7 +67,7 @@ for crate in "${CRATES[@]}"; do
 done
 
 # Additive misuse must be a hard error. Match on the `compile_error!` text
-# rather than a nonzero exit code: openshell-driver-vm does not build on every
+# rather than a nonzero exit code: ryno-driver-vm does not build on every
 # host, and a check that failed for an unrelated reason would make this guard
 # silently vacuous.
 for crate in "${CRATES[@]}"; do

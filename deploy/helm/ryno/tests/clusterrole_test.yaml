@@ -1,0 +1,204 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: ClusterRole RBAC
+templates:
+  - templates/clusterrole.yaml
+release:
+  name: ryno
+  namespace: my-namespace
+
+tests:
+  - it: includes the release namespace in the ClusterRole name
+    asserts:
+      - equal:
+          path: metadata.name
+          value: ryno-node-reader-my-namespace
+
+  - it: grants managed namespace NetworkPolicy apply permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
+  - it: limits namespaced admission reads to PVCs
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.drivers.kubernetes.allowDriverConfig: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: omits PVC admission reads when caller driver config is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+
+  - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      networkPolicy.enabled: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
+  - it: omits credential Secret access in managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "patch", "delete"]
+
+  - it: omits all Secret rules in operator mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.tls.clientTlsSecretName: custom-client-tls
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
+
+  - it: names no Secrets in managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.tls.clientTlsSecretName: custom-client-tls
+      server.sandboxImagePullSecrets:
+        - name: registry-one
+        - name: registry-two
+    asserts:
+      - notExists:
+          path: rules[*].resourceNames
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+
+  - it: omits secrets rule entirely in shared mode
+    set:
+      server.drivers.kubernetes.workspaceMode: shared
+    asserts:
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
+
+  - it: grants managed sandbox-runtime companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+
+  - it: grants operator sandbox-runtime companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+  - it: omits the ClusterRole when cluster-scoped RBAC is disabled
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the ClusterRole when all chart-managed RBAC is disabled
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the ClusterRole independently of the workspace mode
+    set:
+      rbac.clusterScoped.create: false
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: uses the configured ClusterRole name
+    set:
+      rbac.clusterScoped.clusterRoleName: platform-ryno-node-reader
+    asserts:
+      - equal:
+          path: metadata.name
+          value: platform-ryno-node-reader
+
+  - it: creates the ClusterRole when legacy values omit the rbac block
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: ryno-node-reader-my-namespace

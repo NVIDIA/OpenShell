@@ -128,7 +128,7 @@ MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
 UPSTREAM_LOG="$LOG_DIR/upstream.log"
 SANDBOX_LOG="$LOG_DIR/sandbox.log"
 RUN_ID="content-guard-smoke-$$-$RANDOM"
-SUPERVISOR_IMAGE="localhost/openshell-content-guard/supervisor:$RUN_ID"
+SUPERVISOR_IMAGE="localhost/ryno-content-guard/supervisor:$RUN_ID"
 # Sandbox names are capped at 19 characters. Use a short prefix with
 # the PID for uniqueness; keep the full RUN_ID for gateway identity.
 SANDBOX_NAME="cg-$$-$RANDOM"
@@ -216,26 +216,26 @@ GATEWAY_ENDPOINT="http://127.0.0.1:$GATEWAY_PORT"
 
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
 
-[[openshell.supervisor.middleware]]
+[[ryno.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://$SERVICE_HOST:$MIDDLEWARE_PORT"
 allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 
-[openshell.drivers.$COMPUTE_DRIVER]
+[ryno.drivers.$COMPUTE_DRIVER]
 supervisor_image = "$SUPERVISOR_IMAGE"
 EOF
 }
@@ -380,7 +380,7 @@ start_gateway() {
     driver_args=(--compute-driver "$COMPUTE_DRIVER")
   fi
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS -u OPENSHELL_COMPUTE_DRIVER "$GATEWAY_BIN" \
+  env -u RYNO_DRIVERS -u RYNO_COMPUTE_DRIVER "$GATEWAY_BIN" \
     "${driver_args[@]}" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
@@ -413,7 +413,7 @@ wait_for_gateway() {
 create_sandbox() {
   CLI=(
     env
-    -u OPENSHELL_SANDBOX_POLICY
+    -u RYNO_SANDBOX_POLICY
     "$CLI_BIN"
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
@@ -434,7 +434,7 @@ request() {
 response_request() {
   local path="$1"
   "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
-    curl -sS -i --max-time 20 "http://host.openshell.internal:18081/$path"
+    curl -sS -i --max-time 20 "http://host.ryno.internal:18081/$path"
 }
 
 run_suite() {
@@ -543,20 +543,20 @@ require_command uv
 require_command mise
 ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
 EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
-GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
-CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
+GATEWAY_BIN="$ROOT_TARGET_DIR/debug/ryno-gateway"
+CLI_BIN="$ROOT_TARGET_DIR/debug/ryno"
 MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
-run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
+run_setup_step "building gateway" cargo build --quiet -p ryno-gateway --bin ryno-gateway
 # Always rebuild from this checkout and load into the selected runtime. Native
 # macOS binaries cannot run in Linux sandboxes; Podman also needs an image.
 # A unique tag prevents the driver from selecting an older published runtime.
 run_setup_step "building Linux sandbox supervisor image" \
   env -u CI -u DOCKER_PLATFORM -u DOCKER_PUSH -u DOCKER_OUTPUT \
   CONTAINER_ENGINE="$COMPUTE_DRIVER" PREBUILT_AUTO_STAGE=1 \
-  IMAGE_REGISTRY=localhost/openshell-content-guard IMAGE_TAG="$RUN_ID" \
+  IMAGE_REGISTRY=localhost/ryno-content-guard IMAGE_TAG="$RUN_ID" \
   mise run docker:build:supervisor
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
-run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
+run_setup_step "building CLI" cargo build --quiet -p ryno-cli --bin ryno
 generate_gateway_jwt_bundle
 start_upstream
 wait_for_upstream

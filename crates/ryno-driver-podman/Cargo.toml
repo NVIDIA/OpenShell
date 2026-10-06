@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-driver-podman"
+description = "Podman compute driver for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno-driver-podman"
+path = "src/main.rs"
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false, features = ["driver-extraction"] }
+ryno-otel = { path = "../ryno-otel" }
+ryno-isolation-interface = { path = "../ryno-isolation-interface" }
+ryno-sandbox-backend = { path = "../ryno-sandbox-backend" }
+tar = "0.4"
+uuid = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost-types = { workspace = true }
+clap = { workspace = true }
+nix = { workspace = true }
+rustix = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+ryno-otel-test-support = { path = "../ryno-otel-test-support" }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+prost-types = { workspace = true }
+temp-env = "0.3"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

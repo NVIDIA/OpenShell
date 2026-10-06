@@ -41,12 +41,12 @@ let
     }
     .${stdenv.hostPlatform.system};
   archive = fetchurl {
-    url = "https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-${runtime.platform}.tar.zst";
+    url = "https://github.com/NVIDIA/Ryno/releases/download/vm-runtime/vm-runtime-${runtime.platform}.tar.zst";
     inherit (runtime) hash;
   };
 in
 stdenv.mkDerivation {
-  name = "openshell-vm-runtime-${runtime.platform}";
+  name = "ryno-vm-runtime-${runtime.platform}";
 
   nativeBuildInputs = [ zstd ];
   dontUnpack = true;

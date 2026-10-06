@@ -21,8 +21,8 @@ json_status_response() {
 
 case "$cmd" in
     check-skill)
-        test -f /etc/openshell/skills/policy_advisor.md
-        sed -n '1,40p' /etc/openshell/skills/policy_advisor.md
+        test -f /etc/ryno/skills/policy_advisor.md
+        sed -n '1,40p' /etc/ryno/skills/policy_advisor.md
         ;;
 
     current-policy)
@@ -46,16 +46,16 @@ import json
 import sys
 
 branch, run_id = sys.argv[1:3]
-content = f"""# OpenShell policy advisor demo
+content = f"""# Ryno policy advisor demo
 
 Run id: {run_id}
 
-This file was written from inside an OpenShell sandbox after an agent-authored
+This file was written from inside an Ryno sandbox after an agent-authored
 policy proposal was approved.
 """
 
 payload = {
-    "message": f"docs: add OpenShell policy advisor demo note {run_id}",
+    "message": f"docs: add Ryno policy advisor demo note {run_id}",
     "branch": branch,
     "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
 }

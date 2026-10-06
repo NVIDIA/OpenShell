@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_conformance::OpenShellRunner;
+use ryno_conformance::RynoRunner;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ struct ComputeDriverCapabilities {
 /// This interrogates the running gateway rather than accepting a runner
 /// environment variable. A driver-specific suite must fail, rather than skip,
 /// when it is pointed at the wrong gateway.
-pub async fn assert_podman_gateway(runner: &OpenShellRunner) -> Result<(), String> {
+pub async fn assert_podman_gateway(runner: &RynoRunner) -> Result<(), String> {
     let result = runner
         .step("preflight/driver-podman")
         .description("gateway reports Podman as its only compute driver")

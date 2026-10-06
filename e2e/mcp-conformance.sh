@@ -7,23 +7,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh disable=SC1091
 source "${ROOT}/e2e/support/gateway-common.sh"
-CONFORMANCE_DIR="${OPENSHELL_MCP_CONFORMANCE_DIR:-${ROOT}/.cache/mcp-conformance}"
+CONFORMANCE_DIR="${RYNO_MCP_CONFORMANCE_DIR:-${ROOT}/.cache/mcp-conformance}"
 # Pinned after v0.1.16 for the upstream tools_call fixture fix. The current
 # checkout still needs temporary client-fixture patches for
 # modelcontextprotocol/conformance#345; remove patch_conformance_clients when
-# OPENSHELL_MCP_CONFORMANCE_REF points at a release containing those fixes.
-CONFORMANCE_REF="${OPENSHELL_MCP_CONFORMANCE_REF:-b9041ea41b0188581803459dbae71bc7e02fd995}"
-CLIENT_IMAGE="${OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE:-openshell-mcp-conformance-client:local}"
-SCENARIOS="${OPENSHELL_MCP_CONFORMANCE_SCENARIOS:-}"
-SPEC_VERSION="${OPENSHELL_MCP_CONFORMANCE_SPEC_VERSION:-2025-11-25}"
-TIMEOUT_MS="${OPENSHELL_MCP_CONFORMANCE_TIMEOUT_MS:-900000}"
-FORCE_REBUILD="${OPENSHELL_MCP_CONFORMANCE_FORCE_REBUILD:-0}"
-DOCKER_PULL="${OPENSHELL_MCP_CONFORMANCE_DOCKER_PULL:-0}"
-CLIENT_IMAGE_REF_LABEL="org.openshell.mcp-conformance.ref"
-CLIENT_IMAGE_DOCKERFILE_LABEL="org.openshell.mcp-conformance.dockerfile"
-CLIENT_IMAGE_DOCKERIGNORE_LABEL="org.openshell.mcp-conformance.dockerignore"
-CLIENT_IMAGE_FIXTURE_HASH_LABEL="org.openshell.mcp-conformance.fixture-hash"
-RUN_SCENARIOS_COMMAND="__openshell_mcp_run_scenarios"
+# RYNO_MCP_CONFORMANCE_REF points at a release containing those fixes.
+CONFORMANCE_REF="${RYNO_MCP_CONFORMANCE_REF:-b9041ea41b0188581803459dbae71bc7e02fd995}"
+CLIENT_IMAGE="${RYNO_MCP_CONFORMANCE_CLIENT_IMAGE:-ryno-mcp-conformance-client:local}"
+SCENARIOS="${RYNO_MCP_CONFORMANCE_SCENARIOS:-}"
+SPEC_VERSION="${RYNO_MCP_CONFORMANCE_SPEC_VERSION:-2025-11-25}"
+TIMEOUT_MS="${RYNO_MCP_CONFORMANCE_TIMEOUT_MS:-900000}"
+FORCE_REBUILD="${RYNO_MCP_CONFORMANCE_FORCE_REBUILD:-0}"
+DOCKER_PULL="${RYNO_MCP_CONFORMANCE_DOCKER_PULL:-0}"
+CLIENT_IMAGE_REF_LABEL="org.ryno.mcp-conformance.ref"
+CLIENT_IMAGE_DOCKERFILE_LABEL="org.ryno.mcp-conformance.dockerfile"
+CLIENT_IMAGE_DOCKERIGNORE_LABEL="org.ryno.mcp-conformance.dockerignore"
+CLIENT_IMAGE_FIXTURE_HASH_LABEL="org.ryno.mcp-conformance.fixture-hash"
+RUN_SCENARIOS_COMMAND="__ryno_mcp_run_scenarios"
 CLIENT_SANDBOX_MANAGED=0
 HOST_BRIDGE_PID=""
 HOST_BRIDGE_LOG=""
@@ -35,7 +35,7 @@ RUNNER_CONTAINER=""
 # SPEC_VERSION. To refresh this list after changing either value, list the
 # scenarios from the built client image:
 #
-#   docker run --rm openshell-mcp-conformance-client:local \
+#   docker run --rm ryno-mcp-conformance-client:local \
 #     ./node_modules/.bin/tsx src/index.ts list --client --spec-version 2025-11-25
 #
 # Then confirm each scenario has a compatible handler in the pinned
@@ -71,7 +71,7 @@ checkout_conformance() {
 
   if [ ! -d "${CONFORMANCE_DIR}/.git" ]; then
     echo "ERROR: ${CONFORMANCE_DIR} exists but is not a git checkout." >&2
-    echo "       Set OPENSHELL_MCP_CONFORMANCE_DIR to another path or remove the directory." >&2
+    echo "       Set RYNO_MCP_CONFORMANCE_DIR to another path or remove the directory." >&2
     exit 2
   fi
 
@@ -99,15 +99,15 @@ docker_image_label() {
     "${image}" 2>/dev/null || true
 }
 
-openshell_bin() {
-  if [ -n "${OPENSHELL_BIN:-}" ]; then
-    printf '%s\n' "${OPENSHELL_BIN}"
+ryno_bin() {
+  if [ -n "${RYNO_BIN:-}" ]; then
+    printf '%s\n' "${RYNO_BIN}"
     return
   fi
 
   local target_dir
   target_dir="$(e2e_cargo_target_dir "${ROOT}")"
-  printf '%s\n' "${target_dir}/debug/openshell"
+  printf '%s\n' "${target_dir}/debug/ryno"
 }
 
 patch_conformance_clients() {
@@ -173,11 +173,11 @@ NODE
 
 start_host_bridge() {
   local port=$1
-  local openshell runner_ip
+  local ryno runner_ip
   HOST_BRIDGE_LOG="${ROOT}/.cache/mcp-conformance/host-bridge.log"
   mkdir -p "$(dirname "${HOST_BRIDGE_LOG}")"
 
-  if ! openshell="$(openshell_bin)"; then
+  if ! ryno="$(ryno_bin)"; then
     return 1
   fi
   if ! runner_ip="$(runner_container_ip)"; then
@@ -186,15 +186,15 @@ start_host_bridge() {
 
   RUNNER_CONTAINER_IP="${runner_ip}"
   HOST_BRIDGE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-  OPENSHELL_BIN="${openshell}" \
-    OPENSHELL_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
-    OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN="${HOST_BRIDGE_TOKEN}" \
+  RYNO_BIN="${ryno}" \
+    RYNO_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
+    RYNO_MCP_CONFORMANCE_BRIDGE_TOKEN="${HOST_BRIDGE_TOKEN}" \
     python3 "${ROOT}/e2e/mcp-conformance/host-bridge.py" \
     "${port}" "${ROOT}" "${HOST_BRIDGE_LOG}" &
   HOST_BRIDGE_PID=$!
 
   local deadline
-  deadline=$((SECONDS + ${OPENSHELL_MCP_CONFORMANCE_HOST_BRIDGE_START_TIMEOUT_SECONDS:-10}))
+  deadline=$((SECONDS + ${RYNO_MCP_CONFORMANCE_HOST_BRIDGE_START_TIMEOUT_SECONDS:-10}))
   until python3 - "${port}" <<'PY'
 import socket
 import sys
@@ -220,28 +220,28 @@ PY
 
 # Resolve the hostname the runner container uses to reach the host bridge.
 # In CI, e2e/with-docker-gateway.sh connects the job container (which hosts the
-# bridge) to the e2e Docker network with the host.openshell.internal alias. On
+# bridge) to the e2e Docker network with the host.ryno.internal alias. On
 # local Docker Desktop, host.docker.internal reaches the host. On local Linux,
 # the runner container is started with --add-host ...:host-gateway.
 host_bridge_hostname() {
-  if [ -n "${OPENSHELL_MCP_CONFORMANCE_HOST_BRIDGE_HOSTNAME:-}" ]; then
-    printf '%s\n' "${OPENSHELL_MCP_CONFORMANCE_HOST_BRIDGE_HOSTNAME}"
+  if [ -n "${RYNO_MCP_CONFORMANCE_HOST_BRIDGE_HOSTNAME:-}" ]; then
+    printf '%s\n' "${RYNO_MCP_CONFORMANCE_HOST_BRIDGE_HOSTNAME}"
     return
   fi
 
   if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    printf '%s\n' "host.openshell.internal"
+    printf '%s\n' "host.ryno.internal"
   elif [ "$(uname -s)" = "Darwin" ]; then
     printf '%s\n' "host.docker.internal"
   else
-    printf '%s\n' "host.openshell.internal"
+    printf '%s\n' "host.ryno.internal"
   fi
 }
 
 runner_container_ip() {
   local network ip
 
-  network="${OPENSHELL_E2E_DOCKER_NETWORK_NAME:-${OPENSHELL_E2E_NETWORK_NAME:-}}"
+  network="${RYNO_E2E_DOCKER_NETWORK_NAME:-${RYNO_E2E_NETWORK_NAME:-}}"
   if [ -z "${network}" ]; then
     echo "ERROR: no e2e Docker network resolved for the MCP conformance runner container." >&2
     return 1
@@ -314,15 +314,15 @@ build_client_image() {
 }
 
 create_client_sandbox() {
-  if [ -n "${OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX:-}" ]; then
-    echo "Using existing MCP conformance client sandbox ${OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX}." >&2
+  if [ -n "${RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX:-}" ]; then
+    echo "Using existing MCP conformance client sandbox ${RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX}." >&2
     return
   fi
 
-  local sandbox_name policy_file openshell
+  local sandbox_name policy_file ryno
   sandbox_name="mcp-client-$$"
-  policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.yaml")"
-  openshell="$(openshell_bin)"
+  policy_file="$(mktemp "${TMPDIR:-/tmp}/ryno-mcp-conformance-base-policy.XXXXXX.yaml")"
+  ryno="$(ryno_bin)"
 
   # The upstream runner binds its per-scenario test server with listen(0), and
   # the port can be outside the OS ephemeral range. Create the reusable sandbox
@@ -334,7 +334,7 @@ create_client_sandbox() {
     "${SPEC_VERSION}" >/dev/null
 
   echo "Creating MCP conformance client sandbox ${sandbox_name}..." >&2
-  if ! "${openshell}" sandbox create \
+  if ! "${ryno}" sandbox create \
     --name "${sandbox_name}" \
     --from "${CLIENT_IMAGE}" \
     --policy "${policy_file}" \
@@ -346,8 +346,8 @@ create_client_sandbox() {
   fi
   rm -f "${policy_file}"
 
-  export OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX="${sandbox_name}"
-  export OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT="${OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT:-1}"
+  export RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX="${sandbox_name}"
+  export RYNO_MCP_CONFORMANCE_POLICY_WAIT="${RYNO_MCP_CONFORMANCE_POLICY_WAIT:-1}"
   CLIENT_SANDBOX_MANAGED=1
 }
 
@@ -356,34 +356,34 @@ cleanup_client_sandbox() {
     return
   fi
 
-  local openshell
-  openshell="$(openshell_bin)"
-  echo "Deleting MCP conformance client sandbox ${OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX}..." >&2
-  "${openshell}" sandbox delete "${OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX}" >/dev/null 2>&1 || true
+  local ryno
+  ryno="$(ryno_bin)"
+  echo "Deleting MCP conformance client sandbox ${RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX}..." >&2
+  "${ryno}" sandbox delete "${RYNO_MCP_CONFORMANCE_CLIENT_SANDBOX}" >/dev/null 2>&1 || true
 }
 
 # Start the upstream conformance runner in a plain Docker container on the e2e
 # network. The runner runs node (and the bundled MCP test server) off the host
-# for isolation, but unlike an OpenShell sandbox it has an ordinary,
+# for isolation, but unlike an Ryno sandbox it has an ordinary,
 # externally-routable network address: its listen(0) test server is reachable
 # from the client sandbox, and it can call the host bridge back directly.
 create_runner_container() {
   local network
   local -a add_host_args=()
 
-  network="${OPENSHELL_E2E_DOCKER_NETWORK_NAME:-${OPENSHELL_E2E_NETWORK_NAME:-}}"
+  network="${RYNO_E2E_DOCKER_NETWORK_NAME:-${RYNO_E2E_NETWORK_NAME:-}}"
   if [ -z "${network}" ]; then
     echo "ERROR: no e2e Docker network resolved for the MCP conformance runner container." >&2
     return 1
   fi
 
-  RUNNER_CONTAINER="openshell-mcp-runner-$$"
+  RUNNER_CONTAINER="ryno-mcp-runner-$$"
 
   # On local Linux the host bridge runs on the host, so map the bridge hostnames
   # to the Docker host gateway. CI (job-container network alias) and Docker
   # Desktop resolve these names without an explicit mapping.
   if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ "$(uname -s)" != "Darwin" ]; then
-    add_host_args=(--add-host "host.openshell.internal:host-gateway" --add-host "host.docker.internal:host-gateway")
+    add_host_args=(--add-host "host.ryno.internal:host-gateway" --add-host "host.docker.internal:host-gateway")
   fi
 
   echo "Starting MCP conformance runner container ${RUNNER_CONTAINER} on Docker network ${network}..." >&2
@@ -397,7 +397,7 @@ create_runner_container() {
     return 1
   fi
 
-  if ! docker cp "${ROOT}/e2e/mcp-conformance/runner-shim.mjs" "${RUNNER_CONTAINER}:/tmp/openshell-mcp-runner-shim.mjs" \
+  if ! docker cp "${ROOT}/e2e/mcp-conformance/runner-shim.mjs" "${RUNNER_CONTAINER}:/tmp/ryno-mcp-runner-shim.mjs" \
     || ! docker cp "${ROOT}/e2e/mcp-conformance/expected-failures.yml" "${RUNNER_CONTAINER}:/tmp/expected-failures.yml"; then
     return 1
   fi
@@ -452,7 +452,7 @@ run_scenarios_in_runner_container() {
       --env "MCP_CONFORMANCE_HOST_BRIDGE_TOKEN=${HOST_BRIDGE_TOKEN}" \
       --env "MCP_CONFORMANCE_RUNNER_IP=${RUNNER_CONTAINER_IP}" \
       "${RUNNER_CONTAINER}" \
-      sh -c 'cd /opt/mcp-conformance && exec node dist/index.js client --command "node /tmp/openshell-mcp-runner-shim.mjs" --scenario "$1" --spec-version "$2" --expected-failures "$3" --timeout "$4"' \
+      sh -c 'cd /opt/mcp-conformance && exec node dist/index.js client --command "node /tmp/ryno-mcp-runner-shim.mjs" --scenario "$1" --spec-version "$2" --expected-failures "$3" --timeout "$4"' \
       sh "${scenario}" "${SPEC_VERSION}" "/tmp/expected-failures.yml" "${TIMEOUT_MS}" \
       </dev/null; then
       passed+=("${scenario}")
@@ -487,8 +487,8 @@ run_scenarios_with_client_sandbox() {
 }
 
 run_scenarios_under_gateway() {
-  export OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE="${CLIENT_IMAGE}"
-  export OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${CLIENT_IMAGE}}"
+  export RYNO_MCP_CONFORMANCE_CLIENT_IMAGE="${CLIENT_IMAGE}"
+  export RYNO_E2E_DOCKER_SANDBOX_IMAGE="${RYNO_E2E_DOCKER_SANDBOX_IMAGE:-${CLIENT_IMAGE}}"
 
   "${ROOT}/e2e/with-docker-gateway.sh" bash "${BASH_SOURCE[0]}" "${RUN_SCENARIOS_COMMAND}" "$@"
 }

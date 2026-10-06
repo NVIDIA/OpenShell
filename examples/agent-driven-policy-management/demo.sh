@@ -19,20 +19,20 @@ POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
 TASK_TEMPLATE="${SCRIPT_DIR}/agent-task.md"
 SANDBOX_AGENT="${SCRIPT_DIR}/sandbox-agent.sh"
 
-OPENSHELL_BIN="${OPENSHELL_BIN:-}"
-if [[ -z "$OPENSHELL_BIN" ]]; then
-    if [[ -x "${REPO_ROOT}/target/debug/openshell" ]]; then
-        OPENSHELL_BIN="${REPO_ROOT}/target/debug/openshell"
+RYNO_BIN="${RYNO_BIN:-}"
+if [[ -z "$RYNO_BIN" ]]; then
+    if [[ -x "${REPO_ROOT}/target/debug/ryno" ]]; then
+        RYNO_BIN="${REPO_ROOT}/target/debug/ryno"
     else
-        OPENSHELL_BIN="openshell"
+        RYNO_BIN="ryno"
     fi
 fi
 
 DEMO_GITHUB_OWNER="${DEMO_GITHUB_OWNER:-}"
-DEMO_GITHUB_REPO="${DEMO_GITHUB_REPO:-openshell-policy-demo}"
+DEMO_GITHUB_REPO="${DEMO_GITHUB_REPO:-ryno-policy-demo}"
 DEMO_BRANCH="${DEMO_BRANCH:-main}"
 DEMO_RUN_ID="${DEMO_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-DEMO_FILE_DIR="${DEMO_FILE_DIR:-openshell-policy-advisor-demo}"
+DEMO_FILE_DIR="${DEMO_FILE_DIR:-ryno-policy-advisor-demo}"
 DEMO_FILE_PATH="${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-pd-${DEMO_RUN_ID}}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-policy-demo-${DEMO_RUN_ID}}"
@@ -50,7 +50,7 @@ else
 fi
 DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-policy-demo.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryno-policy-demo.XXXXXX")"
 PAYLOAD_DIR="${TMP_DIR}/payload"
 POLICY_FILE="${TMP_DIR}/policy.yaml"
 AGENT_LOG="${TMP_DIR}/agent.log"
@@ -154,21 +154,21 @@ cleanup() {
     fi
 
     if [[ "$DEMO_KEEP_SANDBOX" != "1" ]]; then
-        "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
+        "$RYNO_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
     else
         printf "\n${YELLOW}Keeping sandbox because DEMO_KEEP_SANDBOX=1: %s${RESET}\n" "$DEMO_SANDBOX_NAME"
     fi
-    "$OPENSHELL_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
     # Restore the agent_policy_proposals_enabled setting to what it was
     # before this run.
     if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
         if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
-            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled --yes \
+            "$RYNO_BIN" settings delete --global --key agent_policy_proposals_enabled --yes \
                 >/dev/null 2>&1 || true
         else
-            "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
+            "$RYNO_BIN" settings set --global --key agent_policy_proposals_enabled \
                 --value "$PRIOR_PROPOSALS_FLAG" --yes >/dev/null 2>&1 || true
         fi
     fi
@@ -218,7 +218,7 @@ resolve_codex_auth() {
 validate_env() {
     require_command curl
     require_command jq
-    require_command "$OPENSHELL_BIN"
+    require_command "$RYNO_BIN"
 
     [[ -f "$POLICY_TEMPLATE" ]] || fail "missing policy template: $POLICY_TEMPLATE"
     [[ -f "$TASK_TEMPLATE" ]] || fail "missing agent task template: $TASK_TEMPLATE"
@@ -250,24 +250,24 @@ github_api_status() {
 
 check_gateway() {
     local raw version
-    # `openshell status` colorizes labels with ANSI even when piped, so strip
+    # `ryno status` colorizes labels with ANSI even when piped, so strip
     # escapes before parsing. Use NO_COLOR as a belt-and-suspenders hint for
     # libraries that respect it. Capture stderr explicitly so a connection
     # failure (gateway down, port-forward died after a redeploy) surfaces a
     # real error message instead of `set -euo pipefail` silently exiting.
-    if ! raw="$(NO_COLOR=1 "$OPENSHELL_BIN" status 2>&1)"; then
-        fail "openshell could not reach the gateway. CLI output:
+    if ! raw="$(NO_COLOR=1 "$RYNO_BIN" status 2>&1)"; then
+        fail "ryno could not reach the gateway. CLI output:
 ${raw}
 
 If you just redeployed, the kubectl port-forward you backgrounded earlier
 probably died with the old pod. Restart it (silenced so its noise doesn't
 bleed into the demo):
-  KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 >/dev/null 2>&1 &"
+  KUBECONFIG=kubeconfig kubectl -n ryno port-forward svc/ryno 8090:8080 >/dev/null 2>&1 &"
     fi
     raw="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$raw")"
     version="$(awk -F': *' '/Version:/ { print $2; exit }' <<<"$raw")"
     [[ -n "$version" ]] \
-        || fail "active OpenShell gateway is not reachable; start one with: openshell gateway start"
+        || fail "active Ryno gateway is not reachable; start one with: ryno gateway start"
     info "gateway:  connected · ${version}"
 }
 
@@ -287,7 +287,7 @@ check_github_access() {
         info "${RED}Repo not found:${RESET} ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}"
         info "Create a private scratch repo first, then re-run:"
         info "  ${DIM}gh repo create ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO} --private --add-readme \\${RESET}"
-        info "  ${DIM}    --description 'OpenShell policy advisor demo scratch repo'${RESET}"
+        info "  ${DIM}    --description 'Ryno policy advisor demo scratch repo'${RESET}"
         fail "GitHub returned HTTP $status for ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}"
     fi
     if jq -e '.permissions.push == false and .permissions.admin == false and .permissions.maintain == false' "$body" >/dev/null; then
@@ -328,17 +328,17 @@ render_payload() {
 }
 
 create_providers() {
-    "$OPENSHELL_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
-    "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
-    "$OPENSHELL_BIN" provider create \
+    "$RYNO_BIN" provider create \
         --name "$DEMO_CODEX_PROVIDER_NAME" \
         --type codex \
         --credential CODEX_AUTH_ACCESS_TOKEN \
         --credential CODEX_AUTH_REFRESH_TOKEN \
         --credential CODEX_AUTH_ACCOUNT_ID >/dev/null
 
-    "$OPENSHELL_BIN" provider create \
+    "$RYNO_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
         --type github \
         --credential "GITHUB_TOKEN=$DEMO_GITHUB_TOKEN" >/dev/null
@@ -348,7 +348,7 @@ create_providers() {
 
 start_agent_sandbox() {
     step "Launching sandbox; agent will hit a policy block and draft a proposal"
-    "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
+    "$RYNO_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
 
     info "policy:   raw GitHub schema path denied; GitHub writes denied"
     info "approval: auto for no new findings; review for credential risk"
@@ -360,7 +360,7 @@ start_agent_sandbox() {
     # (basename `payload`) lands at `/sandbox/payload/...`. `--upload` accepts
     # a single value, so we ship both files in one directory.
     (
-        "$OPENSHELL_BIN" sandbox create \
+        "$RYNO_BIN" sandbox create \
             --name "$DEMO_SANDBOX_NAME" \
             --provider "$DEMO_CODEX_PROVIDER_NAME" \
             --provider "$DEMO_GITHUB_PROVIDER_NAME" \
@@ -487,15 +487,15 @@ approve_manually() {
     step "Decide from your other terminal — the agent's /wait is parked"
     info "Run ONE on the host:"
     info ""
-    info "  ${BOLD}${GREEN}approve:${RESET} ${DIM}${OPENSHELL_BIN} rule approve ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id}${RESET}"
-    info "  ${BOLD}reject:${RESET}  ${DIM}${OPENSHELL_BIN} rule reject ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id} --reason \"scope this to ...\"${RESET}"
+    info "  ${BOLD}${GREEN}approve:${RESET} ${DIM}${RYNO_BIN} rule approve ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id}${RESET}"
+    info "  ${BOLD}reject:${RESET}  ${DIM}${RYNO_BIN} rule reject ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id} --reason \"scope this to ...\"${RESET}"
     info ""
     info "  ${DIM}reject --reason sends free-form guidance back to the agent; it will${RESET}"
     info "  ${DIM}read rejection_reason, draft a revised proposal, and we'll pause again.${RESET}"
     info ""
 
     while true; do
-        if ! "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending 2>/dev/null \
+        if ! "$RYNO_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending 2>/dev/null \
             | grep -q "$chunk_id"; then
             spin_clear
             info "  ${GREEN}✓${RESET} decision recorded for chunk ${short_id}"
@@ -536,7 +536,7 @@ approve_pending_until_agent_exits() {
 
         # Anything pending needs an explicit host-side decision. Auto mode only
         # bypasses this when the gateway validation finds no new risk.
-        if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
+        if "$RYNO_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
             if ! pending_requires_review "$pending"; then
                 spin_wait "waiting for auto-approvals to settle" 2
@@ -555,7 +555,7 @@ approve_pending_until_agent_exits() {
                 spin_clear
                 step "Approving for demo"
                 local approve_output
-                if ! approve_output="$("$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" 2>&1)"; then
+                if ! approve_output="$("$RYNO_BIN" rule approve-all "$DEMO_SANDBOX_NAME" 2>&1)"; then
                     if grep -q "no pending chunks to approve" <<<"$approve_output"; then
                         info "  decision already recorded"
                     else
@@ -596,7 +596,7 @@ verify_github_write() {
 # and successful retry.
 show_logs() {
     step "Decision trace"
-    "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
+    "$RYNO_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
         | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|agent_authored proposal|auto-approved: no new prover findings \(source=agent_authored\)|gateway approved draft chunk .*PUT|Policy reloaded successfully' \
         | grep -v 'source=mechanistic' \
         | sed 's/^/  /' || true
@@ -608,10 +608,10 @@ enable_agent_proposals() {
     # can restore it; the sentinel "(unset)" round-trips through `settings
     # delete` rather than a value write.
     local prior
-    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+    prior="$("$RYNO_BIN" settings get --global --json 2>/dev/null \
         | jq -r '.settings.agent_policy_proposals_enabled // empty | tostring | select(. == "true" or . == "false")')"
     PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
-    "$OPENSHELL_BIN" settings set --global \
+    "$RYNO_BIN" settings set --global \
         --key agent_policy_proposals_enabled --value true --yes >/dev/null \
         || fail "could not enable agent_policy_proposals_enabled globally"
 }

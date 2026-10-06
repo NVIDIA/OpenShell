@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
+from ryno._proto import datamodel_pb2, ryno_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox, SandboxClient
+    from ryno import Sandbox, SandboxClient
 
 
 # =============================================================================
@@ -70,7 +70,7 @@ def test_create_sandbox_rejects_root_user(
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
+            ryno_pb2.CreateSandboxRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
@@ -100,7 +100,7 @@ def test_create_sandbox_rejects_path_traversal(
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
+            ryno_pb2.CreateSandboxRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
@@ -130,7 +130,7 @@ def test_create_sandbox_rejects_overly_broad_paths(
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
+            ryno_pb2.CreateSandboxRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
@@ -169,7 +169,7 @@ def test_create_sandbox_materializes_default_mcp_version(
     created = sandbox_client.create(workspace="default", spec=spec)
     try:
         stored = sandbox_client._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(
+            ryno_pb2.GetSandboxRequest(
                 name=created.name,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
@@ -230,7 +230,7 @@ def test_update_policy_rejects_immutable_fields(
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateConfig(
-                openshell_pb2.UpdateConfigRequest(
+                ryno_pb2.UpdateConfigRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),

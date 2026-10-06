@@ -27,7 +27,7 @@ PF_PID=""
 
 cleanup() {
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
-        openshell --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
+        ryno --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
     fi
     if [[ -n "$PF_PID" ]]; then
         kill "$PF_PID" >/dev/null 2>&1 || true
@@ -71,7 +71,7 @@ sandbox_curl_until() {
     local output=""
 
     for attempt in $(seq 1 12); do
-        printf "\n$ openshell sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
+        printf "\n$ ryno sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
         if output=$("${OS[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- curl -sS --max-time 10 "$url" 2>&1); then
             printf "%s\n" "$output"
             if [[ "$output" == *"$expected"* ]]; then
@@ -89,10 +89,10 @@ sandbox_curl_until() {
     exit 1
 }
 
-OS=(openshell --gateway-endpoint "$GATEWAY_ENDPOINT")
+OS=(ryno --gateway-endpoint "$GATEWAY_ENDPOINT")
 
-printf "\n$ kubectl -n default create secret generic openshell-spiffe-token-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
-kubectl -n default create secret generic openshell-spiffe-token-demo \
+printf "\n$ kubectl -n default create secret generic ryno-spiffe-token-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
+kubectl -n default create secret generic ryno-spiffe-token-demo \
     --from-literal=access-token-secret="$ACCESS_TOKEN_SECRET" \
     --dry-run=client \
     -o yaml | kubectl apply -f -
@@ -103,7 +103,7 @@ run kubectl -n default rollout status deployment/token-issuer --timeout=180s
 run kubectl -n default rollout status deployment/alpha --timeout=180s
 run kubectl -n default rollout status deployment/beta --timeout=180s
 
-kubectl -n openshell port-forward svc/openshell "${PORT_FORWARD_PORT}:8080" >/tmp/openshell-spiffe-token-demo-port-forward.log 2>&1 &
+kubectl -n ryno port-forward svc/ryno "${PORT_FORWARD_PORT}:8080" >/tmp/ryno-spiffe-token-demo-port-forward.log 2>&1 &
 PF_PID=$!
 wait_for_port_forward
 
@@ -121,14 +121,14 @@ ALPHA_OUTPUT="$SANDBOX_CURL_OUTPUT"
 assert_contains "$ALPHA_OUTPUT" "alpha called with path /:"
 assert_contains "$ALPHA_OUTPUT" "aud: alpha, account"
 assert_contains "$ALPHA_OUTPUT" "scope: alpha profile email"
-assert_contains "$ALPHA_OUTPUT" "azp: spiffe://openshell.local/openshell/sandbox/"
+assert_contains "$ALPHA_OUTPUT" "azp: spiffe://ryno.local/ryno/sandbox/"
 
 sandbox_curl_until "beta" "http://beta.default.svc.cluster.local/" "beta called with path /:"
 BETA_OUTPUT="$SANDBOX_CURL_OUTPUT"
 assert_contains "$BETA_OUTPUT" "beta called with path /:"
 assert_contains "$BETA_OUTPUT" "aud: beta, account"
 assert_contains "$BETA_OUTPUT" "scope: beta profile email"
-assert_contains "$BETA_OUTPUT" "azp: spiffe://openshell.local/openshell/sandbox/"
+assert_contains "$BETA_OUTPUT" "azp: spiffe://ryno.local/ryno/sandbox/"
 
 sleep 1
 

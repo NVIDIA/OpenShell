@@ -12,13 +12,13 @@ import grpc
 import pytest
 from google.protobuf import duration_pb2
 
-from openshell._proto import datamodel_pb2, openshell_pb2
-from openshell.errors import from_grpc_error
+from ryno._proto import datamodel_pb2, ryno_pb2
+from ryno.errors import from_grpc_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox, SandboxClient
+    from ryno import Sandbox, SandboxClient
 
 
 def assert_blocked(stream, reason: str) -> None:
@@ -36,7 +36,7 @@ def test_exec_request_id_never_relaunches_or_replays_output(
 ) -> None:
     with sandbox(delete_on_exit=True) as sb:
         path = f"/sandbox/exec-admission-{uuid.uuid4().hex}"
-        request = openshell_pb2.ExecSandboxRequest(
+        request = ryno_pb2.ExecSandboxRequest(
             sandbox=sb.sandbox.name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             command=[
@@ -55,7 +55,7 @@ def test_exec_request_id_never_relaunches_or_replays_output(
                 return sandbox_client._stub.ExecSandbox(value, timeout=30)
 
             def inputs():
-                yield openshell_pb2.ExecSandboxInput(start=value)
+                yield ryno_pb2.ExecSandboxInput(start=value)
                 done.wait(timeout=30)
 
             return sandbox_client._stub.ExecSandboxInteractive(inputs(), timeout=30)
@@ -66,7 +66,7 @@ def test_exec_request_id_never_relaunches_or_replays_output(
             assert first.WhichOneof("payload") == "stdout"
             assert b"started" in first.stdout.data
             assert_blocked(invoke(request), "REQUEST_OUTCOME_UNCERTAIN")
-            changed = openshell_pb2.ExecSandboxRequest()
+            changed = ryno_pb2.ExecSandboxRequest()
             changed.CopyFrom(request)
             changed.command.append("changed-payload")
             assert_blocked(invoke(changed), "REQUEST_ID_PAYLOAD_MISMATCH")
@@ -89,7 +89,7 @@ def test_exec_request_timeout_keeps_launch_unresolved(
 ) -> None:
     with sandbox(delete_on_exit=True) as sb:
         path = f"/sandbox/exec-timeout-{uuid.uuid4().hex}"
-        request = openshell_pb2.ExecSandboxRequest(
+        request = ryno_pb2.ExecSandboxRequest(
             sandbox=sb.sandbox.name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             command=["/bin/sh", "-c", f"printf x >> {path}; sleep 5"],
@@ -103,7 +103,7 @@ def test_exec_request_timeout_keeps_launch_unresolved(
                 return sandbox_client._stub.ExecSandbox(request, timeout=30)
 
             def inputs():
-                yield openshell_pb2.ExecSandboxInput(start=request)
+                yield ryno_pb2.ExecSandboxInput(start=request)
                 done.wait(timeout=30)
 
             return sandbox_client._stub.ExecSandboxInteractive(inputs(), timeout=30)
@@ -130,7 +130,7 @@ def test_exec_client_cancellation_does_not_clear_launch_admission(
 ) -> None:
     with sandbox(delete_on_exit=True) as sb:
         path = f"/sandbox/exec-cancel-{uuid.uuid4().hex}"
-        request = openshell_pb2.ExecSandboxRequest(
+        request = ryno_pb2.ExecSandboxRequest(
             sandbox=sb.sandbox.name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             command=[

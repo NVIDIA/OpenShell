@@ -21,9 +21,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{SupportContainer, e2e_network_name};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::{SupportContainer, e2e_network_name};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
 use serial_test::serial;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
@@ -31,12 +31,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-const TEST_SERVER_HOST: &str = "host.openshell.internal";
+const TEST_SERVER_HOST: &str = "host.ryno.internal";
 const PROVIDER_NAME: &str = "e2e-proxy-egress-credentials";
 const PROVIDER_PROFILE_ID: &str = "e2e-proxy-egress-credentials";
 const TOKEN_ENV: &str = "PROXY_E2E_TOKEN";
 const TEST_SECRET: &str = "sk-e2e-proxy-egress-secret";
-const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+const PLACEHOLDER_PREFIX: &str = "ryno:resolve:env:";
 const PRIVATE_ALLOWED_IPS: &str = r#"        allowed_ips:
           - "10.0.0.0/8"
           - "172.0.0.0/8"
@@ -45,20 +45,20 @@ const PRIVATE_ALLOWED_IPS: &str = r#"        allowed_ips:
 static PROVIDER_LOCK: Mutex<()> = Mutex::new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd
         .output()
         .await
-        .map_err(|error| format!("failed to spawn openshell {}: {error}", args.join(" ")))?;
+        .map_err(|error| format!("failed to spawn ryno {}: {error}", args.join(" ")))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
 
     if !output.status.success() {
         return Err(format!(
-            "openshell {} failed (exit {:?}):\n{combined}",
+            "ryno {} failed (exit {:?}):\n{combined}",
             args.join(" "),
             output.status.code()
         ));
@@ -98,7 +98,7 @@ async fn wait_for_sandbox_logs(
 }
 
 async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["provider", "delete", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -106,7 +106,7 @@ async fn delete_provider(name: &str) {
 }
 
 async fn delete_provider_profile(id: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["profile", "delete", id])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -232,7 +232,7 @@ fn write_middleware_policy(
         r#"network_middlewares:
   regex-redactor:
     name: Redact API tokens
-    middleware: openshell/regex
+    middleware: ryno/regex
     order: 10
     config:
       mode: redact
@@ -1149,11 +1149,11 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
     let explicit_server =
-        SupportContainer::start_python("explicit-ip.openshell.test", HTTP_SERVER, 8000)
+        SupportContainer::start_python("explicit-ip.ryno.test", HTTP_SERVER, 8000)
             .await
             .expect("start explicit allowed_ips support container");
     let implicit_server =
-        SupportContainer::start_python("implicit-ip.openshell.test", HTTP_SERVER, 8000)
+        SupportContainer::start_python("implicit-ip.ryno.test", HTTP_SERVER, 8000)
             .await
             .expect("start implicit IP-literal support container");
     let explicit_ip = explicit_server.ip().expect("explicit support container IP");
@@ -1362,14 +1362,14 @@ print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
     );
 
     let logs = wait_for_sandbox_logs(&guard.name, |logs| {
-        logs.contains("openshell.middleware.traffic_uninspectable")
+        logs.contains("ryno.middleware.traffic_uninspectable")
             && logs
                 .contains("Unsupported tunnel protocol cannot be inspected by required middleware")
     })
     .await
     .expect("fetch sandbox logs after middleware denial");
     assert!(
-        logs.contains("openshell.middleware.traffic_uninspectable")
+        logs.contains("ryno.middleware.traffic_uninspectable")
             && logs
                 .contains("Unsupported tunnel protocol cannot be inspected by required middleware"),
         "OCSF logs should explain the fail-closed denial:\n{logs}"

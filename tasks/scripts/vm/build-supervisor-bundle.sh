@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
+OUTPUT_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
 # shellcheck source=tasks/scripts/build-env.sh
 source "${ROOT}/tasks/scripts/build-env.sh"
@@ -58,14 +58,14 @@ case "${GUEST_ARCH}" in
         ;;
 esac
 
-SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-sandbox"
-SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
-VM_INIT_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-vm-init"
-VM_INIT_OUTPUT="${OUTPUT_DIR}/openshell-vm-init.zst"
-HOST_SUPERVISOR_BIN="${ROOT}/target/release/openshell-supervisor"
-HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-supervisor.zst"
+SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/ryno-sandbox"
+SUPERVISOR_OUTPUT="${OUTPUT_DIR}/ryno-sandbox.zst"
+VM_INIT_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/ryno-vm-init"
+VM_INIT_OUTPUT="${OUTPUT_DIR}/ryno-vm-init.zst"
+HOST_SUPERVISOR_BIN="${ROOT}/target/release/ryno-supervisor"
+HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/ryno-supervisor.zst"
 
-echo "==> Building openshell-sandbox supervisor bundle"
+echo "==> Building ryno-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"
 echo "    Sandbox target: ${SANDBOX_RUST_TARGET} (static musl)"
 echo "    Host supervisor target: native"
@@ -74,7 +74,7 @@ echo "    Output: ${SUPERVISOR_OUTPUT}"
 mkdir -p "${OUTPUT_DIR}"
 ensure_build_nofile_limit
 
-SUPERVISOR_BUILD_LOG="$(mktemp -t openshell-supervisor-build.XXXXXX.log)"
+SUPERVISOR_BUILD_LOG="$(mktemp -t ryno-supervisor-build.XXXXXX.log)"
 run_supervisor_build() {
     local rustc_wrapper_mode="${1:-default}"
     local cargo_prefix=()
@@ -84,18 +84,18 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p ryno-sandbox --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p ryno-driver-vm --bin ryno-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p ryno-sandbox --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p ryno-driver-vm --bin ryno-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
-    ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
+    ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p ryno-supervisor \
         --manifest-path "${ROOT}/Cargo.toml"
 }
 
@@ -133,11 +133,11 @@ if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${VM_INIT_BIN}" ] || [ ! -f "${HOST_S
 fi
 
 if readelf -l "${SUPERVISOR_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
-    echo "ERROR: VM guest openshell-sandbox must be statically linked" >&2
+    echo "ERROR: VM guest ryno-sandbox must be statically linked" >&2
     exit 1
 fi
 if readelf -l "${VM_INIT_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
-    echo "ERROR: openshell-vm-init must be statically linked" >&2
+    echo "ERROR: ryno-vm-init must be statically linked" >&2
     exit 1
 fi
 

@@ -1,7 +1,7 @@
 # Governance Interceptor Example
 
 This standalone example implements the
-`openshell.gateway_interceptor.v1.GatewayInterceptor` service. It demonstrates
+`ryno.gateway_interceptor.v1.GatewayInterceptor` service. It demonstrates
 how an interceptor can vend provider profiles and make them the gateway's
 authoritative profile source.
 
@@ -13,7 +13,7 @@ authoritative profile source.
   signature, and signing key ID
 - every new sandbox receives `policy.yaml` during `CreateSandbox`
 - requested sandbox providers must match one of the vended profile IDs
-- every new sandbox gets an `openshell.nvidia.com/policy-signature` metadata
+- every new sandbox gets an `ryno.nvidia.com/policy-signature` metadata
   annotation that is used to verify the policy
 - sandbox creation evaluations add a `correlation_id` log annotation for gateway
   audit logs, plus non-secret policy hash/signing key metadata
@@ -38,7 +38,7 @@ cargo run -- \
 At startup the example parses `policy.yaml`, converts it to the protobuf JSON
 shape used by sandbox creation, computes a canonical SHA-256 digest, and signs
 that digest as an EdDSA JWT. The interceptor adds that JWT to each governed
-sandbox under `metadata.annotations["openshell.nvidia.com/policy-signature"]`
+sandbox under `metadata.annotations["ryno.nvidia.com/policy-signature"]`
 and verifies the JWT against the sandbox policy during the `CreateSandbox`
 validate phase. The signing key is generated in memory on each interceptor
 start. This keeps the example self-contained. Production governance services
@@ -49,7 +49,7 @@ The example owns this digest contract independently of the gateway. It uses a
 local reflected protobuf codec, recursively sorts ProtoJSON object keys, and
 preserves repeated-field order. Policy and profile hashes use the
 `sha256:v2:<hex>` format, and their JWTs require
-`hash_algorithm=openshell-governance-protojson-sha256-v2`. The gateway's policy
+`hash_algorithm=ryno-governance-protojson-sha256-v2`. The gateway's policy
 hash is a separate operational revision identifier and is not expected to
 match the signed governance hash.
 
@@ -81,7 +81,7 @@ selects the interceptor as its only provider profile source, so
 `profile list` shows only `github` and `slack`; the user source is
 omitted, so imported profiles do not appear beside them. The example signs each profile's canonical protobuf payload
 and exposes the JWT under
-`annotations["openshell.nvidia.com/profile-signature"]`; the signed hash and key
+`annotations["ryno.nvidia.com/profile-signature"]`; the signed hash and key
 ID are exposed beside it. These annotations demonstrate logic an interceptor
 can own; the gateway treats them as opaque metadata and does not verify them.
 Valid edits to files under `profiles/` change the profile signature and snapshot
@@ -92,12 +92,12 @@ path. Invalid edits keep the last valid snapshot active.
 Gateway TOML snippet:
 
 ```toml
-[openshell.gateway]
+[ryno.gateway]
 provider_profile_sources = [
   { type = "interceptor", name = "provider-governance" },
 ]
 
-[[openshell.gateway.interceptors]]
+[[ryno.gateway.interceptors]]
 name               = "provider-governance"
 grpc_endpoint      = "http://127.0.0.1:18081"
 order              = 10
@@ -107,32 +107,32 @@ timeout            = "500ms"
 max_response_bytes = 1048576
 max_patches        = 32
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/CreateSandbox"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/CreateSandbox"
 phases = ["modify_operation", "validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/CreateProvider"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/CreateProvider"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/UpdateConfig"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/UpdateConfig"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/SubmitPolicyAnalysis"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/SubmitPolicyAnalysis"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/ImportProviderProfiles"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/ImportProviderProfiles"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/UpdateProviderProfiles"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/UpdateProviderProfiles"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/DeleteProviderProfile"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/DeleteProviderProfile"
 phases = ["validate"]
 ```
 

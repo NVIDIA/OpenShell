@@ -17,8 +17,8 @@ existing non-Snap Docker daemon, verifies that install.sh does not install the
 Docker snap, and exercises a sandbox. The missing-docker mode requires Docker
 to be absent and verifies that install.sh fails before installing either snap.
 The docker-snap mode requires the Docker snap and verifies that install.sh
-rejects it before installing OpenShell. ATTEMPTS defaults to 1; repeated
-system-docker attempts exercise idempotent OpenShell Snap refreshes. Every
+rejects it before installing Ryno. ATTEMPTS defaults to 1; repeated
+system-docker attempts exercise idempotent Ryno Snap refreshes. Every
 failed attempt prints service, connection, snap-change, journal, gateway-log,
 and listener diagnostics.
 EOF
@@ -84,13 +84,13 @@ diagnostics() {
 		sudo systemctl status docker.service --no-pager >&2 || true
 		sudo journalctl -b -u docker.service --no-pager -n 300 >&2 || true
 	fi
-	sudo snap services openshell >&2 || true
-	sudo snap connections openshell >&2 || true
+	sudo snap services ryno >&2 || true
+	sudo snap connections ryno >&2 || true
 	sudo snap changes >&2 || true
-	sudo systemctl status snap.openshell.gateway.service --no-pager >&2 || true
-	sudo journalctl -b -u snap.openshell.gateway.service --no-pager -n 300 >&2 || true
+	sudo systemctl status snap.ryno.gateway.service --no-pager >&2 || true
+	sudo journalctl -b -u snap.ryno.gateway.service --no-pager -n 300 >&2 || true
 	sudo journalctl -b -u snapd.service --no-pager -n 300 >&2 || true
-	sudo snap logs openshell.gateway -n=300 >&2 || true
+	sudo snap logs ryno.gateway -n=300 >&2 || true
 	sudo ss -ltnp '( sport = :17670 )' >&2 || true
 }
 
@@ -99,7 +99,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	echo "==> install.sh Snap ${mode} reproduction attempt ${attempt}/${attempts}"
 	if [ "${mode}" != system-docker ]; then
 		output=$(mktemp)
-		if OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
+		if RYNO_INSTALL_METHOD=snap RYNO_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
 			echo "install.sh unexpectedly succeeded in ${mode} mode" >&2
 			cat "${output}" >&2
 			rm -f "${output}"
@@ -108,11 +108,11 @@ for attempt in $(seq 1 "${attempts}"); do
 			continue
 		fi
 		case "${mode}" in
-		missing-docker) expected="Docker is required before installing the OpenShell snap" ;;
-		docker-snap) expected="the Docker snap is not currently compatible with OpenShell" ;;
+		missing-docker) expected="Docker is required before installing the Ryno snap" ;;
+		docker-snap) expected="the Docker snap is not currently compatible with Ryno" ;;
 		esac
 		if ! grep -Fq "${expected}" "${output}" ||
-			sudo snap list openshell >/dev/null 2>&1 ||
+			sudo snap list ryno >/dev/null 2>&1 ||
 			{ [ "${mode}" = missing-docker ] && sudo snap list docker >/dev/null 2>&1; }; then
 			echo "install.sh did not fail safely in ${mode} mode" >&2
 			cat "${output}" >&2
@@ -127,7 +127,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	fi
 
 	sandbox="snap-${attempt}-$$"
-	prover_dir=$(mktemp -d "$HOME/openshell-prover-repro.XXXXXX")
+	prover_dir=$(mktemp -d "$HOME/ryno-prover-repro.XXXXXX")
 	cat >"${prover_dir}/boundary.yaml" <<'EOF'
 version: 1
 filesystem_policy:
@@ -141,18 +141,18 @@ filesystem_policy:
   read_only:
     - /usr
 EOF
-	if ! OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" ||
-		! sudo snap list openshell >/dev/null ||
-		! snap info openshell | grep -Eq '^tracking: +latest/edge$' ||
+	if ! RYNO_INSTALL_METHOD=snap RYNO_VERSION=dev sh "${install_script}" ||
+		! sudo snap list ryno >/dev/null ||
+		! snap info ryno | grep -Eq '^tracking: +latest/edge$' ||
 		! docker_is_ready ||
-		! sudo snap connections openshell | grep -Eq '^docker +openshell:docker +:docker +' ||
-		! /snap/bin/openshell status ||
-		! /snap/bin/openshell.prover --version ||
-		! /snap/bin/openshell.prover check "${prover_dir}/candidate.yaml" \
+		! sudo snap connections ryno | grep -Eq '^docker +ryno:docker +:docker +' ||
+		! /snap/bin/ryno status ||
+		! /snap/bin/ryno.prover --version ||
+		! /snap/bin/ryno.prover check "${prover_dir}/candidate.yaml" \
 			--boundary "${prover_dir}/boundary.yaml" | grep -q '^result: within_boundary$' ||
-		! /snap/bin/openshell sandbox create --name "${sandbox}" --detach ||
-		! /snap/bin/openshell sandbox exec --name "${sandbox}" --no-tty -- true ||
-		! /snap/bin/openshell sandbox delete "${sandbox}"; then
+		! /snap/bin/ryno sandbox create --name "${sandbox}" --detach ||
+		! /snap/bin/ryno sandbox exec --name "${sandbox}" --no-tty -- true ||
+		! /snap/bin/ryno sandbox delete "${sandbox}"; then
 		echo "install.sh Snap reproduction failed" >&2
 		diagnostics "${attempt}"
 		failures=$((failures + 1))

@@ -3,22 +3,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start a standalone openshell-gateway backed by the Podman compute driver for
+# Start a standalone ryno-gateway backed by the Podman compute driver for
 # local manual testing.
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18080 (IPv6 loopback on macOS Podman Machine)
 # - Gateway installation and CLI registration name "podman-dev"
 # - Persistent state under .cache/gateway-podman
-# - Supervisor sideload image openshell/supervisor:dev, refreshed on launch
+# - Supervisor sideload image ryno/supervisor:dev, refreshed on launch
 #
 # Common overrides:
-#   OPENSHELL_SERVER_PORT=19080 mise run gateway:podman
-#   OPENSHELL_PODMAN_GATEWAY_NAME=my-podman-gateway mise run gateway:podman
-#   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:podman
-#   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:podman
-#   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:podman
-#   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:podman
+#   RYNO_SERVER_PORT=19080 mise run gateway:podman
+#   RYNO_PODMAN_GATEWAY_NAME=my-podman-gateway mise run gateway:podman
+#   RYNO_SANDBOX_NAMESPACE=my-ns mise run gateway:podman
+#   RYNO_SANDBOX_IMAGE=ghcr.io/... mise run gateway:podman
+#   RYNO_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:podman
+#   RYNO_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:podman
 
 set -euo pipefail
 
@@ -27,17 +27,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
-PORT="${OPENSHELL_SERVER_PORT:-18080}"
-GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
-STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
-SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-podman-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
-SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
-LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
-PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
+PORT="${RYNO_SERVER_PORT:-18080}"
+GATEWAY_NAME="${RYNO_PODMAN_GATEWAY_NAME:-podman-dev}"
+STATE_DIR="${RYNO_PODMAN_GATEWAY_STATE_DIR:-${RYNO_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
+SANDBOX_NAMESPACE="${RYNO_SANDBOX_NAMESPACE:-podman-dev}"
+SANDBOX_IMAGE="${RYNO_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${RYNO_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
+GRPC_ENDPOINT="${RYNO_GRPC_ENDPOINT:-}"
+LOG_LEVEL="${RYNO_LOG_LEVEL:-info}"
+PRIMARY_BIND_IP="${RYNO_BIND_ADDRESS:-127.0.0.1}"
 CLI_ENDPOINT_HOST="127.0.0.1"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+GATEWAY_BIN="${ROOT}/target/debug/ryno-gateway"
 
 command_available() {
   command -v "$1" >/dev/null 2>&1
@@ -121,7 +121,7 @@ append_local_otlp_config_if_available() {
 
   cat >>"${config_path}" <<'EOF'
 
-[openshell.gateway.otlp]
+[ryno.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
 EOF
   echo "OTLP trace export enabled for http://127.0.0.1:4317."
@@ -134,7 +134,7 @@ register_gateway_metadata() {
   local config_home gateway_dir
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
+  gateway_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
   cat >"${gateway_dir}/metadata.json" <<EOF
@@ -146,36 +146,36 @@ register_gateway_metadata() {
   "auth_mode": "plaintext"
 }
 EOF
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+  printf '%s' "${name}" >"${config_home}/ryno/active_gateway"
 }
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_PODMAN_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+  echo "ERROR: RYNO_PODMAN_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
 fi
 
 require_podman_service
 
 if port_is_in_use "${PORT}"; then
-  echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
+  echo "ERROR: port ${PORT} is already in use; free it or set RYNO_SERVER_PORT" >&2
   exit 2
 fi
 
-SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
-SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
+SUPERVISOR_IMAGE="${RYNO_SUPERVISOR_IMAGE:-ryno/supervisor:dev}"
+SANDBOX_RUNTIME_IMAGE="${RYNO_SANDBOX_RUNTIME_IMAGE:-ryno/sandbox:dev}"
 ensure_podman_runtime_image \
   "${SUPERVISOR_IMAGE}" \
-  "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
+  "${RYNO_SUPERVISOR_IMAGE:-}" \
   supervisor \
   supervisor
 ensure_podman_runtime_image \
   "${SANDBOX_RUNTIME_IMAGE}" \
-  "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
+  "${RYNO_SANDBOX_RUNTIME_IMAGE:-}" \
   sandbox \
   "sandbox runtime"
-export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
+export RYNO_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 
-echo "Building openshell-gateway..."
+echo "Building ryno-gateway..."
 require_mise
 mise run build:gateway
 
@@ -190,7 +190,7 @@ echo "Generating local gateway credentials..."
   --output-dir "${TLS_DIR}" \
   --server-san "127.0.0.1" \
   --server-san "localhost" \
-  --server-san "host.openshell.internal"
+  --server-san "host.ryno.internal"
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
@@ -198,24 +198,24 @@ CONFIG_PATH="${STATE_DIR}/gateway.toml"
 # keep it owner-only regardless of the ambient umask.
 install -m 600 /dev/null "${CONFIG_PATH}"
 cat >"${CONFIG_PATH}" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 name = "${GATEWAY_NAME}"
 compute_driver = "podman"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
 
-[openshell.drivers.podman]
+[ryno.drivers.podman]
 default_image = "${SANDBOX_IMAGE}"
 supervisor_image = "${SUPERVISOR_IMAGE}"
 sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
@@ -232,39 +232,39 @@ fi
 # ${VAR+x} distinguishes unset from set-but-empty: an unset variable writes
 # nothing, but an explicitly empty one is written through so the gateway's
 # fail-closed proxy validation rejects it instead of silently dropping it.
-if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
-  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_HTTPS_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
-  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
-  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
-  case "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" in
+if [[ -n "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  case "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" in
     true|false)
-      printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+      printf 'proxy_auth_allow_insecure = %s\n' "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
       ;;
     *)
       # Write invalid booleans as strings so config parsing rejects them.
-      printf 'proxy_auth_allow_insecure = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}")" >>"${CONFIG_PATH}"
+      printf 'proxy_auth_allow_insecure = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}")" >>"${CONFIG_PATH}"
       ;;
   esac
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
-  case "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" in
+if [[ -n "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  case "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" in
     true|false)
-      printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+      printf 'proxy_connect_by_hostname = %s\n' "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
       ;;
     *)
       # Write invalid booleans as strings so config parsing rejects them.
-      printf 'proxy_connect_by_hostname = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}")" >>"${CONFIG_PATH}"
+      printf 'proxy_connect_by_hostname = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}")" >>"${CONFIG_PATH}"
       ;;
   esac
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
-  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
+  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
 fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"

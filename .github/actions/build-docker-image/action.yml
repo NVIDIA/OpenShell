@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Build Docker Image
-description: Build, push, and export a multi-platform OpenShell image
+description: Build, push, and export a multi-platform Ryno image
 
 inputs:
   component:
@@ -63,11 +63,11 @@ runs:
       run: |
         install -d artifacts/images
         docker buildx build \
-          --builder openshell \
+          --builder ryno \
           --platform linux/amd64,linux/arm64 \
           --file deploy/docker/Dockerfile.${COMPONENT} \
           --target ${COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
+          --tag ghcr.io/nvidia/ryno/${COMPONENT}:${IMAGE_TAG} \
           --cache-from type=gha,scope=${COMPONENT} \
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
@@ -79,7 +79,7 @@ runs:
     - name: Verify SBOM attestation
       shell: bash
       env:
-        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
+        IMAGE_REF: ghcr.io/nvidia/ryno/${{ inputs.component }}:${{ inputs.image-tag }}
       run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
 
     - name: Upload ${{ inputs.component }} image

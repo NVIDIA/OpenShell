@@ -1,22 +1,22 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Set Up OpenShell on Kubernetes"
+title: "Set Up Ryno on Kubernetes"
 sidebar-title: "Setup"
-description: "Deploy the OpenShell gateway to a Kubernetes cluster using the official Helm chart from GHCR."
+description: "Deploy the Ryno gateway to a Kubernetes cluster using the official Helm chart from GHCR."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Helm, Gateway, Deployment, OCI, GHCR, Installation"
 position: 1
 ---
 
 <Warning>
 Your cluster MUST use a CNI that enforces Kubernetes `NetworkPolicy` for both
-ingress and egress in every sandbox namespace. OpenShell creates the policies,
+ingress and egress in every sandbox namespace. Ryno creates the policies,
 but Kubernetes accepts them even when no CNI enforces them. Without enforcement,
 sandbox workloads may reach the network directly and bypass supervisor policy.
-Verify CNI support before installing OpenShell.
+Verify CNI support before installing Ryno.
 </Warning>
 
-![OpenShell on Kubernetes: the gateway provisions a Sandbox resource, separate supervisor and workload Pods, a boundary Service, NetworkPolicy, and a workspace PVC.](../images/openshell-kubernetes-runtime.svg)
+![Ryno on Kubernetes: the gateway provisions a Sandbox resource, separate supervisor and workload Pods, a boundary Service, NetworkPolicy, and a workspace PVC.](../images/ryno-kubernetes-runtime.svg)
 
 The gateway's Kubernetes compute driver creates a `Sandbox` resource and a
 separate supervisor Pod. The Agent Sandbox controller creates the workload Pod
@@ -41,13 +41,13 @@ Make sure the following are in place before you install.
 | Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
 | CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces | Yes | Verify enforcement on your cluster. |
 | Helm 3.x | Yes | No additional notes. |
-| Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
+| Agent Sandbox controller and CRDs | Yes | Install before the Ryno chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager only if you prefer it over the built-in PKI job. |
 | Kubernetes Gateway API | No | Refer to [Ingress](/kubernetes/ingress). Use it only for external access without port-forwarding. |
 
 ## Install Agent Sandbox
 
-OpenShell uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the OpenShell Helm chart.
+Ryno uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the Ryno Helm chart.
 
 Apply the latest release manifest:
 
@@ -62,7 +62,7 @@ gateway resources. This preflight is enabled by default. Disable it only for
 offline `helm template` rendering, where Helm cannot discover cluster APIs:
 
 ```shell
-helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm template ryno oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
   --set agentSandbox.preflight.enabled=false
 ```
@@ -71,7 +71,7 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. Mirror the OpenShell gateway, supervisor, and trusted sandbox runtime images, then set `global.image.registry` to the mirror. Configure the separate default workload sandbox image with `sandbox.image` when needed.
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. Mirror the Ryno gateway, supervisor, and trusted sandbox runtime images, then set `global.image.registry` to the mirror. Configure the separate default workload sandbox image with `sandbox.image` when needed.
 </Note>
 
 Confirm the controller pod is running before proceeding:
@@ -84,16 +84,16 @@ The controller pod should reach `Running` status within a few seconds. For clust
 
 ### Upgrade Agent Sandbox
 
-OpenShell detects the served Agent Sandbox `Sandbox` API when the Kubernetes gateway first needs it and caches that choice for the gateway process. If you upgrade Agent Sandbox in place, restart the OpenShell gateway after the Agent Sandbox controller and CRD rollout completes so the gateway can detect the served API versions again. Existing sandboxes keep running during the upgrade, and the restarted gateway can continue managing them.
+Ryno detects the served Agent Sandbox `Sandbox` API when the Kubernetes gateway first needs it and caches that choice for the gateway process. If you upgrade Agent Sandbox in place, restart the Ryno gateway after the Agent Sandbox controller and CRD rollout completes so the gateway can detect the served API versions again. Existing sandboxes keep running during the upgrade, and the restarted gateway can continue managing them.
 
-## Install OpenShell
+## Install Ryno
 
 <Steps>
 
 ## Create the namespace
 
 ```shell
-kubectl create namespace openshell
+kubectl create namespace ryno
 ```
 
 ## Install the chart
@@ -101,19 +101,19 @@ kubectl create namespace openshell
 Install from the OCI registry on GHCR. Replace `<version>` with the chart version you want to install.
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell
+  --namespace ryno
 ```
 
 To use the latest development build instead of a stable release:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version 0.0.0-dev \
-  --namespace openshell
+  --namespace ryno
 ```
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
@@ -124,19 +124,19 @@ For a platform-managed namespace, install the gateway without namespace-scoped
 sandbox resources, then install the workspace chart in the sandbox namespace:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set workspaceResources.enabled=false \
   --set server.sandboxNamespace=app-a
 
-helm upgrade --install openshell-workspace \
-  oci://ghcr.io/nvidia/openshell/openshell-workspace \
+helm upgrade --install ryno-workspace \
+  oci://ghcr.io/nvidia/ryno/ryno-workspace \
   --version <version> \
   --namespace app-a \
-  --set gateway.serviceAccount.name=openshell \
-  --set gateway.serviceAccount.namespace=openshell
+  --set gateway.serviceAccount.name=ryno \
+  --set gateway.serviceAccount.namespace=ryno
 ```
 
 The workspace chart does not create the namespace or deploy a gateway. It owns
@@ -161,12 +161,12 @@ database, enable the Kubernetes Secrets credential driver with a dedicated
 namespace:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set server.credentialDrivers.kubernetesSecrets.enabled=true \
-  --set server.credentialDrivers.kubernetesSecrets.namespace=openshell-credentials \
+  --set server.credentialDrivers.kubernetesSecrets.namespace=ryno-credentials \
   --set server.credentialDrivers.kubernetesSecrets.createNamespace=true
 ```
 
@@ -178,13 +178,13 @@ the full set of options, refer to the
 ## Wait for the gateway to be ready
 
 ```shell
-kubectl -n openshell rollout status statefulset/openshell
+kubectl -n ryno rollout status statefulset/ryno
 ```
 
 If you set `workload.kind=deployment`, wait on the Deployment instead:
 
 ```shell
-kubectl -n openshell rollout status deployment/openshell
+kubectl -n ryno rollout status deployment/ryno
 ```
 
 ## Connect to the gateway
@@ -192,7 +192,7 @@ kubectl -n openshell rollout status deployment/openshell
 For local evaluation, use a port-forward:
 
 ```shell
-kubectl -n openshell port-forward svc/openshell 8080:8080
+kubectl -n ryno port-forward svc/ryno 8080:8080
 ```
 
 <Warning>
@@ -204,13 +204,13 @@ The port-forward is for local evaluation only. For shared environments, expose t
 The chart generates an mTLS bundle for transport security. Kubernetes deployments do not use that bundle as user authentication; configure OIDC or a trusted access proxy as described in [Access Control](/kubernetes/access-control). For local port-forwarded access, copy the generated bundle so the CLI can verify the gateway certificate:
 
 ```shell
-mkdir -p ~/.config/openshell/gateways/k8s/mtls
-kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/openshell/gateways/k8s/mtls/ca.crt
-kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/openshell/gateways/k8s/mtls/tls.crt
-kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/openshell/gateways/k8s/mtls/tls.key
+mkdir -p ~/.config/ryno/gateways/k8s/mtls
+kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/ryno/gateways/k8s/mtls/ca.crt
+kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/ryno/gateways/k8s/mtls/tls.crt
+kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/ryno/gateways/k8s/mtls/tls.key
 ```
 
 The server certificate SANs include `localhost` and `127.0.0.1`, so hostname verification passes over the port-forward without extra flags.
@@ -220,10 +220,10 @@ The server certificate SANs include `localhost` and `127.0.0.1`, so hostname ver
 In another terminal, register the gateway with the user authentication mode you configured and verify it is reachable. For example, with OIDC:
 
 ```shell
-openshell gateway add https://127.0.0.1:8080 --local --name k8s \
-  --oidc-issuer https://your-idp.example.com/realms/openshell \
-  --oidc-client-id openshell-cli
-openshell status
+ryno gateway add https://127.0.0.1:8080 --local --name k8s \
+  --oidc-issuer https://your-idp.example.com/realms/ryno \
+  --oidc-client-id ryno-cli
+ryno status
 ```
 
 </Steps>
@@ -235,16 +235,16 @@ The most commonly changed values are:
 | Value | Purpose |
 |---|---|
 | `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Shared registry, tag, and pull policy for the gateway, supervisor, and trusted sandbox runtime. Individual image settings take precedence. |
-| `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
+| `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Gateway container image. Defaults to `ghcr.io/nvidia/ryno/gateway:latest`. |
 | `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
-| `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
+| `server.telemetryEnabled` | Enable anonymous Ryno telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Default sandbox image used when a sandbox does not specify one. |
-| `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |
+| `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `ryno-sandbox` binary. A digest takes precedence over the tag. |
 | `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Trusted control-side supervisor image. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
@@ -258,10 +258,10 @@ The most commonly changed values are:
 Use a values file for repeatable deployments:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --values my-values.yaml
 ```
 
@@ -269,7 +269,7 @@ To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
 in the sandbox namespace and reference its name:
 
 ```shell
-kubectl -n openshell create secret docker-registry regcred \
+kubectl -n ryno create secret docker-registry regcred \
   --docker-server=registry.example.com \
   --docker-username="$REGISTRY_USER" \
   --docker-password="$REGISTRY_TOKEN"
@@ -277,23 +277,23 @@ kubectl -n openshell create secret docker-registry regcred \
 
 ```yaml
 server:
-  sandboxImage: registry.example.com/team/openshell-sandbox:latest
+  sandboxImage: registry.example.com/team/ryno-sandbox:latest
   sandboxImagePullSecrets:
     - name: regcred
 ```
 
 ## Configure a Corporate Upstream Proxy
 
-Configure a corporate forward proxy when sandbox TLS egress cannot dial the Internet directly. OpenShell evaluates policy and SSRF checks before it opens an HTTP CONNECT tunnel through the proxy. The proxy URL is operator-owned configuration. Sandbox environment variables cannot select, replace, or bypass it.
+Configure a corporate forward proxy when sandbox TLS egress cannot dial the Internet directly. Ryno evaluates policy and SSRF checks before it opens an HTTP CONNECT tunnel through the proxy. The proxy URL is operator-owned configuration. Sandbox environment variables cannot select, replace, or bypass it.
 
 Create the credential Secret in the sandbox namespace when the proxy requires Basic authentication. The Secret value uses the `user:pass` form.
 
 ```shell
-kubectl -n openshell create secret generic corporate-proxy-auth \
+kubectl -n ryno create secret generic corporate-proxy-auth \
   --from-literal=credentials="$PROXY_USER:$PROXY_PASSWORD"
 ```
 
-Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `noProxy` with values for your cluster. `noProxy` bypasses only the corporate proxy. OpenShell policy evaluation still applies.
+Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `noProxy` with values for your cluster. `noProxy` bypasses only the corporate proxy. Ryno policy evaluation still applies.
 
 ```yaml
 upstreamProxy:
@@ -317,22 +317,22 @@ The chart creates the following RBAC resources in the release namespace:
 
 | Resource | Scope | Name |
 |---|---|---|
-| ServiceAccount | Namespace | `openshell` |
-| ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
-| Role + RoleBinding | Namespace | `openshell-sandbox` |
-| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader-<release namespace>` |
+| ServiceAccount | Namespace | `ryno` |
+| ServiceAccount | Namespace | `ryno-sandbox` (for sandbox pods) |
+| Role + RoleBinding | Namespace | `ryno-sandbox` |
+| ClusterRole + ClusterRoleBinding | Cluster | `ryno-node-reader-<release namespace>` |
 
 Every other object the chart creates is namespaced. The `ClusterRole` and
 `ClusterRoleBinding` in the last row are the only cluster-scoped objects.
 
 When the Kubernetes Secrets credential driver is enabled, the chart also creates
-an `openshell-credential-secrets` Role and RoleBinding in the credential
+an `ryno-credential-secrets` Role and RoleBinding in the credential
 namespace. That Role grants `get`, `create`, `patch`, and `delete` on all Secrets
 in the credential namespace, and is the gateway's only permission grant for provider
 credential Secrets.
 
 In managed and operator workspace modes, the chart creates an
-`openshell-workspace-secret-source` Role and RoleBinding in the sandbox
+`ryno-workspace-secret-source` Role and RoleBinding in the sandbox
 namespace. That Role grants `get` on only the gateway client TLS Secret and, in
 managed mode, the configured image-pull Secrets. The gateway stages their
 contents into each sandbox runtime generation's Secrets in the workspace
@@ -356,10 +356,10 @@ The ClusterRole grants node inspection and token validation:
 To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set serviceAccount.create=false \
   --set serviceAccount.name=my-existing-sa
 ```
@@ -379,10 +379,10 @@ ServiceAccount. Render them from the same values the release uses, so the rules
 match the configured workspace mode and credential driver:
 
 ```shell
-helm template openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm template ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -396,10 +396,10 @@ objects omitted. The release renders only namespaced objects and needs no
 permission on `clusterroles` or `clusterrolebindings`:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   -f my-values.yaml \
   --set rbac.clusterScoped.create=false
 ```
@@ -419,9 +419,9 @@ TokenReview until a cluster-admin re-applies them. Hand ownership over first, as
 cluster-admin, so nothing is deleted:
 
 ```shell
-kubectl annotate clusterrole "openshell-node-reader-<namespace>" \
+kubectl annotate clusterrole "ryno-node-reader-<namespace>" \
   helm.sh/resource-policy=keep --overwrite
-kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
+kubectl annotate clusterrolebinding "ryno-node-reader-<namespace>" \
   helm.sh/resource-policy=keep --overwrite
 ```
 
@@ -460,10 +460,10 @@ With `rbac.create=false`, the cluster-admin applies the namespaced RBAC in the
 same step by adding it to the render:
 
 ```shell
-helm template openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm template ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   -f my-values.yaml \
   --set rbac.create=true \
   --set rbac.clusterScoped.create=true \
@@ -476,7 +476,7 @@ helm template openshell \
 ```
 
 To grant the installer the sandbox permissions instead, bind it to a Role
-carrying the same rules as the chart's `openshell-sandbox` Role.
+carrying the same rules as the chart's `ryno-sandbox` Role.
 
 ## Probes
 

@@ -6,9 +6,9 @@ requires = ["setuptools>=80", "setuptools-scm[simple]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openshell"
+name = "ryno"
 dynamic = ["version"]
-description = "OpenShell is the safe, private runtime for autonomous AI agents. "
+description = "Ryno is the safe, private runtime for autonomous AI agents. "
 license = "Apache-2.0"
 readme = "README.md"
 authors = [{ name = "NVIDIA Inc." }]
@@ -39,8 +39,8 @@ classifiers = [
 keywords = ["agent", "sandbox", "nvidia"]
 
 [project.urls]
-source = "https://github.com/NVIDIA/OpenShell"
-documentation = "https://docs.nvidia.com/openshell/latest/"
+source = "https://github.com/NVIDIA/Ryno"
+documentation = "https://docs.nvidia.com/ryno/latest/"
 
 [dependency-groups]
 dev = [
@@ -62,16 +62,16 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["python"]
-include = ["openshell*"]
+include = ["ryno*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-openshell = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
+ryno = ["py.typed", "_proto/*.py", "_proto/*.pyi"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 88
-exclude = ["python/openshell/_proto"]
+exclude = ["python/ryno/_proto"]
 
 [tool.ruff.lint]
 select = [
@@ -93,7 +93,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["openshell"]
+known-first-party = ["ryno"]
 
 [tool.ruff.format]
 quote-style = "double"

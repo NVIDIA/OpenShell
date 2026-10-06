@@ -6,15 +6,15 @@
 
 TEST_GUEST_CACHE_SCHEMA_VERSION=1
 TEST_GUEST_CACHE_DISK_LAYOUT=standalone-qcow2-zstd-v1
-TEST_GUEST_CACHE_ARTIFACT_TYPE=application/vnd.nvidia.openshell.test-guest.cache.v1
-TEST_GUEST_CACHE_METADATA_TYPE=application/vnd.nvidia.openshell.test-guest.cache.metadata.v1+json
-TEST_GUEST_CACHE_DISK_TYPE=application/vnd.nvidia.openshell.test-guest.cache.disk.qcow2.v1+zstd
+TEST_GUEST_CACHE_ARTIFACT_TYPE=application/vnd.nvidia.ryno.test-guest.cache.v1
+TEST_GUEST_CACHE_METADATA_TYPE=application/vnd.nvidia.ryno.test-guest.cache.metadata.v1+json
+TEST_GUEST_CACHE_DISK_TYPE=application/vnd.nvidia.ryno.test-guest.cache.disk.qcow2.v1+zstd
 
 test_vm_cache_root() {
-	if [ -n "${OPENSHELL_TEST_GUEST_CACHE_DIR:-}" ]; then
-		printf '%s\n' "${OPENSHELL_TEST_GUEST_CACHE_DIR}"
+	if [ -n "${RYNO_TEST_GUEST_CACHE_DIR:-}" ]; then
+		printf '%s\n' "${RYNO_TEST_GUEST_CACHE_DIR}"
 	else
-		printf '%s\n' "${XDG_CACHE_HOME:-${HOME}/.cache}/openshell/test-guest"
+		printf '%s\n' "${XDG_CACHE_HOME:-${HOME}/.cache}/ryno/test-guest"
 	fi
 }
 
@@ -48,7 +48,7 @@ test_vm_cache_key() {
 	local configuration_line
 
 	architecture=$(test_vm_cache_oci_architecture) || return 1
-	seal_hash=$(test_vm_cache_sha256 "${OPENSHELL_TEST_GUEST_CACHE_SEAL}") || return 1
+	seal_hash=$(test_vm_cache_sha256 "${RYNO_TEST_GUEST_CACHE_SEAL}") || return 1
 	printf -v material \
 		'schema=%s\ngeneration=%s\ndisk_layout=%s\ndistro=%s\nos_version=%s\narchitecture=%s\nbase_url=%s\nbase_hash=%s\noverlay_growth=%s\nansible_version=%s\nseal_sha256=%s\n' \
 		"${TEST_GUEST_CACHE_SCHEMA_VERSION}" \
@@ -66,7 +66,7 @@ test_vm_cache_key() {
 	for configuration in "$@"; do
 		configuration_hash=$(
 			test_vm_cache_sha256 \
-				"${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${configuration}"
+				"${RYNO_TEST_GUEST_CONFIGURATIONS}/${configuration}"
 		) || return 1
 		printf -v configuration_line \
 			'configuration=%s:%s\n' \

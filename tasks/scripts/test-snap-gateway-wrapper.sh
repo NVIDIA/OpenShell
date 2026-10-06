@@ -7,7 +7,7 @@ set -euo pipefail
 wrapper_input=${1:?Usage: test-snap-gateway-wrapper.sh <wrapper>}
 wrapper_dir=$(cd "$(dirname "$wrapper_input")" && pwd)
 wrapper="${wrapper_dir}/$(basename "$wrapper_input")"
-work=$(mktemp -d "${TMPDIR:-/tmp}/openshell snap wrapper.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/ryno snap wrapper.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 snap="$work/snap"
@@ -16,16 +16,16 @@ log="$work/calls"
 expected="$work/expected"
 mkdir -p "$snap/bin" "$common"
 
-cat >"$snap/bin/openshell-gateway" <<'EOF'
+cat >"$snap/bin/ryno-gateway" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_GATEWAY_LOG"
 if [ "${1:-}" = generate-certs ]; then
   exit 0
 fi
 printf 'env:%s|%s|%s\n' \
-  "${OPENSHELL_GATEWAY_CONFIG:-}" \
-  "${OPENSHELL_DB_URL:-}" \
-  "${OPENSHELL_DISABLE_TLS:-}" >>"$FAKE_GATEWAY_LOG"
+  "${RYNO_GATEWAY_CONFIG:-}" \
+  "${RYNO_DB_URL:-}" \
+  "${RYNO_DISABLE_TLS:-}" >>"$FAKE_GATEWAY_LOG"
 if [ "${1:-}" = config ] && [ "${2:-}" = preflight ]; then
   if [ "${FAKE_PREFLIGHT_FAIL:-}" = 1 ]; then
     exit 42
@@ -42,13 +42,13 @@ if [ "${1:-}" = config ] && [ "${2:-}" = preflight ]; then
   fi
 fi
 EOF
-chmod +x "$snap/bin/openshell-gateway"
+chmod +x "$snap/bin/ryno-gateway"
 
 run_wrapper() {
   local config=$1
   local fail=${2:-}
   if [ "$config" = unset ]; then
-    env -u OPENSHELL_GATEWAY_CONFIG \
+    env -u RYNO_GATEWAY_CONFIG \
       SNAP="$snap" \
       SNAP_COMMON="$common" \
       FAKE_GATEWAY_LOG="$log" \
@@ -58,7 +58,7 @@ run_wrapper() {
     env \
       SNAP="$snap" \
       SNAP_COMMON="$common" \
-      OPENSHELL_GATEWAY_CONFIG="$config" \
+      RYNO_GATEWAY_CONFIG="$config" \
       FAKE_GATEWAY_LOG="$log" \
       FAKE_PREFLIGHT_FAIL="$fail" \
       "$wrapper" --trace
@@ -67,7 +67,7 @@ run_wrapper() {
 
 assert_log() {
   printf '%s\n' \
-    "generate-certs --output-dir $common/tls --server-san host.openshell.internal" \
+    "generate-certs --output-dir $common/tls --server-san host.ryno.internal" \
     "$1" >"$expected"
   if ! cmp -s "$expected" "$log"; then
     echo "FAIL: unexpected call sequence" >&2
@@ -94,7 +94,7 @@ cp "$cli_config" "$work/cli-before"
 env \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
+  RYNO_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --trace --config "$cli_config"
 assert_log "config preflight -- --trace --config $cli_config
@@ -107,7 +107,7 @@ cmp -s "$work/cli-before" "$cli_config"
 if env \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
+  RYNO_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   FAKE_PREFLIGHT_FAIL=1 \
   "$wrapper" --config="$cli_config"; then
@@ -122,7 +122,7 @@ cmp -s "$work/cli-before" "$cli_config"
 if env \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
+  RYNO_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   FAKE_REJECT_UNPAIRED_RATE=1 \
   "$wrapper" --grpc-rate-limit-requests 10; then
@@ -142,7 +142,7 @@ for invalid_selector in terminator nested-config; do
   if env \
     SNAP="$snap" \
     SNAP_COMMON="$common" \
-    OPENSHELL_GATEWAY_CONFIG="$override" \
+    RYNO_GATEWAY_CONFIG="$override" \
     FAKE_GATEWAY_LOG="$log" \
     "$wrapper" "${invalid_args[@]}"; then
     echo "FAIL: invalid $invalid_selector selector reached gateway execution" >&2
@@ -158,7 +158,7 @@ done
 env \
   SNAP="$snap" \
   SNAP_COMMON="$common" \
-  OPENSHELL_GATEWAY_CONFIG="$override" \
+  RYNO_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --config=--dash-leading
 assert_log "config preflight -- --config=--dash-leading

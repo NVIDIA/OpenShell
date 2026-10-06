@@ -57,7 +57,7 @@ COMMENT_STYLES: dict[str, str] = {
 
 # Extensionless source files that cannot be identified by suffix.
 FILE_COMMENT_STYLES: dict[str, str] = {
-    "scripts/bin/openshell": "#",
+    "scripts/bin/ryno": "#",
 }
 
 # Some consumer formats do not support comments. Keep SPDX data in
@@ -81,7 +81,7 @@ EXCLUDE_DIRS: set[str] = {
     ".venv",
     ".git",
     ".cache",
-    "python/openshell/_proto",
+    "python/ryno/_proto",
     "sdk/typescript/src/gen",
 }
 

@@ -1,6 +1,6 @@
 ---
 name: test-release-canary
-description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published OpenShell artifacts (install.sh on macOS/Ubuntu/Fedora, Helm chart on kind) after each Release Dev publish. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
+description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published Ryno artifacts (install.sh on macOS/Ubuntu/Fedora, Helm chart on kind) after each Release Dev publish. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
 metadata:
   internal: true
 ---
@@ -17,15 +17,15 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, verifies the packaged prover version and a local policy boundary check, reaches the Docker gateway, creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
-| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the OpenShell Snap path when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
+| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the Ryno Snap path when Docker is absent or supplied by the Docker snap, without installing Ryno. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
-All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
-`OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
+All canary jobs disable anonymous Ryno telemetry. Host package jobs inject
+`RYNO_TELEMETRY_ENABLED=false` through the service environment, and the
 Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
-The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
+The workflow sets `RYNO_VERSION=dev` for every `install.sh` job. Positive
 jobs consume the rolling dev release produced by the triggering workflow. The
 system-Docker Snap lane tracks `latest/edge`; the missing-Docker lane exits
 before installing a snap. The Debian and Kubernetes CLI lanes remove snapd so
@@ -43,7 +43,7 @@ The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
 the release-tooling and package lifecycle tests before relying on the canary.
 
-The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
+The canary does not install or import `@nvidia/ryno-sdk`. TypeScript SDK
 validation lives in the `TypeScript SDK` branch check, including a publish
 dry-run. The tagged release workflow publishes the package to GitHub Packages;
 verify that job directly when diagnosing SDK publication failures.
@@ -91,14 +91,14 @@ gh run view <run-id> --log-failed
 
 When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published dev artifacts* (`0.0.0-dev` chart, `:dev` images, and the `dev` GitHub release). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
+Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/Ryno/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
 
 ## Testing artifacts from a specific SHA
 
 `Release Dev` publishes two chart versions for every dev build (see `.github/actions/release-helm-oci/action.yml:89-102`):
 
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
+- `oci://ghcr.io/nvidia/ryno/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
+- `oci://ghcr.io/nvidia/ryno/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
 To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
 
@@ -111,21 +111,21 @@ kind create cluster --name release-canary-local
 
 bash e2e/support/install-agent-sandbox.sh
 
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install ryno oci://ghcr.io/nvidia/ryno/helm-chart \
   --version 0.0.0-dev \
-  --namespace openshell --create-namespace \
+  --namespace ryno --create-namespace \
   --set server.disableTls=true \
   --set server.telemetryEnabled=false \
   --wait --timeout 5m
 
-kubectl wait --namespace openshell \
+kubectl wait --namespace ryno \
   --for=condition=Ready pod \
-  --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell" \
+  --selector="app.kubernetes.io/name=ryno,app.kubernetes.io/instance=ryno" \
   --timeout=300s
 
-kubectl port-forward --namespace openshell svc/openshell 8080:8080 &
-openshell gateway add http://127.0.0.1:8080 --local --name kind
-openshell status
+kubectl port-forward --namespace ryno svc/ryno 8080:8080 &
+ryno gateway add http://127.0.0.1:8080 --local --name kind
+ryno status
 ```
 
 Keep `pkiInitJob.enabled=true` (the chart default), even when
@@ -134,7 +134,7 @@ secret that the gateway pod always mounts.
 
 Swap `0.0.0-dev` for `0.0.0-dev.<sha>` to pin to a specific dev build. Tear down with `kind delete cluster --name release-canary-local`.
 
-Loopback registration auto-derives the gateway name to `openshell` if `--name` is omitted, which collides with the `install.sh`-installed local gateway — always pass `--name kind` (or another distinct name) when registering in addition to a local install.
+Loopback registration auto-derives the gateway name to `ryno` if `--name` is omitted, which collides with the `install.sh`-installed local gateway — always pass `--name kind` (or another distinct name) when registering in addition to a local install.
 
 ## Diagnosing failures
 
@@ -142,13 +142,13 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 |---|---|---|
 | `macos`/`ubuntu-deb`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | Sandbox create or exec fails | Published sandbox and supervisor artifacts are missing, incompatible, or cannot establish the protected runtime channel. | Gateway logs plus Docker, Podman, VM, Snap, or Kubernetes runtime diagnostics for the job. |
-| `macos`/`ubuntu-deb`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
+| `macos`/`ubuntu-deb`/`fedora` job fails on `ryno status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `RYNO_COMPUTE_DRIVER` env in the "Ensure …" step. |
 | `ubuntu-snap-system-docker` fails during `install.sh` | System Docker was unavailable, the edge revision or automatic interfaces were unavailable, or the gateway did not become reachable. | Failure diagnostics dump system Docker, snap service/connection/change state, gateway and snapd journals, snap logs, and port 17670 listeners. |
-| `ubuntu-snap-system-docker` fails during the prover checks | The prover artifact is missing or packaged for the wrong architecture, `openshell.prover` is not exposed or confined to read the test policies, or its solver linkage is not runnable. | The `Verify Snap installation` and `Check a policy boundary with the Snap prover` steps, plus `snap info openshell` and `snap connections openshell`. |
-| `ubuntu-snap-docker-preflight` unexpectedly succeeds | The installer no longer fails before installing the OpenShell snap when Docker is absent or supplied by the Docker snap. | Inspect `install.log`, `docker-snap.log`, `snap list`, and snapd changes. |
+| `ubuntu-snap-system-docker` fails during the prover checks | The prover artifact is missing or packaged for the wrong architecture, `ryno.prover` is not exposed or confined to read the test policies, or its solver linkage is not runnable. | The `Verify Snap installation` and `Check a policy boundary with the Snap prover` steps, plus `snap info ryno` and `snap connections ryno`. |
+| `ubuntu-snap-docker-preflight` unexpectedly succeeds | The installer no longer fails before installing the Ryno snap when Docker is absent or supplied by the Docker snap. | Inspect `install.log`, `docker-snap.log`, `snap list`, and snapd changes. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
-| `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
-| `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |
+| `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/ryno/gateway`. |
+| `kubernetes` job fails on `ryno gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `ryno gateway list` in the diagnostics dump. |
 
 The `kubernetes` job's diagnostics step (only runs `if: failure()`) emits, in order: helm status, rendered manifest, `kubectl get all`, pod descriptions, pod logs (200 lines per container), port-forward log, gateway list, CLI version. Read it top-to-bottom — most failures fall out by the manifest or pod logs.
 
@@ -156,4 +156,4 @@ The `kubernetes` job's diagnostics step (only runs `if: failure()`) emits, in or
 
 - `helm-dev-environment` skill — local k3d-based dev environment (more featureful than the canary's kind cluster, but uses Skaffold-built local images, not published artifacts).
 - `watch-github-actions` skill — generic `gh run` workflow monitoring.
-- `debug-openshell-cluster` skill — runtime gateway/sandbox diagnostics that pair with the kind job's diagnostics dump.
+- `debug-ryno-cluster` skill — runtime gateway/sandbox diagnostics that pair with the kind job's diagnostics dump.

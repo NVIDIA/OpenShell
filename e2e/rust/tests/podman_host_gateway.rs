@@ -4,32 +4,32 @@
 #![cfg(feature = "e2e-podman")]
 
 //! Verifies that a Podman sandbox can connect to a service on its host through
-//! the driver-neutral `host.openshell.internal` alias.
+//! the driver-neutral `host.ryno.internal` alias.
 
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
-use openshell_e2e::harness::container::ContainerEngine;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use ryno_e2e::harness::container::ContainerEngine;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const RESPONSE: &str = "host.openshell.internal is reachable";
+const RESPONSE: &str = "host.ryno.internal is reachable";
 const READY_MARKER: &str = "podman-host-gateway-ready";
 
 fn podman_container_diagnostics(sandbox_name: &str) -> String {
     let Ok(engine) = ContainerEngine::from_env() else {
         return "container engine unavailable".to_string();
     };
-    let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
+    let name_filter = format!("label=ryno.ai/sandbox-name={sandbox_name}");
     let output = match engine
         .command()
         .args([
             "ps",
             "-aq",
             "--filter",
-            "label=openshell.managed=true",
+            "label=ryno.managed=true",
             "--filter",
             &name_filter,
         ])
@@ -46,7 +46,7 @@ fn podman_container_diagnostics(sandbox_name: &str) -> String {
             .args([
                 "inspect",
                 "--format",
-                "{{.Name}} role={{index .Config.Labels \"openshell.io/isolation-role\"}} state={{json .State}}",
+                "{{.Name}} role={{index .Config.Labels \"ryno.io/isolation-role\"}} state={{json .State}}",
                 id,
             ])
             .output();
@@ -76,7 +76,7 @@ fn podman_container_diagnostics(sandbox_name: &str) -> String {
 }
 
 async fn assert_host_gateway_reachable(sandbox: &SandboxGuard, port: u16, stage: &str) {
-    let url = format!("http://host.openshell.internal:{port}/");
+    let url = format!("http://host.ryno.internal:{port}/");
     let probe = async {
         let mut failures = Vec::new();
         for attempt in 1..=5 {
@@ -127,7 +127,7 @@ async fn assert_host_gateway_reachable(sandbox: &SandboxGuard, port: u16, stage:
 }
 
 #[tokio::test]
-async fn podman_sandbox_reaches_host_openshell_internal() {
+async fn podman_sandbox_reaches_host_ryno_internal() {
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
         .expect("bind host-side TCP listener");
@@ -174,7 +174,7 @@ network_policies:
   host_gateway:
     name: host_gateway
     endpoints:
-      - host: host.openshell.internal
+      - host: host.ryno.internal
         port: {port}
         protocol: tcp
     binaries:

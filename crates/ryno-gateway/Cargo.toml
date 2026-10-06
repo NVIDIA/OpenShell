@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-gateway"
+description = "Ryno gateway binary composition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno-gateway"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-server = { path = "../ryno-server", default-features = false }
+ryno-otel = { path = "../ryno-otel", optional = true }
+async-trait = "0.1"
+miette = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+ryno-driver-docker = { path = "../ryno-driver-docker", optional = true }
+ryno-driver-kubernetes = { path = "../ryno-driver-kubernetes", optional = true }
+ryno-driver-podman = { path = "../ryno-driver-podman", optional = true }
+ryno-policy = { path = "../ryno-policy", optional = true }
+hyper-util = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ryno-driver-mxc = { path = "../ryno-driver-mxc", optional = true }
+
+[features]
+default = ["telemetry", "in-tree-compute-drivers"]
+in-tree-compute-drivers = [
+    "compute-driver-docker",
+    "compute-driver-kubernetes",
+    "compute-driver-podman",
+    "compute-driver-vm",
+    "compute-driver-mxc",
+]
+compute-driver-mxc = ["dep:ryno-driver-mxc"]
+compute-driver-docker = ["dep:ryno-driver-docker", "dep:ryno-otel"]
+compute-driver-kubernetes = ["dep:ryno-driver-kubernetes", "dep:ryno-otel"]
+compute-driver-podman = ["dep:ryno-driver-podman", "dep:ryno-otel"]
+compute-driver-vm = [
+    "dep:ryno-policy",
+    "dep:ryno-otel",
+    "dep:hyper-util",
+    "dep:nix",
+    "dep:serde",
+    "dep:rustix",
+    "dep:tonic",
+    "dep:tower",
+    "dep:tracing",
+]
+telemetry = ["ryno-core/telemetry", "ryno-server/telemetry"]
+## Convenience alias: every default feature except `telemetry`. Build a
+## telemetry-free gateway with
+## `--no-default-features --features defaults-without-telemetry` and stay
+## correct as new default features are added. Cargo cannot subtract a single
+## default feature, so this alias must be paired with `--no-default-features`;
+## enabling it alongside `telemetry` is a compile error rather than a silent
+## telemetry-on build. Kept in sync with `default` by
+## `rust:verify:defaults-without-telemetry`.
+defaults-without-telemetry = ["in-tree-compute-drivers"]
+vendored-z3 = ["ryno-server/vendored-z3"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+toml = { workspace = true }

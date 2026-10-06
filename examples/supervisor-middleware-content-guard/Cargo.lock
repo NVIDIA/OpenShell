@@ -1146,88 +1146,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openshell-core"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "base64",
- "glob",
- "ipnet",
- "miette",
- "nix",
- "openshell-extension-core",
- "openshell-policy-schema",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "rustix",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tonic-types",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "openshell-extension-core"
-version = "0.0.0"
-dependencies = [
- "hyper-util",
- "serde",
- "thiserror",
- "tokio",
- "tonic",
- "tower",
-]
-
-[[package]]
-name = "openshell-policy"
-version = "0.0.0"
-dependencies = [
- "hickory-proto",
- "miette",
- "openshell-core",
- "openshell-policy-schema",
- "prost-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "openshell-policy-schema"
-version = "0.0.0"
-dependencies = [
- "miette",
- "noyalib",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "openshell-supervisor-middleware-content-guard"
-version = "0.0.0"
-dependencies = [
- "clap",
- "openshell-core",
- "openshell-policy",
- "prost-types",
- "tokio",
- "tokio-stream",
- "tonic",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1664,6 +1582,88 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryno-core"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "glob",
+ "ipnet",
+ "miette",
+ "nix",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rustix",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-extension-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tonic-types",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-extension-core"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower",
+]
+
+[[package]]
+name = "ryno-policy"
+version = "0.0.0"
+dependencies = [
+ "hickory-proto",
+ "miette",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ryno-policy-schema"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "noyalib",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "ryno-supervisor-middleware-content-guard"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
 
 [[package]]
 name = "same-file"

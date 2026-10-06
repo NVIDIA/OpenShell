@@ -3,27 +3,27 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Isolation Backends"
 description: "Understand the runtime boundary used to launch and supervise sandboxed workloads."
-keywords: "OpenShell Extensions, Isolation Backends, Sandbox Runtime, Extensibility"
+keywords: "Ryno Extensions, Isolation Backends, Sandbox Runtime, Extensibility"
 ---
 
 The supervisor uses one Rust interface, `IsolationBackend`, to launch and
-control the agent workload. `OpenShellRuntimeBackend` implements that interface
-by calling `openshell-sandbox` over the OpenShell Sandbox Protocol. Because the
+control the agent workload. `RynoRuntimeBackend` implements that interface
+by calling `ryno-sandbox` over the Ryno Sandbox Protocol. Because the
 supervisor depends only on the interface, another backend can provide the same
 operations with different isolation mechanisms without changing the gateway API
 or policy model.
 
-![The supervisor calls the IsolationBackend interface. OpenShellRuntimeBackend implements it as a supervisor-side client and talks to openshell-sandbox, the workload-side server, over the Sandbox Protocol.](../images/openshell-isolation-backend.svg)
+![The supervisor calls the IsolationBackend interface. RynoRuntimeBackend implements it as a supervisor-side client and talks to ryno-sandbox, the workload-side server, over the Sandbox Protocol.](../images/ryno-isolation-backend.svg)
 
 ## The Interface
 
 Each step returns a new type, so the supervisor can't start an agent on a
 boundary that hasn't been confirmed. The traits are defined in
-[`contract.rs`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-isolation-interface/src/contract.rs)
+[`contract.rs`](https://github.com/NVIDIA/Ryno/blob/main/crates/ryno-isolation-interface/src/contract.rs)
 in the
-[`openshell-isolation-interface`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-isolation-interface)
-crate. `OpenShellRuntimeBackend` is implemented in
-[`openshell-sandbox-backend`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-sandbox-backend).
+[`ryno-isolation-interface`](https://github.com/NVIDIA/Ryno/tree/main/crates/ryno-isolation-interface)
+crate. `RynoRuntimeBackend` is implemented in
+[`ryno-sandbox-backend`](https://github.com/NVIDIA/Ryno/tree/main/crates/ryno-sandbox-backend).
 
 | Rust surface | What it does | Returns |
 |---|---|---|
@@ -43,6 +43,6 @@ crate. `OpenShellRuntimeBackend` is implemented in
 | Compute driver | Placement and fencing. The driver creates runtime resources, installs the outer egress fence, and supplies a verified descriptor. |
 | Isolation backend | Common behavior. The backend turns the shared Rust calls into a protected session with the sandbox runtime. |
 
-For how `openshell-sandbox` enforces the boundary, refer to [Inside the Sandbox
+For how `ryno-sandbox` enforces the boundary, refer to [Inside the Sandbox
 Boundary](/about/architecture#inside-the-sandbox-boundary). For driver-specific
 workload behavior, refer to [Runtimes](/how-it-works/sandboxes/runtimes).

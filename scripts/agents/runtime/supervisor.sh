@@ -10,19 +10,19 @@ require_env() {
     [[ -n "${!name:-}" ]] || { echo "missing required env: $name" >&2; exit 1; }
 }
 
-require_env OPENSHELL_AGENT_HARNESS
+require_env RYNO_AGENT_HARNESS
 
 RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD_DIR="$(cd "$RUNTIME_DIR/.." && pwd)"
 PROMPT_FILE="$PAYLOAD_DIR/agent-prompt.md"
-ADAPTER="$PAYLOAD_DIR/runtime/harnesses/$OPENSHELL_AGENT_HARNESS/exec.sh"
-RUN_MODE="${OPENSHELL_AGENT_RUN_MODE:-once}"
-POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-900}"
-MAX_TRANSIENT_FAILURES="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-5}"
-HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-60}"
-STATE_DIR="${OPENSHELL_AGENT_STATE_DIR:-/sandbox/.openshell-agent}"
-STATE_HISTORY_LIMIT="${OPENSHELL_AGENT_STATE_HISTORY_LIMIT:-100}"
-MAX_NOTES_LENGTH="${OPENSHELL_AGENT_MAX_NOTES_LENGTH:-2048}"
+ADAPTER="$PAYLOAD_DIR/runtime/harnesses/$RYNO_AGENT_HARNESS/exec.sh"
+RUN_MODE="${RYNO_AGENT_RUN_MODE:-once}"
+POLL_INTERVAL_SECONDS="${RYNO_AGENT_POLL_INTERVAL_SECONDS:-900}"
+MAX_TRANSIENT_FAILURES="${RYNO_AGENT_MAX_TRANSIENT_FAILURES:-5}"
+HEARTBEAT_SECONDS="${RYNO_AGENT_HEARTBEAT_SECONDS:-60}"
+STATE_DIR="${RYNO_AGENT_STATE_DIR:-/sandbox/.ryno-agent}"
+STATE_HISTORY_LIMIT="${RYNO_AGENT_STATE_HISTORY_LIMIT:-100}"
+MAX_NOTES_LENGTH="${RYNO_AGENT_MAX_NOTES_LENGTH:-2048}"
 MAX_SLEEP_SECONDS=86400
 
 [[ -f "$PROMPT_FILE" ]] || { echo "missing agent prompt: $PROMPT_FILE" >&2; exit 1; }
@@ -32,14 +32,14 @@ case "$RUN_MODE" in
     once|watch) ;;
     *) echo "unsupported agent run mode: $RUN_MODE" >&2; exit 2 ;;
 esac
-[[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be an integer" >&2; exit 2; }
-[[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES must be an integer" >&2; exit 2; }
-[[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_HEARTBEAT_SECONDS must be an integer" >&2; exit 2; }
-[[ "$STATE_HISTORY_LIMIT" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_STATE_HISTORY_LIMIT must be an integer" >&2; exit 2; }
-[[ "$MAX_NOTES_LENGTH" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_MAX_NOTES_LENGTH must be an integer" >&2; exit 2; }
-[[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be greater than zero" >&2; exit 2; }
-[[ "$STATE_HISTORY_LIMIT" -gt 0 ]] || { echo "OPENSHELL_AGENT_STATE_HISTORY_LIMIT must be greater than zero" >&2; exit 2; }
-[[ "$MAX_NOTES_LENGTH" -gt 0 ]] || { echo "OPENSHELL_AGENT_MAX_NOTES_LENGTH must be greater than zero" >&2; exit 2; }
+[[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || { echo "RYNO_AGENT_POLL_INTERVAL_SECONDS must be an integer" >&2; exit 2; }
+[[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || { echo "RYNO_AGENT_MAX_TRANSIENT_FAILURES must be an integer" >&2; exit 2; }
+[[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || { echo "RYNO_AGENT_HEARTBEAT_SECONDS must be an integer" >&2; exit 2; }
+[[ "$STATE_HISTORY_LIMIT" =~ ^[0-9]+$ ]] || { echo "RYNO_AGENT_STATE_HISTORY_LIMIT must be an integer" >&2; exit 2; }
+[[ "$MAX_NOTES_LENGTH" =~ ^[0-9]+$ ]] || { echo "RYNO_AGENT_MAX_NOTES_LENGTH must be an integer" >&2; exit 2; }
+[[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || { echo "RYNO_AGENT_POLL_INTERVAL_SECONDS must be greater than zero" >&2; exit 2; }
+[[ "$STATE_HISTORY_LIMIT" -gt 0 ]] || { echo "RYNO_AGENT_STATE_HISTORY_LIMIT must be greater than zero" >&2; exit 2; }
+[[ "$MAX_NOTES_LENGTH" -gt 0 ]] || { echo "RYNO_AGENT_MAX_NOTES_LENGTH must be greater than zero" >&2; exit 2; }
 
 json_string_field() {
     local json="$1"
@@ -109,8 +109,8 @@ state_record_json() {
     if command -v jq >/dev/null 2>&1; then
         jq -cn \
             --arg recorded_at "$recorded_at" \
-            --arg agent_id "${OPENSHELL_AGENT_ID:-unknown}" \
-            --arg harness "$OPENSHELL_AGENT_HARNESS" \
+            --arg agent_id "${RYNO_AGENT_ID:-unknown}" \
+            --arg harness "$RYNO_AGENT_HARNESS" \
             --arg run_mode "$RUN_MODE" \
             --argjson cycle "$cycle" \
             --arg supervisor_state "$supervisor_state" \
@@ -139,7 +139,7 @@ print(json.dumps({
     "harness_exit_code": int(harness_status) if harness_status else None,
     "result": json.loads(result),
 }, separators=(",", ":")))
-' "$recorded_at" "${OPENSHELL_AGENT_ID:-unknown}" "$OPENSHELL_AGENT_HARNESS" \
+' "$recorded_at" "${RYNO_AGENT_ID:-unknown}" "$RYNO_AGENT_HARNESS" \
         "$RUN_MODE" "$cycle" "$supervisor_state" "$harness_status" "$result_json"
 }
 
@@ -220,7 +220,7 @@ sleep_with_heartbeat() {
         remaining=$((remaining - chunk))
 
         if [[ "$remaining" -gt 0 ]]; then
-            echo "openshell-agent: still waiting ($reason); next cycle in ${remaining}s" >&2
+            echo "ryno-agent: still waiting ($reason); next cycle in ${remaining}s" >&2
         fi
     done
 }
@@ -238,7 +238,7 @@ active_cycle_heartbeat() {
         wait "$sleep_pid" || exit 0
         sleep_pid=""
         elapsed=$((elapsed + HEARTBEAT_SECONDS))
-        echo "openshell-agent: still running $RUN_MODE cycle $active_cycle with harness $OPENSHELL_AGENT_HARNESS after ${elapsed}s" >&2
+        echo "ryno-agent: still running $RUN_MODE cycle $active_cycle with harness $RYNO_AGENT_HARNESS after ${elapsed}s" >&2
     done
 }
 
@@ -250,12 +250,12 @@ retry_watch_cycle() {
 
     if [[ "$MAX_TRANSIENT_FAILURES" -gt 0 ]]; then
         if [[ $((transient_failures % MAX_TRANSIENT_FAILURES)) -eq 0 ]]; then
-            echo "openshell-agent: transient watch failure $transient_failures ($reason); still retrying in ${retry_seconds}s" >&2
+            echo "ryno-agent: transient watch failure $transient_failures ($reason); still retrying in ${retry_seconds}s" >&2
         else
-            echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
+            echo "ryno-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
         fi
     else
-        echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
+        echo "ryno-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
     fi
     sleep_with_heartbeat "$retry_seconds" "$reason"
     if [[ "$advance_backoff" == "true" ]]; then
@@ -302,9 +302,9 @@ cap_transient_backoff
 
 while true; do
     cycle=$((cycle + 1))
-    echo "openshell-agent: starting $RUN_MODE cycle $cycle with harness $OPENSHELL_AGENT_HARNESS" >&2
+    echo "ryno-agent: starting $RUN_MODE cycle $cycle with harness $RYNO_AGENT_HARNESS" >&2
     persist_state "running"
-    output_file="$(mktemp /tmp/openshell-agent-cycle.XXXXXX)"
+    output_file="$(mktemp /tmp/ryno-agent-cycle.XXXXXX)"
 
     if run_cycle "$output_file"; then
         harness_status=0
@@ -312,11 +312,11 @@ while true; do
         harness_status=$?
     fi
 
-    result_line="$(grep -E '^OPENSHELL_AGENT_RESULT[[:space:]]+' "$output_file" | tail -n 1 || true)"
-    result_json="${result_line#OPENSHELL_AGENT_RESULT }"
+    result_line="$(grep -E '^RYNO_AGENT_RESULT[[:space:]]+' "$output_file" | tail -n 1 || true)"
+    result_json="${result_line#RYNO_AGENT_RESULT }"
 
     if [[ -z "$result_line" ]]; then
-        retry_reason="missing OPENSHELL_AGENT_RESULT after harness exit $harness_status"
+        retry_reason="missing RYNO_AGENT_RESULT after harness exit $harness_status"
         if classify_transient_failure "$output_file"; then
             retry_reason="$retry_reason; upstream transport failure detected"
         fi
@@ -339,10 +339,10 @@ while true; do
         persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$diagnostic_json"
         rm -f "$output_file"
         if [[ "$RUN_MODE" == "once" ]]; then
-            echo "openshell-agent: malformed OPENSHELL_AGENT_RESULT JSON" >&2
+            echo "ryno-agent: malformed RYNO_AGENT_RESULT JSON" >&2
             exit 1
         fi
-        retry_watch_cycle "malformed OPENSHELL_AGENT_RESULT JSON"
+        retry_watch_cycle "malformed RYNO_AGENT_RESULT JSON"
         continue
     fi
 
@@ -359,40 +359,40 @@ while true; do
     case "$status" in
         complete)
             persist_state "terminal" "$harness_status" "$result_json"
-            echo "openshell-agent: complete ($reason)" >&2
+            echo "ryno-agent: complete ($reason)" >&2
             exit 0
             ;;
         waiting|blocked)
             persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
-                echo "openshell-agent: $status ($reason)" >&2
+                echo "ryno-agent: $status ($reason)" >&2
                 exit 0
             fi
             transient_failures=0
             transient_backoff_seconds=30
-            echo "openshell-agent: $status ($reason); sleeping ${next_poll_seconds}s outside harness" >&2
+            echo "ryno-agent: $status ($reason); sleeping ${next_poll_seconds}s outside harness" >&2
             sleep_with_heartbeat "$next_poll_seconds" "$reason"
             ;;
         transient_failure)
             persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
-                echo "openshell-agent: transient failure ($reason)" >&2
+                echo "ryno-agent: transient failure ($reason)" >&2
                 exit 1
             fi
             retry_watch_cycle "$reason" "$next_poll_seconds" false
             ;;
         terminal_failure)
             persist_state "terminal" "$harness_status" "$result_json"
-            echo "openshell-agent: terminal failure ($reason)" >&2
+            echo "ryno-agent: terminal failure ($reason)" >&2
             exit 1
             ;;
         *)
             persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
-                echo "openshell-agent: invalid OPENSHELL_AGENT_RESULT status: ${status:-<missing>}" >&2
+                echo "ryno-agent: invalid RYNO_AGENT_RESULT status: ${status:-<missing>}" >&2
                 exit 1
             fi
-            retry_watch_cycle "invalid OPENSHELL_AGENT_RESULT status: ${status:-<missing>}"
+            retry_watch_cycle "invalid RYNO_AGENT_RESULT status: ${status:-<missing>}"
             ;;
     esac
 done

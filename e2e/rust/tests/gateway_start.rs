@@ -12,21 +12,21 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{
+use ryno_e2e::harness::cli::{
     run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
     wait_for_sandbox_phase,
 };
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
-const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
+const MANAGED_BY_LABEL_FILTER: &str = "label=ryno.ai/managed-by=ryno";
 const READY_MARKER: &str = "gateway-start-ready";
 const STOPPED_READY_MARKER: &str = "gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/gateway-start-state";
-const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
-const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
-const SANDBOX_ROLE_LABEL_FILTER: &str = "label=openshell.ai/isolation-role=sandbox";
+const SANDBOX_NAMESPACE_LABEL: &str = "ryno.ai/sandbox-namespace";
+const SANDBOX_NAME_LABEL: &str = "ryno.ai/sandbox-name";
+const SANDBOX_ROLE_LABEL_FILTER: &str = "label=ryno.ai/isolation-role=sandbox";
 
 fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
     let namespace_filter = format!("label={SANDBOX_NAMESPACE_LABEL}={namespace}");
@@ -134,7 +134,7 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
         eprintln!("Skipping gateway start test: e2e gateway is not managed by this test run");
         return;
     };
-    let Some(namespace) = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
+    let Some(namespace) = std::env::var("RYNO_E2E_DOCKER_NETWORK_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {

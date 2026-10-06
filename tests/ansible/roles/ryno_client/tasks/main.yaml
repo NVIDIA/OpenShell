@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Register Ryno gateway for test client
+  ansible.builtin.command:
+    argv:
+      - ryno
+      - gateway
+      - add
+      - "{{ ryno_client_gateway_endpoint | default('http://127.0.0.1:17670') }}"
+      - --local
+      - --name
+      - "{{ ryno_client_gateway_name | default('tmachine') }}"

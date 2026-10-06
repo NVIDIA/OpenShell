@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start a standalone openshell-gateway backed by the Docker compute driver for
+# Start a standalone ryno-gateway backed by the Docker compute driver for
 # local manual testing.
 #
 # Defaults:
@@ -12,16 +12,16 @@
 # - Persistent state under .cache/gateway-docker
 #
 # Common overrides:
-#   OPENSHELL_SERVER_PORT=19080 mise run gateway:docker
-#   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
-#   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
-#   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
-#   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
-#   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
+#   RYNO_SERVER_PORT=19080 mise run gateway:docker
+#   RYNO_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
+#   RYNO_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
+#   RYNO_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
+#   RYNO_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
+#   RYNO_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
 #
 # After the gateway is running, point the CLI at it with either:
-#   openshell --gateway docker-dev <command>
-#   openshell gateway use docker-dev   # then plain `openshell <command>`
+#   ryno --gateway docker-dev <command>
+#   ryno gateway use docker-dev   # then plain `ryno <command>`
 
 set -euo pipefail
 
@@ -30,16 +30,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
-PORT="${OPENSHELL_SERVER_PORT:-18080}"
-GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
-STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
-SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-docker-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
-SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
-SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
-SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
-LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+PORT="${RYNO_SERVER_PORT:-18080}"
+GATEWAY_NAME="${RYNO_DOCKER_GATEWAY_NAME:-docker-dev}"
+STATE_DIR="${RYNO_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
+SANDBOX_NAMESPACE="${RYNO_SANDBOX_NAMESPACE:-docker-dev}"
+SANDBOX_IMAGE="${RYNO_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+SUPERVISOR_IMAGE="${RYNO_SUPERVISOR_IMAGE:-ryno/supervisor:dev}"
+SANDBOX_RUNTIME_IMAGE="${RYNO_SANDBOX_RUNTIME_IMAGE:-ryno/sandbox:dev}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${RYNO_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
+LOG_LEVEL="${RYNO_LOG_LEVEL:-info}"
+GATEWAY_BIN="${ROOT}/target/debug/ryno-gateway"
 
 port_is_in_use() {
   local port=$1
@@ -89,7 +89,7 @@ append_local_otlp_config_if_available() {
 
   cat >>"${config_path}" <<'EOF'
 
-[openshell.gateway.otlp]
+[ryno.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
 EOF
   echo "OTLP trace export enabled for http://127.0.0.1:4317."
@@ -102,7 +102,7 @@ register_gateway_metadata() {
   local config_home gateway_dir
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
+  gateway_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
   cat >"${gateway_dir}/metadata.json" <<EOF
@@ -117,7 +117,7 @@ EOF
 }
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_DOCKER_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+  echo "ERROR: RYNO_DOCKER_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
 fi
 
@@ -131,31 +131,31 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 if port_is_in_use "${PORT}"; then
-  echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
+  echo "ERROR: port ${PORT} is already in use; free it or set RYNO_SERVER_PORT" >&2
   exit 2
 fi
 
 ensure_docker_runtime_image \
   "${SUPERVISOR_IMAGE}" \
-  "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
+  "${RYNO_SUPERVISOR_IMAGE:-}" \
   supervisor \
   supervisor
 ensure_docker_runtime_image \
   "${SANDBOX_RUNTIME_IMAGE}" \
-  "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
+  "${RYNO_SANDBOX_RUNTIME_IMAGE:-}" \
   sandbox \
   "sandbox runtime"
 
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
+GRPC_ENDPOINT="${RYNO_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
 
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-echo "Building openshell-gateway..."
+echo "Building ryno-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-gateway --bin openshell-gateway
+  -p ryno-gateway --bin ryno-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."
@@ -163,29 +163,29 @@ echo "Generating local gateway credentials..."
   --output-dir "${TLS_DIR}" \
   --server-san "127.0.0.1" \
   --server-san "localhost" \
-  --server-san "host.openshell.internal"
+  --server-san "host.ryno.internal"
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 name = "${GATEWAY_NAME}"
 compute_driver = "docker"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
 
-[openshell.drivers.docker]
+[ryno.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"
 supervisor_image = "${SUPERVISOR_IMAGE}"
 sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
@@ -197,28 +197,28 @@ grpc_endpoint = "${GRPC_ENDPOINT}"
 app_armor_profile = "Unconfined"
 EOF
 
-# Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
+# Keep the local task's proxy inputs aligned with [ryno.drivers.docker].
 # Credentials stay in the referenced root-owned file; do not echo their value.
-if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
-  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_HTTPS_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
-  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
-  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
-  printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  printf 'proxy_auth_allow_insecure = %s\n' "${RYNO_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
-  printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  printf 'proxy_connect_by_hostname = %s\n' "${RYNO_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
-  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
+  printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${RYNO_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
 fi
-if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
-  printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
+if [[ -n "${RYNO_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
+  printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${RYNO_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
 fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
@@ -233,8 +233,8 @@ echo "  namespace: ${SANDBOX_NAMESPACE}"
 echo "  state dir: ${STATE_DIR}"
 echo
 echo "Point the CLI at this gateway with one of:"
-echo "  openshell --gateway ${GATEWAY_NAME} status"
-echo "  openshell gateway select ${GATEWAY_NAME}"
+echo "  ryno --gateway ${GATEWAY_NAME} status"
+echo "  ryno gateway select ${GATEWAY_NAME}"
 echo
 
 exec "${GATEWAY_BIN}" \

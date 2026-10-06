@@ -1,13 +1,13 @@
 # Sandbox Policy Quickstart
 
-See how OpenShell's network policy system works in under five minutes.
+See how Ryno's network policy system works in under five minutes.
 You'll create a sandbox, watch a request get blocked by the default-deny
 policy, apply a fine-grained L7 rule, and verify that reads are allowed
 while writes are blocked — all without restarting anything.
 
 ## Prerequisites
 
-- A running OpenShell gateway (`mise run gateway:docker` for local development)
+- A running Ryno gateway (`mise run gateway:docker` for local development)
 - Docker daemon running
 
 ## What's in this example
@@ -22,7 +22,7 @@ while writes are blocked — all without restarting anything.
 ### 1. Create a sandbox
 
 ```bash
-openshell sandbox create --name demo --no-auto-providers
+ryno sandbox create --name demo --no-auto-providers
 ```
 
 `--no-auto-providers` skips the provider setup prompt since this
@@ -58,7 +58,7 @@ exit
 ### 3. Check the deny log
 
 ```bash
-openshell logs demo --since 5m --source sandbox
+ryno logs demo --since 5m --source sandbox
 ```
 
 You'll see a line like:
@@ -73,7 +73,7 @@ attempted it, and the reason. Nothing gets out silently.
 ### 4. Add a read-only GitHub API rule
 
 ```bash
-openshell policy update demo \
+ryno policy update demo \
   --rule-name github_api \
   --binary /usr/bin/curl \
   --add-endpoint api.github.com:443:read-only:rest:enforce \
@@ -109,15 +109,15 @@ revision. No restart required — network rules reload while the sandbox runs.
 
 [`policy.yaml`](policy.yaml) contains the same rule in a complete policy. Use
 it to start a new sandbox with the rule in place:
-`openshell sandbox create --name demo --policy examples/sandbox-policy-quickstart/policy.yaml`.
-Do not apply it to a running sandbox with `openshell policy set`, which
+`ryno sandbox create --name demo --policy examples/sandbox-policy-quickstart/policy.yaml`.
+Do not apply it to a running sandbox with `ryno policy set`, which
 replaces the entire policy and is rejected if the file drops a filesystem path
 the sandbox already has.
 
 ### 5. Connect and verify: GET works
 
 ```bash
-openshell sandbox connect demo
+ryno sandbox connect demo
 ```
 
 ```bash
@@ -188,7 +188,7 @@ exit
 ### 7. Check the L7 deny log
 
 ```bash
-openshell logs demo --since 5m --source sandbox
+ryno logs demo --since 5m --source sandbox
 ```
 
 ```text
@@ -203,7 +203,7 @@ your SIEM for a complete audit trail of every request your agent makes.
 ### 8. Clean up
 
 ```bash
-openshell sandbox delete demo
+ryno sandbox delete demo
 ```
 
 ## What you just saw

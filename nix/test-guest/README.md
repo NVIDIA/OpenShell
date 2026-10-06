@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Test Guests
 
-This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
+This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing Ryno packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
 
 ## Requirements
 
@@ -52,8 +52,8 @@ nix/test-guest/
 └── provisioners/
     └── roles/
         ├── gateway-podman/
-        ├── openshell-development/
-        └── openshell-rpm/
+        ├── ryno-development/
+        └── ryno-rpm/
 ```
 
 - `default.nix` assembles the guest and cache flake apps. It selects host architecture and acceleration, supplies the runtime tools, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
@@ -84,19 +84,19 @@ system-Docker canary, or use it alone to verify that `install.sh` fails safely
 when Docker is absent.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
-OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
+Ryno tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
 AppArmor rule that permits `pasta` to receive Podman stop signals. Fedora
 installs the subordinate-ID utilities and rootless storage and network helpers.
 Both configurations verify rootless mode and the `pasta` network helper
-required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
+required by Ryno sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
 does not provide that helper.
 
 `podman-rootful` installs Podman, enables its system API socket, and records
 the selected mode for the `gateway-podman` provisioner. The provisioner then
-starts the selected OpenShell installation as root. It does not write a
+starts the selected Ryno installation as root. It does not write a
 rootful-specific gateway setting; the gateway discovers the Podman socket
 available to its service account. The rootless configuration records its mode
-the same way and runs the gateway as the `openshell` user.
+the same way and runs the gateway as the `ryno` user.
 
 List the available distros and configurations:
 
@@ -152,7 +152,7 @@ nix run .#test-guest -- \
 
 Configurations are Ansible playbooks stored under `nix/test-guest/configuration/`. Ansible runs on the host using the VM's ephemeral SSH key and loopback port. The guest does not install Ansible.
 
-Configurations run in the order provided on the command line. OpenShell packages and copied files are installed after all configurations succeed.
+Configurations run in the order provided on the command line. Ryno packages and copied files are installed after all configurations succeed.
 
 `--install` packages and `--copy` files are applied by a dedicated per-run
 transfer step. `--copy` preserves each source file's ordinary permission bits
@@ -163,14 +163,14 @@ entries.
 
 `--provision NAME` applies a target-specific system setup after packages and
 copied artifacts are present. Unlike `--with`, provisioners are not cached.
-They can therefore install and start an OpenShell system without coupling the
+They can therefore install and start an Ryno system without coupling the
 prepared guest image to a particular build or driver configuration.
 
-`openshell-development` expects these copied guest paths:
+`ryno-development` expects these copied guest paths:
 
-- `/usr/local/bin/openshell`
-- `/usr/local/bin/openshell-gateway`
-- `/usr/local/lib/openshell-sandbox.tar`
+- `/usr/local/bin/ryno`
+- `/usr/local/bin/ryno-gateway`
+- `/usr/local/lib/ryno-sandbox.tar`
 
 Compose it with `gateway-podman` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
@@ -181,17 +181,17 @@ conformance after the rootless provisioners complete:
 ```shell
 nix run .#test-guest -- \
   --distro fedora --with podman-rootless --with selinux \
-  --copy ./openshell:/usr/local/bin/openshell \
-  --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
-  --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
-  --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
-  --provision openshell-development \
+  --copy ./ryno:/usr/local/bin/ryno \
+  --copy ./ryno-conformance:/usr/local/bin/ryno-conformance \
+  --copy ./ryno-gateway:/usr/local/bin/ryno-gateway \
+  --copy ./ryno-sandbox.tar:/usr/local/lib/ryno-sandbox.tar \
+  --provision ryno-development \
   --provision gateway-podman \
-  -- /usr/local/bin/openshell-conformance run smoke
+  -- /usr/local/bin/ryno-conformance run smoke
 ```
 
-`openshell-rpm` expects OpenShell to have been installed with `--install`. It
-uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
+`ryno-rpm` expects Ryno to have been installed with `--install`. It
+uses the RPM-owned `/usr/bin` binaries and `ryno-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
 `gateway-podman` to start the installed version before running smoke
 conformance.
@@ -213,7 +213,7 @@ backing cache:
 nix run .#test-guest-cache -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --repository ghcr.io/nvidia/openshell/test-guest-cache \
+  --repository ghcr.io/nvidia/ryno/test-guest-cache \
   --digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
@@ -223,7 +223,7 @@ The command never publishes implicitly. Add `--push` after authenticating ORAS t
 nix run .#test-guest-cache -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --repository ghcr.io/nvidia/openshell/test-guest-cache \
+  --repository ghcr.io/nvidia/ryno/test-guest-cache \
   --push
 ```
 
@@ -240,10 +240,10 @@ Normal `test-guest` runs automatically use an exact valid local entry after
 rechecking its disk checksum and QCOW2 structure. On a local miss, the runner
 invokes the cache builder and stores the prepared disk before continuing. It
 then creates a fresh writable overlay, cloud-init instance, machine ID, and SSH
-identity from that entry. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass
+identity from that entry. Set `RYNO_TEST_GUEST_CACHE_DISABLE=1` to bypass
 both local lookup and automatic population.
 
-The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/openshell/test-guest`. Override it with `--cache-dir` on the cache command or `OPENSHELL_TEST_GUEST_CACHE_DIR` for either app.
+The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/ryno/test-guest`. Override it with `--cache-dir` on the cache command or `RYNO_TEST_GUEST_CACHE_DIR` for either app.
 
 Cache command options:
 
@@ -256,16 +256,16 @@ Cache command options:
 --push              Publish the ensured entry to the repository
 ```
 
-## Install an OpenShell package
+## Install an Ryno package
 
 Package existing ARM64 Linux binaries with the repository's `package:deb:arm64` mise task:
 
 ```shell
-OPENSHELL_CLI_BINARY="$PWD/target/aarch64-unknown-linux-musl/release/openshell" \
-OPENSHELL_GATEWAY_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/openshell-gateway" \
-OPENSHELL_DRIVER_VM_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/openshell-driver-vm" \
-OPENSHELL_DEB_VERSION=0.0.0-local \
-OPENSHELL_OUTPUT_DIR="$PWD/artifacts" \
+RYNO_CLI_BINARY="$PWD/target/aarch64-unknown-linux-musl/release/ryno" \
+RYNO_GATEWAY_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/ryno-gateway" \
+RYNO_DRIVER_VM_BINARY="$PWD/target/aarch64-unknown-linux-gnu/release/ryno-driver-vm" \
+RYNO_DEB_VERSION=0.0.0-local \
+RYNO_OUTPUT_DIR="$PWD/artifacts" \
 nix develop --command mise run package:deb:arm64
 ```
 
@@ -275,8 +275,8 @@ Install the package in an Ubuntu VM and run a command:
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --install artifacts/openshell_0.0.0-local_arm64.deb \
-  -- openshell --version
+  --install artifacts/ryno_0.0.0-local_arm64.deb \
+  -- ryno --version
 ```
 
 For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the host and guest architecture.
@@ -292,15 +292,15 @@ permission bits. Supply a bare octal mode such as `755` to override them:
 ```shell
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
-  --copy ./openshell:/usr/local/bin/openshell:755 \
-  -- openshell --version
+  --copy ./ryno:/usr/local/bin/ryno:755 \
+  -- ryno --version
 ```
 
 ## Reproduce Snap installation
 
 Copy the repository installer and reproduction script into a prepared Ubuntu
 guest. The script follows both Release Canary Snap flows: it runs `install.sh`
-with `OPENSHELL_VERSION=dev`, checks the `latest/edge` channel and Docker
+with `RYNO_VERSION=dev`, checks the `latest/edge` channel and Docker
 interface, and exercises a sandbox. Repeated attempts also cover the installer's
 idempotent Snap refresh path. On each failure the script prints snapd, Docker,
 and gateway diagnostics.
@@ -383,4 +383,4 @@ Use `--keep` to preserve the overlay, cloud-init seed, SSH key, and serial log f
 - Prepared cache entries are architecture-specific and match the exact ordered configuration list.
 - OCI pulls transfer a complete compressed standalone disk; incremental disk layers are not implemented.
 - Guest ports are reachable from the host only when explicitly exposed with loopback-only `--forward-port`.
-- The runner does not build OpenShell, configure a gateway, or select an E2E test suite.
+- The runner does not build Ryno, configure a gateway, or select an E2E test suite.

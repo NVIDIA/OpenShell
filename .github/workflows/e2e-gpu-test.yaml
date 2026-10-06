@@ -38,7 +38,7 @@ jobs:
             runner: wsl-amd64-gpu-rtxpro6000-latest-1
             experimental: true
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -49,27 +49,27 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
-      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
-      OPENSHELL_REGISTRY_HOST: ghcr.io
-      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
-      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
-      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      RYNO_REGISTRY: ghcr.io/nvidia/ryno
+      RYNO_REGISTRY_HOST: ghcr.io
+      RYNO_REGISTRY_NAMESPACE: nvidia/ryno
+      RYNO_REGISTRY_USERNAME: ${{ github.actor }}
+      RYNO_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       CONTAINER_ENGINE: docker
-      OPENSHELL_E2E_DOCKER_GPU: "1"
+      RYNO_E2E_DOCKER_GPU: "1"
       # NVIDIA-managed Ubuntu base used as the GPU probe target: it has the
       # filesystem layout CDI injection expects (ldconfig, populated /usr/bin)
       # which the distroless gateway runtime lacks. Consumed by the prereq
       # probe below and by the e2e tests in e2e/rust/tests/gpu/device_selection.rs.
-      OPENSHELL_E2E_GPU_PROBE_IMAGE: "nvcr.io/nvidia/base/ubuntu:noble-20251013"
+      RYNO_E2E_GPU_PROBE_IMAGE: "nvcr.io/nvidia/base/ubuntu:noble-20251013"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Use prebuilt OpenShell CLI
+      - name: Use prebuilt Ryno CLI
         uses: ./.github/actions/setup-e2e-cli
         with:
           conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
-      - name: Use prebuilt OpenShell gateway
+      - name: Use prebuilt Ryno gateway
         uses: ./.github/actions/setup-e2e-gateway
 
       - name: Log in to GHCR
@@ -78,7 +78,7 @@ jobs:
       - name: Check Docker GPU prerequisites
         run: |
           docker info --format '{{json .CDISpecDirs}}'
-          docker run --rm --device nvidia.com/gpu=all "${OPENSHELL_E2E_GPU_PROBE_IMAGE}" nvidia-smi -L
+          docker run --rm --device nvidia.com/gpu=all "${RYNO_E2E_GPU_PROBE_IMAGE}" nvidia-smi -L
 
       - name: Build GPU workload images
         run: mise run --no-deps --skip-deps e2e:workloads:build

@@ -20,7 +20,7 @@ use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use openshell_e2e::harness::binary::openshell_cmd;
+use ryno_e2e::harness::binary::ryno_cmd;
 use serde_json::Value;
 use serial_test::serial;
 use tokio::process::Command;
@@ -41,21 +41,21 @@ const ADMIN: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-admin",
     username: "admin@test",
     password: "admin",
-    expected_role: "openshell-admin",
+    expected_role: "ryno-admin",
 };
 
 const USER: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-user",
     username: "user@test",
     password: "user",
-    expected_role: "openshell-user",
+    expected_role: "ryno-user",
 };
 
 const USER_B: IdentityScenario = IdentityScenario {
     gateway_name: "oidc-pkce-user-b",
     username: "user-b@test",
     password: "user-b",
-    expected_role: "openshell-user",
+    expected_role: "ryno-user",
 };
 
 struct LoginSession {
@@ -221,7 +221,7 @@ async fn admin_can_inspect_gateway() {
     let output = assert_allowed(&session, &["gateway", "info"], "inspect gateway info").await;
     let info = combined_output(&output);
     let expected_driver =
-        std::env::var("OPENSHELL_E2E_DRIVER").expect("OIDC E2E requires OPENSHELL_E2E_DRIVER");
+        std::env::var("RYNO_E2E_DRIVER").expect("OIDC E2E requires RYNO_E2E_DRIVER");
     assert!(
         info.to_ascii_lowercase()
             .contains(&expected_driver.to_ascii_lowercase()),
@@ -1044,9 +1044,9 @@ async fn workspace_user_cannot_list_another_workspace_members() {
 }
 
 async fn login_identity(identity: IdentityScenario) -> LoginSession {
-    let issuer = std::env::var("OPENSHELL_E2E_OIDC_ISSUER")
-        .unwrap_or_else(|_| "http://localhost:8180/realms/openshell".to_string());
-    let gateway_endpoint = std::env::var("OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT")
+    let issuer = std::env::var("RYNO_E2E_OIDC_ISSUER")
+        .unwrap_or_else(|_| "http://localhost:8180/realms/ryno".to_string());
+    let gateway_endpoint = std::env::var("RYNO_E2E_OIDC_GATEWAY_ENDPOINT")
         .expect("OIDC E2E requires a live gateway endpoint");
     let temp = tempfile::tempdir().expect("create isolated test directory");
     let fake_bin = temp.path().join("bin");
@@ -1055,7 +1055,7 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
     install_xdg_open_recorder(&fake_bin);
 
     let path = prepend_path(&fake_bin);
-    let mut cli = openshell_cmd();
+    let mut cli = ryno_cmd();
     cli.args([
         "gateway",
         "add",
@@ -1066,21 +1066,21 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
         "--oidc-issuer",
         &issuer,
         "--oidc-scopes",
-        "profile email openshell:all",
+        "profile email ryno:all",
     ])
     .env("XDG_CONFIG_HOME", temp.path())
     .env("HOME", temp.path())
     .env("PATH", path)
-    .env("OPENSHELL_E2E_BROWSER_URL_FILE", &browser_url_file)
-    .env_remove("OPENSHELL_GATEWAY")
-    .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
-    .env_remove("OPENSHELL_NO_BROWSER")
-    .env_remove("OPENSHELL_OIDC_CLIENT_SECRET")
+    .env("RYNO_E2E_BROWSER_URL_FILE", &browser_url_file)
+    .env_remove("RYNO_GATEWAY")
+    .env_remove("RYNO_GATEWAY_ENDPOINT")
+    .env_remove("RYNO_NO_BROWSER")
+    .env_remove("RYNO_OIDC_CLIENT_SECRET")
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
-    let child = cli.spawn().expect("start openshell PKCE login");
+    let child = cli.spawn().expect("start ryno PKCE login");
     let authorization_url = wait_for_browser_url(&browser_url_file).await;
     let redirect_uri = assert_pkce_authorization_url(&authorization_url, &issuer);
 
@@ -1101,8 +1101,8 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
 
     let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await
-        .expect("openshell did not finish after receiving the OIDC callback")
-        .expect("wait for openshell PKCE login");
+        .expect("ryno did not finish after receiving the OIDC callback")
+        .expect("wait for ryno PKCE login");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1110,7 +1110,7 @@ async fn login_identity(identity: IdentityScenario) -> LoginSession {
     );
     assert!(
         output.status.success(),
-        "openshell PKCE login failed:\n{combined}"
+        "ryno PKCE login failed:\n{combined}"
     );
     assert!(
         combined.contains("Authenticated successfully"),
@@ -1137,7 +1137,7 @@ fn install_xdg_open_recorder(bin_dir: &Path) {
     let script = bin_dir.join("xdg-open");
     std::fs::write(
         &script,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" > \"$OPENSHELL_E2E_BROWSER_URL_FILE\"\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" > \"$RYNO_E2E_BROWSER_URL_FILE\"\n",
     )
     .expect("write xdg-open recorder");
     std::fs::set_permissions(&script, Permissions::from_mode(0o755))
@@ -1186,7 +1186,7 @@ fn assert_pkce_authorization_url(authorization_url: &str, issuer: &str) -> Strin
     );
     assert_eq!(
         params.get("client_id").map(String::as_str),
-        Some("openshell-cli")
+        Some("ryno-cli")
     );
     assert_eq!(
         params.get("code_challenge_method").map(String::as_str),
@@ -1212,7 +1212,7 @@ fn assert_pkce_authorization_url(authorization_url: &str, issuer: &str) -> Strin
         .expect("authorization URL has scopes")
         .split_whitespace()
         .collect();
-    for expected in ["openid", "profile", "email", "openshell:all"] {
+    for expected in ["openid", "profile", "email", "ryno:all"] {
         assert!(scopes.contains(&expected), "missing OIDC scope {expected}");
     }
 
@@ -1310,14 +1310,14 @@ fn assert_persisted_login(
     expected_role: &str,
 ) -> String {
     let gateway_dir = config_home
-        .join("openshell")
+        .join("ryno")
         .join("gateways")
         .join(gateway_name);
     let metadata: Value = read_json(&gateway_dir.join("metadata.json"));
     assert_eq!(metadata["auth_mode"], "oidc");
     assert_eq!(metadata["oidc_issuer"], issuer);
-    assert_eq!(metadata["oidc_client_id"], "openshell-cli");
-    assert_eq!(metadata["oidc_scopes"], "profile email openshell:all");
+    assert_eq!(metadata["oidc_client_id"], "ryno-cli");
+    assert_eq!(metadata["oidc_scopes"], "profile email ryno:all");
 
     let token: Value = read_json(&gateway_dir.join("oidc_token.json"));
     let access_token = token["access_token"]
@@ -1331,11 +1331,11 @@ fn assert_persisted_login(
         "browser flow should persist a refresh token"
     );
     assert_eq!(token["issuer"], issuer);
-    assert_eq!(token["client_id"], "openshell-cli");
+    assert_eq!(token["client_id"], "ryno-cli");
 
     let claims = decode_jwt_claims(access_token);
-    assert!(jwt_audience_contains(&claims["aud"], "openshell-cli"));
-    assert_eq!(claims["azp"], "openshell-cli");
+    assert!(jwt_audience_contains(&claims["aud"], "ryno-cli"));
+    assert_eq!(claims["azp"], "ryno-cli");
     assert_eq!(claims["preferred_username"], username);
     let subject = claims["sub"]
         .as_str()
@@ -1597,7 +1597,7 @@ fn assert_admin_role_denial(output: &Output, action: &str) {
         .filter(|character| !character.is_whitespace() && *character != '│')
         .collect();
     assert!(
-        !output.status.success() && compact_denial.contains("openshell-admin"),
+        !output.status.success() && compact_denial.contains("ryno-admin"),
         "standard user unexpectedly authorized to {action}, or denial omitted the admin role:\n{denied}"
     );
 }
@@ -1610,7 +1610,7 @@ fn assert_workspace_admin_denial(
 ) {
     let denied = combined_output(output);
     let remediation = format!(
-        "openshell workspace member add --workspace '{workspace}' --subject '{}' --role admin",
+        "ryno workspace member add --workspace '{workspace}' --subject '{}' --role admin",
         session.subject
     );
     let compact_denial: String = denied
@@ -1655,21 +1655,21 @@ fn assert_non_member_denial(output: &Output, action: &str) {
 }
 
 async fn run_cli(config_home: &Path, args: &[&str]) -> Output {
-    openshell_cmd()
+    ryno_cmd()
         .arg("--gateway-insecure")
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
         .env("HOME", config_home)
-        .env("OPENSHELL_GATEWAY_INSECURE", "true")
-        .env_remove("OPENSHELL_GATEWAY")
-        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
-        .env_remove("OPENSHELL_OIDC_CLIENT_SECRET")
+        .env("RYNO_GATEWAY_INSECURE", "true")
+        .env_remove("RYNO_GATEWAY")
+        .env_remove("RYNO_GATEWAY_ENDPOINT")
+        .env_remove("RYNO_OIDC_CLIENT_SECRET")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .expect("run openshell authorization action")
+        .expect("run ryno authorization action")
 }
 
 fn combined_output(output: &Output) -> String {

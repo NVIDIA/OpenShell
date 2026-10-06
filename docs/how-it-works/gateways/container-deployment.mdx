@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Running the Gateway as a Container"
 sidebar-title: "Container Deployment"
-description: "Run the OpenShell gateway using docker run or docker-compose without the installer."
+description: "Run the Ryno gateway using docker run or docker-compose without the installer."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, docker-compose, container, immutable OS, bootc, rpm-ostree"
 position: 8
 ---
 
-Use this approach when you want to run the OpenShell gateway as a container instead of installing it with the system package manager. This is useful on immutable OS distributions (Fedora CoreOS, bootc-based images, Silverblue) where the standard installer is not appropriate, or anywhere you prefer a container-first workflow.
+Use this approach when you want to run the Ryno gateway as a container instead of installing it with the system package manager. This is useful on immutable OS distributions (Fedora CoreOS, bootc-based images, Silverblue) where the standard installer is not appropriate, or anywhere you prefer a container-first workflow.
 
-The gateway image is published at `ghcr.io/nvidia/openshell/gateway`.
+The gateway image is published at `ghcr.io/nvidia/ryno/gateway`.
 
 ## Prerequisites for the Docker Driver
 
@@ -22,14 +22,14 @@ a basic `docker run`:
    Add the `docker` group (or the GID of `/var/run/docker.sock`) so the socket is accessible
    without running as root.
 
-2. **gRPC endpoint.** Sandbox containers call back to the gateway over the `OPENSHELL_GRPC_ENDPOINT`
-   address. The Docker driver substitutes `host.openshell.internal` as the host and the gateway's
+2. **gRPC endpoint.** Sandbox containers call back to the gateway over the `RYNO_GRPC_ENDPOINT`
+   address. The Docker driver substitutes `host.ryno.internal` as the host and the gateway's
    own bind port as the port — only the **scheme** (`http` or `https`) is preserved. Use
-   `http://host.openshell.internal:8080` when TLS is disabled and `https://host.openshell.internal:8080`
+   `http://host.ryno.internal:8080` when TLS is disabled and `https://host.ryno.internal:8080`
    when mTLS is enabled. The docker driver automatically binds the gateway to the bridge network
    interface so sandbox containers can reach it — you do not need to expose the port on `0.0.0.0`.
 
-3. **Supervisor binary on the host.** The gateway bind-mounts the `openshell-sandbox` supervisor
+3. **Supervisor binary on the host.** The gateway bind-mounts the `ryno-sandbox` supervisor
    binary into each sandbox container. Because bind-mount paths are resolved by the host Docker
    daemon (not inside the gateway container), the binary must exist at a path on the **host**
    filesystem and be mounted at the **same absolute path** inside the gateway container. That way
@@ -41,54 +41,54 @@ a basic `docker run`:
 Extract the supervisor binary to the host once, then start the gateway:
 
 ```shell
-mkdir -p ~/openshell/supervisor
-docker create --name tmp-supervisor ghcr.io/nvidia/openshell/supervisor:latest
-docker cp tmp-supervisor:/openshell-sandbox ~/openshell/supervisor/openshell-sandbox
+mkdir -p ~/ryno/supervisor
+docker create --name tmp-supervisor ghcr.io/nvidia/ryno/supervisor:latest
+docker cp tmp-supervisor:/ryno-sandbox ~/ryno/supervisor/ryno-sandbox
 docker rm tmp-supervisor
-chmod +x ~/openshell/supervisor/openshell-sandbox
+chmod +x ~/ryno/supervisor/ryno-sandbox
 ```
 
 Start the gateway:
 
 ```shell
 docker run -d \
-  --name openshell-gateway \
+  --name ryno-gateway \
   --restart unless-stopped \
   --group-add docker \
   -p 127.0.0.1:8080:8080 \
-  -v openshell-state:/var/openshell \
+  -v ryno-state:/var/ryno \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
-  -e OPENSHELL_COMPUTE_DRIVER=docker \
-  -e OPENSHELL_GRPC_ENDPOINT=http://host.openshell.internal:8080 \
-  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
-  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
-  -e OPENSHELL_DISABLE_TLS=true \
-  ghcr.io/nvidia/openshell/gateway:latest
+  -v ~/ryno/supervisor/ryno-sandbox:~/ryno/supervisor/ryno-sandbox:ro \
+  -e RYNO_COMPUTE_DRIVER=docker \
+  -e RYNO_GRPC_ENDPOINT=http://host.ryno.internal:8080 \
+  -e RYNO_DOCKER_SUPERVISOR_BIN=~/ryno/supervisor/ryno-sandbox \
+  -e RYNO_DB_URL=sqlite:/var/ryno/ryno.db \
+  -e RYNO_DISABLE_TLS=true \
+  ghcr.io/nvidia/ryno/gateway:latest
 ```
 
-The volume mount uses `~/openshell/supervisor/openshell-sandbox` for both the host and container
+The volume mount uses `~/ryno/supervisor/ryno-sandbox` for both the host and container
 paths. The shell expands `~` in both halves before passing the argument to Docker, so both sides
-resolve to the same absolute path (e.g., `/home/user/openshell/supervisor/openshell-sandbox`).
+resolve to the same absolute path (e.g., `/home/user/ryno/supervisor/ryno-sandbox`).
 This satisfies the same-path requirement so the host Docker daemon can find the binary when
 creating sandbox containers.
 
 Register the gateway with the CLI. If running on the same machine, use `--local`:
 
 ```shell
-openshell gateway add http://127.0.0.1:8080 --local --name local
+ryno gateway add http://127.0.0.1:8080 --local --name local
 ```
 
 If registering from a different machine on the same network, use the host IP and `--remote`:
 
 ```shell
-openshell gateway add http://HOST_IP:8080 --remote --name remote
+ryno gateway add http://HOST_IP:8080 --remote --name remote
 ```
 
 Confirm the CLI can reach the gateway:
 
 ```shell
-openshell status
+ryno status
 ```
 
 <Warning>
@@ -104,54 +104,54 @@ To run the gateway with mutual TLS, generate the PKI bundle first, then start th
 Bootstrap the PKI into a local state directory:
 
 ```shell
-mkdir -p ~/.local/state/openshell/tls
+mkdir -p ~/.local/state/ryno/tls
 
 docker run --rm \
-  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
-  -v "$HOME/.config/openshell:/home/openshell/.config/openshell" \
-  ghcr.io/nvidia/openshell/gateway:latest \
+  -v "$HOME/.local/state/ryno:/home/ryno/.local/state/ryno" \
+  -v "$HOME/.config/ryno:/home/ryno/.config/ryno" \
+  ghcr.io/nvidia/ryno/gateway:latest \
   generate-certs \
-    --output-dir /home/openshell/.local/state/openshell/tls \
-    --server-san host.openshell.internal
+    --output-dir /home/ryno/.local/state/ryno/tls \
+    --server-san host.ryno.internal
 ```
 
-This writes the server and client certificates under `~/.local/state/openshell/tls/`, writes sandbox JWT signing keys under `~/.local/state/openshell/tls/jwt/`, and copies the client bundle to `~/.config/openshell/gateways/openshell/mtls/` so the CLI picks it up automatically.
+This writes the server and client certificates under `~/.local/state/ryno/tls/`, writes sandbox JWT signing keys under `~/.local/state/ryno/tls/jwt/`, and copies the client bundle to `~/.config/ryno/gateways/ryno/mtls/` so the CLI picks it up automatically.
 
 Start the gateway with mTLS enabled:
 
 ```shell
 docker run -d \
-  --name openshell-gateway \
+  --name ryno-gateway \
   --restart unless-stopped \
   --group-add docker \
   -p 127.0.0.1:8080:8080 \
-  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
+  -v "$HOME/.local/state/ryno:/home/ryno/.local/state/ryno" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
-  -e OPENSHELL_COMPUTE_DRIVER=docker \
-  -e OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:8080 \
-  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
-  -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
-  -e OPENSHELL_LOCAL_TLS_DIR=/home/openshell/.local/state/openshell/tls \
-  -e OPENSHELL_TLS_CERT=/home/openshell/.local/state/openshell/tls/server/tls.crt \
-  -e OPENSHELL_TLS_KEY=/home/openshell/.local/state/openshell/tls/server/tls.key \
-  -e OPENSHELL_TLS_CLIENT_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
-  -e OPENSHELL_ENABLE_MTLS_AUTH=true \
-  -e OPENSHELL_DOCKER_TLS_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
-  -e OPENSHELL_DOCKER_TLS_CERT=/home/openshell/.local/state/openshell/tls/client/tls.crt \
-  -e OPENSHELL_DOCKER_TLS_KEY=/home/openshell/.local/state/openshell/tls/client/tls.key \
-  ghcr.io/nvidia/openshell/gateway:latest
+  -v ~/ryno/supervisor/ryno-sandbox:~/ryno/supervisor/ryno-sandbox:ro \
+  -e RYNO_COMPUTE_DRIVER=docker \
+  -e RYNO_GRPC_ENDPOINT=https://127.0.0.1:8080 \
+  -e RYNO_DOCKER_SUPERVISOR_BIN=~/ryno/supervisor/ryno-sandbox \
+  -e RYNO_DB_URL=sqlite:/home/ryno/.local/state/ryno/ryno.db \
+  -e RYNO_LOCAL_TLS_DIR=/home/ryno/.local/state/ryno/tls \
+  -e RYNO_TLS_CERT=/home/ryno/.local/state/ryno/tls/server/tls.crt \
+  -e RYNO_TLS_KEY=/home/ryno/.local/state/ryno/tls/server/tls.key \
+  -e RYNO_TLS_CLIENT_CA=/home/ryno/.local/state/ryno/tls/ca.crt \
+  -e RYNO_ENABLE_MTLS_AUTH=true \
+  -e RYNO_DOCKER_TLS_CA=/home/ryno/.local/state/ryno/tls/ca.crt \
+  -e RYNO_DOCKER_TLS_CERT=/home/ryno/.local/state/ryno/tls/client/tls.crt \
+  -e RYNO_DOCKER_TLS_KEY=/home/ryno/.local/state/ryno/tls/client/tls.key \
+  ghcr.io/nvidia/ryno/gateway:latest
 ```
 
 Register the gateway with mTLS:
 
 ```shell
-openshell gateway add https://127.0.0.1:8080 --local --name local
+ryno gateway add https://127.0.0.1:8080 --local --name local
 ```
 
 ## Docker Compose
 
-The [`deploy/docker/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/docker) directory in
+The [`deploy/docker/`](https://github.com/NVIDIA/Ryno/tree/main/deploy/docker) directory in
 the repository contains a production-ready Compose setup with full inline documentation:
 
 | File | Purpose |
@@ -168,14 +168,14 @@ docker compose -f deploy/docker/docker-compose.yml up -d
 Register the gateway with the CLI. If registering from the same machine:
 
 ```shell
-openshell gateway add http://127.0.0.1:8080 --local --name local
+ryno gateway add http://127.0.0.1:8080 --local --name local
 ```
 
 If registering from a different machine on the same network, replace `HOST_IP` with the
 machine's LAN address:
 
 ```shell
-openshell gateway add http://HOST_IP:8080 --remote --name remote
+ryno gateway add http://HOST_IP:8080 --remote --name remote
 ```
 
 ## Using Podman
@@ -184,15 +184,15 @@ Replace `docker` with `podman` in the commands above. Mount the Podman socket in
 
 ```shell
 podman run -d \
-  --name openshell-gateway \
+  --name ryno-gateway \
   -p 127.0.0.1:8080:8080 \
-  -v openshell-state:/var/openshell \
+  -v ryno-state:/var/ryno \
   -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock" \
-  -e OPENSHELL_COMPUTE_DRIVER=podman \
-  -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
-  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
-  -e OPENSHELL_DISABLE_TLS=true \
-  ghcr.io/nvidia/openshell/gateway:latest
+  -e RYNO_COMPUTE_DRIVER=podman \
+  -e RYNO_PODMAN_SOCKET=/var/run/podman.sock \
+  -e RYNO_DB_URL=sqlite:/var/ryno/ryno.db \
+  -e RYNO_DISABLE_TLS=true \
+  ghcr.io/nvidia/ryno/gateway:latest
 ```
 
 ## Next Steps

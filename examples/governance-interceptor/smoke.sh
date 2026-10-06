@@ -280,14 +280,14 @@ policy_signature_for_sandbox() {
   local sandbox_name="$1"
 
   "${CLI[@]}" sandbox get "$sandbox_name" \
-    | awk -F': ' '/openshell.nvidia.com\/policy-signature:/ { print $2; exit }'
+    | awk -F': ' '/ryno.nvidia.com\/policy-signature:/ { print $2; exit }'
 }
 
 profile_signature_for_profile() {
   local profile_id="$1"
 
   "${CLI[@]}" profile export "$profile_id" -o json \
-    | awk -F'"' '/"openshell.nvidia.com\/profile-signature":/ { print $4; exit }'
+    | awk -F'"' '/"ryno.nvidia.com\/profile-signature":/ { print $4; exit }'
 }
 
 wait_for_profile() {
@@ -324,24 +324,24 @@ generate_gateway_jwt_bundle() {
 
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 provider_profile_sources = [
   { type = "interceptor", name = "provider-governance" },
 ]
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
 
-[[openshell.gateway.interceptors]]
+[[ryno.gateway.interceptors]]
 name = "provider-governance"
 grpc_endpoint = "http://$INTERCEPTOR_ADDR"
 order = 10
@@ -351,32 +351,32 @@ timeout = "500ms"
 max_response_bytes = 1048576
 max_patches = 32
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/CreateSandbox"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/CreateSandbox"
 phases = ["modify_operation", "validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/CreateProvider"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/CreateProvider"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/UpdateConfig"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/UpdateConfig"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/SubmitPolicyAnalysis"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/SubmitPolicyAnalysis"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/ImportProviderProfiles"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/ImportProviderProfiles"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/UpdateProviderProfiles"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/UpdateProviderProfiles"
 phases = ["validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc = "openshell.v1.OpenShell/DeleteProviderProfile"
+[[ryno.gateway.interceptors.bindings]]
+rpc = "ryno.v1.Ryno/DeleteProviderProfile"
 phases = ["validate"]
 EOF
 }
@@ -394,7 +394,7 @@ start_interceptor() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_COMPUTE_DRIVER "$ROOT/target/debug/openshell-gateway" \
+  env -u RYNO_COMPUTE_DRIVER "$ROOT/target/debug/ryno-gateway" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \
@@ -428,8 +428,8 @@ wait_for_gateway() {
 configure_gateway() {
   CLI=(
     env
-    -u OPENSHELL_SANDBOX_POLICY
-    "$ROOT/target/debug/openshell"
+    -u RYNO_SANDBOX_POLICY
+    "$ROOT/target/debug/ryno"
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
 
@@ -453,8 +453,8 @@ binaries: [/usr/bin/curl]
 EOF
   "${CLI[@]}" profile import -f "$TMPDIR/unvended-profile.yaml" --global >/dev/null 2>&1 || true
   expect_output_not_contains "hides profiles the interceptor does not vend" "unvended-api" "${CLI[@]}" profile list
-  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" profile export github -o json
-  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" profile export github -o json
+  expect_output_contains "github profile has governance profile signature" "ryno.nvidia.com/profile-signature" "${CLI[@]}" profile export github -o json
+  expect_output_contains "github profile has governance profile hash" "ryno.nvidia.com/profile-hash" "${CLI[@]}" profile export github -o json
 
   cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
 id: custom-slack
@@ -542,7 +542,7 @@ EOF
   local reloaded_policy_signature=""
   {
     printf '\n== policy.yaml reload updates sandbox policy signature ==\n'
-    printf '+ wait for sandbox annotation %q to change\n' "openshell.nvidia.com/policy-signature"
+    printf '+ wait for sandbox annotation %q to change\n' "ryno.nvidia.com/policy-signature"
   } >>"$SETUP_LOG"
   for _ in {1..60}; do
     reloaded_policy_signature="$(policy_signature_for_sandbox "$SANDBOX_NAME")"
@@ -598,7 +598,7 @@ EOF
   local reloaded_github_profile_signature=""
   {
     printf '\n== github profile reload updates profile signature ==\n'
-    printf '+ wait for provider profile annotation %q to change\n' "openshell.nvidia.com/profile-signature"
+    printf '+ wait for provider profile annotation %q to change\n' "ryno.nvidia.com/profile-signature"
   } >>"$SETUP_LOG"
   for _ in {1..60}; do
     reloaded_github_profile_signature="$(profile_signature_for_profile github)"
@@ -637,7 +637,7 @@ Gateway log:          $GATEWAY_LOG
 Interceptor log:      $INTERCEPTOR_LOG
 
 Example CLI:
-  env -u OPENSHELL_SANDBOX_POLICY "$ROOT/target/debug/openshell" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox list
+  env -u RYNO_SANDBOX_POLICY "$ROOT/target/debug/ryno" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox list
 
 Press Ctrl-C to stop the gateway and interceptor.
 EOF
@@ -659,9 +659,9 @@ wait_until_stopped() {
 
 cd "$ROOT"
 
-run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
+run_setup_step "building gateway" cargo build --quiet -p ryno-gateway --bin ryno-gateway
 run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
-run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
+run_setup_step "building CLI" cargo build --quiet -p ryno-cli --bin ryno
 
 generate_gateway_jwt_bundle
 cp "$EXAMPLE_DIR/policy.yaml" "$POLICY_FILE"

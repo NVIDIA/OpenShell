@@ -18,7 +18,7 @@ A network policy decides whether an agent can call an API. Use middleware when y
 - Remove sensitive content from HTTP responses before the agent receives them.
 - Check outgoing WebSocket text messages during a session.
 
-The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) shows a complete middleware service that performs checks like these.
+The [content guard example](https://github.com/NVIDIA/Ryno/tree/main/examples/supervisor-middleware-content-guard) shows a complete middleware service that performs checks like these.
 
 ## How Middleware Processes Traffic
 
@@ -43,9 +43,9 @@ sequenceDiagram
   Supervisor-->>Sandbox: Response
 ```
 
-OpenShell checks network policy first, so middleware only sees traffic that policy allows. It then selects middleware by destination host and runs it in the order you configure. OpenShell injects provider credentials after request middleware runs, so middleware never sees them.
+Ryno checks network policy first, so middleware only sees traffic that policy allows. It then selects middleware by destination host and runs it in the order you configure. Ryno injects provider credentials after request middleware runs, so middleware never sees them.
 
-Each middleware decides whether to allow, deny, or change the traffic. A denial blocks the request even when network policy allows it. If middleware fails or its service is unavailable, OpenShell blocks the affected traffic by default.
+Each middleware decides whether to allow, deny, or change the traffic. A denial blocks the request even when network policy allows it. If middleware fails or its service is unavailable, Ryno blocks the affected traffic by default.
 
 Middleware can handle three operations: HTTP requests, HTTP responses, and the text messages an agent sends over a WebSocket connection. Each middleware declares which operations it supports. [Supported Operations](/extensibility/supervisor-middleware/operations) describes each one.
 
@@ -72,11 +72,11 @@ Attach built-in middleware, register your own service, choose failure behavior, 
 
 ## Build Your Middleware Service
 
-A middleware service is a gRPC server that implements the services in [`proto/supervisor_middleware.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/supervisor_middleware.proto). The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) is a complete service you can start from.
+A middleware service is a gRPC server that implements the services in [`proto/supervisor_middleware.proto`](https://github.com/NVIDIA/Ryno/blob/main/proto/supervisor_middleware.proto). The [content guard example](https://github.com/NVIDIA/Ryno/tree/main/examples/supervisor-middleware-content-guard) is a complete service you can start from.
 
 <Warning>
 
-The middleware API is still evolving. Future versions will change it to make the contract consistent across HTTP requests, HTTP responses, and WebSocket messages. Expect to update your service when you upgrade OpenShell. [Protocol negotiation](/extensibility/overview#protocol-negotiation) detects incompatible versions at startup.
+The middleware API is still evolving. Future versions will change it to make the contract consistent across HTTP requests, HTTP responses, and WebSocket messages. Expect to update your service when you upgrade Ryno. [Protocol negotiation](/extensibility/overview#protocol-negotiation) detects incompatible versions at startup.
 
 </Warning>
 
@@ -95,17 +95,17 @@ These guides cover the rest of the service contract:
 
 <Card title="Supported Operations" href="/extensibility/supervisor-middleware/operations">
 
-When OpenShell calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
+When Ryno calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
 </Card>
 
 <Card title="Authenticating Extensions" href="/extensibility/overview#authenticating-extensions">
 
-How to verify that calls to your service come from your OpenShell gateway.
+How to verify that calls to your service come from your Ryno gateway.
 </Card>
 
 <Card title="Protocol Negotiation" href="/extensibility/overview#protocol-negotiation">
 
-How your service and OpenShell agree on a protocol version at startup.
+How your service and Ryno agree on a protocol version at startup.
 </Card>
 
 </Cards>

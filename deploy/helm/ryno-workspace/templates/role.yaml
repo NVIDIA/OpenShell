@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- include "ryno-workspace.validateValues" . }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "ryno-workspace.fullname" . }}-sandbox
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ryno-workspace.labels" . | nindent 4 }}
+rules:
+  {{- if .Values.gateway.allowDriverConfig }}
+  # Metadata-only admission of caller-selected PVCs requires get permission.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
+  {{- end }}
+  - apiGroups:
+      - agents.x-k8s.io
+    resources:
+      - sandboxes
+      - sandboxes/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+  # Generation-scoped sandbox bootstrap Secrets.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - delete

@@ -29,7 +29,7 @@ write_report() {
       ArtifactType: "filesystem",
       TrivyProfile: $profile,
       Results: (if $count == 0 then [] else [{
-        Target: "deploy/helm/openshell/templates/clusterrole.yaml",
+        Target: "deploy/helm/ryno/templates/clusterrole.yaml",
         Class: "config",
         Type: "kubernetes",
         MisconfSummary: {Successes: 0, Failures: $count, Exceptions: 0},
@@ -42,7 +42,7 @@ write_report() {
             Type: "Kubernetes Security Check",
             Status: "FAIL",
             Severity: "HIGH",
-            CauseMetadata: {Provider: "Kubernetes", Service: "RBAC", Resource: "ClusterRole.openshell"}
+            CauseMetadata: {Provider: "Kubernetes", Service: "RBAC", Resource: "ClusterRole.ryno"}
           }
         ]
       }] end)
@@ -148,7 +148,7 @@ jq -e '
   | ($findings | length) == 2
     and all($findings[]; .Message | contains("Profiles: "))
     and any($findings[];
-      .CauseMetadata.Resource == "ClusterRole.openshell"
+      .CauseMetadata.Resource == "ClusterRole.ryno"
       and (.Message | contains("config-defaults"))
       and (.Message | contains("config-fixture-resources")))
 ' "${HEAD}/consolidated/config.json" >/dev/null
@@ -162,7 +162,7 @@ jq -e '
   and (.runs[0] as $run | all($run.results[];
     .ruleId == $run.tool.driver.rules[.ruleIndex].id
     and all(.locations[].physicalLocation.artifactLocation;
-      .uri == "deploy/helm/openshell/templates/clusterrole.yaml" and .uriBaseId == null)))
+      .uri == "deploy/helm/ryno/templates/clusterrole.yaml" and .uriBaseId == null)))
 ' "${HEAD}/code-scanning/uploads/0/config.sarif" >/dev/null
 jq -se '[.[].runs[]] | length == 20' "${HEAD}/code-scanning/uploads/0/"*.sarif >/dev/null
 jq -se '[.[].runs[]] | length == 6' "${HEAD}/code-scanning/uploads/1/"*.sarif >/dev/null
@@ -215,7 +215,7 @@ jq -se '
   length == 19
   and ([.[] | select(.[-1] == "deploy")] | length) == 1
   and ([.[] | select(.[-1] == "deploy/helm")] | length) == 1
-  and ([.[] | select(.[-1] == "deploy/helm/openshell")] | length) == 14
+  and ([.[] | select(.[-1] == "deploy/helm/ryno")] | length) == 14
   and all(.[]; (join(" ") | contains("values-spire-stack.yaml")) | not)
   and all(.[]; index("UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL") != null)
 ' "${TRIVY_TEST_CALLS}" >/dev/null

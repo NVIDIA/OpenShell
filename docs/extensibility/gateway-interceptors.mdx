@@ -4,12 +4,12 @@
 title: "Gateway Interceptors"
 sidebar-title: "Gateway Interceptors"
 slug: "extensibility/gateway-interceptors"
-description: "Extend OpenShell gateway operations with deployment-specific governance and business logic."
+description: "Extend Ryno gateway operations with deployment-specific governance and business logic."
 keywords: "Generative AI, Cybersecurity, AI Agents, Gateway Interceptors, Extensibility, Governance"
 ---
-Gateway interceptors let operators add deployment-specific governance to OpenShell control-plane operations without modifying the gateway. An external gRPC service can modify or validate selected API writes before the gateway handles them, then observe successful responses after commit.
+Gateway interceptors let operators add deployment-specific governance to Ryno control-plane operations without modifying the gateway. An external gRPC service can modify or validate selected API writes before the gateway handles them, then observe successful responses after commit.
 
-See the [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor) for a complete service that vends provider profiles, applies a signed policy to new sandboxes, and rejects attempts to weaken that policy.
+See the [governance interceptor example](https://github.com/NVIDIA/Ryno/tree/main/examples/governance-interceptor) for a complete service that vends provider profiles, applies a signed policy to new sandboxes, and rejects attempts to weaken that policy.
 
 ## When to Use Gateway Interceptors
 
@@ -43,7 +43,7 @@ The gateway runs built-in operation and driver validation after `modify_operatio
 
 ## Implement an Interceptor Service
 
-An interceptor implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto):
+An interceptor implements the `ryno.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/NVIDIA/Ryno/blob/main/proto/gateway_interceptor.proto):
 
 - `Describe` declares the service's bindings and capabilities.
 - `Evaluate` handles one selected operation phase.
@@ -51,13 +51,13 @@ An interceptor implements the `openshell.gateway_interceptor.v1.GatewayIntercept
 
 `DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation).
 
-Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
+Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public Ryno service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
 
 The interceptor returns an `InterceptorResult` with an allow or deny decision, an optional denial status and reason, JSON patches during `modify_operation`, and non-secret log annotations.
 
 ## Declare and Authorize Bindings
 
-The interceptor declares bindings in its `InterceptorManifest` returned by `Describe`. Each binding selects one public OpenShell RPC and one or more phases. The gateway validates these declarations at startup against its compiled protobuf descriptors and explicit interceptable RPC allowlist.
+The interceptor declares bindings in its `InterceptorManifest` returned by `Describe`. Each binding selects one public Ryno RPC and one or more phases. The gateway validates these declarations at startup against its compiled protobuf descriptors and explicit interceptable RPC allowlist.
 
 The operator chooses how the manifest and gateway configuration combine with `binding_policy`:
 
@@ -74,7 +74,7 @@ Use `allowlist` or `exact` when interceptor authority is part of a security boun
 Start the interceptor before the gateway, then register it in gateway TOML:
 
 ```toml
-[[openshell.gateway.interceptors]]
+[[ryno.gateway.interceptors]]
 name               = "policy-governance"
 grpc_endpoint      = "https://governance.example:18081"
 tls_ca_cert_path   = "/path/to/governance-ca.pem"
@@ -86,12 +86,12 @@ timeout            = "500ms"
 max_response_bytes = 1048576
 max_patches        = 32
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/CreateSandbox"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/CreateSandbox"
 phases = ["modify_operation", "validate"]
 
-[[openshell.gateway.interceptors.bindings]]
-rpc    = "openshell.v1.OpenShell/UpdateConfig"
+[[ryno.gateway.interceptors.bindings]]
+rpc    = "ryno.v1.Ryno/UpdateConfig"
 phases = ["validate"]
 ```
 
@@ -105,7 +105,7 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 Start with the invariant the interceptor must preserve, then identify every gateway RPC that can establish or weaken it. For example, an interceptor that owns sandbox policy can use `modify_operation` on `CreateSandbox` to apply an approved initial policy and `validate` on `UpdateConfig` to reject unauthorized changes.
 
-The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
+The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/Ryno/blob/main/crates/ryno-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
 
 Choose a phase by intent:
 
@@ -143,7 +143,7 @@ An interceptor can advertise `provider_profiles = true` in its manifest and impl
 Select only the interceptor to make its catalog authoritative:
 
 ```toml
-[openshell.gateway]
+[ryno.gateway]
 provider_profile_sources = [
   { type = "interceptor", name = "provider-governance" },
 ]

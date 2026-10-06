@@ -7,7 +7,7 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 const SUCCESS_MARKER: &str = "landlock-hard-requirement-ok";

@@ -16,8 +16,8 @@ use std::process::Stdio;
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use sha1::{Digest, Sha1};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,20 +27,20 @@ use tokio::task::JoinHandle;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PROVIDER_NAME: &str = "e2e-websocket-conformance";
 const PROVIDER_PROFILE_ID: &str = "e2e-websocket-conformance";
-const TEST_SERVER_HOST: &str = "host.openshell.internal";
+const TEST_SERVER_HOST: &str = "host.ryno.internal";
 const TEST_SECRET: &str = "sk-e2e-websocket-conformance-secret";
 const TOKEN_ENV: &str = "WS_E2E_TOKEN";
-const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+const PLACEHOLDER_PREFIX: &str = "ryno:resolve:env:";
 static PROVIDER_LOCK: Mutex<()> = Mutex::new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("failed to spawn openshell {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("failed to spawn ryno {}: {e}", args.join(" ")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -48,7 +48,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
 
     if !output.status.success() {
         return Err(format!(
-            "openshell {} failed (exit {:?}):\n{combined}",
+            "ryno {} failed (exit {:?}):\n{combined}",
             args.join(" "),
             output.status.code()
         ));
@@ -58,7 +58,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
 }
 
 async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("provider")
         .arg("delete")
         .arg(name)
@@ -68,7 +68,7 @@ async fn delete_provider(name: &str) {
 }
 
 async fn delete_provider_profile(id: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["profile", "delete", id])
         .stdout(Stdio::null())
         .stderr(Stdio::null());

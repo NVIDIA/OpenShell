@@ -3,14 +3,14 @@
 
 syntax = "proto3";
 
-package openshell.gateway_interceptor.v1;
+package ryno.gateway_interceptor.v1;
 
 import "google/protobuf/struct.proto";
 import "extension.proto";
-import "openshell.proto";
+import "ryno.proto";
 
 // GatewayInterceptor lets an external governance service evaluate gateway
-// control-plane operations after OpenShell admission and before or after the
+// control-plane operations after Ryno admission and before or after the
 // gateway applies the operation.
 service GatewayInterceptor {
   // Describe returns the interceptor manifest and declared bindings.
@@ -28,7 +28,7 @@ service GatewayInterceptor {
 
 message DescribeRequest {
   // Gateway protocol metadata. Interceptors must reject unmet requirements.
-  openshell.extension.v1.PeerMetadata gateway = 1;
+  ryno.extension.v1.PeerMetadata gateway = 1;
 }
 
 message ProviderProfileSnapshotRequest {}
@@ -45,7 +45,7 @@ message InterceptorEvaluation {
   string interceptor_name = 1;
   // Manifest binding id selected for this evaluation.
   string binding_id = 2;
-  // Public gRPC service name, e.g. "openshell.v1.OpenShell".
+  // Public gRPC service name, e.g. "ryno.v1.Ryno".
   string service = 3;
   // Public gRPC method name, e.g. "CreateSandbox".
   string method = 4;
@@ -104,21 +104,21 @@ message InterceptorManifest {
   string failure_policy = 3;
   // True when this interceptor implements SnapshotProviderProfiles.
   bool provider_profiles = 4;
-  // Exact JWT audience this service verifies on inbound OpenShell calls.
+  // Exact JWT audience this service verifies on inbound Ryno calls.
   // After authenticated Describe succeeds, the gateway refuses to start unless
   // this matches the operator-configured audience. A strict verifier may reject
   // an incorrect audience before returning this manifest. Empty skips this
   // post-authentication consistency check.
   string expected_audience = 5;
   // Gateway-interceptor protocol metadata. Required for negotiation.
-  openshell.extension.v1.PeerMetadata extension = 6;
+  ryno.extension.v1.PeerMetadata extension = 6;
 }
 
 message ProviderProfileSnapshot {
   // Opaque source revision used for cache freshness and sandbox reload checks.
   string revision = 1;
   // Complete profile snapshot vended by this source.
-  repeated openshell.v1.ProviderProfile profiles = 2;
+  repeated ryno.v1.ProviderProfile profiles = 2;
 }
 
 message InterceptorBinding {
@@ -136,7 +136,7 @@ message InterceptorBinding {
 }
 
 message InterceptorSelector {
-  // Full selector form: "openshell.v1.OpenShell/CreateSandbox".
+  // Full selector form: "ryno.v1.Ryno/CreateSandbox".
   string rpc = 1;
   // Structured service/method form. If rpc is set, it takes precedence.
   string service = 2;

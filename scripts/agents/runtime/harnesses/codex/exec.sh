@@ -26,9 +26,9 @@ export GH_NO_UPDATE_NOTIFIER=1
 export GH_NO_EXTENSION_UPDATE_NOTIFIER=1
 export GH_TELEMETRY=false
 export DO_NOT_TRACK=1
-export HOME="${OPENSHELL_AGENT_HOME:-/sandbox/home}"
+export HOME="${RYNO_AGENT_HOME:-/sandbox/home}"
 
-echo "openshell-agent: preparing Codex harness auth and workspace" >&2
+echo "ryno-agent: preparing Codex harness auth and workspace" >&2
 mkdir -p "$HOME/.codex"
 node - <<'NODE'
 const fs = require("fs");
@@ -43,8 +43,8 @@ const fallbackIdToken = [
   b64u({
     iss: "https://auth.openai.com",
     aud: "codex",
-    sub: "openshell-agent",
-    email: "agent@openshell.local",
+    sub: "ryno-agent",
+    email: "agent@ryno.local",
     iat: now,
     exp: now + 3600,
   }),
@@ -77,7 +77,7 @@ fi
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
 
-echo "openshell-agent: invoking Codex bounded cycle (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
+echo "ryno-agent: invoking Codex bounded cycle (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
 
 CODEX_EXEC_ARGS=(
     exec

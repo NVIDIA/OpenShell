@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [book]
-title = "OpenShell Go SDK"
+title = "Ryno Go SDK"
 authors = ["NVIDIA Corporation"]
 language = "en"
 src = "src"
@@ -15,8 +15,8 @@ create-missing = false
 default-theme = "ayu"
 preferred-dark-theme = "navy"
 additional-css = ["theme/custom.css"]
-git-repository-url = "https://github.com/NVIDIA/OpenShell/sdk/go"
-edit-url-template = "https://github.com/NVIDIA/OpenShell/sdk/go/edit/main/docs/src/{path}"
+git-repository-url = "https://github.com/NVIDIA/Ryno/sdk/go"
+edit-url-template = "https://github.com/NVIDIA/Ryno/sdk/go/edit/main/docs/src/{path}"
 
 [output.html.search]
 enable = true

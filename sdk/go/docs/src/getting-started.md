@@ -1,18 +1,18 @@
 # Quick Start
 
-This guide walks you through installing the OpenShell Go SDK, connecting to a gateway, creating a sandbox, running a command, and cleaning up. You should be up and running in under 5 minutes.
+This guide walks you through installing the Ryno Go SDK, connecting to a gateway, creating a sandbox, running a command, and cleaning up. You should be up and running in under 5 minutes.
 
 ## Prerequisites
 
 - Go 1.25.13 or later
-- Access to an OpenShell gateway (address and authentication token)
+- Access to an Ryno gateway (address and authentication token)
 
 ## Installation
 
 Add the SDK to your Go module:
 
 ```bash
-go get github.com/NVIDIA/OpenShell/sdk/go@latest
+go get github.com/NVIDIA/Ryno/sdk/go@latest
 ```
 
 ## Connect to the Gateway
@@ -27,7 +27,7 @@ import (
     "fmt"
     "log"
 
-    v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+    v1 "github.com/NVIDIA/Ryno/sdk/go/ryno/v1"
 )
 
 func main() {
@@ -42,7 +42,7 @@ func main() {
 ```
 
 For production use, load the token from an environment variable instead of hardcoding it:
-`v1.StaticToken(os.Getenv("OPENSHELL_TOKEN"))`
+`v1.StaticToken(os.Getenv("RYNO_TOKEN"))`
 
 The `Config` struct accepts optional fields for TLS configuration and retry policies. For development against a local gateway without TLS, use `v1.NoAuth()` and set TLS to skip verification.
 
@@ -92,7 +92,7 @@ Sandboxes take a moment to provision. Use `WaitReady` to block until the sandbox
 Execute a command inside the sandbox:
 
 ```go
-    result, err := client.Exec().Run(ctx, "default", sandbox.Name, []string{"echo", "hello from OpenShell"})
+    result, err := client.Exec().Run(ctx, "default", sandbox.Name, []string{"echo", "hello from Ryno"})
     if err != nil {
         log.Fatal(err)
     }

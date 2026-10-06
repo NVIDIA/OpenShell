@@ -3,21 +3,21 @@
 #
 # Default gateway configuration for RPM installs.
 #
-# This file is seeded to ~/.config/openshell/gateway.toml on first start
-# of the openshell-gateway.service systemd user unit. Edit that copy to
+# This file is seeded to ~/.config/ryno/gateway.toml on first start
+# of the ryno-gateway.service systemd user unit. Edit that copy to
 # customize. This file is not read directly at runtime.
 #
 # Configuration precedence (highest to lowest):
-#   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
+#   CLI flag  >  RYNO_* env var  >  TOML file  >  built-in default
 #
-# To override settings without editing this file, set OPENSHELL_* variables
-# in ~/.config/openshell/gateway.env or run:
-#   systemctl --user edit openshell-gateway
+# To override settings without editing this file, set RYNO_* variables
+# in ~/.config/ryno/gateway.env or run:
+#   systemctl --user edit ryno-gateway
 
-[openshell]
+[ryno]
 version = 1
 
-[openshell.gateway]
+[ryno.gateway]
 # Keep the primary listener on the built-in 127.0.0.1:17670 default. The
 # host-networked Podman supervisor uses this same loopback endpoint.
 

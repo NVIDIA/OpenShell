@@ -1,4 +1,4 @@
-# OpenShell RPM Troubleshooting
+# Ryno RPM Troubleshooting
 
 Troubleshooting guide, CLI compatibility notes, remote access setup,
 and upgrade procedures for the RPM deployment.
@@ -18,17 +18,17 @@ communicate with the gateway over gRPC and work identically regardless
 of deployment mode:
 
 ```
-openshell status
-openshell sandbox create|list|get|delete|connect|exec
-openshell logs <sandbox>
-openshell provider create|list|get|update|delete
-openshell policy get|set|update|list|prove
-openshell provider list
-openshell sandbox provider list <sandbox>
-openshell settings get|set
-openshell forward start|stop|list
-openshell term
-openshell gateway add|select|info|list|remove
+ryno status
+ryno sandbox create|list|get|delete|connect|exec
+ryno logs <sandbox>
+ryno provider create|list|get|update|delete
+ryno policy get|set|update|list|prove
+ryno provider list
+ryno sandbox provider list <sandbox>
+ryno settings get|set
+ryno forward start|stop|list
+ryno term
+ryno gateway add|select|info|list|remove
 ```
 
 ### Gateway lifecycle
@@ -38,13 +38,13 @@ systemd commands directly:
 
 | Task | Command |
 |------|---------|
-| Start gateway | `systemctl --user start openshell-gateway` |
-| Stop gateway | `systemctl --user stop openshell-gateway` |
-| Restart gateway | `systemctl --user restart openshell-gateway` |
-| Check status | `systemctl --user status openshell-gateway` |
-| View logs | `journalctl --user -u openshell-gateway` |
-| Follow logs | `journalctl --user -u openshell-gateway -f` |
-| Remove CLI registration | `openshell gateway remove [name]` |
+| Start gateway | `systemctl --user start ryno-gateway` |
+| Stop gateway | `systemctl --user stop ryno-gateway` |
+| Restart gateway | `systemctl --user restart ryno-gateway` |
+| Check status | `systemctl --user status ryno-gateway` |
+| View logs | `journalctl --user -u ryno-gateway` |
+| Follow logs | `journalctl --user -u ryno-gateway -f` |
+| Remove CLI registration | `ryno gateway remove [name]` |
 
 ### Building from local Dockerfiles
 
@@ -52,7 +52,7 @@ Build the image with Podman, then reference it directly:
 
 ```shell
 podman build -t localhost/my-sandbox:latest ./my-dir
-openshell sandbox create --from localhost/my-sandbox:latest
+ryno sandbox create --from localhost/my-sandbox:latest
 ```
 
 ## Remote CLI access
@@ -71,11 +71,11 @@ ssh -L 17670:127.0.0.1:17670 user@gateway-host
 
 # In another terminal on the same machine:
 # Copy the client certs from the gateway host first:
-scp -r user@gateway-host:~/.config/openshell/gateways/openshell/mtls/ \
-    ~/.config/openshell/gateways/openshell/mtls/
+scp -r user@gateway-host:~/.config/ryno/gateways/ryno/mtls/ \
+    ~/.config/ryno/gateways/ryno/mtls/
 
-openshell gateway add --local https://127.0.0.1:17670
-openshell status
+ryno gateway add --local https://127.0.0.1:17670
+ryno status
 ```
 
 ### Option 2: Externally-managed certificates
@@ -83,7 +83,7 @@ openshell status
 Generate certificates that include the server's hostname or IP in the
 SANs. See "Using externally-managed certificates" in CONFIGURATION.md.
 Then change `bind_address` in
-`~/.config/openshell/gateway.toml` to the interface the remote CLI
+`~/.config/ryno/gateway.toml` to the interface the remote CLI
 can reach, for example `192.168.1.10:17670`, and restart the gateway.
 
 After placing the server and client certs, register from the remote
@@ -91,10 +91,10 @@ CLI:
 
 ```shell
 # Copy client certs to the remote CLI machine
-mkdir -p ~/.config/openshell/gateways/openshell/mtls/
-cp ca.crt tls.crt tls.key ~/.config/openshell/gateways/openshell/mtls/
+mkdir -p ~/.config/ryno/gateways/ryno/mtls/
+cp ca.crt tls.crt tls.key ~/.config/ryno/gateways/ryno/mtls/
 
-openshell gateway add --local https://<gateway-hostname>:17670
+ryno gateway add --local https://<gateway-hostname>:17670
 ```
 
 ### Firewall
@@ -120,7 +120,7 @@ The CLI cannot find a registered gateway. This happens when the
 gateway is running but has not been registered with the CLI.
 
 ```shell
-openshell gateway add --local https://127.0.0.1:17670
+ryno gateway add --local https://127.0.0.1:17670
 ```
 
 ### Gateway fails to start
@@ -128,7 +128,7 @@ openshell gateway add --local https://127.0.0.1:17670
 Check the journal for error details:
 
 ```shell
-journalctl --user -u openshell-gateway --no-pager -n 50
+journalctl --user -u ryno-gateway --no-pager -n 50
 ```
 
 Common causes:
@@ -157,8 +157,8 @@ systemctl --user status podman.socket
 **TLS certificate errors.** If certs are corrupted, regenerate them:
 
 ```shell
-rm -rf ~/.local/state/openshell/tls
-systemctl --user restart openshell-gateway
+rm -rf ~/.local/state/ryno/tls
+systemctl --user restart ryno-gateway
 ```
 
 ### Sandbox creation fails
@@ -186,11 +186,11 @@ and cached. To update:
 
 ```shell
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
-podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull ghcr.io/nvidia/ryno/supervisor:latest
 ```
 
 Or set `image_pull_policy = "always"` in
-`~/.config/openshell/gateway.toml` and restart the gateway.
+`~/.config/ryno/gateway.toml` and restart the gateway.
 
 ### Gateway stops on logout
 
@@ -212,9 +212,9 @@ read the certificates through the MAC policy.
 After upgrading the RPM packages:
 
 ```shell
-sudo dnf update openshell openshell-gateway
+sudo dnf update ryno ryno-gateway
 systemctl --user restart podman.socket
-systemctl --user restart openshell-gateway
+systemctl --user restart ryno-gateway
 ```
 
 The SQLite database schema is auto-migrated on startup. Running
@@ -226,19 +226,19 @@ non-functional until restarted, causing the gateway to fail with a
 connection error on `/run/user/<uid>/podman/podman.sock`. The gateway
 retries briefly on startup, but a stale socket will not recover on its own.
 
-Package upgrades preserve edited `~/.config/openshell/gateway.toml` files. On
+Package upgrades preserve edited `~/.config/ryno/gateway.toml` files. On
 the schema-v2 upgrade, the user service replaces only an exact copy of the v1
 file previously seeded by the RPM. If you edited that file, migrate it manually
 before restarting the service; direct `dnf` or `rpm` upgrades do not use the
 breaking-upgrade guard in `install.sh`. See the
-[Gateway Configuration File](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2)
+[Gateway Configuration File](https://docs.nvidia.com/ryno/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2)
 for the field-by-field migration steps. New gateway process options are listed
-in CONFIGURATION.md and `openshell-gateway --help`.
+in CONFIGURATION.md and `ryno-gateway --help`.
 
 To pick up new container images after an upgrade:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull ghcr.io/nvidia/ryno/supervisor:latest
 podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
@@ -246,37 +246,37 @@ podman pull nvcr.io/nvidia/base/ubuntu:24.04
 
 Docker, Podman, and VM supervisors authenticate the gateway with its CA and
 authenticate RPCs with sandbox bearer tokens. Package-managed installs use the
-CA generated under `~/.local/state/openshell/tls`, so the RPM default requires
+CA generated under `~/.local/state/ryno/tls`, so the RPM default requires
 no additional TOML. If you override the listener with custom `--tls-cert` and
 `--tls-key` inputs and do not use that managed CA, configure `guest_tls_ca` under
-`[openshell.gateway]`. Remove the retired `guest_tls_cert` and `guest_tls_key`
+`[ryno.gateway]`. Remove the retired `guest_tls_cert` and `guest_tls_key`
 fields. The gateway fails at startup if the required CA is missing. Omit
 `guest_tls_ca` when TLS is disabled.
 
 ### Migrating from gateway.env
 
-Previous releases generated `~/.config/openshell/gateway.env` on first
+Previous releases generated `~/.config/ryno/gateway.env` on first
 start and used it to configure the gateway at launch. The gateway now
 starts from built-in runtime defaults and reads
-`~/.config/openshell/gateway.toml` when that file exists.
+`~/.config/ryno/gateway.toml` when that file exists.
 
 If you have a `gateway.env` file it is still honored: the systemd unit
 reads it via `EnvironmentFile` on every start. You can leave it in place
 or delete it. New installs no longer generate one.
 
-To migrate settings to TOML, create `~/.config/openshell/gateway.toml`
+To migrate settings to TOML, create `~/.config/ryno/gateway.toml`
 and map the relevant variables:
 
 | Environment variable | TOML equivalent |
 |---|---|
-| `OPENSHELL_BIND_ADDRESS=A` + `OPENSHELL_SERVER_PORT=P` | `bind_address = "A:P"` under `[openshell.gateway]` |
-| `OPENSHELL_COMPUTE_DRIVER=podman` | `compute_driver = "podman"` under `[openshell.gateway]` |
-| `OPENSHELL_DISABLE_TLS=true` | `disable_tls = true` under `[openshell.gateway]` |
-| `OPENSHELL_TLS_CERT=PATH` | `cert_path = "PATH"` under `[openshell.gateway.tls]` |
-| `OPENSHELL_TLS_KEY=PATH` | `key_path = "PATH"` under `[openshell.gateway.tls]` |
-| `OPENSHELL_TLS_CLIENT_CA=PATH` | `client_ca_path = "PATH"` under `[openshell.gateway.tls]` |
-| `OPENSHELL_DB_URL=URL` | env-only — not accepted in TOML; keep in env or drop-in override |
-| `OPENSHELL_LOG_LEVEL=debug` | env-only — keep as `Environment=OPENSHELL_LOG_LEVEL=debug` in a drop-in |
+| `RYNO_BIND_ADDRESS=A` + `RYNO_SERVER_PORT=P` | `bind_address = "A:P"` under `[ryno.gateway]` |
+| `RYNO_COMPUTE_DRIVER=podman` | `compute_driver = "podman"` under `[ryno.gateway]` |
+| `RYNO_DISABLE_TLS=true` | `disable_tls = true` under `[ryno.gateway]` |
+| `RYNO_TLS_CERT=PATH` | `cert_path = "PATH"` under `[ryno.gateway.tls]` |
+| `RYNO_TLS_KEY=PATH` | `key_path = "PATH"` under `[ryno.gateway.tls]` |
+| `RYNO_TLS_CLIENT_CA=PATH` | `client_ca_path = "PATH"` under `[ryno.gateway.tls]` |
+| `RYNO_DB_URL=URL` | env-only — not accepted in TOML; keep in env or drop-in override |
+| `RYNO_LOG_LEVEL=debug` | env-only — keep as `Environment=RYNO_LOG_LEVEL=debug` in a drop-in |
 
 Other breaking changes in this release:
 
@@ -284,16 +284,16 @@ Other breaking changes in this release:
   gateway at `https://127.0.0.1:8080`, re-register it:
 
   ```shell
-  openshell gateway add --local https://127.0.0.1:17670
+  ryno gateway add --local https://127.0.0.1:17670
   ```
 
 - **Default bind address changed from `0.0.0.0` to `127.0.0.1`.** If
   you relied on network-accessible access without an explicit bind
   address, bind the specific reachable interface in
-  `~/.config/openshell/gateway.toml`:
+  `~/.config/ryno/gateway.toml`:
 
   ```toml
-  [openshell.gateway]
+  [ryno.gateway]
   bind_address = "192.168.1.10:17670"
   ```
 
@@ -305,13 +305,13 @@ Other breaking changes in this release:
   sudo firewall-cmd --reload
   ```
 
-- **Database path changed** from `~/.local/state/openshell/gateway.db`
-  to `~/.local/state/openshell/gateway/openshell.db`. Existing gateway
+- **Database path changed** from `~/.local/state/ryno/gateway.db`
+  to `~/.local/state/ryno/gateway/ryno.db`. Existing gateway
   state (registered sandboxes, etc.) is not migrated automatically. To
   preserve state across the upgrade, move the file before restarting:
 
   ```shell
-  mkdir -p ~/.local/state/openshell/gateway
-  mv ~/.local/state/openshell/gateway.db \
-     ~/.local/state/openshell/gateway/openshell.db
+  mkdir -p ~/.local/state/ryno/gateway
+  mv ~/.local/state/ryno/gateway.db \
+     ~/.local/state/ryno/gateway/ryno.db
   ```

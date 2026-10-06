@@ -1,0 +1,183 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+{{- $hookName := printf "%s-certgen" (include "ryno.fullname" .) }}
+{{- $ns := .Release.Namespace }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+  {{- if .Values.grpcRoute.backendTLSPolicy.enabled }}
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $hookName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $hookName }}
+    namespace: {{ $ns }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ add .Values.pkiInitJob.timeoutSeconds 30 }}
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "ryno.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $hookName }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: certgen
+          image: {{ include "ryno.image" . | quote }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command: ["/usr/local/bin/ryno-gateway"]
+          args:
+            - generate-certs
+            {{- if .Values.certManager.enabled }}
+            - --jwt-only
+            {{- else }}
+            - --server-secret-name={{ .Values.server.tls.certSecretName }}
+            - --client-secret-name={{ .Values.server.tls.clientTlsSecretName }}
+            {{- end }}
+            - --jwt-secret-name={{ include "ryno.sandboxJwtSecretName" . }}
+            {{- if and .Values.pkiInitJob.enabled (not .Values.certManager.enabled) }}
+            {{- range (include "ryno.defaultServerDnsNames" . | fromYamlArray) }}
+            - --server-san={{ . }}
+            {{- end }}
+            - --server-san=127.0.0.1
+            {{- range .Values.pkiInitJob.serverDnsNames }}
+            - --server-san={{ . }}
+            {{- end }}
+            {{- range .Values.pkiInitJob.serverIpAddresses }}
+            - --server-san={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.grpcRoute.backendTLSPolicy.enabled (not .Values.certManager.enabled) }}
+            - --backend-ca-configmap-name={{ include "ryno.backendCaConfigMapName" . }}
+            {{- end }}
+{{- if and .Values.certManager.enabled .Values.grpcRoute.backendTLSPolicy.enabled }}
+---
+# Post-install Job that polls for the cert-manager-issued server Secret and
+# creates / reconciles the backend CA ConfigMap.  Runs after regular resources
+# (including the cert-manager Certificate objects) are applied so cert-manager
+# has started issuing before the poll begins.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $hookName }}-backend-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ add .Values.pkiInitJob.timeoutSeconds 30 }}
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "ryno.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $hookName }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: certgen
+          image: {{ include "ryno.image" . | quote }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command: ["/usr/local/bin/ryno-gateway"]
+          args:
+            - generate-certs
+            - --jwt-only
+            - --jwt-secret-name={{ include "ryno.sandboxJwtSecretName" . }}
+            - --backend-ca-configmap-name={{ include "ryno.backendCaConfigMapName" . }}
+            - --backend-ca-source-secret={{ .Values.server.tls.certSecretName }}
+            - --backend-ca-poll-timeout-seconds={{ .Values.pkiInitJob.timeoutSeconds }}
+            {{- if .Values.pkiInitJob.failOnTimeout }}
+            - --backend-ca-fail-on-timeout
+            {{- end }}
+{{- end }}
+{{- end }}

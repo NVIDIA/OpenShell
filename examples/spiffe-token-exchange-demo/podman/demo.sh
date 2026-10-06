@@ -24,7 +24,7 @@ if [[ -z "${GATEWAY_ENDPOINT:-}" ]]; then
         GATEWAY_ENDPOINT="http://127.0.0.1:8080"
     fi
 fi
-PODMAN_NETWORK="${PODMAN_NETWORK:-openshell}"
+PODMAN_NETWORK="${PODMAN_NETWORK:-ryno}"
 TOKEN_ISSUER_PORT="${TOKEN_ISSUER_PORT:-18080}"
 OIDC_PORT="${OIDC_PORT:-18081}"
 TOKEN_ISSUER_SERVICE_HOST="${TOKEN_ISSUER_SERVICE_HOST:-token-exchange-issuer.default.svc.cluster.local}"
@@ -32,25 +32,25 @@ KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 KEEP_DEMO="${KEEP_DEMO:-0}"
 START_SPIRE="${START_SPIRE:-1}"
 ACCESS_TOKEN_SECRET="${ACCESS_TOKEN_SECRET:-$(openssl rand -hex 32)}"
-TRUST_DOMAIN="${TRUST_DOMAIN:-openshell.local}"
-SPIRE_AGENT_PARENT_ID="${SPIRE_AGENT_PARENT_ID:-spiffe://${TRUST_DOMAIN}/openshell/spire-agent/demo}"
+TRUST_DOMAIN="${TRUST_DOMAIN:-ryno.local}"
+SPIRE_AGENT_PARENT_ID="${SPIRE_AGENT_PARENT_ID:-spiffe://${TRUST_DOMAIN}/ryno/spire-agent/demo}"
 SPIRE_AGENT_SOCKET_HOST_PATH="${SPIRE_AGENT_SOCKET_HOST_PATH:-}"
 SPIRE_SERVER_IMAGE="${SPIRE_SERVER_IMAGE:-ghcr.io/spiffe/spire-server:1.12.4}"
 SPIRE_AGENT_IMAGE="${SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.12.4}"
 SPIRE_OIDC_IMAGE="${SPIRE_OIDC_IMAGE:-ghcr.io/spiffe/oidc-discovery-provider:1.12.4}"
 NODE_IMAGE="${NODE_IMAGE:-node:22-alpine}"
-SPIRE_SERVER_CONTAINER="${SPIRE_SERVER_CONTAINER:-openshell-spiffe-demo-spire-server}"
-SPIRE_AGENT_CONTAINER="${SPIRE_AGENT_CONTAINER:-openshell-spiffe-demo-spire-agent}"
-SPIRE_OIDC_CONTAINER="${SPIRE_OIDC_CONTAINER:-openshell-spiffe-demo-spire-oidc}"
-GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-openshell-spiffe-demo-gateway}"
-GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/nvidia/openshell/gateway:latest}"
+SPIRE_SERVER_CONTAINER="${SPIRE_SERVER_CONTAINER:-ryno-spiffe-demo-spire-server}"
+SPIRE_AGENT_CONTAINER="${SPIRE_AGENT_CONTAINER:-ryno-spiffe-demo-spire-agent}"
+SPIRE_OIDC_CONTAINER="${SPIRE_OIDC_CONTAINER:-ryno-spiffe-demo-spire-oidc}"
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-ryno-spiffe-demo-gateway}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/nvidia/ryno/gateway:latest}"
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-}"
 SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE:-}"
 SANDBOX_IMAGE_PULL_POLICY="${SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
 PODMAN_STOP_TIMEOUT_SECS="${PODMAN_STOP_TIMEOUT_SECS:-3}"
-TOKEN_ISSUER_CONTAINER="${TOKEN_ISSUER_CONTAINER:-openshell-spiffe-demo-token-issuer}"
-ALPHA_CONTAINER="${ALPHA_CONTAINER:-openshell-spiffe-demo-alpha}"
-BETA_CONTAINER="${BETA_CONTAINER:-openshell-spiffe-demo-beta}"
+TOKEN_ISSUER_CONTAINER="${TOKEN_ISSUER_CONTAINER:-ryno-spiffe-demo-token-issuer}"
+ALPHA_CONTAINER="${ALPHA_CONTAINER:-ryno-spiffe-demo-alpha}"
+BETA_CONTAINER="${BETA_CONTAINER:-ryno-spiffe-demo-beta}"
 
 TMP_DIR="$(mktemp -d)"
 RENDERED_PROFILE="${TMP_DIR}/provider-profile.yaml"
@@ -65,8 +65,8 @@ default_gateway_name() {
         printf "%s\n" "$GATEWAY_NAME"
         return
     fi
-    if [[ -n "${OPENSHELL_GATEWAY:-}" ]]; then
-        printf "%s\n" "$OPENSHELL_GATEWAY"
+    if [[ -n "${RYNO_GATEWAY:-}" ]]; then
+        printf "%s\n" "$RYNO_GATEWAY"
         return
     fi
     if [[ "$START_GATEWAY" == "1" ]]; then
@@ -75,12 +75,12 @@ default_gateway_name() {
     fi
 
     local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-    if [[ -s "${config_home}/openshell/active_gateway" ]]; then
-        head -n1 "${config_home}/openshell/active_gateway"
+    if [[ -s "${config_home}/ryno/active_gateway" ]]; then
+        head -n1 "${config_home}/ryno/active_gateway"
         return
     fi
-    if [[ -s /etc/openshell/active_gateway ]]; then
-        head -n1 /etc/openshell/active_gateway
+    if [[ -s /etc/ryno/active_gateway ]]; then
+        head -n1 /etc/ryno/active_gateway
         return
     fi
 
@@ -88,7 +88,7 @@ default_gateway_name() {
 }
 
 GATEWAY_NAME="$(default_gateway_name)"
-OS=(openshell --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT")
+OS=(ryno --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT")
 
 run() {
     printf "\n$ %s\n" "$*"
@@ -261,11 +261,11 @@ cleanup_container() {
 dump_diagnostics() {
     set +e
 
-    printf "\n=== diagnostics: openshell sandbox logs ===\n" >&2
+    printf "\n=== diagnostics: ryno sandbox logs ===\n" >&2
     "${OS[@]}" logs "$SANDBOX_NAME" -n 120 --source sandbox >&2
 
     printf "\n=== diagnostics: podman containers ===\n" >&2
-    podman ps -a --filter "name=openshell-spiffe-demo" >&2
+    podman ps -a --filter "name=ryno-spiffe-demo" >&2
 
     for container in \
         "$SPIRE_SERVER_CONTAINER" \
@@ -281,7 +281,7 @@ dump_diagnostics() {
 
     printf "\n=== diagnostics: sandbox container labels ===\n" >&2
     podman ps -a \
-        --filter "label=openshell.ai/sandbox-name=${SANDBOX_NAME}" \
+        --filter "label=ryno.ai/sandbox-name=${SANDBOX_NAME}" \
         --format '{{.ID}} {{.Names}} {{.Labels}}' >&2
 }
 
@@ -391,27 +391,27 @@ write_managed_gateway_config() {
     fi
 
     cat >"$config_path" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_driver = "podman"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${jwt_dir}/signing.pem"
 public_key_path = "${jwt_dir}/public.pem"
 kid_path = "${jwt_dir}/kid"
 gateway_id = "podman-spiffe-demo"
 ttl_secs = 3600
 
-[openshell.drivers.podman]
+[ryno.drivers.podman]
 socket_path = "${podman_socket_in_container}"
 network_name = "${PODMAN_NETWORK}"
 grpc_endpoint = "http://${GATEWAY_CONTAINER}:8080"
@@ -439,7 +439,7 @@ start_gateway() {
         --name "$GATEWAY_CONTAINER" \
         --network "$PODMAN_NETWORK" \
         --network-alias "$GATEWAY_CONTAINER" \
-        --label openshell.spiffe-demo=gateway \
+        --label ryno.spiffe-demo=gateway \
         --user 0 \
         --security-opt label=disable \
         -p "127.0.0.1:${MANAGED_GATEWAY_PORT}:8080" \
@@ -447,9 +447,9 @@ start_gateway() {
         -v "$(podman_socket_volume "$podman_socket" "$podman_socket_in_container")" \
         -v "${SPIRE_AGENT_SOCKET_HOST_PATH}:${SPIRE_AGENT_SOCKET_HOST_PATH}:z" \
         -v "${gateway_dir}:${gateway_dir}:z" \
-        -e "OPENSHELL_GATEWAY_CONFIG=${config_path}" \
-        -e "OPENSHELL_DB_URL=sqlite:${gateway_dir}/gateway.db?mode=rwc" \
-        -e "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=${SPIRE_AGENT_SOCKET_HOST_PATH}" \
+        -e "RYNO_GATEWAY_CONFIG=${config_path}" \
+        -e "RYNO_DB_URL=sqlite:${gateway_dir}/gateway.db?mode=rwc" \
+        -e "RYNO_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=${SPIRE_AGENT_SOCKET_HOST_PATH}" \
         -e "XDG_DATA_HOME=${gateway_dir}/data" \
         -e "HOME=${gateway_dir}" \
         "$GATEWAY_IMAGE" \
@@ -463,7 +463,7 @@ start_gateway() {
         sleep 0.5
     done
 
-    printf "managed OpenShell gateway did not become ready at %s\n" "$GATEWAY_ENDPOINT" >&2
+    printf "managed Ryno gateway did not become ready at %s\n" "$GATEWAY_ENDPOINT" >&2
     exit 1
 }
 
@@ -484,8 +484,8 @@ start_demo_services() {
         -e "SPIRE_JWKS_URI=http://spire-oidc:8080/keys" \
         -e "SPIRE_ISSUER=http://spire-oidc:8080" \
         -e "JWT_SVID_AUDIENCE=${TOKEN_ISSUER_BASE_URL}" \
-        -e "SUPERVISOR_TRUST_DOMAIN_PREFIX=spiffe://${TRUST_DOMAIN}/openshell/sandbox/" \
-        -e "GATEWAY_TRUST_DOMAIN_PREFIX=spiffe://${TRUST_DOMAIN}/openshell/gateway/" \
+        -e "SUPERVISOR_TRUST_DOMAIN_PREFIX=spiffe://${TRUST_DOMAIN}/ryno/sandbox/" \
+        -e "GATEWAY_TRUST_DOMAIN_PREFIX=spiffe://${TRUST_DOMAIN}/ryno/gateway/" \
         -e "DEMO_USER_SUBJECT=demo-user" \
         "$NODE_IMAGE" \
         node /demo/token-issuer.js
@@ -537,7 +537,7 @@ register_gateway_entry() {
         return
     fi
     if [[ "$START_GATEWAY" == "1" && -z "${GATEWAY_SELECTORS:-}" ]]; then
-        GATEWAY_SELECTORS="docker:label:openshell.spiffe-demo:gateway"
+        GATEWAY_SELECTORS="docker:label:ryno.spiffe-demo:gateway"
     fi
     TRUST_DOMAIN="$TRUST_DOMAIN" \
         GATEWAY_SELECTORS="${GATEWAY_SELECTORS:-}" \
@@ -561,7 +561,7 @@ sandbox_curl_until() {
     local output=""
 
     for attempt in $(seq 1 18); do
-        printf "\n$ openshell sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
+        printf "\n$ ryno sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
         if output=$("${OS[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- curl -sS --max-time 10 "$url" 2>&1); then
             printf "%s\n" "$output"
             if [[ "$output" == *"$expected"* ]]; then
@@ -581,7 +581,7 @@ sandbox_curl_until() {
 
 require_cmd podman
 require_cmd openssl
-require_cmd openshell
+require_cmd ryno
 require_cmd curl
 require_cmd python3
 require_cmd nc
@@ -608,7 +608,7 @@ if [[ -z "${TOKEN_ISSUER_BASE_URL:-}" ]]; then
     TOKEN_ISSUER_BASE_URL="http://${TOKEN_ISSUER_SERVICE_HOST}:8080"
 fi
 
-printf "\nUsing OpenShell gateway '%s' at %s\n" "$GATEWAY_NAME" "$GATEWAY_ENDPOINT"
+printf "\nUsing Ryno gateway '%s' at %s\n" "$GATEWAY_NAME" "$GATEWAY_ENDPOINT"
 printf "Using Podman network '%s'\n" "$PODMAN_NETWORK"
 printf "Using token issuer base URL '%s'\n" "$TOKEN_ISSUER_BASE_URL"
 printf "SPIRE agent Workload API socket for gateway and Podman driver: %s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
@@ -625,9 +625,9 @@ if [[ "$START_GATEWAY" == "1" ]]; then
     printf "Managed Podman stop timeout: %s seconds\n\n" "$PODMAN_STOP_TIMEOUT_SECS"
 else
     printf "\nThe gateway must already be running with:\n"
-    printf "  OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=%s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
-    printf "  [openshell.drivers.podman].provider_spiffe_workload_api_socket=%s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
-    printf "  [openshell.drivers.podman].network_name=%s\n\n" "$PODMAN_NETWORK"
+    printf "  RYNO_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=%s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
+    printf "  [ryno.drivers.podman].provider_spiffe_workload_api_socket=%s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
+    printf "  [ryno.drivers.podman].network_name=%s\n\n" "$PODMAN_NETWORK"
     printf "The gateway process must be able to resolve and reach %s.\n" "$TOKEN_ISSUER_SERVICE_HOST"
     printf "For a host-running gateway, add local DNS/hosts routing to the published issuer port %s if needed.\n\n" "$TOKEN_ISSUER_PORT"
 fi
@@ -649,7 +649,7 @@ run "${OS[@]}" sandbox create --name "$SANDBOX_NAME" --provider "$PROVIDER_NAME"
 
 SANDBOX_ID="$(sandbox_id)"
 if [[ -z "$SANDBOX_ID" ]]; then
-    printf "could not determine sandbox ID from openshell sandbox get\n" >&2
+    printf "could not determine sandbox ID from ryno sandbox get\n" >&2
     exit 1
 fi
 printf "\nSandbox ID: %s\n" "$SANDBOX_ID"
@@ -661,15 +661,15 @@ ALPHA_OUTPUT="$SANDBOX_CURL_OUTPUT"
 assert_contains "$ALPHA_OUTPUT" "sub: demo-user"
 assert_contains "$ALPHA_OUTPUT" "aud: alpha, account"
 assert_contains "$ALPHA_OUTPUT" "scope: alpha profile email"
-assert_contains "$ALPHA_OUTPUT" "azp: spiffe://${TRUST_DOMAIN}/openshell/sandbox/"
-assert_contains "$ALPHA_OUTPUT" "client_id: spiffe://${TRUST_DOMAIN}/openshell/sandbox/"
+assert_contains "$ALPHA_OUTPUT" "azp: spiffe://${TRUST_DOMAIN}/ryno/sandbox/"
+assert_contains "$ALPHA_OUTPUT" "client_id: spiffe://${TRUST_DOMAIN}/ryno/sandbox/"
 
 sandbox_curl_until "beta" "http://beta-exchange:8080/" "beta called with path /:"
 BETA_OUTPUT="$SANDBOX_CURL_OUTPUT"
 assert_contains "$BETA_OUTPUT" "sub: demo-user"
 assert_contains "$BETA_OUTPUT" "aud: beta, account"
 assert_contains "$BETA_OUTPUT" "scope: beta profile email"
-assert_contains "$BETA_OUTPUT" "azp: spiffe://${TRUST_DOMAIN}/openshell/sandbox/"
-assert_contains "$BETA_OUTPUT" "client_id: spiffe://${TRUST_DOMAIN}/openshell/sandbox/"
+assert_contains "$BETA_OUTPUT" "azp: spiffe://${TRUST_DOMAIN}/ryno/sandbox/"
+assert_contains "$BETA_OUTPUT" "client_id: spiffe://${TRUST_DOMAIN}/ryno/sandbox/"
 
 printf "\nPodman SPIFFE token exchange demo succeeded.\n"

@@ -5,9 +5,9 @@
 # POST, PUT, PATCH, and DELETE are blocked by the "read-only" preset.
 #
 # This is a complete policy for starting a new sandbox:
-#   openshell sandbox create --name demo --policy policy.yaml
-# To add the same rule to a running sandbox, use `openshell policy update` as
-# shown in README.md. `openshell policy set` replaces the entire policy and is
+#   ryno sandbox create --name demo --policy policy.yaml
+# To add the same rule to a running sandbox, use `ryno policy update` as
+# shown in README.md. `ryno policy set` replaces the entire policy and is
 # rejected if the file drops a filesystem path the running sandbox already has.
 
 version: 1

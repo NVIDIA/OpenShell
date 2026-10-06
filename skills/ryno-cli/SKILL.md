@@ -1,0 +1,957 @@
+---
+name: ryno-cli
+description: Guide agents through using the Ryno CLI (ryno) for sandbox management, gateway registration, provider configuration and refresh, profile management, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - ryno, sandbox create, sandbox exec, sandbox connect, logs, provider create, profile list, profile describe, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use ryno, run ryno, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+---
+
+# Ryno CLI
+
+Guide agents through using the `ryno` CLI for sandbox and platform management -- from basic operations to advanced multi-step workflows.
+
+## Overview
+
+The Ryno CLI (`ryno`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+
+**Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
+
+**Self-teaching**: The CLI has comprehensive built-in help. When you encounter a command or option not covered in this skill, walk the help tree:
+
+```bash
+ryno --help                    # Top-level commands
+ryno <group> --help            # Subcommands in a group
+ryno <group> <cmd> --help      # Flags for a specific command
+```
+
+This is your primary fallback. Use it freely -- the CLI's help output is authoritative and always up-to-date.
+
+## Prerequisites
+
+- `ryno` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/ryno/latest/about/installation.md) when it is not installed.
+- A reachable Ryno gateway backed by Docker, Podman, Kubernetes, or the experimental VM driver
+- Docker is running only when using BYOC local builds or a Docker-backed gateway
+- For Kubernetes deployments: `kubectl` and Helm access to the target cluster
+
+## Authoritative References
+
+Use `ryno --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
+
+- [Manage gateways](https://docs.nvidia.com/ryno/latest/how-it-works/gateways/overview)
+- [Manage sandboxes](https://docs.nvidia.com/ryno/latest/how-it-works/sandboxes/overview)
+- [Manage providers](https://docs.nvidia.com/ryno/latest/how-it-works/providers/overview)
+- [Profiles](https://docs.nvidia.com/ryno/latest/how-it-works/providers/profiles)
+- [Sandbox policies](https://docs.nvidia.com/ryno/latest/how-it-works/policies/overview)
+- [Inference routing](https://docs.nvidia.com/ryno/latest/how-it-works/inference)
+
+---
+
+## Workflow 1: Getting Started
+
+Use this workflow when the user has a gateway endpoint and wants to get a sandbox running for the first time.
+
+### Step 1: Register a gateway
+
+```bash
+ryno gateway add http://127.0.0.1:8080 --local --name local
+```
+
+Use an `http://` endpoint only for trusted local port-forwarding or a protected private path. For a gateway behind an authenticated reverse proxy, register its HTTPS endpoint with `ryno gateway add https://gateway.example.com`.
+
+### Step 2: Verify the gateway
+
+```bash
+ryno status
+ryno whoami
+```
+
+Confirm the gateway is reachable, authentication is valid or not required, and
+the output shows a version. `Status: Connected` only proves the public health
+endpoint is reachable; inspect the separate `Authentication` line before
+running protected commands. `ryno whoami` reports the identity validated
+by the gateway, including the subject an administrator uses for workspace
+membership. Add `--output json` for automation.
+
+### Step 3: Create a sandbox
+
+The simplest way to get a sandbox running:
+
+```bash
+ryno sandbox create
+```
+
+This creates a sandbox whose canonical main process is `/bin/bash -l` and
+attaches your terminal to that retained process. Add `--detach` to return after
+the sandbox becomes ready without attaching.
+
+An explicit trailing command is foreground even when stdin or stdout is not a
+terminal. The CLI streams its stdout and stderr and reports the command's exit
+status after output drains. A failure to deliver output makes the CLI report a
+failure even if the command itself exited successfully; check the sandbox's
+state before retrying work that might have side effects. Exit code 0 leaves a
+retained sandbox in `Completed`; nonzero leaves it in `Error` with
+`MainProcessFailed`. Use `--no-keep` to delete either result after output
+drains, or `--detach` for a long-running service. Combine
+`--detach --no-keep` when the gateway should run the service without a host
+attachment and delete its sandbox after the service exits.
+
+When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
+
+Provider attachment is explicit. Name each provider with `--provider`; the
+trailing command does not select or attach one. If the named provider does not
+exist but a profile with that ID is available, the CLI can create it from local
+credentials:
+
+```bash
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --provider claude-code -- claude
+ryno sandbox create --from registry.example.com/your-org/codex-agent:latest --provider codex -- codex
+```
+
+The agent will be prompted interactively if credentials are missing.
+
+### Step 4: Exit and clean up
+
+Exit the sandbox shell with `exit`, or detach with Ctrl-D, then:
+
+```bash
+ryno sandbox delete <name>
+```
+
+---
+
+## Workflow 2: Provider Management
+
+Providers supply credentials and provider-specific configuration to sandboxes. Provider profiles are import-only: a gateway serves exactly what an operator imported, and a new gateway serves an empty catalog. Never rely on a hard-coded type list or on a legacy alias such as `gh` or `claude` — `--type` matches a profile ID exactly. Discover the profiles available on the selected gateway:
+
+```shell
+ryno profile list
+ryno profile list --type provider --output json
+```
+
+### Create a provider from local credentials
+
+```bash
+ryno provider create --name my-github --type github --from-existing
+```
+
+The `--from-existing` flag discovers credentials from local state (e.g., `gh auth` tokens, Claude config files).
+
+### Create a provider with explicit credentials
+
+```bash
+ryno provider create --name my-openai --type openai \
+  --credential OPENAI_API_KEY
+```
+
+Bare `KEY` reads the value from the environment variable of that name and avoids placing the secret in shell history. Use `KEY=VALUE` only when the user explicitly accepts that exposure.
+
+Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
+
+Static provider credentials resolve only for hosts, ports, and paths declared by
+the provider profile. Use `profile export` to inspect that boundary
+when a placeholder is present but requests receive
+`credential_endpoint_mismatch`. A profileless static provider fails closed
+because the gateway cannot construct a binding.
+
+When an inspected request receives `request_authority_mismatch`, compare its
+HTTP authority with the CONNECT tunnel endpoint. The host and effective port
+must match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; `Host: api.example.com` omits the non-default
+port and is rejected. An absolute-form request target must use the same
+authority.
+
+Profile-backed providers always contribute policy unless a gateway-global
+policy is active. Static credential endpoint binding remains independently
+enforced.
+
+### Inspect and manage provider profiles
+
+```shell
+ryno profile describe github
+ryno profile export github --output yaml
+ryno profile lint --file ./my-profile.yaml
+ryno profile import --file ./my-profile.yaml
+ryno profile lint --url https://example.com/profiles/my-profile.yaml
+ryno profile import --url https://example.com/profiles/my-profile.yaml
+```
+
+`--url` accepts one HTTP or HTTPS YAML or JSON profile. Review its endpoint and
+binary grants before importing it. The URL path must end in `.yaml`, `.yml`, or
+`.json`; downloads are limited to 1 MiB and 15 seconds.
+
+Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
+
+Existing scripts can continue using `provider list-profiles` and `provider profile export/import/update/lint/delete`. These commands share the top-level handlers and preserve their arguments, output options, and workspace/global flags. Prefer `profile` when writing new commands.
+
+### List, inspect, update, delete
+
+Use `ryno sandbox provider status --help` and the attach, detach, and update help to find the installed version's wait options. Add `--wait` when the next step depends on a provider change taking effect. Without it, a successful command only confirms that the gateway saved the change. Save the returned `receipt_id` to check that same change later, and inspect the result for every selected sandbox. Credential refresh status confirms that Ryno obtained credentials; provider status confirms that the sandbox applied them, activated the policy, and updated the environment for new processes. If the status is `superseded`, explain that a later change replaced the request and inspect that change separately.
+
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, explain that the change may already be saved and its readiness receipt may be unavailable. Do not blindly retry the mutation. Inspect the provider and sandbox state and reconcile the saved change before deciding on another mutation; the error proves neither rollback nor readiness.
+
+```bash
+ryno provider list
+ryno provider list --output json
+ryno provider get my-github
+ryno provider update my-github --from-existing
+ryno provider delete my-github
+```
+
+`provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
+
+### Configure credential refresh
+
+Use refresh commands only when the provider profile and gateway support refreshable credentials:
+
+```bash
+ryno provider refresh status my-provider
+ryno provider refresh configure my-provider \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --secret-material-env REFRESH_TOKEN=MS_GRAPH_REFRESH_TOKEN \
+  --credential-expires-at 2026-07-16T00:00:00Z
+ryno provider refresh rotate my-provider --credential-key ACCESS_TOKEN
+```
+
+Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
+
+The gateway stores secret refresh material through its active credential driver.
+With Vault selected, refresh tokens, client secrets, and private keys live in
+Vault alongside injectable provider credentials; refresh state contains only
+opaque handles. A credential-backend read or write failure makes refresh fail
+closed rather than falling back to inline storage. Before Ryno 0.1.0, the
+gateway does not migrate legacy inline refresh material or move secrets between
+credential backends. Reconfigure affected grants after upgrading, and remove or
+reconfigure credentials while the original backend remains available before
+changing backends. Do not run mixed gateway versions against the same refresh
+records.
+
+Gateway-managed refresh credentials use an identity-stable workload handle.
+Routine automatic refresh and `provider refresh rotate` update the access token
+behind that handle, so long-running processes do not need to restart. Running
+processes must be restarted once when upgrading from revision-scoped
+placeholders. A later `provider refresh configure` call is an explicit
+reauthorization boundary: it revokes the previous handle, and processes holding
+that handle fail closed until restarted.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete the refresh-owned primary credential or any co-minted
+output. Use `provider refresh rotate`, reconfigure refresh, or delete refresh
+before returning those keys to manual management. Unrelated provider fields
+remain updateable.
+
+When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
+`provider refresh status`; do not infer the remedy from HTTP status or parse
+`LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
+user must obtain a new OAuth grant and run `provider refresh configure`,
+`fix_configuration` means an operator must repair the OAuth client, scopes, or
+administrator policy, and `investigate` means the issuer returned an
+unrecognized response. The gateway parks `reauthorize` records until a manual
+rotate or reconfiguration. It retries
+`fix_configuration` records hourly so externally repaired configuration can
+recover without rapid token-endpoint traffic. The existing access credential
+remains usable only until its recorded expiry.
+
+---
+
+## Workflow 3: Sandbox Lifecycle
+
+### Create with options
+
+```bash
+ryno sandbox create \
+  --name my-sandbox \
+  --provider my-github \
+  --provider my-claude \
+  --policy ./my-policy.yaml \
+  --upload .:/workspace \
+  --label team=agents \
+  -- claude
+```
+
+Key flags:
+
+- `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
+- `--policy`: Custom policy YAML (otherwise uses built-in default or `RYNO_SANDBOX_POLICY` env var)
+- `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
+- `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
+- `--driver-config-json`: Pass experimental driver-specific sandbox configuration
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
+- `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--tty`: Allocate a retained PTY for the canonical main process
+- `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
+- `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
+- `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
+- `--no-git-ignore`: Disable `.gitignore` filtering for uploads
+- `--no-keep`: Delete the sandbox after main output and the exit result drain
+- `--detach`: Start the canonical main process without attaching
+- `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
+- `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+`--detach` adds no attachment grace period. When the canonical process exits,
+its terminal phase is reported immediately. A foreground create declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+closes naturally. With `--detach --no-keep`, the gateway owns the detached
+process lifecycle and deletes the ephemeral sandbox after terminal reporting
+finishes.
+
+Do not combine `--upload` with a trailing main command. Uploads currently finish
+after the canonical process starts; create a scratch sandbox and use
+`sandbox exec`, or build the files into the image.
+
+Create from a reusable workload template when several sandboxes should share
+image, environment, sizing, or driver-specific configuration:
+
+```bash
+ryno sandbox template create gpu-kata \
+  --image registry.example.com/agents/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}'
+
+ryno sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
+```
+
+Driver config is disabled by default. These template and one-off
+`sandbox create --driver-config-json` examples require the administrator to set
+`allow_driver_config = true` for the selected driver. This does not waive
+resource admission: external attachments need administrator-controlled approval
+labels on the actual resources, not sandbox labels. GPU device attachments
+are temporarily exempt from labels; the public `--gpu` flag needs no driver
+config opt-in. Consult the published gateway configuration reference before
+changing admission settings; do not recommend disabling admission to bypass a
+denial. Put driver config on a template only when it should be reused.
+
+### Manage sandbox workload templates
+
+```bash
+ryno sandbox template create gpu-kata \
+  --image registry.example.com/agents/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+ryno sandbox template list
+ryno sandbox template list --label-selector team=runtime
+ryno sandbox template list --all-workspaces --output json
+ryno sandbox template get gpu-kata
+ryno sandbox template delete gpu-kata
+```
+
+Template `--image` accepts an OCI image reference. If omitted, the gateway
+applies its default sandbox image when creating a sandbox from the template.
+Create-time policy, providers, labels, uploads, forwarding, editor launch, and
+the initial command stay on `sandbox create`.
+
+### List and inspect sandboxes
+
+```bash
+ryno sandbox list
+ryno sandbox list --selector team=agents --output json
+ryno sandbox get my-sandbox
+```
+
+Most commands with an optional sandbox name use the last-used sandbox. Pass an explicit name in automation.
+
+### Connect to a running sandbox
+
+```bash
+ryno sandbox connect my-sandbox
+ryno sandbox connect my-sandbox --editor vscode
+```
+
+Attaches to the sandbox's existing canonical main process. Disconnecting leaves
+that process running; reconnecting targets the same process instance and replays
+recent output. If an established SSH transport is interrupted, such as when a
+laptop sleeps and wakes, the CLI retries transient failures for up to 60 seconds
+and reattaches to that same process. Use `sandbox exec --tty -- /bin/bash -l`
+for a new shell. Press `Ctrl-D` or `Ctrl-P`, then `Ctrl-Q` to disconnect without
+terminating main. OpenSSH's `~.` escape looks like transport loss and therefore
+starts automatic recovery; after it reattaches, use `Ctrl-D` or `Ctrl-P`, then
+`Ctrl-Q` to exit, or press `Ctrl-C` between retry attempts to cancel recovery.
+When you own stdin, `Ctrl-C` interrupts the foreground process. In a read-only
+attachment, `Ctrl-C` or `Ctrl-D` exits the viewer and leaves main and other
+attachments running. Configure VS Code Remote-SSH with:
+
+```bash
+ryno sandbox ssh-config my-sandbox >> ~/.ssh/config
+```
+
+A writable attachment that finds another attachment holding stdin reports `attached read-only; retry input after the owner disconnects`. Automatic recovery can hit this when it reattaches before the supervisor closes the dead connection. The supervisor closes a connection 60 seconds after it last received bytes from it, which can be later than 60 seconds after the network failed if the relay buffered data. After the old owner disconnects or times out, send the input you meant to type next. If stdin is free, the attachment prints `input enabled` and forwards that input to the process, so do not probe with Enter or a prompt answer such as `y`. If nothing prints, the old connection still holds stdin. Input sent while the attachment was read-only never reaches the process, so send it again later. `Ctrl-C`, `Ctrl-D`, and `Ctrl-P` then `Ctrl-Q` still exit a read-only attachment instead of enabling input; enable input first if you need `Ctrl-C` to interrupt the process. Recovery never takes stdin from a healthy owner, and an explicitly read-only attachment stays read-only.
+
+If `connect` reports `canonical main process already finished`, inspect the
+result with `sandbox get`. A pending foreground attachment can still retrieve
+retained output in `Completed` or `Error`; phase alone does not determine
+whether attachment is available. A nonzero main-process exit under
+`on-failure`, or any exit under `always`,
+moves the sandbox to `Starting` during backoff and resource replacement. Connect
+and exec commands resume after the new supervisor session makes it `Ready`.
+An explicit `sandbox stop` cancels a pending restart.
+
+### Upload and download files
+
+```bash
+# Upload local files to the sandbox working directory
+ryno sandbox upload my-sandbox ./src
+
+# Download a path relative to the sandbox working directory
+ryno sandbox download my-sandbox output ./local-output
+```
+
+Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
+
+If `sandbox create --upload` rejects an upload, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
+
+Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
+When the upload destination is omitted, the CLI discovers the remote working
+directory. Uploading a named directory merges it into an existing directory of
+the same name, overwriting matching entries without deleting unrelated entries.
+Downloads accept paths relative to that working directory or absolute paths
+within it.
+
+### Execute a non-interactive command
+
+```bash
+ryno sandbox exec my-sandbox --workdir /workspace -- ls -la
+ryno sandbox exec --name my-sandbox --env MODE=test -- cargo test
+```
+
+The sandbox is a positional name or `--name`, not both; omit it to use the
+last-used sandbox. `--` is required and everything after it is the remote
+command, so put options such as `--tty` before it.
+
+`sandbox exec` starts an independent sibling process and streams output. After
+stdout and stderr drain, it returns the remote command's exit code if delivery
+succeeds. Output delivery failure instead returns exit code 74, even when the
+command exited successfully. A descendant that keeps an inherited output pipe
+open for more than 30 seconds after the command exits triggers that failure.
+Check whether the command ran before retrying work with side effects. Use
+`sandbox connect` to attach to the canonical main process.
+Use `--env` only for non-secret values. Attach credentials to the sandbox with a
+provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
+
+### Change attached providers
+
+```bash
+ryno sandbox provider list my-sandbox
+ryno sandbox provider list my-sandbox --output json
+ryno sandbox provider attach my-sandbox my-github --wait --timeout 30
+ryno sandbox provider status my-sandbox my-github --output json
+ryno sandbox provider detach my-sandbox my-github --wait --timeout 30
+```
+
+Structured attachment output contains provider names, types, and sorted
+credential and config key names. It never contains credential, handle, or
+config values.
+
+### View logs
+
+```bash
+# Recent logs
+ryno logs my-sandbox
+
+# Stream live logs
+ryno logs my-sandbox --tail
+
+# Filter by source and level
+ryno logs my-sandbox --tail --source sandbox --level warn
+
+# Logs from the last 5 minutes
+ryno logs my-sandbox --since 5m
+```
+
+### Delete sandboxes
+
+```bash
+ryno sandbox delete my-sandbox
+ryno sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
+ryno sandbox delete --all
+```
+
+`deletion accepted` means cleanup is still pending. Inspect the sandbox until
+it disappears before assuming completion. An already-absent sandbox succeeds;
+missing workspaces and authorization failures remain errors. Do not blindly
+retry by name if another process might have recreated that name.
+
+### Stop and start sandboxes
+
+Use stop to halt compute while retaining the sandbox and its persistent
+workspace:
+
+```bash
+ryno sandbox stop [name]
+ryno sandbox start [name]
+```
+
+Both commands default to the last-used sandbox. Stop stops background
+forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
+file transfer, forwarding, and exposed services are unavailable while
+stopped or completed. Starting a retained `Completed` or
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
+invalidates SSH sessions from the previous runtime generation. Delete remains
+the operation that removes retained state.
+
+---
+
+## Workflow 4: Policy Iteration Loop
+
+This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
+
+**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+
+If startup reports `ConfigurationInvalid`, inspect `ryno sandbox get` and
+repair the complete policy or provider set through the gateway. The workload
+has not started on its first activation, so static fields can also be replaced
+during this initial repair. A previously activated sandbox retains static-field
+restrictions while restart admission is pending or rejected.
+Before the gateway's 300-second repair window expires, successful validation
+completes startup in place. Effective stored configuration changes and their
+first failed load reset that window; repeated failures do not. After
+`ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
+configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
+wait timeout is separate from this gateway deadline. Follow the
+published [policy repair guidance](https://docs.nvidia.com/ryno/latest/how-it-works/policies/overview)
+and confirm current replacement/detach syntax with installed CLI help.
+
+An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
+`protocol: tcp` requests policy DNS and transparent TCP and currently requires
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
+workload rather than activating only part of the network contract.
+
+```
+Create sandbox with initial policy
+        │
+        ▼
+   Monitor logs ◄──────────────────┐
+        │                          │
+        ▼                          │
+  Observe denied actions           │
+        │                          │
+        ▼                          │
+  Pull current policy              │
+        │                          │
+        ▼                          │
+  Modify policy YAML               │
+  (use generate-sandbox-policy)    │
+        │                          │
+        ▼                          │
+  Push updated policy              │
+        │                          │
+        ▼                          │
+  Verify reload succeeded ─────────┘
+```
+
+### Step 1: Create sandbox with initial policy
+
+```bash
+ryno sandbox create --name dev --from registry.example.com/your-org/claude-agent:latest --policy ./initial-policy.yaml -- claude
+```
+
+Sandboxes stay alive by default for iteration. Add `--no-keep` only when the sandbox should be deleted automatically after the initial session.
+
+### Step 2: Monitor logs for denied actions
+
+In a separate terminal or as the agent:
+
+```bash
+ryno logs dev --tail --source sandbox
+```
+
+Look for `DENIED` log lines. `NET:OPEN [MED] DENIED` marks a blocked connection, and `HTTP:<METHOD> [MED] DENIED` marks a blocked request. Policy events are INFO-level log records, so do not add `--level warn`. The logs include:
+
+- **Destination host and port** (what was blocked)
+- **Binary path** (which process attempted the connection)
+- **Deny reason** (why it was blocked)
+
+### Step 3: Pull the current policy
+
+```bash
+set -o pipefail
+ryno policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
+```
+
+`--base` returns the editable policy without provider-composed entries; Ryno composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
+
+### Step 4: Modify the policy
+
+Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
+
+- Network endpoint rule structure
+- L4 vs REST, WebSocket, JSON-RPC, and MCP L7 policy decisions
+- Access presets (`read-only`, `read-write`, `full`)
+- TLS termination configuration
+- Enforcement modes (`audit` vs `enforce`)
+- Binary matching patterns
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `ryno/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[ryno.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+
+Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
+messages when the implementation advertises the matching binding. The built-in
+`ryno/regex` supports request bodies and client WebSocket text messages.
+Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
+and `debug-ryno-cluster` to investigate middleware failures.
+
+### Step 5: Push the updated policy
+
+```bash
+ryno policy set dev --policy current-policy.yaml --wait
+```
+
+The gateway validates the complete effective candidate—including attached
+provider-profile policy—before it stores a direct update, incremental merge,
+approved proposal, provider attachment, or profile update that affects attached
+sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
+candidate does not create a policy revision or partially update affected
+sandboxes. The same fail-closed response applies when `credential_signing`
+does not have an attached AWS profile whose credential boundary covers the
+endpoint, or an explicit binding to an endpointless AWS profile. Fix the
+conflicting endpoint selectors or credential source and submit again.
+
+The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
+
+- **0**: Policy loaded successfully
+- **1**: Policy load failed
+- **124**: Timeout (default 60 seconds)
+
+### Step 6: Verify the update
+
+```bash
+ryno policy list dev
+```
+
+Check that the latest revision shows status `loaded`. If `failed`, check the error column for details.
+
+### Step 7: Repeat
+
+Return to Step 2. Continue monitoring logs and refining the policy until all required actions are allowed and no unnecessary permissions exist.
+
+### Policy revision history
+
+View all revisions to understand how the policy evolved:
+
+```bash
+ryno policy list dev --page-size 50
+ryno policy list dev --output json
+```
+
+Fetch a specific historical revision:
+
+```bash
+ryno policy get dev --rev 3 --full
+```
+
+Gateway-global policy commands use `--global` and require confirmation unless `--yes` is supplied:
+
+```bash
+ryno policy get --global --full
+ryno policy set --global --policy ./global-policy.yaml
+ryno policy list --global
+ryno policy delete --global
+```
+
+Avoid `--yes` during interactive work. A global policy locks policy control for all sandboxes on the gateway.
+
+### Review agent-authored rule proposals
+
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only valid effective-policy candidates with an empty prover delta; findings still require review. The CLI binds approval to the candidate's current review token. If live policy, provider, or credential inputs change, approval leaves the chunk pending with a refreshed candidate and requires a fresh review.
+
+```bash
+ryno rule get dev --status pending
+ryno rule approve dev --chunk-id <chunk-id>
+ryno rule reject dev --chunk-id <chunk-id> --reason "too broad"
+ryno rule history dev
+```
+
+Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+
+---
+
+## Workflow 5: BYOC (Bring Your Own Container)
+
+Build a custom container image and run it as a sandbox.
+
+### Create a sandbox from a pre-built image
+
+```bash
+docker build -t my-app:latest .
+ryno sandbox create --from my-app:latest --name my-app
+```
+
+The `--from` flag accepts an explicit OCI image reference such as `myregistry.com/img:tag`. It does not expand catalog aliases. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
+
+Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway.
+
+For Docker and Podman gateways, custom images should declare a non-root OCI
+`USER`. Images without one run as numeric UID and GID `1000`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+field wins independently; omitted fields fall back to the image declaration.
+Explicit numeric fields may use any UID/GID from `1` through
+`4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
+Warn users that low IDs can inherit permissions from matching accounts, image
+files, mounted volumes, or devices.
+
+### Forward ports
+
+```bash
+# Foreground (blocks)
+ryno forward start 8080 my-app
+
+# Background (returns immediately)
+ryno forward start 8080 my-app -d
+```
+
+The service is now reachable at `localhost:8080`.
+CLI forwards ignore SSH multiplexing and automatic backgrounding settings in the
+user's SSH config. Only background forwards are tracked by `forward list` and
+managed by `forward stop`; foreground forwards end when the command exits.
+
+Manage or iterate on the sandbox:
+
+```bash
+ryno forward list
+ryno forward stop 8080 my-app
+ryno sandbox delete my-app
+ryno sandbox create --from my-app:latest --name my-app --forward 8080
+```
+
+Use structured output when automation needs the tracked forward metadata and
+validated process state:
+
+```bash
+ryno forward list --output json
+```
+
+Each record includes `workspace`, `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean validates the workspace-scoped sandbox and tracked
+process identity; it does not probe the forwarded socket.
+
+Create and forward in one command:
+
+```bash
+ryno sandbox create --from my-app:latest --forward 8080 -- ./start-server.sh
+```
+
+The `--forward` flag starts a background port forward before the command runs.
+
+## Workflow 6: Agent-Assisted Sandbox Session
+
+Support a human working in a sandbox while an agent monitors activity and refines the policy in parallel.
+
+Create the sandbox and keep it alive:
+
+```bash
+ryno sandbox create \
+  --name work-session \
+  --provider github \
+  --provider claude \
+  --policy ./dev-policy.yaml
+```
+
+Tell the user to connect in another shell:
+
+```bash
+ryno sandbox connect work-session
+ryno sandbox connect work-session --editor vscode
+```
+
+Monitor denied activity:
+
+```bash
+ryno logs work-session --tail --source sandbox
+```
+
+When denied actions appear:
+
+1. Prefer incremental updates for additive network changes:
+   `ryno policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
+   `ryno policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+
+   A rule authorizes every binary it lists to reach every endpoint it lists, so
+   an update that adds a binary or an endpoint to an existing rule must declare
+   that rule's whole binary and endpoint scope. The gateway rejects an update
+   that would grant a binary-to-endpoint pair the update never asked for, and
+   the error names the binaries still missing. To grant one binary access to
+   only part of a rule's endpoints, send the narrow authorization under its own
+   `--rule-name`; it stays on its own rule instead of folding into the broader
+   one.
+
+   `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
+2. Use full YAML replacement for broad network changes or settings that
+   `policy update` cannot express, including any change that would otherwise
+   require restating a large existing scope. Filesystem, Landlock, and process
+   changes still require recreating the sandbox:
+   `ryno policy get work-session --base | sed '1,/^---$/d' > policy.yaml`
+   Modify the policy with the `generate-sandbox-policy` skill.
+   `ryno policy set work-session --policy policy.yaml --wait`
+3. Verify with `ryno policy list work-session`.
+
+The user does not need to disconnect. Policy updates are hot-reloaded; `--wait` blocks until the sandbox confirms the revision or the timeout expires. Delete the sandbox when the session ends:
+
+```bash
+ryno sandbox delete work-session
+```
+
+## Workflow 7: Inference with Attached Providers
+
+Inference uses the same provider attachment workflow as other credentialed
+services. Import or select a profile that authorizes the provider's native
+endpoint, create the provider, and attach it only to sandboxes that need it:
+
+```bash
+ryno provider profile import -f ./inference-provider.yaml
+ryno provider create --name model-provider --type <profile-id> --credential <KEY>
+ryno sandbox provider attach work-session model-provider --wait --timeout 30
+ryno sandbox exec work-session -- <client-command>
+```
+
+The application owns the native base URL, model, request shape, and timeout.
+Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
+
+For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
+
+## Workflow 8: Gateway Management
+
+List, switch, and verify gateways:
+
+```bash
+ryno gateway select
+ryno gateway list --output json
+ryno gateway select production
+ryno gateway info --name production
+ryno status
+```
+
+`ryno gateway info` reports the immutable startup snapshot for compute drivers, credential drivers, gateway interceptors, and supervisor middleware. Use each entry's protocol version, implementation version, supported capabilities, and gateway requirements when diagnosing extension skew; implementation versions do not identify underlying Docker, Kubernetes, or credential backends.
+
+Register or remove gateways:
+
+```bash
+ryno gateway add http://127.0.0.1:8080 --local --name local
+ryno gateway add https://gateway.example.com --name production
+ryno gateway remove local
+```
+
+`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. If automatic OIDC refresh fails, protected commands stop before sending an RPC and direct the user to run `ryno gateway login <name>`; `ryno status` still reports gateway reachability and authentication separately. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
+
+For one-off automation, `--gateway-endpoint URL` connects directly without stored metadata. Limit `--gateway-insecure` to explicitly trusted development endpoints.
+
+Inspect a Kubernetes deployment:
+
+```bash
+helm -n ryno status ryno
+kubectl -n ryno get deployment,statefulset,pods,svc
+kubectl -n ryno logs deployment/ryno -c ryno-gateway --tail=100
+kubectl -n ryno logs statefulset/ryno -c ryno-gateway --tail=100
+```
+
+For Docker, Podman, and VM-backed gateways, inspect the gateway process or container logs and the selected runtime directly.
+
+## Workflow 9: Settings Management
+
+Manage sandbox-scoped or gateway-global settings:
+
+```bash
+ryno settings get work-session
+ryno settings set work-session --key ocsf_json_enabled --value true
+ryno settings delete work-session --key ocsf_json_enabled
+
+ryno settings get --global --json
+ryno settings set --global --key ocsf_json_enabled --value true
+
+# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
+ryno settings set --global --key ocsf_schema_version --value "1.1"
+```
+
+Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
+
+`policy_validation_failure_mode` is gateway startup configuration, not a
+mutable `ryno settings` key. Set it under `[ryno.gateway]` in
+`gateway.toml` and restart the gateway. The security-first default is
+`fail_closed`; `retain_last_valid` is an explicit availability tradeoff. OCSF
+configuration events state whether the previous generation is active after a
+runtime validation failure.
+
+## Workflow 10: Service Access
+
+Use `forward` for local access and `service` for a gateway-managed HTTP endpoint:
+
+```bash
+# SSH-based same-port forwarding; optional bind address is accepted.
+ryno forward start 127.0.0.1:8080 my-app -d
+
+# gRPC relay to a loopback TCP service, with an optional dynamic local port.
+ryno forward service my-app --target-port 8000 --local 127.0.0.1:0
+
+# Create a sandbox with its unnamed HTTP or WebSocket service exposed.
+ryno sandbox create \
+  --name my-app \
+  --from my-app:latest \
+  --expose 8080 \
+  --expose-authorization-mode bearer-passthrough \
+  --detach \
+  -- ./start-server.sh
+
+# Expose and manage an HTTP service through the gateway.
+ryno service expose my-app 8080 web \
+  --authorization-mode bearer-passthrough
+ryno service list my-app
+ryno service list my-app --output json
+ryno service get my-app web
+ryno service delete my-app web
+```
+
+Use `ryno service list --all-workspaces` for a Platform Admin view across
+workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
+
+`sandbox create --expose PORT` registers the unnamed endpoint in the create
+request and keeps the sandbox running. Add `--output json` for automation; the
+result contains a `service_urls` map whose empty key is the unnamed endpoint.
+Use `ryno service expose` after creation to add or update named endpoints.
+
+Exposed services strip `Authorization` by default. Select
+`bearer-passthrough` only when the application inside the sandbox authenticates
+its own clients. This mode accepts either no `Authorization` header or exactly
+one non-empty Bearer credential and forwards that value unchanged. It rejects
+duplicate, malformed, or non-Bearer authorization before contacting the
+application. The application remains responsible for validating the token, and
+the raw token reaches the sandbox process, so never log it. Service routes
+bypass control-plane RPC authorization, but they still use the gateway's
+existing listener, domain routing, and TLS configuration, including any client
+certificate requirement. See the published
+[sandbox service documentation](https://docs.nvidia.com/ryno/latest/how-it-works/sandboxes/overview.md)
+for the complete security contract.
+
+Prefer loopback binds unless the user explicitly needs LAN-visible local access.
+
+---
+
+## Self-Teaching via `--help`
+
+When you encounter a command or option not covered in this skill:
+
+1. **Start broad**: `ryno --help` to see all command groups.
+2. **Narrow down**: `ryno <group> --help` to see subcommands (e.g., `ryno sandbox --help`).
+3. **Get specific**: `ryno <group> <cmd> --help` for flags and usage (e.g., `ryno sandbox create --help`).
+
+The CLI help is always authoritative. If the help output contradicts this skill, follow the help output -- the CLI may have been updated since this skill was written.
+
+### Example: discovering an unfamiliar command
+
+```bash
+$ ryno sandbox --help
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider, template
+
+$ ryno sandbox upload --help
+# Shows: positional arguments (name, path, dest), usage examples
+```
+
+---
+
+## Companion Skills
+
+| Skill | When to use |
+|-------|------------|
+| `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
+| `debug-ryno-cluster` | Diagnosing gateway deployment, runtime, or health failures |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |

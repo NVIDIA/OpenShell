@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Detect container runtime
+  ansible.builtin.include_tasks: detect.yaml
+
+- name: Create Ryno state directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/ryno
+    state: directory
+    owner: "{{ ryno_gateway_user }}"
+    group: "{{ ryno_gateway_user }}"
+    mode: "0700"
+
+- name: Prepare Docker gateway
+  ansible.builtin.include_tasks: docker.yaml
+  when: ryno_gateway_driver == "docker"
+
+- name: Prepare Podman gateway
+  ansible.builtin.include_tasks: podman.yaml
+  when: ryno_gateway_driver == "podman"
+
+- name: Create Ryno configuration directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/ryno
+    state: directory
+    mode: "0755"
+
+- name: Create Ryno gateway PKI directory
+  become: true
+  ansible.builtin.file:
+    path: /var/lib/ryno/pki
+    state: directory
+    owner: "{{ ryno_gateway_user }}"
+    group: "{{ ryno_gateway_user }}"
+    mode: "0700"
+
+- name: Generate Ryno gateway certificates
+  become: true
+  become_user: "{{ ryno_gateway_user }}"
+  ansible.builtin.command:
+    argv:
+      - ryno-gateway
+      - generate-certs
+      - --output-dir
+      - /var/lib/ryno/pki
+    creates: /var/lib/ryno/pki/jwt/signing.pem
+  environment:
+    HOME: "{{ ryno_gateway_home }}"
+
+- name: Configure Ryno gateway
+  become: true
+  ansible.builtin.template:
+    src: "gateway-{{ ryno_gateway_driver }}.toml.j2"
+    dest: /etc/ryno/gateway.toml
+    mode: "0644"
+
+- name: Install Ryno gateway service
+  become: true
+  ansible.builtin.template:
+    src: "gateway-{{ ryno_gateway_driver }}.service.j2"
+    dest: /etc/systemd/system/ryno-gateway.service
+    mode: "0644"
+
+- name: Start Ryno gateway
+  become: true
+  ansible.builtin.systemd_service:
+    name: ryno-gateway.service
+    daemon_reload: true
+    enabled: true
+    state: started
+
+- name: Wait for Ryno gateway
+  block:
+    - name: Wait for gateway port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 17670
+        timeout: 60
+
+  rescue:
+    - name: Read Ryno gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - ryno-gateway.service
+          - --no-pager
+          - --lines
+          - "100"
+      changed_when: false
+      failed_when: false
+      register: ryno_gateway_logs
+
+    - name: Show Ryno gateway logs
+      ansible.builtin.debug:
+        var: ryno_gateway_logs.stdout_lines
+
+    - name: Report Ryno gateway startup failure
+      ansible.builtin.fail:
+        msg: Ryno gateway did not start

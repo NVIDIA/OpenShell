@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Gateway, Sandboxing, AI Agents, Sandbox
 position: 1
 ---
 
-A sandbox is the OpenShell data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with OpenShell policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
+A sandbox is the Ryno data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with Ryno policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
 
 <Info>You need an active gateway before creating a sandbox.</Info>
 
@@ -17,27 +17,27 @@ A sandbox is the OpenShell data plane: a safe, private execution environment whe
 Create a sandbox with a single command. For example, to create a sandbox with Claude, run:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest -- claude
 ```
 
-The trailing command is the sandbox's canonical main process. OpenShell streams
+The trailing command is the sandbox's canonical main process. Ryno streams
 its output and returns its exit status. By default, exit code 0 leaves a
 retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
-`MainProcessFailed` condition. With no trailing command, OpenShell starts a
+`MainProcessFailed` condition. With no trailing command, Ryno starts a
 login shell in a retained pseudo-terminal: `/bin/bash -l` when the image
 provides bash, otherwise a shell detected in the image such as `/bin/sh` on
 minimal bases like Alpine. Add `--detach` to create the sandbox without
 attaching:
 
 ```shell
-openshell sandbox create --name worker --detach -- ./worker
+ryno sandbox create --name worker --detach -- ./worker
 ```
 
 Use `--restart-policy on-failure` to replace the runtime after a nonzero main
 process exit, or `--restart-policy always` to replace it after every exit:
 
 ```shell
-openshell sandbox create --name worker --detach --restart-policy on-failure -- ./worker
+ryno sandbox create --name worker --detach --restart-policy on-failure -- ./worker
 ```
 
 The default policy is `never`. The gateway starts the first replacement as soon
@@ -48,23 +48,23 @@ identity and configuration; filesystem persistence follows the compute driver's 
 start behavior. It does not restore process memory or terminal history.
 
 Detached commands have no attachment grace period. When the command exits,
-OpenShell records its terminal phase immediately. For a foreground command,
-the create request declares one expected SSH attachment. OpenShell retains the
+Ryno records its terminal phase immediately. For a foreground command,
+the create request declares one expected SSH attachment. Ryno retains the
 terminal transport until that connection drains and closes naturally, then
 finalizes ephemeral cleanup.
 
-Use `--no-keep` for an ephemeral command. OpenShell drains stdout and stderr,
+Use `--no-keep` for an ephemeral command. Ryno drains stdout and stderr,
 captures the command result, and deletes the sandbox after the command exits:
 
 ```shell
-openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
+ryno sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
 
 Combine `--detach` and `--no-keep` for a background workload whose lifecycle
 belongs entirely to the gateway:
 
 ```shell
-openshell sandbox create --detach --no-keep -- ./worker
+ryno sandbox create --detach --no-keep -- ./worker
 ```
 
 The create command returns after the workload is ready. The gateway keeps the
@@ -79,14 +79,14 @@ sandbox image.
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
 
 ```shell
-openshell sandbox create --output json
+ryno sandbox create --output json
 ```
 
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
-openshell gateway add http://127.0.0.1:18080 --local --name local
-openshell gateway select local
+ryno gateway add http://127.0.0.1:18080 --local --name local
+ryno gateway select local
 ```
 
 ### CPU and Memory
@@ -94,7 +94,7 @@ openshell gateway select local
 Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --cpu 2 --memory 4Gi -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --cpu 2 --memory 4Gi -- claude
 ```
 
 CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
@@ -115,7 +115,7 @@ Nested keys inside each driver block use snake_case. The top-level envelope keys
 are driver names, such as `kubernetes`, and are not part of the nested schema.
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
   -- claude
 ```
@@ -129,23 +129,23 @@ the same behavior.
 To request GPU resources, add `--gpu`:
 
 ```shell
-openshell sandbox create --gpu --from registry.example.com/your-org/gpu-agent:latest -- claude
+ryno sandbox create --gpu --from registry.example.com/your-org/gpu-agent:latest -- claude
 ```
 
 Request a specific number of GPUs by passing a count to `--gpu`:
 
 ```shell
-openshell sandbox create --gpu 2 --from registry.example.com/your-org/gpu-agent:latest -- claude
+ryno sandbox create --gpu 2 --from registry.example.com/your-org/gpu-agent:latest -- claude
 ```
 
-When you omit the count, OpenShell treats the request as `--gpu 1`.
+When you omit the count, Ryno treats the request as `--gpu 1`.
 Kubernetes honors counted `--gpu` requests by setting the `nvidia.com/gpu`
 limit. Docker and Podman select the requested number of default NVIDIA CDI
 devices in round-robin order. VM gateways accept only one GPU, either through
 `--gpu` or `--gpu 1`; a single `gpu_device_ids` entry works with either form.
 
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
-CDI after the gateway starts, restart the gateway so OpenShell can detect the
+CDI after the gateway starts, restart the gateway so Ryno can detect the
 updated Docker daemon capability.
 
 Docker and Podman refresh the CDI inventory before validating or creating a
@@ -161,7 +161,7 @@ IDs are treated as opaque strings. The list must not contain duplicate IDs, and
 its length must match the effective GPU count:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --gpu \
   --driver-config-json '{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}' \
   -- claude
@@ -175,9 +175,9 @@ built-in default is `nvcr.io/nvidia/base/ubuntu:24.04`.
 Use `--from` with an explicit OCI image reference or a rootfs tar archive:
 
 ```shell
-openshell sandbox create --from nvcr.io/nvidia/base/ubuntu:24.04
-openshell sandbox create --from my-registry.example.com/my-image:latest
-openshell sandbox create --from ./rootfs.tar
+ryno sandbox create --from nvcr.io/nvidia/base/ubuntu:24.04
+ryno sandbox create --from my-registry.example.com/my-image:latest
+ryno sandbox create --from ./rootfs.tar
 ```
 
 `--from` does not expand catalog aliases and does not build local Dockerfiles or
@@ -187,18 +187,18 @@ local gateway, then pass the resulting image reference:
 ```shell
 # Docker gateway
 docker build -t my-image:latest .
-openshell sandbox create --from my-image:latest
+ryno sandbox create --from my-image:latest
 
 # Podman gateway
 podman build -t localhost/my-image:latest .
-openshell sandbox create --from localhost/my-image:latest
+ryno sandbox create --from localhost/my-image:latest
 ```
 
 For a remote gateway, push the image to a registry that the gateway can pull
 from and use that registry image reference.
 
 <Warning>
-**Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
+**Pre-0.1.0 breaking change:** `ryno sandbox create --from ./Dockerfile`
 and directory sources no longer build images. Bare catalog names are no longer
 expanded. Build or select an image and pass its explicit reference.
 </Warning>
@@ -214,7 +214,7 @@ docker create --name export-me my-image:latest
 docker export -o rootfs.tar export-me
 docker rm export-me
 
-openshell sandbox create --from ./rootfs.tar
+ryno sandbox create --from ./rootfs.tar
 ```
 
 Rootfs tar sources require a local gateway running the VM compute driver. The
@@ -238,32 +238,32 @@ To reuse image and resource settings across sandboxes, see [Templates](/how-it-w
 
 ## Default Workload Image
 
-OpenShell defaults to `nvcr.io/nvidia/base/ubuntu:24.04` unless the gateway
+Ryno defaults to `nvcr.io/nvidia/base/ubuntu:24.04` unless the gateway
 operator configures another image. The image provides a minimal Ubuntu Noble
-userspace. It does not include agent CLIs or an image-baked OpenShell policy.
-OpenShell applies its built-in restrictive policy when no explicit policy is
+userspace. It does not include agent CLIs or an image-baked Ryno policy.
+Ryno applies its built-in restrictive policy when no explicit policy is
 provided.
 
 Create a sandbox with the default image:
 
 ```shell
-openshell sandbox create
+ryno sandbox create
 ```
 
 Override it with any image visible to the active compute driver:
 
 ```shell
-openshell sandbox create --from registry.example.com/agents/my-agent:1.0
+ryno sandbox create --from registry.example.com/agents/my-agent:1.0
 ```
 
-Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
+Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/Ryno/tree/main/examples/bring-your-own-container).
 
 ## Connect to a Sandbox
 
 Attach to the canonical main process in a running sandbox:
 
 ```shell
-openshell sandbox connect my-sandbox
+ryno sandbox connect my-sandbox
 ```
 
 Press `Ctrl-D` or `Ctrl-P`, then `Ctrl-Q` in sequence to disconnect. The main
@@ -287,18 +287,18 @@ process. For read-only attachments, `Ctrl-C` or `Ctrl-D` exits only the current
 viewer.
 OpenSSH's `~.` escape reports the same status as a broken transport, so it
 starts automatic recovery instead of exiting. After `~.`, use `Ctrl-D` or
-`Ctrl-P`, then `Ctrl-Q` once OpenShell reattaches, or press `Ctrl-C` while the CLI
+`Ctrl-P`, then `Ctrl-Q` once Ryno reattaches, or press `Ctrl-C` while the CLI
 is between retry attempts to cancel recovery.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 
 ```shell
-openshell sandbox create --editor vscode --name my-sandbox
-openshell sandbox connect my-sandbox --editor cursor
+ryno sandbox create --editor vscode --name my-sandbox
+ryno sandbox connect my-sandbox --editor cursor
 ```
 
-When `--editor` is used, OpenShell keeps the sandbox alive and installs an
-OpenShell-managed SSH include file instead of cluttering your main
+When `--editor` is used, Ryno keeps the sandbox alive and installs an
+Ryno-managed SSH include file instead of cluttering your main
 `~/.ssh/config` with generated host blocks.
 
 ## Execute a Command in a Sandbox
@@ -314,13 +314,13 @@ The supervisor limits pending stdin to 4 MiB per exec channel. If input arrives 
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
 ```shell
-openshell sandbox exec -n my-sandbox -- ls -la /workspace
+ryno sandbox exec -n my-sandbox -- ls -la /workspace
 ```
 
 Pipe stdin into the command:
 
 ```shell
-echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+echo "hello" | ryno sandbox exec -n my-sandbox -- cat
 ```
 
 The CLI sends small piped input in one request for compatibility with older
@@ -348,12 +348,12 @@ A failed final gRPC status also makes the CLI report failure, even if the remote
 Run an interactive shell with a TTY:
 
 ```shell
-openshell sandbox exec -n my-sandbox --tty -- /bin/bash
+ryno sandbox exec -n my-sandbox --tty -- /bin/bash
 ```
 
 Run `exit` or press `Ctrl-D` to close this separate shell.
 
-OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
+Ryno allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
 | Flag              | Purpose                                                  |
 | ----------------- | -------------------------------------------------------- |
@@ -372,7 +372,7 @@ By default `sandbox exec` runs the command through a login shell (`bash -lc`), s
 For automation and managed checks that need predictable output and side effects, pass `--no-login-shell` so those startup files are not sourced before the command runs:
 
 ```shell
-openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
+ryno sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
 ```
 
 In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
@@ -382,7 +382,7 @@ In this mode a sandbox user's login startup files cannot write to the command's 
 Inject environment variables into the sandbox at creation time:
 
 ```shell
-openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
+ryno sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 ```
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
@@ -392,26 +392,26 @@ When an `--env` key looks like a credential — a known provider variable, or a 
 You can also set per-command environment variables with `sandbox exec`:
 
 ```shell
-openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
+ryno sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
 ```
 
 Per-command variables override the sandbox-level environment for that command only.
 
-Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+Environment variable names starting with `RYNO_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 ## Label a Sandbox
 
 Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --label env=dev --label team=platform -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --label env=dev --label team=platform -- claude
 ```
 
 List only the sandboxes that match a label selector:
 
 ```shell
-openshell sandbox list --selector env=dev
-openshell sandbox list --selector env=dev,team=platform
+ryno sandbox list --selector env=dev
+ryno sandbox list --selector env=dev,team=platform
 ```
 
 The Python SDK accepts the same gateway labels and selectors. Labels passed to
@@ -419,7 +419,7 @@ The Python SDK accepts the same gateway labels and selectors. Labels passed to
 `SandboxRef.labels`, so selector-based listing finds Python-created sandboxes:
 
 ```python
-from openshell import SandboxClient
+from ryno import SandboxClient
 
 with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
@@ -437,7 +437,7 @@ Create reusable sandbox templates through the Python SDK when several runs
 should share the same workload shape:
 
 ```python
-from openshell import SandboxClient
+from ryno import SandboxClient
 
 with SandboxClient.from_active_cluster() as client:
     templates = client.sandbox_templates()
@@ -456,7 +456,7 @@ Omitted issuer, client ID, audience, and scopes are read from the active
 gateway's metadata. The client requires TLS for non-loopback gateways:
 
 ```python
-from openshell import ClientCredentialsAuth, SandboxClient
+from ryno import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
@@ -465,13 +465,13 @@ with SandboxClient.from_active_cluster(client_credentials=auth) as client:
 
 ## Expose Long Running Services
 
-Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
+Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by Ryno.
 
 Expose the unnamed service as part of sandbox creation when the sandbox's main
 process starts the server:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name my-sandbox \
   --expose 8080 \
   --detach \
@@ -481,14 +481,14 @@ openshell sandbox create \
 The CLI includes the unnamed endpoint in the sandbox create request and prints
 its URL after the sandbox reaches `Ready`. `--expose` keeps the sandbox after
 the create command returns and cannot be combined with `--no-keep`. Use
-`openshell service expose` to add or update an endpoint later.
+`ryno service expose` to add or update an endpoint later.
 
 SDK create methods accept named or unnamed service exposures. An empty service
 name selects the unnamed endpoint. The returned sandbox includes a service URL
 map keyed by those names; use the empty key for the unnamed endpoint:
 
 ```python
-from openshell import SandboxClient, ServiceAuthorizationMode, ServiceExposure
+from ryno import SandboxClient, ServiceAuthorizationMode, ServiceExposure
 
 with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(
@@ -528,12 +528,12 @@ fmt.Println(sandbox.ServiceURLs[""])
 ```
 
 ```rust
-let sandbox = client.create_sandbox(openshell_sdk::SandboxSpec {
+let sandbox = client.create_sandbox(ryno_sdk::SandboxSpec {
     name: Some("app-server".into()),
-    service_exposures: vec![openshell_sdk::ServiceExposure {
+    service_exposures: vec![ryno_sdk::ServiceExposure {
         service: String::new(),
         target_port: 4500,
-        authorization_mode: openshell_sdk::ServiceAuthorizationMode::BearerPassthrough,
+        authorization_mode: ryno_sdk::ServiceAuthorizationMode::BearerPassthrough,
     }],
     ..Default::default()
 }).await?;
@@ -543,35 +543,35 @@ println!("{}", sandbox.service_urls[""]);
 Expose a service that listens on loopback inside the sandbox:
 
 ```shell
-openshell service expose my-sandbox 8080
+ryno service expose my-sandbox 8080
 ```
 
 Pass an optional service name to create a named service URL:
 
 ```shell
-openshell service expose my-sandbox 8080 web
+ryno service expose my-sandbox 8080 web
 ```
 
-OpenShell strips the incoming `Authorization` header by default. Opt a service
+Ryno strips the incoming `Authorization` header by default. Opt a service
 into forwarding one valid bearer credential unchanged when the application
 performs its own authentication:
 
 ```shell
-openshell service expose my-sandbox 4500 \
+ryno service expose my-sandbox 4500 \
   --authorization-mode bearer-passthrough
 ```
 
 For a create-time exposure, use both flags:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --expose 4500 \
   --expose-authorization-mode bearer-passthrough \
   --detach \
   -- ./authenticated-server
 ```
 
-In `bearer-passthrough` mode, OpenShell accepts zero or one application
+In `bearer-passthrough` mode, Ryno accepts zero or one application
 `Authorization` header. When present, it must contain a nonempty Bearer
 credential. Missing credentials reach the application so it can return its own
 authentication response. Duplicate, Basic, and malformed credentials fail with
@@ -592,7 +592,7 @@ and receive only its SHA-256 verifier:
 APP_SERVER_TOKEN="$(openssl rand -hex 32)"
 APP_SERVER_TOKEN_SHA256="$(printf %s "$APP_SERVER_TOKEN" | openssl dgst -sha256 -hex | awk '{print $2}')"
 
-openshell sandbox create \
+ryno sandbox create \
   --name codex-server \
   --env "APP_SERVER_TOKEN_SHA256=$APP_SERVER_TOKEN_SHA256" \
   --expose 4500 \
@@ -612,20 +612,20 @@ production workloads. It authenticates the handshake before the app-server
 List exposed endpoints:
 
 ```shell
-openshell service list
+ryno service list
 ```
 
 List endpoints for one sandbox:
 
 ```shell
-openshell service list my-sandbox
+ryno service list my-sandbox
 ```
 
 Use structured output for automation:
 
 ```shell
-openshell service list --output json
-openshell service list my-sandbox --output yaml
+ryno service list --output json
+ryno service list my-sandbox --output yaml
 ```
 
 Structured list output contains `services` and `next_page_token` fields. Each
@@ -637,19 +637,19 @@ The unnamed service uses an empty `service` string. Pass the returned token to
 Show or delete one endpoint:
 
 ```shell
-openshell service get my-sandbox web
-openshell service delete my-sandbox web
+ryno service get my-sandbox web
+ryno service delete my-sandbox web
 ```
 
 Omit the service name to manage the unnamed endpoint:
 
 ```shell
-openshell service get my-sandbox
-openshell service delete my-sandbox
+ryno service get my-sandbox
+ryno service delete my-sandbox
 ```
 
 <Note>
-Loopback gateways return local `openshell.localhost` URLs. Remote gateways
+Loopback gateways return local `ryno.localhost` URLs. Remote gateways
 return HTTPS URLs on the gateway listener. Service routes bypass control-plane
 RPC authorization and do not use OIDC or CLI login. Because they share the
 listener in this release, its TLS configuration—including any required client
@@ -664,20 +664,20 @@ access policy. For gateway service-domain configuration, refer to
 List all sandboxes:
 
 ```shell
-openshell sandbox list
+ryno sandbox list
 ```
 
 Filter the list by labels when you want a narrower view:
 
 ```shell
-openshell sandbox list --selector team=platform
+ryno sandbox list --selector team=platform
 ```
 
 Use `-o json` or `-o yaml` for machine-readable output:
 
 ```shell
-openshell sandbox list -o json
-openshell sandbox list -o yaml
+ryno sandbox list -o json
+ryno sandbox list -o yaml
 ```
 
 Structured list output contains `sandboxes` and `next_page_token` fields.
@@ -686,31 +686,31 @@ Pass the returned token to `--page-token` to continue.
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
-openshell sandbox get my-sandbox
+ryno sandbox get my-sandbox
 ```
 
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox details:
 
 ```shell
-openshell sandbox get my-sandbox --output json
+ryno sandbox get my-sandbox --output json
 ```
 
 Print only the policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
-openshell sandbox get my-sandbox --policy-only
+ryno sandbox get my-sandbox --policy-only
 ```
 
 ### Diagnose Failed Calls to Tool Servers
 
-A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `ryno sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
 
 JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the corresponding timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`; SDKs render it using their native or curated time representation. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
 
 For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
 
 ```shell
-openshell sandbox get my-sandbox --output json | jq -e \
+ryno sandbox get my-sandbox --output json | jq -e \
   --arg host tools.example.com --arg path /mcp --argjson ports '[443]' '
   .endpoint_statuses[]
   | select(.host == $host and .path == $path and .ports == $ports)
@@ -721,7 +721,7 @@ Read `last_result` to choose the next check:
 
 - `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
 - `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
-- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
+- `PolicyDenied`: Ryno denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
 - `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
 - `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
 - `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
@@ -741,27 +741,27 @@ Addresses use lowercase hosts, canonical paths, and sorted distinct effective po
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 
 ```shell
-openshell logs my-sandbox
+ryno logs my-sandbox
 ```
 
 | Flag       | Purpose                      | Example                            |
 | ---------- | ---------------------------- | ---------------------------------- |
-| `--tail`   | Stream logs in real time     | `openshell logs my-sandbox --tail` |
+| `--tail`   | Stream logs in real time     | `ryno logs my-sandbox --tail` |
 | `--source` | Filter by log source         | `--source sandbox`                 |
 | `--level`  | Filter by severity           | `--level warn`                     |
 | `--since`  | Show logs from a time window | `--since 5m`                       |
 
-OpenShell Terminal combines sandbox status and live logs in a single real-time dashboard:
+Ryno Terminal combines sandbox status and live logs in a single real-time dashboard:
 
 ```shell
-openshell term
+ryno term
 ```
 
 Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Manage Sandbox Policies](/how-it-works/policies/manage-policies) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
-The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
+The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `ryno sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
 
 Press `c` in the Sandboxes panel to create a sandbox. In the optional Command field, use quotes or backslashes to group arguments containing spaces. For example, `/bin/sh -c "echo GOOD; read x"` prints `GOOD` and waits for Enter. Invalid quoting keeps the form open without creating a sandbox. The field does not expand variables or evaluate shell operators; invoke a shell explicitly with `sh -c` when you need that behavior.
 
@@ -770,41 +770,41 @@ Press `c` in the Sandboxes panel to create a sandbox. In the optional Command fi
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
 
 ```shell
-openshell forward start 8000 my-sandbox
-openshell forward start 8000 my-sandbox -d    # run in background
+ryno forward start 8000 my-sandbox
+ryno forward start 8000 my-sandbox -d    # run in background
 ```
 
-OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
+Ryno prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `ryno forward list` and `ryno forward stop` can manage them.
 CLI forwards run independently of SSH multiplexing settings in your SSH config.
 Foreground forwards end when the command exits; only background forwards appear in `forward list`.
 
 List and stop active forwards:
 
 ```shell
-openshell forward list
-openshell forward stop 8000 my-sandbox
+ryno forward list
+ryno forward stop 8000 my-sandbox
 ```
 
 Use JSON or YAML output when inspecting tracked forwards from automation:
 
 ```shell
-openshell forward list --output json
-openshell forward list --output yaml
+ryno forward list --output json
+ryno forward list --output yaml
 ```
 
 Structured output includes `workspace`, `sandbox`, `bind_address`, `port`,
 `pid`, and `alive`. The `alive` boolean reports whether the tracked PID still
-matches the expected workspace-scoped OpenShell SSH forward and immutable
+matches the expected workspace-scoped Ryno SSH forward and immutable
 sandbox identity; it does not probe the forwarded socket. When no forwards are
 tracked, structured output returns an empty collection.
 
-The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `openshell` command.
+The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `ryno` command.
 
 <Tip>
 You can also forward a port at creation time with `--forward`:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --forward 8000 -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --forward 8000 -- claude
 ```
 
 </Tip>
@@ -814,7 +814,7 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
 ```shell
-openshell sandbox ssh-config my-sandbox
+ryno sandbox ssh-config my-sandbox
 ```
 
 Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
@@ -824,21 +824,21 @@ Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sand
 Upload files from your host into the sandbox:
 
 ```shell
-openshell sandbox upload my-sandbox ./src
+ryno sandbox upload my-sandbox ./src
 ```
 
-When you omit the destination, OpenShell discovers the sandbox's working
-directory and uploads there. For a named local directory, OpenShell preserves
+When you omit the destination, Ryno discovers the sandbox's working
+directory and uploads there. For a named local directory, Ryno preserves
 the basename, matching `scp -r` and `cp -r`. If that directory already exists,
 the upload merges into it and overwrites matching entries without deleting
 unrelated entries.
 
-OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
+Ryno preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
 
 Download files from the sandbox to your host:
 
 ```shell
-openshell sandbox download my-sandbox output ./local
+ryno sandbox download my-sandbox output ./local
 ```
 
 When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
@@ -852,11 +852,11 @@ directory are also accepted.
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on
-`openshell sandbox create`. Pass `--upload` multiple times to upload
+`ryno sandbox create`. Pass `--upload` multiple times to upload
 several paths in a single command:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
 ```
 
 </Note>
@@ -874,8 +874,8 @@ without filtering. These rules apply to both `sandbox upload` and
 `sandbox create --upload` provisions the sandbox before checking Git filtering.
 If filtering rejects an upload, the command exits with an error, but the sandbox
 remains running. Earlier uploads in the same command may already have completed.
-Use `openshell sandbox upload` to retry against the existing sandbox, or
-`openshell sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
+Use `ryno sandbox upload` to retry against the existing sandbox, or
+`ryno sandbox delete` to remove it. Add `--no-git-ignore` to the retry only
 if you intend to upload without filtering.
 
 Uploads preserve symlinks, including dangling links, instead of dereferencing
@@ -888,8 +888,8 @@ Stop compute when you want to retain a sandbox and its persistent workspace
 without keeping its container, pod, or VM running:
 
 ```shell
-openshell sandbox stop my-sandbox
-openshell sandbox start my-sandbox
+ryno sandbox stop my-sandbox
+ryno sandbox start my-sandbox
 ```
 
 The name is optional and defaults to the last-used sandbox. Stop stops local
@@ -916,13 +916,13 @@ missing workspaces and authorization failures remain errors. SDK callers can
 inspect [typed deletion outcomes](/sdk/api-errors#deletion-outcomes).
 
 ```shell
-openshell sandbox delete my-sandbox
+ryno sandbox delete my-sandbox
 ```
 
 Delete multiple sandboxes by listing their names in one command:
 
 ```shell
-openshell sandbox delete sandbox-a sandbox-b
+ryno sandbox delete sandbox-a sandbox-b
 ```
 
 When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
@@ -933,15 +933,15 @@ after it attempts every requested deletion if any entry failed.
 
 Every sandbox moves through a defined set of phases:
 
-Before workload activation, OpenShell validates the effective policy and matching
+Before workload activation, Ryno validates the effective policy and matching
 provider configuration. A rejection keeps the workload unstarted and exposes a
-`ConfigurationInvalid` condition in `Provisioning`. Use `openshell sandbox get`
+`ConfigurationInvalid` condition in `Provisioning`. Use `ryno sandbox get`
 to inspect the diagnostic, then [repair the policy or provider configuration](/how-it-works/policies/manage-policies#a-new-sandbox-stays-in-provisioning).
 Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
-Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
+Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[ryno.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
 The first authenticated configuration report from the current supervisor ends preparation and starts a separate 300-second admission repair window. A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 
@@ -954,8 +954,8 @@ An actual driver response clears the pending flag, including ordinary rejection 
 For `ImagePreparationTimedOut`, inspect image preparation and supervisor startup diagnostics and check whether the configured preparation budget is sufficient. For `ProvisioningTimedOut`, repair the rejected configuration. In either case, wait for cleanup to complete, then explicitly restart:
 
 ```shell
-openshell sandbox get my-sandbox --output json
-openshell sandbox start my-sandbox
+ryno sandbox get my-sandbox --output json
+ryno sandbox start my-sandbox
 ```
 
 Editing configuration after expiry does not restart compute. An explicit retry gets a new preparation deadline and a separate admission repair window, while static-policy restrictions from any previous activation remain in force. Attempts already active when the gateway is upgraded retain their stored deadline. Timed-out records are retained even for ephemeral creates; use `sandbox delete` when you no longer need the diagnostic or stored state.
@@ -984,13 +984,13 @@ with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
 signal exits use the standard `128 + signal` convention. When restart policy
 selects replacement, `status.restart_count` and `status.next_restart_time`
 show the attempt number and next deadline. Inspect them with
-`openshell sandbox get <name>`. `sandbox stop` cancels a pending replacement;
+`ryno sandbox get <name>`. `sandbox stop` cancels a pending replacement;
 an explicit later start resets the restart count. Compute runtimes do not
 apply their own restart policy.
 
 ## Sandbox Runtimes
 
-The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
+The gateway's configured compute driver determines how Ryno creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
 
 For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Runtimes](/how-it-works/sandboxes/runtimes).
 

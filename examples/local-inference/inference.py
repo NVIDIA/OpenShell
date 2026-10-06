@@ -3,12 +3,12 @@
 
 """Test native NVIDIA inference with non-streaming and streaming requests.
 
-OpenShell attaches a profile-backed provider to supply endpoint-bound
+Ryno attaches a profile-backed provider to supply endpoint-bound
 ``NVIDIA_API_KEY`` credentials and matching network policy. The client selects
 the native endpoint, model, request shape, and timeout.
 
 Usage:
-  openshell sandbox create --provider nvidia-demo --policy sandbox-policy.yaml \
+  ryno sandbox create --provider nvidia-demo --policy sandbox-policy.yaml \
     --upload inference.py -- python3 /sandbox/inference.py
 """
 

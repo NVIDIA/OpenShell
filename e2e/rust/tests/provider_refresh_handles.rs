@@ -14,10 +14,10 @@ use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::HostSupportContainer;
-use openshell_e2e::harness::port::find_free_port;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::HostSupportContainer;
+use ryno_e2e::harness::port::find_free_port;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 const PROVIDER_NAME: &str = "e2e-stable-refresh-handle";
@@ -75,7 +75,7 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
 }
 
 async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     command
         .args(args)
         .envs(env.iter().copied())
@@ -84,7 +84,7 @@ async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String,
     let output = command
         .output()
         .await
-        .map_err(|error| format!("run openshell command: {error}"))?;
+        .map_err(|error| format!("run ryno command: {error}"))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -92,7 +92,7 @@ async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String,
     );
     if !output.status.success() {
         return Err(format!(
-            "openshell command failed (exit {:?}):\n{combined}",
+            "ryno command failed (exit {:?}):\n{combined}",
             output.status.code()
         ));
     }
@@ -131,7 +131,7 @@ credentials:
           required: true
           secret: true
 endpoints:
-  - host: host.openshell.internal
+  - host: host.ryno.internal
     port: {resource_port}
     path: /probe
     protocol: rest
@@ -173,7 +173,7 @@ network_policies:
   refresh_probe:
     name: refresh_probe
     endpoints:
-      - host: host.openshell.internal
+      - host: host.ryno.internal
         port: {resource_port}
         path: /probe
         protocol: rest
@@ -308,10 +308,10 @@ async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Re
     configure_refresh(&profile).await?;
 
     let policy_path = policy.path().to_string_lossy().into_owned();
-    let resource_url = format!("http://host.openshell.internal:{}/probe", fixture.port);
+    let resource_url = format!("http://host.ryno.internal:{}/probe", fixture.port);
     let parent_script = format!(
         r#"case "$REFRESH_E2E_ACCESS_TOKEN" in
-  openshell:resolve:env:s*_REFRESH_E2E_ACCESS_TOKEN) ;;
+  ryno:resolve:env:s*_REFRESH_E2E_ACCESS_TOKEN) ;;
   *) exit 64 ;;
 esac
 echo {READY_MARKER}

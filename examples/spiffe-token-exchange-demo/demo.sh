@@ -30,18 +30,18 @@ default_gateway_name() {
         printf "%s\n" "$GATEWAY_NAME"
         return
     fi
-    if [[ -n "${OPENSHELL_GATEWAY:-}" ]]; then
-        printf "%s\n" "$OPENSHELL_GATEWAY"
+    if [[ -n "${RYNO_GATEWAY:-}" ]]; then
+        printf "%s\n" "$RYNO_GATEWAY"
         return
     fi
 
     local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-    if [[ -s "${config_home}/openshell/active_gateway" ]]; then
-        head -n1 "${config_home}/openshell/active_gateway"
+    if [[ -s "${config_home}/ryno/active_gateway" ]]; then
+        head -n1 "${config_home}/ryno/active_gateway"
         return
     fi
-    if [[ -s /etc/openshell/active_gateway ]]; then
-        head -n1 /etc/openshell/active_gateway
+    if [[ -s /etc/ryno/active_gateway ]]; then
+        head -n1 /etc/ryno/active_gateway
         return
     fi
 
@@ -56,11 +56,11 @@ TOKEN_PF_PID=""
 dump_diagnostics() {
     set +e
 
-    printf "\n=== diagnostics: openshell sandbox logs ===\n" >&2
+    printf "\n=== diagnostics: ryno sandbox logs ===\n" >&2
     "${OS[@]}" logs "$SANDBOX_NAME" -n 120 --source sandbox >&2
 
     printf "\n=== diagnostics: gateway logs ===\n" >&2
-    kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    kubectl -n ryno logs -l app.kubernetes.io/name=ryno,app.kubernetes.io/instance=ryno \
         --tail=120 --prefix=true >&2
 
     printf "\n=== diagnostics: token exchange issuer logs ===\n" >&2
@@ -73,15 +73,15 @@ dump_diagnostics() {
     kubectl -n default logs -l app=beta-exchange --tail=60 --prefix=true >&2
 
     printf "\n=== diagnostics: gateway port-forward log ===\n" >&2
-    sed 's/^/gateway-port-forward> /' /tmp/openshell-spiffe-token-exchange-demo-gateway-port-forward.log >&2
+    sed 's/^/gateway-port-forward> /' /tmp/ryno-spiffe-token-exchange-demo-gateway-port-forward.log >&2
 
     printf "\n=== diagnostics: token issuer port-forward log ===\n" >&2
-    sed 's/^/issuer-port-forward> /' /tmp/openshell-spiffe-token-exchange-demo-issuer-port-forward.log >&2
+    sed 's/^/issuer-port-forward> /' /tmp/ryno-spiffe-token-exchange-demo-issuer-port-forward.log >&2
 }
 
 cleanup() {
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
-        openshell --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
+        ryno --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
     fi
     if [[ -n "$PF_PID" ]]; then
         kill "$PF_PID" >/dev/null 2>&1 || true
@@ -134,13 +134,13 @@ assert_contains() {
 
 install_gateway_tls_bundle() {
     local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-    local tls_dir="${config_home}/openshell/gateways/${GATEWAY_NAME}/mtls"
+    local tls_dir="${config_home}/ryno/gateways/${GATEWAY_NAME}/mtls"
     mkdir -p "$tls_dir"
-    kubectl -n openshell get secret openshell-client-tls \
+    kubectl -n ryno get secret ryno-client-tls \
         -o jsonpath='{.data.ca\.crt}' | base64 -d >"${tls_dir}/ca.crt"
-    kubectl -n openshell get secret openshell-client-tls \
+    kubectl -n ryno get secret ryno-client-tls \
         -o jsonpath='{.data.tls\.crt}' | base64 -d >"${tls_dir}/tls.crt"
-    kubectl -n openshell get secret openshell-client-tls \
+    kubectl -n ryno get secret ryno-client-tls \
         -o jsonpath='{.data.tls\.key}' | base64 -d >"${tls_dir}/tls.key"
 }
 
@@ -155,7 +155,7 @@ sandbox_curl_until() {
     local output=""
 
     for attempt in $(seq 1 12); do
-        printf "\n$ openshell sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
+        printf "\n$ ryno sandbox exec %s curl (attempt %s)\n" "$label" "$attempt"
         if output=$("${OS[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- curl -sS --max-time 10 "$url" 2>&1); then
             printf "%s\n" "$output"
             if [[ "$output" == *"$expected"* ]]; then
@@ -173,12 +173,12 @@ sandbox_curl_until() {
     exit 1
 }
 
-OS=(openshell --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT")
+OS=(ryno --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT")
 
-printf "Using OpenShell gateway '%s' at %s\n" "$GATEWAY_NAME" "$GATEWAY_ENDPOINT"
+printf "Using Ryno gateway '%s' at %s\n" "$GATEWAY_NAME" "$GATEWAY_ENDPOINT"
 
-printf "\n$ kubectl -n default create secret generic openshell-spiffe-token-exchange-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
-kubectl -n default create secret generic openshell-spiffe-token-exchange-demo \
+printf "\n$ kubectl -n default create secret generic ryno-spiffe-token-exchange-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
+kubectl -n default create secret generic ryno-spiffe-token-exchange-demo \
     --from-literal=access-token-secret="$ACCESS_TOKEN_SECRET" \
     --dry-run=client \
     -o yaml | kubectl apply -f -
@@ -189,12 +189,12 @@ run kubectl -n default rollout status deployment/token-exchange-issuer --timeout
 run kubectl -n default rollout status deployment/alpha-exchange --timeout=180s
 run kubectl -n default rollout status deployment/beta-exchange --timeout=180s
 
-kubectl -n openshell port-forward svc/openshell "${PORT_FORWARD_PORT}:8080" >/tmp/openshell-spiffe-token-exchange-demo-gateway-port-forward.log 2>&1 &
+kubectl -n ryno port-forward svc/ryno "${PORT_FORWARD_PORT}:8080" >/tmp/ryno-spiffe-token-exchange-demo-gateway-port-forward.log 2>&1 &
 PF_PID=$!
 wait_for_port "$PORT_FORWARD_PORT" "gateway"
 install_gateway_tls_bundle
 
-kubectl -n default port-forward svc/token-exchange-issuer "${TOKEN_ISSUER_PORT}:80" >/tmp/openshell-spiffe-token-exchange-demo-issuer-port-forward.log 2>&1 &
+kubectl -n default port-forward svc/token-exchange-issuer "${TOKEN_ISSUER_PORT}:80" >/tmp/ryno-spiffe-token-exchange-demo-issuer-port-forward.log 2>&1 &
 TOKEN_PF_PID=$!
 wait_for_port "$TOKEN_ISSUER_PORT" "token issuer"
 
@@ -215,7 +215,7 @@ assert_contains "$ALPHA_OUTPUT" "alpha called with path /:"
 assert_contains "$ALPHA_OUTPUT" "sub: demo-user"
 assert_contains "$ALPHA_OUTPUT" "aud: alpha, account"
 assert_contains "$ALPHA_OUTPUT" "scope: alpha profile email"
-assert_contains "$ALPHA_OUTPUT" "azp: spiffe://openshell.local/openshell/sandbox/"
+assert_contains "$ALPHA_OUTPUT" "azp: spiffe://ryno.local/ryno/sandbox/"
 
 sandbox_curl_until "beta" "http://beta-exchange.default.svc.cluster.local/" "beta called with path /:"
 BETA_OUTPUT="$SANDBOX_CURL_OUTPUT"
@@ -223,6 +223,6 @@ assert_contains "$BETA_OUTPUT" "beta called with path /:"
 assert_contains "$BETA_OUTPUT" "sub: demo-user"
 assert_contains "$BETA_OUTPUT" "aud: beta, account"
 assert_contains "$BETA_OUTPUT" "scope: beta profile email"
-assert_contains "$BETA_OUTPUT" "azp: spiffe://openshell.local/openshell/sandbox/"
+assert_contains "$BETA_OUTPUT" "azp: spiffe://ryno.local/ryno/sandbox/"
 
 printf "\nSPIFFE token exchange demo succeeded.\n"

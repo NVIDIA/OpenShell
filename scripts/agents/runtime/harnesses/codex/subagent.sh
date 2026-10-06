@@ -37,7 +37,7 @@ trap cleanup EXIT
 cat >"$TASK_FILE"
 
 {
-    printf '%s\n\n' "You are running as the $SUBAGENT_ID sub-agent inside an OpenShell sandbox."
+    printf '%s\n\n' "You are running as the $SUBAGENT_ID sub-agent inside an Ryno sandbox."
     printf '%s\n\n' 'Follow this agent definition exactly:'
     cat "$SUBAGENT_PROMPT"
     printf '\n%s\n\n' 'Task:'
@@ -58,7 +58,7 @@ if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-rules"; then
     CODEX_EXEC_ARGS+=(--ignore-rules)
 fi
 
-echo "openshell-agent: invoking Codex sub-agent '$SUBAGENT_ID' (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
+echo "ryno-agent: invoking Codex sub-agent '$SUBAGENT_ID' (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
 
 exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \

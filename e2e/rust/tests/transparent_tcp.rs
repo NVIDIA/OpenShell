@@ -7,17 +7,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
-use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::port::find_free_port;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::container::{SupportContainer, is_e2e_driver};
+use ryno_e2e::harness::host_process::HostPythonFixture;
+use ryno_e2e::harness::port::find_free_port;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 // Use a qualified policy hostname so runtime-provided resolver search domains
 // (for example Podman's `dns.podman`) cannot rewrite the policy identity.
-const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
-const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.openshell.test";
+const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.ryno.test";
+const MUSL_FIXTURE_ALIAS: &str = "transparent-tcp-musl.ryno.test";
 const FIXTURE_PORT: u16 = 5432;
 const TCP_DNS_PORT: u16 = 53;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
@@ -201,13 +201,13 @@ while True:
 }
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
-    let output = openshell_cmd()
+    let output = ryno_cmd()
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|error| format!("run openshell {}: {error}", args.join(" ")))?;
+        .map_err(|error| format!("run ryno {}: {error}", args.join(" ")))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -306,7 +306,7 @@ serve(fixture_listener)
             .expect("start host TCP fixture");
             (
                 Fixture::Host(fixture),
-                "host.openshell.internal".to_string(),
+                "host.ryno.internal".to_string(),
                 "127.0.0.1".to_string(),
                 fixture_host_port,
                 tcp_dns_host_port,

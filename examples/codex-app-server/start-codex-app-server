@@ -24,8 +24,8 @@ const idToken = [
   b64u({
     iss: "https://auth.openai.com",
     aud: "codex",
-    sub: "openshell-app-server",
-    email: "app-server@openshell.local",
+    sub: "ryno-app-server",
+    email: "app-server@ryno.local",
     iat: now,
     exp: now + 3600,
   }),

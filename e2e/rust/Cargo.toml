@@ -7,8 +7,8 @@
 [workspace]
 
 [package]
-name = "openshell-e2e"
-description = "End-to-end tests for the OpenShell CLI"
+name = "ryno-e2e"
+description = "End-to-end tests for the Ryno CLI"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
@@ -18,7 +18,7 @@ publish = false
 [features]
 # Selects the common E2E suite.
 e2e = []
-# Selects tests that rely on `host.openshell.internal` (the sandbox's stable
+# Selects tests that rely on `host.ryno.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
 # `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and

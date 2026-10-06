@@ -11,7 +11,7 @@ if [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
-rm -f /home/openshell/.ssh/authorized_keys
+rm -f /home/ryno/.ssh/authorized_keys
 rm -f /root/.ssh/authorized_keys
 rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
@@ -26,10 +26,10 @@ rm -f /var/lib/dbus/machine-id
 rm -f /var/lib/systemd/random-seed
 rm -f /var/lib/NetworkManager/*lease* /var/lib/dhcp/*lease* 2>/dev/null || true
 
-rm -f /root/.bash_history /home/openshell/.bash_history
-rm -f /root/.docker/config.json /home/openshell/.docker/config.json
+rm -f /root/.bash_history /home/ryno/.bash_history
+rm -f /root/.docker/config.json /home/ryno/.docker/config.json
 rm -f /root/.config/containers/auth.json
-rm -f /home/openshell/.config/containers/auth.json
+rm -f /home/ryno/.config/containers/auth.json
 
 if command -v apt-get >/dev/null 2>&1; then
 	apt-get clean
@@ -48,7 +48,7 @@ sync
 
 # Deleted credentials can remain in allocated blocks. Fill free space with
 # zeroes so qemu-img convert can safely omit those blocks from the cache disk.
-zero_file=/var/tmp/openshell-cache-zero
+zero_file=/var/tmp/ryno-cache-zero
 echo "==> Cache sealing: zeroing free disk space"
 dd if=/dev/zero of="${zero_file}" bs=64M status=progress || true
 echo "==> Cache sealing: free disk space zeroed"

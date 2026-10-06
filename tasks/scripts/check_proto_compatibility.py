@@ -59,7 +59,7 @@ def export_proto(ref: str, destination: Path) -> None:
 
 
 def compare(candidate: str, baseline: str, allows_breaks: bool) -> int:
-    with tempfile.TemporaryDirectory(prefix="openshell-proto-") as directory:
+    with tempfile.TemporaryDirectory(prefix="ryno-proto-") as directory:
         root = Path(directory)
         export_proto(baseline, root / "before")
         export_proto(candidate, root / "after")

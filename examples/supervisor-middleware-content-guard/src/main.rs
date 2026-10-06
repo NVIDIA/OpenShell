@@ -6,14 +6,14 @@ use std::net::SocketAddr;
 use std::ops::Range;
 
 use clap::Parser;
-use openshell_core::middleware::{HttpResponseResultStream, WebSocketResponseStream};
-use openshell_core::proto::middleware::v1::http_response_pre_return_server::{
+use ryno_core::middleware::{HttpResponseResultStream, WebSocketResponseStream};
+use ryno_core::proto::middleware::v1::http_response_pre_return_server::{
     HttpResponsePreReturn, HttpResponsePreReturnServer,
 };
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
+use ryno_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
-use openshell_core::proto::{
+use ryno_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, HttpResponseBlockDelivery,
     HttpResponseBodyMode, HttpResponseBodyResult, HttpResponseBodyTransform, HttpResponseEvent,
     HttpResponseEventResult, HttpResponsePreflightInspect, HttpResponsePreflightResult,
@@ -40,7 +40,7 @@ const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
 const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 
 #[derive(Debug, Parser)]
-#[command(about = "Run the example OpenShell supervisor middleware service")]
+#[command(about = "Run the example Ryno supervisor middleware service")]
 struct Cli {
     /// Address on which to serve plaintext gRPC.
     #[arg(long, default_value = "127.0.0.1:50051")]
@@ -256,15 +256,15 @@ impl SupervisorMiddleware for ContentGuard {
                 },
             ],
             expected_audience: String::new(),
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+            extension: Some(ryno_core::extension_protocol::extension_metadata(
+                ryno_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
                 MANIFEST_NAME,
-                openshell_core::VERSION,
+                ryno_core::VERSION,
                 [],
             )),
         };
-        openshell_core::extension_protocol::validate_gateway_metadata(
-            openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+        ryno_core::extension_protocol::validate_gateway_metadata(
+            ryno_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
             MANIFEST_NAME,
             manifest.extension.as_ref(),
             request.into_inner().gateway,
@@ -321,7 +321,7 @@ struct ResponseSessionState {
 impl ResponseSessionState {
     fn preflight(
         &mut self,
-        preflight: openshell_core::proto::HttpResponsePreflight,
+        preflight: ryno_core::proto::HttpResponsePreflight,
     ) -> Result<HttpResponseEventResult, Status> {
         if self.config.is_some() {
             return Err(Status::failed_precondition("duplicate preflight"));
@@ -353,7 +353,7 @@ impl ResponseSessionState {
     }
     fn body(
         &mut self,
-        body: openshell_core::proto::HttpResponseBodyUnit,
+        body: ryno_core::proto::HttpResponseBodyUnit,
     ) -> Result<HttpResponseEventResult, Status> {
         let config = self
             .config
@@ -380,7 +380,7 @@ impl ResponseSessionState {
             })
         } else {
             http_response_body_result::Action::PassThrough(
-                openshell_core::proto::HttpResponseBodyPassThrough {},
+                ryno_core::proto::HttpResponseBodyPassThrough {},
             )
         };
         self.body_ended = true;
@@ -655,7 +655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{
+    use ryno_core::proto::{
         HttpResponseBodyUnit, HttpResponsePreflight, MiddlewareSessionEnd, WebSocketPreflight,
         WebSocketSessionStart,
     };
@@ -695,8 +695,8 @@ mod tests {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
             Request::new(MiddlewareDescribeRequest {
-                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
-                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                gateway: Some(ryno_core::extension_protocol::gateway_metadata(
+                    ryno_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
                 )),
             }),
         )
@@ -1048,8 +1048,8 @@ mod tests {
 
     #[test]
     fn example_policy_is_valid() {
-        let policy = openshell_policy::parse_sandbox_policy(include_str!("../policy.yaml"))
+        let policy = ryno_policy::parse_sandbox_policy(include_str!("../policy.yaml"))
             .expect("example policy must parse");
-        openshell_policy::validate_sandbox_policy(&policy).expect("example policy must be valid");
+        ryno_policy::validate_sandbox_policy(&policy).expect("example policy must be valid");
     }
 }

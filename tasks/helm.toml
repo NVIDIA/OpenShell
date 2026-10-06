@@ -4,27 +4,27 @@
 # Helm chart tasks
 
 ["helm:docs"]
-description = "Generate the OpenShell gateway and workspace Helm chart READMEs"
+description = "Generate the Ryno gateway and workspace Helm chart READMEs"
 run = """
-  helm-docs --chart-search-root deploy/helm/openshell
-  helm-docs --chart-search-root deploy/helm/openshell-workspace
+  helm-docs --chart-search-root deploy/helm/ryno
+  helm-docs --chart-search-root deploy/helm/ryno-workspace
 """
 
 ["helm:docs:check"]
-description = "Verify the openshell Helm chart README is generated and up to date"
+description = "Verify the ryno Helm chart README is generated and up to date"
 run = """
   set -e
   gateway_tmp="$(mktemp)"
   workspace_tmp="$(mktemp)"
   trap 'rm -f "$gateway_tmp" "$workspace_tmp"' EXIT
 
-  helm-docs --chart-search-root deploy/helm/openshell --dry-run > "$gateway_tmp"
-  if ! diff -u deploy/helm/openshell/README.md "$gateway_tmp"; then
+  helm-docs --chart-search-root deploy/helm/ryno --dry-run > "$gateway_tmp"
+  if ! diff -u deploy/helm/ryno/README.md "$gateway_tmp"; then
     echo "Helm chart README is out of sync. Run: mise run helm:docs" >&2
     exit 1
   fi
-  helm-docs --chart-search-root deploy/helm/openshell-workspace --dry-run > "$workspace_tmp"
-  if ! diff -u deploy/helm/openshell-workspace/README.md "$workspace_tmp"; then
+  helm-docs --chart-search-root deploy/helm/ryno-workspace --dry-run > "$workspace_tmp"
+  if ! diff -u deploy/helm/ryno-workspace/README.md "$workspace_tmp"; then
     echo "Workspace Helm chart README is out of sync. Run: mise run helm:docs" >&2
     exit 1
   fi
@@ -33,23 +33,23 @@ run_windows = "echo Skipping helm:docs:check: Helm validation is not part of the
 hide = true
 
 ["helm:lint"]
-description = "Lint the OpenShell gateway and workspace Helm charts"
+description = "Lint the Ryno gateway and workspace Helm charts"
 run = """
   set -e
-  helm dependency build deploy/helm/openshell
+  helm dependency build deploy/helm/ryno
   echo "--- helm lint: defaults ---"
-  echo "values files: deploy/helm/openshell/values.yaml"
-  helm lint deploy/helm/openshell --set agentSandbox.preflight.enabled=false
-  helm template openshell deploy/helm/openshell --set agentSandbox.preflight.enabled=false >/dev/null
-  for f in deploy/helm/openshell/ci/values-*.yaml; do
+  echo "values files: deploy/helm/ryno/values.yaml"
+  helm lint deploy/helm/ryno --set agentSandbox.preflight.enabled=false
+  helm template ryno deploy/helm/ryno --set agentSandbox.preflight.enabled=false >/dev/null
+  for f in deploy/helm/ryno/ci/values-*.yaml; do
     variant=$(basename "$f" .yaml | sed 's/values-//')
     echo "--- helm lint: $variant ---"
-    echo "values files: deploy/helm/openshell/values.yaml, $f"
-    helm lint deploy/helm/openshell -f "$f" --set agentSandbox.preflight.enabled=false
-    helm template openshell deploy/helm/openshell -f "$f" --set agentSandbox.preflight.enabled=false >/dev/null
+    echo "values files: deploy/helm/ryno/values.yaml, $f"
+    helm lint deploy/helm/ryno -f "$f" --set agentSandbox.preflight.enabled=false
+    helm template ryno deploy/helm/ryno -f "$f" --set agentSandbox.preflight.enabled=false >/dev/null
   done
   echo "--- helm lint: workspace defaults ---"
-  helm lint deploy/helm/openshell-workspace
+  helm lint deploy/helm/ryno-workspace
   echo "All variants passed."
 """
 run_windows = "echo Skipping helm:lint: Helm validation is not part of the native Windows lane."
@@ -61,31 +61,31 @@ run = """
   if ! helm plugin list | grep -q unittest; then
     helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
   fi
-  helm dependency build deploy/helm/openshell
-  helm unittest deploy/helm/openshell
-  helm unittest deploy/helm/openshell-workspace
+  helm dependency build deploy/helm/ryno
+  helm unittest deploy/helm/ryno
+  helm unittest deploy/helm/ryno-workspace
   deploy/helm/test-split-ownership.sh
 """
 run_windows = "echo Skipping helm:test: Helm validation is not part of the native Windows lane."
 
 ["helm:skaffold:dev"]
-description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
-dir = "deploy/helm/openshell"
+description = "Run skaffold dev for deploy/helm/ryno (iterative deploy)"
+dir = "deploy/helm/ryno"
 run = "skaffold dev"
 
 ["helm:skaffold:run"]
 description = "Run a one-shot Skaffold deploy and register its local plaintext gateway"
-dir = "deploy/helm/openshell"
+dir = "deploy/helm/ryno"
 run = "skaffold run && ../../../tasks/scripts/helm-k3s-local.sh register"
 
 ["helm:skaffold:delete"]
-description = "Run skaffold delete for deploy/helm/openshell"
-dir = "deploy/helm/openshell"
+description = "Run skaffold delete for deploy/helm/ryno"
+dir = "deploy/helm/ryno"
 run = "skaffold delete"
 
 ["helm:skaffold:diagnose"]
-description = "Run skaffold diagnose for deploy/helm/openshell"
-dir = "deploy/helm/openshell"
+description = "Run skaffold diagnose for deploy/helm/ryno"
+dir = "deploy/helm/ryno"
 run = "skaffold diagnose"
 hide = true
 
@@ -123,4 +123,4 @@ run = "tasks/scripts/helm-k3s-local.sh forward"
 
 ["helm:gateway:apply"]
 description = "Apply the Envoy GatewayClass manifest (run after helm:skaffold:run when gateway routing is enabled)"
-run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-openshell.yaml"
+run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-ryno.yaml"

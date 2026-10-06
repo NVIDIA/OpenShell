@@ -5,21 +5,21 @@ SPDX-License-Identifier: Apache-2.0
 
 # Example provider profiles
 
-These files are reviewable examples. OpenShell does not compile them into any
+These files are reviewable examples. Ryno does not compile them into any
 binary and no gateway loads them on its own: a gateway's profile catalog
 contains exactly what an operator imported.
 
 Import one at platform scope:
 
 ```shell
-openshell provider profile lint   -f providers/github.yaml
-openshell provider profile import -f providers/github.yaml --global
+ryno provider profile lint   -f providers/github.yaml
+ryno provider profile import -f providers/github.yaml --global
 ```
 
 Or import the whole directory:
 
 ```shell
-openshell provider profile import --from providers --global
+ryno provider profile import --from providers --global
 ```
 
 Drop `--global` to import into the current workspace instead.
@@ -48,7 +48,7 @@ workload, and import your copy.
   injection safe.
 - Keep `endpoints` limited to the hosts the credential should reach. A
   credential is only sent to the endpoints its profile declares.
-- Run `openshell provider profile lint` before importing.
+- Run `ryno provider profile lint` before importing.
 
-See [Provider profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles) for the
+See [Provider profiles](https://docs.nvidia.com/ryno/latest/how-it-works/providers/profiles) for the
 full schema.

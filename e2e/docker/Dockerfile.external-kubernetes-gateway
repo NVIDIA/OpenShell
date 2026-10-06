@@ -7,26 +7,26 @@ ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8
 FROM ${GATEWAY_BASE_IMAGE}
 
 ARG TARGETARCH
-ARG SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
-ARG SANDBOX_RUNTIME_IMAGE=ghcr.io/nvidia/openshell/sandbox:latest
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-driver-kubernetes /usr/local/bin/openshell-driver-kubernetes
+ARG SUPERVISOR_IMAGE=ghcr.io/nvidia/ryno/supervisor:latest
+ARG SANDBOX_RUNTIME_IMAGE=ghcr.io/nvidia/ryno/sandbox:latest
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/ryno-gateway /usr/local/bin/ryno-gateway
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/ryno-driver-kubernetes /usr/local/bin/ryno-driver-kubernetes
 
-ENV OPENSHELL_COMPUTE_DRIVER=kubernetes \
-    OPENSHELL_COMPUTE_DRIVER_SOCKET=/var/run/openshell-compute/driver/driver.sock \
-    OPENSHELL_GATEWAY_ID=openshell \
-    OPENSHELL_SANDBOX_NAMESPACE=openshell \
-    OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT=openshell-sandbox \
-    OPENSHELL_SANDBOX_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04 \
-    OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=if_not_present \
-    OPENSHELL_GRPC_ENDPOINT=http://openshell.openshell.svc.cluster.local:8080 \
-    OPENSHELL_SUPERVISOR_IMAGE=${SUPERVISOR_IMAGE} \
-    OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY=if_not_present \
-    OPENSHELL_SANDBOX_RUNTIME_IMAGE=${SANDBOX_RUNTIME_IMAGE} \
-    OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY=if_not_present \
-    OPENSHELL_SUPERVISOR_SIDELOAD_METHOD=init-container
+ENV RYNO_COMPUTE_DRIVER=kubernetes \
+    RYNO_COMPUTE_DRIVER_SOCKET=/var/run/ryno-compute/driver/driver.sock \
+    RYNO_GATEWAY_ID=ryno \
+    RYNO_SANDBOX_NAMESPACE=ryno \
+    RYNO_K8S_SANDBOX_SERVICE_ACCOUNT=ryno-sandbox \
+    RYNO_SANDBOX_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04 \
+    RYNO_SANDBOX_IMAGE_PULL_POLICY=if_not_present \
+    RYNO_GRPC_ENDPOINT=http://ryno.ryno.svc.cluster.local:8080 \
+    RYNO_SUPERVISOR_IMAGE=${SUPERVISOR_IMAGE} \
+    RYNO_SUPERVISOR_IMAGE_PULL_POLICY=if_not_present \
+    RYNO_SANDBOX_RUNTIME_IMAGE=${SANDBOX_RUNTIME_IMAGE} \
+    RYNO_SANDBOX_RUNTIME_IMAGE_PULL_POLICY=if_not_present \
+    RYNO_SUPERVISOR_SIDELOAD_METHOD=init-container
 
 USER 1000:1000
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+ENTRYPOINT ["/usr/local/bin/ryno-gateway"]
 CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

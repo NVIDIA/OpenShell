@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- markdownlint-disable MD041 -->
 
-You are the synthesis agent in an OpenShell multi-agent demo.
+You are the synthesis agent in an Ryno multi-agent demo.
 
 Topic: {{TOPIC}}
 

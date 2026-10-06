@@ -1,26 +1,26 @@
 # Syncing Files To and From a Sandbox
 
-Move code, data, and artifacts between your local machine and an OpenShell
-sandbox using `openshell sandbox upload` and `openshell sandbox download`.
+Move code, data, and artifacts between your local machine and an Ryno
+sandbox using `ryno sandbox upload` and `ryno sandbox download`.
 
 ## Push local files into a sandbox
 
 Upload your current project directory into `/sandbox` on the sandbox:
 
 ```bash
-openshell sandbox upload my-sandbox .
+ryno sandbox upload my-sandbox .
 ```
 
 Push a specific directory to a custom destination:
 
 ```bash
-openshell sandbox upload my-sandbox ./src /sandbox/src
+ryno sandbox upload my-sandbox ./src /sandbox/src
 ```
 
 Push a single file:
 
 ```bash
-openshell sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
+ryno sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
 ```
 
 ## Pull files from a sandbox
@@ -28,13 +28,13 @@ openshell sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
 Download sandbox output to your local machine:
 
 ```bash
-openshell sandbox download my-sandbox /sandbox/output ./output
+ryno sandbox download my-sandbox /sandbox/output ./output
 ```
 
 Pull results to the current directory:
 
 ```bash
-openshell sandbox download my-sandbox /sandbox/results
+ryno sandbox download my-sandbox /sandbox/results
 ```
 
 ## Sync on create
@@ -42,7 +42,7 @@ openshell sandbox download my-sandbox /sandbox/results
 Push all files in the current directory into a new sandbox automatically:
 
 ```bash
-openshell sandbox create --upload . -- python main.py
+ryno sandbox create --upload . -- python main.py
 ```
 
 This uploads the current directory into `/sandbox` before the command runs.
@@ -51,22 +51,22 @@ This uploads the current directory into `/sandbox` before the command runs.
 
 ```bash
 # Create a sandbox and upload your repo
-openshell sandbox create --name dev --upload .
+ryno sandbox create --name dev --upload .
 
 # Make local changes, then push them
-openshell sandbox upload dev ./src /sandbox/src
+ryno sandbox upload dev ./src /sandbox/src
 
 # Run tests inside the sandbox
-openshell sandbox connect dev
+ryno sandbox connect dev
 # (inside sandbox) pytest
 
 # Pull test artifacts back
-openshell sandbox download dev /sandbox/coverage ./coverage
+ryno sandbox download dev /sandbox/coverage ./coverage
 ```
 
 ## How it works
 
-File sync uses the native OpenShell streaming file-transfer protocol. The CLI
+File sync uses the native Ryno streaming file-transfer protocol. The CLI
 creates and extracts tar streams in Rust, and the sandbox performs the matching
 operation under the workload identity. Transfers use bounded frames with
 backpressure, cancellation, and explicit completion; they do not require

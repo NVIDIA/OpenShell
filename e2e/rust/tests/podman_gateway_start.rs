@@ -9,24 +9,24 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{
+use ryno_e2e::harness::cli::{
     run_cli, sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
     wait_for_sandbox_phase,
 };
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
 const READY_MARKER: &str = "podman-gateway-start-ready";
 const STOPPED_READY_MARKER: &str = "podman-gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/podman-gateway-start-state";
-const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.managed=true";
-const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
+const MANAGED_BY_LABEL_FILTER: &str = "label=ryno.managed=true";
+const SANDBOX_NAME_LABEL: &str = "ryno.ai/sandbox-name";
 
 /// Build a `podman` command that targets the same API socket the gateway uses.
 ///
 /// The e2e harness (`e2e/with-podman-gateway.sh`) exports
-/// `OPENSHELL_PODMAN_SOCKET` (discovered via `podman machine inspect` on macOS,
+/// `RYNO_PODMAN_SOCKET` (discovered via `podman machine inspect` on macOS,
 /// or the rootless socket on Linux) and also clobbers `XDG_CONFIG_HOME` with an
 /// empty directory to isolate CLI/SDK gateway metadata. On macOS the podman
 /// client resolves its VM connection through `XDG_CONFIG_HOME`, so a bare
@@ -34,11 +34,11 @@ const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 /// fails. Pinning `--url` to the exported socket bypasses connection-config
 /// resolution entirely and mirrors the shell's `podman_cmd` helper.
 ///
-/// When `OPENSHELL_PODMAN_SOCKET` is unset (e.g. running this test outside the
+/// When `RYNO_PODMAN_SOCKET` is unset (e.g. running this test outside the
 /// harness), fall back to plain `podman`, leaving Linux behavior unchanged.
 fn podman_command() -> Command {
     let mut command = Command::new("podman");
-    if let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET")
+    if let Ok(socket) = std::env::var("RYNO_PODMAN_SOCKET")
         && !socket.is_empty()
     {
         command.arg("--url").arg(format!("unix://{socket}"));
@@ -55,7 +55,7 @@ fn sandbox_container_running(sandbox_name: &str) -> Result<bool, String> {
             "--filter",
             MANAGED_BY_LABEL_FILTER,
             "--filter",
-            "label=openshell.ai/isolation-role=sandbox",
+            "label=ryno.ai/isolation-role=sandbox",
             "--filter",
         ])
         .arg(sandbox_name_filter)
@@ -123,7 +123,7 @@ async fn wait_for_container_running(
 
 #[tokio::test]
 async fn podman_gateway_restart_preserves_running_and_stopped_intent() {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("podman") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("podman") {
         eprintln!("Skipping Podman gateway start test: e2e driver is not podman");
         return;
     }

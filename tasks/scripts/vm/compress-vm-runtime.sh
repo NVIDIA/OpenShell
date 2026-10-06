@@ -6,19 +6,19 @@
 #
 # This script collects libkrun, libkrunfw, and the guest OCI unpacker
 # from local sources or pinned releases and compresses them with zstd for
-# embedding into the openshell-driver-vm binary.
+# embedding into the ryno-driver-vm binary.
 #
 # Usage:
 #   ./compress-vm-runtime.sh
 #
 # Environment:
-#   OPENSHELL_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
+#   RYNO_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
 #   VM_RUNTIME_TARBALL - Path to a pre-built vm-runtime-*.tar.zst tarball.
 #                        When set, the script extracts and re-compresses
 #                        artifacts from this tarball instead of looking for
 #                        local builds.  Used by CI and download-kernel-runtime.sh.
 #
-# The script sets OPENSHELL_VM_RUNTIME_COMPRESSED_DIR for use by build.rs.
+# The script sets RYNO_VM_RUNTIME_COMPRESSED_DIR for use by build.rs.
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pins for runtime tool versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/ryno-driver-vm/runtime/pins.env" 2>/dev/null || true
 UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
@@ -53,7 +53,7 @@ make_dylib_portable() {
 }
 
 WORK_DIR="${ROOT}/target/vm-runtime"
-OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
+OUTPUT_DIR="${RYNO_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -106,7 +106,7 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     ls -lah "$WORK_DIR"
 
     echo ""
-    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+    echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"
     exit 0
 fi
 
@@ -156,7 +156,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     else
         echo ""
         echo "Note: rootfs.tar.zst not found."
-        echo "      openshell-driver-vm does not embed a standalone rootfs."
+        echo "      ryno-driver-vm does not embed a standalone rootfs."
     fi
 
     echo ""
@@ -166,7 +166,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     echo ""
     echo "==> Total compressed size: ${TOTAL}"
     echo ""
-    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+    echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"
     exit 0
 fi
 
@@ -285,7 +285,7 @@ if [ -f "$ROOTFS_TARBALL" ]; then
 else
     echo ""
     echo "Note: rootfs.tar.zst not found."
-      echo "      openshell-driver-vm does not embed a standalone rootfs."
+      echo "      ryno-driver-vm does not embed a standalone rootfs."
 fi
 
 echo ""
@@ -296,4 +296,4 @@ TOTAL=$(du -sh "$OUTPUT_DIR" | cut -f1)
 echo ""
 echo "==> Total compressed size: ${TOTAL}"
 echo ""
-echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
+echo "Next step: mise run vm:supervisor && cargo build -p ryno-driver-vm"

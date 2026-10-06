@@ -7,7 +7,7 @@ set -euo pipefail
 hook_input=${1:?Usage: test-snap-post-refresh-hook.sh <post-refresh-hook>}
 hook_dir=$(cd "$(dirname "$hook_input")" && pwd)
 hook="${hook_dir}/$(basename "$hook_input")"
-work=$(mktemp -d "${TMPDIR:-/tmp}/openshell snap post-refresh hook.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/ryno snap post-refresh hook.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 mkdir -p "${work}/bin"
@@ -20,7 +20,7 @@ chmod 755 "${work}/bin/snapctl"
 run_hook() {
   local common=$1
 
-  PATH="${work}/bin:$PATH" SNAP_COMMON="$common" SNAP_INSTANCE_NAME=openshell "$hook"
+  PATH="${work}/bin:$PATH" SNAP_COMMON="$common" SNAP_INSTANCE_NAME=ryno "$hook"
 }
 
 assert_no_restart() {
@@ -46,7 +46,7 @@ assert_removed_and_restarted() {
     echo "FAIL: post-refresh hook did not remove ${name}" >&2
     exit 1
   fi
-  if [[ $(cat "${work}/snapctl.log") != "restart openshell.gateway" ]]; then
+  if [[ $(cat "${work}/snapctl.log") != "restart ryno.gateway" ]]; then
     echo "FAIL: post-refresh hook did not restart the gateway once for ${name}" >&2
     cat "${work}/snapctl.log" >&2
     exit 1
@@ -64,14 +64,14 @@ fi
 common="${work}/secure"
 mkdir -p "$common"
 cat >"$common/gateway.toml" <<'EOF'
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 compute_driver = "docker"
 disable_tls = false
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = false
 # allow_unauthenticated_users = true
 EOF
@@ -82,7 +82,7 @@ cmp -s "${work}/secure-before" "$common/gateway.toml"
 common="${work}/unauthenticated"
 mkdir -p "$common"
 cat >"$common/gateway.toml" <<'EOF'
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 EOF
 assert_removed_and_restarted "an unauthenticated config" "$common"
@@ -90,7 +90,7 @@ assert_removed_and_restarted "an unauthenticated config" "$common"
 common="${work}/tls-disabled"
 mkdir -p "$common"
 cat >"$common/gateway.toml" <<'EOF'
-[openshell.gateway]
+[ryno.gateway]
 disable_tls = true # old local override
 
 # operator note
@@ -134,7 +134,7 @@ EOF
 chmod 755 "${work}/failing-bin/rm"
 rm -f "${work}/snapctl.log"
 if PATH="${work}/failing-bin:${work}/bin:$PATH" SNAP_COMMON="$common" \
-  SNAP_INSTANCE_NAME=openshell "$hook"; then
+  SNAP_INSTANCE_NAME=ryno "$hook"; then
   echo "FAIL: post-refresh hook succeeded when config removal failed" >&2
   exit 1
 fi

@@ -1,0 +1,12 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "gateway.toml.j2" %}
+{% block driver %}
+[ryno.drivers.docker]
+socket_path = "{{ ryno_runtime_socket }}"
+image_pull_policy = "if_not_present"
+sandbox_label = "tmachine"
+grpc_endpoint = "http://127.0.0.1:17670"
+sandbox_runtime_image = "docker.io/ryno/sandbox:tmachine"
+supervisor_image = "docker.io/ryno/supervisor:tmachine"
+{% endblock %}

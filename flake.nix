@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {
-  description = "OpenShell development environment";
+  description = "Ryno development environment";
 
   nixConfig = {
-    extra-substituters = [ "https://openshell.cachix.org" ];
+    extra-substituters = [ "https://ryno.cachix.org" ];
     extra-trusted-public-keys = [
-      "openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w="
+      "ryno.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w="
     ];
   };
 

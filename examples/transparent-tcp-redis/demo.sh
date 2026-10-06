@@ -10,8 +10,8 @@ POLICY_FILE="${SCRIPT_DIR}/policy.yaml"
 CLIENT_FILE="${SCRIPT_DIR}/redis_client.py"
 
 SANDBOX_NAME="${SANDBOX_NAME:-tcp-redis-demo}"
-REDIS_CONTAINER="${REDIS_CONTAINER:-openshell-transparent-tcp-redis-demo}"
-DOCKER_NETWORK="${OPENSHELL_DOCKER_NETWORK:-openshell-docker}"
+REDIS_CONTAINER="${REDIS_CONTAINER:-ryno-transparent-tcp-redis-demo}"
+DOCKER_NETWORK="${RYNO_DOCKER_NETWORK:-ryno-docker}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 REDIS_REAL_IP=""
 
@@ -31,7 +31,7 @@ cleanup() {
         # Give the bounded gateway log stream a moment to receive the final
         # network decision before fetching it and deleting the sandbox.
         sleep 1
-        if sandbox_logs="$(openshell logs "$SANDBOX_NAME" \
+        if sandbox_logs="$(ryno logs "$SANDBOX_NAME" \
             --source sandbox \
             --since 10m \
             -n 500 2>&1)"; then
@@ -47,7 +47,7 @@ cleanup() {
 
     printf '\nCleaning up...\n'
     if [[ "$SANDBOX_CREATED" == "1" ]]; then
-        openshell sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
+        ryno sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
     fi
     if [[ "$REDIS_CREATED" == "1" ]]; then
         docker rm --force "$REDIS_CONTAINER" >/dev/null 2>&1 || true
@@ -64,7 +64,7 @@ run() {
     "$@"
 }
 
-for command in docker openshell; do
+for command in docker ryno; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -78,12 +78,12 @@ fi
 
 if ! docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
     printf 'Docker network %q does not exist.\n' "$DOCKER_NETWORK" >&2
-    printf 'Start a Docker-backed OpenShell gateway, or set OPENSHELL_DOCKER_NETWORK.\n' >&2
+    printf 'Start a Docker-backed Ryno gateway, or set RYNO_DOCKER_NETWORK.\n' >&2
     exit 1
 fi
 
-if ! openshell sandbox list --page-size 1 >/dev/null 2>&1; then
-    printf 'The configured OpenShell gateway is not reachable.\n' >&2
+if ! ryno sandbox list --page-size 1 >/dev/null 2>&1; then
+    printf 'The configured Ryno gateway is not reachable.\n' >&2
     printf 'Start or select a Docker-backed gateway and try again.\n' >&2
     exit 1
 fi
@@ -93,19 +93,19 @@ if docker container inspect "$REDIS_CONTAINER" >/dev/null 2>&1; then
     exit 1
 fi
 
-if openshell sandbox get "$SANDBOX_NAME" >/dev/null 2>&1; then
+if ryno sandbox get "$SANDBOX_NAME" >/dev/null 2>&1; then
     printf 'Sandbox %q already exists; choose SANDBOX_NAME or delete it.\n' "$SANDBOX_NAME" >&2
     exit 1
 fi
 
-printf 'Starting Redis on the OpenShell Docker network...\n'
+printf 'Starting Redis on the Ryno Docker network...\n'
 REDIS_CREATED=1
 run docker run \
     --detach \
     --rm \
     --name "$REDIS_CONTAINER" \
     --network "$DOCKER_NETWORK" \
-    --network-alias redis.openshell.demo \
+    --network-alias redis.ryno.demo \
     "$REDIS_IMAGE" \
     redis-server --save '' --appendonly no
 
@@ -129,7 +129,7 @@ fi
 
 printf '\nCreating a Docker-backed sandbox with an explicit TCP endpoint policy...\n'
 SANDBOX_CREATED=1
-run openshell sandbox create \
+run ryno sandbox create \
     --name "$SANDBOX_NAME" \
     --policy "$POLICY_FILE" \
     --upload "${CLIENT_FILE}:/sandbox" \
@@ -138,7 +138,7 @@ run openshell sandbox create \
     -- echo 'sandbox ready'
 
 printf '\nRunning native Redis commands from the sandbox...\n'
-run openshell sandbox exec \
+run ryno sandbox exec \
     --name "$SANDBOX_NAME" \
     --no-tty \
     -- python3 /sandbox/redis_client.py "$REDIS_REAL_IP" "$REDIS_CONTAINER"

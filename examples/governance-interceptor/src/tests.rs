@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::proto::gateway_interceptor::v1::{
+use ryno_core::proto::gateway_interceptor::v1::{
     ModifyOperationEvaluation, PostCommitEvaluation, ValidateEvaluation,
 };
 use serde_json::json;
@@ -15,8 +15,8 @@ fn service() -> GovernanceInterceptorService {
 #[tokio::test]
 async fn describe_rejects_incompatible_gateway_metadata() {
     let service = service();
-    let mut gateway = openshell_core::extension_protocol::gateway_metadata(
-        openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+    let mut gateway = ryno_core::extension_protocol::gateway_metadata(
+        ryno_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
     );
     gateway.protocol_version.as_mut().unwrap().major = 2;
 
@@ -192,7 +192,7 @@ fn signature_patch_token(result: &InterceptorResult) -> String {
         .patches
         .iter()
         .find(|patch| {
-            patch.path == "/annotations/openshell.nvidia.com~1policy-signature"
+            patch.path == "/annotations/ryno.nvidia.com~1policy-signature"
                 || patch.path == "/annotations"
         })
         .and_then(|patch| patch.value.as_ref())
@@ -334,7 +334,7 @@ fn create_sandbox_modify_adds_policy_and_signature_without_replacing_providers()
     assert!(!paths.contains(&"/spec/providers"));
     assert!(
         paths.contains(&"/annotations")
-            || paths.contains(&"/annotations/openshell.nvidia.com~1policy-signature")
+            || paths.contains(&"/annotations/ryno.nvidia.com~1policy-signature")
     );
     let token = signature_patch_token(&result);
     assert_eq!(token.split('.').count(), 3);
@@ -506,7 +506,7 @@ fn policy_signature_rejects_legacy_hash_algorithm() {
         aud: POLICY_JWT_AUDIENCE.to_string(),
         iat: now_secs(),
         exp: 0,
-        hash_algorithm: "openshell-governance-protobuf-sha256-v1".to_string(),
+        hash_algorithm: "ryno-governance-protobuf-sha256-v1".to_string(),
         policy_sha256: state.policy_hash.clone(),
     };
     let token = encode(

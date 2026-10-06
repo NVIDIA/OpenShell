@@ -6,29 +6,29 @@
 //! E2E tests for edge tunnel auth flow against a running gateway.
 //!
 //! Prerequisites:
-//! - A running openshell gateway
+//! - A running ryno gateway
 //! - For WS tunnel coverage, the gateway's HTTP endpoint is accessible (no TLS)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - The `ryno` binary (built automatically from the workspace)
 //!
 //! These tests exercise the full CLI → WS tunnel → gRPC flow.
 //!
 //! Environment variables:
-//! - `OPENSHELL_GATEWAY`: Name of the active gateway (standard e2e var)
-//! - `OPENSHELL_GATEWAY_ENDPOINT`: Optional direct plaintext endpoint.
+//! - `RYNO_GATEWAY`: Name of the active gateway (standard e2e var)
+//! - `RYNO_GATEWAY_ENDPOINT`: Optional direct plaintext endpoint.
 //!
 //! The edge-tunnel path requires a gateway endpoint that accepts plaintext HTTP.
 
 use std::process::Stdio;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::strip_ansi;
 
-/// Run `openshell <args>` using the system's configured gateway.
+/// Run `ryno <args>` using the system's configured gateway.
 async fn run_cli(args: &[&str]) -> (String, i32) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell");
+    let output = cmd.output().await.expect("spawn ryno");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -36,19 +36,19 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
     (combined, code)
 }
 
-/// Run `openshell <args>` with a custom config directory so the CLI reads
+/// Run `ryno <args>` with a custom config directory so the CLI reads
 /// our seeded gateway metadata and edge token instead of the real config.
 async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("HOME", config_dir)
-        .env_remove("OPENSHELL_GATEWAY")
-        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .env_remove("RYNO_GATEWAY")
+        .env_remove("RYNO_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell");
+    let output = cmd.output().await.expect("spawn ryno");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -65,11 +65,11 @@ fn seed_edge_gateway_config(
     gateway_endpoint: &str,
     edge_token: &str,
 ) {
-    let openshell_dir = config_dir.join("openshell");
-    let gateways_dir = openshell_dir.join("gateways");
+    let ryno_dir = config_dir.join("ryno");
+    let gateways_dir = ryno_dir.join("gateways");
 
-    std::fs::create_dir_all(&openshell_dir).expect("create openshell config dir");
-    std::fs::write(openshell_dir.join("active_gateway"), gateway_name)
+    std::fs::create_dir_all(&ryno_dir).expect("create ryno config dir");
+    std::fs::write(ryno_dir.join("active_gateway"), gateway_name)
         .expect("write active_gateway");
 
     // Write gateway metadata JSON.
@@ -96,7 +96,7 @@ fn seed_edge_gateway_config(
 // Test 12: gRPC health check against a gateway
 // -------------------------------------------------------------------
 
-/// `openshell status` should report a healthy gateway when connected to a
+/// `ryno status` should report a healthy gateway when connected to a
 /// configured gateway.
 ///
 /// This test verifies the normal gateway path:
@@ -110,7 +110,7 @@ async fn gateway_status_reports_healthy() {
 
     assert_eq!(
         code, 0,
-        "openshell status should exit 0 against gateway:\n{clean}"
+        "ryno status should exit 0 against gateway:\n{clean}"
     );
 
     // The status output should show the gateway as healthy/connected.
@@ -134,7 +134,7 @@ async fn gateway_status_reports_healthy() {
 /// CLI → local TCP proxy → WebSocket → /_ws_tunnel → loopback TCP → gRPC
 ///
 /// The test seeds a temporary config directory with edge auth metadata and a
-/// dummy token, then runs `openshell status` against the live plaintext
+/// dummy token, then runs `ryno status` against the live plaintext
 /// gateway.
 ///
 /// Note: The dummy token won't be validated (no edge auth middleware on
@@ -208,7 +208,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     let clean = strip_ansi(&output);
     assert_eq!(
         code, 0,
-        "openshell status through WS tunnel should exit 0:\n{clean}"
+        "ryno status through WS tunnel should exit 0:\n{clean}"
     );
     assert!(
         clean.to_lowercase().contains("healthy")

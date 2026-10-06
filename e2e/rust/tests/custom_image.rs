@@ -6,15 +6,15 @@
 //! E2E test: build custom container images and run sandboxes with them.
 //!
 //! Prerequisites:
-//! - A running Docker- or Podman-backed openshell gateway
+//! - A running Docker- or Podman-backed ryno gateway
 //! - The matching container runtime running (for image builds)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - The `ryno` binary (built automatically from the workspace)
 
 use std::{fs, io::Write};
 
-use openshell_e2e::harness::container::ImageGuard;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ImageGuard;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 
 const DOCKERFILE_CONTENT: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and (include "ryno.workspaceResourcesEnabled" .) .Values.networkPolicy.enabled }}
+# NetworkPolicy restricting SSH ingress on sandbox pods to the gateway pod.
+# Sandbox pods are dynamically created by the server and labelled with
+# ryno.ai/managed-by=ryno. This policy ensures only the gateway
+# (ryno server) pod can reach the sandbox SSH port (2222), blocking
+# lateral movement from other in-cluster workloads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ryno.fullname" . }}-sandbox-ssh
+  namespace: {{ include "ryno.sandboxNamespace" . }}
+  labels:
+    {{- include "ryno.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      ryno.ai/managed-by: ryno
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "ryno.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 2222
+{{- end }}

@@ -14,12 +14,12 @@
 # limit of 256 and fails with ProcessFdQuotaExceeded. The raised limit
 # propagates to the cargo/zig children the caller spawns.
 #
-# The limit is read from OPENSHELL_BUILD_NOFILE_LIMIT (default 8192), honoring
-# the legacy OPENSHELL_VM_BUILD_NOFILE_LIMIT for back-compat. This is a no-op on
+# The limit is read from RYNO_BUILD_NOFILE_LIMIT (default 8192), honoring
+# the legacy RYNO_VM_BUILD_NOFILE_LIMIT for back-compat. This is a no-op on
 # Linux and when cargo-zigbuild is not installed (native builds, CI Linux
 # runners), so it must be safe to call unconditionally.
 ensure_build_nofile_limit() {
-    local desired="${OPENSHELL_BUILD_NOFILE_LIMIT:-${OPENSHELL_VM_BUILD_NOFILE_LIMIT:-8192}}"
+    local desired="${RYNO_BUILD_NOFILE_LIMIT:-${RYNO_VM_BUILD_NOFILE_LIMIT:-8192}}"
     local minimum=1024
     local current=""
     local hard=""

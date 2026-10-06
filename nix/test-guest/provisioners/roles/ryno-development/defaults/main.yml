@@ -1,0 +1,10 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ryno_development_cli_bin: /usr/local/bin/ryno
+ryno_development_gateway_bin: /usr/local/bin/ryno-gateway
+ryno_development_sandbox_archive: /usr/local/lib/ryno-sandbox.tar
+ryno_development_gateway_service: ryno-test-guest-gateway.service
+ryno_development_gateway_endpoint: http://127.0.0.1:8080
+ryno_development_supervisor_image: localhost/ryno/supervisor:test-guest

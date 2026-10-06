@@ -7,10 +7,10 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::cli::run_cli;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::cli::run_cli;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use sha2::{Digest, Sha256};
 
 const CREDENTIAL_KEY: &str = "OPENAI_API_KEY";
@@ -24,11 +24,11 @@ fn unique_suffix() -> String {
 }
 
 fn namespace() -> String {
-    std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE").unwrap_or_else(|_| "openshell".to_string())
+    std::env::var("RYNO_E2E_SANDBOX_NAMESPACE").unwrap_or_else(|_| "ryno".to_string())
 }
 
 fn credential_driver() -> String {
-    std::env::var("OPENSHELL_E2E_CREDENTIAL_DRIVER")
+    std::env::var("RYNO_E2E_CREDENTIAL_DRIVER")
         .unwrap_or_else(|_| "kubernetes-secrets".to_string())
 }
 
@@ -39,15 +39,15 @@ struct ProviderIdentity {
 }
 
 fn vault_namespace() -> String {
-    std::env::var("OPENSHELL_E2E_VAULT_NAMESPACE").unwrap_or_else(|_| "vault".to_string())
+    std::env::var("RYNO_E2E_VAULT_NAMESPACE").unwrap_or_else(|_| "vault".to_string())
 }
 
 fn vault_pod() -> String {
-    std::env::var("OPENSHELL_E2E_VAULT_POD").unwrap_or_else(|_| "vault-0".to_string())
+    std::env::var("RYNO_E2E_VAULT_POD").unwrap_or_else(|_| "vault-0".to_string())
 }
 
 fn vault_token() -> String {
-    std::env::var("OPENSHELL_E2E_VAULT_TOKEN").unwrap_or_else(|_| "root".to_string())
+    std::env::var("RYNO_E2E_VAULT_TOKEN").unwrap_or_else(|_| "root".to_string())
 }
 
 fn managed_credential_hash(identity: &ProviderIdentity, provider_name: &str) -> String {
@@ -67,17 +67,17 @@ fn managed_credential_hash(identity: &ProviderIdentity, provider_name: &str) -> 
 
 fn managed_kubernetes_secret_name(identity: &ProviderIdentity, provider_name: &str) -> String {
     let hex = managed_credential_hash(identity, provider_name);
-    format!("openshell-cred-{}", &hex[..40])
+    format!("ryno-cred-{}", &hex[..40])
 }
 
 fn managed_vault_path(identity: &ProviderIdentity, provider_name: &str) -> String {
     let hex = managed_credential_hash(identity, provider_name);
-    format!("openshell/provider-credentials/{}", &hex[..40])
+    format!("ryno/provider-credentials/{}", &hex[..40])
 }
 
 fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
-    let legacy = format!("openshell:resolve:env:{key}");
-    let revision_prefix = "openshell:resolve:env:v";
+    let legacy = format!("ryno:resolve:env:{key}");
+    let revision_prefix = "ryno:resolve:env:v";
     let revision_suffix = format!("_{key}");
     output.split_whitespace().any(|token| {
         token == legacy || (token.starts_with(revision_prefix) && token.ends_with(&revision_suffix))
@@ -86,7 +86,7 @@ fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
 
 fn kubectl_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("kubectl");
-    if let Ok(context) = std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
+    if let Ok(context) = std::env::var("RYNO_E2E_KUBE_CONTEXT_ACTIVE")
         && !context.trim().is_empty()
     {
         cmd.arg("--context").arg(context);
@@ -145,7 +145,7 @@ async fn bao(args: &[&str]) -> Result<String, String> {
 }
 
 async fn delete_provider(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.arg("provider")
         .arg("delete")
         .arg(name)
@@ -369,7 +369,7 @@ async fn assert_backend_deleted(
 async fn provider_credentials_are_stored_in_configured_backend() {
     assert!(
         matches!(
-            std::env::var("OPENSHELL_E2E_CREDENTIAL_DRIVERS").as_deref(),
+            std::env::var("RYNO_E2E_CREDENTIAL_DRIVERS").as_deref(),
             Ok("1")
         ),
         "run with `mise run e2e:kubernetes:credential-drivers` so the Kubernetes wrapper enables a credential storage driver"

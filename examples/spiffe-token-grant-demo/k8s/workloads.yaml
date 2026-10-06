@@ -30,7 +30,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-demo
+                  name: ryno-spiffe-token-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
@@ -41,7 +41,7 @@ spec:
             - name: JWT_SVID_AUDIENCE
               value: http://token-issuer.default.svc.cluster.local
             - name: TRUST_DOMAIN_PREFIX
-              value: spiffe://openshell.local/openshell/sandbox/
+              value: spiffe://ryno.local/ryno/sandbox/
           readinessProbe:
             httpGet:
               path: /healthz
@@ -53,7 +53,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-demo-scripts
+            name: ryno-spiffe-token-demo-scripts
 ---
 apiVersion: v1
 kind: Service
@@ -103,7 +103,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-demo
+                  name: ryno-spiffe-token-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
@@ -118,7 +118,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-demo-scripts
+            name: ryno-spiffe-token-demo-scripts
 ---
 apiVersion: v1
 kind: Service
@@ -168,7 +168,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-demo
+                  name: ryno-spiffe-token-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
@@ -183,7 +183,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-demo-scripts
+            name: ryno-spiffe-token-demo-scripts
 ---
 apiVersion: v1
 kind: Service

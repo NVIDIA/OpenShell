@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify RPM-provided Ryno files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ ryno_rpm_cli_bin }}"
+    - "{{ ryno_rpm_gateway_bin }}"
+    - /usr/lib/systemd/user/ryno-gateway.service
+  register: ryno_rpm_files
+
+- name: Require the installed Ryno RPM
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required RPM-provided file: {{ item.item }}"
+  loop: "{{ ryno_rpm_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish RPM Ryno installation
+  ansible.builtin.set_fact:
+    ryno_install_source: rpm
+    ryno_cli_bin: "{{ ryno_rpm_cli_bin }}"
+    ryno_gateway_bin: "{{ ryno_rpm_gateway_bin }}"
+    ryno_gateway_service: "{{ ryno_rpm_gateway_service }}"
+    ryno_gateway_endpoint: "{{ ryno_rpm_gateway_endpoint }}"
+    ryno_supervisor_source: package

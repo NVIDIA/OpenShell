@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// The OpenShell gateway client: a thin, idiomatic ergonomics layer over the
+// The Ryno gateway client: a thin, idiomatic ergonomics layer over the
 // protobuf-generated gRPC stubs (src/gen/). Resource operations live on scoped
-// clients (`SandboxClient`, mirroring the Python SDK) that OpenShellClient
+// clients (`SandboxClient`, mirroring the Python SDK) that RynoClient
 // composes as `client.sandbox.*`, mirroring the CLI's noun-verb model; each
 // scoped client is also usable standalone via its own `connect()`. Gateway-
 // scoped calls (`health`) stay top-level. A scoped client owns proto request
@@ -18,18 +18,18 @@ import { durationFromMs } from '@bufbuild/protobuf/wkt';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
-import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
+import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/ryno_pb.js';
 import {
   type ExecSandboxInputSchema,
-  OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
+  Ryno,
   SandboxPhase,
   SandboxRestartPolicy,
   type SandboxSpecSchema,
   type SandboxWorkloadTemplateSchema,
   ServiceStatus,
   type TcpForwardFrameSchema,
-} from './gen/openshell_pb.js';
+} from './gen/ryno_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
 import { validateSshResponse } from './ssh-validate.js';
@@ -57,7 +57,7 @@ export type {
   SandboxWorkloadConfig,
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateSpec,
-} from './gen/openshell_pb.js';
+} from './gen/ryno_pb.js';
 export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
@@ -901,12 +901,12 @@ export class Pager<T> implements AsyncIterable<Page<T>> {
 // generated proto messages because the resource owns portable workload fields
 // plus driver-specific config that should not be lossy in the curated layer.
 export class SandboxTemplateClient {
-  private readonly grpc: Client<typeof OpenShell>;
+  private readonly grpc: Client<typeof Ryno>;
 
-  readonly raw: Client<typeof OpenShell>;
+  readonly raw: Client<typeof Ryno>;
   readonly transport: Transport;
 
-  constructor(transport: Transport, grpc = createClient(OpenShell, transport)) {
+  constructor(transport: Transport, grpc = createClient(Ryno, transport)) {
     this.transport = transport;
     this.grpc = grpc;
     this.raw = this.grpc;
@@ -983,24 +983,24 @@ export class SandboxTemplateClient {
 // ---- sandbox client --------------------------------------------------------
 
 // Sandbox lifecycle + exec. Usable standalone via `SandboxClient.connect()`,
-// or reached as `client.sandbox` on an OpenShellClient, which shares one
+// or reached as `client.sandbox` on an RynoClient, which shares one
 // transport (one connection) across all of its scoped clients.
 export class SandboxClient {
-  private readonly grpc: Client<typeof OpenShell>;
+  private readonly grpc: Client<typeof Ryno>;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
    * surface the curated methods do not wrap yet. Request/response types are the
-   * generated wire messages (import them from '@nvidia/openshell-sdk/raw').
+   * generated wire messages (import them from '@nvidia/ryno-sdk/raw').
    */
-  readonly raw: Client<typeof OpenShell>;
+  readonly raw: Client<typeof Ryno>;
   /** The shared Connect transport, for building extra clients over the same connection. */
   readonly transport: Transport;
 
-  // Takes a transport rather than options so OpenShellClient can compose
+  // Takes a transport rather than options so RynoClient can compose
   // several scoped clients over a single connection. For standalone use,
   // prefer the SandboxClient.connect() factory below.
-  constructor(transport: Transport, grpc = createClient(OpenShell, transport)) {
+  constructor(transport: Transport, grpc = createClient(Ryno, transport)) {
     this.transport = transport;
     this.grpc = grpc;
     this.raw = this.grpc;
@@ -1801,7 +1801,7 @@ export class SandboxClient {
 
 // ---- The client ------------------------------------------------------------
 
-export class OpenShellClient {
+export class RynoClient {
   /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
   readonly sandbox: SandboxClient;
   /** Reusable sandbox workload template lifecycle. */
@@ -1811,18 +1811,18 @@ export class OpenShellClient {
    * Advanced escape hatch: a generated client for every gateway RPC, including
    * surface the curated sub-clients do not wrap yet (gateway config, provider
    * CRUD, policy status, watch, logs, and the full observed Sandbox). See
-   * '@nvidia/openshell-sdk/raw' for the generated request/response types.
+   * '@nvidia/ryno-sdk/raw' for the generated request/response types.
    */
-  readonly raw: Client<typeof OpenShell>;
+  readonly raw: Client<typeof Ryno>;
   /** The shared Connect transport, for building extra clients over the same connection. */
   readonly transport: Transport;
 
-  private readonly grpc: Client<typeof OpenShell>;
+  private readonly grpc: Client<typeof Ryno>;
 
   private constructor(transport: Transport) {
     // One transport (one connection) shared across every scoped client.
     this.transport = transport;
-    this.grpc = createClient(OpenShell, transport);
+    this.grpc = createClient(Ryno, transport);
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
     this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
@@ -1832,8 +1832,8 @@ export class OpenShellClient {
    * Constructs a lazy Connect client. No network request is made until the
    * first RPC; call health() when startup must verify gateway reachability.
    */
-  static async connect(options: ConnectOptions): Promise<OpenShellClient> {
-    return new OpenShellClient(buildTransport(options));
+  static async connect(options: ConnectOptions): Promise<RynoClient> {
+    return new RynoClient(buildTransport(options));
   }
 
   // Gateway-scoped, so it stays top-level rather than under a namespace.

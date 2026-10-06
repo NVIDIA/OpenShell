@@ -1,0 +1,8 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ryno_rpm_cli_bin: /usr/bin/ryno
+ryno_rpm_gateway_bin: /usr/bin/ryno-gateway
+ryno_rpm_gateway_service: ryno-gateway.service
+ryno_rpm_gateway_endpoint: https://127.0.0.1:17670

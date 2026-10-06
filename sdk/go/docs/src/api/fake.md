@@ -1,6 +1,6 @@
 # Fake
 
-Package: `openshell/v1/fake`
+Package: `ryno/v1/fake`
 
 The fake package provides an in-memory fake implementation of all SDK
 client interfaces for use in consumer test suites. It follows the
@@ -11,7 +11,7 @@ conditions (`NotFound`, `AlreadyExists`, `Unavailable`, `Unimplemented`).
 ## Quick Start
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/fake"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/fake"
 
 func TestSandboxLifecycle(t *testing.T) {
     client := fake.NewClient()

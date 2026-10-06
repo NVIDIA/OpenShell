@@ -15,8 +15,8 @@
 
 use std::process::Stdio;
 
-use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::{ryno_bin, ryno_cmd};
+use ryno_e2e::harness::output::strip_ansi;
 
 const WORKSPACE: &str = "lifecycle-test";
 const WORKSPACE_TERM: &str = "terminating-test";
@@ -29,10 +29,10 @@ struct CliResult {
 }
 
 async fn run_cli(args: &[&str]) -> CliResult {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell command");
+    let output = cmd.output().await.expect("spawn ryno command");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -47,7 +47,7 @@ struct WorkspaceCleanup;
 
 impl Drop for WorkspaceCleanup {
     fn drop(&mut self) {
-        let bin = openshell_bin();
+        let bin = ryno_bin();
         let _ = std::process::Command::new(&bin)
             .args(["provider", "delete", PROVIDER, "--workspace", WORKSPACE])
             .stdout(Stdio::null())
@@ -171,7 +171,7 @@ struct TerminatingCleanup;
 
 impl Drop for TerminatingCleanup {
     fn drop(&mut self) {
-        let bin = openshell_bin();
+        let bin = ryno_bin();
         let _ = std::process::Command::new(&bin)
             .args([
                 "provider",

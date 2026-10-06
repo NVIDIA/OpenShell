@@ -7,7 +7,7 @@
 
 # E2E traffic is synthetic and must not contribute to product usage metrics.
 # Keep an explicit override so telemetry-specific tests can opt back in.
-export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
+export RYNO_TELEMETRY_ENABLED="${RYNO_TELEMETRY_ENABLED:-false}"
 
 # Resolve a test image override. Repository-only values inherit the caller's
 # tag, while tagged and digest-pinned references are already complete.
@@ -134,7 +134,7 @@ e2e_generate_pki() {
   # host.docker.internal and localhost are already in the default SAN list.
 
   local san_args=()
-  san_args+=(--server-san host.openshell.internal)
+  san_args+=(--server-san host.ryno.internal)
   for san in "$@"; do
     san_args+=(--server-san "${san}")
   done
@@ -183,7 +183,7 @@ e2e_register_plaintext_gateway() {
   local name=$2
   local endpoint=$3
   local port=$4
-  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+  local gateway_config_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}"
   cat >"${gateway_config_dir}/metadata.json" <<EOF
@@ -195,7 +195,7 @@ e2e_register_plaintext_gateway() {
   "auth_mode": "plaintext"
 }
 EOF
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+  printf '%s' "${name}" >"${config_home}/ryno/active_gateway"
 }
 
 e2e_register_mtls_gateway() {
@@ -205,7 +205,7 @@ e2e_register_mtls_gateway() {
   local port=$4
   local pki_dir=$5
   local oidc_issuer="${6:-}"
-  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+  local gateway_config_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
   cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
@@ -225,12 +225,12 @@ e2e_register_mtls_gateway() {
   "gateway_port": ${port}${oidc_line}
 }
 EOF
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+  printf '%s' "${name}" >"${config_home}/ryno/active_gateway"
 }
 
 # Import the example provider profiles at platform scope.
 #
-# OpenShell compiles no provider profile into a binary, so a freshly started
+# Ryno compiles no provider profile into a binary, so a freshly started
 # gateway serves an empty catalog. The e2e suites exercise providers built from
 # github, openai, nvidia and the rest, which means the lane has to import them
 # first — the same step the upgrade notes give operators.
@@ -249,7 +249,7 @@ e2e_import_example_provider_profiles() {
 #
 # The browser PKCE flow the CLI normally uses cannot run unattended, so mint an
 # admin access token with Keycloak's password grant and write the same token
-# bundle `openshell gateway login` would have stored. Used only to establish a
+# bundle `ryno gateway login` would have stored. Used only to establish a
 # setup identity; the tests themselves still authenticate however they choose.
 e2e_register_oidc_admin_session() {
   local config_home=$1
@@ -261,10 +261,10 @@ e2e_register_oidc_admin_session() {
   local password=$7
   local pki_dir=$8
   local cli_bin=$9
-  local client_id="${10:-openshell-cli}"
-  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+  local client_id="${10:-ryno-cli}"
+  local gateway_config_dir="${config_home}/ryno/gateways/${name}"
 
-  # The OpenShell scopes are optional client scopes on openshell-cli, so
+  # The Ryno scopes are optional client scopes on ryno-cli, so
   # Keycloak mints them only when they are asked for. Without an explicit
   # scope the token carries the realm defaults alone and every authorized RPC
   # fails with "scope '<name>' required".
@@ -274,7 +274,7 @@ e2e_register_oidc_admin_session() {
     -d "client_id=${client_id}" \
     -d "username=${username}" \
     -d "password=${password}" \
-    --data-urlencode "scope=openid openshell:all" \
+    --data-urlencode "scope=openid ryno:all" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
 
   if [ -z "${token}" ]; then
@@ -304,7 +304,7 @@ e2e_register_oidc_admin_session() {
   "auth_mode": "oidc",
   "oidc_issuer": "${issuer}",
   "oidc_client_id": "${client_id}",
-  "oidc_scopes": "openid openshell:all"
+  "oidc_scopes": "openid ryno:all"
 }
 EOF
   cat >"${gateway_config_dir}/oidc_token.json" <<EOF
@@ -315,7 +315,7 @@ EOF
 }
 EOF
   chmod 600 "${gateway_config_dir}/oidc_token.json"
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+  printf '%s' "${name}" >"${config_home}/ryno/active_gateway"
 
   # Assert the CLI reaches the gateway as an authenticated administrator before
   # anything depends on it. ListProviderProfiles is annotated
@@ -356,7 +356,7 @@ e2e_write_gateway_jwt_config() {
   local jwt_dir=$1
   local gateway_id=$2
 
-  printf '[openshell.gateway.gateway_jwt]\n'
+  printf '[ryno.gateway.gateway_jwt]\n'
   printf 'signing_key_path = %s\n' "$(e2e_toml_string "${jwt_dir}/signing.pem")"
   printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
   printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
@@ -367,7 +367,7 @@ e2e_write_gateway_jwt_config() {
 }
 
 e2e_write_gateway_mtls_auth_config() {
-  printf '[openshell.gateway.mtls_auth]\n'
+  printf '[ryno.gateway.mtls_auth]\n'
   printf 'enabled = true\n\n'
 }
 
@@ -375,18 +375,18 @@ e2e_write_gateway_oidc_config() {
   local issuer=$1
   local scopes_claim="${2:-scope}"
 
-  printf '[openshell.gateway.oidc]\n'
+  printf '[ryno.gateway.oidc]\n'
   printf 'issuer = %s\n'         "$(e2e_toml_string "${issuer}")"
   case "${issuer}" in
     http://127.*|http://\[::1\]*)
       printf 'dangerously_allow_insecure_http = true\n'
       ;;
   esac
-  printf 'audience = "openshell-cli"\n'
+  printf 'audience = "ryno-cli"\n'
   printf 'jwks_ttl_secs = 60\n'
   printf 'roles_claim = "realm_access.roles"\n'
-  printf 'admin_role = "openshell-admin"\n'
-  printf 'user_role = "openshell-user"\n'
+  printf 'admin_role = "ryno-admin"\n'
+  printf 'user_role = "ryno-user"\n'
   printf 'scopes_claim = %s\n\n' "$(e2e_toml_string "${scopes_claim}")"
 }
 
@@ -404,37 +404,37 @@ e2e_build_gateway_binaries() {
 
   target_dir="$(e2e_cargo_target_dir "${root}")"
   printf -v "${target_var}" '%s' "${target_dir}"
-  printf -v "${gateway_var}" '%s' "${OPENSHELL_GATEWAY_BIN:-${target_dir}/debug/openshell-gateway}"
-  printf -v "${cli_var}" '%s' "${OPENSHELL_BIN:-${target_dir}/debug/openshell}"
+  printf -v "${gateway_var}" '%s' "${RYNO_GATEWAY_BIN:-${target_dir}/debug/ryno-gateway}"
+  printf -v "${cli_var}" '%s' "${RYNO_BIN:-${target_dir}/debug/ryno}"
 
-  if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
-    echo "Building openshell-gateway..."
-    if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  if [ -z "${RYNO_GATEWAY_BIN:-}" ]; then
+    echo "Building ryno-gateway..."
+    if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
       cargo build ${jobs[@]+"${jobs[@]}"} \
-        -p openshell-gateway --bin openshell-gateway \
+        -p ryno-gateway --bin ryno-gateway \
         --no-default-features --features telemetry
     else
       cargo build ${jobs[@]+"${jobs[@]}"} \
-        -p openshell-gateway --bin openshell-gateway
+        -p ryno-gateway --bin ryno-gateway
     fi
   else
-    echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
+    echo "Using prebuilt ryno gateway at ${RYNO_GATEWAY_BIN}"
   fi
 
-  if [ -z "${OPENSHELL_BIN:-}" ]; then
-    echo "Building openshell-cli..."
+  if [ -z "${RYNO_BIN:-}" ]; then
+    echo "Building ryno-cli..."
     cargo build ${jobs[@]+"${jobs[@]}"} \
-      -p openshell-cli
+      -p ryno-cli
   else
-    echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
+    echo "Using prebuilt ryno CLI at ${RYNO_BIN}"
   fi
 
   if [ ! -x "${!gateway_var}" ]; then
-    echo "ERROR: expected openshell-gateway binary at ${!gateway_var}" >&2
+    echo "ERROR: expected ryno-gateway binary at ${!gateway_var}" >&2
     exit 1
   fi
   if [ ! -x "${!cli_var}" ]; then
-    echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
+    echo "ERROR: expected ryno CLI binary at ${!cli_var}" >&2
     exit 1
   fi
 }
@@ -451,9 +451,9 @@ e2e_build_external_driver() {
     jobs=(-j "${CARGO_BUILD_JOBS}")
   fi
   target_dir="$(e2e_cargo_target_dir "${root}")"
-  if [ -n "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
-    printf -v "${output_var}" '%s' "${OPENSHELL_EXTERNAL_DRIVER_BIN}"
-    echo "Using prebuilt external driver at ${OPENSHELL_EXTERNAL_DRIVER_BIN}"
+  if [ -n "${RYNO_EXTERNAL_DRIVER_BIN:-}" ]; then
+    printf -v "${output_var}" '%s' "${RYNO_EXTERNAL_DRIVER_BIN}"
+    echo "Using prebuilt external driver at ${RYNO_EXTERNAL_DRIVER_BIN}"
   else
     printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
     echo "Building external ${binary}..."
@@ -513,10 +513,10 @@ e2e_export_gateway_restart_metadata() {
   local log_file=$3
   local pid_file=$4
 
-  export OPENSHELL_E2E_GATEWAY_BIN="${gateway_bin}"
-  export OPENSHELL_E2E_GATEWAY_ARGS_FILE="${args_file}"
-  export OPENSHELL_E2E_GATEWAY_LOG="${log_file}"
-  export OPENSHELL_E2E_GATEWAY_PID_FILE="${pid_file}"
+  export RYNO_E2E_GATEWAY_BIN="${gateway_bin}"
+  export RYNO_E2E_GATEWAY_ARGS_FILE="${args_file}"
+  export RYNO_E2E_GATEWAY_LOG="${log_file}"
+  export RYNO_E2E_GATEWAY_PID_FILE="${pid_file}"
 }
 
 e2e_stop_gateway() {
@@ -527,7 +527,7 @@ e2e_stop_gateway() {
     gateway_pid="$(cat "${gateway_pid_file}" 2>/dev/null || true)"
   fi
   if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
-    echo "Stopping openshell-gateway (pid ${gateway_pid})..."
+    echo "Stopping ryno-gateway (pid ${gateway_pid})..."
     kill "${gateway_pid}" 2>/dev/null || true
 
     # A Rust E2E test may have restarted the gateway and updated the PID file.

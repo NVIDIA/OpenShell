@@ -6,7 +6,7 @@ your local machine through port forwarding.
 
 ## Prerequisites
 
-- A running OpenShell gateway (`mise run gateway:docker` for local development)
+- A running Ryno gateway (`mise run gateway:docker` for local development)
 - Docker or Podman running, matching the gateway driver
 
 ## What's in this example
@@ -22,16 +22,16 @@ your local machine through port forwarding.
 
 ```bash
 # Docker gateway
-docker build -t openshell-byoc:latest examples/bring-your-own-container
-openshell sandbox create \
-    --from openshell-byoc:latest \
+docker build -t ryno-byoc:latest examples/bring-your-own-container
+ryno sandbox create \
+    --from ryno-byoc:latest \
     --forward 8080 \
     -- python /sandbox/app.py
 
 # Podman gateway
-podman build -t localhost/openshell-byoc:latest examples/bring-your-own-container
-openshell sandbox create \
-    --from localhost/openshell-byoc:latest \
+podman build -t localhost/ryno-byoc:latest examples/bring-your-own-container
+ryno sandbox create \
+    --from localhost/ryno-byoc:latest \
     --forward 8080 \
     -- python /sandbox/app.py
 ```
@@ -44,7 +44,7 @@ The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
 machine reaches the REST API inside the sandbox.
 
 **Important:** The image's `CMD` / `ENTRYPOINT` does not run automatically.
-OpenShell replaces it with the sandbox supervisor (which manages SSH access,
+Ryno replaces it with the sandbox supervisor (which manages SSH access,
 network policy, etc.).  You must pass your application's start command
 after `--` so it is executed via SSH once the sandbox is ready.
 
@@ -52,7 +52,7 @@ after `--` so it is executed via SSH once the sandbox is ready.
 
 ```bash
 curl http://localhost:8080/hello
-# {"message": "hello from OpenShell sandbox!"}
+# {"message": "hello from Ryno sandbox!"}
 
 curl http://localhost:8080/hello/world
 # {"message": "hello, world!"}
@@ -82,10 +82,10 @@ key requirements are:
 
 ## How it works
 
-OpenShell handles all the wiring automatically.  You build a standard
-Linux container image — no OpenShell-specific dependencies or
+Ryno handles all the wiring automatically.  You build a standard
+Linux container image — no Ryno-specific dependencies or
 configuration required.  When you create a sandbox with `--from`,
-OpenShell ensures that sandboxing (network policy, filesystem isolation,
+Ryno ensures that sandboxing (network policy, filesystem isolation,
 SSH access) works the same as with the default image.
 
 Port forwarding is entirely client-side: the CLI spawns a background
@@ -97,5 +97,5 @@ bridges the tunnel to `127.0.0.1:<port>` inside the container.
 Delete the sandbox when you're done (this also stops port forwards):
 
 ```bash
-openshell sandbox delete <sandbox-name>
+ryno sandbox delete <sandbox-name>
 ```

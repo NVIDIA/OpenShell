@@ -4,9 +4,9 @@
 //! Authenticated negative-path client for the governance example smoke suite.
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use openshell_core::proto::{
+use ryno_core::proto::{
     GetSandboxConfigRequest, NetworkActivitySummary, PolicyChunk, SubmitPolicyAnalysisRequest,
-    UpdateConfigRequest, open_shell_client::OpenShellClient,
+    UpdateConfigRequest, ryno_client::RynoClient,
 };
 use serde::Serialize;
 use tonic::Code;
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert("authorization", bearer.clone());
         Ok(request)
     };
-    let mut client = OpenShellClient::new(InterceptedService::new(channel, interceptor));
+    let mut client = RynoClient::new(InterceptedService::new(channel, interceptor));
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_result = client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox_name.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace_scope: Some(ryno_core::proto::workspace_selector(
                 "default".to_string(),
             )),
             policy: Some(widened_policy),
@@ -147,9 +147,9 @@ fn mint_sandbox_token(
     gateway_id: &str,
     sandbox_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let identity = format!("openshell-gateway:{gateway_id}");
+    let identity = format!("ryno-gateway:{gateway_id}");
     let claims = SandboxJwtClaims {
-        sub: format!("spiffe://openshell/sandbox/{sandbox_id}"),
+        sub: format!("spiffe://ryno/sandbox/{sandbox_id}"),
         iss: identity.clone(),
         aud: identity,
         iat: 0,

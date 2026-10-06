@@ -5,9 +5,9 @@
 
 set -euo pipefail
 
-readonly SUCCESS_MARKER="OPENSHELL_GPU_WORKLOAD_SUCCESS"
-readonly FAILURE_MARKER="OPENSHELL_GPU_WORKLOAD_FAILURE"
-readonly WORKLOAD_DIR="/usr/local/lib/openshell-gpu-workload"
+readonly SUCCESS_MARKER="RYNO_GPU_WORKLOAD_SUCCESS"
+readonly FAILURE_MARKER="RYNO_GPU_WORKLOAD_FAILURE"
+readonly WORKLOAD_DIR="/usr/local/lib/ryno-gpu-workload"
 
 run_sample() {
   local name=$1

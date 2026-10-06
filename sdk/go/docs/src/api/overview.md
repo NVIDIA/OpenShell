@@ -1,6 +1,6 @@
 # API Overview
 
-The OpenShell Go SDK exposes typed interfaces through the sub-client pattern.
+The Ryno Go SDK exposes typed interfaces through the sub-client pattern.
 You access each interface through a typed accessor on the concrete `Client`.
 
 ## Interface Summary

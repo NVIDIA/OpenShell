@@ -12,15 +12,15 @@
 # Usage:
 #   mise run keycloak:k8s:setup
 #
-# After setup, add deploy/helm/openshell/values-keycloak.yaml to your Helm
+# After setup, add deploy/helm/ryno/values-keycloak.yaml to your Helm
 # release and redeploy:
-#   skaffold dev -f deploy/helm/openshell/skaffold.yaml
+#   skaffold dev -f deploy/helm/ryno/skaffold.yaml
 #   (uncomment values-keycloak.yaml in skaffold.yaml valuesFiles first)
 #
 # To get tokens for the CLI while the cluster is running:
 #   kubectl -n keycloak port-forward svc/keycloak 9090:80
-#   curl -s -X POST http://localhost:9090/realms/openshell/protocol/openid-connect/token \
-#     -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \
+#   curl -s -X POST http://localhost:9090/realms/ryno/protocol/openid-connect/token \
+#     -d 'grant_type=password&client_id=ryno-cli&username=admin@test&password=admin' \
 #     | jq -r .access_token
 
 set -euo pipefail
@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 NAMESPACE="keycloak"
-GATEWAY_NAMESPACE="${OPENSHELL_NAMESPACE:-openshell}"
+GATEWAY_NAMESPACE="${RYNO_NAMESPACE:-ryno}"
 KEYCLOAK_IMAGE="${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:24.0}"
 ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-admin}"
@@ -59,7 +59,7 @@ echo "Creating namespace '${NAMESPACE}'..."
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Applying realm ConfigMap..."
-kubectl -n "${NAMESPACE}" create configmap openshell-realm \
+kubectl -n "${NAMESPACE}" create configmap ryno-realm \
     --from-file=realm.json="${REALM_FILE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
@@ -68,7 +68,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "${TLS_DIR}/ca.key" \
     -out "${TLS_DIR}/ca.crt" \
     -days 30 \
-    -subj "/CN=OpenShell development Keycloak CA" \
+    -subj "/CN=Ryno development Keycloak CA" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     >/dev/null 2>&1
@@ -102,7 +102,7 @@ kubectl -n "${NAMESPACE}" create secret tls keycloak-tls \
 # development trust anchor there as well; rerunning this task rotates both the
 # serving certificate and the trusted copy.
 kubectl create namespace "${GATEWAY_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n "${GATEWAY_NAMESPACE}" create configmap openshell-keycloak-ca \
+kubectl -n "${GATEWAY_NAMESPACE}" create configmap ryno-keycloak-ca \
     --from-file=ca.crt="${TLS_DIR}/ca.crt" \
     --dry-run=client -o yaml | kubectl apply -f -
 
@@ -180,7 +180,7 @@ spec:
       volumes:
         - name: realm
           configMap:
-            name: openshell-realm
+            name: ryno-realm
         - name: tls
           secret:
             secretName: keycloak-tls
@@ -218,26 +218,26 @@ kubectl rollout status deployment/keycloak -n "${NAMESPACE}" --timeout="${HEALTH
 # Summary
 # ---------------------------------------------------------------------------
 
-ISSUER="https://${SVC_HOSTNAME}:443/realms/openshell"
+ISSUER="https://${SVC_HOSTNAME}:443/realms/ryno"
 
 echo ""
 echo "Keycloak is ready."
 echo ""
 echo "  In-cluster issuer:  ${ISSUER}"
-echo "  Helm values file:   deploy/helm/openshell/values-keycloak.yaml"
+echo "  Helm values file:   deploy/helm/ryno/values-keycloak.yaml"
 echo ""
 echo "  To enable OIDC on the gateway, uncomment values-keycloak.yaml in"
-echo "  deploy/helm/openshell/skaffold.yaml and restart skaffold."
+echo "  deploy/helm/ryno/skaffold.yaml and restart skaffold."
 echo ""
 echo "  To get tokens for CLI use, keep a port-forward running:"
 echo "    kubectl -n ${NAMESPACE} port-forward svc/keycloak ${SETUP_PORT}:80"
 echo ""
-echo "  Test users (token endpoint: http://localhost:${SETUP_PORT}/realms/openshell/protocol/openid-connect/token):"
-echo "    admin@test / admin  (role: openshell-admin)"
-echo "    user@test  / user   (role: openshell-user)"
+echo "  Test users (token endpoint: http://localhost:${SETUP_PORT}/realms/ryno/protocol/openid-connect/token):"
+echo "    admin@test / admin  (role: ryno-admin)"
+echo "    user@test  / user   (role: ryno-user)"
 echo ""
 echo "  Get a token:"
-echo "    curl -s -X POST http://localhost:${SETUP_PORT}/realms/openshell/protocol/openid-connect/token \\"
-echo "      -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \\"
+echo "    curl -s -X POST http://localhost:${SETUP_PORT}/realms/ryno/protocol/openid-connect/token \\"
+echo "      -d 'grant_type=password&client_id=ryno-cli&username=admin@test&password=admin' \\"
 echo "      | jq -r .access_token"
 echo ""

@@ -10,7 +10,7 @@
 package datamodelv1
 
 import (
-	_ "github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1"
+	_ "github.com/NVIDIA/Ryno/sdk/go/proto/optionsv1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -205,7 +205,7 @@ func (*AllWorkspaces) Descriptor() ([]byte, []int) {
 	return file_datamodel_proto_rawDescGZIP(), []int{1}
 }
 
-// Kubernetes-style metadata shared by all top-level OpenShell domain objects.
+// Kubernetes-style metadata shared by all top-level Ryno domain objects.
 //
 // This structure provides consistent metadata (identity, labels, annotations,
 // timestamps, resource versioning) across Sandbox, Provider, SshSession, and
@@ -327,7 +327,7 @@ func (x *ObjectMeta) GetDeletionTime() *timestamppb.Timestamp {
 // Status of a workspace.
 type WorkspaceStatus struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Phase         WorkspacePhase         `protobuf:"varint,1,opt,name=phase,proto3,enum=openshell.datamodel.v1.WorkspacePhase" json:"phase,omitempty"`
+	Phase         WorkspacePhase         `protobuf:"varint,1,opt,name=phase,proto3,enum=ryno.datamodel.v1.WorkspacePhase" json:"phase,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -428,7 +428,7 @@ func (x *Workspace) GetStatus() *WorkspaceStatus {
 }
 
 // Opaque handle for a provider credential stored by gateway credential storage.
-// Handles are created by OpenShell and must not be authored by users.
+// Handles are created by Ryno and must not be authored by users.
 type CredentialHandle struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Internal storage owner or credential driver that owns this handle.
@@ -492,7 +492,7 @@ func (x *CredentialHandle) GetMetadata() map[string]string {
 	return nil
 }
 
-// Provider model stored by OpenShell.
+// Provider model stored by Ryno.
 type Provider struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Kubernetes-style metadata (id, name, labels, timestamps, resource version).
@@ -601,20 +601,20 @@ var File_datamodel_proto protoreflect.FileDescriptor
 
 const file_datamodel_proto_rawDesc = "" +
 	"\n" +
-	"\x0fdatamodel.proto\x12\x16openshell.datamodel.v1\x1a\roptions.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x90\x01\n" +
+	"\x0fdatamodel.proto\x12\x11ryno.datamodel.v1\x1a\roptions.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8b\x01\n" +
 	"\x11WorkspaceSelector\x12\x1e\n" +
-	"\tworkspace\x18\x01 \x01(\tH\x00R\tworkspace\x12N\n" +
-	"\x0eall_workspaces\x18\x02 \x01(\v2%.openshell.datamodel.v1.AllWorkspacesH\x00R\rallWorkspacesB\v\n" +
+	"\tworkspace\x18\x01 \x01(\tH\x00R\tworkspace\x12I\n" +
+	"\x0eall_workspaces\x18\x02 \x01(\v2 .ryno.datamodel.v1.AllWorkspacesH\x00R\rallWorkspacesB\v\n" +
 	"\tselection\"\x0f\n" +
-	"\rAllWorkspaces\"\xc5\x04\n" +
+	"\rAllWorkspaces\"\xbb\x04\n" +
 	"\n" +
 	"ObjectMeta\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12=\n" +
-	"\fcreated_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\vcreatedTime\x12F\n" +
-	"\x06labels\x18\x04 \x03(\v2..openshell.datamodel.v1.ObjectMeta.LabelsEntryR\x06labels\x12)\n" +
-	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\x12U\n" +
-	"\vannotations\x18\x06 \x03(\v23.openshell.datamodel.v1.ObjectMeta.AnnotationsEntryR\vannotations\x12\x1c\n" +
+	"\fcreated_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\vcreatedTime\x12A\n" +
+	"\x06labels\x18\x04 \x03(\v2).ryno.datamodel.v1.ObjectMeta.LabelsEntryR\x06labels\x12)\n" +
+	"\x10resource_version\x18\x05 \x01(\x04R\x0fresourceVersion\x12P\n" +
+	"\vannotations\x18\x06 \x03(\v2..ryno.datamodel.v1.ObjectMeta.AnnotationsEntryR\vannotations\x12\x1c\n" +
 	"\tworkspace\x18\a \x01(\tR\tworkspace\x12?\n" +
 	"\rdeletion_time\x18l \x01(\v2\x1a.google.protobuf.TimestampR\fdeletionTime\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
@@ -622,27 +622,27 @@ const file_datamodel_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
 	"\x10AnnotationsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x03\x10\x04J\x04\b\b\x10\tR\rcreated_at_msR\x15deletion_timestamp_ms\"O\n" +
-	"\x0fWorkspaceStatus\x12<\n" +
-	"\x05phase\x18\x01 \x01(\x0e2&.openshell.datamodel.v1.WorkspacePhaseR\x05phase\"\x8c\x01\n" +
-	"\tWorkspace\x12>\n" +
-	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12?\n" +
-	"\x06status\x18\x02 \x01(\v2'.openshell.datamodel.v1.WorkspaceStatusR\x06status\"\xd3\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x03\x10\x04J\x04\b\b\x10\tR\rcreated_at_msR\x15deletion_timestamp_ms\"J\n" +
+	"\x0fWorkspaceStatus\x127\n" +
+	"\x05phase\x18\x01 \x01(\x0e2!.ryno.datamodel.v1.WorkspacePhaseR\x05phase\"\x82\x01\n" +
+	"\tWorkspace\x129\n" +
+	"\bmetadata\x18\x01 \x01(\v2\x1d.ryno.datamodel.v1.ObjectMetaR\bmetadata\x12:\n" +
+	"\x06status\x18\x02 \x01(\v2\".ryno.datamodel.v1.WorkspaceStatusR\x06status\"\xce\x01\n" +
 	"\x10CredentialHandle\x12\x16\n" +
 	"\x06driver\x18\x01 \x01(\tR\x06driver\x12\x16\n" +
-	"\x06handle\x18\x02 \x01(\tR\x06handle\x12R\n" +
-	"\bmetadata\x18\x03 \x03(\v26.openshell.datamodel.v1.CredentialHandle.MetadataEntryR\bmetadata\x1a;\n" +
+	"\x06handle\x18\x02 \x01(\tR\x06handle\x12M\n" +
+	"\bmetadata\x18\x03 \x03(\v21.ryno.datamodel.v1.CredentialHandle.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8a\a\n" +
-	"\bProvider\x12>\n" +
-	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12Y\n" +
-	"\vcredentials\x18\x03 \x03(\v21.openshell.datamodel.v1.Provider.CredentialsEntryB\x04\x88\xb5\x18\x01R\vcredentials\x12D\n" +
-	"\x06config\x18\x04 \x03(\v2,.openshell.datamodel.v1.Provider.ConfigEntryR\x06config\x12\x7f\n" +
-	"\x1bcredential_expiration_times\x18i \x03(\v2?.openshell.datamodel.v1.Provider.CredentialExpirationTimesEntryR\x19credentialExpirationTimes\x12+\n" +
-	"\x11profile_workspace\x18\x06 \x01(\tR\x10profileWorkspace\x12f\n" +
-	"\x12credential_handles\x18\a \x03(\v27.openshell.datamodel.v1.Provider.CredentialHandlesEntryR\x11credentialHandles\x1a>\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xec\x06\n" +
+	"\bProvider\x129\n" +
+	"\bmetadata\x18\x01 \x01(\v2\x1d.ryno.datamodel.v1.ObjectMetaR\bmetadata\x12\x12\n" +
+	"\x04type\x18\x02 \x01(\tR\x04type\x12T\n" +
+	"\vcredentials\x18\x03 \x03(\v2,.ryno.datamodel.v1.Provider.CredentialsEntryB\x04\x88\xb5\x18\x01R\vcredentials\x12?\n" +
+	"\x06config\x18\x04 \x03(\v2'.ryno.datamodel.v1.Provider.ConfigEntryR\x06config\x12z\n" +
+	"\x1bcredential_expiration_times\x18i \x03(\v2:.ryno.datamodel.v1.Provider.CredentialExpirationTimesEntryR\x19credentialExpirationTimes\x12+\n" +
+	"\x11profile_workspace\x18\x06 \x01(\tR\x10profileWorkspace\x12a\n" +
+	"\x12credential_handles\x18\a \x03(\v22.ryno.datamodel.v1.Provider.CredentialHandlesEntryR\x11credentialHandles\x1a>\n" +
 	"\x10CredentialsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
@@ -651,10 +651,10 @@ const file_datamodel_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1ah\n" +
 	"\x1eCredentialExpirationTimesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x120\n" +
-	"\x05value\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x05value:\x028\x01\x1an\n" +
+	"\x05value\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x05value:\x028\x01\x1ai\n" +
 	"\x16CredentialHandlesEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12>\n" +
-	"\x05value\x18\x02 \x01(\v2(.openshell.datamodel.v1.CredentialHandleR\x05value:\x028\x01J\x04\b\x05\x10\x06R\x18credential_expires_at_ms*n\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x129\n" +
+	"\x05value\x18\x02 \x01(\v2#.ryno.datamodel.v1.CredentialHandleR\x05value:\x028\x01J\x04\b\x05\x10\x06R\x18credential_expires_at_ms*n\n" +
 	"\x0eWorkspacePhase\x12\x1f\n" +
 	"\x1bWORKSPACE_PHASE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16WORKSPACE_PHASE_ACTIVE\x10\x01\x12\x1f\n" +
@@ -675,40 +675,40 @@ func file_datamodel_proto_rawDescGZIP() []byte {
 var file_datamodel_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_datamodel_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_datamodel_proto_goTypes = []any{
-	(WorkspacePhase)(0),           // 0: openshell.datamodel.v1.WorkspacePhase
-	(*WorkspaceSelector)(nil),     // 1: openshell.datamodel.v1.WorkspaceSelector
-	(*AllWorkspaces)(nil),         // 2: openshell.datamodel.v1.AllWorkspaces
-	(*ObjectMeta)(nil),            // 3: openshell.datamodel.v1.ObjectMeta
-	(*WorkspaceStatus)(nil),       // 4: openshell.datamodel.v1.WorkspaceStatus
-	(*Workspace)(nil),             // 5: openshell.datamodel.v1.Workspace
-	(*CredentialHandle)(nil),      // 6: openshell.datamodel.v1.CredentialHandle
-	(*Provider)(nil),              // 7: openshell.datamodel.v1.Provider
-	nil,                           // 8: openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	nil,                           // 9: openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	nil,                           // 10: openshell.datamodel.v1.CredentialHandle.MetadataEntry
-	nil,                           // 11: openshell.datamodel.v1.Provider.CredentialsEntry
-	nil,                           // 12: openshell.datamodel.v1.Provider.ConfigEntry
-	nil,                           // 13: openshell.datamodel.v1.Provider.CredentialExpirationTimesEntry
-	nil,                           // 14: openshell.datamodel.v1.Provider.CredentialHandlesEntry
+	(WorkspacePhase)(0),           // 0: ryno.datamodel.v1.WorkspacePhase
+	(*WorkspaceSelector)(nil),     // 1: ryno.datamodel.v1.WorkspaceSelector
+	(*AllWorkspaces)(nil),         // 2: ryno.datamodel.v1.AllWorkspaces
+	(*ObjectMeta)(nil),            // 3: ryno.datamodel.v1.ObjectMeta
+	(*WorkspaceStatus)(nil),       // 4: ryno.datamodel.v1.WorkspaceStatus
+	(*Workspace)(nil),             // 5: ryno.datamodel.v1.Workspace
+	(*CredentialHandle)(nil),      // 6: ryno.datamodel.v1.CredentialHandle
+	(*Provider)(nil),              // 7: ryno.datamodel.v1.Provider
+	nil,                           // 8: ryno.datamodel.v1.ObjectMeta.LabelsEntry
+	nil,                           // 9: ryno.datamodel.v1.ObjectMeta.AnnotationsEntry
+	nil,                           // 10: ryno.datamodel.v1.CredentialHandle.MetadataEntry
+	nil,                           // 11: ryno.datamodel.v1.Provider.CredentialsEntry
+	nil,                           // 12: ryno.datamodel.v1.Provider.ConfigEntry
+	nil,                           // 13: ryno.datamodel.v1.Provider.CredentialExpirationTimesEntry
+	nil,                           // 14: ryno.datamodel.v1.Provider.CredentialHandlesEntry
 	(*timestamppb.Timestamp)(nil), // 15: google.protobuf.Timestamp
 }
 var file_datamodel_proto_depIdxs = []int32{
-	2,  // 0: openshell.datamodel.v1.WorkspaceSelector.all_workspaces:type_name -> openshell.datamodel.v1.AllWorkspaces
-	15, // 1: openshell.datamodel.v1.ObjectMeta.created_time:type_name -> google.protobuf.Timestamp
-	8,  // 2: openshell.datamodel.v1.ObjectMeta.labels:type_name -> openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	9,  // 3: openshell.datamodel.v1.ObjectMeta.annotations:type_name -> openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	15, // 4: openshell.datamodel.v1.ObjectMeta.deletion_time:type_name -> google.protobuf.Timestamp
-	0,  // 5: openshell.datamodel.v1.WorkspaceStatus.phase:type_name -> openshell.datamodel.v1.WorkspacePhase
-	3,  // 6: openshell.datamodel.v1.Workspace.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	4,  // 7: openshell.datamodel.v1.Workspace.status:type_name -> openshell.datamodel.v1.WorkspaceStatus
-	10, // 8: openshell.datamodel.v1.CredentialHandle.metadata:type_name -> openshell.datamodel.v1.CredentialHandle.MetadataEntry
-	3,  // 9: openshell.datamodel.v1.Provider.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	11, // 10: openshell.datamodel.v1.Provider.credentials:type_name -> openshell.datamodel.v1.Provider.CredentialsEntry
-	12, // 11: openshell.datamodel.v1.Provider.config:type_name -> openshell.datamodel.v1.Provider.ConfigEntry
-	13, // 12: openshell.datamodel.v1.Provider.credential_expiration_times:type_name -> openshell.datamodel.v1.Provider.CredentialExpirationTimesEntry
-	14, // 13: openshell.datamodel.v1.Provider.credential_handles:type_name -> openshell.datamodel.v1.Provider.CredentialHandlesEntry
-	15, // 14: openshell.datamodel.v1.Provider.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
-	6,  // 15: openshell.datamodel.v1.Provider.CredentialHandlesEntry.value:type_name -> openshell.datamodel.v1.CredentialHandle
+	2,  // 0: ryno.datamodel.v1.WorkspaceSelector.all_workspaces:type_name -> ryno.datamodel.v1.AllWorkspaces
+	15, // 1: ryno.datamodel.v1.ObjectMeta.created_time:type_name -> google.protobuf.Timestamp
+	8,  // 2: ryno.datamodel.v1.ObjectMeta.labels:type_name -> ryno.datamodel.v1.ObjectMeta.LabelsEntry
+	9,  // 3: ryno.datamodel.v1.ObjectMeta.annotations:type_name -> ryno.datamodel.v1.ObjectMeta.AnnotationsEntry
+	15, // 4: ryno.datamodel.v1.ObjectMeta.deletion_time:type_name -> google.protobuf.Timestamp
+	0,  // 5: ryno.datamodel.v1.WorkspaceStatus.phase:type_name -> ryno.datamodel.v1.WorkspacePhase
+	3,  // 6: ryno.datamodel.v1.Workspace.metadata:type_name -> ryno.datamodel.v1.ObjectMeta
+	4,  // 7: ryno.datamodel.v1.Workspace.status:type_name -> ryno.datamodel.v1.WorkspaceStatus
+	10, // 8: ryno.datamodel.v1.CredentialHandle.metadata:type_name -> ryno.datamodel.v1.CredentialHandle.MetadataEntry
+	3,  // 9: ryno.datamodel.v1.Provider.metadata:type_name -> ryno.datamodel.v1.ObjectMeta
+	11, // 10: ryno.datamodel.v1.Provider.credentials:type_name -> ryno.datamodel.v1.Provider.CredentialsEntry
+	12, // 11: ryno.datamodel.v1.Provider.config:type_name -> ryno.datamodel.v1.Provider.ConfigEntry
+	13, // 12: ryno.datamodel.v1.Provider.credential_expiration_times:type_name -> ryno.datamodel.v1.Provider.CredentialExpirationTimesEntry
+	14, // 13: ryno.datamodel.v1.Provider.credential_handles:type_name -> ryno.datamodel.v1.Provider.CredentialHandlesEntry
+	15, // 14: ryno.datamodel.v1.Provider.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
+	6,  // 15: ryno.datamodel.v1.Provider.CredentialHandlesEntry.value:type_name -> ryno.datamodel.v1.CredentialHandle
 	16, // [16:16] is the sub-list for method output_type
 	16, // [16:16] is the sub-list for method input_type
 	16, // [16:16] is the sub-list for extension type_name

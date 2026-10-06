@@ -3,20 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OpenShift"
 sidebar-title: "OpenShift"
-description: "Install the OpenShell Helm chart on OpenShift with capability-free sandbox workloads."
+description: "Install the Ryno Helm chart on OpenShift with capability-free sandbox workloads."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
 position: 7
 ---
 
 The Kubernetes driver resolves the UID range assigned to each OpenShift
 namespace and renders the sandbox and supervisor with a numeric non-root
-identity from that range. OpenShell does not require the `privileged` SCC or any
+identity from that range. Ryno does not require the `privileged` SCC or any
 added Linux capability.
 
 <Warning>
 Verify that the selected OpenShift runtime profile permits an unprivileged
 process to install a nested seccomp user-notification filter and use Landlock.
-OpenShell fails sandbox startup when either capability-free runtime probe fails.
+Ryno fails sandbox startup when either capability-free runtime probe fails.
 </Warning>
 
 ## Node kernel and legacy read-only mode
@@ -43,21 +43,21 @@ in the sandbox qualification output.
 
 <Warning>
 Your cluster MUST enforce ingress and egress `NetworkPolicy` in every sandbox
-namespace. OpenShell creates the policies, but Kubernetes does not verify that
+namespace. Ryno creates the policies, but Kubernetes does not verify that
 the CNI applies them. Without enforcement, sandbox workloads may bypass
 supervisor network policy through direct connections.
 </Warning>
 
-## Install OpenShell
+## Install Ryno
 
 Pre-create the namespace, then install the chart. Keep the default restricted
 security posture.
 
 ```shell
-oc create ns openshell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+oc create ns ryno
+helm install ryno oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell
+  --namespace ryno
 ```
 
 The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and
@@ -68,19 +68,19 @@ Linux capabilities, and uses `RuntimeDefault` seccomp.
 Wait for the gateway:
 
 ```shell
-oc -n openshell rollout status statefulset/openshell
+oc -n ryno rollout status statefulset/ryno
 ```
 
-If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
+If you set `workload.kind=deployment`, wait for `deployment/ryno` instead.
 
 ## Connect to the Gateway
 
 Forward the gateway port for local evaluation:
 
 ```shell
-oc -n openshell port-forward svc/openshell 8080:8080
-openshell gateway add https://127.0.0.1:8080 --local --name openshift
-openshell status
+oc -n ryno port-forward svc/ryno 8080:8080
+ryno gateway add https://127.0.0.1:8080 --local --name openshift
+ryno status
 ```
 
 ## Options for end-to-end TLS
@@ -89,10 +89,10 @@ The steps above run the gateway over plaintext HTTP for quick evaluation. For pr
 
 ### End-to-end TLS using Gateway API and BackendTLSPolicy (OpenShift 4.22+)
 
-OpenShift 4.22 and later support `BackendTLSPolicy` in the Gateway API, enabling end-to-end TLS between the OpenShift router and the OpenShell gateway pod. The traffic flow is:
+OpenShift 4.22 and later support `BackendTLSPolicy` in the Gateway API, enabling end-to-end TLS between the OpenShift router and the Ryno gateway pod. The traffic flow is:
 
 ```text
-client → HTTPS → OpenShift Gateway (terminate TLS) → TLS (re-encrypt) → openshell gateway pod
+client → HTTPS → OpenShift Gateway (terminate TLS) → TLS (re-encrypt) → ryno gateway pod
 ```
 
 This removes the requirement to run the gateway with `server.disableTls=true`. The OpenShift router terminates client-facing TLS at the listener and re-encrypts when connecting to the backend service, validating the backend's certificate against a CA you provide.
@@ -120,14 +120,14 @@ EOF
 
 #### Create the Gateway
 
-Create a Gateway resource in the `openshift-ingress` namespace. Replace `<external-hostname>` with your cluster's route hostname (typically a wildcard like `*.openshell-ingress-gw.example.com`):
+Create a Gateway resource in the `openshift-ingress` namespace. Replace `<external-hostname>` with your cluster's route hostname (typically a wildcard like `*.ryno-ingress-gw.example.com`):
 
 ```shell
 oc apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: openshell-gateway
+  name: ryno-gateway
   namespace: openshift-ingress
 spec:
   gatewayClassName: openshift-default
@@ -146,7 +146,7 @@ spec:
           from: Selector
           selector:
             matchLabels:
-              kubernetes.io/metadata.name: openshell
+              kubernetes.io/metadata.name: ryno
 EOF
 ```
 
@@ -157,19 +157,19 @@ The listener TLS Secret should contain the certificate for the external hostname
 Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen hook automatically creates the backend CA ConfigMap from the generated PKI bundle:
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install ryno oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
   --set server.tls.enableMtls=false \
   --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.name=openshell-gateway \
+  --set grpcRoute.gateway.name=ryno-gateway \
   --set grpcRoute.gateway.namespace=openshift-ingress \
   --set 'grpcRoute.hostnames[0]=gateway.example.com' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli
+  --set server.oidc.issuer=https://keycloak.example.com/realms/ryno \
+  --set server.oidc.audience=ryno-cli
 ```
 
 | Override | Reason |
@@ -190,11 +190,11 @@ If cert-manager takes longer than 120 seconds to issue certificates, increase th
 #### Register over HTTPS
 
 ```shell
-openshell gateway add https://gateway.example.com \
+ryno gateway add https://gateway.example.com \
   --name openshift \
-  --oidc-issuer https://keycloak.example.com/realms/openshell \
-  --oidc-client-id openshell-cli
-openshell status
+  --oidc-issuer https://keycloak.example.com/realms/ryno \
+  --oidc-client-id ryno-cli
+ryno status
 ```
 
 ### End-to-end TLS using pass-through Route (all OpenShift versions)
@@ -209,9 +209,9 @@ CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
 Install the chart with:
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+helm install ryno oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
   --set server.disableTls=false \
@@ -221,8 +221,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set certManager.serverDnsNames[0]=gateway.example.com \
   --set openshiftRoute.enabled=true \
   --set openshiftRoute.host=gateway.example.com \
-  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli
+  --set server.oidc.issuer=https://keycloak.example.com/realms/ryno \
+  --set server.oidc.audience=ryno-cli
 ```
 
 | Override | Reason |
@@ -235,11 +235,11 @@ Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
 users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
 
 ```shell
-openshell gateway add https://gateway.example.com \
+ryno gateway add https://gateway.example.com \
   --name openshift \
-  --oidc-issuer https://keycloak.example.com/realms/openshell \
-  --oidc-client-id openshell-cli
-openshell gateway login openshift
+  --oidc-issuer https://keycloak.example.com/realms/ryno \
+  --oidc-client-id ryno-cli
+ryno gateway login openshift
 ```
 
 ## Next Steps

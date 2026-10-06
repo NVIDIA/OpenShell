@@ -10,7 +10,7 @@ require_env() {
     [[ -n "${!name:-}" ]] || { echo "missing required env: $name" >&2; exit 1; }
 }
 
-require_env OPENSHELL_AGENT_HARNESS
+require_env RYNO_AGENT_HARNESS
 
 RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD_DIR="$(cd "$RUNTIME_DIR/.." && pwd)"

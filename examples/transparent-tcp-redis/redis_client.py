@@ -9,9 +9,9 @@ import ipaddress
 import socket
 import sys
 
-HOST = "redis.openshell.demo"
+HOST = "redis.ryno.demo"
 PORT = 6379
-KEY = "openshell:transparent-tcp-demo"
+KEY = "ryno:transparent-tcp-demo"
 
 
 def encode_command(*parts: str) -> bytes:
@@ -88,8 +88,8 @@ def main() -> None:
         connection.makefile("rb") as stream,
     ):
         assert command(connection, stream, "PING") == "PONG"
-        assert command(connection, stream, "SET", KEY, "hello-from-openshell") == "OK"
-        assert command(connection, stream, "GET", KEY) == "hello-from-openshell"
+        assert command(connection, stream, "SET", KEY, "hello-from-ryno") == "OK"
+        assert command(connection, stream, "GET", KEY) == "hello-from-ryno"
         assert command(connection, stream, "DEL", KEY) == 1
 
     print("\nChecking connections that policy must block...")

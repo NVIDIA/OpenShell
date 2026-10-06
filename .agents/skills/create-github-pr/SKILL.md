@@ -19,8 +19,8 @@ Create pull requests on GitHub using the `gh` CLI.
 
 ### Check Config Documentation
 
-If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
-`[openshell.drivers.<name>]` fields, driver config defaults, or Helm rendering
+If the branch changes gateway TOML parsing, `[ryno.gateway]` fields,
+`[ryno.drivers.<name>]` fields, driver config defaults, or Helm rendering
 of `gateway.toml`, verify that `docs/how-it-works/gateways/configuration.mdx` is updated
 in the same branch. If the change affects user-facing compute-driver setup,
 also update `docs/how-it-works/sandboxes/runtimes.mdx` or the relevant
@@ -177,7 +177,7 @@ gh pr create \
   --body "$(cat <<'EOF'
 ## Summary
 
-Add `--page-size` and `--page-token` flags to `openshell sandbox list` for continuation-token pagination.
+Add `--page-size` and `--page-token` flags to `ryno sandbox list` for continuation-token pagination.
 
 ## Related Issue
 

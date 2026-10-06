@@ -81,7 +81,7 @@ env:
 
 jobs:
   scan:
-    name: ${{ inputs.fail-on-findings && 'OpenShell / Trivy' || 'OpenShell / Trivy (informational)' }}
+    name: ${{ inputs.fail-on-findings && 'Ryno / Trivy' || 'Ryno / Trivy (informational)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:

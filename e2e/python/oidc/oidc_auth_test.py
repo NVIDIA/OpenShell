@@ -4,11 +4,11 @@
 """End-to-end tests for OIDC authentication, RBAC, and scope enforcement.
 
 These tests require:
-- A running K3s cluster with OIDC enabled (OPENSHELL_OIDC_ISSUER set)
-- A running Keycloak instance with the openshell realm
-- The cluster started with OPENSHELL_OIDC_SCOPES_CLAIM=scope
+- A running K3s cluster with OIDC enabled (RYNO_OIDC_ISSUER set)
+- A running Keycloak instance with the ryno realm
+- The cluster started with RYNO_OIDC_SCOPES_CLAIM=scope
 
-Skip condition: set OPENSHELL_E2E_OIDC=1 to enable these tests.
+Skip condition: set RYNO_E2E_OIDC=1 to enable these tests.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from pathlib import Path
 import grpc
 import pytest
 
-from openshell import ClientCredentialsAuth, SandboxClient, TlsConfig
-from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
+from ryno import ClientCredentialsAuth, SandboxClient, TlsConfig
+from ryno._proto import datamodel_pb2, ryno_pb2, ryno_pb2_grpc
 
 from .helpers import (
     KEYCLOAK_REALM,
@@ -36,8 +36,8 @@ from .helpers import (
 )
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("OPENSHELL_E2E_OIDC") != "1",
-    reason="OIDC e2e tests disabled (set OPENSHELL_E2E_OIDC=1)",
+    os.environ.get("RYNO_E2E_OIDC") != "1",
+    reason="OIDC e2e tests disabled (set RYNO_E2E_OIDC=1)",
 )
 
 
@@ -48,9 +48,9 @@ class TestRbac:
     """Test role-based access control."""
 
     def test_admin_can_create_provider(self) -> None:
-        token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        token = get_token("admin@test", "admin", scopes="openid ryno:all")
         stub, metadata = stub_with_token(token)
-        req = openshell_pb2.CreateProviderRequest(
+        req = ryno_pb2.CreateProviderRequest(
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
@@ -68,7 +68,7 @@ class TestRbac:
         finally:
             with contextlib.suppress(grpc.RpcError):
                 stub.DeleteProvider(
-                    openshell_pb2.DeleteProviderRequest(
+                    ryno_pb2.DeleteProviderRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
@@ -78,9 +78,9 @@ class TestRbac:
                 )
 
     def test_user_cannot_create_provider(self) -> None:
-        token = get_token("user@test", "user", scopes="openid openshell:all")
+        token = get_token("user@test", "user", scopes="openid ryno:all")
         stub, metadata = stub_with_token(token)
-        req = openshell_pb2.CreateProviderRequest(
+        req = ryno_pb2.CreateProviderRequest(
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
@@ -93,26 +93,26 @@ class TestRbac:
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
 
     def test_user_can_list_sandboxes(self) -> None:
-        admin_token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        admin_token = get_token("admin@test", "admin", scopes="openid ryno:all")
         admin_stub, admin_md = stub_with_token(admin_token)
-        user_token = get_token("user@test", "user", scopes="openid openshell:all")
+        user_token = get_token("user@test", "user", scopes="openid ryno:all")
         user_sub = extract_sub(user_token)
         user_stub, user_md = stub_with_token(user_token)
 
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
-                openshell_pb2.AddWorkspaceMemberRequest(
+                ryno_pb2.AddWorkspaceMemberRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
                     principal_subject=user_sub,
-                    role=openshell_pb2.WORKSPACE_ROLE_USER,
+                    role=ryno_pb2.WORKSPACE_ROLE_USER,
                 ),
                 metadata=admin_md,
             )
         try:
             user_stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(
+                ryno_pb2.ListSandboxesRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=user_md,
@@ -120,7 +120,7 @@ class TestRbac:
         finally:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
-                    openshell_pb2.RemoveWorkspaceMemberRequest(
+                    ryno_pb2.RemoveWorkspaceMemberRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
@@ -131,10 +131,10 @@ class TestRbac:
 
     def test_request_without_bearer_token_rejected(self) -> None:
         channel = grpc_channel()
-        stub = openshell_pb2_grpc.OpenShellStub(channel)
+        stub = ryno_pb2_grpc.RynoStub(channel)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(
+                ryno_pb2.ListSandboxesRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 )
             )
@@ -145,9 +145,9 @@ class TestRbac:
 
     def test_health_does_not_require_auth(self) -> None:
         channel = grpc_channel()
-        stub = openshell_pb2_grpc.OpenShellStub(channel)
-        resp = stub.Health(openshell_pb2.HealthRequest())
-        assert resp.status == openshell_pb2.SERVICE_STATUS_HEALTHY
+        stub = ryno_pb2_grpc.RynoStub(channel)
+        resp = stub.Health(ryno_pb2.HealthRequest())
+        assert resp.status == ryno_pb2.SERVICE_STATUS_HEALTHY
 
 
 # ── Scope Enforcement Tests ──────────────────────────────────────────
@@ -157,12 +157,12 @@ class TestScopes:
     """Test scope-based fine-grained permissions.
 
     These tests require the server to be started with
-    OPENSHELL_OIDC_SCOPES_CLAIM=scope.
+    RYNO_OIDC_SCOPES_CLAIM=scope.
     """
 
     pytestmark = pytest.mark.skipif(
-        os.environ.get("OPENSHELL_E2E_OIDC_SCOPES") != "1",
-        reason="Scope e2e tests disabled (set OPENSHELL_E2E_OIDC_SCOPES=1)",
+        os.environ.get("RYNO_E2E_OIDC_SCOPES") != "1",
+        reason="Scope e2e tests disabled (set RYNO_E2E_OIDC_SCOPES=1)",
     )
 
     def test_sandbox_scoped_token_can_list_sandboxes(self) -> None:
@@ -171,7 +171,7 @@ class TestScopes:
         )
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(
+            ryno_pb2.ListSandboxesRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
@@ -184,7 +184,7 @@ class TestScopes:
         stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListProviders(
-                openshell_pb2.ListProvidersRequest(
+                ryno_pb2.ListProvidersRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
@@ -192,28 +192,28 @@ class TestScopes:
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
         assert "provider:read" in exc_info.value.details()
 
-    def test_openshell_all_grants_full_access(self) -> None:
-        token = get_token("admin@test", "admin", scopes="openid openshell:all")
+    def test_ryno_all_grants_full_access(self) -> None:
+        token = get_token("admin@test", "admin", scopes="openid ryno:all")
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(
+            ryno_pb2.ListSandboxesRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
         stub.ListProviders(
-            openshell_pb2.ListProvidersRequest(
+            ryno_pb2.ListProvidersRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
 
-    def test_no_openshell_scopes_denied(self) -> None:
+    def test_no_ryno_scopes_denied(self) -> None:
         token = get_token("admin@test", "admin")
         stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(
+                ryno_pb2.ListSandboxesRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
@@ -228,11 +228,11 @@ class TestClientCredentials:
     """Test CI/automation client credentials flow."""
 
     def test_ci_token_can_list_sandboxes(self) -> None:
-        admin_token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        admin_token = get_token("admin@test", "admin", scopes="openid ryno:all")
         admin_stub, admin_md = stub_with_token(admin_token)
         auth = ClientCredentialsAuth(
             issuer=f"{keycloak_url()}/realms/{KEYCLOAK_REALM}",
-            client_id="openshell-ci",
+            client_id="ryno-ci",
             client_secret="ci-test-secret",
         )
         ci_token = auth()
@@ -242,7 +242,7 @@ class TestClientCredentials:
         target = f"{parsed.hostname}:{parsed.port or (443 if is_tls else 80)}"
         tls = None
         if is_tls:
-            if ca_path := os.environ.get("OPENSHELL_E2E_GATEWAY_CA_CERT"):
+            if ca_path := os.environ.get("RYNO_E2E_GATEWAY_CA_CERT"):
                 tls = TlsConfig(ca_path=Path(ca_path))
             else:
                 mtls = _mtls_dir()
@@ -255,12 +255,12 @@ class TestClientCredentials:
 
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
-                openshell_pb2.AddWorkspaceMemberRequest(
+                ryno_pb2.AddWorkspaceMemberRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
                     principal_subject=ci_sub,
-                    role=openshell_pb2.WORKSPACE_ROLE_USER,
+                    role=ryno_pb2.WORKSPACE_ROLE_USER,
                 ),
                 metadata=admin_md,
             )
@@ -270,7 +270,7 @@ class TestClientCredentials:
             ci_client.close()
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
-                    openshell_pb2.RemoveWorkspaceMemberRequest(
+                    ryno_pb2.RemoveWorkspaceMemberRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),

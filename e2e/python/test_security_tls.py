@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
+from ryno._proto import datamodel_pb2, ryno_pb2, ryno_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,17 +35,17 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_cluster_name() -> str:
-    if os.environ.get("OPENSHELL_GATEWAY_ENDPOINT"):
-        return os.environ.get("OPENSHELL_GATEWAY", "openshell-e2e-endpoint")
-    env_cluster = os.environ.get("OPENSHELL_GATEWAY")
+    if os.environ.get("RYNO_GATEWAY_ENDPOINT"):
+        return os.environ.get("RYNO_GATEWAY", "ryno-e2e-endpoint")
+    env_cluster = os.environ.get("RYNO_GATEWAY")
     if env_cluster:
         return env_cluster
-    active_file = _xdg_config_home() / "openshell" / "active_gateway"
+    active_file = _xdg_config_home() / "ryno" / "active_gateway"
     return active_file.read_text().strip()
 
 
 def _cluster_metadata(cluster_name: str) -> dict:
-    endpoint = os.environ.get("OPENSHELL_GATEWAY_ENDPOINT")
+    endpoint = os.environ.get("RYNO_GATEWAY_ENDPOINT")
     if endpoint:
         return {
             "name": cluster_name,
@@ -53,13 +53,13 @@ def _cluster_metadata(cluster_name: str) -> dict:
             "auth_mode": "plaintext",
         }
     metadata_path = (
-        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
+        _xdg_config_home() / "ryno" / "gateways" / cluster_name / "metadata.json"
     )
     return json.loads(metadata_path.read_text())
 
 
 def _mtls_dir(cluster_name: str) -> pathlib.Path:
-    return _xdg_config_home() / "openshell" / "gateways" / cluster_name / "mtls"
+    return _xdg_config_home() / "ryno" / "gateways" / cluster_name / "mtls"
 
 
 def _generate_self_signed_cert(
@@ -107,7 +107,7 @@ def cluster_name() -> str:
 
 @pytest.fixture(scope="session")
 def server_endpoint(cluster_name: str) -> tuple[str, int, str]:
-    """Return (host, port, scheme) for the OpenShell server."""
+    """Return (host, port, scheme) for the Ryno server."""
     metadata = _cluster_metadata(cluster_name)
     parsed = urlparse(metadata["gateway_endpoint"])
     host = parsed.hostname or "127.0.0.1"
@@ -154,11 +154,11 @@ class TestServerMtlsEnforcement:
         )
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = openshell_pb2_grpc.OpenShellStub(channel)
-            response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
-            assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
+            stub = ryno_pb2_grpc.RynoStub(channel)
+            response = stub.Health(ryno_pb2.HealthRequest(), timeout=10)
+            assert response.status == ryno_pb2.SERVICE_STATUS_HEALTHY
             stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(
+                ryno_pb2.ListSandboxesRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 timeout=10,
@@ -179,12 +179,12 @@ class TestServerMtlsEnforcement:
         credentials = grpc.ssl_channel_credentials(root_certificates=ca)
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = openshell_pb2_grpc.OpenShellStub(channel)
-            response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
-            assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
+            stub = ryno_pb2_grpc.RynoStub(channel)
+            response = stub.Health(ryno_pb2.HealthRequest(), timeout=10)
+            assert response.status == ryno_pb2.SERVICE_STATUS_HEALTHY
             with pytest.raises(grpc.RpcError) as exc_info:
                 stub.ListSandboxes(
-                    openshell_pb2.ListSandboxesRequest(
+                    ryno_pb2.ListSandboxesRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         )
@@ -197,7 +197,7 @@ class TestServerMtlsEnforcement:
             # to a user identity either.
             with pytest.raises(grpc.RpcError) as exc_info:
                 stub.ListSandboxes(
-                    openshell_pb2.ListSandboxesRequest(
+                    ryno_pb2.ListSandboxesRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         )
@@ -232,9 +232,9 @@ class TestServerMtlsEnforcement:
         )
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = openshell_pb2_grpc.OpenShellStub(channel)
+            stub = ryno_pb2_grpc.RynoStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
+                stub.Health(ryno_pb2.HealthRequest(), timeout=10)
             assert exc_info.value.code() in (
                 grpc.StatusCode.UNAVAILABLE,
                 grpc.StatusCode.UNKNOWN,
@@ -254,9 +254,9 @@ class TestServerMtlsEnforcement:
 
         channel = grpc.insecure_channel(f"{host}:{port}")
         try:
-            stub = openshell_pb2_grpc.OpenShellStub(channel)
+            stub = ryno_pb2_grpc.RynoStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
+                stub.Health(ryno_pb2.HealthRequest(), timeout=10)
             # The loopback listener may intentionally accept plaintext service
             # HTTP. A gRPC request is still rejected, either at the transport
             # boundary or as an unimplemented HTTP route.

@@ -23,12 +23,12 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
+from ryno._proto import datamodel_pb2, ryno_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from openshell import Sandbox, SandboxClient, WorkspaceClient
+    from ryno import Sandbox, SandboxClient, WorkspaceClient
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 
 
 def _is_placeholder_for_env_key(value: str, key: str) -> bool:
-    """Return true when value is an OpenShell credential placeholder for key."""
-    prefix = "openshell:resolve:env:"
+    """Return true when value is an Ryno credential placeholder for key."""
+    prefix = "ryno:resolve:env:"
     if value == f"{prefix}{key}":
         return True
     token = value.removeprefix(prefix)
@@ -81,7 +81,7 @@ def provider(
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
     stub.CreateProvider(
-        openshell_pb2.CreateProviderRequest(
+        ryno_pb2.CreateProviderRequest(
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -102,7 +102,7 @@ def _delete_provider(stub: object, name: str) -> None:
     """Delete a provider, ignoring not-found errors."""
     try:
         stub.DeleteProvider(
-            openshell_pb2.DeleteProviderRequest(
+            ryno_pb2.DeleteProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
@@ -118,7 +118,7 @@ def _delete_provider_profile(stub: object, profile_id: str) -> None:
     """Delete a provider profile, ignoring not-found errors."""
     try:
         stub.DeleteProviderProfile(
-            openshell_pb2.DeleteProviderProfileRequest(
+            ryno_pb2.DeleteProviderProfileRequest(
                 id=profile_id,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
@@ -134,15 +134,15 @@ def _delete_provider_profile(stub: object, profile_id: str) -> None:
 def imported_provider_profile(
     stub: object,
     *,
-    profile: openshell_pb2.ProviderProfile,
+    profile: ryno_pb2.ProviderProfile,
     source: str,
 ) -> Iterator[str]:
     """Import a workspace-scoped provider profile for the duration of the block."""
     _delete_provider_profile(stub, profile.id)
     response = stub.ImportProviderProfiles(
-        openshell_pb2.ImportProviderProfilesRequest(
+        ryno_pb2.ImportProviderProfilesRequest(
             profiles=[
-                openshell_pb2.ProviderProfileImportItem(
+                ryno_pb2.ProviderProfileImportItem(
                     profile=profile,
                     source=source,
                 )
@@ -165,15 +165,15 @@ def _native_inference_profile(
     rules: list[sandbox_pb2.L7Rule],
     auth_style: str = "bearer",
     header_name: str = "authorization",
-) -> openshell_pb2.ProviderProfile:
-    return openshell_pb2.ProviderProfile(
+) -> ryno_pb2.ProviderProfile:
+    return ryno_pb2.ProviderProfile(
         id=profile_id,
         display_name=f"{profile_id} display",
         description="E2E imported inference profile fixture",
-        category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_INFERENCE,
+        category=ryno_pb2.PROVIDER_PROFILE_CATEGORY_INFERENCE,
         inference_capable=True,
         credentials=[
-            openshell_pb2.ProviderProfileCredential(
+            ryno_pb2.ProviderProfileCredential(
                 name="api_key",
                 description="API key",
                 env_vars=[env_var],
@@ -184,7 +184,7 @@ def _native_inference_profile(
         ],
         endpoints=[
             sandbox_pb2.NetworkEndpoint(
-                host="host.openshell.internal",
+                host="host.ryno.internal",
                 port=port,
                 protocol="rest",
                 tls=sandbox_pb2.NETWORK_TLS_MODE_UNSPECIFIED,
@@ -326,7 +326,7 @@ def test_profileless_provider_creation_is_rejected(
     """New providers must reference a built-in or imported profile."""
     with pytest.raises(grpc.RpcError) as exc_info:
         sandbox_client._stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(
+            ryno_pb2.CreateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(
@@ -599,7 +599,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
 
             try:
                 stub.AttachSandboxProvider(
-                    openshell_pb2.AttachSandboxProviderRequest(
+                    ryno_pb2.AttachSandboxProviderRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
@@ -609,11 +609,11 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 )
                 wait_for_token(
                     sb,
-                    "openshell:resolve:env:NVIDIA_API_KEY",
+                    "ryno:resolve:env:NVIDIA_API_KEY",
                 )
 
                 stub.DetachSandboxProvider(
-                    openshell_pb2.DetachSandboxProviderRequest(
+                    ryno_pb2.DetachSandboxProviderRequest(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
@@ -625,7 +625,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
             finally:
                 try:
                     stub.DetachSandboxProvider(
-                        openshell_pb2.DetachSandboxProviderRequest(
+                        ryno_pb2.DetachSandboxProviderRequest(
                             workspace_scope=datamodel_pb2.WorkspaceSelector(
                                 workspace="default"
                             ),
@@ -713,7 +713,7 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                 with sandbox(spec=spec, delete_on_exit=True) as sb:
                     result = sb.exec_python(
                         call_native_openai,
-                        args=("host.openshell.internal", port),
+                        args=("host.ryno.internal", port),
                         timeout_seconds=60,
                     )
                     assert result.exit_code == 0, result.stderr
@@ -802,7 +802,7 @@ def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provide
                 with sandbox(spec=spec, delete_on_exit=True) as sb:
                     native_result = sb.exec_python(
                         call_native_anthropic,
-                        args=("host.openshell.internal", port),
+                        args=("host.ryno.internal", port),
                         timeout_seconds=60,
                     )
                     assert native_result.exit_code == 0, native_result.stderr
@@ -852,7 +852,7 @@ def test_credentials_not_in_persisted_spec_environment(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
-                openshell_pb2.GetSandboxRequest(
+                ryno_pb2.GetSandboxRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
@@ -880,7 +880,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
     try:
         stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(
+            ryno_pb2.CreateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -896,7 +896,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         )
 
         stub.UpdateProvider(
-            openshell_pb2.UpdateProviderRequest(
+            ryno_pb2.UpdateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -907,7 +907,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         )
 
         got = stub.GetProvider(
-            openshell_pb2.GetProviderRequest(
+            ryno_pb2.GetProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
@@ -936,7 +936,7 @@ def test_update_provider_empty_maps_preserves_all(
 
     try:
         stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(
+            ryno_pb2.CreateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -948,7 +948,7 @@ def test_update_provider_empty_maps_preserves_all(
         )
 
         stub.UpdateProvider(
-            openshell_pb2.UpdateProviderRequest(
+            ryno_pb2.UpdateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -958,7 +958,7 @@ def test_update_provider_empty_maps_preserves_all(
         )
 
         got = stub.GetProvider(
-            openshell_pb2.GetProviderRequest(
+            ryno_pb2.GetProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
@@ -985,7 +985,7 @@ def test_update_provider_merges_config_preserves_credentials(
 
     try:
         stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(
+            ryno_pb2.CreateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -997,7 +997,7 @@ def test_update_provider_merges_config_preserves_credentials(
         )
 
         stub.UpdateProvider(
-            openshell_pb2.UpdateProviderRequest(
+            ryno_pb2.UpdateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -1008,7 +1008,7 @@ def test_update_provider_merges_config_preserves_credentials(
         )
 
         got = stub.GetProvider(
-            openshell_pb2.GetProviderRequest(
+            ryno_pb2.GetProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
@@ -1035,7 +1035,7 @@ def test_update_provider_rejects_type_change(
 
     try:
         stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(
+            ryno_pb2.CreateProviderRequest(
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
@@ -1047,7 +1047,7 @@ def test_update_provider_rejects_type_change(
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
-                openshell_pb2.UpdateProviderRequest(
+                ryno_pb2.UpdateProviderRequest(
                     workspace_scope=datamodel_pb2.WorkspaceSelector(
                         workspace="default"
                     ),
@@ -1139,12 +1139,12 @@ def test_provider_profile_platform_vs_workspace_isolation(
     platform_id = "e2e-platform-profile"
     workspace_id = "e2e-workspace-profile"
 
-    def _make_profile(profile_id: str) -> openshell_pb2.ProviderProfileImportItem:
-        return openshell_pb2.ProviderProfileImportItem(
-            profile=openshell_pb2.ProviderProfile(
+    def _make_profile(profile_id: str) -> ryno_pb2.ProviderProfileImportItem:
+        return ryno_pb2.ProviderProfileImportItem(
+            profile=ryno_pb2.ProviderProfile(
                 id=profile_id,
                 display_name=f"{profile_id} display",
-                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+                category=ryno_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
             ),
             source=f"{profile_id}.yaml",
         )
@@ -1152,7 +1152,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
     def _cleanup() -> None:
         for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
             try:
-                request = openshell_pb2.DeleteProviderProfileRequest(id=pid)
+                request = ryno_pb2.DeleteProviderProfileRequest(id=pid)
                 if ws:
                     request.workspace_scope.workspace = ws
                 stub.DeleteProviderProfile(request)
@@ -1162,14 +1162,14 @@ def test_provider_profile_platform_vs_workspace_isolation(
     _cleanup()
     try:
         resp = stub.ImportProviderProfiles(
-            openshell_pb2.ImportProviderProfilesRequest(
+            ryno_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(platform_id)],
             )
         )
         assert resp.imported, "platform-scoped import should succeed"
 
         resp = stub.ImportProviderProfiles(
-            openshell_pb2.ImportProviderProfilesRequest(
+            ryno_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(workspace_id)],
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
@@ -1177,7 +1177,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200)
+            ryno_pb2.ListProviderProfilesRequest(page_size=200)
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1188,7 +1188,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
 
         workspace_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(
+            ryno_pb2.ListProviderProfilesRequest(
                 page_size=200,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
@@ -1217,12 +1217,12 @@ def test_cross_workspace_profile_ids_do_not_collide(
     ws_a = f"ws-a-{uuid.uuid4().hex[:8]}"
     ws_b = f"ws-b-{uuid.uuid4().hex[:8]}"
 
-    def _make_profile() -> openshell_pb2.ProviderProfileImportItem:
-        return openshell_pb2.ProviderProfileImportItem(
-            profile=openshell_pb2.ProviderProfile(
+    def _make_profile() -> ryno_pb2.ProviderProfileImportItem:
+        return ryno_pb2.ProviderProfileImportItem(
+            profile=ryno_pb2.ProviderProfile(
                 id=profile_id,
                 display_name=f"{profile_id} display",
-                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+                category=ryno_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
             ),
             source=f"{profile_id}.yaml",
         )
@@ -1231,7 +1231,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
     workspace_client.create(ws_b)
     try:
         resp_a = stub.ImportProviderProfiles(
-            openshell_pb2.ImportProviderProfilesRequest(
+            ryno_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
             )
@@ -1239,7 +1239,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         assert resp_a.imported, "import into ws-a should succeed"
 
         resp_b = stub.ImportProviderProfiles(
-            openshell_pb2.ImportProviderProfilesRequest(
+            ryno_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
             )
@@ -1247,7 +1247,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(
+            ryno_pb2.ListProviderProfilesRequest(
                 page_size=200,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
             )
@@ -1257,7 +1257,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(
+            ryno_pb2.ListProviderProfilesRequest(
                 page_size=200,
                 workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
             )
@@ -1269,7 +1269,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         for ws in [ws_a, ws_b]:
             with contextlib.suppress(Exception):
                 stub.DeleteProviderProfile(
-                    openshell_pb2.DeleteProviderProfileRequest(
+                    ryno_pb2.DeleteProviderProfileRequest(
                         id=profile_id,
                         workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws),
                     )

@@ -1,15 +1,15 @@
 # OIDC Login
 
-Package: `openshell/v1/oidc`
+Package: `ryno/v1/oidc`
 
-The oidc package provides OIDC authentication for OpenShell gateways.
+The oidc package provides OIDC authentication for Ryno gateways.
 It supports four OAuth2 flows: browser-based authorization code with
 PKCE, keyboard fallback, device code (RFC 8628), and client credentials.
 
 ## Quick Start
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/oidc"
 
 // Gateway-aware login (reads OIDC config from gateway metadata)
 token, err := oidc.Login(ctx, "my-gateway")

@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Fern site config — merged with skills/convert-to-fern/assets/theme/nvidia/docs-theme.yml pattern
-# Production: https://docs.nvidia.com/openshell/ — preview + custom-domain share path prefix `openshell`.
+# Production: https://docs.nvidia.com/ryno/ — preview + custom-domain share path prefix `ryno`.
 # Source checkouts and pull request previews expose the current documentation at /dev.
+# Redirect `source:` entries below intentionally keep the legacy /openshell/ prefix
+# so previously published URLs keep resolving after the OpenShell -> Ryno rename.
 instances:
-  - url: openshell.docs.buildwithfern.com/openshell
-    custom-domain: docs.nvidia.com/openshell
+  - url: ryno.docs.buildwithfern.com/ryno
+    custom-domain: docs.nvidia.com/ryno
     multi-source: true
 
-title: NVIDIA OpenShell
+title: NVIDIA Ryno
 
 global-theme: nvidia
 
@@ -38,8 +40,8 @@ logo:
   dark: ./assets/NVIDIA_dark.svg
   light: ./assets/NVIDIA_light.svg
   height: 20
-  href: /openshell
-  right-text: OpenShell
+  href: /ryno
+  right-text: Ryno
 
 favicon: ./assets/NVIDIA_symbol.svg
 
@@ -48,7 +50,7 @@ css:
 
 navbar-links:
   - type: github
-    value: https://github.com/NVIDIA/OpenShell
+    value: https://github.com/NVIDIA/Ryno
 
 experimental:
   mdx-components:
@@ -60,68 +62,68 @@ versions:
     path: ../docs/index.yml
     slug: dev
     announcement:
-      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New in OpenShell 0.1.x:</strong> a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0" target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
+      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New in Ryno 0.1.x:</strong> a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/ryno/dev/upgrade/0-1-0" target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 
 redirects:
   - source: "/openshell/latest/kubernetes/sandbox-runtime"
-    destination: "/openshell/latest/kubernetes/setup"
+    destination: "/ryno/latest/kubernetes/setup"
   - source: "/openshell/dev/kubernetes/sandbox-runtime"
-    destination: "/openshell/dev/kubernetes/setup"
+    destination: "/ryno/dev/kubernetes/setup"
   - source: "/openshell/latest/about/how-it-works"
-    destination: "/openshell/latest/about/architecture"
+    destination: "/ryno/latest/about/architecture"
   - source: "/openshell/dev/about/how-it-works"
-    destination: "/openshell/dev/about/architecture"
+    destination: "/ryno/dev/about/architecture"
   - source: "/openshell/latest/extensibility/extension-negotiation"
-    destination: "/openshell/latest/extensibility/overview#protocol-negotiation"
+    destination: "/ryno/latest/extensibility/overview#protocol-negotiation"
   - source: "/openshell/dev/extensibility/extension-negotiation"
-    destination: "/openshell/dev/extensibility/overview#protocol-negotiation"
+    destination: "/ryno/dev/extensibility/overview#protocol-negotiation"
   - source: "/openshell/latest/providers/google-vertex-ai"
-    destination: "/openshell/latest/how-it-works/providers/google#vertex-ai"
+    destination: "/ryno/latest/how-it-works/providers/google#vertex-ai"
   - source: "/openshell/dev/providers/google-vertex-ai"
-    destination: "/openshell/dev/how-it-works/providers/google#vertex-ai"
+    destination: "/ryno/dev/how-it-works/providers/google#vertex-ai"
   - source: "/openshell/latest/about/supported-agents"
-    destination: "/openshell/latest/about/run-your-first-agent"
+    destination: "/ryno/latest/about/run-your-first-agent"
   - source: "/openshell/dev/about/supported-agents"
-    destination: "/openshell/dev/about/run-your-first-agent"
+    destination: "/ryno/dev/about/run-your-first-agent"
   - source: "/openshell/latest/get-started/quickstart"
-    destination: "/openshell/latest/about/run-your-first-agent"
+    destination: "/ryno/latest/about/run-your-first-agent"
   - source: "/openshell/dev/get-started/quickstart"
-    destination: "/openshell/dev/about/run-your-first-agent"
+    destination: "/ryno/dev/about/run-your-first-agent"
   - source: "/openshell/latest/sandboxes/providers-v2"
-    destination: "/openshell/latest/how-it-works/providers/profiles"
+    destination: "/ryno/latest/how-it-works/providers/profiles"
   # Preserve published URLs when page names and slugs change.
   - source: "/openshell/about/why-open-shell"
-    destination: "/openshell/latest/about/overview"
+    destination: "/ryno/latest/about/overview"
   - source: "/openshell/sdk/type-script"
-    destination: "/openshell/latest/sdk/typescript"
+    destination: "/ryno/latest/sdk/typescript"
   - source: "/openshell/latest/about/why-open-shell"
-    destination: "/openshell/latest/about/overview"
+    destination: "/ryno/latest/about/overview"
   - source: "/openshell/dev/about/why-open-shell"
-    destination: "/openshell/dev/about/overview"
+    destination: "/ryno/dev/about/overview"
   - source: "/openshell/latest/sdk/type-script"
-    destination: "/openshell/latest/sdk/typescript"
+    destination: "/ryno/latest/sdk/typescript"
   - source: "/openshell/dev/sdk/type-script"
-    destination: "/openshell/dev/sdk/typescript"
+    destination: "/ryno/dev/sdk/typescript"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
   # Legacy HTML URLs used .../path/to/page/index.html; Fern canonical URLs omit index.html.
   # List explicit /index.html routes before :path*/index.html so empty path segments do not
   # mis-resolve (see NeMo-Curator fern/docs.yml). :path*.html must follow :path*/index.html rules.
   # https://www.buildwithfern.com/learn/docs/configuration/site-level-settings#redirects-configuration
   - source: "/openshell/index.html"
-    destination: "/openshell/latest"
+    destination: "/ryno/latest"
   - source: "/openshell/index"
-    destination: "/openshell/latest"
+    destination: "/ryno/latest"
   - source: "/openshell/latest/index.html"
-    destination: "/openshell/latest"
+    destination: "/ryno/latest"
   - source: "/openshell/latest/index"
-    destination: "/openshell/latest"
+    destination: "/ryno/latest"
   - source: "/openshell/latest/:path*/index.html"
-    destination: "/openshell/latest/:path*"
+    destination: "/ryno/latest/:path*"
   - source: "/openshell/:path*/index.html"
-    destination: "/openshell/:path*"
+    destination: "/ryno/:path*"
   - source: "/openshell/:path*.html"
-    destination: "/openshell/:path*"
+    destination: "/ryno/:path*"
   - source: "/openshell/tutorials"
-    destination: "/openshell/latest/tutorials"
+    destination: "/ryno/latest/tutorials"
   - source: "/openshell/tutorials/:path*"
-    destination: "/openshell/latest/tutorials/:path*"
+    destination: "/ryno/latest/tutorials/:path*"

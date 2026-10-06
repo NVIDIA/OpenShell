@@ -16,18 +16,18 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use openshell_e2e::harness::cli::{wait_for_healthy, wait_for_sandbox_exec_contains};
-use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::{wait_for_healthy, wait_for_sandbox_exec_contains};
+use ryno_e2e::harness::container::{ContainerEngine, e2e_driver};
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use prost::Message;
 use tokio::time::sleep;
 
 const READY_MARKER: &str = "local-driver-token-restart-ready";
 const RESTART_FILE: &str = "/sandbox/local-driver-token-restart-state";
-const CONTAINER_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
-const VM_STATE_DIR_ENV: &str = "OPENSHELL_E2E_VM_STATE_DIR";
+const CONTAINER_TOKEN_MOUNT_PATH: &str = "/etc/ryno/auth/sandbox.jwt";
+const VM_STATE_DIR_ENV: &str = "RYNO_E2E_VM_STATE_DIR";
 
 #[derive(Clone, PartialEq, Message)]
 struct PersistedDriverSandbox {
@@ -67,15 +67,15 @@ impl LocalDriver {
     fn container_filters(self, namespace: &str, sandbox_name: &str, role: &str) -> Vec<String> {
         match self {
             Self::Docker => vec![
-                "label=openshell.ai/managed-by=openshell".to_string(),
-                format!("label=openshell.ai/isolation-role={role}"),
-                format!("label=openshell.ai/sandbox-namespace={namespace}"),
-                format!("label=openshell.ai/sandbox-name={sandbox_name}"),
+                "label=ryno.ai/managed-by=ryno".to_string(),
+                format!("label=ryno.ai/isolation-role={role}"),
+                format!("label=ryno.ai/sandbox-namespace={namespace}"),
+                format!("label=ryno.ai/sandbox-name={sandbox_name}"),
             ],
             Self::Podman => vec![
-                "label=openshell.managed=true".to_string(),
-                format!("label=openshell.ai/isolation-role={role}"),
-                format!("label=openshell.ai/sandbox-name={sandbox_name}"),
+                "label=ryno.managed=true".to_string(),
+                format!("label=ryno.ai/isolation-role={role}"),
+                format!("label=ryno.ai/sandbox-name={sandbox_name}"),
             ],
             Self::Vm => Vec::new(),
         }
@@ -324,7 +324,7 @@ async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result
     let deadline = Instant::now() + timeout;
     let mut last_output = String::new();
     while Instant::now() < deadline {
-        let mut cmd = openshell_e2e::harness::binary::openshell_cmd();
+        let mut cmd = ryno_e2e::harness::binary::ryno_cmd();
         cmd.args(["sandbox", "get", sandbox_name])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -386,12 +386,12 @@ async fn local_driver_restart_or_stop_respects_main_process_lifecycle() {
         return;
     };
     let namespace = if driver.is_container() {
-        let Some(namespace) = std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
+        let Some(namespace) = std::env::var("RYNO_E2E_SANDBOX_NAMESPACE")
             .ok()
             .filter(|value| !value.trim().is_empty())
         else {
             eprintln!(
-                "Skipping local-driver lifecycle test: OPENSHELL_E2E_SANDBOX_NAMESPACE is unavailable"
+                "Skipping local-driver lifecycle test: RYNO_E2E_SANDBOX_NAMESPACE is unavailable"
             );
             return;
         };

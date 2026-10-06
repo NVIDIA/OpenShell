@@ -1,0 +1,6973 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `Ryno` CLI - command-line interface for `Ryno`.
+
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use clap_complete::engine::ArgValueCompleter;
+use clap_complete::env::CompleteEnv;
+use miette::Result;
+use ryno_cli::color::{self, ColorChoice, Colorize};
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+
+use ryno_bootstrap::{
+    edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
+    load_gateway_metadata, load_last_sandbox, save_last_sandbox,
+};
+use ryno_cli::completers;
+use ryno_cli::run;
+use ryno_cli::tls::TlsOptions;
+use ryno_core::proto::{GpuResourceRequirements, ServiceAuthorizationMode};
+
+/// Resolved gateway context: name + gateway endpoint.
+struct GatewayContext {
+    /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
+    name: String,
+    /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
+    endpoint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuCliRequest {
+    DriverDefault,
+    Count(u32),
+}
+
+impl From<GpuCliRequest> for GpuResourceRequirements {
+    fn from(gpu: GpuCliRequest) -> Self {
+        match gpu {
+            GpuCliRequest::Count(count) => Self { count: Some(count) },
+            GpuCliRequest::DriverDefault => Self { count: None },
+        }
+    }
+}
+
+/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
+///
+/// Resolution priority:
+/// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
+/// 2. `--gateway` flag (explicit name)
+/// 3. `RYNO_GATEWAY` environment variable
+/// 4. Active gateway from `~/.config/ryno/active_gateway`
+///
+/// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
+/// If stored metadata can still identify the gateway, the stored gateway name
+/// is preserved so auth and TLS materials continue to resolve correctly.
+fn normalize_gateway_endpoint(endpoint: &str) -> &str {
+    endpoint.trim_end_matches('/')
+}
+
+fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
+    let endpoint = normalize_gateway_endpoint(endpoint);
+
+    if let Some(active_name) = load_active_gateway()
+        && let Ok(metadata) = load_gateway_metadata(&active_name)
+        && normalize_gateway_endpoint(&metadata.gateway_endpoint) == endpoint
+    {
+        return Some(metadata.name);
+    }
+
+    list_gateways().ok()?.into_iter().find_map(|metadata| {
+        (normalize_gateway_endpoint(&metadata.gateway_endpoint) == endpoint)
+            .then_some(metadata.name)
+    })
+}
+
+fn resolve_gateway(
+    gateway_flag: &Option<String>,
+    gateway_endpoint: &Option<String>,
+) -> Result<GatewayContext> {
+    if let Some(endpoint) = gateway_endpoint {
+        // When a gateway name is explicitly provided (via flag or env var),
+        // trust it directly — don't require metadata to exist yet. This
+        // avoids a race condition where mTLS certs are stored under the
+        // real gateway name but the CLI falls back to using the raw
+        // endpoint URL (producing a mangled path like `https___...`).
+        let name = gateway_flag
+            .clone()
+            .or_else(|| find_gateway_by_endpoint(endpoint))
+            .unwrap_or_else(|| endpoint.clone());
+        return Ok(GatewayContext {
+            name,
+            endpoint: endpoint.clone(),
+        });
+    }
+
+    let name = gateway_flag
+        .clone()
+        .or_else(|| {
+            std::env::var("RYNO_GATEWAY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(load_active_gateway)
+        .ok_or_else(|| {
+            miette::miette!(
+                "No active gateway.\n\
+                 Set one with: ryno gateway select <name>\n\
+                 Or register one with: ryno gateway add <endpoint>"
+            )
+        })?;
+
+    let metadata = load_gateway_metadata(&name).map_err(|_| {
+        miette::miette!(
+            "Unknown gateway '{name}'.\n\
+             Register it first: ryno gateway add <endpoint> --name {name}\n\
+             Or list available gateways: ryno gateway select"
+        )
+    })?;
+
+    Ok(GatewayContext {
+        name: metadata.name,
+        endpoint: metadata.gateway_endpoint,
+    })
+}
+
+fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> {
+    if value.is_empty() {
+        return Ok(GpuCliRequest::DriverDefault);
+    }
+
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| "GPU count must be a positive integer".to_string())?;
+    if count == 0 {
+        return Err("GPU count must be greater than 0".to_string());
+    }
+
+    Ok(GpuCliRequest::Count(count))
+}
+
+fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
+    gateway_flag
+        .clone()
+        .or_else(|| {
+            std::env::var("RYNO_GATEWAY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(load_active_gateway)
+}
+
+/// Apply authentication token from local storage based on gateway auth mode.
+///
+/// Handles Cloudflare Access and OIDC auth modes by loading the stored token
+/// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
+/// if it's near expiry.
+fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) -> Result<()> {
+    if let Some(error) = apply_auth_with_status(tls, gateway_name) {
+        return Err(miette::miette!(error));
+    }
+    Ok(())
+}
+
+/// Apply stored authentication and return a user-facing preparation failure,
+/// if the CLI already knows the credentials cannot be used.
+fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<String> {
+    let meta = get_gateway_metadata(gateway_name)?;
+    match meta.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => {
+            if let Some(token) = load_edge_token(gateway_name) {
+                tls.edge_token = Some(token);
+                None
+            } else {
+                Some(format!(
+                    "edge credentials are missing; run `ryno gateway login {gateway_name}`"
+                ))
+            }
+        }
+        Some("oidc") => {
+            let Some(bundle) = ryno_bootstrap::oidc_token::load_oidc_token(gateway_name) else {
+                return Some(format!(
+                    "OIDC credentials are missing; run `ryno gateway login {gateway_name}`"
+                ));
+            };
+            if ryno_bootstrap::oidc_token::is_token_expired(&bundle) {
+                let insecure = std::env::var("RYNO_GATEWAY_INSECURE")
+                    .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+                // Try to refresh the token in-place using block_in_place
+                // so the async refresh can run within the sync apply_auth call.
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        ryno_cli::oidc_auth::oidc_refresh_token(
+                            &bundle,
+                            meta.oidc_scopes.as_deref(),
+                            insecure,
+                        ),
+                    )
+                }) {
+                    Ok(refreshed) => {
+                        let _ =
+                            ryno_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed);
+                        tls.oidc_token = Some(refreshed.access_token);
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("OIDC token refresh failed: {e}");
+                        if ryno_bootstrap::oidc_token::is_token_actually_expired(&bundle) {
+                            Some(format!(
+                                "OIDC token refresh failed: {e}\ncached OIDC token has expired; run `ryno gateway login {gateway_name}`"
+                            ))
+                        } else {
+                            tls.oidc_token = Some(bundle.access_token);
+                            eprintln!(
+                                "Warning: OIDC token refresh failed; continuing with the cached token: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+            } else {
+                tls.oidc_token = Some(bundle.access_token);
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a sandbox name, falling back to the last-used sandbox for the
+/// gateway and workspace.
+///
+/// When `name` is `None`, looks up the last sandbox recorded for the active
+/// gateway and workspace. Prints a hint when falling back so the user knows
+/// which sandbox was chosen.
+fn resolve_sandbox_name(name: Option<String>, gateway: &str, workspace: &str) -> Result<String> {
+    if let Some(n) = name {
+        return Ok(n);
+    }
+    let last = load_last_sandbox(gateway, workspace).ok_or_else(|| {
+        miette::miette!(
+            "No sandbox name provided and no last-used sandbox.\n\
+             Specify a sandbox name or connect to one first: ryno sandbox connect <name>"
+        )
+    })?;
+    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
+    Ok(last)
+}
+
+// Custom root help stays hand-authored so commands can be grouped into product
+// areas without relying on clap's default subcommand listing. User-facing
+// commands remain visible so shell completion can suggest them at the root.
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  ryno <command> <subcommand> [flags]
+
+\x1b[1mSANDBOX COMMANDS\x1b[0m
+  sandbox:     Manage sandboxes
+  service:     Expose sandbox services
+  forward:     Manage port forwarding to a sandbox
+  logs:        View sandbox logs
+  policy:      Manage sandbox policy
+  settings:    Manage sandbox and global settings
+  provider:    Manage provider configuration
+  profile:     Browse and manage profiles
+
+\x1b[1mGATEWAY COMMANDS\x1b[0m
+  gateway:     Manage gateways
+  status:      Show gateway status and information
+  whoami:      Show the authenticated user identity
+  doctor:      Diagnose gateway issues
+
+\x1b[1mADDITIONAL COMMANDS\x1b[0m
+  term:        Launch the Ryno interactive TUI
+  completions: Generate shell completions
+  ssh-proxy:   SSH proxy (used by ProxyCommand)
+  help:        Print this message or the help of the given subcommand(s)
+
+\x1b[1mFLAGS\x1b[0m
+{options}
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno sandbox create
+  $ ryno gateway add http://127.0.0.1:8080 --local
+  $ ryno logs my-sandbox
+
+\x1b[1mLEARN MORE\x1b[0m
+  Use `ryno <command> --help` for more information about a command.
+";
+
+// Help template for subcommands (sandbox, gateway, etc.)
+const SUBCOMMAND_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  {usage}
+
+\x1b[1mCOMMANDS\x1b[0m
+{subcommands}
+
+\x1b[1mFLAGS\x1b[0m
+{options}
+{after-help}";
+
+// Help template for leaf commands (sandbox create, provider list, etc.)
+const LEAF_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  {usage}
+
+{all-args}
+{after-help}";
+
+const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  sb
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno sandbox create
+  $ ryno sandbox create --from registry.example.com/agents/python:latest
+  $ ryno sandbox connect my-sandbox
+  $ ryno sandbox list
+  $ ryno sandbox delete my-sandbox
+";
+
+const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  fwd
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno forward start 8080
+  $ ryno forward start 3000 my-sandbox
+  $ ryno forward service my-sandbox --target-port 8000 --local 8000
+  $ ryno forward stop 8080
+  $ ryno forward list
+";
+
+const SERVICE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  svc
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno service expose my-sandbox 8080
+  $ ryno service expose my-sandbox 8080 web
+  $ ryno service list
+  $ ryno service list my-sandbox
+  $ ryno service get my-sandbox web
+  $ ryno service delete my-sandbox web
+";
+
+const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  lg
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno logs my-sandbox
+  $ ryno logs my-sandbox --tail
+  $ ryno logs --since 5m
+  $ ryno logs --source sandbox --level debug
+";
+
+const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  pol
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno policy get my-sandbox
+  $ ryno policy set my-sandbox --policy policy.yaml
+  $ ryno policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ ryno policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8
+  $ ryno policy update my-sandbox --rule-name github --binary /usr/bin/gh --add-allow 'api.github.com:443:GET:/repos/**'
+  $ ryno policy set --global --policy policy.yaml
+  $ ryno policy delete --global
+  $ ryno policy list my-sandbox
+";
+
+const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ ryno settings get my-sandbox
+  $ ryno settings get --global
+  $ ryno settings set my-sandbox --key ocsf_json_enabled --value true
+  $ ryno settings set --global --key ocsf_json_enabled --value true
+  $ ryno settings delete --global --key ocsf_json_enabled
+";
+
+const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ ryno provider create --name openai --type openai --credential OPENAI_API_KEY
+  $ ryno provider create --name anthropic --type anthropic --from-existing
+  $ ryno provider list
+  $ ryno provider get openai
+  $ ryno provider delete openai
+";
+
+const PROFILE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ ryno profile list
+  $ ryno profile list --type provider -o json
+  $ ryno profile describe openai
+  $ ryno profile export openai
+  $ ryno profile import -f custom-api.yaml
+";
+
+const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  ws
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno workspace create --name staging
+  $ ryno workspace list
+  $ ryno workspace get staging
+  $ ryno workspace delete staging
+";
+
+const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  gw
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno gateway add http://127.0.0.1:8080 --local
+  $ ryno gateway select my-gateway
+  $ ryno gateway info
+  $ ryno gateway remove my-gateway
+";
+
+const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
+  dr
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ ryno doctor check
+";
+
+/// `Ryno` CLI - agent execution and management.
+#[derive(Parser, Debug)]
+#[command(name = "ryno")]
+#[command(author, version = ryno_core::VERSION, about, long_about = None)]
+#[command(propagate_version = true)]
+#[command(help_template = HELP_TEMPLATE)]
+#[command(disable_help_subcommand = true)]
+#[command(disable_help_flag = true, disable_version_flag = true)]
+struct Cli {
+    /// Gateway name to operate on (resolved from stored metadata).
+    #[arg(
+        long,
+        short = 'g',
+        global = true,
+        env = "RYNO_GATEWAY",
+        help_heading = "GATEWAY FLAGS",
+        add = ArgValueCompleter::new(completers::complete_gateway_names)
+    )]
+    gateway: Option<String>,
+
+    /// Gateway endpoint URL (e.g. <https://gateway.example.com>).
+    /// Connects directly without looking up gateway metadata.
+    #[arg(
+        long,
+        global = true,
+        env = "RYNO_GATEWAY_ENDPOINT",
+        help_heading = "GATEWAY FLAGS"
+    )]
+    gateway_endpoint: Option<String>,
+
+    /// Skip TLS certificate verification for gateway connections.
+    #[arg(
+        long,
+        global = true,
+        env = "RYNO_GATEWAY_INSECURE",
+        help_heading = "GATEWAY FLAGS"
+    )]
+    gateway_insecure: bool,
+
+    /// Workspace scope for resource operations.
+    #[arg(
+        long,
+        global = true,
+        env = "RYNO_WORKSPACE",
+        default_value = "default",
+        help_heading = "GLOBAL FLAGS",
+        add = ArgValueCompleter::new(completers::complete_workspace_names)
+    )]
+    workspace: String,
+
+    /// Increase verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
+    verbose: u8,
+
+    /// When to colorize output. `auto` colorizes only when stdout is a terminal.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ColorChoice::Auto,
+        value_name = "WHEN",
+        env = "RYNO_COLOR",
+        help_heading = "GLOBAL FLAGS"
+    )]
+    color: ColorChoice,
+
+    /// Print help.
+    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, help_heading = "GLOBAL FLAGS")]
+    help: (),
+
+    /// Print version.
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, global = true, help_heading = "GLOBAL FLAGS")]
+    version: (),
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    // ===================================================================
+    // SANDBOX COMMANDS
+    // ===================================================================
+    /// Manage sandboxes.
+    #[command(alias = "sb", after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Sandbox {
+        #[command(subcommand)]
+        command: Option<SandboxCommands>,
+    },
+
+    /// Manage port forwarding to a sandbox.
+    #[command(alias = "fwd", after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Forward {
+        #[command(subcommand)]
+        command: Option<ForwardCommands>,
+    },
+
+    /// Manage sandbox services.
+    #[command(alias = "svc", after_help = SERVICE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Service {
+        #[command(subcommand)]
+        command: Option<ServiceCommands>,
+    },
+
+    /// View sandbox logs.
+    #[command(alias = "lg", after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logs {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Number of log lines to return.
+        #[arg(short, default_value_t = 200)]
+        n: u32,
+
+        /// Stream live logs.
+        #[arg(long)]
+        tail: bool,
+
+        /// Only show logs from this duration ago (e.g. 5m, 1h, 30s).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter by log source: "gateway", "sandbox", or "all" (default).
+        /// Can be specified multiple times: --source gateway --source sandbox
+        #[arg(long, default_value = "all")]
+        source: Vec<String>,
+
+        /// Minimum log level to display: error, warn, info (default), debug, trace.
+        #[arg(long, default_value = "")]
+        level: String,
+    },
+
+    /// Manage sandbox policy.
+    #[command(alias = "pol", after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Policy {
+        #[command(subcommand)]
+        command: Option<PolicyCommands>,
+    },
+
+    /// Manage sandbox and gateway settings.
+    #[command(after_help = SETTINGS_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Settings {
+        #[command(subcommand)]
+        command: Option<SettingsCommands>,
+    },
+
+    /// Manage network rules for a sandbox.
+    #[command(visible_alias = "rl", hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Rule {
+        #[command(subcommand)]
+        command: Option<DraftCommands>,
+    },
+
+    /// Manage provider configuration.
+    #[command(after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Provider {
+        #[command(subcommand)]
+        command: Option<ProviderCommands>,
+    },
+
+    /// Browse and manage profiles.
+    #[command(after_help = PROFILE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile {
+        #[command(subcommand)]
+        command: Option<ProfileCommands>,
+    },
+
+    /// Manage workspaces.
+    #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Workspace {
+        #[command(subcommand)]
+        command: Option<WorkspaceCommands>,
+    },
+
+    // ===================================================================
+    // GATEWAY COMMANDS
+    // ===================================================================
+    /// Manage gateways.
+    #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Gateway {
+        #[command(subcommand)]
+        command: Option<GatewayCommands>,
+    },
+
+    /// Show gateway status and information.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show the identity validated by the gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Whoami {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    // ===================================================================
+    // DIAGNOSTIC COMMANDS
+    // ===================================================================
+    /// Diagnose gateway issues.
+    ///
+    /// Check local prerequisites for gateway development.
+    #[command(visible_alias = "dr", hide = true, after_help = DOCTOR_HELP, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Doctor {
+        #[command(subcommand)]
+        command: Option<DoctorCommands>,
+    },
+
+    // ===================================================================
+    // ADDITIONAL COMMANDS
+    // ===================================================================
+    /// Launch the `Ryno` interactive TUI.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Term {
+        /// Color theme for the TUI: auto, dark, or light.
+        #[arg(long, default_value = "auto", env = "RYNO_THEME")]
+        theme: ryno_tui::ThemeMode,
+    },
+
+    /// Generate shell completions.
+    #[command(after_long_help = COMPLETIONS_HELP, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Completions {
+        /// Shell to generate completions for.
+        shell: CompletionShell,
+    },
+
+    /// SSH proxy (used by `ProxyCommand`).
+    ///
+    /// Two mutually exclusive modes:
+    ///
+    /// **Token mode** (used internally by `sandbox connect`):
+    ///   `ryno ssh-proxy --gateway <url> --sandbox <name> --token <token>`
+    ///
+    /// **Name mode** (for use in `~/.ssh/config`):
+    ///   `ryno ssh-proxy --gateway <name> --name <sandbox-name>`
+    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    SshProxy {
+        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
+        /// Required in token mode. In name mode, can be a gateway name.
+        #[arg(long, short = 'g')]
+        gateway: Option<String>,
+
+        /// Sandbox name. Required in token mode.
+        #[arg(long)]
+        sandbox: Option<String>,
+
+        /// SSH session token. Required in token mode.
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Gateway name. Used with --name to resolve gateway from metadata.
+        #[arg(long)]
+        gateway_name: Option<String>,
+
+        /// Sandbox name. Used in name mode.
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Fish,
+    Zsh,
+    Powershell,
+}
+
+impl std::fmt::Display for CompletionShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bash => write!(f, "bash"),
+            Self::Fish => write!(f, "fish"),
+            Self::Zsh => write!(f, "zsh"),
+            Self::Powershell => write!(f, "powershell"),
+        }
+    }
+}
+
+const COMPLETIONS_HELP: &str = "\
+Generate shell completion scripts for Ryno CLI.
+
+Supported shells: bash, fish, zsh, powershell.
+
+The script is output on stdout, allowing you to redirect the output to the file of your choosing.
+
+The exact config file locations might vary based on your system. Make sure to restart your
+shell before testing whether completions are working.
+
+\x1b[1mBASH\x1b[0m
+
+First, ensure that you install `bash-completion` using your package manager.
+
+  mkdir -p ~/.local/share/bash-completion/completions
+  ryno completions bash > ~/.local/share/bash-completion/completions/ryno
+
+On macOS with Homebrew (install bash-completion first):
+
+  mkdir -p $(brew --prefix)/etc/bash_completion.d
+  ryno completions bash > $(brew --prefix)/etc/bash_completion.d/ryno.bash-completion
+
+\x1b[1mFISH\x1b[0m
+
+  mkdir -p ~/.config/fish/completions
+  ryno completions fish > ~/.config/fish/completions/ryno.fish
+
+\x1b[1mZSH\x1b[0m
+
+  mkdir -p ~/.zfunc
+  ryno completions zsh > ~/.zfunc/_ryno
+
+Then add the following to your .zshrc before compinit:
+
+  fpath+=~/.zfunc
+
+\x1b[1mPOWERSHELL\x1b[0m
+
+   ryno completions powershell >> $PROFILE
+
+If no profile exists yet, create one first:
+
+   New-Item -Path $PROFILE -Type File -Force
+";
+
+fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) -> Result<String> {
+    let script = String::from_utf8(output)
+        .map_err(|e| miette::miette!("generated completions were not valid UTF-8: {e}"))?;
+    Ok(script.replace(executable.to_string_lossy().as_ref(), "ryno"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Yaml,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliServiceAuthorizationMode {
+    #[default]
+    Strip,
+    BearerPassthrough,
+}
+
+impl From<CliServiceAuthorizationMode> for ServiceAuthorizationMode {
+    fn from(value: CliServiceAuthorizationMode) -> Self {
+        match value {
+            CliServiceAuthorizationMode::Strip => Self::Strip,
+            CliServiceAuthorizationMode::BearerPassthrough => Self::BearerPassthrough,
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProviderRefreshStrategy {
+    Oauth2RefreshToken,
+    Oauth2ClientCredentials,
+    GoogleServiceAccountJwt,
+    AwsStsAssumeRole,
+}
+
+impl CliProviderRefreshStrategy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Oauth2RefreshToken => "oauth2_refresh_token",
+            Self::Oauth2ClientCredentials => "oauth2_client_credentials",
+            Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+            Self::AwsStsAssumeRole => "aws_sts_assume_role",
+        }
+    }
+}
+
+impl OutputFormat {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Yaml => "yaml",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum PolicyGetOutput {
+    Table,
+    Json,
+}
+
+impl PolicyGetOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliEditor {
+    Vscode,
+    Cursor,
+}
+
+impl From<CliEditor> for ryno_cli::ssh::Editor {
+    fn from(value: CliEditor) -> Self {
+        match value {
+            CliEditor::Vscode => Self::Vscode,
+            CliEditor::Cursor => Self::Cursor,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderCommands {
+    /// Create a provider config.
+    #[command(group = clap::ArgGroup::new("cred_source").required(false).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Provider name.
+        #[arg(long)]
+        name: String,
+
+        /// Provider type.
+        #[arg(long = "type")]
+        provider_type: String,
+
+        /// Load provider credentials/config from existing local state.
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
+        from_existing: bool,
+
+        /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
+        #[arg(
+            long = "credential",
+            value_name = "KEY[=VALUE]",
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
+        )]
+        credentials: Vec<String>,
+
+        /// Configure credentials from gcloud Application Default Credentials
+        /// (`~/.config/gcloud/application_default_credentials.json`).
+        /// Valid for providers whose profile declares an ADC-compatible credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials", "from_oidc_token"])]
+        from_gcloud_adc: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"])]
+        from_oidc_token: bool,
+
+        /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_oidc_token"])]
+        runtime_credentials: bool,
+
+        /// Provider config key/value pair.
+        #[arg(long = "config", value_name = "KEY=VALUE")]
+        config: Vec<String>,
+
+        /// Use a platform-scoped (global) provider profile instead of
+        /// a workspace-scoped one.
+        #[arg(long)]
+        global_profile: bool,
+    },
+
+    /// Manage provider credential refresh.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Refresh(ProviderRefreshCommands),
+
+    /// Fetch a provider by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+    },
+
+    /// List providers.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Print only provider names, one per line.
+        #[arg(long, conflicts_with = "output")]
+        names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
+
+        /// List providers across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+
+    /// List available provider profiles (alias for `profile list --type provider`).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ListProfiles {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// List platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Manage provider profiles (alias for `profile`).
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile(ProfileCommands),
+
+    /// Update an existing provider's credentials or config.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Re-discover credentials from existing local state (e.g. env vars, config files).
+        #[arg(long, conflicts_with_all = ["credentials", "from_oidc_token"])]
+        from_existing: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, conflicts_with = "from_existing")]
+        from_oidc_token: bool,
+
+        /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
+        #[arg(
+            long = "credential",
+            value_name = "KEY[=VALUE]",
+            conflicts_with = "from_existing"
+        )]
+        credentials: Vec<String>,
+
+        /// Provider config key/value pair.
+        #[arg(long = "config", value_name = "KEY=VALUE")]
+        config: Vec<String>,
+
+        /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
+        #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
+        credential_expires_at: Vec<String>,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
+    },
+
+    /// Delete providers by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
+        names: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderRefreshCommands {
+    /// Show provider credential refresh status.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Optional credential key to filter by.
+        #[arg(long = "credential-key")]
+        credential_key: Option<String>,
+    },
+
+    /// Configure refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Configure {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+
+        /// Refresh strategy.
+        #[arg(long, value_enum)]
+        strategy: CliProviderRefreshStrategy,
+
+        /// Non-injectable refresh material (`KEY=VALUE`).
+        #[arg(long = "material", value_name = "KEY=VALUE")]
+        material: Vec<String>,
+
+        /// Secret refresh material resolved from the CLI environment
+        /// (`ENVVAR` defaults to `KEY`); `KEY` is auto-marked secret.
+        #[arg(long = "secret-material-env", value_name = "KEY[=ENVVAR]")]
+        secret_material_env: Vec<String>,
+
+        /// Material keys that are secret and must not be exposed.
+        #[arg(long = "secret-material-key", value_name = "KEY")]
+        secret_material_keys: Vec<String>,
+
+        /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
+        #[arg(
+            long = "credential-expires-at",
+            value_name = "TIMESTAMP",
+            value_parser = run::parse_credential_expiry_cli_value
+        )]
+        credential_expires_at: Option<i64>,
+    },
+
+    /// Record a gateway-owned credential rotation request.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Rotate {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Delete refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+}
+
+/// Profile kinds exposed by the gateway's profile catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ProfileType {
+    /// Credential, endpoint, and policy definitions for providers.
+    Provider,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum ProfileCommands {
+    /// List available profiles.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Filter profiles by type.
+        #[arg(long = "type", value_enum)]
+        profile_type: Option<ProfileType>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// List platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Describe a profile's credentials, endpoints, and policy defaults.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Describe {
+        /// Profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// Describe a platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Export a provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Export {
+        /// Provider profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Yaml)]
+        output: OutputFormat,
+
+        /// Target platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Import provider profiles from a file, directory, or HTTP URL.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Import {
+        /// Profile file to import.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to import.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Import as platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Update an existing custom provider profile from a file.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Existing provider profile id to update.
+        id: String,
+
+        /// Profile file to update.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: PathBuf,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Validate provider profile files without registering them.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Lint {
+        /// Profile file to lint.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to lint.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Lint against platform scope (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Delete a custom provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider profile id(s).
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+impl ProfileCommands {
+    /// Execute either command spelling against the same authenticated gateway.
+    async fn run(self, endpoint: &str, workspace: &str, tls: &TlsOptions) -> Result<()> {
+        let profile_workspace = |global: bool| -> &str { if global { "" } else { workspace } };
+        match self {
+            Self::List {
+                profile_type,
+                output,
+                global,
+            } => {
+                // The catalog currently contains only provider profiles. An exhaustive
+                // match requires a routing decision when another profile kind is added.
+                match profile_type {
+                    None | Some(ProfileType::Provider) => {
+                        run::provider_list_profiles(
+                            endpoint,
+                            output.as_str(),
+                            profile_workspace(global),
+                            tls,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Self::Describe { id, output, global } => {
+                run::provider_profile_describe(
+                    endpoint,
+                    &id,
+                    output.as_str(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Export { id, output, global } => {
+                run::provider_profile_export(
+                    endpoint,
+                    &id,
+                    output.as_str(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Import {
+                file,
+                from,
+                url,
+                global,
+            } => {
+                run::provider_profile_import(
+                    endpoint,
+                    file.as_deref(),
+                    from.as_deref(),
+                    url.as_deref(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Update { id, file, global } => {
+                run::provider_profile_update(endpoint, &id, &file, profile_workspace(global), tls)
+                    .await?;
+            }
+            Self::Lint {
+                file,
+                from,
+                url,
+                global,
+            } => {
+                run::provider_profile_lint(
+                    endpoint,
+                    file.as_deref(),
+                    from.as_deref(),
+                    url.as_deref(),
+                    profile_workspace(global),
+                    tls,
+                )
+                .await?;
+            }
+            Self::Delete { ids, global } => {
+                run::provider_profile_delete(endpoint, &ids, profile_workspace(global), tls)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------
+// Gateway commands (replaces the old `cluster` / `cluster admin` groups)
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum GatewayCommands {
+    /// Add an existing gateway.
+    ///
+    /// Registers a gateway endpoint so it appears in `ryno gateway select`.
+    ///
+    /// An `http://...` endpoint is treated as a direct plaintext gateway and
+    /// skips both mTLS client certificate lookup and browser authentication.
+    ///
+    /// Without extra flags, an `https://...` endpoint is treated as an
+    /// edge-authenticated (cloud) gateway and a browser is opened for
+    /// authentication.
+    ///
+    /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway. Pass
+    /// `--local` to register a local mTLS gateway. In both cases, mTLS
+    /// certificates must already exist in the gateway config directory.
+    ///
+    /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand
+    /// for `--remote user@host` with the endpoint derived from the URL.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Add {
+        /// Gateway endpoint URL (for example `http://127.0.0.1:8080`,
+        /// `https://10.0.0.5:8080`, or `ssh://user@host:8080`).
+        endpoint: String,
+
+        /// Gateway name (auto-derived from the endpoint hostname when omitted).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Register a remote mTLS gateway accessible via SSH.
+        /// With `http://...`, stores a remote plaintext registration instead.
+        #[arg(long, conflicts_with = "local")]
+        remote: Option<String>,
+
+        /// Register a local mTLS gateway running in Docker on this machine.
+        /// With `http://...`, stores a local plaintext registration instead.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+
+        /// Register as an OIDC-authenticated gateway using the given issuer URL.
+        /// The server must be configured with `--oidc-issuer` matching this URL.
+        #[arg(long, conflicts_with = "remote")]
+        oidc_issuer: Option<String>,
+
+        /// OIDC client ID for the CLI login flow (defaults to "ryno-cli").
+        #[arg(long, default_value = "ryno-cli", requires = "oidc_issuer")]
+        oidc_client_id: String,
+
+        /// OIDC audience for the API resource server. When different from
+        /// the client ID, the CLI requests this audience in the token exchange.
+        /// Defaults to the client ID value.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_audience: Option<String>,
+
+        /// Space-separated `OAuth2` scopes to request during OIDC login.
+        /// When set, tokens will include these scopes for fine-grained access control.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_scopes: Option<String>,
+    },
+
+    /// Remove a local gateway registration.
+    ///
+    /// This only removes CLI metadata and stored auth tokens. It does not stop
+    /// or destroy the gateway service.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Remove {
+        /// Gateway name (defaults to active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Authenticate with an edge-authenticated or OIDC gateway.
+    ///
+    /// Opens a browser for the edge proxy's login flow and stores the
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Login {
+        /// Gateway name (defaults to the active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Clear stored authentication credentials for a gateway.
+    ///
+    /// Removes the locally stored OIDC token or edge token so subsequent
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logout {
+        /// Gateway name (defaults to the active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Select the active gateway.
+    ///
+    /// When called without a name, opens an interactive chooser on a TTY and
+    /// lists available gateways in non-interactive mode.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Select {
+        /// Gateway name (omit to choose interactively or list in non-interactive mode).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Show elevated live gateway runtime information.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Info {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List registered gateways.
+    ///
+    /// Prints all registered gateways with their endpoint, type,
+    /// authentication mode, source, and remote registration details.
+    /// The active gateway is marked with `*`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+}
+
+// -----------------------------------------------------------------------
+// Doctor (diagnostic) commands
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum DoctorCommands {
+    /// Validate system prerequisites for running a gateway.
+    ///
+    /// Checks that a Docker-compatible runtime is installed, running, and
+    /// reachable. Reports version info and socket path.
+    ///
+    /// Examples:
+    ///   ryno doctor check
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Check,
+}
+
+#[derive(Subcommand, Debug)]
+// `Create` carries enough optional fields to be ~3x larger than the next
+// variant; boxing it would obscure the clap derive ergonomics for one
+// (rare) enum allocation per parse, which isn't worth the readability
+// cost.
+#[allow(clippy::large_enum_variant)]
+enum SandboxCommands {
+    /// Create a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Optional sandbox name (auto-generated when omitted).
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Create the sandbox from a named sandbox template.
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        template: Option<String>,
+
+        /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
+        /// or a container image reference (e.g., `myregistry.com/img:tag`).
+        ///
+        /// To use a local Dockerfile, build and tag it with the container
+        /// engine used by your local gateway, then pass the resulting image
+        /// reference here. A rootfs tar is staged for the VM compute driver.
+        #[arg(long, value_hint = ValueHint::AnyPath)]
+        from: Option<String>,
+
+        /// Upload local files into the sandbox before running.
+        ///
+        /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
+        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
+        /// working directory.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
+        #[arg(
+            long,
+            value_hint = ValueHint::AnyPath,
+            help_heading = "UPLOAD FLAGS",
+            conflicts_with = "command"
+        )]
+        upload: Vec<String>,
+
+        /// Disable `.gitignore` filtering for `--upload`.
+        #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
+        no_git_ignore: bool,
+
+        /// Deprecated compatibility flag. Sandboxes are kept by default.
+        #[arg(long, hide = true, conflicts_with = "no_keep")]
+        keep: bool,
+
+        /// Delete the sandbox after the initial command or shell exits.
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "expose"])]
+        no_keep: bool,
+
+        /// Launch a remote editor after the sandbox is ready.
+        /// Keeps the sandbox alive and installs Ryno-managed SSH config.
+        #[arg(long, value_enum, conflicts_with = "no_keep")]
+        editor: Option<CliEditor>,
+
+        /// Request GPU resources for the sandbox.
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
+
+        /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for the sandbox (for example: 512Mi, 4Gi, 8G).
+        #[arg(long)]
+        memory: Option<String>,
+
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Disabled unless the gateway administrator enables `allow_driver_config`.
+        /// External resource attachments still require approval labels.
+        ///
+        /// For Kubernetes, pass a value such as
+        /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
+        /// Attach a configured credential provider to the sandbox.
+        /// Use providers for API keys, tokens, and other secrets so commands in
+        /// the sandbox do not receive the real credential values. Repeatable.
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+
+        /// Path to a custom sandbox policy YAML file.
+        /// Overrides the built-in default and the `RYNO_SANDBOX_POLICY` env var.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: Option<String>,
+
+        /// Forward a local port to the sandbox before the initial command or shell starts.
+        /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
+        #[arg(long, conflicts_with = "no_keep")]
+        forward: Option<String>,
+
+        /// Expose a loopback HTTP or WebSocket service after the sandbox is ready.
+        /// Keeps the sandbox alive. Use `ryno service expose` to add a named service.
+        #[arg(
+            long,
+            value_name = "PORT",
+            value_parser = clap::value_parser!(u16).range(1..),
+            conflicts_with = "no_keep"
+        )]
+        expose: Option<u16>,
+
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t, requires = "expose")]
+        expose_authorization_mode: CliServiceAuthorizationMode,
+
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
+        /// Start the canonical main process without attaching to it.
+        #[arg(long, conflicts_with = "editor")]
+        detach: bool,
+
+        /// Restart behavior after the canonical main process exits.
+        #[arg(
+            long,
+            value_parser = ["never", "on-failure", "always"],
+            default_value = "never"
+        )]
+        restart_policy: String,
+
+        /// Auto-create missing providers from local credentials.
+        ///
+        /// Without this flag, an interactive prompt asks per-provider;
+        /// in non-interactive mode the command errors.
+        #[arg(long, overrides_with = "no_auto_providers")]
+        auto_providers: bool,
+
+        /// Never auto-create providers; error if required providers are missing.
+        #[arg(long, overrides_with = "auto_providers")]
+        no_auto_providers: bool,
+
+        /// Attach labels to the sandbox (key=value format, repeatable).
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        /// Set a non-secret environment variable in the sandbox.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it with `--provider` instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
+        /// Approval mode for agent-authored policy proposals.
+        ///
+        /// `manual` (default): every proposal lands in the draft inbox for
+        /// human review, regardless of the prover verdict.
+        ///
+        /// `auto`: proposals whose prover delta is empty are approved
+        /// automatically; proposals with findings still require human
+        /// approval. Auto mode is an explicit opt-in — `Ryno`'s
+        /// default-deny posture is preserved unless you choose otherwise.
+        #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
+        approval_mode: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "no_keep", "forward"])]
+        output: OutputFormat,
+
+        /// Command to run after "--" (defaults to an interactive shell).
+        #[arg(last = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Fetch a sandbox by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Print only the active policy YAML (same policy as the default view; stdout only).
+        #[arg(long, conflicts_with = "output")]
+        policy_only: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List sandboxes.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of sandboxes to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Print only sandbox ids (one per line).
+        #[arg(long, conflicts_with_all = ["names", "output"])]
+        ids: bool,
+
+        /// Print only sandbox names (one per line).
+        #[arg(long, conflicts_with_all = ["ids", "output"])]
+        names: bool,
+
+        /// Filter sandboxes by label selector (key1=value1,key2=value2).
+        #[arg(long)]
+        selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
+        output: OutputFormat,
+
+        /// List sandboxes across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+
+    /// Delete a sandbox by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox names.
+        #[arg(required_unless_present = "all", num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        names: Vec<String>,
+
+        /// Delete all sandboxes.
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
+    },
+
+    /// Stop a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Start a stopped sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Execute a command in a running sandbox.
+    ///
+    /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
+    /// Output is streamed to the terminal in real-time. The CLI exits with the
+    /// remote command's exit code.
+    ///
+    /// For interactive shell sessions, use `sandbox connect` instead.
+    ///
+    /// Examples:
+    ///   ryno sandbox exec my-sandbox -- ls -la /workspace
+    ///   ryno sandbox exec --name my-sandbox -- ls -la /workspace
+    ///   ryno sandbox exec -n my-sandbox --workdir /app -- python script.py
+    ///   echo "hello" | ryno sandbox exec -n my-sandbox -- cat
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Exec {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Sandbox name; same as the positional argument.
+        #[arg(long, short = 'n', conflicts_with = "sandbox", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Working directory inside the sandbox.
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Timeout in seconds (0 = no timeout).
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
+        /// Run the command without sourcing shell login/profile startup files.
+        ///
+        /// Default sources them so tool-specific env (`VIRTUAL_ENV`, etc.) is
+        /// available. Use this for automation and managed checks that need
+        /// predictable startup behavior — sandbox-user startup files cannot run
+        /// before the requested command.
+        #[arg(long)]
+        no_login_shell: bool,
+
+        /// Set a non-secret environment variable for the command.
+        /// Do not use this option for API keys, tokens, or other secrets; attach
+        /// a provider to the sandbox instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// Command and arguments to execute, after `--`.
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+
+    /// Connect to a sandbox.
+    ///
+    /// When no name is given, reconnects to the last-used sandbox.
+    /// Press Ctrl-D or Ctrl-P Ctrl-Q to disconnect without terminating the main process.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Connect {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Launch a remote editor instead of an interactive shell.
+        /// Installs Ryno-managed SSH config if needed.
+        #[arg(long, value_enum)]
+        editor: Option<CliEditor>,
+    },
+
+    /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Upload {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Local path to upload.
+        #[arg(value_hint = ValueHint::AnyPath)]
+        local_path: String,
+
+        /// Destination path in the sandbox (defaults to the container's working directory).
+        dest: Option<String>,
+
+        /// Disable `.gitignore` filtering (uploads everything).
+        #[arg(long)]
+        no_git_ignore: bool,
+    },
+
+    /// Download files from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Download {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Sandbox path to download.
+        sandbox_path: String,
+
+        /// Local destination (defaults to `.`).
+        #[arg(value_hint = ValueHint::AnyPath)]
+        dest: Option<String>,
+    },
+
+    /// Print an SSH config entry for a sandbox.
+    ///
+    /// Outputs a Host block suitable for appending to ~/.ssh/config,
+    /// enabling tools like `VSCode` Remote-SSH to connect to the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    SshConfig {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Manage providers attached to a sandbox.
+    #[command(subcommand)]
+    Provider(SandboxProviderCommands),
+
+    /// Manage reusable sandbox workload templates.
+    #[command(subcommand)]
+    Template(SandboxTemplateCommands),
+}
+
+/// Common observation flags; the deadline starts after the mutation is saved.
+#[derive(clap::Args, Debug)]
+struct ProviderReadinessArgs {
+    /// Wait until the sandbox applies the credentials, policy, and environment for new processes.
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum wait in seconds after saving the change, shared by all selected sandboxes.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout: u64,
+
+    /// Output format; JSON and YAML include change IDs and results for each sandbox.
+    #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+impl ProviderReadinessArgs {
+    fn options(&self) -> run::ProviderWaitOptions<'_> {
+        run::ProviderWaitOptions {
+            wait: self.wait,
+            timeout: std::time::Duration::from_secs(self.timeout),
+            output: self.output.as_str(),
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxProviderCommands {
+    /// List providers attached to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Maximum number of attached providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Attach a provider to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Attach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to attach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
+    },
+
+    /// Detach a provider from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Detach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to detach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
+    },
+
+    /// Check whether a sandbox has applied a provider change.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider whose attachment or revocation is being inspected.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        /// Change ID returned by attach, detach, or update; omitted means the latest saved state.
+        #[arg(long = "receipt")]
+        receipt: Option<String>,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+// `Create` carries several optional strings and repeated key-value flags. This
+// enum is only used for clap parsing, so boxing fields would add friction
+// without a meaningful runtime win.
+#[allow(clippy::large_enum_variant)]
+enum SandboxTemplateCommands {
+    /// Create a reusable sandbox workload template.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Template name.
+        name: String,
+
+        /// Container image for sandboxes created from this template.
+        /// When omitted, the gateway's default sandbox image is used at create time.
+        #[arg(long)]
+        image: Option<String>,
+
+        /// CPU limit for sandboxes created from this template (for example: 500m, 1, 2.5).
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for sandboxes created from this template (for example: 512Mi, 4Gi, 8G).
+        #[arg(long)]
+        memory: Option<String>,
+
+        /// Request GPU resources for sandboxes created from this template.
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
+
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Requires administrator opt-in; resource admission still applies.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
+        /// Target startup readiness duration for this template (for example: 30s, 5m, 1h).
+        #[arg(long, value_name = "DURATION")]
+        ready_within: Option<String>,
+
+        /// Maximum startup burst associated with this template.
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
+        max_burst: Option<u32>,
+
+        /// Attach labels to the template (key=value format, repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// Attach annotations to the template (key=value format, repeatable).
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+
+        /// Set a non-secret environment variable in sandboxes created from this template.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it when creating sandboxes instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Fetch a sandbox workload template by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Template name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List sandbox workload templates.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of templates to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Filter templates by labels, e.g. env=prod,team=runtime.
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Print only template names (one per line).
+        #[arg(long, conflicts_with = "output")]
+        names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
+
+        /// List templates across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+
+    /// Delete sandbox workload templates.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Template names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DraftCommands {
+    /// Show network rules for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Filter by status (pending, approved, rejected).
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Approve a network rule.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Approve {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to approve.
+        #[arg(long)]
+        chunk_id: String,
+    },
+
+    /// Reject a network rule.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Reject {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to reject.
+        #[arg(long)]
+        chunk_id: String,
+
+        /// Reason for rejection.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+
+    /// Approve all pending network rules.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ApproveAll {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Also approve security-flagged rules.
+        #[arg(long)]
+        include_security_flagged: bool,
+    },
+
+    /// Clear all pending network rules.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Clear {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+
+    /// Show network rule history.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    History {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommands {
+    /// Update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Set {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Path to the policy YAML file.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+
+        /// Apply as a gateway-global policy for all sandboxes.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global policy updates.
+        #[arg(long)]
+        yes: bool,
+
+        /// Wait for the sandbox to load the policy.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
+    /// Incrementally update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
+        #[arg(long = "add-endpoint")]
+        add_endpoints: Vec<String>,
+
+        /// Remove an endpoint: host:port.
+        #[arg(long = "remove-endpoint")]
+        remove_endpoints: Vec<String>,
+
+        /// Append an allow rule: `host:port[,port...]:METHOD:path_glob`.
+        /// List every port on the target endpoint.
+        /// Requires --rule-name and the complete --binary list or --any-binary.
+        #[arg(long = "add-allow")]
+        add_allow: Vec<String>,
+
+        /// Append a deny rule: `host:port[,port...]:METHOD:path_glob`.
+        /// List every port on the target endpoint.
+        /// Requires --rule-name and the complete --binary list or --any-binary.
+        #[arg(long = "add-deny")]
+        add_deny: Vec<String>,
+
+        /// Remove a network rule by name.
+        #[arg(long = "remove-rule")]
+        remove_rules: Vec<String>,
+
+        /// Add a binary to --add-endpoint, or declare every binary of an L7 target rule.
+        #[arg(long = "binary", value_hint = ValueHint::FilePath)]
+        binaries: Vec<String>,
+
+        /// Name the target rule for L7 appends, or override one --add-endpoint rule name.
+        #[arg(long = "rule-name")]
+        rule_name: Option<String>,
+
+        /// Explicitly declare that the target rule for L7 appends allows any binary.
+        #[arg(long, conflicts_with = "binaries")]
+        any_binary: bool,
+
+        /// Select an exact endpoint path for L7 appends; an empty value selects no path.
+        /// This is distinct from the appended method/path matcher.
+        #[arg(long)]
+        endpoint_path: Option<String>,
+
+        /// Preview the merged policy without sending it to the gateway.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Wait for the sandbox to load the policy revision.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
+    /// Show current effective policy for a sandbox or a stored global policy.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Show a specific stored policy revision. Default shows the current effective policy.
+        #[arg(long = "rev", default_value_t = 0)]
+        rev: u32,
+
+        /// Include the effective policy payload, including provider-composed entries.
+        #[arg(long, conflicts_with = "base")]
+        full: bool,
+
+        /// Include the base policy payload without provider-composed entries.
+        #[arg(long)]
+        base: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
+        output: PolicyGetOutput,
+
+        /// Show the global policy revision.
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// List policy history for a sandbox or the global policy.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Maximum number of revisions to return in this page.
+        #[arg(long, default_value_t = 20)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// List global policy revisions.
+        #[arg(long)]
+        global: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete the gateway-global policy lock, restoring sandbox-level policy control.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Delete the global policy setting.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global policy delete.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SettingsCommands {
+    /// Show effective settings for a sandbox or gateway-global scope.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Show gateway-global settings.
+        #[arg(long)]
+        global: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set a single setting key.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Set {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Setting key.
+        #[arg(long)]
+        key: String,
+
+        /// Setting value (string input; bool keys accept true/false/yes/no/1/0).
+        #[arg(long)]
+        value: String,
+
+        /// Apply at gateway-global scope.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global setting updates.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Delete a setting key (sandbox-scoped or gateway-global).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Setting key.
+        #[arg(long)]
+        key: String,
+
+        /// Delete at gateway-global scope.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global setting delete.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ForwardCommands {
+    /// Start forwarding a local port to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Port to forward: [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080).
+        port: String,
+
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Run the forward in the background and exit immediately.
+        #[arg(short = 'd', long)]
+        background: bool,
+    },
+
+    /// Stop a background port forward.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Port that was forwarded.
+        port: u16,
+
+        /// Sandbox name (auto-detected from active forwards if omitted).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// List tracked port forwards.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Service {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Target service port inside the sandbox.
+        #[arg(long)]
+        target_port: u16,
+
+        /// Target service host inside the sandbox. Phase 1 accepts loopback only.
+        #[arg(long, default_value = "127.0.0.1")]
+        target_host: String,
+
+        /// Local bind address and port: `[bind_address:]port`. Defaults to the target port. Use port 0 for dynamic assignment.
+        #[arg(long)]
+        local: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Expose an HTTP service running inside a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Expose {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Loopback TCP port inside the sandbox.
+        #[arg(value_name = "TARGET-PORT")]
+        target_port: u16,
+
+        /// Service name.
+        service: Option<String>,
+
+        /// Handling for an incoming application Authorization header.
+        #[arg(long, value_enum, default_value_t)]
+        authorization_mode: CliServiceAuthorizationMode,
+    },
+
+    /// List exposed sandbox service endpoints.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Maximum number of endpoints to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// List services across all workspaces (overrides --workspace).
+        #[arg(long, conflicts_with = "sandbox")]
+        all_workspaces: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
+
+    /// Delete one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCommands {
+    /// Create a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Workspace name (DNS-1123 label: lowercase alphanumeric and hyphens, max 19 chars).
+        #[arg(long)]
+        name: String,
+
+        /// Labels to attach to the workspace (KEY=VALUE).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+    },
+
+    /// Fetch a workspace by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Workspace name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        name: String,
+    },
+
+    /// List workspaces.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of workspaces to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Filter by label selector (e.g. "env=staging").
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Workspace name(s) to delete.
+        #[arg(required = true, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        names: Vec<String>,
+    },
+
+    /// Manage workspace members.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Member(WorkspaceMemberCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceMemberCommands {
+    /// Add a member to a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Add {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// OIDC subject claim identifying the principal.
+        #[arg(long)]
+        subject: String,
+
+        /// Role to assign (user or admin).
+        #[arg(long)]
+        role: String,
+    },
+
+    /// Remove a member from a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Remove {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// OIDC subject claim identifying the principal.
+        #[arg(long)]
+        subject: String,
+    },
+
+    /// List members of a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// Maximum number of members to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+}
+
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    ryno_core::compat::apply_legacy_env();
+    std::thread::Builder::new()
+        .name("ryno-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start Ryno main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("Ryno main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::main]
+async fn main() -> Result<()> {
+    ryno_core::compat::apply_legacy_env();
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+
+    let cli = Cli::parse();
+
+    // Resolve colorization before anything is printed, so no command can emit
+    // escape sequences into a pipe.
+    color::init(cli.color);
+
+    let mut tls = TlsOptions::default();
+    tls.gateway_insecure = cli.gateway_insecure;
+
+    // Set up logging based on verbosity
+    let log_level = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+
+    // The fmt formatter defaults to ANSI on with no terminal detection, and it
+    // writes to stdout, so without this `ryno -v ... | ...` pipes escapes
+    // to the caller.
+    tracing_subscriber::fmt()
+        .with_ansi(color::stdout_enabled())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .init();
+
+    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
+    // Only set the env var when it hasn't been explicitly overridden by the
+    // user, so `RYNO_SSH_LOG_LEVEL=DEBUG ryno ...` still wins.
+    if std::env::var("RYNO_SSH_LOG_LEVEL").is_err() {
+        let ssh_log_level = match cli.verbose {
+            0 => "ERROR",
+            1 => "INFO",
+            _ => "DEBUG",
+        };
+        // SAFETY: Called early in main() before spawning async tasks that
+        // read the environment, so no concurrent readers exist.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("RYNO_SSH_LOG_LEVEL", ssh_log_level);
+        }
+    }
+
+    match cli.command {
+        // -----------------------------------------------------------
+        // Gateway commands (was `cluster` / `cluster admin`)
+        // -----------------------------------------------------------
+        Some(Commands::Gateway {
+            command: Some(command),
+        }) => match command {
+            GatewayCommands::Add {
+                endpoint,
+                name,
+                remote,
+                local,
+                oidc_issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+            } => {
+                run::gateway_add(
+                    &endpoint,
+                    name.as_deref(),
+                    remote.as_deref(),
+                    local,
+                    oidc_issuer.as_deref(),
+                    &oidc_client_id,
+                    oidc_audience.as_deref(),
+                    oidc_scopes.as_deref(),
+                    cli.gateway_insecure,
+                )
+                .await?;
+            }
+            GatewayCommands::Remove { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                         Specify a gateway name: ryno gateway remove <name>\n\
+                         Or list available gateways: ryno gateway select"
+                        )
+                    })?;
+                run::gateway_remove(&name)?;
+            }
+            GatewayCommands::Login { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                             Specify a gateway name: ryno gateway login <name>\n\
+                             Or set one with: ryno gateway select <name>"
+                        )
+                    })?;
+                run::gateway_login(&name, cli.gateway_insecure).await?;
+            }
+            GatewayCommands::Logout { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                             Specify a gateway name: ryno gateway logout <name>\n\
+                             Or set one with: ryno gateway select <name>"
+                        )
+                    })?;
+                run::gateway_logout(&name)?;
+            }
+            GatewayCommands::Select { name } => {
+                run::gateway_select(name.as_deref(), &cli.gateway)?;
+            }
+            GatewayCommands::Info { output } => {
+                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
+                    run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
+                } else {
+                    run::gateway_info_not_configured()?;
+                }
+            }
+            GatewayCommands::List { output } => {
+                run::gateway_list(&cli.gateway, output.as_str())?;
+            }
+        },
+
+        // -----------------------------------------------------------
+        // Doctor (diagnostic) commands
+        // -----------------------------------------------------------
+        Some(Commands::Doctor {
+            command: Some(command),
+        }) => match command {
+            DoctorCommands::Check => {
+                run::doctor_check()?;
+            }
+        },
+        Some(Commands::Doctor { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("doctor")
+                .expect("doctor subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+
+        // -----------------------------------------------------------
+        // Top-level status
+        // -----------------------------------------------------------
+        Some(Commands::Status { output }) => {
+            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
+                run::gateway_status(
+                    &ctx.name,
+                    &ctx.endpoint,
+                    output.as_str(),
+                    &tls,
+                    auth_error.as_deref(),
+                )
+                .await?;
+            } else if ryno_cli::output::print_output_single(
+                output.as_str(),
+                &(),
+                |()| serde_json::json!({"status": "not_configured"}),
+            )? {
+                // Structured output handled.
+            } else {
+                println!("{}", "Gateway Status".cyan().bold());
+                println!();
+                println!("  {} No gateway configured.", "Status:".dimmed());
+                println!();
+                println!(
+                    "Register a gateway with: {}",
+                    "ryno gateway add <endpoint>".dimmed()
+                );
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Top-level current identity
+        // -----------------------------------------------------------
+        Some(Commands::Whoami { output }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
+        }
+
+        // -----------------------------------------------------------
+        // Top-level forward (was `sandbox forward`)
+        // -----------------------------------------------------------
+        Some(Commands::Forward {
+            command: Some(fwd_cmd),
+        }) => match fwd_cmd {
+            ForwardCommands::Stop { port, name } => {
+                let (workspace, name) = match name {
+                    Some(n) => (cli.workspace.clone(), n),
+                    None => {
+                        if let Some((workspace, name)) = run::find_forward_by_port(port)? {
+                            eprintln!(
+                                "→ Found forward on sandbox '{name}' in workspace '{workspace}'"
+                            );
+                            (workspace, name)
+                        } else {
+                            eprintln!("{} No active forward found for port {port}", "!".yellow());
+                            return Ok(());
+                        }
+                    }
+                };
+                if run::stop_forward(&workspace, &name, port)? {
+                    eprintln!(
+                        "{} Stopped forward of port {port} for sandbox {name}",
+                        "✓".green().bold(),
+                    );
+                } else {
+                    eprintln!(
+                        "{} No active forward found for port {port} on sandbox {name}",
+                        "!".yellow(),
+                    );
+                }
+            }
+            ForwardCommands::List { output } => {
+                let forwards = run::list_forwards()?;
+                if ryno_cli::output::print_output_collection(
+                    output.as_str(),
+                    &forwards,
+                    |forward| {
+                        serde_json::json!({
+                            "workspace": forward.workspace,
+                            "sandbox": forward.sandbox_name,
+                            "bind_address": forward.bind_addr,
+                            "port": forward.port,
+                            "pid": forward.pid,
+                            "alive": forward.validated_alive,
+                        })
+                    },
+                )? {
+                    return Ok(());
+                }
+                if forwards.is_empty() {
+                    eprintln!("No active forwards.");
+                } else {
+                    let workspace_width = forwards
+                        .iter()
+                        .map(|f| f.workspace.len())
+                        .max()
+                        .unwrap_or(9)
+                        .max(9);
+                    let name_width = forwards
+                        .iter()
+                        .map(|f| f.sandbox_name.len())
+                        .max()
+                        .unwrap_or(7)
+                        .max(7);
+                    let bind_width = forwards
+                        .iter()
+                        .map(|f| f.bind_addr.len())
+                        .max()
+                        .unwrap_or(4)
+                        .max(4);
+                    println!(
+                        "{:<ww$} {:<nw$} {:<bw$} {:<8} {:<10} STATUS",
+                        "WORKSPACE",
+                        "SANDBOX",
+                        "BIND",
+                        "PORT",
+                        "PID",
+                        ww = workspace_width,
+                        nw = name_width,
+                        bw = bind_width,
+                    );
+                    for f in &forwards {
+                        let status = if f.validated_alive {
+                            "running".green().to_string()
+                        } else {
+                            "dead".red().to_string()
+                        };
+                        println!(
+                            "{:<ww$} {:<nw$} {:<bw$} {:<8} {:<10} {}",
+                            f.workspace,
+                            f.sandbox_name,
+                            f.bind_addr,
+                            f.port,
+                            f.pid,
+                            status,
+                            ww = workspace_width,
+                            nw = name_width,
+                            bw = bind_width,
+                        );
+                    }
+                }
+            }
+            ForwardCommands::Service {
+                name,
+                target_port,
+                target_host,
+                local,
+            } => {
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                let local = local.unwrap_or_else(|| target_port.to_string());
+                run::service_forward_tcp(
+                    &ctx.endpoint,
+                    &name,
+                    Some(&local),
+                    &target_host,
+                    target_port,
+                    &tls,
+                    &cli.workspace,
+                )
+                .await?;
+            }
+            ForwardCommands::Start {
+                port,
+                name,
+                background,
+            } => {
+                let spec = ryno_core::forward::ForwardSpec::parse(&port)?;
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
+                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                run::sandbox_forward(
+                    &ctx.endpoint,
+                    &name,
+                    &spec,
+                    background,
+                    &tls,
+                    &cli.workspace,
+                )
+                .await?;
+                if background {
+                    eprintln!(
+                        "{} Forwarding port {} to sandbox {name} in the background",
+                        "✓".green().bold(),
+                        spec.port,
+                    );
+                    eprintln!("  Access at: {}", spec.access_url());
+                    eprintln!("  Stop with: ryno forward stop {} {name}", spec.port);
+                }
+            }
+        },
+
+        // -----------------------------------------------------------
+        // Service exposure
+        // -----------------------------------------------------------
+        Some(Commands::Service {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match command {
+                ServiceCommands::Expose {
+                    sandbox,
+                    service,
+                    target_port,
+                    authorization_mode,
+                } => {
+                    let service = service.unwrap_or_default();
+                    run::service_expose(
+                        &ctx.endpoint,
+                        &sandbox,
+                        &service,
+                        target_port,
+                        authorization_mode.into(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                ServiceCommands::List {
+                    sandbox,
+                    page_size,
+                    page_token,
+                    all_workspaces,
+                    output,
+                } => {
+                    run::service_list(
+                        &ctx.endpoint,
+                        sandbox.as_deref(),
+                        page_size,
+                        &page_token,
+                        &cli.workspace,
+                        all_workspaces,
+                        output.as_str(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ServiceCommands::Get { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_get(&ctx.endpoint, &sandbox, &service, &cli.workspace, &tls)
+                        .await?;
+                }
+                ServiceCommands::Delete { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_delete(&ctx.endpoint, &sandbox, &service, &cli.workspace, &tls)
+                        .await?;
+                }
+            }
+        }
+        // -----------------------------------------------------------
+        // Top-level logs (was `sandbox logs`)
+        // -----------------------------------------------------------
+        Some(Commands::Logs {
+            name,
+            n,
+            tail,
+            since,
+            source,
+            level,
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+            run::sandbox_logs(
+                &ctx.endpoint,
+                &name,
+                n,
+                tail,
+                since.as_deref(),
+                &source,
+                &level,
+                &cli.workspace,
+                &tls,
+            )
+            .await?;
+        }
+
+        // -----------------------------------------------------------
+        // Top-level policy (was `sandbox policy`)
+        // -----------------------------------------------------------
+        Some(Commands::Policy {
+            command: Some(policy_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match policy_cmd {
+                PolicyCommands::Set {
+                    name,
+                    policy,
+                    global,
+                    yes,
+                    wait,
+                    timeout,
+                } => {
+                    if global {
+                        if wait {
+                            return Err(miette::miette!(
+                                "--wait is not supported for global policies; \
+                                 global policies are effective immediately"
+                            ));
+                        }
+                        run::sandbox_policy_set_global(
+                            &ctx.endpoint,
+                            &policy,
+                            yes,
+                            wait,
+                            timeout,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_policy_set(
+                            &ctx.endpoint,
+                            &name,
+                            &policy,
+                            wait,
+                            timeout,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                }
+                PolicyCommands::Update {
+                    name,
+                    add_endpoints,
+                    remove_endpoints,
+                    add_allow,
+                    add_deny,
+                    remove_rules,
+                    binaries,
+                    rule_name,
+                    any_binary,
+                    endpoint_path,
+                    dry_run,
+                    wait,
+                    timeout,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_policy_update(
+                        &ctx.endpoint,
+                        &name,
+                        &add_endpoints,
+                        &remove_endpoints,
+                        &add_deny,
+                        &add_allow,
+                        &remove_rules,
+                        &binaries,
+                        rule_name.as_deref(),
+                        any_binary,
+                        endpoint_path.as_deref(),
+                        dry_run,
+                        wait,
+                        timeout,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                PolicyCommands::Get {
+                    name,
+                    rev,
+                    full,
+                    base,
+                    output,
+                    global,
+                } => {
+                    let view = run::PolicyGetView::from_flags(base, full);
+                    if global {
+                        run::sandbox_policy_get_global(
+                            &ctx.endpoint,
+                            rev,
+                            view,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_policy_get(
+                            &ctx.endpoint,
+                            &name,
+                            rev,
+                            view,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                }
+                PolicyCommands::List {
+                    name,
+                    page_size,
+                    page_token,
+                    global,
+                    output,
+                } => {
+                    if global {
+                        run::sandbox_policy_list_global(
+                            &ctx.endpoint,
+                            page_size,
+                            &page_token,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_policy_list(
+                            &ctx.endpoint,
+                            &name,
+                            page_size,
+                            &page_token,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                }
+                PolicyCommands::Delete { global, yes } => {
+                    if !global {
+                        return Err(miette::miette!(
+                            "sandbox policy delete is not supported; use --global to remove global policy lock"
+                        ));
+                    }
+                    run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &cli.workspace, &tls)
+                        .await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Settings commands
+        // -----------------------------------------------------------
+        Some(Commands::Settings {
+            command: Some(settings_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+
+            match settings_cmd {
+                SettingsCommands::Get { name, global, json } => {
+                    if global {
+                        if name.is_some() {
+                            return Err(miette::miette!(
+                                "settings get --global does not accept a sandbox name"
+                            ));
+                        }
+                        run::gateway_settings_get(&ctx.endpoint, json, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_settings_get(&ctx.endpoint, &name, json, &cli.workspace, &tls)
+                            .await?;
+                    }
+                }
+                SettingsCommands::Set {
+                    name,
+                    key,
+                    value,
+                    global,
+                    yes,
+                } => {
+                    if global {
+                        run::gateway_setting_set(
+                            &ctx.endpoint,
+                            &key,
+                            &value,
+                            yes,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_setting_set(
+                            &ctx.endpoint,
+                            &name,
+                            &key,
+                            &value,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                }
+                SettingsCommands::Delete {
+                    name,
+                    key,
+                    global,
+                    yes,
+                } => {
+                    if global {
+                        run::gateway_setting_delete(&ctx.endpoint, &key, yes, &cli.workspace, &tls)
+                            .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_setting_delete(
+                            &ctx.endpoint,
+                            &name,
+                            &key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Network rules
+        // -----------------------------------------------------------
+        Some(Commands::Rule {
+            command: Some(draft_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            match draft_cmd {
+                DraftCommands::Get { name, status } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_get(
+                        &ctx.endpoint,
+                        &name,
+                        status.as_deref(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DraftCommands::Approve { name, chunk_id } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_approve(
+                        &ctx.endpoint,
+                        &name,
+                        &chunk_id,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DraftCommands::Reject {
+                    name,
+                    chunk_id,
+                    reason,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_reject(
+                        &ctx.endpoint,
+                        &name,
+                        &chunk_id,
+                        &reason,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DraftCommands::ApproveAll {
+                    name,
+                    include_security_flagged,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_approve_all(
+                        &ctx.endpoint,
+                        &name,
+                        include_security_flagged,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+
+                DraftCommands::Clear { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_clear(&ctx.endpoint, &name, &cli.workspace, &tls).await?;
+                }
+                DraftCommands::History { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_history(&ctx.endpoint, &name, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Sandbox commands
+        // -----------------------------------------------------------
+        Some(Commands::Sandbox {
+            command: Some(command),
+        }) => {
+            match command {
+                SandboxCommands::Create {
+                    name,
+                    template,
+                    from,
+                    upload,
+                    no_git_ignore,
+                    keep,
+                    no_keep,
+                    editor,
+                    gpu,
+                    cpu,
+                    memory,
+                    driver_config_json,
+                    providers,
+                    policy,
+                    forward,
+                    expose,
+                    expose_authorization_mode,
+                    tty,
+                    no_tty,
+                    detach,
+                    restart_policy,
+                    auto_providers,
+                    no_auto_providers,
+                    labels,
+                    envs,
+                    no_credential_warnings,
+                    approval_mode,
+                    output,
+                    command,
+                } => {
+                    // Resolve --tty / --no-tty into an Option<bool> override.
+                    let tty_override = if no_tty {
+                        Some(false)
+                    } else if tty {
+                        Some(true)
+                    } else {
+                        None // auto-detect
+                    };
+
+                    // Resolve --auto-providers / --no-auto-providers.
+                    let auto_providers_override = if no_auto_providers {
+                        Some(false)
+                    } else if auto_providers {
+                        Some(true)
+                    } else {
+                        None // prompt or auto-detect
+                    };
+
+                    // Parse --label flags into a HashMap<String, String>.
+                    let mut labels_map = HashMap::new();
+                    for label_str in &labels {
+                        let parts: Vec<&str> = label_str.splitn(2, '=').collect();
+                        if parts.len() != 2 {
+                            return Err(miette::miette!(
+                                "invalid label format '{}', expected key=value",
+                                label_str
+                            ));
+                        }
+                        labels_map.insert(parts[0].to_string(), parts[1].to_string());
+                    }
+
+                    // Parse --env flags into a HashMap<String, String>.
+                    let env_map = run::parse_env_pairs(&envs)?;
+
+                    // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
+                    let upload_specs: Vec<(String, Option<String>, bool)> = upload
+                        .iter()
+                        .map(|s| {
+                            let (local, remote) = parse_upload_spec(s);
+                            (local, remote, !no_git_ignore)
+                        })
+                        .collect();
+
+                    // Validate all local paths before creating the sandbox so failures are
+                    // fast and have no side effects.
+                    for (local, _, _) in &upload_specs {
+                        if std::fs::symlink_metadata(local).is_err() {
+                            return Err(miette::miette!("local path does not exist: {}", local));
+                        }
+                    }
+
+                    let editor = editor.map(Into::into);
+                    let forward = forward
+                        .map(|s| ryno_core::forward::ForwardSpec::parse(&s))
+                        .transpose()?;
+                    let keep = keep
+                        || !no_keep
+                        || editor.is_some()
+                        || forward.is_some()
+                        || expose.is_some();
+                    let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
+
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let endpoint = &ctx.endpoint;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
+                    let exit_code = Box::pin(run::sandbox_create(
+                        endpoint,
+                        &ctx.name,
+                        run::SandboxCreateConfig {
+                            name: name.as_deref(),
+                            template: template.as_deref(),
+                            from: from.as_deref(),
+                            uploads: &upload_specs,
+                            keep,
+                            gpu_requirements,
+                            cpu: cpu.as_deref(),
+                            memory: memory.as_deref(),
+                            driver_config_json: driver_config_json.as_deref(),
+                            editor,
+                            providers: &providers,
+                            policy: policy.as_deref(),
+                            forward,
+                            expose,
+                            expose_authorization_mode: expose_authorization_mode.into(),
+                            command: &command,
+                            tty_override,
+                            auto_providers_override,
+                            labels: labels_map,
+                            environment: env_map,
+                            approval_mode: &approval_mode,
+                            output: output.as_str(),
+                            detach,
+                            suppress_credential_warnings: no_credential_warnings,
+                            restart_policy: &restart_policy,
+                        },
+                        &cli.workspace,
+                        &tls,
+                    ))
+                    .await?;
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
+                }
+                SandboxCommands::Upload {
+                    name,
+                    local_path,
+                    dest,
+                    no_git_ignore,
+                } => {
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
+                    let local = std::path::Path::new(&local_path);
+                    run::sandbox_upload(
+                        &ctx.endpoint,
+                        &name,
+                        local,
+                        dest.as_deref(),
+                        !no_git_ignore,
+                        &tls,
+                        &cli.workspace,
+                    )
+                    .await?;
+                }
+                SandboxCommands::Download {
+                    name,
+                    sandbox_path,
+                    dest,
+                } => {
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
+                    let local_dest = dest.as_deref().unwrap_or(".");
+                    eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
+                    run::sandbox_sync_down(
+                        &ctx.endpoint,
+                        &name,
+                        &sandbox_path,
+                        local_dest,
+                        &tls,
+                        &cli.workspace,
+                    )
+                    .await?;
+                    eprintln!("{} Download complete", "✓".green().bold());
+                }
+                other => {
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let endpoint = &ctx.endpoint;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
+                    match other {
+                        SandboxCommands::Create { .. }
+                        | SandboxCommands::Upload { .. }
+                        | SandboxCommands::Download { .. } => {
+                            unreachable!()
+                        }
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                            output,
+                        } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_get(
+                                endpoint,
+                                &name,
+                                policy_only,
+                                output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        SandboxCommands::List {
+                            page_size,
+                            page_token,
+                            ids,
+                            names,
+                            selector,
+                            output,
+                            all_workspaces,
+                        } => {
+                            run::sandbox_list(
+                                endpoint,
+                                page_size,
+                                &page_token,
+                                ids,
+                                names,
+                                selector.as_deref(),
+                                output.as_str(),
+                                &cli.workspace,
+                                all_workspaces,
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        SandboxCommands::Delete { names, all } => {
+                            run::sandbox_delete(
+                                endpoint,
+                                &names,
+                                all,
+                                &cli.workspace,
+                                &tls,
+                                &ctx.name,
+                            )
+                            .await?;
+                        }
+                        SandboxCommands::Stop { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Connect { name, editor } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            if let Some(editor) = editor.map(Into::into) {
+                                run::sandbox_connect_editor(
+                                    endpoint,
+                                    &ctx.name,
+                                    &name,
+                                    editor,
+                                    &tls,
+                                    &cli.workspace,
+                                )
+                                .await?;
+                            } else {
+                                let exit_code =
+                                    run::sandbox_connect(endpoint, &name, &tls, &cli.workspace)
+                                        .await?;
+                                if exit_code != 0 {
+                                    std::process::exit(exit_code);
+                                }
+                            }
+                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
+                        }
+                        SandboxCommands::Exec {
+                            sandbox,
+                            name,
+                            workdir,
+                            timeout,
+                            tty,
+                            no_tty,
+                            envs,
+                            command,
+                            no_login_shell,
+                        } => {
+                            let name =
+                                resolve_sandbox_name(name.or(sandbox), &ctx.name, &cli.workspace)?;
+                            // Resolve --tty / --no-tty into an Option<bool> override.
+                            let tty_override = if no_tty {
+                                Some(false)
+                            } else if tty {
+                                Some(true)
+                            } else {
+                                None // auto-detect
+                            };
+                            let env_map = run::parse_env_pairs(&envs)?;
+                            let exit_code = run::sandbox_exec_grpc(
+                                endpoint,
+                                &name,
+                                &command,
+                                workdir.as_deref(),
+                                timeout,
+                                tty_override,
+                                &env_map,
+                                no_login_shell,
+                                &tls,
+                                &cli.workspace,
+                            )
+                            .await?;
+                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
+                            if exit_code != 0 {
+                                std::process::exit(exit_code);
+                            }
+                        }
+                        SandboxCommands::SshConfig { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
+                        }
+                        SandboxCommands::Provider(command) => match command {
+                            SandboxProviderCommands::List {
+                                name,
+                                page_size,
+                                page_token,
+                                output,
+                            } => {
+                                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                                run::sandbox_provider_list(
+                                    endpoint,
+                                    &name,
+                                    page_size,
+                                    &page_token,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxProviderCommands::Attach {
+                                name,
+                                provider,
+                                readiness,
+                            } => {
+                                run::sandbox_provider_attach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    &cli.workspace,
+                                    &tls,
+                                    readiness.options(),
+                                )
+                                .await?;
+                            }
+                            SandboxProviderCommands::Detach {
+                                name,
+                                provider,
+                                readiness,
+                            } => {
+                                run::sandbox_provider_detach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    &cli.workspace,
+                                    &tls,
+                                    readiness.options(),
+                                )
+                                .await?;
+                            }
+                            SandboxProviderCommands::Status {
+                                name,
+                                provider,
+                                receipt,
+                                readiness,
+                            } => {
+                                run::sandbox_provider_status(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    receipt.as_deref().unwrap_or_default(),
+                                    &cli.workspace,
+                                    &tls,
+                                    readiness.options(),
+                                )
+                                .await?;
+                            }
+                        },
+                        SandboxCommands::Template(command) => match command {
+                            SandboxTemplateCommands::Create {
+                                name,
+                                image,
+                                cpu,
+                                memory,
+                                gpu,
+                                driver_config_json,
+                                ready_within,
+                                max_burst,
+                                labels,
+                                annotations,
+                                envs,
+                                no_credential_warnings,
+                                output,
+                            } => {
+                                let labels = run::parse_key_value_pairs(&labels, "--label")?;
+                                let annotations =
+                                    run::parse_key_value_pairs(&annotations, "--annotation")?;
+                                let environment = run::parse_env_pairs(&envs)?;
+                                let gpu_requirements: Option<GpuResourceRequirements> =
+                                    gpu.map(Into::into);
+                                run::sandbox_template_create(
+                                    endpoint,
+                                    &name,
+                                    image.as_deref(),
+                                    cpu.as_deref(),
+                                    memory.as_deref(),
+                                    gpu_requirements,
+                                    driver_config_json.as_deref(),
+                                    ready_within.as_deref(),
+                                    max_burst,
+                                    labels,
+                                    annotations,
+                                    environment,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                    no_credential_warnings,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Get { name, output } => {
+                                run::sandbox_template_get(
+                                    endpoint,
+                                    &name,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::List {
+                                page_size,
+                                page_token,
+                                label_selector,
+                                names,
+                                output,
+                                all_workspaces,
+                            } => {
+                                run::sandbox_template_list(
+                                    endpoint,
+                                    page_size,
+                                    &page_token,
+                                    label_selector.as_deref(),
+                                    names,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    all_workspaces,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Delete { names } => {
+                                run::sandbox_template_delete(
+                                    endpoint,
+                                    &names,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Workspace commands
+        // -----------------------------------------------------------
+        Some(Commands::Workspace {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+
+            match command {
+                WorkspaceCommands::Create { name, labels } => {
+                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                }
+                WorkspaceCommands::Get { name } => {
+                    run::workspace_get(endpoint, &name, &tls).await?;
+                }
+                WorkspaceCommands::List {
+                    page_size,
+                    page_token,
+                    label_selector,
+                    output,
+                } => {
+                    run::workspace_list(
+                        endpoint,
+                        page_size,
+                        &page_token,
+                        label_selector.as_deref().unwrap_or(""),
+                        output.as_str(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                WorkspaceCommands::Delete { names } => {
+                    run::workspace_delete(endpoint, &names, &tls).await?;
+                }
+                WorkspaceCommands::Member(command) => match command {
+                    WorkspaceMemberCommands::Add {
+                        workspace,
+                        subject,
+                        role,
+                    } => {
+                        run::workspace_member_add(endpoint, &workspace, &subject, &role, &tls)
+                            .await?;
+                    }
+                    WorkspaceMemberCommands::Remove { workspace, subject } => {
+                        run::workspace_member_remove(endpoint, &workspace, &subject, &tls).await?;
+                    }
+                    WorkspaceMemberCommands::List {
+                        workspace,
+                        page_size,
+                        page_token,
+                        output,
+                    } => {
+                        run::workspace_member_list(
+                            endpoint,
+                            &workspace,
+                            page_size,
+                            &page_token,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                },
+            }
+        }
+
+        Some(Commands::Provider {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+
+            match command {
+                ProviderCommands::Create {
+                    name,
+                    provider_type,
+                    from_existing,
+                    credentials,
+                    from_gcloud_adc,
+                    from_oidc_token,
+                    runtime_credentials,
+                    config,
+                    global_profile,
+                } => {
+                    let profile_ws = if global_profile { "" } else { &cli.workspace };
+                    let credential_source = if from_existing {
+                        run::ProviderCreateCredentialSource::Existing
+                    } else if from_gcloud_adc {
+                        run::ProviderCreateCredentialSource::GcloudAdc
+                    } else if from_oidc_token {
+                        run::ProviderCreateCredentialSource::OidcToken
+                    } else if runtime_credentials {
+                        run::ProviderCreateCredentialSource::Runtime
+                    } else {
+                        run::ProviderCreateCredentialSource::ExplicitCredentials
+                    };
+                    run::provider_create_with_options(run::ProviderCreateOptions {
+                        server: endpoint,
+                        name: &name,
+                        provider_type: provider_type.as_str(),
+                        credentials: &credentials,
+                        credential_source,
+                        config: &config,
+                        workspace: &cli.workspace,
+                        profile_workspace: profile_ws,
+                        tls: &tls,
+                    })
+                    .await?;
+                }
+                ProviderCommands::Refresh(command) => match command {
+                    ProviderRefreshCommands::Status {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_status(
+                            endpoint,
+                            &name,
+                            credential_key.as_deref(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Configure {
+                        name,
+                        credential_key,
+                        strategy,
+                        material,
+                        secret_material_env,
+                        secret_material_keys,
+                        credential_expires_at,
+                    } => {
+                        run::provider_refresh_config(
+                            endpoint,
+                            run::ProviderRefreshConfigInput {
+                                name: &name,
+                                credential_key: &credential_key,
+                                strategy: strategy.as_str(),
+                                material: &material,
+                                secret_material_env: &secret_material_env,
+                                secret_material_keys: &secret_material_keys,
+                                credential_expires_at_ms: credential_expires_at,
+                            },
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Rotate {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_rotate(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Delete {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_delete(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
+                    }
+                },
+                ProviderCommands::ListProfiles { output, global } => {
+                    // Normalize the legacy list command before execution so output,
+                    // pagination, and scope handling stay identical for both spellings.
+                    ProfileCommands::List {
+                        profile_type: Some(ProfileType::Provider),
+                        output,
+                        global,
+                    }
+                    .run(endpoint, &cli.workspace, &tls)
+                    .await?;
+                }
+                ProviderCommands::Profile(command) => {
+                    command.run(endpoint, &cli.workspace, &tls).await?;
+                }
+                ProviderCommands::Get { name } => {
+                    run::provider_get(endpoint, &name, &cli.workspace, &tls).await?;
+                }
+                ProviderCommands::List {
+                    page_size,
+                    page_token,
+                    names,
+                    output,
+                    all_workspaces,
+                } => {
+                    run::provider_list(
+                        endpoint,
+                        page_size,
+                        &page_token,
+                        names,
+                        output.as_str(),
+                        &cli.workspace,
+                        all_workspaces,
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProviderCommands::Update {
+                    name,
+                    from_existing,
+                    from_oidc_token,
+                    credentials,
+                    config,
+                    credential_expires_at,
+                    readiness,
+                } => {
+                    run::provider_update(run::ProviderUpdateOptions {
+                        server: endpoint,
+                        name: &name,
+                        from_existing,
+                        from_oidc_token,
+                        credentials: &credentials,
+                        config: &config,
+                        credential_expires_at: &credential_expires_at,
+                        workspace: &cli.workspace,
+                        tls: &tls,
+                        readiness: readiness.options(),
+                    })
+                    .await?;
+                }
+                ProviderCommands::Delete { names } => {
+                    run::provider_delete(endpoint, &names, &cli.workspace, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Profile {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            command.run(endpoint, &cli.workspace, &tls).await?;
+        }
+        Some(Commands::Term { theme }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+            let channel = ryno_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
+            let interceptor = ryno_core::auth::EdgeAuthInterceptor::new(
+                tls.oidc_token.as_deref(),
+                tls.edge_token.as_deref(),
+            )?;
+            ryno_tui::run(
+                channel,
+                interceptor,
+                &ctx.name,
+                &ctx.endpoint,
+                &cli.workspace,
+                theme,
+            )
+            .await?;
+        }
+        Some(Commands::Completions { shell }) => {
+            let exe = std::env::current_exe()
+                .map_err(|e| miette::miette!("failed to find current executable: {e}"))?;
+            let output = std::process::Command::new(&exe)
+                .env("COMPLETE", shell.to_string())
+                .output()
+                .map_err(|e| miette::miette!("failed to generate completions: {e}"))?;
+            let script = normalize_completion_script(output.stdout, &exe)?;
+            std::io::stdout()
+                .write_all(script.as_bytes())
+                .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
+        }
+        Some(Commands::SshProxy {
+            gateway,
+            sandbox,
+            token,
+            server,
+            gateway_name,
+            name,
+        }) => {
+            match (gateway, sandbox, token, server, gateway_name, name) {
+                // Token mode (existing behavior): pre-created session credentials.
+                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
+                    let mut effective_tls = match gateway_name_opt {
+                        Some(ref g) => tls.with_gateway_name(g),
+                        None => tls,
+                    };
+                    if let Some(ref g) = gateway_name_opt {
+                        apply_auth(&mut effective_tls, g)?;
+                    }
+                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
+                        .await?;
+                }
+                // Name mode with --gateway-name: resolve endpoint from metadata.
+                (_, _, _, server_override, Some(g), Some(n)) => {
+                    let endpoint = if let Some(srv) = server_override {
+                        srv
+                    } else {
+                        let meta = load_gateway_metadata(&g).map_err(|_| {
+                            miette::miette!(
+                                "Unknown gateway '{g}'.\n\
+                                  Register it first: ryno gateway add <endpoint> --name {g}\n\
+                                  Or list available gateways: ryno gateway select"
+                            )
+                        })?;
+                        meta.gateway_endpoint
+                    };
+                    let mut tls = tls.with_gateway_name(&g);
+                    apply_auth(&mut tls, &g)?;
+                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
+                }
+                // Legacy name mode with --server only (no --gateway-name).
+                (_, _, _, Some(srv), None, Some(n)) => {
+                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls, &cli.workspace).await?;
+                }
+                _ => {
+                    return Err(miette::miette!(
+                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
+                    ));
+                }
+            }
+        }
+
+        // No subcommand provided - print help for the command
+        Some(Commands::Sandbox { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("sandbox")
+                .expect("sandbox subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Forward { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("forward")
+                .expect("forward subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Service { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("service")
+                .expect("service subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Policy { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("policy")
+                .expect("policy subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Settings { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("settings")
+                .expect("settings subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Workspace { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("workspace")
+                .expect("workspace subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Profile { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("profile")
+                .ok_or_else(|| miette::miette!("profile command is unavailable"))?
+                .print_help()
+                .map_err(|error| miette::miette!("failed to print profile help: {error}"))?;
+        }
+        Some(Commands::Provider { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("provider")
+                .expect("provider subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Gateway { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("gateway")
+                .expect("gateway subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Rule { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("rule")
+                .expect("rule subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+
+        None => {
+            Cli::command().print_help().expect("Failed to print help");
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse an upload spec like `<local>[:<remote>]` into (`local_path`, `optional_sandbox_path`).
+fn parse_upload_spec(spec: &str) -> (String, Option<String>) {
+    if let Some((local, remote)) = spec.split_once(':') {
+        (
+            local.to_string(),
+            if remote.is_empty() {
+                None
+            } else {
+                Some(remote.to_string())
+            },
+        )
+    } else {
+        (spec.to_string(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ryno_bootstrap::{GatewayMetadata, edge_token::store_edge_token, store_gateway_metadata};
+    use std::ffi::OsString;
+    use std::fs;
+
+    #[test]
+    fn policy_update_parses_explicit_l7_scope_and_endpoint_path() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "policy",
+            "update",
+            "sandbox-1",
+            "--rule-name",
+            "api",
+            "--binary",
+            "/usr/bin/curl",
+            "--binary",
+            "/usr/bin/python3",
+            "--endpoint-path",
+            "",
+            "--add-allow",
+            "api.example.com:443,8443:POST:/v1/a:b",
+        ])
+        .expect("explicit scope flags should parse");
+        let Some(Commands::Policy {
+            command:
+                Some(PolicyCommands::Update {
+                    rule_name,
+                    binaries,
+                    any_binary,
+                    endpoint_path,
+                    add_allow,
+                    ..
+                }),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected policy update");
+        };
+        assert_eq!(rule_name.as_deref(), Some("api"));
+        assert_eq!(binaries, vec!["/usr/bin/curl", "/usr/bin/python3"]);
+        assert!(!any_binary);
+        assert_eq!(endpoint_path.as_deref(), Some(""));
+        assert_eq!(add_allow, vec!["api.example.com:443,8443:POST:/v1/a:b"]);
+    }
+
+    #[test]
+    fn policy_update_any_binary_is_explicit_and_conflicts_with_binary() {
+        let args = [
+            "ryno",
+            "policy",
+            "update",
+            "--rule-name",
+            "api",
+            "--any-binary",
+            "--add-deny",
+            "api.example.com:443:DELETE:/v1/**",
+        ];
+        let cli = Cli::try_parse_from(args).expect("explicit wildcard should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Update {
+                    any_binary: true,
+                    ..
+                }),
+                ..
+            })
+        ));
+        let conflicting = args.into_iter().chain(["--binary", "/usr/bin/curl"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+    }
+
+    #[test]
+    fn policy_update_add_endpoint_keeps_scope_defaults() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "policy",
+            "update",
+            "--add-endpoint",
+            "api.example.com:443",
+        ])
+        .expect("endpoint creation retains its existing flags");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Update {
+                    any_binary: false,
+                    endpoint_path: None,
+                    rule_name: None,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
+    // A static mutex serialises them so concurrent threads don't clobber
+    // each other's environment.
+    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
+    /// then restore the original value.
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    fn edge_metadata(name: &str, endpoint: &str) -> GatewayMetadata {
+        GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.to_string(),
+            is_remote: true,
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_engine_returns_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["ryno".into(), "".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.contains(&"sandbox".to_string()),
+            "expected 'sandbox' in root candidates, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"--gateway".to_string()),
+            "expected '--gateway' in root candidates, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"lg".to_string()),
+            "expected root candidates to prefer canonical command names, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"pol".to_string()),
+            "expected root candidates to prefer canonical command names, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn completions_subcommand_appears_in_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["ryno".into(), "comp".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"completions".to_string()),
+            "expected 'completions' in candidates, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_provider_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "provider",
+            "attach",
+            "work-sandbox",
+            "work-github",
+        ])
+        .expect("sandbox provider attach should parse");
+
+        let Some(Commands::Sandbox {
+            command:
+                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach {
+                    name, provider, ..
+                })),
+        }) = cli.command
+        else {
+            panic!("expected sandbox provider attach command");
+        };
+
+        assert_eq!(name, "work-sandbox");
+        assert_eq!(provider, "work-github");
+    }
+
+    #[test]
+    fn exec_grammar_requires_separator_before_remote_command() {
+        use clap::error::ErrorKind;
+
+        // Returns (target, command, tty) or the clap error kind.
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["ryno", "sandbox", "exec"];
+            argv.extend(args);
+            let cli = Cli::try_parse_from(argv).map_err(|e| e.kind())?;
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Exec {
+                        sandbox,
+                        name,
+                        command,
+                        tty,
+                        ..
+                    }),
+            }) = cli.command
+            else {
+                panic!("expected sandbox exec command");
+            };
+            Ok::<_, ErrorKind>((name.or(sandbox), command, tty))
+        };
+        let check = |args: &[&str], target: Option<&str>, command: &[&str], tty: bool| {
+            let got = parse(args).unwrap_or_else(|kind| panic!("{args:?} failed: {kind:?}"));
+            let command = command.iter().map(ToString::to_string).collect();
+            assert_eq!(got, (target.map(str::to_string), command, tty), "{args:?}");
+        };
+
+        check(
+            &["a", "--", "echo", "hi"],
+            Some("a"),
+            &["echo", "hi"],
+            false,
+        );
+        check(&["-n", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--name", "a", "--", "echo"], Some("a"), &["echo"], false);
+        check(&["--", "echo", "hi"], None, &["echo", "hi"], false);
+        // Flags on either side of the positional target.
+        check(&["--tty", "a", "--", "echo"], Some("a"), &["echo"], true);
+        check(&["a", "--tty", "--", "echo"], Some("a"), &["echo"], true);
+        check(
+            &["-n", "a", "--tty", "--", "echo"],
+            Some("a"),
+            &["echo"],
+            true,
+        );
+        // Hyphenated remote args are opaque.
+        check(&["a", "--", "ls", "-la"], Some("a"), &["ls", "-la"], false);
+        check(&["a", "--", "--tty"], Some("a"), &["--tty"], false);
+        check(&["--", "-n", "x"], None, &["-n", "x"], false);
+        // An inner delimiter belongs to the remote command.
+        let git = ["git", "log", "--", "path"];
+        check(
+            &["a", "--", "git", "log", "--", "path"],
+            Some("a"),
+            &git,
+            false,
+        );
+        check(&["--", "git", "log", "--", "path"], None, &git, false);
+
+        let err: &[(&[&str], ErrorKind)] = &[
+            // Target given twice.
+            (&["-n", "a", "b", "--", "echo"], ErrorKind::ArgumentConflict),
+            (&["b", "-n", "a", "--", "echo"], ErrorKind::ArgumentConflict),
+            // Missing `--`.
+            (&["a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["a", "--tty", "echo"], ErrorKind::UnknownArgument),
+            (&["-n", "a", "echo", "hi"], ErrorKind::UnknownArgument),
+            (&["git", "log"], ErrorKind::UnknownArgument),
+            (&["a"], ErrorKind::MissingRequiredArgument),
+            (&[], ErrorKind::MissingRequiredArgument),
+            // Missing remote command.
+            (&["a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["-n", "a", "--"], ErrorKind::MissingRequiredArgument),
+            (&["--"], ErrorKind::MissingRequiredArgument),
+        ];
+        for (args, kind) in err {
+            assert_eq!(parse(args).map(|_| ()), Err(*kind), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn provider_readiness_commands_have_bounded_waits_and_structured_output() {
+        for action in ["attach", "detach", "status"] {
+            let cli = Cli::try_parse_from([
+                "ryno",
+                "sandbox",
+                "provider",
+                action,
+                "sandbox",
+                "provider",
+                "--wait",
+                "--timeout",
+                "45",
+                "--output",
+                "json",
+            ])
+            .expect("readiness flags should parse");
+            let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Provider(command)),
+            }) = cli.command
+            else {
+                panic!("expected provider command")
+            };
+            let (SandboxProviderCommands::Attach { readiness, .. }
+            | SandboxProviderCommands::Detach { readiness, .. }
+            | SandboxProviderCommands::Status { readiness, .. }) = command
+            else {
+                panic!("expected readiness command");
+            };
+            assert!(readiness.wait);
+            assert_eq!(readiness.timeout, 45);
+            assert_eq!(readiness.output.as_str(), "json");
+        }
+        for timeout in ["0", "3601"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ryno",
+                    "provider",
+                    "update",
+                    "provider",
+                    "--wait",
+                    "--timeout",
+                    timeout,
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ryno",
+                "sandbox",
+                "provider",
+                "status",
+                "sandbox",
+                "provider",
+                "--receipt",
+                "receipt-id",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn completions_policy_flag_falls_back_to_file_paths() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        fs::write(temp.path().join("policy.yaml"), "version: 1\n")
+            .expect("failed to create policy file");
+
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec![
+            "ryno".into(),
+            "sandbox".into(),
+            "create".into(),
+            "--policy".into(),
+            "pol".into(),
+        ];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 4, Some(temp.path()))
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.contains(&"policy.yaml".to_string()),
+            "expected file path completion for --policy, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn completions_other_path_flags_fall_back_to_path_candidates() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        fs::write(temp.path().join("id_rsa"), "key").expect("failed to create key file");
+        fs::write(temp.path().join("Dockerfile"), "FROM scratch\n")
+            .expect("failed to create dockerfile");
+        fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
+
+        let cases: Vec<(Vec<&str>, usize, &str)> = vec![
+            (
+                vec!["ryno", "sandbox", "upload", "demo", "Do"],
+                4,
+                "Dockerfile",
+            ),
+            (
+                vec!["ryno", "sandbox", "download", "demo", "/sandbox/file", "Do"],
+                5,
+                "Dockerfile",
+            ),
+        ];
+
+        for (raw_args, index, expected) in cases {
+            let mut cmd = Cli::command();
+            let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
+            let candidates =
+                clap_complete::engine::complete(&mut cmd, args, index, Some(temp.path()))
+                    .expect("completion engine failed");
+            let names: Vec<String> = candidates
+                .iter()
+                .map(|c| c.get_value().to_string_lossy().into_owned())
+                .collect();
+
+            assert!(
+                names.contains(&expected.to_string()),
+                "expected path completion '{expected}' for args {raw_args:?}, got: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_uses_path_value_hint() {
+        let cmd = Cli::command();
+        let sandbox = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sandbox")
+            .expect("missing sandbox subcommand");
+        let upload = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "upload")
+            .expect("missing sandbox upload subcommand");
+        let local_path = upload
+            .get_arguments()
+            .find(|arg| arg.get_id() == "local_path")
+            .expect("missing local_path argument");
+
+        assert_eq!(local_path.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn sandbox_upload_completion_suggests_local_paths() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        fs::write(temp.path().join("sample.txt"), "x").expect("failed to create sample file");
+
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec![
+            "ryno".into(),
+            "sandbox".into(),
+            "upload".into(),
+            "demo".into(),
+            "sa".into(),
+        ];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 4, Some(temp.path()))
+            .expect("completion engine failed");
+
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("sample.txt")),
+            "expected path completion for upload local_path, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_completion_suggests_registered_gateways() {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_metadata("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway alpha");
+            store_gateway_metadata("beta", &edge_metadata("beta", "https://beta.example.com"))
+                .expect("store gateway beta");
+
+            for (raw_args, index) in [
+                (vec!["ryno", "--gateway", "a"], 2),
+                (vec!["ryno", "gateway", "select", "a"], 3),
+                (vec!["ryno", "gateway", "remove", "a"], 3),
+            ] {
+                let mut cmd = Cli::command();
+                let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
+                let candidates = clap_complete::engine::complete(&mut cmd, args, index, None)
+                    .expect("completion engine failed");
+                let names: Vec<String> = candidates
+                    .iter()
+                    .map(|c| c.get_value().to_string_lossy().into_owned())
+                    .collect();
+
+                assert!(
+                    names.contains(&"alpha".to_string()),
+                    "expected gateway completion for args {raw_args:?}, got: {names:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn global_gateway_flag_still_parses_with_subcommands() {
+        let cli = Cli::try_parse_from(["ryno", "--gateway", "demo", "status"])
+            .expect("global gateway flag should parse with subcommands");
+
+        assert_eq!(cli.gateway.as_deref(), Some("demo"));
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn whoami_accepts_output_json() {
+        let cli = Cli::try_parse_from(["ryno", "whoami", "--output", "json"])
+            .expect("whoami --output json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Whoami {
+                output: OutputFormat::Json
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_info_accepts_output_json() {
+        let cli = Cli::try_parse_from(["ryno", "gateway", "info", "-o", "json"])
+            .expect("gateway info -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::Info {
+                    output: OutputFormat::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_info_is_not_a_command() {
+        assert!(Cli::try_parse_from(["ryno", "info"]).is_err());
+    }
+
+    #[test]
+    fn managed_inference_is_not_a_command() {
+        assert!(Cli::try_parse_from(["ryno", "inference", "get"]).is_err());
+    }
+
+    #[test]
+    fn hidden_aliases_still_parse() {
+        let cli = Cli::try_parse_from(["ryno", "lg", "sandbox-1"])
+            .expect("hidden aliases should still parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs { name: Some(ref name), .. }) if name == "sandbox-1"
+        ));
+    }
+
+    #[test]
+    fn completion_script_uses_ryno_command_name() {
+        let script = normalize_completion_script(
+            b"/tmp/custom/ryno -- \"${words[@]}\"\n#compdef ryno\n".to_vec(),
+            std::path::Path::new("/tmp/custom/ryno"),
+        )
+        .expect("normalize completion script");
+
+        assert!(script.contains("ryno -- \"${words[@]}\""));
+        assert!(!script.contains("/tmp/custom/ryno"));
+    }
+
+    #[test]
+    fn sandbox_download_uses_path_value_hint() {
+        let cmd = Cli::command();
+        let sandbox = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sandbox")
+            .expect("missing sandbox subcommand");
+        let download = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "download")
+            .expect("missing download subcommand");
+        let dest = download
+            .get_arguments()
+            .find(|arg| arg.get_id() == "dest")
+            .expect("missing dest argument");
+
+        assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn parse_upload_spec_without_remote() {
+        let (local, remote) = parse_upload_spec("./src");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, None);
+    }
+
+    #[test]
+    fn parse_upload_spec_with_remote() {
+        let (local, remote) = parse_upload_spec("./src:/sandbox/src");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, Some("/sandbox/src".to_string()));
+    }
+
+    #[test]
+    fn parse_upload_spec_with_trailing_colon() {
+        let (local, remote) = parse_upload_spec("./src:");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, None);
+    }
+
+    #[test]
+    fn sandbox_create_upload_flag_accepts_multiple_values() {
+        let result = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--upload",
+            "./src:/workspace/src",
+            "--upload",
+            "./config:/workspace/config",
+        ]);
+        assert!(
+            result.is_ok(),
+            "--upload should be repeatable, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_upload_flag_accepts_zero_values() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create with no --upload should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_no_git_ignore_requires_upload() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create", "--no-git-ignore"]);
+        assert!(
+            result.is_err(),
+            "--no-git-ignore without --upload should be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_name_returns_explicit_name() {
+        // When a name is provided, it should be returned regardless of any
+        // stored last-sandbox state.
+        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-gateway", "default");
+        assert_eq!(result.unwrap(), "explicit");
+    }
+
+    #[test]
+    fn resolve_sandbox_name_falls_back_to_last_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("test-gateway", "default", "remembered-sb").unwrap();
+            let result = resolve_sandbox_name(None, "test-gateway", "default");
+            assert_eq!(result.unwrap(), "remembered-sb");
+        });
+    }
+
+    #[test]
+    fn resolve_sandbox_name_errors_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let err = resolve_sandbox_name(None, "unknown-gateway", "default").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ryno sandbox connect"),
+                "expected helpful hint in error, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_gateway_uses_stored_name_for_matching_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let ctx = resolve_gateway(&None, &Some("https://gw.example.com/".to_string())).unwrap();
+            assert_eq!(ctx.name, "edge-gateway");
+            assert_eq!(ctx.endpoint, "https://gw.example.com/");
+        });
+    }
+
+    #[test]
+    fn resolve_gateway_prefers_explicit_gateway_for_direct_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "named-gateway",
+                &edge_metadata("named-gateway", "https://stored.example.com"),
+            )
+            .unwrap();
+
+            let ctx = resolve_gateway(
+                &Some("named-gateway".to_string()),
+                &Some("https://override.example.com".to_string()),
+            )
+            .unwrap();
+
+            assert_eq!(ctx.name, "named-gateway");
+            assert_eq!(ctx.endpoint, "https://override.example.com");
+        });
+    }
+
+    #[test]
+    fn gpu_cli_request_option_maps_absent_gpu_to_no_requirements() {
+        let gpu: Option<GpuResourceRequirements> = Option::<GpuCliRequest>::None.map(Into::into);
+
+        assert_eq!(gpu, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_driver_default_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::DriverDefault);
+
+        assert_eq!(gpu.count, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_count_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::Count(2));
+
+        assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
+    fn apply_auth_uses_stored_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+            store_edge_token("edge-gateway", "token-123").unwrap();
+
+            let mut tls = TlsOptions::default();
+            apply_auth(&mut tls, "edge-gateway").unwrap();
+
+            assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
+        });
+    }
+
+    #[test]
+    fn apply_auth_reports_missing_edge_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let mut tls = TlsOptions::default();
+            let error = apply_auth_with_status(&mut tls, "edge-gateway")
+                .expect("missing credentials should be reported");
+
+            assert!(error.contains("edge credentials are missing"));
+            assert!(!tls.is_bearer_auth());
+        });
+    }
+
+    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
+    /// accepted by the `SshProxy` subcommand and land in the right fields.
+    /// This catches drift when CLI flags are renamed or restructured.
+    #[test]
+    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
+        // This is the exact flag pattern constructed by the TUI in lib.rs
+        // (handle_shell_connect, handle_exec, handle_port_forward).
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "ssh-proxy",
+            "--gateway",
+            "https://gw.example.com:8080/proxy/connect",
+            "--sandbox",
+            "my-box",
+            "--workspace",
+            "team-a",
+            "--token",
+            "tok-abc",
+            "--gateway-name",
+            "my-gateway",
+        ])
+        .expect("TUI proxy command flags must be accepted by the CLI");
+        assert_eq!(cli.workspace, "team-a");
+
+        match cli.command {
+            Some(Commands::SshProxy {
+                gateway,
+                sandbox,
+                token,
+                gateway_name,
+                ..
+            }) => {
+                assert_eq!(
+                    gateway.as_deref(),
+                    Some("https://gw.example.com:8080/proxy/connect"),
+                    "gateway URL must land in SshProxy.gateway, not the global flag"
+                );
+                assert_eq!(sandbox.as_deref(), Some("my-box"));
+                assert_eq!(token.as_deref(), Some("tok-abc"));
+                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            }
+            other => panic!("expected SshProxy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_list_defaults_and_type_filter_parse() {
+        let cli = Cli::try_parse_from(["ryno", "profile", "list"]).expect("profile list");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Profile {
+                command: Some(ProfileCommands::List {
+                    profile_type: None,
+                    output: OutputFormat::Table,
+                    global: false,
+                })
+            })
+        ));
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from([
+                "ryno", "profile", "list", "--type", "provider", "-o", format, "--global",
+            ])
+            .expect("profile list with type, output, and scope");
+            assert!(matches!(cli.command, Some(Commands::Profile {
+                command: Some(ProfileCommands::List {
+                    profile_type: Some(ProfileType::Provider), output, global: true,
+                })
+            }) if output == expected));
+        }
+        assert!(Cli::try_parse_from(["ryno", "profile", "list", "--type", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn profile_describe_parses_output_and_scope() {
+        for (format, expected) in [
+            ("table", OutputFormat::Table),
+            ("json", OutputFormat::Json),
+            ("yaml", OutputFormat::Yaml),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ryno",
+                "--workspace",
+                "team",
+                "profile",
+                "describe",
+                "openai",
+                "-o",
+                format,
+                "--global",
+            ])
+            .expect("profile describe");
+            assert_eq!(cli.workspace, "team");
+            assert!(matches!(cli.command, Some(Commands::Profile {
+                command: Some(ProfileCommands::Describe {id, output, global: true})
+            }) if id == "openai" && output == expected));
+        }
+        let cli = Cli::try_parse_from(["ryno", "profile", "describe", "openai"])
+            .expect("profile describe defaults");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Profile {
+                command: Some(ProfileCommands::Describe {
+                    output: OutputFormat::Table,
+                    global: false,
+                    ..
+                })
+            })
+        ));
+        assert!(Cli::try_parse_from(["ryno", "profile", "describe"]).is_err());
+    }
+
+    #[test]
+    fn profile_crud_subcommands_parse() {
+        let export = Cli::try_parse_from(["ryno", "profile", "export", "custom-api"])
+            .expect("profile export");
+        assert!(matches!(export.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Export {id, output: OutputFormat::Yaml, global: false})
+        }) if id == "custom-api"));
+        let update = Cli::try_parse_from([
+            "ryno",
+            "profile",
+            "update",
+            "custom-api",
+            "-f",
+            "custom-api.yaml",
+            "--global",
+        ])
+        .expect("profile update");
+        assert!(matches!(update.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Update {id, file, global: true})
+        }) if id == "custom-api" && file == std::path::Path::new("custom-api.yaml")));
+        let delete = Cli::try_parse_from([
+            "ryno",
+            "profile",
+            "delete",
+            "custom-api",
+            "custom-alt",
+            "--global",
+        ])
+        .expect("profile delete");
+        assert!(matches!(delete.command, Some(Commands::Profile {
+            command: Some(ProfileCommands::Delete {ids, global: true})
+        }) if ids == ["custom-api", "custom-alt"]));
+    }
+
+    #[test]
+    fn profile_import_and_lint_require_exactly_one_source() {
+        for verb in ["import", "lint"] {
+            for source in ["-f", "--from", "--url"] {
+                let cli = Cli::try_parse_from([
+                    "ryno",
+                    "profile",
+                    verb,
+                    source,
+                    "./profiles",
+                    "--global",
+                ])
+                .expect("profile source should parse");
+                let (file, from, url, global) = match cli.command {
+                    Some(Commands::Profile {
+                        command:
+                            Some(
+                                ProfileCommands::Import {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                }
+                                | ProfileCommands::Lint {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                },
+                            ),
+                    }) => (file, from, url, global),
+                    other => panic!("unexpected profile command: {other:?}"),
+                };
+                assert!(global);
+                assert_eq!(file.is_some(), source == "-f");
+                assert_eq!(from.is_some(), source == "--from");
+                assert_eq!(url.is_some(), source == "--url");
+            }
+            assert!(Cli::try_parse_from(["ryno", "profile", verb]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "ryno",
+                    "profile",
+                    verb,
+                    "-f",
+                    "file.yaml",
+                    "--from",
+                    "./profiles"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_help_exposes_all_commands_without_gateway() {
+        let cli = Cli::try_parse_from(["ryno", "profile"]).expect("profile help");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Profile { command: None })
+        ));
+        let mut root = Cli::command();
+        assert!(root.render_help().to_string().contains("profile:"));
+        let profile = root
+            .find_subcommand_mut("profile")
+            .expect("profile command");
+        assert!(!profile.is_hide_set());
+        for verb in [
+            "list", "describe", "export", "import", "update", "lint", "delete",
+        ] {
+            assert!(profile.find_subcommand(verb).is_some(), "missing {verb}");
+        }
+    }
+
+    #[test]
+    fn profile_legacy_list_preserves_output_and_scope_flags() {
+        let default = Cli::try_parse_from(["ryno", "provider", "list-profiles"])
+            .expect("legacy profile list");
+        assert!(matches!(
+            default.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {
+                    output: OutputFormat::Table,
+                    global: false
+                })
+            })
+        ));
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from([
+                "ryno",
+                "provider",
+                "list-profiles",
+                "--workspace",
+                "team",
+                "--global",
+                "-o",
+                format,
+            ])
+            .expect("legacy list with output and scope");
+            assert_eq!(cli.workspace, "team");
+            assert!(matches!(cli.command, Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {output, global: true})
+            }) if output == expected));
+        }
+    }
+
+    #[test]
+    fn profile_legacy_subcommands_match_top_level_arguments() {
+        for args in [
+            vec!["export", "openai"],
+            vec!["export", "openai", "-o", "json", "--global"],
+            vec!["import", "-f", "profile.yaml"],
+            vec!["import", "--from", "profiles", "--global"],
+            vec!["update", "custom-api", "--file", "profile.yaml", "--global"],
+            vec!["lint", "--file", "profile.yaml", "--global"],
+            vec!["lint", "--from", "profiles"],
+            vec!["delete", "first", "second", "--global"],
+        ] {
+            let top = Cli::try_parse_from(
+                ["ryno", "--workspace", "team", "profile"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .expect("top-level profile command");
+            let legacy = Cli::try_parse_from(
+                ["ryno", "--workspace", "team", "provider", "profile"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .expect("nested profile command");
+            assert_eq!(top.workspace, legacy.workspace);
+            match (top.command, legacy.command) {
+                (
+                    Some(Commands::Profile { command: Some(top) }),
+                    Some(Commands::Provider {
+                        command: Some(ProviderCommands::Profile(legacy)),
+                    }),
+                ) => assert_eq!(top, legacy),
+                other => panic!("unexpected command pair: {other:?}"),
+            }
+        }
+        for verb in ["import", "lint"] {
+            assert!(Cli::try_parse_from(["ryno", "provider", "profile", verb]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "ryno",
+                    "provider",
+                    "profile",
+                    verb,
+                    "-f",
+                    "profile.yaml",
+                    "--from",
+                    "profiles"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn forward_list_default_output_is_table() {
+        let cli =
+            Cli::try_parse_from(["ryno", "forward", "list"]).expect("forward list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Forward {
+                command: Some(ForwardCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn forward_list_accepts_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from(["ryno", "forward", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("forward list -o {format} should parse: {error}"));
+
+            let Some(Commands::Forward {
+                command: Some(ForwardCommands::List { output }),
+            }) = cli.command
+            else {
+                panic!("expected forward list command");
+            };
+            assert_eq!(output, expected, "unexpected output format for {format}");
+        }
+    }
+
+    #[test]
+    fn remaining_list_commands_default_output_to_table() {
+        let sandbox_provider = Cli::try_parse_from(["ryno", "sandbox", "provider", "list"])
+            .expect("sandbox provider list should parse");
+        assert!(matches!(
+            sandbox_provider.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Provider(SandboxProviderCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+
+        let policy =
+            Cli::try_parse_from(["ryno", "policy", "list"]).expect("policy list should parse");
+        assert!(matches!(
+            policy.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let service =
+            Cli::try_parse_from(["ryno", "service", "list"]).expect("service list should parse");
+        assert!(matches!(
+            service.command,
+            Some(Commands::Service {
+                command: Some(ServiceCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let workspace_member = Cli::try_parse_from([
+            "ryno",
+            "workspace",
+            "member",
+            "list",
+            "--workspace",
+            "default",
+        ])
+        .expect("workspace member list should parse");
+        assert!(matches!(
+            workspace_member.command,
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+    }
+
+    #[test]
+    fn remaining_list_commands_accept_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let sandbox_provider =
+                Cli::try_parse_from(["ryno", "sandbox", "provider", "list", "-o", format])
+                    .unwrap_or_else(|error| panic!("sandbox provider list -o {format}: {error}"));
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Provider(SandboxProviderCommands::List { output, .. })),
+            }) = sandbox_provider.command
+            else {
+                panic!("expected sandbox provider list command");
+            };
+            assert_eq!(output, expected);
+
+            let policy = Cli::try_parse_from(["ryno", "policy", "list", "--output", format])
+                .unwrap_or_else(|error| panic!("policy list --output {format}: {error}"));
+            let Some(Commands::Policy {
+                command: Some(PolicyCommands::List { output, .. }),
+            }) = policy.command
+            else {
+                panic!("expected policy list command");
+            };
+            assert_eq!(output, expected);
+
+            let service = Cli::try_parse_from(["ryno", "service", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("service list -o {format}: {error}"));
+            let Some(Commands::Service {
+                command: Some(ServiceCommands::List { output, .. }),
+            }) = service.command
+            else {
+                panic!("expected service list command");
+            };
+            assert_eq!(output, expected);
+
+            let workspace_member = Cli::try_parse_from([
+                "ryno",
+                "workspace",
+                "member",
+                "list",
+                "--workspace",
+                "default",
+                "-o",
+                format,
+            ])
+            .unwrap_or_else(|error| panic!("workspace member list -o {format}: {error}"));
+            let Some(Commands::Workspace {
+                command:
+                    Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List { output, .. })),
+            }) = workspace_member.command
+            else {
+                panic!("expected workspace member list command");
+            };
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn sandbox_list_default_output_is_table() {
+        let cli =
+            Cli::try_parse_from(["ryno", "sandbox", "list"]).expect("sandbox list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_stop_and_start_accept_optional_names() {
+        let stop = Cli::try_parse_from(["ryno", "sandbox", "stop", "demo"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let start =
+            Cli::try_parse_from(["ryno", "sandbox", "start"]).expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Start { name: None }),
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "list", "-o", "json"])
+            .expect("sandbox list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "list", "-o", "yaml"])
+            .expect("sandbox list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_ids() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "list", "-o", "json", "--ids"]);
+        assert!(result.is_err(), "--ids and -o json should conflict");
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_names() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o json should conflict");
+    }
+
+    #[test]
+    fn gateway_list_default_output_is_table() {
+        let cli =
+            Cli::try_parse_from(["ryno", "gateway", "list"]).expect("gateway list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["ryno", "gateway", "list", "-o", "json"])
+            .expect("gateway list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Json,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["ryno", "gateway", "list", "-o", "yaml"])
+            .expect("gateway list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Yaml,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["ryno", "provider", "list", "-o", "json"])
+            .expect("provider list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["ryno", "provider", "list", "-o", "yaml"])
+            .expect("provider list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_output_conflicts_with_names() {
+        let result = Cli::try_parse_from(["ryno", "provider", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
+    fn provider_list_names_conflicts_with_output() {
+        let result = Cli::try_parse_from(["ryno", "provider", "list", "--names", "-o", "yaml"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
+    fn provider_create_accepts_custom_profile_type_ids() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "create",
+            "--name",
+            "work-github",
+            "--type",
+            "github-readonly",
+            "--credential",
+            "GITHUB_TOKEN=token",
+        ])
+        .expect("provider create should parse custom profile ids");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "work-github");
+                assert_eq!(provider_type, "github-readonly");
+                assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_accepts_no_credential_source() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+        ])
+        .expect("provider create should allow profiles without static credentials");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Create {
+                    from_existing: false,
+                    credentials,
+                    from_gcloud_adc: false,
+                    from_oidc_token: false,
+                    runtime_credentials: false,
+                    ..
+                })
+            }) if credentials.is_empty()
+        ));
+    }
+
+    #[test]
+    fn provider_create_accepts_runtime_credentials() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+            "--runtime-credentials",
+        ])
+        .expect("provider create should parse runtime credentials");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_existing,
+                        credentials,
+                        from_gcloud_adc,
+                        runtime_credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "spiffe-token-demo");
+                assert_eq!(provider_type, "spiffe-token-demo");
+                assert!(!from_existing);
+                assert!(credentials.is_empty());
+                assert!(!from_gcloud_adc);
+                assert!(runtime_credentials);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_from_existing() {
+        let err = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-existing",
+            "--from-gcloud-adc",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--from-existing"));
+        assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_credential() {
+        let err = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-gcloud-adc",
+            "--credential",
+            "GOOGLE_VERTEX_AI_TOKEN=token",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--credential"));
+        assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_refresh_commands_parse() {
+        let status = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "refresh",
+            "status",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Status {
+                    name,
+                    credential_key: Some(key)
+                }))
+            }) if name == "my-graph" && key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let config = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--material",
+            "tenant_id=abc",
+            "--secret-material-env",
+            "client_secret=GRAPH_CLIENT_SECRET",
+            "--secret-material-key",
+            "client_secret",
+            "--credential-expires-at",
+            "1767225600000",
+        ])
+        .expect("provider refresh configure should parse");
+        assert!(matches!(
+            config.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ref secret_material_env,
+                        ..
+                    }
+                ))
+            }) if secret_material_env == &["client_secret=GRAPH_CLIENT_SECRET".to_string()]
+        ));
+
+        let rotate = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "refresh",
+            "rotate",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh rotate should parse");
+        assert!(matches!(
+            rotate.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Rotate {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let delete = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "refresh",
+            "delete",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Delete {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn provider_update_accepts_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "update",
+            "my-graph",
+            "--credential",
+            "MS_GRAPH_ACCESS_TOKEN=abc",
+            "--credential-expires-at",
+            "MS_GRAPH_ACCESS_TOKEN=1767225600000",
+        ])
+        .expect("provider update should parse credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    credential_expires_at,
+                    ..
+                })
+            }) if credential_expires_at == vec!["MS_GRAPH_ACCESS_TOKEN=1767225600000"]
+        ));
+    }
+
+    #[test]
+    fn provider_refresh_config_accepts_rfc3339_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--credential-expires-at",
+            "2026-01-01T00:00:00Z",
+        ])
+        .expect("provider refresh configure should parse RFC3339 credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
+        ));
+    }
+
+    #[test]
+    fn settings_set_global_parses_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "settings",
+            "set",
+            "--global",
+            "--key",
+            "log_level",
+            "--value",
+            "warn",
+            "--yes",
+        ])
+        .expect("settings set --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command:
+                    Some(SettingsCommands::Set {
+                        global,
+                        yes,
+                        key,
+                        value,
+                        ..
+                    }),
+            }) => {
+                assert!(global);
+                assert!(yes);
+                assert_eq!(key, "log_level");
+                assert_eq!(value, "warn");
+            }
+            other => panic!("expected settings set command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_get_global_parses() {
+        let cli = Cli::try_parse_from(["ryno", "settings", "get", "--global"])
+            .expect("settings get --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command: Some(SettingsCommands::Get { name, global, .. }),
+            }) => {
+                assert!(global);
+                assert!(name.is_none());
+            }
+            other => panic!("expected settings get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "policy",
+            "get",
+            "my-sandbox",
+            "--full",
+            "-o",
+            "json",
+        ])
+        .expect("policy get -o json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name,
+                        full,
+                        base,
+                        output,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(full);
+                assert!(!base);
+                assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_base_output_parses() {
+        let cli = Cli::try_parse_from(["ryno", "policy", "get", "my-sandbox", "--base"])
+            .expect("policy get --base should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, base, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(!full);
+                assert!(base);
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_delete_global_parses() {
+        let cli = Cli::try_parse_from(["ryno", "policy", "delete", "--global", "--yes"])
+            .expect("policy delete --global should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Delete { global, yes }),
+            }) => {
+                assert!(global);
+                assert!(yes);
+            }
+            other => panic!("expected policy delete command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_delete_global_parses_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "settings",
+            "delete",
+            "--global",
+            "--key",
+            "log_level",
+            "--yes",
+        ])
+        .expect("settings delete --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command:
+                    Some(SettingsCommands::Delete {
+                        key, global, yes, ..
+                    }),
+            }) => {
+                assert_eq!(key, "log_level");
+                assert!(global);
+                assert!(yes);
+            }
+            other => panic!("expected settings delete command, got: {other:?}"),
+        }
+    }
+
+    // ── sandbox create arg-shape tests ───────────────────────────────────
+
+    /// Verify that `sandbox create --name <value>` still parses as a named
+    /// option rather than a positional argument.  The `ArgValueCompleter`
+    /// attribute must be combined with `long` on the `name` field; without
+    /// `long`, clap treats the field as positional and `--name` is rejected.
+    #[test]
+    fn sandbox_create_name_is_a_named_flag() {
+        // Build the CLI app and try to parse `sandbox create --name foo`.
+        // `try_parse_from` returns Err if clap rejects the arguments.
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create", "--name", "my-sb"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create --name should parse as a named flag: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name.as_deref(), Some("my-sb"));
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    /// Verify that `sandbox create` without `--name` still works (name is
+    /// optional and auto-generated when omitted).
+    #[test]
+    fn sandbox_create_name_is_optional() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create without --name should be accepted: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name, None);
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_defaults_to_never() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create"]).unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "never"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_accepts_on_failure() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--restart-policy",
+            "on-failure",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { restart_policy, .. }),
+                ..
+            }) => assert_eq!(restart_policy, "on-failure"),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_restart_policy_rejects_unknown_value() {
+        assert!(
+            Cli::try_parse_from([
+                "ryno",
+                "sandbox",
+                "create",
+                "--restart-policy",
+                "unless-stopped",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_detach_parses_with_main_command() {
+        let cli = Cli::try_parse_from([
+            "ryno", "sandbox", "create", "--detach", "--", "worker", "--serve",
+        ])
+        .expect("sandbox create --detach should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        detach, command, ..
+                    }),
+                ..
+            }) => {
+                assert!(detach);
+                assert_eq!(command, ["worker", "--serve"]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_detach_accepts_ephemeral_sandbox() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--detach",
+            "--no-keep",
+            "--",
+            "worker",
+        ])
+        .expect("detached ephemeral sandbox should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        detach,
+                        no_keep,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert!(detach);
+                assert!(no_keep);
+                assert_eq!(command, ["worker"]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_rejects_upload_with_main_command() {
+        let result = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "./run-uploaded-app",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// `sandbox create` defaults `--approval-mode` to `"manual"`. The CLI
+    /// always sends an explicit value so the wire form is human-readable
+    /// (the gateway treats `""` as `"manual"` too, but the CLI's job is to
+    /// be unambiguous).
+    #[test]
+    fn sandbox_create_approval_mode_defaults_to_manual() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create"])
+            .expect("sandbox create with no flags should parse");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { approval_mode, .. }),
+                ..
+            }) => {
+                assert_eq!(approval_mode, "manual");
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    /// `--approval-mode auto` parses through.
+    #[test]
+    fn sandbox_create_approval_mode_accepts_auto() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--approval-mode", "auto"])
+            .expect("--approval-mode auto should parse");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { approval_mode, .. }),
+                ..
+            }) => {
+                assert_eq!(approval_mode, "auto");
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    /// `--approval-mode <bogus>` is rejected by clap's value parser, so the
+    /// CLI can't smuggle through a future-mode value that the gateway
+    /// doesn't yet know about.
+    #[test]
+    fn sandbox_create_approval_mode_rejects_unknown_value() {
+        let result = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--approval-mode",
+            "auto_on_low_risk",
+        ]);
+        assert!(
+            result.is_err(),
+            "--approval-mode auto_on_low_risk should be rejected until added to the value parser"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_output_conflicts_with_side_effect_args() {
+        for (label, extra_args) in [
+            ("--editor", &["--editor", "code"][..]),
+            ("--no-keep", &["--no-keep"][..]),
+            ("--forward", &["--forward", "8080"][..]),
+        ] {
+            let args = ["ryno", "sandbox", "create", "--output", "json"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(
+                result.is_err(),
+                "structured output should conflict with {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_create_detached_command_accepts_structured_output() {
+        Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--detach",
+            "--output",
+            "json",
+            "--",
+            "codex",
+            "app-server",
+        ])
+        .expect("a detached command should support structured create output");
+    }
+
+    #[test]
+    fn sandbox_create_resource_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "ryno", "sandbox", "create", "--cpu", "500m", "--memory", "2Gi", "--", "claude",
+        ])
+        .expect("sandbox create resource flags should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        cpu,
+                        memory,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(cpu.as_deref(), Some("500m"));
+                assert_eq!(memory.as_deref(), Some("2Gi"));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_driver_config_json_flag_parses() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--driver-config-json", json])
+            .expect("sandbox create driver config JSON flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        driver_config_json, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(driver_config_json.as_deref(), Some(json));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_template_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--template",
+            "gpu-kata",
+            "--provider",
+            "github",
+        ])
+        .expect("sandbox create template flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        template,
+                        providers,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert_eq!(providers, vec!["github".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_template_conflicts_with_inline_workload_flags() {
+        for (label, extra_args) in [
+            ("--from", &["--from", "python:3.12"][..]),
+            ("--gpu", &["--gpu"][..]),
+            ("--cpu", &["--cpu", "1"][..]),
+            ("--memory", &["--memory", "2Gi"][..]),
+            ("--env", &["--env", "FOO=bar"][..]),
+            (
+                "--driver-config-json",
+                &["--driver-config-json", r#"{"kubernetes":{}}"#][..],
+            ),
+        ] {
+            let args = ["ryno", "sandbox", "create", "--template", "base"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "--template should conflict with {label}");
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_parses_workload_flags() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--image",
+            "registry.example.com/agent:latest",
+            "--cpu",
+            "2",
+            "--memory",
+            "4Gi",
+            "--gpu",
+            "1",
+            "--driver-config-json",
+            json,
+            "--ready-within",
+            "5m",
+            "--max-burst",
+            "3",
+            "--label",
+            "team=runtime",
+            "--annotation",
+            "owner=platform",
+            "--env",
+            "FEATURE_FLAG=on",
+            "--no-credential-warnings",
+            "--output",
+            "json",
+        ])
+        .expect("sandbox template create should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create {
+                        name,
+                        image,
+                        cpu,
+                        memory,
+                        gpu,
+                        driver_config_json,
+                        ready_within,
+                        max_burst,
+                        labels,
+                        annotations,
+                        envs,
+                        no_credential_warnings,
+                        output,
+                    })),
+                ..
+            }) => {
+                assert_eq!(name, "gpu-kata");
+                assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
+                assert_eq!(cpu.as_deref(), Some("2"));
+                assert_eq!(memory.as_deref(), Some("4Gi"));
+                assert_eq!(gpu, Some(GpuCliRequest::Count(1)));
+                assert_eq!(driver_config_json.as_deref(), Some(json));
+                assert_eq!(ready_within.as_deref(), Some("5m"));
+                assert_eq!(max_burst, Some(3));
+                assert_eq!(labels, vec!["team=runtime".to_string()]);
+                assert_eq!(annotations, vec!["owner=platform".to_string()]);
+                assert_eq!(envs, vec!["FEATURE_FLAG=on".to_string()]);
+                assert!(no_credential_warnings);
+                assert!(matches!(output, OutputFormat::Json));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_list_parses_names_and_all_workspaces() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "template",
+            "list",
+            "--names",
+            "--all-workspaces",
+            "--label-selector",
+            "team=runtime",
+            "--page-size",
+            "25",
+            "--page-token",
+            "next-template-page",
+        ])
+        .expect("sandbox template list should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::List {
+                        page_size,
+                        page_token,
+                        label_selector,
+                        names,
+                        all_workspaces,
+                        ..
+                    })),
+                ..
+            }) => {
+                assert_eq!(page_size, 25);
+                assert_eq!(page_token, "next-template-page");
+                assert_eq!(label_selector.as_deref(), Some("team=runtime"));
+                assert!(names);
+                assert!(all_workspaces);
+            }
+            other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_list_names_conflicts_with_output() {
+        let result = Cli::try_parse_from([
+            "ryno", "sandbox", "template", "list", "--names", "--output", "json",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_template_create_image_is_optional() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "template", "create", "base"])
+            .expect("sandbox template create without --image should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { image, .. })),
+                ..
+            }) => {
+                assert_eq!(image, None);
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_gpu_parses_driver_default() {
+        let cli =
+            Cli::try_parse_from(["ryno", "sandbox", "template", "create", "gpu-kata", "--gpu"])
+                .expect("sandbox template create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { gpu, .. })),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu"])
+            .expect("sandbox create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_parses_from_gpu_flag() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu", "2"])
+            .expect("sandbox create --gpu 2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_driver_default_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu", "--", "claude"])
+            .expect("sandbox create --gpu -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu", "2", "--", "claude"])
+            .expect("sandbox create --gpu 2 -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu", "0"]);
+
+        assert!(result.is_err(), "sandbox create --gpu 0 should be rejected");
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_accepts_equals_syntax() {
+        let cli = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu=2"])
+            .expect("sandbox create --gpu=2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_non_integer() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create", "--gpu", "many"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu many should be rejected"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_accepts_service_exposure() {
+        let cli =
+            Cli::try_parse_from(["ryno", "sandbox", "create", "--expose", "4500", "--detach"])
+                .expect("sandbox create --expose should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        expose,
+                        expose_authorization_mode,
+                        detach,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(expose, Some(4500));
+                assert_eq!(
+                    expose_authorization_mode,
+                    CliServiceAuthorizationMode::Strip
+                );
+                assert!(detach);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_rejects_service_exposure_with_no_keep() {
+        let result =
+            Cli::try_parse_from(["ryno", "sandbox", "create", "--expose", "4500", "--no-keep"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_rejects_zero_service_port() {
+        let result = Cli::try_parse_from(["ryno", "sandbox", "create", "--expose", "0"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_parses_bearer_passthrough_and_requires_expose() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--expose-authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("create-time authorization mode should parse with --expose");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        expose_authorization_mode,
+                        ..
+                    }),
+            }) => assert_eq!(
+                expose_authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "ryno",
+                "sandbox",
+                "create",
+                "--expose-authorization-mode",
+                "bearer-passthrough",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn service_expose_accepts_positional_target_port_and_service() {
+        let cli = Cli::try_parse_from(["ryno", "service", "expose", "my-sandbox", "8080", "api"])
+            .expect("service expose positional target port should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                        authorization_mode,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service.as_deref(), Some("api"));
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_allows_omitted_service_name() {
+        let cli = Cli::try_parse_from(["ryno", "service", "expose", "my-sandbox", "8080"])
+            .expect("service expose should allow omitting the service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                        authorization_mode,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+                assert_eq!(authorization_mode, CliServiceAuthorizationMode::Strip);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_parses_bearer_passthrough() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "service",
+            "expose",
+            "my-sandbox",
+            "4500",
+            "--authorization-mode",
+            "bearer-passthrough",
+        ])
+        .expect("service authorization mode should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        authorization_mode, ..
+                    }),
+            }) => assert_eq!(
+                authorization_mode,
+                CliServiceAuthorizationMode::BearerPassthrough
+            ),
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_alias_parses_service_commands() {
+        let cli = Cli::try_parse_from(["ryno", "svc", "expose", "my-sandbox", "8080"])
+            .expect("svc alias should parse service commands");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_accepts_optional_sandbox_and_paging() {
+        let cli = Cli::try_parse_from([
+            "ryno",
+            "service",
+            "list",
+            "my-sandbox",
+            "--page-size",
+            "10",
+            "--page-token",
+            "next-service-page",
+        ])
+        .expect("service list should parse optional sandbox and paging");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        page_size,
+                        page_token,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(sandbox.as_deref(), Some("my-sandbox"));
+                assert_eq!(page_size, 10);
+                assert_eq!(page_token, "next-service-page");
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ryno", "service", "list"])
+            .expect("service list should allow omitting sandbox");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        page_size,
+                        page_token,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(sandbox, None);
+                assert_eq!(page_size, 100);
+                assert!(page_token.is_empty());
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_rejects_sandbox_with_all_workspaces() {
+        let result =
+            Cli::try_parse_from(["ryno", "service", "list", "my-sandbox", "--all-workspaces"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn service_get_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["ryno", "service", "get", "my-sandbox", "api"])
+            .expect("service get should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ryno", "service", "get", "my-sandbox"])
+            .expect("service get should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_delete_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["ryno", "service", "delete", "my-sandbox", "api"])
+            .expect("service delete should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ryno", "service", "delete", "my-sandbox"])
+            .expect("service delete should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
+        }
+    }
+}

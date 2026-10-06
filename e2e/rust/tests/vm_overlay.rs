@@ -6,10 +6,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
 
 #[tokio::test]
 async fn vm_overlay() {
@@ -25,13 +25,13 @@ async fn vm_overlay() {
         "test \"$(stat -f -c %T /)\" = \"overlayfs\"; ",
         "printf \"overlay-write\\n\" > /sandbox/overlay-check; ",
         "test \"$(cat /sandbox/overlay-check)\" = \"overlay-write\"; ",
-        "if [ -e /opt/openshell/tls/tls.key ]; then ",
-        "test \"$(stat -c %a /opt/openshell/tls/tls.key)\" = \"600\"; ",
+        "if [ -e /opt/ryno/tls/tls.key ]; then ",
+        "test \"$(stat -c %a /opt/ryno/tls/tls.key)\" = \"600\"; ",
         "fi; ",
         "echo vm-overlay-ok",
     );
 
-    let mut exec_cmd = openshell_cmd();
+    let mut exec_cmd = ryno_cmd();
     exec_cmd
         .args(["sandbox", "exec", "--name", &sandbox.name, "--no-tty", "--"])
         .arg("sh")

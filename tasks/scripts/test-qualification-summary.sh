@@ -13,7 +13,7 @@ trap 'rm -rf "${TEST_DIR}"' EXIT
 export RELEASE_TAG=v0.1.0-pre.8
 export SOURCE_SHA=0123456789abcdef0123456789abcdef01234567
 export IS_PRERELEASE=true
-export GITHUB_REPOSITORY=NVIDIA/OpenShell
+export GITHUB_REPOSITORY=NVIDIA/Ryno
 export GITHUB_SERVER_URL=https://github.com
 export GITHUB_RUN_ID=1234
 export GITHUB_RUN_ATTEMPT=2

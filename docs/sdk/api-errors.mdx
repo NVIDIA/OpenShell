@@ -4,7 +4,7 @@
 title: "API Errors"
 sidebar-title: "API Errors"
 description: "Inspect structured gateway failures and choose an appropriate recovery action."
-keywords: "OpenShell, SDK, gRPC, API errors, retries"
+keywords: "Ryno, SDK, gRPC, API errors, retries"
 ---
 
 Gateway errors include a gRPC status code and a message. Shared request validation
@@ -21,7 +21,7 @@ a code and message. Missing details do not change the meaning of the status code
 | Detail | Meaning |
 |---|---|
 | `google.rpc.BadRequest` | `field_violations` identifies rejected fields and explains each violation. Shared sandbox, exec, provider size, and workspace selector checks supply these details. |
-| `google.rpc.ErrorInfo` | `reason`, `domain`, and `metadata` identify a failure without parsing its message. Gateway reasons use the `openshell.nvidia.com` domain. |
+| `google.rpc.ErrorInfo` | `reason`, `domain`, and `metadata` identify a failure without parsing its message. Gateway reasons use the `ryno.nvidia.com` domain. |
 | `google.rpc.RetryInfo` | `retry_delay` gives a minimum delay before an otherwise safe retry. Its presence does not guarantee that a mutation has not already committed. |
 
 Recognized gateway reasons include the following.
@@ -132,7 +132,7 @@ even after restart or after 24 hours. Status codes alone do not prove that the
 attempt had no effects.
 
 Successful results have a 24-hour replay window, measured from durable completion.
-A successful replay includes `openshell-replayed: true` response metadata and
+A successful replay includes `ryno-replayed: true` response metadata and
 does not extend the window. After it expires, the same ID can admit a new
 execution. Do not retry an old operation after that window without reconciling
 its effects. Unresolved admissions never expire.

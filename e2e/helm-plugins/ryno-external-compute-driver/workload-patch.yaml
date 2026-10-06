@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ryno
+spec:
+  template:
+    spec:
+      containers:
+        - name: ryno-gateway
+          volumeMounts:
+            - name: compute-driver-socket
+              mountPath: /var/run/ryno-compute
+        - name: kubernetes-compute-driver
+          image: replaced-by-kustomize
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/ryno-driver-kubernetes
+          args:
+            - --bind-socket
+            - /var/run/ryno-compute/driver/driver.sock
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: compute-driver-socket
+              mountPath: /var/run/ryno-compute
+          resources: {}
+      volumes:
+        - name: compute-driver-socket
+          emptyDir: {}

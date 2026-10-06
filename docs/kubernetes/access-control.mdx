@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Access Control"
 sidebar-title: "Access Control"
-description: "Configure OIDC user authentication or reverse-proxy auth termination for a Kubernetes-deployed OpenShell gateway."
+description: "Configure OIDC user authentication or reverse-proxy auth termination for a Kubernetes-deployed Ryno gateway."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Authentication, mTLS, OIDC, Keycloak, Entra ID, Okta, Gateway Auth"
 position: 6
 ---
 
-The OpenShell gateway supports these access-control models for human callers on Kubernetes:
+The Ryno gateway supports these access-control models for human callers on Kubernetes:
 
 | Model | When to use |
 |---|---|
@@ -26,7 +26,7 @@ Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workl
 
 Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 
-Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `openshell.ai/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
+Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `ryno.ai/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
 
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIFFE Workload API, so intermediate token exchange does not require gateway access to the SPIRE OIDC discovery endpoint or its TLS CA.
 
@@ -35,18 +35,18 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIF
 Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint. It accepts JWTs signed with RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, or EdDSA (Ed25519) keys published in the issuer JWKS. Okta tenants that sign access tokens with ES256 work without additional gateway configuration.
 
 ```shell
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli \
+  --namespace ryno \
+  --set server.oidc.issuer=https://your-idp.example.com/realms/ryno \
+  --set server.oidc.audience=ryno-cli \
   --set server.tls.clientCaSecretName=""
 ```
 
 Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `server.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
-The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
+The `audience` value must match the client ID configured in your identity provider for the Ryno resource server.
 
 ### OIDC values reference
 
@@ -56,7 +56,7 @@ The `audience` value must match the client ID configured in your identity provid
 | `server.oidc.dangerouslyAllowInsecureHttp` | `false` | Development-only acknowledgement for numeric-loopback HTTP. It does not allow cluster-service or remote HTTP issuers. |
 | `server.oidc.jwksAllowedOrigins` | `[]` | Additional trusted HTTPS origins allowed to serve JWKS. |
 | `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`. |
-| `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
+| `server.oidc.audience` | `ryno-cli` | Expected `aud` claim in the JWT. |
 | `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
 | `server.oidc.adminRole` | `""` | Role name that grants admin access. |
@@ -75,16 +75,16 @@ Leave both `adminRole` and `userRole` empty to use auth-only mode: any request w
 Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
 
 ```shell
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli \
+  --namespace ryno \
+  --set server.oidc.issuer=https://your-idp.example.com/realms/ryno \
+  --set server.oidc.audience=ryno-cli \
   --set server.tls.clientCaSecretName="" \
   --set server.oidc.rolesClaim=realm_access.roles \
-  --set server.oidc.adminRole=openshell-admin \
-  --set server.oidc.userRole=openshell-user
+  --set server.oidc.adminRole=ryno-admin \
+  --set server.oidc.userRole=ryno-user
 ```
 
 Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported.
@@ -101,13 +101,13 @@ OIDC RBAC is method-level authorization. It controls which API operations a call
 
 ## Reverse-Proxy Auth Termination
 
-When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the OpenShell gateway, you can explicitly allow unauthenticated user calls at the gateway:
+When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the Ryno gateway, you can explicitly allow unauthenticated user calls at the gateway:
 
 ```shell
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --set server.auth.allowUnauthenticatedUsers=true
 ```
 
@@ -129,5 +129,5 @@ Only enable unauthenticated users when the gateway is not reachable from outside
 Register the gateway with the CLI using the proxy's public URL. The browser-based login flow runs automatically on first use:
 
 ```shell
-openshell gateway add https://gateway.example.com --name production
+ryno gateway add https://gateway.example.com --name production
 ```

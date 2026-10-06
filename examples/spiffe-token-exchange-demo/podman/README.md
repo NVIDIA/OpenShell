@@ -4,24 +4,24 @@ This variant runs the SPIFFE token exchange demo with local Podman containers
 instead of Kubernetes workloads.
 
 The first version is intentionally single-sandbox. The script creates one
-concrete SPIRE registration entry for the sandbox after OpenShell creates it.
+concrete SPIRE registration entry for the sandbox after Ryno creates it.
 It does not rely on SPIRE templating one entry into many per-sandbox SPIFFE IDs.
 
 ## What Runs
 
-`demo.sh` starts these local Podman containers on the `openshell` network by
+`demo.sh` starts these local Podman containers on the `ryno` network by
 default:
 
 | Container | Purpose |
 |---|---|
-| `openshell-spiffe-demo-spire-server` | Local SPIRE server |
-| `openshell-spiffe-demo-spire-agent` | Local SPIRE agent with a Workload API socket |
-| `openshell-spiffe-demo-spire-oidc` | SPIRE OIDC discovery provider for JWKS |
-| `openshell-spiffe-demo-token-issuer` | Dummy IdP/token exchange endpoint |
-| `openshell-spiffe-demo-alpha` | Protected alpha service |
-| `openshell-spiffe-demo-beta` | Protected beta service |
+| `ryno-spiffe-demo-spire-server` | Local SPIRE server |
+| `ryno-spiffe-demo-spire-agent` | Local SPIRE agent with a Workload API socket |
+| `ryno-spiffe-demo-spire-oidc` | SPIRE OIDC discovery provider for JWKS |
+| `ryno-spiffe-demo-token-issuer` | Dummy IdP/token exchange endpoint |
+| `ryno-spiffe-demo-alpha` | Protected alpha service |
+| `ryno-spiffe-demo-beta` | Protected beta service |
 
-The OpenShell gateway is not started by this script. Start it separately with
+The Ryno gateway is not started by this script. Start it separately with
 the Podman driver and SPIFFE provider token grant settings.
 
 For the most self-contained path, set `START_GATEWAY=1`. The script starts a
@@ -35,14 +35,14 @@ without host DNS changes.
 Start the gateway with:
 
 ```shell
-export OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=/path/to/demo/spire-agent.sock
+export RYNO_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET=/path/to/demo/spire-agent.sock
 ```
 
 Configure the Podman driver with the same socket path:
 
 ```toml
-[openshell.drivers.podman]
-network_name = "openshell"
+[ryno.drivers.podman]
+network_name = "ryno"
 provider_spiffe_workload_api_socket = "/path/to/demo/spire-agent.sock"
 ```
 
@@ -86,31 +86,31 @@ datastore and Workload API sockets.
 From anywhere:
 
 ```shell
-export OPENSHELL_REPO=/path/to/OpenShell
+export RYNO_REPO=/path/to/Ryno
 export GATEWAY_NAME=local
 export GATEWAY_ENDPOINT=http://127.0.0.1:8080
 
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
 ```
 
 Self-contained local path:
 
 ```shell
 START_GATEWAY=1 \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
 ```
 
 Common overrides:
 
 ```shell
 SANDBOX_NAME=spiffe-podman-demo
-PODMAN_NETWORK=openshell
+PODMAN_NETWORK=ryno
 TOKEN_ISSUER_PORT=18080
 MANAGED_GATEWAY_PORT=18082
 MANAGED_GATEWAY_HEALTH_PORT=18083
-GATEWAY_IMAGE=ghcr.io/nvidia/openshell/gateway:latest
+GATEWAY_IMAGE=ghcr.io/nvidia/ryno/gateway:latest
 SANDBOX_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04
-SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+SUPERVISOR_IMAGE=ghcr.io/nvidia/ryno/supervisor:latest
 SANDBOX_IMAGE_PULL_POLICY=if_not_present
 PODMAN_STOP_TIMEOUT_SECS=3
 KEEP_DEMO=1
@@ -125,19 +125,19 @@ wait for sandbox containers to stop before Podman force-kills them during
 cleanup. The short demo default avoids waiting on long SIGTERM grace periods.
 
 When testing branch-local images with `START_GATEWAY=1`, override all three
-OpenShell runtime images:
+Ryno runtime images:
 
 ```shell
 START_GATEWAY=1 \
-GATEWAY_IMAGE=localhost/openshell/gateway:branch \
-SANDBOX_IMAGE=localhost/openshell/sandbox:branch \
-SUPERVISOR_IMAGE=localhost/openshell/supervisor:branch \
+GATEWAY_IMAGE=localhost/ryno/gateway:branch \
+SANDBOX_IMAGE=localhost/ryno/sandbox:branch \
+SUPERVISOR_IMAGE=localhost/ryno/supervisor:branch \
 SANDBOX_IMAGE_PULL_POLICY=never \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
 ```
 
-`SANDBOX_IMAGE` renders to `[openshell.drivers.podman].default_image`.
-`SUPERVISOR_IMAGE` renders to `[openshell.drivers.podman].supervisor_image`.
+`SANDBOX_IMAGE` renders to `[ryno.drivers.podman].default_image`.
+`SUPERVISOR_IMAGE` renders to `[ryno.drivers.podman].supervisor_image`.
 
 Use `START_SPIRE=0` only when you already have SPIRE running and can provide a
 host path to a Workload API socket:
@@ -145,7 +145,7 @@ host path to a Workload API socket:
 ```shell
 START_SPIRE=0 \
 SPIRE_AGENT_SOCKET_HOST_PATH=/run/spire/agent.sock \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/demo.sh"
 ```
 
 ## SPIRE Startup Scripts
@@ -155,16 +155,16 @@ when you want to manage SPIRE separately from the token exchange flow:
 
 ```shell
 SPIRE_STATE_DIR="$(mktemp -d)" \
-SPIRE_ENV_FILE=/tmp/openshell-spire-server.env \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/spire/start-server-oidc.sh"
+SPIRE_ENV_FILE=/tmp/ryno-spire-server.env \
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/spire/start-server-oidc.sh"
 
-source /tmp/openshell-spire-server.env
+source /tmp/ryno-spire-server.env
 
 SPIRE_STATE_DIR="$(mktemp -d)" \
-SPIRE_ENV_FILE=/tmp/openshell-spire-agent.env \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/spire/start-agent.sh"
+SPIRE_ENV_FILE=/tmp/ryno-spire-agent.env \
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/spire/start-agent.sh"
 
-source /tmp/openshell-spire-agent.env
+source /tmp/ryno-spire-agent.env
 printf "Workload API socket: %s\n" "$SPIRE_AGENT_SOCKET_HOST_PATH"
 ```
 
@@ -176,12 +176,12 @@ environment variables as `demo.sh`.
 
 ## Gateway Startup Script
 
-After starting the SPIRE agent, start a Podman-backed OpenShell gateway with:
+After starting the SPIRE agent, start a Podman-backed Ryno gateway with:
 
 ```shell
-SPIRE_AGENT_ENV_FILE=/tmp/openshell-spire-agent.env \
-GATEWAY_ENV_FILE=/tmp/openshell-spiffe-gateway.env \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/start-gateway.sh"
+SPIRE_AGENT_ENV_FILE=/tmp/ryno-spire-agent.env \
+GATEWAY_ENV_FILE=/tmp/ryno-spiffe-gateway.env \
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/start-gateway.sh"
 ```
 
 The gateway listens on `http://127.0.0.1:8888` by default, with health checks on
@@ -193,8 +193,8 @@ container and writes a temporary gateway config with the Podman driver enabled.
 Register the gateway SPIFFE entry as a separate step:
 
 ```shell
-GATEWAY_SELECTORS="docker:label:openshell.spiffe-demo:gateway" \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/spire/register-gateway.sh"
+GATEWAY_SELECTORS="docker:label:ryno.spiffe-demo:gateway" \
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/spire/register-gateway.sh"
 ```
 
 The script also honors `GATEWAY_IMAGE`, `SANDBOX_IMAGE`, `SUPERVISOR_IMAGE`,
@@ -202,40 +202,40 @@ The script also honors `GATEWAY_IMAGE`, `SANDBOX_IMAGE`, `SUPERVISOR_IMAGE`,
 `PODMAN_STOP_TIMEOUT_SECS`.
 
 To require OIDC login for user-facing gateway calls, set `GATEWAY_OIDC_ISSUER`.
-The script then renders `[openshell.gateway.oidc]` and defaults
+The script then renders `[ryno.gateway.oidc]` and defaults
 `allow_unauthenticated_users` to `false`:
 
 ```shell
-SPIRE_AGENT_ENV_FILE=/tmp/openshell-spire-agent.env \
-GATEWAY_OIDC_ISSUER=https://idp.example.com/realms/openshell \
-GATEWAY_OIDC_AUDIENCE=openshell-cli \
-GATEWAY_OIDC_CLIENT_ID=openshell-cli \
+SPIRE_AGENT_ENV_FILE=/tmp/ryno-spire-agent.env \
+GATEWAY_OIDC_ISSUER=https://idp.example.com/realms/ryno \
+GATEWAY_OIDC_AUDIENCE=ryno-cli \
+GATEWAY_OIDC_CLIENT_ID=ryno-cli \
 GATEWAY_OIDC_LOGIN_SCOPES="openid profile email" \
-bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/podman/start-gateway.sh"
+bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/podman/start-gateway.sh"
 ```
 
-The script prints the matching `openshell gateway add ... --oidc-issuer ...`
+The script prints the matching `ryno gateway add ... --oidc-issuer ...`
 command after the gateway is ready. You can also run it directly:
 
 ```shell
-openshell gateway add http://127.0.0.1:8888 \
+ryno gateway add http://127.0.0.1:8888 \
   --name podman-spiffe-demo \
-  --oidc-issuer https://idp.example.com/realms/openshell \
-  --oidc-client-id openshell-cli \
-  --oidc-audience openshell-cli \
+  --oidc-issuer https://idp.example.com/realms/ryno \
+  --oidc-client-id ryno-cli \
+  --oidc-audience ryno-cli \
   --oidc-scopes "openid profile email"
 ```
 
 OIDC-related overrides:
 
 - `GATEWAY_OIDC_ISSUER`
-- `GATEWAY_OIDC_AUDIENCE`, default `openshell-cli`
+- `GATEWAY_OIDC_AUDIENCE`, default `ryno-cli`
 - `GATEWAY_OIDC_JWKS_TTL_SECS`, default `3600`
 - `GATEWAY_OIDC_ROLES_CLAIM`, default `realm_access.roles`
-- `GATEWAY_OIDC_ADMIN_ROLE`, default `openshell-admin`
-- `GATEWAY_OIDC_USER_ROLE`, default `openshell-user`
+- `GATEWAY_OIDC_ADMIN_ROLE`, default `ryno-admin`
+- `GATEWAY_OIDC_USER_ROLE`, default `ryno-user`
 - `GATEWAY_OIDC_SCOPES_CLAIM`, default empty
-- `GATEWAY_OIDC_CLIENT_ID`, default `openshell-cli`
+- `GATEWAY_OIDC_CLIENT_ID`, default `ryno-cli`
 - `GATEWAY_OIDC_LOGIN_SCOPES`, default empty
 - `GATEWAY_ALLOW_UNAUTHENTICATED_USERS`, default `false` when OIDC is enabled
   and `true` otherwise
@@ -252,25 +252,25 @@ examples/spiffe-token-exchange-demo/podman/spire/register-sandbox.sh <sandbox-id
 Defaults:
 
 - SPIRE agent parent ID:
-  `spiffe://openshell.local/openshell/spire-agent/demo`
+  `spiffe://ryno.local/ryno/spire-agent/demo`
 - Gateway SPIFFE ID:
-  `spiffe://openshell.local/openshell/gateway/demo`
+  `spiffe://ryno.local/ryno/gateway/demo`
 - Gateway selectors:
-  `unix:uid:<current-uid>` plus `unix:path:<openshell-server-path>` when
-  `openshell-server` is on `PATH`
+  `unix:uid:<current-uid>` plus `unix:path:<ryno-server-path>` when
+  `ryno-server` is on `PATH`
 - Managed gateway selectors:
-  `docker:label:openshell.spiffe-demo:gateway`
+  `docker:label:ryno.spiffe-demo:gateway`
 - Sandbox SPIFFE ID:
-  `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`
+  `spiffe://ryno.local/ryno/sandbox/<sandbox-id>`
 - Sandbox selectors:
-  `docker:label:openshell.managed:true` and
-  `docker:label:openshell.ai/sandbox-id:<sandbox-id>`
+  `docker:label:ryno.managed:true` and
+  `docker:label:ryno.ai/sandbox-id:<sandbox-id>`
 
-If your gateway binary is not named `openshell-server` or is not on `PATH`, set
+If your gateway binary is not named `ryno-server` or is not on `PATH`, set
 `GATEWAY_WORKLOAD_PATH` or provide `GATEWAY_SELECTORS`:
 
 ```shell
-GATEWAY_WORKLOAD_PATH=/path/to/openshell-server \
+GATEWAY_WORKLOAD_PATH=/path/to/ryno-server \
   examples/spiffe-token-exchange-demo/podman/spire/register-gateway.sh
 ```
 
@@ -291,8 +291,8 @@ alpha called with path /:
   sub: demo-user
   aud: alpha, account
   scope: alpha profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-  client_id: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
+  client_id: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
 ```
 
 ## Cleanup
@@ -303,14 +303,14 @@ The script deletes demo containers and the sandbox on exit unless you set
 Manual cleanup:
 
 ```shell
-openshell --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT" \
+ryno --gateway "$GATEWAY_NAME" --gateway-endpoint "$GATEWAY_ENDPOINT" \
   sandbox delete spiffe-podman-demo
 
 podman rm -f \
-  openshell-spiffe-demo-token-issuer \
-  openshell-spiffe-demo-alpha \
-  openshell-spiffe-demo-beta \
-  openshell-spiffe-demo-spire-oidc \
-  openshell-spiffe-demo-spire-agent \
-  openshell-spiffe-demo-spire-server
+  ryno-spiffe-demo-token-issuer \
+  ryno-spiffe-demo-alpha \
+  ryno-spiffe-demo-beta \
+  ryno-spiffe-demo-spire-oidc \
+  ryno-spiffe-demo-spire-agent \
+  ryno-spiffe-demo-spire-server
 ```

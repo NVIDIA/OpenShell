@@ -3,7 +3,7 @@
 
 id: github-gator
 display_name: GitHub Gator
-description: Repo-scoped GitHub access for the OpenShell gator gate agent
+description: Repo-scoped GitHub access for the Ryno gator gate agent
 category: source_control
 credentials:
   - name: GITHUB_TOKEN
@@ -27,21 +27,21 @@ endpoints:
           query:
             q:
               any:
-                - "*repo:NVIDIA/OpenShell*"
-      - allow: { method: GET, path: /repos/NVIDIA/OpenShell }
-      - allow: { method: GET, path: /repos/NVIDIA/OpenShell/** }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/issues/*/comments }
-      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/issues/comments/* }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/issues/*/labels }
-      - allow: { method: PUT, path: /repos/NVIDIA/OpenShell/issues/*/labels }
-      - allow: { method: DELETE, path: /repos/NVIDIA/OpenShell/issues/*/labels/* }
-      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/issues/* }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/labels }
-      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/labels/* }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/comments }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews/*/comments }
-      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/statuses/* }
+                - "*repo:NVIDIA/Ryno*"
+      - allow: { method: GET, path: /repos/NVIDIA/Ryno }
+      - allow: { method: GET, path: /repos/NVIDIA/Ryno/** }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/issues/*/comments }
+      - allow: { method: PATCH, path: /repos/NVIDIA/Ryno/issues/comments/* }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/issues/*/labels }
+      - allow: { method: PUT, path: /repos/NVIDIA/Ryno/issues/*/labels }
+      - allow: { method: DELETE, path: /repos/NVIDIA/Ryno/issues/*/labels/* }
+      - allow: { method: PATCH, path: /repos/NVIDIA/Ryno/issues/* }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/labels }
+      - allow: { method: PATCH, path: /repos/NVIDIA/Ryno/labels/* }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/pulls/*/comments }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/pulls/*/reviews }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/pulls/*/reviews/*/comments }
+      - allow: { method: POST, path: /repos/NVIDIA/Ryno/statuses/* }
   - host: api.github.com
     port: 443
     path: /graphql
@@ -59,17 +59,17 @@ endpoints:
     protocol: rest
     enforcement: enforce
     rules:
-      - allow: { method: GET, path: /NVIDIA/OpenShell }
-      - allow: { method: GET, path: /NVIDIA/OpenShell/** }
-      - allow: { method: GET, path: /NVIDIA/OpenShell.git/** }
-      - allow: { method: POST, path: /NVIDIA/OpenShell/**/git-upload-pack }
-      - allow: { method: POST, path: /NVIDIA/OpenShell.git/**/git-upload-pack }
+      - allow: { method: GET, path: /NVIDIA/Ryno }
+      - allow: { method: GET, path: /NVIDIA/Ryno/** }
+      - allow: { method: GET, path: /NVIDIA/Ryno.git/** }
+      - allow: { method: POST, path: /NVIDIA/Ryno/**/git-upload-pack }
+      - allow: { method: POST, path: /NVIDIA/Ryno.git/**/git-upload-pack }
   - host: codeload.github.com
     port: 443
     protocol: rest
     enforcement: enforce
     rules:
-      - allow: { method: GET, path: /NVIDIA/OpenShell/** }
+      - allow: { method: GET, path: /NVIDIA/Ryno/** }
   - host: results-receiver.actions.githubusercontent.com
     port: 443
     protocol: rest

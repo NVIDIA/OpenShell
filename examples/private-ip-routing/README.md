@@ -62,7 +62,7 @@ Create a sandbox and curl the private API through the proxy. Replace the IP
 with whatever `kubectl get pod` showed above:
 
 ```bash
-openshell sandbox create \
+ryno sandbox create \
   --from registry.example.com/tools/curl:latest \
   --policy ./private-policy.yaml \
   -- bash -c \

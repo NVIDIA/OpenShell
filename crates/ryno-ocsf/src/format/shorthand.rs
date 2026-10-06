@@ -1,0 +1,1273 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shorthand formatter — single-line human-readable format derived from OCSF events.
+//!
+//! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
+
+use crate::events::OcsfEvent;
+use crate::events::base_event::BaseEventData;
+use crate::objects::Url;
+
+/// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
+///
+/// Returns a placeholder `"??:??:??.???"` for out-of-range timestamps
+/// instead of panicking.
+#[must_use]
+pub fn format_ts(time_ms: i64) -> String {
+    use chrono::{MappedLocalTime, TimeZone, Utc};
+    match Utc.timestamp_millis_opt(time_ms) {
+        MappedLocalTime::Single(dt) => dt.format("%H:%M:%S%.3f").to_string(),
+        _ => "??:??:??.???".to_string(),
+    }
+}
+
+/// Map a severity ID byte to its single-character shorthand.
+#[must_use]
+pub fn severity_char(severity_id: u8) -> char {
+    // Safe: we match on the raw u8 value
+    match severity_id {
+        1 => 'I',
+        2 => 'L',
+        3 => 'M',
+        4 => 'H',
+        5 => 'C',
+        6 => 'F',
+        _ => ' ',
+    }
+}
+
+/// Format the severity as a bracketed tag placed after the `CLASS:ACTIVITY`.
+///
+/// Placed as a suffix so the class name always starts at column 0, keeping
+/// logs vertically scannable:
+///
+/// ```text
+/// NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443
+/// NET:OPEN [MED] DENIED python3(42) -> blocked.com:443
+/// FINDING:BLOCKED [HIGH] "NSSH1 Nonce Replay Attack"
+/// ```
+#[must_use]
+pub fn severity_tag(severity_id: u8) -> &'static str {
+    match severity_id {
+        2 => "[LOW]",
+        3 => "[MED]",
+        4 => "[HIGH]",
+        5 => "[CRIT]",
+        6 => "[FATAL]",
+        _ => "[INFO]",
+    }
+}
+
+/// Max length for the reason text in `[reason:...]` before truncation. A
+/// denial reason carries the full destination endpoint plus the rejecting
+/// policy name (e.g. `endpoint host.example:443 not in policy <name>`), so the
+/// budget has to be wide enough to keep the port and policy name readable in
+/// the shorthand denial logs; 80 chars cut a typical reason mid-endpoint.
+const MAX_REASON_LEN: usize = 256;
+const MAX_MESSAGE_LEN: usize = 120;
+
+/// Truncate `text` to at most `max` bytes at a UTF-8 char boundary, appending
+/// an ellipsis when it was shortened. Slicing on a raw byte index panics when
+/// the index falls inside a multibyte char, so step back to the nearest
+/// boundary first.
+fn truncate_with_ellipsis(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+fn escape_quoted_field(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn escape_context_field(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            character if character.is_whitespace() || character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn reason_text(text: Option<&str>) -> Option<String> {
+    let text = text?;
+    if text.is_empty() {
+        return None;
+    }
+    let text = text.replace(['\n', '\r'], " ");
+    Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
+}
+
+/// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
+/// for denied events. Returns an empty string if neither field is set.
+fn reason_tag(base: &BaseEventData) -> String {
+    reason_text(base.status_detail.as_deref().or(base.message.as_deref()))
+        .map_or_else(String::new, |text| format!(" [reason:{text}]"))
+}
+
+fn sorted_unmapped_fields(base: &BaseEventData) -> Vec<(&str, &serde_json::Value)> {
+    let mut fields: Vec<_> = base
+        .unmapped
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    // Cargo can enable insertion-ordered JSON maps through another dependency.
+    // Keep shorthand ordering and truncated field selection stable either way.
+    fields.sort_unstable_by_key(|(key, _)| *key);
+    fields
+}
+
+fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
+    sorted_unmapped_fields(base)
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let value = match value {
+                serde_json::Value::Bool(value) => value.to_string(),
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::String(value) => {
+                    let value = truncate_with_ellipsis(value, MAX_REASON_LEN);
+                    escape_context_field(&value)
+                }
+                _ => return None,
+            };
+            Some(format!("{}:{value}", escape_context_field(key)))
+        })
+        .collect()
+}
+
+fn unmapped_context(base: &BaseEventData, include_reason: bool) -> String {
+    let mut fields = unmapped_fields(base);
+
+    if include_reason
+        && let Some(reason) = reason_text(base.status_detail.as_deref().or(base.message.as_deref()))
+    {
+        fields.push(format!("reason:{reason}"));
+    }
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", fields.join(" "))
+    }
+}
+
+fn message_tag(base: &BaseEventData) -> String {
+    let text = base.message.as_deref().unwrap_or("");
+    if text.is_empty() {
+        return String::new();
+    }
+    let text = text.replace(['\n', '\r'], " ");
+    format!(" [msg:{}]", truncate_with_ellipsis(&text, MAX_MESSAGE_LEN))
+}
+
+impl OcsfEvent {
+    /// Produce the single-line shorthand for `ryno.log` and gRPC log push.
+    ///
+    /// This is a display-only projection — the full OCSF JSON is the source of truth.
+    #[must_use]
+    pub fn format_shorthand(&self) -> String {
+        let base = self.base();
+        let sev = severity_tag(base.severity.as_u8());
+
+        match self {
+            Self::NetworkActivity(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .unwrap_or_default();
+                let dst = e
+                    .dst_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let host = ep.domain_or_ip();
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        // Include protocol for bypass detection events
+                        let proto = e
+                            .connection_info
+                            .as_ref()
+                            .map(|c| format!("/{}", c.protocol_name))
+                            .unwrap_or_default();
+                        format!("{host}{port}{proto}")
+                    })
+                    .unwrap_or_default();
+                let rule_ctx = e
+                    .firewall_rule
+                    .as_ref()
+                    .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
+                    .unwrap_or_default();
+                // For denied events, surface the reason from status_detail
+                let reason_ctx = if action == "DENIED" {
+                    reason_tag(&e.base)
+                } else {
+                    String::new()
+                };
+                let arrow = if actor_str.is_empty() && dst.is_empty() {
+                    String::new()
+                } else if actor_str.is_empty() {
+                    format!(" {dst}")
+                } else if dst.is_empty() {
+                    format!(" {actor_str}")
+                } else {
+                    format!(" {actor_str} -> {dst}")
+                };
+
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                // Most network messages duplicate the structured action and
+                // destination shown above. Transparent TCP correlation is the
+                // exception: its message intentionally carries the logical,
+                // synthetic, and actual dial targets needed to follow the
+                // policy-DNS mapping in the human-readable audit log.
+                let show_correlation_message =
+                    e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                let message_ctx = if show_correlation_message
+                    || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
+                format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
+            }
+
+            Self::HttpActivity(e) => {
+                let method = e
+                    .http_request
+                    .as_ref()
+                    .map_or("UNKNOWN", |r| r.http_method.as_str());
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
+                let actor_str = e
+                    .actor
+                    .as_ref()
+                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .unwrap_or_default();
+                let url_str = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .map(Url::to_display_string)
+                    .unwrap_or_default();
+                let rule_ctx = e
+                    .firewall_rule
+                    .as_ref()
+                    .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
+                    .unwrap_or_default();
+                let outcome_ctx = unmapped_context(&e.base, action == "DENIED");
+                let arrow = if actor_str.is_empty() {
+                    format!(" {method} {url_str}")
+                } else {
+                    format!(" {actor_str} -> {method} {url_str}")
+                };
+
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                // Denied HTTP events surface their message through outcome_ctx.
+                // Allowed MCP decisions also need the JSON-RPC message so the
+                // selected tool name is visible in the shorthand log stream.
+                let message_ctx = if action != "DENIED"
+                    && e.firewall_rule
+                        .as_ref()
+                        .is_some_and(|rule| rule.rule_type == "l7-mcp")
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
+                format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
+            }
+
+            Self::ApiActivity(e) => {
+                let model_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " {}",
+                            escape_context_field(&truncate_with_ellipsis(&m.name, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
+                let provider_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " via {}",
+                            escape_context_field(&truncate_with_ellipsis(
+                                &m.ai_provider,
+                                MAX_REASON_LEN
+                            ))
+                        )
+                    })
+                    .unwrap_or_default();
+                let latency = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|u| u.get("latency_ms"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|ms| format!(" {ms}ms"))
+                    .unwrap_or_default();
+                let op =
+                    escape_context_field(&truncate_with_ellipsis(&e.api.operation, MAX_REASON_LEN));
+                let status_ctx = e
+                    .base
+                    .status
+                    .map(|s| format!(" {}", s.label()))
+                    .unwrap_or_default();
+                format!("API:INFERENCE {sev}{status_ctx}{model_ctx}{provider_ctx}{latency} [{op}]")
+            }
+
+            Self::SshActivity(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
+                let peer = e
+                    .src_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let host = ep.domain_or_ip();
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        format!("{host}{port}")
+                    })
+                    .unwrap_or_default();
+                let auth_ctx = e
+                    .auth_type
+                    .as_ref()
+                    .map(|id| {
+                        let label = e
+                            .auth_type_custom_label
+                            .as_deref()
+                            .unwrap_or_else(|| id.label());
+                        format!(" [auth:{label}]")
+                    })
+                    .unwrap_or_default();
+
+                let detail = [
+                    if action.is_empty() { "" } else { &action },
+                    if peer.is_empty() { "" } else { &peer },
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+                let detail = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {detail}")
+                };
+                format!("SSH:{activity} {sev}{detail}{auth_ctx}")
+            }
+
+            Self::ProcessActivity(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let proc_str = format!("{}({})", e.process.name, e.process.pid);
+                let exit_ctx = e
+                    .exit_code
+                    .map(|c| format!(" [exit:{c}]"))
+                    .unwrap_or_default();
+                let cmd_ctx = e
+                    .process
+                    .cmd_line
+                    .as_ref()
+                    .map(|c| format!(" [cmd:{c}]"))
+                    .unwrap_or_default();
+
+                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
+            }
+
+            Self::DetectionFinding(e) => {
+                let disposition = e.disposition.map_or_else(
+                    || e.base.activity_name.to_uppercase(),
+                    |d| d.label().to_uppercase(),
+                );
+                let title = escape_quoted_field(&truncate_with_ellipsis(
+                    &e.finding_info.title,
+                    MAX_MESSAGE_LEN,
+                ));
+                let mut context = vec![format!(
+                    "type:{}",
+                    escape_context_field(&e.finding_info.uid)
+                )];
+                context.extend(unmapped_fields(&e.base));
+                if let Some(confidence) = e.confidence {
+                    context.push(format!("confidence:{}", confidence.label().to_lowercase()));
+                }
+                let context = format!(" [{}]", context.join(" "));
+
+                format!("FINDING:{disposition} {sev} \"{title}\"{context}")
+            }
+
+            Self::ApplicationLifecycle(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let app = &e.app.name;
+                let status = e
+                    .base
+                    .status
+                    .map(|s| s.label().to_lowercase())
+                    .unwrap_or_default();
+
+                format!("LIFECYCLE:{activity} {sev} {app} {status}")
+            }
+
+            Self::DeviceConfigStateChange(e) => {
+                let state = e.state.map_or_else(
+                    || "UNKNOWN".to_string(),
+                    |s| {
+                        e.state_custom_label
+                            .as_deref()
+                            .unwrap_or_else(|| s.label())
+                            .to_uppercase()
+                    },
+                );
+                let what = e.base.message.as_deref().unwrap_or("config");
+                // Bracketed suffix carries the structured provenance fields a
+                // reviewer needs to scan a CONFIG audit line. Auto-approval
+                // emits `auto`/`source`/`prover_delta`; every config change
+                // also carries `policy_version` and `policy_hash`. Order is
+                // stable so logs are greppable.
+                let suffix = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .map(|u| {
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut push = |key: &str| {
+                            if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
+                                parts.push(format!("{key}:{value}"));
+                            }
+                        };
+                        push("auto");
+                        push("source");
+                        push("prover_delta");
+                        push("resolved_from");
+                        if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
+                            parts.push(format!("version:{ver}"));
+                        }
+                        if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
+                            parts.push(format!("hash:{hash}"));
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", parts.join(" "))
+                        }
+                    })
+                    .unwrap_or_default();
+
+                format!("CONFIG:{state} {sev} {what}{suffix}")
+            }
+
+            Self::Base(e) => {
+                let message = e.base.message.as_deref().unwrap_or("");
+                let unmapped_ctx = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|u| {
+                        let obj = u.as_object()?;
+                        if obj.is_empty() {
+                            return None;
+                        }
+                        let fields: Vec<String> = sorted_unmapped_fields(&e.base)
+                            .into_iter()
+                            .take(3)
+                            .map(|(k, v)| {
+                                let val = v.as_str().map_or_else(|| v.to_string(), String::from);
+                                format!("{k}:{val}")
+                            })
+                            .collect();
+                        Some(format!(" [{}]", fields.join(" ")))
+                    })
+                    .unwrap_or_default();
+
+                format!("EVENT {sev} {message}{unmapped_ctx}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enums::{ActionId, AuthTypeId, ConfidenceId, DispositionId, LaunchTypeId, StateId};
+    use crate::events::base_event::BaseEventData;
+    use crate::events::{
+        ApplicationLifecycleEvent, BaseEvent, DetectionFindingEvent, DeviceConfigStateChangeEvent,
+        HttpActivityEvent, NetworkActivityEvent, ProcessActivityEvent, SshActivityEvent,
+    };
+    use crate::objects::*;
+
+    fn test_metadata() -> Metadata {
+        Metadata {
+            version: "1.8.0".to_string(),
+            product: Product::ryno_sandbox("0.1.0"),
+            profiles: vec!["security_control".to_string()],
+            uid: Some("sandbox-abc123".to_string()),
+            log_source: None,
+        }
+    }
+
+    fn base(
+        class_uid: u32,
+        class_name: &str,
+        cat_uid: u8,
+        cat_name: &str,
+        act_id: u8,
+        act_name: &str,
+    ) -> BaseEventData {
+        let mut b = BaseEventData::new(
+            class_uid,
+            class_name,
+            cat_uid,
+            cat_name,
+            act_id,
+            act_name,
+            crate::enums::SeverityId::Informational,
+            test_metadata(),
+        );
+        b.set_time(1_742_047_200_000); // Fixed timestamp for deterministic tests
+        b
+    }
+
+    #[test]
+    fn test_format_ts() {
+        let ts = format_ts(1_742_047_200_000);
+        assert_eq!(ts, "14:00:00.000");
+    }
+
+    #[test]
+    fn test_format_ts_invalid_timestamp_does_not_panic() {
+        // Out-of-range timestamp should return placeholder, not panic
+        let ts = format_ts(i64::MAX);
+        assert_eq!(ts, "??:??:??.???");
+
+        let ts = format_ts(i64::MIN);
+        assert_eq!(ts, "??:??:??.???");
+    }
+
+    #[test]
+    fn test_severity_char_mapping() {
+        assert_eq!(severity_char(0), ' ');
+        assert_eq!(severity_char(1), 'I');
+        assert_eq!(severity_char(2), 'L');
+        assert_eq!(severity_char(3), 'M');
+        assert_eq!(severity_char(4), 'H');
+        assert_eq!(severity_char(5), 'C');
+        assert_eq!(severity_char(6), 'F');
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_allow() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: base(4001, "Network Activity", 4, "Network Activity", 1, "Open"),
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("python3", 42),
+            }),
+            firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
+            connection_info: None,
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443 [policy:default-egress engine:mechanistic]"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_bypass() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: {
+                let mut b = base(4001, "Network Activity", 4, "Network Activity", 5, "Refuse");
+                b.severity = crate::enums::SeverityId::Medium;
+                b
+            },
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_ip_str("93.184.216.34", 443)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("node", 1234),
+            }),
+            firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
+            connection_info: Some(ConnectionInfo::new("tcp")),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: Some(3),
+            is_src_dst_assignment_known: Some(true),
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "NET:REFUSE [MED] DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:nftables]"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand() {
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: base(4002, "HTTP Activity", 4, "Network Activity", 3, "Get"),
+            http_request: Some(HttpRequest::new(
+                "GET",
+                Url::new("https", "api.example.com", "/v1/data", 443),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 88),
+            }),
+            firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
+            action: Some(ActionId::Allowed),
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:GET [INFO] ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress engine:mechanistic]"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_includes_unmapped_attributes() {
+        let mut base = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
+        base.add_unmapped("cached", serde_json::json!(true));
+        base.add_unmapped("attempt", serde_json::json!(2));
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "httpbin.org", "/anything", 443),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("httpbin", "extension")),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:extension] [attempt:2 cached:true]"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_mcp_shows_tool_for_allow_and_deny() {
+        let mut event_base = base(4002, "HTTP Activity", 4, "Network Activity", 0, "Other");
+        event_base.set_message(
+            "JSONRPC_L7_REQUEST decision=allow rule_methods=tools/call tools=move_head",
+        );
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: event_base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "host.ryno.internal", "/mcp", 8766),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("reachy-mcp", "l7-mcp")),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(shorthand.contains("engine:l7-mcp"));
+        assert!(shorthand.contains("tools=move_head"));
+
+        let mut denied_base = base(4002, "HTTP Activity", 4, "Network Activity", 0, "Other");
+        denied_base.severity = crate::enums::SeverityId::Medium;
+        denied_base.set_message(
+            "JSONRPC_L7_REQUEST decision=deny rule_methods=tools/call tools=move_head",
+        );
+        let denied_event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: denied_base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "host.ryno.internal", "/mcp", 8766),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("reachy-mcp", "l7-mcp")),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let denied_shorthand = denied_event.format_shorthand();
+        assert!(denied_shorthand.contains("[reason:"));
+        assert!(denied_shorthand.contains("tools=move_head"));
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_denied_shows_reason() {
+        let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail(
+            "169.254.169.254 resolves to always-blocked address 169.254.169.254, connection rejected"
+                .to_string(),
+        );
+
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: b,
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 1618),
+            }),
+            firewall_rule: Some(FirewallRule::new("-", "ssrf")),
+            connection_info: None,
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("[reason:"),
+            "denied shorthand should contain [reason:]: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("always-blocked"),
+            "reason should contain 'always-blocked': {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_allowed_no_reason() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: base(4001, "Network Activity", 4, "Network Activity", 1, "Open"),
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("python3", 42),
+            }),
+            firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
+            connection_info: None,
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.contains("[reason:"),
+            "allowed shorthand should NOT contain [reason:]: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_shows_message_when_no_key_fields() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: {
+                let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+                b.set_message("relay open (channel_id=ch-42)");
+                b
+            },
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: None,
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "NET:OPEN [INFO] [msg:relay open (channel_id=ch-42)]"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_denied_shows_reason() {
+        let mut b = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail("not in allowed_ips".to_string());
+
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: b,
+            http_request: Some(HttpRequest::new(
+                "PUT",
+                Url::new("http", "169.254.169.254", "/latest/api/token", 80),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 1618),
+            }),
+            firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("[reason:not in allowed_ips]"),
+            "denied HTTP shorthand should contain [reason:not in allowed_ips]: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("[policy:aws_iam engine:ssrf]"),
+            "denied HTTP shorthand should contain engine: {shorthand}"
+        );
+    }
+
+    fn denied_network_shorthand(status_detail: String) -> String {
+        let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail(status_detail);
+
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: b,
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("example.com", 443)),
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+        event.format_shorthand()
+    }
+
+    #[test]
+    fn test_shorthand_reason_truncated_beyond_max_len() {
+        let long_reason = "a".repeat(MAX_REASON_LEN + 40);
+        let shorthand = denied_network_shorthand(long_reason.clone());
+        assert!(
+            shorthand.contains("[reason:"),
+            "should have reason tag: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("...]"),
+            "an over-budget reason should be truncated with ...: {shorthand}"
+        );
+        assert!(
+            !shorthand.contains(&long_reason),
+            "full over-budget reason should not appear: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_keeps_full_endpoint_and_policy() {
+        // Regression for #4760: a realistic denial reason (full FQDN, port, and
+        // rejecting policy name) is under the budget and must render end-to-end
+        // with no `...` truncation so the operator can read why it was denied.
+        let reason =
+            "endpoint nemoclaw-prr-repro-long-hostname-for-truncation-test.example.invalid:443 \
+             not in policy balanced"
+                .to_string();
+        assert!(reason.len() <= MAX_REASON_LEN);
+        let shorthand = denied_network_shorthand(reason.clone());
+        assert!(
+            shorthand.contains(&format!("[reason:{reason}]")),
+            "full reason (endpoint + :443 + policy name) should be readable: {shorthand}"
+        );
+        assert!(
+            !shorthand.contains("...]"),
+            "an in-budget reason should not be truncated: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_truncates_on_multibyte_char_boundary() {
+        // A raw byte slice at MAX_REASON_LEN would panic when the boundary
+        // falls inside a multibyte char; truncation must step back safely. The
+        // boundary byte lands inside the 2-byte "é" here: MAX_REASON_LEN-1
+        // single-byte chars, then a multibyte char straddling the limit.
+        let reason = format!("{}étail", "a".repeat(MAX_REASON_LEN - 1));
+        let shorthand = denied_network_shorthand(reason);
+        assert!(
+            shorthand.contains("...]"),
+            "over-budget multibyte reason should be truncated: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_normalizes_newlines() {
+        // status_detail can carry endpoint/error-derived text; the single-line
+        // shorthand must not let embedded CR/LF break downstream log parsing
+        // (CWE-117), matching the [msg:...] tag's normalization.
+        let shorthand = denied_network_shorthand("line one\nline two\rline three".to_string());
+        assert!(
+            !shorthand.contains('\n') && !shorthand.contains('\r'),
+            "reason newlines must be normalized: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("line one line two line three"),
+            "reason newlines should become spaces: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_non_default_port() {
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: base(4002, "HTTP Activity", 4, "Network Activity", 3, "Get"),
+            http_request: Some(HttpRequest::new(
+                "GET",
+                Url::new("http", "172.20.0.1", "/test", 9876),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 68),
+            }),
+            firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
+            action: Some(ActionId::Allowed),
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:GET [INFO] ALLOWED curl(68) -> GET http://172.20.0.1:9876/test [policy:allow_host_9876 engine:mechanistic]"
+        );
+    }
+
+    #[test]
+    fn test_ssh_activity_shorthand() {
+        let event = OcsfEvent::SshActivity(SshActivityEvent {
+            base: base(4007, "SSH Activity", 4, "Network Activity", 1, "Open"),
+            src_endpoint: Some(Endpoint::from_ip_str("10.42.0.1", 48201)),
+            dst_endpoint: None,
+            actor: None,
+            auth_type: Some(AuthTypeId::Other),
+            auth_type_custom_label: Some("NSSH1".to_string()),
+            protocol_ver: None,
+            action: Some(ActionId::Allowed),
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "SSH:OPEN [INFO] ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
+        );
+    }
+
+    #[test]
+    fn test_process_activity_shorthand_launch() {
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+            process: Process::new("python3", 42).with_cmd_line("python3 /app/main.py"),
+            actor: None,
+            launch_type: Some(LaunchTypeId::Spawn),
+            exit_code: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
+        );
+    }
+
+    #[test]
+    fn test_process_activity_shorthand_terminate() {
+        let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
+            base: base(
+                1007,
+                "Process Activity",
+                1,
+                "System Activity",
+                2,
+                "Terminate",
+            ),
+            process: Process::new("python3", 42),
+            actor: None,
+            launch_type: None,
+            exit_code: Some(0),
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(shorthand, "PROC:TERMINATE [INFO] python3(42) [exit:0]");
+    }
+
+    #[test]
+    fn test_detection_finding_shorthand() {
+        let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
+            base: {
+                let mut b = base(2004, "Detection Finding", 2, "Findings", 1, "Create");
+                b.severity = crate::enums::SeverityId::High;
+                b
+            },
+            finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack"),
+            evidences: None,
+            attacks: None,
+            remediation: None,
+            is_alert: Some(true),
+            confidence: Some(ConfidenceId::High),
+            risk_level: None,
+            action: None,
+            disposition: Some(DispositionId::Blocked),
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "FINDING:BLOCKED [HIGH] \"NSSH1 Nonce Replay Attack\" [type:nssh1-replay-abc confidence:high]"
+        );
+    }
+
+    #[test]
+    fn test_detection_finding_shorthand_uses_activity_and_safe_unmapped_attributes() {
+        let mut base = base(2004, "Detection Finding", 2, "Findings", 1, "Create");
+        base.add_unmapped("count", serde_json::json!(1));
+        base.add_unmapped("source", serde_json::json!("content_guard"));
+        let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
+            base,
+            finding_info: FindingInfo::new("content_guard.match", "configured content matched"),
+            evidences: Some(vec![Evidence::from_pairs(&[(
+                "matched_content",
+                "must-not-appear",
+            )])]),
+            attacks: None,
+            remediation: None,
+            is_alert: None,
+            confidence: None,
+            risk_level: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "FINDING:CREATE [INFO] \"configured content matched\" [type:content_guard.match count:1 source:content_guard]"
+        );
+        assert!(!shorthand.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn detection_finding_shorthand_escapes_control_characters_and_delimiters() {
+        let mut base = base(2004, "Detection Finding", 2, "Findings", 1, "Create");
+        base.add_unmapped(
+            "source\nforged",
+            serde_json::json!("guard]\nFINDING:FORGED"),
+        );
+        let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
+            base,
+            finding_info: FindingInfo::new(
+                "content_guard\nforged",
+                "matched \"value\"\nFINDING:FORGED",
+            ),
+            evidences: None,
+            attacks: None,
+            remediation: None,
+            is_alert: None,
+            confidence: None,
+            risk_level: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+
+        assert_eq!(shorthand.lines().count(), 1);
+        assert!(shorthand.contains("matched \\\"value\\\"\\nFINDING:FORGED"));
+        assert!(shorthand.contains("type:content_guard\\u{a}forged"));
+        assert!(shorthand.contains("source\\u{a}forged:guard\\]\\u{a}FINDING:FORGED"));
+    }
+
+    #[test]
+    fn test_lifecycle_shorthand() {
+        let mut b = base(
+            6002,
+            "Application Lifecycle",
+            6,
+            "Application Activity",
+            3,
+            "Start",
+        );
+        b.set_status(crate::enums::StatusId::Success);
+        let event = OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent {
+            base: b,
+            app: Product {
+                name: "ryno-sandbox".to_string(),
+                vendor_name: "Ryno".to_string(),
+                version: Some("0.1.0".to_string()),
+            },
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(shorthand, "LIFECYCLE:START [INFO] ryno-sandbox success");
+    }
+
+    #[test]
+    fn test_config_state_change_shorthand() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("policy reloaded");
+        b.add_unmapped("policy_version", serde_json::json!("v3"));
+        b.add_unmapped("policy_hash", serde_json::json!("sha256:abc123def456"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Enabled),
+            state_custom_label: Some("LOADED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "CONFIG:LOADED [INFO] policy reloaded [version:v3 hash:sha256:abc123def456]"
+        );
+    }
+
+    /// Auto-approval audit events carry `auto`, `source`, `prover_delta`, and
+    /// `resolved_from` as unmapped fields. Lock the suffix order so operators
+    /// (and the demo's grep) can rely on it.
+    #[test]
+    fn test_config_state_change_shorthand_includes_auto_approve_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("auto-approved: no new prover findings (source=agent_authored)");
+        b.add_unmapped("auto", serde_json::json!("true"));
+        b.add_unmapped("source", serde_json::json!("agent_authored"));
+        b.add_unmapped("prover_delta", serde_json::json!("empty"));
+        b.add_unmapped("resolved_from", serde_json::json!("sandbox"));
+        b.add_unmapped("policy_version", serde_json::json!("v4"));
+        b.add_unmapped("policy_hash", serde_json::json!("sha256:cafe"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("APPROVED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "CONFIG:APPROVED [INFO] auto-approved: no new prover findings (source=agent_authored) \
+             [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
+             version:v4 hash:sha256:cafe]"
+        );
+    }
+
+    #[test]
+    fn test_base_event_shorthand() {
+        let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+        b.set_message("Network namespace created");
+        b.add_unmapped("ns", serde_json::json!("ryno-sandbox-abc123"));
+
+        let event = OcsfEvent::Base(BaseEvent { base: b });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "EVENT [INFO] Network namespace created [ns:ryno-sandbox-abc123]"
+        );
+    }
+
+    #[test]
+    fn test_base_event_selects_unmapped_fields_in_key_order() {
+        let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+        b.set_message("Context");
+        for (key, value) in [("z", 4), ("c", 3), ("a", 1), ("b", 2)] {
+            b.add_unmapped(key, serde_json::json!(value));
+        }
+
+        let event = OcsfEvent::Base(BaseEvent { base: b });
+        assert_eq!(
+            event.format_shorthand(),
+            "EVENT [INFO] Context [a:1 b:2 c:3]"
+        );
+    }
+}

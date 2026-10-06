@@ -3,12 +3,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# This script runs INSIDE each OpenShell sandbox.
+# This script runs INSIDE each Ryno sandbox.
 #
 # It is uploaded to /sandbox/payload/demo-runner.sh by demo.sh and invoked as
 # the sandbox entrypoint. It receives positional arguments from `run_sandbox()`
 # in demo.sh and reads DEMO_GITHUB_TOKEN from the environment, where the
-# OpenShell proxy resolves the provider placeholder at the network boundary.
+# Ryno proxy resolves the provider placeholder at the network boundary.
 #
 # Modes:
 #   worker     — render the worker prompt for a slice, run codex, PUT the note.
@@ -78,7 +78,7 @@ const fakeIdToken = [
   b64u({
     iss: "https://auth.openai.com",
     aud: "codex",
-    sub: "openshell-placeholder",
+    sub: "ryno-placeholder",
     email: "placeholder@example.com",
     iat: now,
     exp: now + 3600,

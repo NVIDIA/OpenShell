@@ -26,7 +26,7 @@ SKIP_DOCKERFILES=(
   --skip-files 'deploy/docker/Dockerfile.ci'
 )
 
-# Explicit OpenShell variants, including dev/E2E regression coverage.
+# Explicit Ryno variants, including dev/E2E regression coverage.
 # spire-stack belongs to the external SPIRE chart and is intentionally absent.
 HELM_PROFILES=(
   cert-manager credential-driver-kubernetes-secrets credential-driver-vault
@@ -112,7 +112,7 @@ scan_config() {
 
   local values fixture
   for fixture in "${HELM_PROFILES[@]}"; do
-    values="deploy/helm/openshell/ci/values-${fixture}.yaml"
+    values="deploy/helm/ryno/ci/values-${fixture}.yaml"
     if [ ! -f "${values}" ]; then
       # A newly added profile has no baseline report yet. A missing candidate
       # fixture is an error: intentional removal must also update HELM_PROFILES.
@@ -120,8 +120,8 @@ scan_config() {
       echo "Error: Helm profile not found: ${values}" >&2
       return 2
     fi
-    scan config "config-fixture-${fixture}" deploy/helm/openshell/ \
-      "${PREFLIGHT_OFF[@]}" --helm-values "${values}" deploy/helm/openshell
+    scan config "config-fixture-${fixture}" deploy/helm/ryno/ \
+      "${PREFLIGHT_OFF[@]}" --helm-values "${values}" deploy/helm/ryno
   done
 }
 

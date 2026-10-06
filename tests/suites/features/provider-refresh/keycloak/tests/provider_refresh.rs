@@ -5,7 +5,7 @@
 
 //! Provider OAuth refresh recovery against Keycloak.
 //!
-//! OpenShell itself uses the local gateway's mTLS authentication. Keycloak is
+//! Ryno itself uses the local gateway's mTLS authentication. Keycloak is
 //! only the provider token issuer: the test refreshes a valid grant, revokes
 //! its Keycloak session, and verifies that the gateway reports the next
 //! refresh as requiring user reauthorization.
@@ -13,7 +13,7 @@
 use std::io::Write as _;
 use std::process::{Output, Stdio};
 
-use openshell_e2e::harness::binary::openshell_cmd;
+use ryno_e2e::harness::binary::ryno_cmd;
 use serde_json::Value;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt as _;
@@ -32,7 +32,7 @@ fn combined_output(output: &Output) -> String {
 }
 
 async fn run_cli(args: &[&str], env: &[(&str, &str)]) -> Result<Output, String> {
-    openshell_cmd()
+    ryno_cmd()
         .args(args)
         .env("NO_COLOR", "1")
         .envs(env.iter().copied())
@@ -40,7 +40,7 @@ async fn run_cli(args: &[&str], env: &[(&str, &str)]) -> Result<Output, String> 
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|error| format!("run openshell command: {error}"))
+        .map_err(|error| format!("run ryno command: {error}"))
 }
 
 async fn run_cli_success(args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
@@ -48,7 +48,7 @@ async fn run_cli_success(args: &[&str], env: &[(&str, &str)]) -> Result<String, 
     let combined = combined_output(&output);
     if !output.status.success() {
         return Err(format!(
-            "openshell command failed (exit {:?}):\n{combined}",
+            "ryno command failed (exit {:?}):\n{combined}",
             output.status.code()
         ));
     }
@@ -74,7 +74,7 @@ async fn acquire_keycloak_grant(
             "--data-urlencode",
             "grant_type=password",
             "--data-urlencode",
-            "client_id=openshell-cli",
+            "client_id=ryno-cli",
             "--data-urlencode",
             &username_form,
             "--data-urlencode",
@@ -121,7 +121,7 @@ async fn revoke_keycloak_grant(issuer: &str, refresh_token: &str) -> Result<(), 
             "POST",
             &logout_endpoint,
             "--data-urlencode",
-            "client_id=openshell-cli",
+            "client_id=ryno-cli",
             "--data-urlencode",
             "refresh_token@-",
         ])
@@ -202,12 +202,12 @@ async fn delete_provider_resources() {
 
 #[tokio::test]
 async fn revoked_refresh_grant_requires_user_reauthorization() -> Result<(), String> {
-    let issuer = std::env::var("OPENSHELL_E2E_OIDC_ISSUER")
-        .map_err(|_| "OPENSHELL_E2E_OIDC_ISSUER is required".to_string())?;
-    let username = std::env::var("OPENSHELL_E2E_OIDC_USERNAME")
-        .map_err(|_| "OPENSHELL_E2E_OIDC_USERNAME is required".to_string())?;
-    let password = std::env::var("OPENSHELL_E2E_OIDC_PASSWORD")
-        .map_err(|_| "OPENSHELL_E2E_OIDC_PASSWORD is required".to_string())?;
+    let issuer = std::env::var("RYNO_E2E_OIDC_ISSUER")
+        .map_err(|_| "RYNO_E2E_OIDC_ISSUER is required".to_string())?;
+    let username = std::env::var("RYNO_E2E_OIDC_USERNAME")
+        .map_err(|_| "RYNO_E2E_OIDC_USERNAME is required".to_string())?;
+    let password = std::env::var("RYNO_E2E_OIDC_PASSWORD")
+        .map_err(|_| "RYNO_E2E_OIDC_PASSWORD is required".to_string())?;
     let (access_token, refresh_token) =
         acquire_keycloak_grant(&issuer, &username, &password).await?;
     let profile = write_profile(&issuer)?;
@@ -245,7 +245,7 @@ async fn revoked_refresh_grant_requires_user_reauthorization() -> Result<(), Str
                 "--strategy",
                 "oauth2-refresh-token",
                 "--material",
-                "client_id=openshell-cli",
+                "client_id=ryno-cli",
                 "--secret-material-env",
                 "refresh_token=KEYCLOAK_REFRESH_TOKEN",
             ],

@@ -27,18 +27,18 @@ Publishing is explicit and requires both --repository and --push.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_SEAL:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_RUNNER:-}" ]; then
+if [ "${RYNO_TEST_GUEST_RUNTIME:-}" != 1 ] ||
+	[ ! -d "${RYNO_TEST_GUEST_DISTROS:-}" ] ||
+	[ ! -d "${RYNO_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -r "${RYNO_TEST_GUEST_CACHE_LIB:-}" ] ||
+	[ ! -r "${RYNO_TEST_GUEST_CACHE_SEAL:-}" ] ||
+	[ ! -r "${RYNO_TEST_GUEST_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest-cache -- ...'" >&2
 	exit 2
 fi
 
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
+. "${RYNO_TEST_GUEST_CACHE_LIB}"
 
 require_value() {
 	if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
@@ -48,8 +48,8 @@ require_value() {
 }
 
 distro=
-repository=${OPENSHELL_TEST_GUEST_CACHE_REPOSITORY:-}
-pull_digest=${OPENSHELL_TEST_GUEST_CACHE_DIGEST:-}
+repository=${RYNO_TEST_GUEST_CACHE_REPOSITORY:-}
+pull_digest=${RYNO_TEST_GUEST_CACHE_DIGEST:-}
 cache_dir=
 push=0
 configurations=()
@@ -103,18 +103,18 @@ if [ -z "${distro}" ]; then
 	exit 2
 fi
 if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
+	[ ! -r "${RYNO_TEST_GUEST_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
 
 # Distro profiles contain only trusted values generated into the Nix store.
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
+. "${RYNO_TEST_GUEST_DISTROS}/${distro}"
 
 for item in "${configurations[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+		[ ! -r "${RYNO_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -143,8 +143,8 @@ if [ -n "${pull_digest}" ] &&
 fi
 
 if [ -n "${cache_dir}" ]; then
-	OPENSHELL_TEST_GUEST_CACHE_DIR=${cache_dir}
-	export OPENSHELL_TEST_GUEST_CACHE_DIR
+	RYNO_TEST_GUEST_CACHE_DIR=${cache_dir}
+	export RYNO_TEST_GUEST_CACHE_DIR
 fi
 
 umask 077
@@ -351,19 +351,19 @@ build_local() {
 	done
 	prepare_args+=(
 		--copy
-		"${OPENSHELL_TEST_GUEST_CACHE_SEAL}:/usr/local/sbin/openshell-test-guest-cache-seal"
+		"${RYNO_TEST_GUEST_CACHE_SEAL}:/usr/local/sbin/ryno-test-guest-cache-seal"
 		--
 		sudo
-		/usr/local/sbin/openshell-test-guest-cache-seal
+		/usr/local/sbin/ryno-test-guest-cache-seal
 	)
 
 	echo "==> Cache miss: preparing ${distro} ($(test_vm_cache_oci_architecture))"
 	TMPDIR="${build_stage}/prepare-tmp" \
-		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
-		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${prepare_args[@]}"
+		RYNO_TEST_GUEST_CACHE_DISABLE=1 \
+		"${TEST_GUEST_BASH}" "${RYNO_TEST_GUEST_RUNNER}" "${prepare_args[@]}"
 
 	shopt -s nullglob
-	run_dirs=("${build_stage}/prepare-tmp/openshell-test-guest"/run.*)
+	run_dirs=("${build_stage}/prepare-tmp/ryno-test-guest"/run.*)
 	shopt -u nullglob
 	if [ "${#run_dirs[@]}" -ne 1 ] ||
 		[ ! -f "${run_dirs[0]}/disk.qcow2" ]; then
@@ -380,8 +380,8 @@ build_local() {
 	for configuration in "${configurations[@]}"; do
 		case "${configuration}" in
 		docker) validation+='; docker info >/dev/null' ;;
-		podman-rootful) validation+='; sudo podman --url unix:///run/podman/podman.sock info >/dev/null; test "$(cat /etc/openshell-test-guest/podman-mode)" = rootful' ;;
-		podman-rootless) validation+='; podman info >/dev/null; test "$(cat /etc/openshell-test-guest/podman-mode)" = rootless' ;;
+		podman-rootful) validation+='; sudo podman --url unix:///run/podman/podman.sock info >/dev/null; test "$(cat /etc/ryno-test-guest/podman-mode)" = rootful' ;;
+		podman-rootless) validation+='; podman info >/dev/null; test "$(cat /etc/ryno-test-guest/podman-mode)" = rootless' ;;
 		selinux) validation+='; test "$(getenforce)" = Enforcing' ;;
 		esac
 	done
@@ -394,9 +394,9 @@ build_local() {
 
 	echo "==> Validating fresh boot from prepared cache disk"
 	TMPDIR="${build_stage}/validate-tmp" \
-		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
-		OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE="${prepared_disk}" \
-		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${validate_args[@]}"
+		RYNO_TEST_GUEST_CACHE_DISABLE=1 \
+		RYNO_TEST_GUEST_IMAGE_OVERRIDE="${prepared_disk}" \
+		"${TEST_GUEST_BASH}" "${RYNO_TEST_GUEST_RUNNER}" "${validate_args[@]}"
 
 	configuration_json=$(jq -cn --args '$ARGS.positional' "${configurations[@]}")
 	disk_sha=$(test_vm_cache_sha256 "${prepared_disk}")

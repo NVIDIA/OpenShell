@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-REPO = "NVIDIA/OpenShell"
+REPO = "NVIDIA/Ryno"
 
 WORKFLOWS: list[str] = [
     "branch-checks.yml",

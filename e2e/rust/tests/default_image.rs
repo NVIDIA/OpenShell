@@ -5,8 +5,8 @@
 
 //! E2E coverage for the default NVIDIA Ubuntu workload image.
 
-use openshell_e2e::harness::output::strip_ansi;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 #[tokio::test]
 async fn sandbox_from_default_image() {

@@ -12,7 +12,7 @@ The demo deploys three in-cluster workloads:
 | `alpha-exchange` | Requires a final bearer token with audience and scope `alpha` |
 | `beta-exchange` | Requires a final bearer token with audience and scope `beta` |
 
-The OpenShell provider profile in `provider-profile.yaml` declares a stored
+The Ryno provider profile in `provider-profile.yaml` declares a stored
 `subject_token` credential and a runtime `access_token` credential with
 `token_grant.grant_type: token_exchange`. The subject token is stored for
 gateway-side exchange only and is not injected into the sandbox environment.
@@ -34,24 +34,24 @@ When a sandbox curls `alpha-exchange` or `beta-exchange`:
 
 ## Prerequisites
 
-- A Kubernetes OpenShell dev cluster.
+- A Kubernetes Ryno dev cluster.
 - SPIRE enabled for provider token grants and gateway token exchange.
 - Gateway and supervisor access to SPIRE OIDC/JWKS discovery.
-- OpenShell configured with the Kubernetes ServiceAccount supervisor bootstrap
+- Ryno configured with the Kubernetes ServiceAccount supervisor bootstrap
   path.
-- Local `curl`, `python3`, `openssl`, `nc`, `kubectl`, and `openshell`.
+- Local `curl`, `python3`, `openssl`, `nc`, `kubectl`, and `ryno`.
 - A registered and logged-in CLI gateway. The script uses `GATEWAY_NAME`, then
-  `OPENSHELL_GATEWAY`, then the active OpenShell gateway selection.
+  `RYNO_GATEWAY`, then the active Ryno gateway selection.
 
 For the Helm dev environment, deploy with the SPIRE releases and
-`ci/values-spire.yaml` enabled in `deploy/helm/openshell/skaffold.yaml`.
+`ci/values-spire.yaml` enabled in `deploy/helm/ryno/skaffold.yaml`.
 
 The demo assumes these SPIFFE ID prefixes:
 
 | Identity | Prefix |
 |---|---|
-| Gateway | `spiffe://openshell.local/ns/openshell/sa/` |
-| Supervisor | `spiffe://openshell.local/openshell/sandbox/` |
+| Gateway | `spiffe://ryno.local/ns/ryno/sa/` |
+| Supervisor | `spiffe://ryno.local/ryno/sandbox/` |
 
 Override `GATEWAY_TRUST_DOMAIN_PREFIX` or `SUPERVISOR_TRUST_DOMAIN_PREFIX` in
 `k8s/workloads.yaml` if your development cluster uses different SPIFFE IDs.
@@ -64,14 +64,14 @@ bundle as `SPIRE_JWKS_CA_FILE` when fetching JWKS over HTTPS.
 ## Kubeconfig And Mise
 
 The repository `mise.toml` sets `KUBECONFIG` to the repo-local `kubeconfig`
-when your shell activates the OpenShell directory. If you are testing against a
+when your shell activates the Ryno directory. If you are testing against a
 different cluster, run these commands from outside the repository and pass the
 target kubeconfig explicitly.
 
 ```bash
-export OPENSHELL_REPO=/path/to/OpenShell
+export RYNO_REPO=/path/to/Ryno
 export DEMO_KUBECONFIG=/path/to/your/kubeconfig
-export OPENSHELL_GATEWAY=local
+export RYNO_GATEWAY=local
 ```
 
 ## Deploy Workloads
@@ -80,11 +80,11 @@ From a directory outside the repository:
 
 ```bash
 ACCESS_TOKEN_SECRET="$(openssl rand -hex 32)"
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default create secret generic openshell-spiffe-token-exchange-demo \
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default create secret generic ryno-spiffe-token-exchange-demo \
   --from-literal=access-token-secret="$ACCESS_TOKEN_SECRET" \
   --dry-run=client \
   -o yaml | KUBECONFIG="$DEMO_KUBECONFIG" kubectl apply -f -
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl apply -k "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/k8s"
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl apply -k "$RYNO_REPO/examples/spiffe-token-exchange-demo/k8s"
 KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default rollout restart deployment/token-exchange-issuer deployment/alpha-exchange deployment/beta-exchange
 KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default rollout status deployment/token-exchange-issuer --timeout=180s
 KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default rollout status deployment/alpha-exchange --timeout=180s
@@ -96,20 +96,20 @@ KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default rollout status deployment/beta-
 Port-forward the local gateway in one terminal:
 
 ```bash
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl port-forward -n openshell svc/openshell 8097:8080
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl port-forward -n ryno svc/ryno 8097:8080
 ```
 
 Copy the Helm-generated TLS client bundle into the CLI config used for this
-demo. This uses the same gateway name as `OPENSHELL_GATEWAY`.
+demo. This uses the same gateway name as `RYNO_GATEWAY`.
 
 ```bash
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateways/${OPENSHELL_GATEWAY}/mtls"
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.ca\.crt}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateways/${OPENSHELL_GATEWAY}/mtls/ca.crt"
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.tls\.crt}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateways/${OPENSHELL_GATEWAY}/mtls/tls.crt"
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n openshell get secret openshell-client-tls \
-  -o jsonpath='{.data.tls\.key}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateways/${OPENSHELL_GATEWAY}/mtls/tls.key"
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/ryno/gateways/${RYNO_GATEWAY}/mtls"
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/ryno/gateways/${RYNO_GATEWAY}/mtls/ca.crt"
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/ryno/gateways/${RYNO_GATEWAY}/mtls/tls.crt"
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n ryno get secret ryno-client-tls \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > "${XDG_CONFIG_HOME:-$HOME/.config}/ryno/gateways/${RYNO_GATEWAY}/mtls/tls.key"
 ```
 
 Port-forward the token exchange issuer in another terminal and fetch a demo
@@ -128,27 +128,27 @@ Then run:
 ```bash
 export GATEWAY=https://127.0.0.1:8097
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" profile import \
-  -f "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/provider-profile.yaml"
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" profile import \
+  -f "$RYNO_REPO/examples/spiffe-token-exchange-demo/provider-profile.yaml"
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" provider create \
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" provider create \
   --name spiffe-token-exchange-demo \
   --type spiffe-token-exchange-demo \
   --credential "subject_token=${SUBJECT_TOKEN}"
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox create \
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox create \
   --name spiffe-token-exchange-demo \
   --provider spiffe-token-exchange-demo \
   --keep \
   --no-tty \
   -- echo "sandbox ready"
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox exec \
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox exec \
   --name spiffe-token-exchange-demo \
   --no-tty \
   -- curl -sS http://alpha-exchange.default.svc.cluster.local/
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox exec \
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox exec \
   --name spiffe-token-exchange-demo \
   --no-tty \
   -- curl -sS http://beta-exchange.default.svc.cluster.local/
@@ -162,15 +162,15 @@ alpha called with path /:
   sub: demo-user
   aud: alpha, account
   scope: alpha profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-  client_id: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
+  client_id: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
 
 beta called with path /:
   sub: demo-user
   aud: beta, account
   scope: beta profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-  client_id: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
+  client_id: spiffe://ryno.local/ryno/sandbox/<sandbox-id>
 ```
 
 The token issuer logs both token exchange phases:
@@ -182,25 +182,25 @@ KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default logs deployment/token-exchange-
 Example log lines:
 
 ```text
-issued intermediate token for user=demo-user audience=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-issued final token for user=demo-user audience=alpha client=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-issued final token for user=demo-user audience=beta client=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+issued intermediate token for user=demo-user audience=spiffe://ryno.local/ryno/sandbox/<sandbox-id>
+issued final token for user=demo-user audience=alpha client=spiffe://ryno.local/ryno/sandbox/<sandbox-id>
+issued final token for user=demo-user audience=beta client=spiffe://ryno.local/ryno/sandbox/<sandbox-id>
 ```
 
 ## Automated Demo
 
 `demo.sh` applies the workloads, fetches a demo subject token, registers the
 provider profile, creates a sandbox, curls alpha/beta, and deletes the sandbox
-with `openshell` on exit. It leaves the Kubernetes demo workloads in place and
+with `ryno` on exit. It leaves the Kubernetes demo workloads in place and
 prints diagnostics only when the run fails.
 
 ```bash
 cd /tmp
-KUBECONFIG="$DEMO_KUBECONFIG" bash "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/demo.sh"
+KUBECONFIG="$DEMO_KUBECONFIG" bash "$RYNO_REPO/examples/spiffe-token-exchange-demo/demo.sh"
 ```
 
-The script reuses your normal OpenShell CLI config so it can load the stored
-OIDC token for `OPENSHELL_GATEWAY`. If you set `ISOLATED_CONFIG=1`, register
+The script reuses your normal Ryno CLI config so it can load the stored
+OIDC token for `RYNO_GATEWAY`. If you set `ISOLATED_CONFIG=1`, register
 and log in to the gateway in that isolated config before running the demo.
 
 ## Podman Demo
@@ -215,14 +215,14 @@ usage.
 
 ## Cleanup
 
-Delete the sandbox through OpenShell:
+Delete the sandbox through Ryno:
 
 ```bash
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox delete spiffe-token-exchange-demo
+ryno --gateway "$RYNO_GATEWAY" --gateway-endpoint "$GATEWAY" sandbox delete spiffe-token-exchange-demo
 ```
 
 Delete the demo workloads with Kubernetes:
 
 ```bash
-KUBECONFIG="$DEMO_KUBECONFIG" kubectl delete -k "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/k8s"
+KUBECONFIG="$DEMO_KUBECONFIG" kubectl delete -k "$RYNO_REPO/examples/spiffe-token-exchange-demo/k8s"
 ```

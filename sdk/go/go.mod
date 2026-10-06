@@ -1,4 +1,4 @@
-module github.com/NVIDIA/OpenShell/sdk/go
+module github.com/NVIDIA/Ryno/sdk/go
 
 go 1.25.13
 

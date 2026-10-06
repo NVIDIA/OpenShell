@@ -10,8 +10,8 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::container::ContainerHttpServer;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ContainerHttpServer;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
 async fn start_test_server(alias: &str) -> Result<ContainerHttpServer, String> {
@@ -96,7 +96,7 @@ network_policies:
 /// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
 async fn forward_proxy_allows_l7_permitted_request() {
-    let server = start_test_server("rest-l7-allow.openshell.test")
+    let server = start_test_server("rest-l7-allow.ryno.test")
         .await
         .expect("start test server");
     let policy =
@@ -148,7 +148,7 @@ print(json.dumps(last))
 /// POST /allowed should be denied — the L7 policy only allows GET.
 #[tokio::test]
 async fn forward_proxy_denies_l7_blocked_request() {
-    let server = start_test_server("rest-l7-deny.openshell.test")
+    let server = start_test_server("rest-l7-deny.ryno.test")
         .await
         .expect("start test server");
     let policy =

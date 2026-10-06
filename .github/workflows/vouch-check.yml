@@ -89,18 +89,18 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
               body: [
-                `Thank you for your interest in contributing to OpenShell, @${author}.`,
+                `Thank you for your interest in contributing to Ryno, @${author}.`,
                 '',
                 'This project uses a **vouch system** for first-time contributors. Before submitting a pull request, you need to be vouched by a maintainer.',
                 '',
                 '**To get vouched:**',
-                '1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.',
+                '1. Open a [Vouch Request](https://github.com/NVIDIA/Ryno/discussions/new?category=vouch-request) discussion.',
                 '2. Describe what you want to change and why.',
                 '3. Write in your own words — do not have an AI generate the request.',
                 '4. A maintainer will comment `/vouch` if approved.',
                 '5. Once vouched, open a new PR (preferred) or reopen this one after a few minutes.',
                 '',
-                'See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#first-time-contributors) for details.',
+                'See [CONTRIBUTING.md](https://github.com/NVIDIA/Ryno/blob/main/CONTRIBUTING.md#first-time-contributors) for details.',
               ].join('\n'),
             });
 

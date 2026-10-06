@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import openshell_pb2
+from ryno._proto import ryno_pb2
 
 if TYPE_CHECKING:
-    from openshell import WorkspaceClient
+    from ryno import WorkspaceClient
 
 
 def test_workspace_crud(workspace_client: WorkspaceClient) -> None:
@@ -88,14 +88,14 @@ def test_workspace_request_ids_are_scoped_to_each_target(
     originals = []
     try:
         for name in names:
-            request = openshell_pb2.CreateWorkspaceRequest(
+            request = ryno_pb2.CreateWorkspaceRequest(
                 name=name, request_id=create_id
             )
             response, call = stub.CreateWorkspace.with_call(request, timeout=20)
-            assert "openshell-replayed" not in dict(call.initial_metadata())
+            assert "ryno-replayed" not in dict(call.initial_metadata())
             assert response.workspace.metadata.name == name
             fetched = stub.GetWorkspace(
-                openshell_pb2.GetWorkspaceRequest(name=name), timeout=20
+                ryno_pb2.GetWorkspaceRequest(name=name), timeout=20
             )
             assert fetched.workspace.metadata.id == response.workspace.metadata.id
             originals.append(response)
@@ -103,30 +103,30 @@ def test_workspace_request_ids_are_scoped_to_each_target(
 
         for name, original in zip(names, originals, strict=True):
             replay, call = stub.CreateWorkspace.with_call(
-                openshell_pb2.CreateWorkspaceRequest(name=name, request_id=create_id),
+                ryno_pb2.CreateWorkspaceRequest(name=name, request_id=create_id),
                 timeout=20,
             )
             assert replay == original
-            assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+            assert dict(call.initial_metadata())["ryno-replayed"] == "true"
 
         for name in names:
-            request = openshell_pb2.DeleteWorkspaceRequest(
+            request = ryno_pb2.DeleteWorkspaceRequest(
                 name=name, request_id=delete_id
             )
             response, call = stub.DeleteWorkspace.with_call(request, timeout=20)
-            assert "openshell-replayed" not in dict(call.initial_metadata())
-            assert response.outcome == openshell_pb2.DELETION_OUTCOME_COMPLETED
+            assert "ryno-replayed" not in dict(call.initial_metadata())
+            assert response.outcome == ryno_pb2.DELETION_OUTCOME_COMPLETED
             with pytest.raises(grpc.RpcError) as exc_info:
                 workspace_client.get(name)
             assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
 
         for name in names:
             replay, call = stub.DeleteWorkspace.with_call(
-                openshell_pb2.DeleteWorkspaceRequest(name=name, request_id=delete_id),
+                ryno_pb2.DeleteWorkspaceRequest(name=name, request_id=delete_id),
                 timeout=20,
             )
-            assert replay.outcome == openshell_pb2.DELETION_OUTCOME_COMPLETED
-            assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+            assert replay.outcome == ryno_pb2.DELETION_OUTCOME_COMPLETED
+            assert dict(call.initial_metadata())["ryno-replayed"] == "true"
     finally:
         for name in names:
             with contextlib.suppress(Exception):
@@ -139,19 +139,19 @@ def test_workspace_request_id_replays_without_deleting_replacement(
     name = f"ws-replay-{uuid.uuid4().hex[:8]}"
     # Exercise the generated wire fields before curated request-ID helpers land.
     stub = workspace_client._stub
-    create = openshell_pb2.CreateWorkspaceRequest(
+    create = ryno_pb2.CreateWorkspaceRequest(
         name=name, request_id=str(uuid.uuid4())
     )
-    delete = openshell_pb2.DeleteWorkspaceRequest(
+    delete = ryno_pb2.DeleteWorkspaceRequest(
         name=name, request_id=str(uuid.uuid4())
     )
     try:
         original = stub.CreateWorkspace(create, timeout=20)
         replay, call = stub.CreateWorkspace.with_call(create, timeout=20)
         assert original == replay
-        assert dict(call.initial_metadata())["openshell-replayed"] == "true"
+        assert dict(call.initial_metadata())["ryno-replayed"] == "true"
 
-        mismatch = openshell_pb2.CreateWorkspaceRequest(
+        mismatch = ryno_pb2.CreateWorkspaceRequest(
             name=name, request_id=create.request_id, labels={"changed": "true"}
         )
         with pytest.raises(grpc.RpcError) as exc_info:
@@ -160,12 +160,12 @@ def test_workspace_request_id_replays_without_deleting_replacement(
 
         removed = stub.DeleteWorkspace(delete, timeout=20)
         replacement = stub.CreateWorkspace(
-            openshell_pb2.CreateWorkspaceRequest(name=name), timeout=20
+            ryno_pb2.CreateWorkspaceRequest(name=name), timeout=20
         )
         assert replacement.workspace.metadata.id != original.workspace.metadata.id
         assert stub.DeleteWorkspace(delete, timeout=20) == removed
         fetched = stub.GetWorkspace(
-            openshell_pb2.GetWorkspaceRequest(name=name), timeout=20
+            ryno_pb2.GetWorkspaceRequest(name=name), timeout=20
         )
         assert fetched.workspace.metadata.id == replacement.workspace.metadata.id
     finally:

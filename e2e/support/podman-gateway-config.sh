@@ -47,7 +47,7 @@ e2e_write_podman_gateway_config() {
 
   configured_with_tls="${output}.tls"
   while IFS= read -r line; do
-    if [ "${line}" = "[openshell.drivers.podman]" ]; then
+    if [ "${line}" = "[ryno.drivers.podman]" ]; then
       printf 'guest_tls_ca = %s\n' "$(e2e_podman_toml_string "${pki_dir}/ca.crt")"
     fi
     printf '%s\n' "${line}"
@@ -73,7 +73,7 @@ e2e_write_podman_gateway_config() {
       if [ -n "${podman_socket}" ]; then
         printf 'socket_path = %s\n' "$(e2e_podman_toml_string "${podman_socket}")"
       fi
-      printf '\n[openshell.drivers.podman.resource_admission]\n'
+      printf '\n[ryno.drivers.podman.resource_admission]\n'
       printf 'enabled = false\n'
     fi
     e2e_write_gateway_jwt_config "${jwt_dir}" "${gateway_id}"

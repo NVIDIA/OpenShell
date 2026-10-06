@@ -8,10 +8,10 @@ use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
 
-use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
-use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
+use ryno_e2e::harness::binary::{ryno_cmd, ryno_tty_cmd};
+use ryno_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use ryno_e2e::harness::output::{extract_field, strip_ansi};
+use ryno_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
 use serial_test::serial;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Instant, sleep};
@@ -50,13 +50,13 @@ async fn sandbox_list_names(deadline: Instant) -> Option<Vec<String>> {
         return None;
     }
 
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", "list", "--names"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let output = match tokio::time::timeout_at(deadline, cmd.output()).await {
-        Ok(output) => output.expect("spawn openshell sandbox list"),
+        Ok(output) => output.expect("spawn ryno sandbox list"),
         Err(_) => return None,
     };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -105,7 +105,7 @@ async fn assert_sandbox_presence_eventually(
 }
 
 async fn delete_sandbox(name: &str) {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", "delete", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -148,7 +148,7 @@ async fn sandbox_exec_large_output_is_complete() {
         } else {
             format!("yes A | head -c {BYTES}")
         };
-        let mut command = openshell_cmd();
+        let mut command = ryno_cmd();
         command
             .args([
                 "sandbox",
@@ -175,7 +175,7 @@ async fn sandbox_exec_large_output_is_complete() {
         assert!(bytes.chunks_exact(2).all(|pair| pair == b"A\n"));
     }
 
-    let mut early_exit = openshell_cmd();
+    let mut early_exit = ryno_cmd();
     let mut early_child = early_exit
         .args([
             "sandbox",
@@ -212,7 +212,7 @@ async fn sandbox_exec_large_output_is_complete() {
     assert!(early_output.status.success(), "early-exit exec failed");
     assert_eq!(early_output.stdout, b"first\n");
 
-    let mut command = openshell_cmd();
+    let mut command = ryno_cmd();
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         command
@@ -248,7 +248,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
         .expect("create sandbox for streamed stdin");
 
     for size in [5, 1_048_576, 4_194_304] {
-        let mut command = openshell_cmd();
+        let mut command = ryno_cmd();
         command
             .args([
                 "sandbox",
@@ -286,7 +286,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
         );
     }
 
-    let mut oversized = openshell_cmd();
+    let mut oversized = ryno_cmd();
     let mut oversized_child = oversized
         .args([
             "sandbox",
@@ -321,7 +321,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
 
     // A forced PTY with a small pipe must keep using the unary RPC for
     // compatibility with older gateways.
-    let mut tty_command = openshell_cmd();
+    let mut tty_command = ryno_cmd();
     let mut tty_child = tty_command
         .args([
             "sandbox",
@@ -361,7 +361,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
     #[cfg(unix)]
     {
         let directory = std::fs::File::open("/").expect("open directory as stdin");
-        let mut command = openshell_cmd();
+        let mut command = ryno_cmd();
         let output = command
             .args([
                 "sandbox",
@@ -386,7 +386,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
 }
 
 async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", operation, name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -394,7 +394,7 @@ async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     let output = cmd
         .output()
         .await
-        .unwrap_or_else(|error| panic!("spawn openshell sandbox {operation}: {error}"));
+        .unwrap_or_else(|error| panic!("spawn ryno sandbox {operation}: {error}"));
     let combined = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -427,7 +427,7 @@ async fn reconnect_with_input_ownership(
     loop {
         attempt += 1;
         let token = format!("reconnect-{attempt}");
-        let mut reconnect_cmd = openshell_cmd();
+        let mut reconnect_cmd = ryno_cmd();
         reconnect_cmd
             .args(["sandbox", "connect", sandbox_name])
             .stdin(Stdio::piped())
@@ -548,9 +548,9 @@ async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
 async fn sandbox_stop_start_preserves_workspace() {
-    const SENTINEL: &str = "openshell-stop-start-sentinel";
-    const SENTINEL_PATH: &str = "/sandbox/.openshell-stop-start-e2e";
-    const RUN_COUNT_PATH: &str = "/sandbox/.openshell-main-run-count";
+    const SENTINEL: &str = "ryno-stop-start-sentinel";
+    const SENTINEL_PATH: &str = "/sandbox/.ryno-stop-start-e2e";
+    const RUN_COUNT_PATH: &str = "/sandbox/.ryno-main-run-count";
     let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
     let main = format!(
         "count=0; test ! -f '{RUN_COUNT_PATH}' || count=$(cat '{RUN_COUNT_PATH}'); \
@@ -572,7 +572,7 @@ async fn sandbox_stop_start_preserves_workspace() {
         "expected stop confirmation in:\n{stop_output}",
     );
 
-    let mut exec_cmd = openshell_cmd();
+    let mut exec_cmd = ryno_cmd();
     exec_cmd
         .args([
             "sandbox",
@@ -589,7 +589,7 @@ async fn sandbox_stop_start_preserves_workspace() {
     let stopped_exec = exec_cmd
         .output()
         .await
-        .expect("spawn openshell sandbox exec while stopped");
+        .expect("spawn ryno sandbox exec while stopped");
     assert!(
         !stopped_exec.status.success(),
         "sandbox exec should fail while stopped"
@@ -671,7 +671,7 @@ async fn canonical_main_exit_zero_completes_persistent_sandbox() {
     let sandbox_name = unique_sandbox_name();
     let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
 
-    let mut cmd = openshell_tty_cmd(&[
+    let mut cmd = ryno_tty_cmd(&[
         "sandbox",
         "create",
         "--name",
@@ -682,7 +682,7 @@ async fn canonical_main_exit_zero_completes_persistent_sandbox() {
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let output = cmd.output().await.expect("spawn ryno sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -700,12 +700,12 @@ async fn canonical_main_exit_zero_completes_persistent_sandbox() {
         );
     }
 
-    let mut get_cmd = openshell_cmd();
+    let mut get_cmd = ryno_cmd();
     get_cmd
         .args(["sandbox", "get", &sandbox_name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let get_output = get_cmd.output().await.expect("spawn ryno sandbox get");
     let details = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&get_output.stdout),
@@ -728,7 +728,7 @@ async fn canonical_main_nonzero_exit_preserves_status() {
     let sandbox_name = unique_sandbox_name();
     let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
 
-    let mut cmd = openshell_tty_cmd(&[
+    let mut cmd = ryno_tty_cmd(&[
         "sandbox",
         "create",
         "--name",
@@ -740,7 +740,7 @@ async fn canonical_main_nonzero_exit_preserves_status() {
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let output = cmd.output().await.expect("spawn ryno sandbox create");
     let combined = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -756,12 +756,12 @@ async fn canonical_main_nonzero_exit_preserves_status() {
         "main output was not streamed:\n{combined}"
     );
 
-    let mut get_cmd = openshell_cmd();
+    let mut get_cmd = ryno_cmd();
     get_cmd
         .args(["sandbox", "get", &sandbox_name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let get_output = get_cmd.output().await.expect("spawn ryno sandbox get");
     let details = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&get_output.stdout),
@@ -780,7 +780,7 @@ async fn canonical_main_nonzero_exit_preserves_status() {
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
 async fn detached_canonical_main_exit_zero_reaches_completed() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-success-release";
+    const RELEASE_PATH: &str = "/sandbox/.ryno-detached-success-release";
     let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 0");
     let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
         .await
@@ -805,7 +805,7 @@ async fn detached_canonical_main_exit_zero_reaches_completed() {
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
 async fn detached_canonical_main_nonzero_exit_reaches_error() {
-    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-failure-release";
+    const RELEASE_PATH: &str = "/sandbox/.ryno-detached-failure-release";
     let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 11");
     let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
         .await
@@ -877,12 +877,12 @@ async fn detached_main_exit_during_provisioning_is_classified_as_workload_result
         .await
         .unwrap_or_else(|err| panic!("fast detached main did not reach Error:\n{err}"));
 
-    let mut get_cmd = openshell_cmd();
+    let mut get_cmd = ryno_cmd();
     get_cmd
         .args(["sandbox", "get", &sandbox.name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let get_output = get_cmd.output().await.expect("spawn ryno sandbox get");
     let details = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&get_output.stdout),
@@ -946,7 +946,7 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
         .await
         .expect("create retained canonical main process");
 
-    let mut owner_cmd = openshell_cmd();
+    let mut owner_cmd = ryno_cmd();
     owner_cmd
         .args(["sandbox", "connect", &sandbox.name])
         .stdin(Stdio::piped())
@@ -965,7 +965,7 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
         "unexpected owner output: {owner_line}"
     );
 
-    let mut observer_cmd = openshell_cmd();
+    let mut observer_cmd = ryno_cmd();
     observer_cmd
         .args(["sandbox", "connect", &sandbox.name])
         .stdin(Stdio::piped())
@@ -1075,7 +1075,7 @@ async fn canonical_main_connect_recovers_its_ssh_transport() {
         .await
         .expect("create retained canonical main process");
 
-    let mut connect_cmd = openshell_cmd();
+    let mut connect_cmd = ryno_cmd();
     connect_cmd
         .args(["sandbox", "connect", &sandbox.name])
         .stdin(Stdio::piped())
@@ -1181,7 +1181,7 @@ async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh(
     let controller: OwnedFd = pty.master;
     let follower: OwnedFd = pty.slave;
 
-    let mut connect_cmd = openshell_cmd();
+    let mut connect_cmd = ryno_cmd();
     connect_cmd
         .args(["sandbox", "connect", &sandbox.name])
         .stdin(
@@ -1208,7 +1208,7 @@ async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh(
     let ssh_pid = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(pid) =
-                find_child_process_with_args(connect_pid, &["-s", "sandbox", "openshell-main"])
+                find_child_process_with_args(connect_pid, &["-s", "sandbox", "ryno-main"])
             {
                 return pid;
             }
@@ -1222,12 +1222,12 @@ async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh(
         nix::unistd::Pid::from_raw(i32::try_from(connect_pid).expect("connect PID fits i32")),
         nix::sys::signal::Signal::SIGTERM,
     )
-    .expect("send SIGTERM to only the OpenShell parent");
+    .expect("send SIGTERM to only the Ryno parent");
 
     let status = tokio::time::timeout(Duration::from_secs(10), connect.wait())
         .await
-        .expect("OpenShell parent did not terminate")
-        .expect("wait for OpenShell parent");
+        .expect("Ryno parent did not terminate")
+        .expect("wait for Ryno parent");
     assert_eq!(status.code(), Some(143));
     tokio::time::timeout(Duration::from_secs(5), async {
         while fs::metadata(format!("/proc/{ssh_pid}")).is_ok() {
@@ -1245,7 +1245,7 @@ async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh(
 #[serial(sandbox_lifecycle)]
 async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
     const READY_MARKER: &str = "exit-255-ready";
-    const RELEASE_PATH: &str = "/sandbox/.openshell-exit-255-release";
+    const RELEASE_PATH: &str = "/sandbox/.ryno-exit-255-release";
     let script = format!(
         "echo {READY_MARKER}; while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 255"
     );
@@ -1253,7 +1253,7 @@ async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
         .await
         .expect("create retained canonical main process");
 
-    let mut connect_cmd = openshell_cmd();
+    let mut connect_cmd = ryno_cmd();
     connect_cmd
         .args(["sandbox", "connect", &sandbox.name])
         .stdin(Stdio::null())
@@ -1302,7 +1302,7 @@ async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
 async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
     const FIRST_MARKER: &str = "initial-main-ready";
     const SCRIPT: &str = r#"
-marker=/sandbox/.openshell-restart-e2e
+marker=/sandbox/.ryno-restart-e2e
 if [ -e "$marker" ]; then
   printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
   printf 'replacement-main-ready\n'
@@ -1374,7 +1374,7 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
             loop {
                 let containers = tokio::process::Command::new("docker")
                     .args(["ps", "--all", "--quiet", "--filter"])
-                    .arg(format!("label=openshell.ai/sandbox-name={log_name}"))
+                    .arg(format!("label=ryno.ai/sandbox-name={log_name}"))
                     .kill_on_drop(true)
                     .output()
                     .await
@@ -1403,7 +1403,7 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
         .ok()
         .flatten()
     });
-    let mut cmd = openshell_tty_cmd(&[
+    let mut cmd = ryno_tty_cmd(&[
         "sandbox",
         "create",
         "--name",
@@ -1415,7 +1415,7 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let output = cmd.output().await.expect("spawn ryno sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -1450,7 +1450,7 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
 async fn sandbox_create_with_no_keep_preserves_failure_then_cleans_up() {
-    let mut cmd = openshell_tty_cmd(&[
+    let mut cmd = ryno_tty_cmd(&[
         "sandbox",
         "create",
         "--no-keep",
@@ -1461,7 +1461,7 @@ async fn sandbox_create_with_no_keep_preserves_failure_then_cleans_up() {
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let output = cmd.output().await.expect("spawn ryno sandbox create");
     let combined = normalize_output(&format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

@@ -3,9 +3,9 @@
 
 use std::process::Stdio;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::{extract_field, strip_ansi};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -33,7 +33,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 }
 
 async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> String {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", "create", "--detach", "--name", name]);
 
     for (key, value) in labels {
@@ -42,7 +42,7 @@ async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> Stri
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let output = cmd.output().await.expect("spawn ryno sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -57,7 +57,7 @@ async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> Stri
 }
 
 async fn list_sandboxes_with_selector(selector: &str) -> Vec<String> {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", "list", "--names"]);
 
     if !selector.is_empty() {
@@ -66,7 +66,7 @@ async fn list_sandboxes_with_selector(selector: &str) -> Vec<String> {
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox list");
+    let output = cmd.output().await.expect("spawn ryno sandbox list");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -86,12 +86,12 @@ async fn list_sandboxes_with_selector(selector: &str) -> Vec<String> {
 }
 
 async fn get_sandbox_details(name: &str) -> String {
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["sandbox", "get", name])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox get");
+    let output = cmd.output().await.expect("spawn ryno sandbox get");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));

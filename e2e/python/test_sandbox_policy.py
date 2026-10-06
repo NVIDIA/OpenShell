@@ -15,12 +15,12 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from ryno._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox
+    from ryno import Sandbox
 
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(

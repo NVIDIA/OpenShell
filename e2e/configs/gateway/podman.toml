@@ -1,31 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 bind_address = "127.0.0.1:8080"
 log_level = "info"
 compute_driver = "podman"
 disable_tls = true
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
-signing_key_path = ".cache/openshell-e2e/gateway-jwt/signing.pem"
-public_key_path = ".cache/openshell-e2e/gateway-jwt/public.pem"
-kid_path = ".cache/openshell-e2e/gateway-jwt/kid"
-gateway_id = "openshell-e2e"
+[ryno.gateway.gateway_jwt]
+signing_key_path = ".cache/ryno-e2e/gateway-jwt/signing.pem"
+public_key_path = ".cache/ryno-e2e/gateway-jwt/public.pem"
+kid_path = ".cache/ryno-e2e/gateway-jwt/kid"
+gateway_id = "ryno-e2e"
 
-[openshell.drivers.podman]
+[ryno.drivers.podman]
 default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy = "if_not_present"
 health_check_interval_secs = 10
-network_name = "openshell-e2e"
+network_name = "ryno-e2e"
 grpc_endpoint = "http://host.containers.internal:8080"
-ssh_socket_path = "/run/openshell/ssh.sock"
-sandbox_runtime_image = "localhost/openshell/sandbox:e2e-vm"
-supervisor_image = "localhost/openshell/supervisor:e2e-vm"
+ssh_socket_path = "/run/ryno/ssh.sock"
+sandbox_runtime_image = "localhost/ryno/sandbox:e2e-vm"
+supervisor_image = "localhost/ryno/supervisor:e2e-vm"
 app_armor_profile = "Unconfined"

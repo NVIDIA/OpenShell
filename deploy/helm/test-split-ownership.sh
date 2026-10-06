@@ -8,21 +8,21 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 
-helm template openshell "${repo_root}/deploy/helm/openshell" \
-  --namespace openshell \
+helm template ryno "${repo_root}/deploy/helm/ryno" \
+  --namespace ryno \
   --set agentSandbox.preflight.enabled=false \
   --set workspaceResources.enabled=false \
   >"${work_dir}/gateway.yaml"
 
 if yq ea -e \
-  'select(.kind == "Role" and .metadata.name == "openshell-sandbox")' \
+  'select(.kind == "Role" and .metadata.name == "ryno-sandbox")' \
   "${work_dir}/gateway.yaml" >/dev/null 2>&1; then
   echo "gateway chart rendered workspace resources despite workspaceResources.enabled=false" >&2
   exit 1
 fi
 
-helm template openshell "${repo_root}/deploy/helm/openshell" \
-  --namespace openshell \
+helm template ryno "${repo_root}/deploy/helm/ryno" \
+  --namespace ryno \
   --set agentSandbox.preflight.enabled=false \
   --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set rbac.clusterScoped.create=false \
@@ -41,16 +41,16 @@ if [[ -n "${cluster_scoped_kinds}" ]]; then
 fi
 
 if ! yq ea -e \
-  'select(.kind == "ServiceAccount" and .metadata.name == "openshell")' \
+  'select(.kind == "ServiceAccount" and .metadata.name == "ryno")' \
   "${work_dir}/namespace-admin.yaml" >/dev/null 2>&1; then
   echo "gateway chart dropped the gateway ServiceAccount with rbac.clusterScoped.create=false" >&2
   exit 1
 fi
 
-helm template openshell-workspace "${repo_root}/deploy/helm/openshell-workspace" \
+helm template ryno-workspace "${repo_root}/deploy/helm/ryno-workspace" \
   --namespace app-a \
-  --set gateway.serviceAccount.name=openshell \
-  --set gateway.serviceAccount.namespace=openshell \
+  --set gateway.serviceAccount.name=ryno \
+  --set gateway.serviceAccount.namespace=ryno \
   >"${work_dir}/workspace.yaml"
 
 invalid_workspace_docs="$(
@@ -63,19 +63,19 @@ if [[ -n "${invalid_workspace_docs}" ]]; then
   exit 1
 fi
 
-helm template openshell "${repo_root}/deploy/helm/openshell" \
-  --namespace openshell \
+helm template ryno "${repo_root}/deploy/helm/ryno" \
+  --namespace ryno \
   --set agentSandbox.preflight.enabled=false \
   --set-json workspaceResources=null \
   >"${work_dir}/legacy-reuse-values.yaml"
 
 yq ea -e \
-  'select(.kind == "Role" and .metadata.name == "openshell-sandbox") |
+  'select(.kind == "Role" and .metadata.name == "ryno-sandbox") |
    .apiVersion == "rbac.authorization.k8s.io/v1"' \
   "${work_dir}/legacy-reuse-values.yaml" >/dev/null
 
 yq ea -N -r \
-  'select(.kind != null) | [.apiVersion, .kind, (.metadata.namespace // "openshell"), .metadata.name] | @tsv' \
+  'select(.kind != null) | [.apiVersion, .kind, (.metadata.namespace // "ryno"), .metadata.name] | @tsv' \
   "${work_dir}/gateway.yaml" | sort -u >"${work_dir}/gateway.objects"
 yq ea -N -r \
   'select(.kind != null) | [.apiVersion, .kind, (.metadata.namespace // "app-a"), .metadata.name] | @tsv' \

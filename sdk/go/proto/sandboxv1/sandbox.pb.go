@@ -10,7 +10,7 @@
 package sandboxv1
 
 import (
-	datamodelv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
+	datamodelv1 "github.com/NVIDIA/Ryno/sdk/go/proto/datamodelv1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
@@ -829,12 +829,12 @@ type NetworkEndpoint struct {
 	// "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
 	Protocol string `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
 	// TLS handling. Unspecified enables automatic detection and termination.
-	Tls NetworkTlsMode `protobuf:"varint,4,opt,name=tls,proto3,enum=openshell.sandbox.v1.NetworkTlsMode" json:"tls,omitempty"`
+	Tls NetworkTlsMode `protobuf:"varint,4,opt,name=tls,proto3,enum=ryno.sandbox.v1.NetworkTlsMode" json:"tls,omitempty"`
 	// Enforcement mode. Unspecified preserves the audit default.
-	Enforcement NetworkEnforcementMode `protobuf:"varint,5,opt,name=enforcement,proto3,enum=openshell.sandbox.v1.NetworkEnforcementMode" json:"enforcement,omitempty"`
+	Enforcement NetworkEnforcementMode `protobuf:"varint,5,opt,name=enforcement,proto3,enum=ryno.sandbox.v1.NetworkEnforcementMode" json:"enforcement,omitempty"`
 	// Access preset shorthand. Unspecified means no preset.
 	// Mutually exclusive with rules.
-	Access NetworkAccessPreset `protobuf:"varint,6,opt,name=access,proto3,enum=openshell.sandbox.v1.NetworkAccessPreset" json:"access,omitempty"`
+	Access NetworkAccessPreset `protobuf:"varint,6,opt,name=access,proto3,enum=ryno.sandbox.v1.NetworkAccessPreset" json:"access,omitempty"`
 	// Explicit L7 rules (mutually exclusive with access).
 	Rules []*L7Rule `protobuf:"bytes,7,rep,name=rules,proto3" json:"rules,omitempty"`
 	// Allowed resolved IP addresses or CIDR ranges for this endpoint.
@@ -873,11 +873,11 @@ type NetworkEndpoint struct {
 	// protocol "rest" when both surfaces live under api.example.com:443.
 	// Empty means all paths.
 	Path string `protobuf:"bytes,15,opt,name=path,proto3" json:"path,omitempty"`
-	// When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+	// When true on a "rest" endpoint, Ryno rewrites credential placeholders
 	// inside client-to-server WebSocket text messages after an allowed HTTP 101
 	// upgrade. Defaults to false.
 	WebsocketCredentialRewrite bool `protobuf:"varint,16,opt,name=websocket_credential_rewrite,json=websocketCredentialRewrite,proto3" json:"websocket_credential_rewrite,omitempty"`
-	// When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+	// When true on a "rest" endpoint, Ryno rewrites credential placeholders
 	// inside supported textual HTTP request bodies before forwarding upstream.
 	// Defaults to false.
 	RequestBodyCredentialRewrite bool `protobuf:"varint,17,opt,name=request_body_credential_rewrite,json=requestBodyCredentialRewrite,proto3" json:"request_body_credential_rewrite,omitempty"`
@@ -904,7 +904,7 @@ type NetworkEndpoint struct {
 	// endpointless provider profile. Profiles that already define endpoints
 	// continue to use those profile endpoints as their credential boundary.
 	CredentialBinding *NetworkCredentialBinding `protobuf:"bytes,24,opt,name=credential_binding,json=credentialBinding,proto3" json:"credential_binding,omitempty"`
-	// Explicitly permits credential-bearing traffic to use paths that OpenShell
+	// Explicitly permits credential-bearing traffic to use paths that Ryno
 	// cannot inspect or rewrite. Defaults to false. This is a security-sensitive
 	// escape hatch and must be explicitly approved.
 	AllowUninspectedCredentials bool `protobuf:"varint,25,opt,name=allow_uninspected_credentials,json=allowUninspectedCredentials,proto3" json:"allow_uninspected_credentials,omitempty"`
@@ -1128,7 +1128,7 @@ func (x *NetworkEndpoint) GetProviderCredentialed() bool {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// top-level NetworkEndpoint fields. Ryno owns the supported revision
 // profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
@@ -1145,14 +1145,14 @@ type McpOptions struct {
 	// Source:
 	// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
 	StrictToolNames *bool `protobuf:"varint,1,opt,name=strict_tool_names,json=strictToolNames,proto3,oneof" json:"strict_tool_names,omitempty"`
-	// Method-layer default for MCP endpoints. When true, OpenShell allows parsed
+	// Method-layer default for MCP endpoints. When true, Ryno allows parsed
 	// MCP-family methods at the method layer unless a tool-name policy narrows
 	// tools/call. When unset or false, explicit method rules are required.
 	AllowAllKnownMcpMethods *bool `protobuf:"varint,2,opt,name=allow_all_known_mcp_methods,json=allowAllKnownMcpMethods,proto3,oneof" json:"allow_all_known_mcp_methods,omitempty"`
 	// Exact MCP protocol revisions accepted by the endpoint's policy schema.
 	// Authors may omit this field. Because proto3 repeated fields do not retain
 	// presence, omission reaches protobuf ingress as an empty list. Checked
-	// normalization materializes OpenShell's pinned default revision
+	// normalization materializes Ryno's pinned default revision
 	// "2025-11-25" before producing canonical downstream state, which is always
 	// nonempty.
 	//
@@ -1921,7 +1921,7 @@ func (*SettingValue_BytesValue) isSettingValue_Value() {}
 type EffectiveSetting struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Value         *SettingValue          `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
-	Scope         SettingScope           `protobuf:"varint,2,opt,name=scope,proto3,enum=openshell.sandbox.v1.SettingScope" json:"scope,omitempty"`
+	Scope         SettingScope           `protobuf:"varint,2,opt,name=scope,proto3,enum=ryno.sandbox.v1.SettingScope" json:"scope,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1985,7 +1985,7 @@ type GetSandboxConfigResponse struct {
 	// Fingerprint for effective config (policy + settings). Changes when any effective input changes.
 	ConfigRevision uint64 `protobuf:"varint,5,opt,name=config_revision,json=configRevision,proto3" json:"config_revision,omitempty"`
 	// Source of the policy payload for this response.
-	PolicySource PolicySource `protobuf:"varint,6,opt,name=policy_source,json=policySource,proto3,enum=openshell.sandbox.v1.PolicySource" json:"policy_source,omitempty"`
+	PolicySource PolicySource `protobuf:"varint,6,opt,name=policy_source,json=policySource,proto3,enum=ryno.sandbox.v1.PolicySource" json:"policy_source,omitempty"`
 	// When policy_source is GLOBAL, the version of the global policy revision.
 	// Zero when no global policy is active or when policy_source is SANDBOX.
 	GlobalPolicyVersion uint32 `protobuf:"varint,7,opt,name=global_policy_version,json=globalPolicyVersion,proto3" json:"global_policy_version,omitempty"`
@@ -2184,7 +2184,7 @@ type SupervisorMiddlewareService struct {
 	// name before sending sandbox config.
 	Audience string `protobuf:"bytes,6,opt,name=audience,proto3" json:"audience,omitempty"`
 	// Operator opt-out from extension authentication for this registration.
-	// When true the service may use a plaintext endpoint and OpenShell attaches
+	// When true the service may use a plaintext endpoint and Ryno attaches
 	// no bearer credential; supervisors must not request one. Intended only for
 	// trusted-network development deployments.
 	AllowInsecureTransport bool `protobuf:"varint,7,opt,name=allow_insecure_transport,json=allowInsecureTransport,proto3" json:"allow_insecure_transport,omitempty"`
@@ -2275,22 +2275,22 @@ var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
 	"\n" +
-	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x0fdatamodel.proto\"\xa8\x05\n" +
+	"\rsandbox.proto\x12\x0fryno.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x0fdatamodel.proto\"\x85\x05\n" +
 	"\rSandboxPolicy\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\rR\aversion\x12F\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12A\n" +
 	"\n" +
-	"filesystem\x18\x02 \x01(\v2&.openshell.sandbox.v1.FilesystemPolicyR\n" +
-	"filesystem\x12@\n" +
-	"\blandlock\x18\x03 \x01(\v2$.openshell.sandbox.v1.LandlockPolicyR\blandlock\x12=\n" +
-	"\aprocess\x18\x04 \x01(\v2#.openshell.sandbox.v1.ProcessPolicyR\aprocess\x12c\n" +
-	"\x10network_policies\x18\x05 \x03(\v28.openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntryR\x0fnetworkPolicies\x12l\n" +
-	"\x13network_middlewares\x18\x06 \x03(\v2;.openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntryR\x12networkMiddlewares\x1ak\n" +
+	"filesystem\x18\x02 \x01(\v2!.ryno.sandbox.v1.FilesystemPolicyR\n" +
+	"filesystem\x12;\n" +
+	"\blandlock\x18\x03 \x01(\v2\x1f.ryno.sandbox.v1.LandlockPolicyR\blandlock\x128\n" +
+	"\aprocess\x18\x04 \x01(\v2\x1e.ryno.sandbox.v1.ProcessPolicyR\aprocess\x12^\n" +
+	"\x10network_policies\x18\x05 \x03(\v23.ryno.sandbox.v1.SandboxPolicy.NetworkPoliciesEntryR\x0fnetworkPolicies\x12g\n" +
+	"\x13network_middlewares\x18\x06 \x03(\v26.ryno.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntryR\x12networkMiddlewares\x1af\n" +
 	"\x14NetworkPoliciesEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12=\n" +
-	"\x05value\x18\x02 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\x05value:\x028\x01\x1at\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x128\n" +
+	"\x05value\x18\x02 \x01(\v2\".ryno.sandbox.v1.NetworkPolicyRuleR\x05value:\x028\x01\x1ao\n" +
 	"\x17NetworkMiddlewaresEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12C\n" +
-	"\x05value\x18\x02 \x01(\v2-.openshell.sandbox.v1.NetworkMiddlewareConfigR\x05value:\x028\x01\"w\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12>\n" +
+	"\x05value\x18\x02 \x01(\v2(.ryno.sandbox.v1.NetworkMiddlewareConfigR\x05value:\x028\x01\"w\n" +
 	"\x10FilesystemPolicy\x12'\n" +
 	"\x0finclude_workdir\x18\x01 \x01(\bR\x0eincludeWorkdir\x12\x1b\n" +
 	"\tread_only\x18\x02 \x03(\tR\breadOnly\x12\x1d\n" +
@@ -2301,42 +2301,42 @@ const file_sandbox_proto_rawDesc = "" +
 	"\rProcessPolicy\x12\x1e\n" +
 	"\vrun_as_user\x18\x01 \x01(\tR\trunAsUser\x12 \n" +
 	"\frun_as_group\x18\x02 \x01(\tR\n" +
-	"runAsGroup\"\xad\x01\n" +
+	"runAsGroup\"\xa3\x01\n" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
-	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +
-	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xff\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12>\n" +
+	"\tendpoints\x18\x02 \x03(\v2 .ryno.sandbox.v1.NetworkEndpointR\tendpoints\x12:\n" +
+	"\bbinaries\x18\x03 \x03(\v2\x1e.ryno.sandbox.v1.NetworkBinaryR\bbinaries\"\xfa\x01\n" +
 	"\x17NetworkMiddlewareConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1e\n" +
 	"\n" +
 	"middleware\x18\x02 \x01(\tR\n" +
 	"middleware\x12/\n" +
 	"\x06config\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x06config\x12\x19\n" +
-	"\bon_error\x18\x04 \x01(\tR\aonError\x12N\n" +
-	"\tendpoints\x18\x05 \x01(\v20.openshell.sandbox.v1.MiddlewareEndpointSelectorR\tendpoints\x12\x14\n" +
+	"\bon_error\x18\x04 \x01(\tR\aonError\x12I\n" +
+	"\tendpoints\x18\x05 \x01(\v2+.ryno.sandbox.v1.MiddlewareEndpointSelectorR\tendpoints\x12\x14\n" +
 	"\x05order\x18\x06 \x01(\x05R\x05order\"P\n" +
 	"\x1aMiddlewareEndpointSelector\x12\x18\n" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
 	"\x18NetworkCredentialBinding\x12\x1a\n" +
-	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xdb\v\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xae\v\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
-	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x126\n" +
-	"\x03tls\x18\x04 \x01(\x0e2$.openshell.sandbox.v1.NetworkTlsModeR\x03tls\x12N\n" +
-	"\venforcement\x18\x05 \x01(\x0e2,.openshell.sandbox.v1.NetworkEnforcementModeR\venforcement\x12A\n" +
-	"\x06access\x18\x06 \x01(\x0e2).openshell.sandbox.v1.NetworkAccessPresetR\x06access\x122\n" +
-	"\x05rules\x18\a \x03(\v2\x1c.openshell.sandbox.v1.L7RuleR\x05rules\x12\x1f\n" +
+	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x121\n" +
+	"\x03tls\x18\x04 \x01(\x0e2\x1f.ryno.sandbox.v1.NetworkTlsModeR\x03tls\x12I\n" +
+	"\venforcement\x18\x05 \x01(\x0e2'.ryno.sandbox.v1.NetworkEnforcementModeR\venforcement\x12<\n" +
+	"\x06access\x18\x06 \x01(\x0e2$.ryno.sandbox.v1.NetworkAccessPresetR\x06access\x12-\n" +
+	"\x05rules\x18\a \x03(\v2\x17.ryno.sandbox.v1.L7RuleR\x05rules\x12\x1f\n" +
 	"\vallowed_ips\x18\b \x03(\tR\n" +
 	"allowedIps\x12\x14\n" +
-	"\x05ports\x18\t \x03(\rR\x05ports\x12?\n" +
+	"\x05ports\x18\t \x03(\rR\x05ports\x12:\n" +
 	"\n" +
 	"deny_rules\x18\n" +
-	" \x03(\v2 .openshell.sandbox.v1.L7DenyRuleR\tdenyRules\x12.\n" +
+	" \x03(\v2\x1b.ryno.sandbox.v1.L7DenyRuleR\tdenyRules\x12.\n" +
 	"\x13allow_encoded_slash\x18\v \x01(\bR\x11allowEncodedSlash\x12+\n" +
-	"\x11persisted_queries\x18\f \x01(\tR\x10persistedQueries\x12~\n" +
-	"\x19graphql_persisted_queries\x18\r \x03(\v2B.openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntryR\x17graphqlPersistedQueries\x123\n" +
+	"\x11persisted_queries\x18\f \x01(\tR\x10persistedQueries\x12y\n" +
+	"\x19graphql_persisted_queries\x18\r \x03(\v2=.ryno.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntryR\x17graphqlPersistedQueries\x123\n" +
 	"\x16graphql_max_body_bytes\x18\x0e \x01(\rR\x13graphqlMaxBodyBytes\x12\x12\n" +
 	"\x04path\x18\x0f \x01(\tR\x04path\x12@\n" +
 	"\x1cwebsocket_credential_rewrite\x18\x10 \x01(\bR\x1awebsocketCredentialRewrite\x12E\n" +
@@ -2345,14 +2345,14 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x12credential_signing\x18\x13 \x01(\tR\x11credentialSigning\x12'\n" +
 	"\x0fsigning_service\x18\x14 \x01(\tR\x0esigningService\x12%\n" +
 	"\x0esigning_region\x18\x15 \x01(\tR\rsigningRegion\x124\n" +
-	"\x17json_rpc_max_body_bytes\x18\x16 \x01(\rR\x13jsonRpcMaxBodyBytes\x122\n" +
-	"\x03mcp\x18\x17 \x01(\v2 .openshell.sandbox.v1.McpOptionsR\x03mcp\x12]\n" +
-	"\x12credential_binding\x18\x18 \x01(\v2..openshell.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x12B\n" +
+	"\x17json_rpc_max_body_bytes\x18\x16 \x01(\rR\x13jsonRpcMaxBodyBytes\x12-\n" +
+	"\x03mcp\x18\x17 \x01(\v2\x1b.ryno.sandbox.v1.McpOptionsR\x03mcp\x12X\n" +
+	"\x12credential_binding\x18\x18 \x01(\v2).ryno.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x12B\n" +
 	"\x1dallow_uninspected_credentials\x18\x19 \x01(\bR\x1ballowUninspectedCredentials\x123\n" +
-	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
+	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1am\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x127\n" +
+	"\x05value\x18\x02 \x01(\v2!.ryno.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
 	"\n" +
 	"McpOptions\x12/\n" +
 	"\x11strict_tool_names\x18\x01 \x01(\bH\x00R\x0fstrictToolNames\x88\x01\x01\x12A\n" +
@@ -2363,57 +2363,57 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x10GraphqlOperation\x12%\n" +
 	"\x0eoperation_type\x18\x01 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x02 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\x03 \x03(\tR\x06fields\"\x88\x04\n" +
+	"\x06fields\x18\x03 \x03(\tR\x06fields\"\xf4\x03\n" +
 	"\n" +
 	"L7DenyRule\x12\x16\n" +
 	"\x06method\x18\x01 \x01(\tR\x06method\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\tR\acommand\x12A\n" +
-	"\x05query\x18\x04 \x03(\v2+.openshell.sandbox.v1.L7DenyRule.QueryEntryR\x05query\x12%\n" +
+	"\acommand\x18\x03 \x01(\tR\acommand\x12<\n" +
+	"\x05query\x18\x04 \x03(\v2&.ryno.sandbox.v1.L7DenyRule.QueryEntryR\x05query\x12%\n" +
 	"\x0eoperation_type\x18\x05 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x06 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\a \x03(\tR\x06fields\x12D\n" +
-	"\x06params\x18\t \x03(\v2,.openshell.sandbox.v1.L7DenyRule.ParamsEntryR\x06params\x1a^\n" +
+	"\x06fields\x18\a \x03(\tR\x06fields\x12?\n" +
+	"\x06params\x18\t \x03(\v2'.ryno.sandbox.v1.L7DenyRule.ParamsEntryR\x06params\x1aY\n" +
 	"\n" +
 	"QueryEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1a_\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x125\n" +
+	"\x05value\x18\x02 \x01(\v2\x1f.ryno.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1aZ\n" +
 	"\vParamsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"=\n" +
-	"\x06L7Rule\x123\n" +
-	"\x05allow\x18\x01 \x01(\v2\x1d.openshell.sandbox.v1.L7AllowR\x05allow\"\xff\x03\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x125\n" +
+	"\x05value\x18\x02 \x01(\v2\x1f.ryno.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"8\n" +
+	"\x06L7Rule\x12.\n" +
+	"\x05allow\x18\x01 \x01(\v2\x18.ryno.sandbox.v1.L7AllowR\x05allow\"\xeb\x03\n" +
 	"\aL7Allow\x12\x16\n" +
 	"\x06method\x18\x01 \x01(\tR\x06method\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\tR\acommand\x12>\n" +
-	"\x05query\x18\x04 \x03(\v2(.openshell.sandbox.v1.L7Allow.QueryEntryR\x05query\x12%\n" +
+	"\acommand\x18\x03 \x01(\tR\acommand\x129\n" +
+	"\x05query\x18\x04 \x03(\v2#.ryno.sandbox.v1.L7Allow.QueryEntryR\x05query\x12%\n" +
 	"\x0eoperation_type\x18\x05 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x06 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\a \x03(\tR\x06fields\x12A\n" +
-	"\x06params\x18\t \x03(\v2).openshell.sandbox.v1.L7Allow.ParamsEntryR\x06params\x1a^\n" +
+	"\x06fields\x18\a \x03(\tR\x06fields\x12<\n" +
+	"\x06params\x18\t \x03(\v2$.ryno.sandbox.v1.L7Allow.ParamsEntryR\x06params\x1aY\n" +
 	"\n" +
 	"QueryEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1a_\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x125\n" +
+	"\x05value\x18\x02 \x01(\v2\x1f.ryno.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1aZ\n" +
 	"\vParamsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"6\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x125\n" +
+	"\x05value\x18\x02 \x01(\v2\x1f.ryno.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"6\n" +
 	"\x0eL7QueryMatcher\x12\x12\n" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\x81\x01\n" +
-	"\x17GetSandboxConfigRequest\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"|\n" +
+	"\x17GetSandboxConfigRequest\x12M\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2$.ryno.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x19\n" +
-	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
-	"\x18GetGatewayConfigResponse\x12X\n" +
-	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +
-	"\x11settings_revision\x18\x02 \x01(\x04R\x10settingsRevision\x1a_\n" +
+	"\x17GetGatewayConfigRequest\"\xf8\x01\n" +
+	"\x18GetGatewayConfigResponse\x12S\n" +
+	"\bsettings\x18\x01 \x03(\v27.ryno.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +
+	"\x11settings_revision\x18\x02 \x01(\x04R\x10settingsRevision\x1aZ\n" +
 	"\rSettingsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x128\n" +
-	"\x05value\x18\x02 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value:\x028\x01\"\x9f\x01\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x123\n" +
+	"\x05value\x18\x02 \x01(\v2\x1d.ryno.sandbox.v1.SettingValueR\x05value:\x028\x01\"\x9f\x01\n" +
 	"\fSettingValue\x12#\n" +
 	"\fstring_value\x18\x01 \x01(\tH\x00R\vstringValue\x12\x1f\n" +
 	"\n" +
@@ -2421,21 +2421,21 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tint_value\x18\x03 \x01(\x03H\x00R\bintValue\x12!\n" +
 	"\vbytes_value\x18\x04 \x01(\fH\x00R\n" +
 	"bytesValueB\a\n" +
-	"\x05value\"\x86\x01\n" +
-	"\x10EffectiveSetting\x128\n" +
-	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xb1\b\n" +
-	"\x18GetSandboxConfigResponse\x12;\n" +
-	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
+	"\x05value\"|\n" +
+	"\x10EffectiveSetting\x123\n" +
+	"\x05value\x18\x01 \x01(\v2\x1d.ryno.sandbox.v1.SettingValueR\x05value\x123\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\x1d.ryno.sandbox.v1.SettingScopeR\x05scope\"\x98\b\n" +
+	"\x18GetSandboxConfigResponse\x126\n" +
+	"\x06policy\x18\x01 \x01(\v2\x1e.ryno.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
 	"\vpolicy_hash\x18\x03 \x01(\tR\n" +
-	"policyHash\x12X\n" +
-	"\bsettings\x18\x04 \x03(\v2<.openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntryR\bsettings\x12'\n" +
-	"\x0fconfig_revision\x18\x05 \x01(\x04R\x0econfigRevision\x12G\n" +
-	"\rpolicy_source\x18\x06 \x01(\x0e2\".openshell.sandbox.v1.PolicySourceR\fpolicySource\x122\n" +
+	"policyHash\x12S\n" +
+	"\bsettings\x18\x04 \x03(\v27.ryno.sandbox.v1.GetSandboxConfigResponse.SettingsEntryR\bsettings\x12'\n" +
+	"\x0fconfig_revision\x18\x05 \x01(\x04R\x0econfigRevision\x12B\n" +
+	"\rpolicy_source\x18\x06 \x01(\x0e2\x1d.ryno.sandbox.v1.PolicySourceR\fpolicySource\x122\n" +
 	"\x15global_policy_version\x18\a \x01(\rR\x13globalPolicyVersion\x122\n" +
-	"\x15provider_env_revision\x18\b \x01(\x04R\x13providerEnvRevision\x12w\n" +
-	"\x1esupervisor_middleware_services\x18\t \x03(\v21.openshell.sandbox.v1.SupervisorMiddlewareServiceR\x1csupervisorMiddlewareServices\x12\x1c\n" +
+	"\x15provider_env_revision\x18\b \x01(\x04R\x13providerEnvRevision\x12r\n" +
+	"\x1esupervisor_middleware_services\x18\t \x03(\v2,.ryno.sandbox.v1.SupervisorMiddlewareServiceR\x1csupervisorMiddlewareServices\x12\x1c\n" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
@@ -2443,10 +2443,10 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x19provider_attachment_epoch\x18\x0e \x01(\tR\x17providerAttachmentEpoch\x125\n" +
 	"\x16configuration_admitted\x18\r \x01(\bR\x15configurationAdmitted\x12/\n" +
 	"\x13configuration_error\x18\x10 \x01(\tR\x12configurationError\x12:\n" +
-	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x1ac\n" +
+	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x1a^\n" +
 	"\rSettingsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x127\n" +
+	"\x05value\x18\x02 \x01(\v2!.ryno.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
@@ -2493,88 +2493,88 @@ func file_sandbox_proto_rawDescGZIP() []byte {
 var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
 var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_sandbox_proto_goTypes = []any{
-	(NetworkTlsMode)(0),                   // 0: openshell.sandbox.v1.NetworkTlsMode
-	(NetworkEnforcementMode)(0),           // 1: openshell.sandbox.v1.NetworkEnforcementMode
-	(NetworkAccessPreset)(0),              // 2: openshell.sandbox.v1.NetworkAccessPreset
-	(SettingScope)(0),                     // 3: openshell.sandbox.v1.SettingScope
-	(PolicySource)(0),                     // 4: openshell.sandbox.v1.PolicySource
-	(*SandboxPolicy)(nil),                 // 5: openshell.sandbox.v1.SandboxPolicy
-	(*FilesystemPolicy)(nil),              // 6: openshell.sandbox.v1.FilesystemPolicy
-	(*LandlockPolicy)(nil),                // 7: openshell.sandbox.v1.LandlockPolicy
-	(*ProcessPolicy)(nil),                 // 8: openshell.sandbox.v1.ProcessPolicy
-	(*NetworkPolicyRule)(nil),             // 9: openshell.sandbox.v1.NetworkPolicyRule
-	(*NetworkMiddlewareConfig)(nil),       // 10: openshell.sandbox.v1.NetworkMiddlewareConfig
-	(*MiddlewareEndpointSelector)(nil),    // 11: openshell.sandbox.v1.MiddlewareEndpointSelector
-	(*NetworkCredentialBinding)(nil),      // 12: openshell.sandbox.v1.NetworkCredentialBinding
-	(*NetworkEndpoint)(nil),               // 13: openshell.sandbox.v1.NetworkEndpoint
-	(*McpOptions)(nil),                    // 14: openshell.sandbox.v1.McpOptions
-	(*GraphqlOperation)(nil),              // 15: openshell.sandbox.v1.GraphqlOperation
-	(*L7DenyRule)(nil),                    // 16: openshell.sandbox.v1.L7DenyRule
-	(*L7Rule)(nil),                        // 17: openshell.sandbox.v1.L7Rule
-	(*L7Allow)(nil),                       // 18: openshell.sandbox.v1.L7Allow
-	(*L7QueryMatcher)(nil),                // 19: openshell.sandbox.v1.L7QueryMatcher
-	(*NetworkBinary)(nil),                 // 20: openshell.sandbox.v1.NetworkBinary
-	(*GetSandboxConfigRequest)(nil),       // 21: openshell.sandbox.v1.GetSandboxConfigRequest
-	(*GetGatewayConfigRequest)(nil),       // 22: openshell.sandbox.v1.GetGatewayConfigRequest
-	(*GetGatewayConfigResponse)(nil),      // 23: openshell.sandbox.v1.GetGatewayConfigResponse
-	(*SettingValue)(nil),                  // 24: openshell.sandbox.v1.SettingValue
-	(*EffectiveSetting)(nil),              // 25: openshell.sandbox.v1.EffectiveSetting
-	(*GetSandboxConfigResponse)(nil),      // 26: openshell.sandbox.v1.GetSandboxConfigResponse
-	(*SupervisorMiddlewareService)(nil),   // 27: openshell.sandbox.v1.SupervisorMiddlewareService
-	nil,                                   // 28: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	nil,                                   // 29: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
-	nil,                                   // 30: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	nil,                                   // 31: openshell.sandbox.v1.L7DenyRule.QueryEntry
-	nil,                                   // 32: openshell.sandbox.v1.L7DenyRule.ParamsEntry
-	nil,                                   // 33: openshell.sandbox.v1.L7Allow.QueryEntry
-	nil,                                   // 34: openshell.sandbox.v1.L7Allow.ParamsEntry
-	nil,                                   // 35: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	nil,                                   // 36: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	(NetworkTlsMode)(0),                   // 0: ryno.sandbox.v1.NetworkTlsMode
+	(NetworkEnforcementMode)(0),           // 1: ryno.sandbox.v1.NetworkEnforcementMode
+	(NetworkAccessPreset)(0),              // 2: ryno.sandbox.v1.NetworkAccessPreset
+	(SettingScope)(0),                     // 3: ryno.sandbox.v1.SettingScope
+	(PolicySource)(0),                     // 4: ryno.sandbox.v1.PolicySource
+	(*SandboxPolicy)(nil),                 // 5: ryno.sandbox.v1.SandboxPolicy
+	(*FilesystemPolicy)(nil),              // 6: ryno.sandbox.v1.FilesystemPolicy
+	(*LandlockPolicy)(nil),                // 7: ryno.sandbox.v1.LandlockPolicy
+	(*ProcessPolicy)(nil),                 // 8: ryno.sandbox.v1.ProcessPolicy
+	(*NetworkPolicyRule)(nil),             // 9: ryno.sandbox.v1.NetworkPolicyRule
+	(*NetworkMiddlewareConfig)(nil),       // 10: ryno.sandbox.v1.NetworkMiddlewareConfig
+	(*MiddlewareEndpointSelector)(nil),    // 11: ryno.sandbox.v1.MiddlewareEndpointSelector
+	(*NetworkCredentialBinding)(nil),      // 12: ryno.sandbox.v1.NetworkCredentialBinding
+	(*NetworkEndpoint)(nil),               // 13: ryno.sandbox.v1.NetworkEndpoint
+	(*McpOptions)(nil),                    // 14: ryno.sandbox.v1.McpOptions
+	(*GraphqlOperation)(nil),              // 15: ryno.sandbox.v1.GraphqlOperation
+	(*L7DenyRule)(nil),                    // 16: ryno.sandbox.v1.L7DenyRule
+	(*L7Rule)(nil),                        // 17: ryno.sandbox.v1.L7Rule
+	(*L7Allow)(nil),                       // 18: ryno.sandbox.v1.L7Allow
+	(*L7QueryMatcher)(nil),                // 19: ryno.sandbox.v1.L7QueryMatcher
+	(*NetworkBinary)(nil),                 // 20: ryno.sandbox.v1.NetworkBinary
+	(*GetSandboxConfigRequest)(nil),       // 21: ryno.sandbox.v1.GetSandboxConfigRequest
+	(*GetGatewayConfigRequest)(nil),       // 22: ryno.sandbox.v1.GetGatewayConfigRequest
+	(*GetGatewayConfigResponse)(nil),      // 23: ryno.sandbox.v1.GetGatewayConfigResponse
+	(*SettingValue)(nil),                  // 24: ryno.sandbox.v1.SettingValue
+	(*EffectiveSetting)(nil),              // 25: ryno.sandbox.v1.EffectiveSetting
+	(*GetSandboxConfigResponse)(nil),      // 26: ryno.sandbox.v1.GetSandboxConfigResponse
+	(*SupervisorMiddlewareService)(nil),   // 27: ryno.sandbox.v1.SupervisorMiddlewareService
+	nil,                                   // 28: ryno.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	nil,                                   // 29: ryno.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
+	nil,                                   // 30: ryno.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	nil,                                   // 31: ryno.sandbox.v1.L7DenyRule.QueryEntry
+	nil,                                   // 32: ryno.sandbox.v1.L7DenyRule.ParamsEntry
+	nil,                                   // 33: ryno.sandbox.v1.L7Allow.QueryEntry
+	nil,                                   // 34: ryno.sandbox.v1.L7Allow.ParamsEntry
+	nil,                                   // 35: ryno.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	nil,                                   // 36: ryno.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	(*structpb.Struct)(nil),               // 37: google.protobuf.Struct
-	(*datamodelv1.WorkspaceSelector)(nil), // 38: openshell.datamodel.v1.WorkspaceSelector
+	(*datamodelv1.WorkspaceSelector)(nil), // 38: ryno.datamodel.v1.WorkspaceSelector
 	(*durationpb.Duration)(nil),           // 39: google.protobuf.Duration
 }
 var file_sandbox_proto_depIdxs = []int32{
-	6,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
-	7,  // 1: openshell.sandbox.v1.SandboxPolicy.landlock:type_name -> openshell.sandbox.v1.LandlockPolicy
-	8,  // 2: openshell.sandbox.v1.SandboxPolicy.process:type_name -> openshell.sandbox.v1.ProcessPolicy
-	28, // 3: openshell.sandbox.v1.SandboxPolicy.network_policies:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	29, // 4: openshell.sandbox.v1.SandboxPolicy.network_middlewares:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
-	13, // 5: openshell.sandbox.v1.NetworkPolicyRule.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
-	20, // 6: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
-	37, // 7: openshell.sandbox.v1.NetworkMiddlewareConfig.config:type_name -> google.protobuf.Struct
-	11, // 8: openshell.sandbox.v1.NetworkMiddlewareConfig.endpoints:type_name -> openshell.sandbox.v1.MiddlewareEndpointSelector
-	0,  // 9: openshell.sandbox.v1.NetworkEndpoint.tls:type_name -> openshell.sandbox.v1.NetworkTlsMode
-	1,  // 10: openshell.sandbox.v1.NetworkEndpoint.enforcement:type_name -> openshell.sandbox.v1.NetworkEnforcementMode
-	2,  // 11: openshell.sandbox.v1.NetworkEndpoint.access:type_name -> openshell.sandbox.v1.NetworkAccessPreset
-	17, // 12: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
-	16, // 13: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
-	30, // 14: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	14, // 15: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
-	12, // 16: openshell.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> openshell.sandbox.v1.NetworkCredentialBinding
-	31, // 17: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
-	32, // 18: openshell.sandbox.v1.L7DenyRule.params:type_name -> openshell.sandbox.v1.L7DenyRule.ParamsEntry
-	18, // 19: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
-	33, // 20: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
-	34, // 21: openshell.sandbox.v1.L7Allow.params:type_name -> openshell.sandbox.v1.L7Allow.ParamsEntry
-	38, // 22: openshell.sandbox.v1.GetSandboxConfigRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	35, // 23: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	24, // 24: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
-	3,  // 25: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
-	5,  // 26: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	36, // 27: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
-	4,  // 28: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	27, // 29: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	39, // 30: openshell.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
-	9,  // 31: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	10, // 32: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
-	15, // 33: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	19, // 34: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	19, // 35: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	19, // 36: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	19, // 37: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	24, // 38: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	25, // 39: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	6,  // 0: ryno.sandbox.v1.SandboxPolicy.filesystem:type_name -> ryno.sandbox.v1.FilesystemPolicy
+	7,  // 1: ryno.sandbox.v1.SandboxPolicy.landlock:type_name -> ryno.sandbox.v1.LandlockPolicy
+	8,  // 2: ryno.sandbox.v1.SandboxPolicy.process:type_name -> ryno.sandbox.v1.ProcessPolicy
+	28, // 3: ryno.sandbox.v1.SandboxPolicy.network_policies:type_name -> ryno.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	29, // 4: ryno.sandbox.v1.SandboxPolicy.network_middlewares:type_name -> ryno.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry
+	13, // 5: ryno.sandbox.v1.NetworkPolicyRule.endpoints:type_name -> ryno.sandbox.v1.NetworkEndpoint
+	20, // 6: ryno.sandbox.v1.NetworkPolicyRule.binaries:type_name -> ryno.sandbox.v1.NetworkBinary
+	37, // 7: ryno.sandbox.v1.NetworkMiddlewareConfig.config:type_name -> google.protobuf.Struct
+	11, // 8: ryno.sandbox.v1.NetworkMiddlewareConfig.endpoints:type_name -> ryno.sandbox.v1.MiddlewareEndpointSelector
+	0,  // 9: ryno.sandbox.v1.NetworkEndpoint.tls:type_name -> ryno.sandbox.v1.NetworkTlsMode
+	1,  // 10: ryno.sandbox.v1.NetworkEndpoint.enforcement:type_name -> ryno.sandbox.v1.NetworkEnforcementMode
+	2,  // 11: ryno.sandbox.v1.NetworkEndpoint.access:type_name -> ryno.sandbox.v1.NetworkAccessPreset
+	17, // 12: ryno.sandbox.v1.NetworkEndpoint.rules:type_name -> ryno.sandbox.v1.L7Rule
+	16, // 13: ryno.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> ryno.sandbox.v1.L7DenyRule
+	30, // 14: ryno.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> ryno.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	14, // 15: ryno.sandbox.v1.NetworkEndpoint.mcp:type_name -> ryno.sandbox.v1.McpOptions
+	12, // 16: ryno.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> ryno.sandbox.v1.NetworkCredentialBinding
+	31, // 17: ryno.sandbox.v1.L7DenyRule.query:type_name -> ryno.sandbox.v1.L7DenyRule.QueryEntry
+	32, // 18: ryno.sandbox.v1.L7DenyRule.params:type_name -> ryno.sandbox.v1.L7DenyRule.ParamsEntry
+	18, // 19: ryno.sandbox.v1.L7Rule.allow:type_name -> ryno.sandbox.v1.L7Allow
+	33, // 20: ryno.sandbox.v1.L7Allow.query:type_name -> ryno.sandbox.v1.L7Allow.QueryEntry
+	34, // 21: ryno.sandbox.v1.L7Allow.params:type_name -> ryno.sandbox.v1.L7Allow.ParamsEntry
+	38, // 22: ryno.sandbox.v1.GetSandboxConfigRequest.workspace_scope:type_name -> ryno.datamodel.v1.WorkspaceSelector
+	35, // 23: ryno.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> ryno.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	24, // 24: ryno.sandbox.v1.EffectiveSetting.value:type_name -> ryno.sandbox.v1.SettingValue
+	3,  // 25: ryno.sandbox.v1.EffectiveSetting.scope:type_name -> ryno.sandbox.v1.SettingScope
+	5,  // 26: ryno.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> ryno.sandbox.v1.SandboxPolicy
+	36, // 27: ryno.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> ryno.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	4,  // 28: ryno.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> ryno.sandbox.v1.PolicySource
+	27, // 29: ryno.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> ryno.sandbox.v1.SupervisorMiddlewareService
+	39, // 30: ryno.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
+	9,  // 31: ryno.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> ryno.sandbox.v1.NetworkPolicyRule
+	10, // 32: ryno.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> ryno.sandbox.v1.NetworkMiddlewareConfig
+	15, // 33: ryno.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> ryno.sandbox.v1.GraphqlOperation
+	19, // 34: ryno.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> ryno.sandbox.v1.L7QueryMatcher
+	19, // 35: ryno.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> ryno.sandbox.v1.L7QueryMatcher
+	19, // 36: ryno.sandbox.v1.L7Allow.QueryEntry.value:type_name -> ryno.sandbox.v1.L7QueryMatcher
+	19, // 37: ryno.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> ryno.sandbox.v1.L7QueryMatcher
+	24, // 38: ryno.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> ryno.sandbox.v1.SettingValue
+	25, // 39: ryno.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> ryno.sandbox.v1.EffectiveSetting
 	40, // [40:40] is the sub-list for method output_type
 	40, // [40:40] is the sub-list for method input_type
 	40, // [40:40] is the sub-list for extension type_name

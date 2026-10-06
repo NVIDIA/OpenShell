@@ -6,16 +6,16 @@
 //! E2E test: TCP port forwarding through a sandbox.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`mise run gateway:docker`)
-//! - The `openshell` binary (built automatically from the workspace)
+//! - A running ryno gateway (`mise run gateway:docker`)
+//! - The `ryno` binary (built automatically from the workspace)
 
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use openshell_e2e::harness::port::{find_free_port, wait_for_port};
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::port::{find_free_port, wait_for_port};
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 /// Python script that runs a single-threaded TCP echo server inside the
 /// sandbox. It prints `echo-server-ready` to stdout once listening, which

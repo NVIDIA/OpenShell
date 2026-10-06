@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG CUDA_BUILD_IMAGE=nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04
-ARG OPENSHELL_SANDBOX_BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04
+ARG RYNO_SANDBOX_BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:24.04
 
 FROM ${CUDA_BUILD_IMAGE} AS builder
 
@@ -44,29 +44,29 @@ RUN set -eux; \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_RUNTIME_LIBRARY=Static; \
     cmake --build /tmp/build-vector-add --parallel; \
-    mkdir -p /opt/openshell-gpu-workload; \
-    cp /tmp/build-device-query/deviceQuery /opt/openshell-gpu-workload/deviceQuery; \
-    cp /tmp/build-vector-add/vectorAdd /opt/openshell-gpu-workload/vectorAdd; \
-    cp LICENSE /opt/openshell-gpu-workload/cuda-samples.LICENSE; \
+    mkdir -p /opt/ryno-gpu-workload; \
+    cp /tmp/build-device-query/deviceQuery /opt/ryno-gpu-workload/deviceQuery; \
+    cp /tmp/build-vector-add/vectorAdd /opt/ryno-gpu-workload/vectorAdd; \
+    cp LICENSE /opt/ryno-gpu-workload/cuda-samples.LICENSE; \
     rm -f /tmp/cuda-samples.tar.gz
 
-FROM ${OPENSHELL_SANDBOX_BASE_IMAGE}
+FROM ${RYNO_SANDBOX_BASE_IMAGE}
 
 ARG CUDA_SAMPLES_REF=v12.8
 
-LABEL com.nvidia.openshell.gpu-workload.name="cuda-basic" \
-      com.nvidia.openshell.gpu-workload.cuda-samples-ref="${CUDA_SAMPLES_REF}"
+LABEL com.nvidia.ryno.gpu-workload.name="cuda-basic" \
+      com.nvidia.ryno.gpu-workload.cuda-samples-ref="${CUDA_SAMPLES_REF}"
 
 USER root
-RUN mkdir -p /usr/local/lib/openshell-gpu-workload \
-    /usr/local/share/doc/openshell-gpu-workload
-COPY --from=builder /opt/openshell-gpu-workload/deviceQuery /usr/local/lib/openshell-gpu-workload/deviceQuery
-COPY --from=builder /opt/openshell-gpu-workload/vectorAdd /usr/local/lib/openshell-gpu-workload/vectorAdd
-COPY --from=builder /opt/openshell-gpu-workload/cuda-samples.LICENSE /usr/local/share/doc/openshell-gpu-workload/cuda-samples.LICENSE
-COPY workload.sh /usr/local/bin/openshell-gpu-workload
-RUN chmod 0755 /usr/local/bin/openshell-gpu-workload \
-    /usr/local/lib/openshell-gpu-workload/deviceQuery \
-    /usr/local/lib/openshell-gpu-workload/vectorAdd
+RUN mkdir -p /usr/local/lib/ryno-gpu-workload \
+    /usr/local/share/doc/ryno-gpu-workload
+COPY --from=builder /opt/ryno-gpu-workload/deviceQuery /usr/local/lib/ryno-gpu-workload/deviceQuery
+COPY --from=builder /opt/ryno-gpu-workload/vectorAdd /usr/local/lib/ryno-gpu-workload/vectorAdd
+COPY --from=builder /opt/ryno-gpu-workload/cuda-samples.LICENSE /usr/local/share/doc/ryno-gpu-workload/cuda-samples.LICENSE
+COPY workload.sh /usr/local/bin/ryno-gpu-workload
+RUN chmod 0755 /usr/local/bin/ryno-gpu-workload \
+    /usr/local/lib/ryno-gpu-workload/deviceQuery \
+    /usr/local/lib/ryno-gpu-workload/vectorAdd
 
 USER 1000:1000
-ENTRYPOINT ["/usr/local/bin/openshell-gpu-workload"]
+ENTRYPOINT ["/usr/local/bin/ryno-gpu-workload"]

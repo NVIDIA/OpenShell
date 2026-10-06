@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Providers"
 sidebar-title: "Overview"
-description: "Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes."
+description: "Create and manage credential providers that inject API keys and tokens into Ryno sandboxes."
 keywords: "Generative AI, Cybersecurity, Providers, Credentials, API Keys, Sandbox, Security"
 position: 4
 ---
 
-AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. Ryno manages these credentials as first-class entities called *providers*.
 
 Create and manage providers that supply credentials to sandboxes.
 
@@ -22,15 +22,15 @@ Provider profiles include metadata for known endpoints and binaries. View
 the available profiles before creating a provider:
 
 ```shell
-openshell profile list
-openshell profile describe github
+ryno profile list
+ryno profile describe github
 ```
 
 ## Create a Provider
 
 Providers can be created from local environment variables or with explicit credential values.
 
-For refresh-backed providers such as `google-vertex-ai --from-gcloud-adc`, `openshell provider create` now waits for the gateway to configure refresh metadata and mint the initial access token before it reports success.
+For refresh-backed providers such as `google-vertex-ai --from-gcloud-adc`, `ryno provider create` now waits for the gateway to configure refresh metadata and mint the initial access token before it reports success.
 
 ### From Local Credentials
 
@@ -38,7 +38,7 @@ The fastest way to create a provider is to let the CLI discover credentials from
 your shell environment:
 
 ```shell
-openshell provider create --name my-claude --type claude-code --from-existing
+ryno provider create --name my-claude --type claude-code --from-existing
 ```
 
 This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
@@ -49,7 +49,7 @@ and stores them in the provider.
 Supply a credential value directly:
 
 ```shell
-openshell provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY=nvapi-example
+ryno provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY=nvapi-example
 ```
 
 ### Bare Key Form
@@ -58,7 +58,7 @@ Pass a key name without a value to read the value from the environment variable
 of that name:
 
 ```shell
-openshell provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY
+ryno provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY
 ```
 
 This looks up the current value of `$NVIDIA_API_KEY` in your shell and stores it.
@@ -71,19 +71,19 @@ gateway-only and is not emitted into sandbox environment material or static
 credential bindings:
 
 ```shell
-openshell provider create \
+ryno provider create \
   --name custom-api \
   --type custom-api \
   --from-oidc-token
 ```
 
-OpenShell infers the destination credential from the provider profile when the
+Ryno infers the destination credential from the provider profile when the
 profile has exactly one `token_grant.subject_token.credential`. If the profile
 has more than one, pass `--credential <key>`. Refresh the stored subject token
 later with:
 
 ```shell
-openshell provider update custom-api --from-oidc-token
+ryno provider update custom-api --from-oidc-token
 ```
 
 This copies the current OIDC access token and expiry from the active gateway
@@ -101,20 +101,20 @@ Create a provider whose profile requires no static credentials without a
 credential source:
 
 ```shell
-openshell provider create --name public-pypi --type pypi
+ryno provider create --name public-pypi --type pypi
 ```
 
 Provider creation rejects profileless types. For a custom GitLab deployment,
 import a profile with the deployment's endpoints and then create an instance
 using that profile ID. Existing profileless provider records remain usable, but
-OpenShell does not create new ones.
+Ryno does not create new ones.
 
 Update a custom provider profile after exporting it, editing its endpoints,
 binaries, or credential metadata, and preserving the exported `resource_version`:
 
 ```shell
-openshell profile export my-api -o yaml > my-api-profile.yaml
-openshell profile update my-api -f my-api-profile.yaml
+ryno profile export my-api -o yaml > my-api-profile.yaml
+ryno profile update my-api -f my-api-profile.yaml
 ```
 
 Import remains create-only and fails if the profile ID already exists. Use
@@ -126,7 +126,7 @@ applies to all provider instances of that type on the next sandbox config sync.
 Delete one or more custom provider profiles by ID:
 
 ```shell
-openshell profile delete custom-api custom-alt
+ryno profile delete custom-api custom-alt
 ```
 
 When a multi-profile delete fails for one entry, the CLI reports that profile's
@@ -136,7 +136,7 @@ after it attempts every requested deletion if any entry failed.
 <Warning>
 Static credentials require an imported provider profile. Profiles
 normally define at least one endpoint. An endpointless profile requires an
-explicit `credential_binding.provider` on a sandbox policy endpoint. OpenShell
+explicit `credential_binding.provider` on a sandbox policy endpoint. Ryno
 does not activate static credentials from a profileless provider because it
 cannot determine which credential definition applies.
 </Warning>
@@ -148,14 +148,14 @@ List, inspect, update, and delete providers from the active gateway.
 List all providers:
 
 ```shell
-openshell provider list
+ryno provider list
 ```
 
 Use `-o json` or `-o yaml` for machine-readable output:
 
 ```shell
-openshell provider list -o json
-openshell provider list -o yaml
+ryno provider list -o json
+ryno provider list -o yaml
 ```
 
 Structured list output is an envelope with `providers` and
@@ -170,31 +170,31 @@ details on how credentials are injected into sandboxes, refer to
 Inspect a provider:
 
 ```shell
-openshell provider get my-claude
+ryno provider get my-claude
 ```
 
 Update a provider's credentials:
 
 ```shell
-openshell provider update my-claude --from-existing
+ryno provider update my-claude --from-existing
 ```
 
 To wait until attached sandboxes apply the updated credentials, add `--wait`:
 
 ```shell
-openshell provider update my-claude --from-existing --wait --timeout 30 --output json
+ryno provider update my-claude --from-existing --wait --timeout 30 --output json
 ```
 
 The update records which sandboxes are attached before saving the new credentials. Its result includes a change ID and outcome for each of those sandboxes. Sandboxes attached later are outside this wait. The timeout applies to the whole group; if any selected sandbox fails or times out, the command exits with an error and still reports each sandbox's outcome. When no sandboxes are attached, it reports the saved change and an empty target list.
 
-Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
+Credential refresh status tells you whether Ryno obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
 
 After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
 
 Set or clear a credential expiry timestamp:
 
 ```shell
-openshell provider update my-graph \
+ryno provider update my-graph \
   --credential MS_GRAPH_ACCESS_TOKEN="$MS_GRAPH_ACCESS_TOKEN" \
   --credential-expires-at MS_GRAPH_ACCESS_TOKEN=1767225600000
 ```
@@ -212,7 +212,7 @@ provider record for sandbox injection.
 Configure refresh metadata for one injectable credential key:
 
 ```shell
-openshell provider refresh configure my-graph \
+ryno provider refresh configure my-graph \
   --credential-key MS_GRAPH_ACCESS_TOKEN \
   --strategy oauth2-client-credentials \
   --material tenant_id="$TENANT_ID" \
@@ -231,20 +231,20 @@ still marks a key supplied through `--material` as secret.
 Check refresh status:
 
 ```shell
-openshell provider refresh status my-graph
+ryno provider refresh status my-graph
 ```
 
 Delete refresh metadata for a credential:
 
 ```shell
-openshell provider refresh delete my-graph \
+ryno provider refresh delete my-graph \
   --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
 
 Force a gateway-managed refresh for one credential:
 
 ```shell
-openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKEN
+ryno provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
 
 ### AWS STS
@@ -258,15 +258,15 @@ so all three credentials are gateway-minted. Create the provider with
 `--runtime-credentials` — no placeholder credential is needed.
 
 ```shell
-openshell provider create --name my-aws --type aws-s3 --runtime-credentials
+ryno provider create --name my-aws --type aws-s3 --runtime-credentials
 
-openshell provider refresh configure my-aws \
+ryno provider refresh configure my-aws \
   --credential-key AWS_ACCESS_KEY_ID \
   --strategy aws-sts-assume-role \
   --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
-  --material session_name="openshell-sandbox"
+  --material session_name="ryno-sandbox"
 
-openshell provider refresh rotate my-aws --credential-key AWS_ACCESS_KEY_ID
+ryno provider refresh rotate my-aws --credential-key AWS_ACCESS_KEY_ID
 ```
 
 The gateway resolves its own AWS credentials using the default credential chain
@@ -274,7 +274,7 @@ The gateway resolves its own AWS credentials using the default credential chain
 running on AWS, provide explicit IAM keys via refresh material:
 
 ```shell
-openshell provider refresh configure my-aws \
+ryno provider refresh configure my-aws \
   --credential-key AWS_ACCESS_KEY_ID \
   --strategy aws-sts-assume-role \
   --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
@@ -297,20 +297,20 @@ The proxy re-signs requests using SigV4 before forwarding to AWS. Both curl and
 Python boto3 are supported.
 
 External refresh systems should continue to push new current credentials through
-`openshell provider update`. The `--credential-expires-at` option works for
+`ryno provider update`. The `--credential-expires-at` option works for
 static credentials, externally refreshed credentials, and gateway-managed
 refresh strategies.
 
 Delete a provider:
 
 ```shell
-openshell provider delete my-claude
+ryno provider delete my-claude
 ```
 
 Delete multiple providers by listing their names in one command:
 
 ```shell
-openshell provider delete my-claude my-github
+ryno provider delete my-claude my-github
 ```
 
 When a multi-provider delete fails for one entry, the CLI reports that
@@ -322,7 +322,7 @@ with an error after it attempts every requested deletion if any entry failed.
 Pass one or more `--provider` flags when creating a sandbox:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --provider my-claude --provider my-github -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --provider my-claude --provider my-github -- claude
 ```
 
 Each `--provider` flag attaches one provider. The sandbox receives eligible
@@ -335,8 +335,8 @@ be resolved.
 
 <Info>
 Use `--provider` to attach providers when creating a sandbox. To change the
-providers attached to a running sandbox, use `openshell sandbox provider attach`
-and `openshell sandbox provider detach`. See
+providers attached to a running sandbox, use `ryno sandbox provider attach`
+and `ryno sandbox provider detach`. See
 [Profiles](/how-it-works/providers/profiles#attach-and-detach-providers) for details.
 
 </Info>
@@ -348,14 +348,14 @@ name matches an imported profile ID, the CLI creates one from local profile
 discovery, so you do not need to create it separately:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --provider claude-code -- claude
+ryno sandbox create --from registry.example.com/your-org/claude-agent:latest --provider claude-code -- claude
 ```
 
 This finds your `ANTHROPIC_API_KEY`, creates a `claude-code` provider, attaches
 it to the sandbox, and launches Claude Code. Add `--auto-providers` to skip the
 confirmation prompt, or `--no-auto-providers` to skip creation entirely.
 
-A provider is attached only when you name it. OpenShell does not derive one from
+A provider is attached only when you name it. Ryno does not derive one from
 the trailing command: a profile's `binaries` list authorizes a binary to reach
 that profile's endpoints, which is not a statement that running the binary asks
 for the provider. A sandbox with no providers is a normal, fully supported
@@ -364,7 +364,7 @@ state.
 ## How Credential Injection Works
 
 The agent process inside the sandbox never sees real credential values. At
-startup, OpenShell replaces each credential with an opaque placeholder token in
+startup, Ryno replaces each credential with an opaque placeholder token in
 the agent's environment. When the agent sends an HTTP request containing a
 placeholder, the proxy resolves it immediately before forwarding the request.
 
@@ -424,7 +424,7 @@ closed instead of being forwarded to the upstream service.
 Export the profile used by a provider to inspect its credential boundary:
 
 ```shell
-openshell profile export github -o yaml
+ryno profile export github -o yaml
 ```
 
 For the GitHub example profile, `GITHUB_TOKEN` and `GH_TOKEN` can resolve for
@@ -444,11 +444,11 @@ The provider types available to `--type` are the IDs of the profiles you
 imported. List them:
 
 ```shell
-openshell provider list-profiles
+ryno provider list-profiles
 ```
 
 The repository's
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers) directory
+[`providers/`](https://github.com/NVIDIA/Ryno/tree/main/providers) directory
 ships example profiles for GitHub, PyPI, and the major inference and agent
 providers. Each file's header states the credential environment variables it
 declares, the binaries it authorizes, and the endpoints it grants. Read it,
@@ -461,7 +461,7 @@ adjust the binary paths for your image, and import your copy.
 ## Inference Provider Access
 
 Attach an inference provider to each sandbox that needs it and configure the
-workload to call the provider's native endpoint. The workload, not OpenShell,
+workload to call the provider's native endpoint. The workload, not Ryno,
 selects the model and request timeout.
 
 | Provider | Example profile | Native base URL | Credential variable |

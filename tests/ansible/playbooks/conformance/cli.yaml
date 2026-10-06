@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Run OpenShell conformance tests
+- name: Run Ryno conformance tests
   hosts: all
   gather_facts: false
   tasks:
@@ -16,55 +16,55 @@
           - git
         state: present
 
-    - name: Create OpenShell conformance test directory
+    - name: Create Ryno conformance test directory
       become: true
       ansible.builtin.file:
-        path: /var/lib/openshell-conformance/tests
+        path: /var/lib/ryno-conformance/tests
         state: directory
         owner: tmachine
         group: tmachine
         mode: "0700"
 
-    - name: Extract OpenShell conformance test bundle
+    - name: Extract Ryno conformance test bundle
       become: true
       ansible.builtin.unarchive:
-        src: "{{ openshell_conformance_test_bundle }}"
-        dest: /var/lib/openshell-conformance/tests
+        src: "{{ ryno_conformance_test_bundle }}"
+        dest: /var/lib/ryno-conformance/tests
         owner: tmachine
         group: tmachine
 
     # Report a malformed outer bundle directly instead of failing later with
     # an opaque cargo-nextest missing-archive error.
-    - name: Check OpenShell conformance nextest archive
+    - name: Check Ryno conformance nextest archive
       ansible.builtin.stat:
-        path: /var/lib/openshell-conformance/tests/tests.tar.zst
+        path: /var/lib/ryno-conformance/tests/tests.tar.zst
       register: conformance_archive
 
-    - name: Require OpenShell conformance nextest archive
+    - name: Require Ryno conformance nextest archive
       ansible.builtin.assert:
         that:
           - conformance_archive.stat.isreg | default(false)
-        fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
+        fail_msg: Ryno conformance test bundle did not contain tests.tar.zst
 
-    - name: Resolve installed OpenShell CLI
+    - name: Resolve installed Ryno CLI
       ansible.builtin.command:
         argv:
           - /bin/sh
           - -c
-          - command -v openshell
-      register: openshell_cli
+          - command -v ryno
+      register: ryno_cli
       changed_when: false
 
-    - name: Run OpenShell conformance archive
+    - name: Run Ryno conformance archive
       ansible.builtin.command:
         argv:
           - cargo-nextest
           - nextest
           - run
           - --archive-file
-          - /var/lib/openshell-conformance/tests/tests.tar.zst
+          - /var/lib/ryno-conformance/tests/tests.tar.zst
           - --workspace-remap
-          - /var/lib/openshell-conformance/tests
+          - /var/lib/ryno-conformance/tests
           - --no-capture
           # The guest has 4 GiB; keep sandbox creates from competing for it.
           - --test-threads
@@ -73,19 +73,19 @@
           - "{{ conformance_filter | default('all()') }}"
           - --no-fail-fast
       environment:
-        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+        RYNO_BIN: "{{ ryno_cli.stdout }}"
       register: conformance_result
       changed_when: false
       failed_when: false
 
     # Preserve both streams for failures without adding passing-test output to
     # every tmachine run.
-    - name: Show OpenShell conformance diagnostics
+    - name: Show Ryno conformance diagnostics
       ansible.builtin.debug:
         var: conformance_result
       when: conformance_result.rc != 0
 
-    - name: Read OpenShell gateway logs
+    - name: Read Ryno gateway logs
       become: true
       ansible.builtin.command:
         argv:
@@ -93,21 +93,21 @@
           - --no-pager
           - --lines
           - "500"
-          - _SYSTEMD_UNIT=openshell-gateway.service
+          - _SYSTEMD_UNIT=ryno-gateway.service
           - "+"
-          - _SYSTEMD_USER_UNIT=openshell-gateway.service
-      register: openshell_gateway_logs
+          - _SYSTEMD_USER_UNIT=ryno-gateway.service
+      register: ryno_gateway_logs
       changed_when: false
       failed_when: false
       when: conformance_result.rc != 0
 
-    - name: Show OpenShell gateway logs
+    - name: Show Ryno gateway logs
       ansible.builtin.debug:
-        var: openshell_gateway_logs.stdout_lines
+        var: ryno_gateway_logs.stdout_lines
       when: conformance_result.rc != 0
 
-    - name: Require OpenShell conformance success
+    - name: Require Ryno conformance success
       ansible.builtin.assert:
         that:
           - conformance_result.rc == 0
-        fail_msg: OpenShell conformance test failed
+        fail_msg: Ryno conformance test failed

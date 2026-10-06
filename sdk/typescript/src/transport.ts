@@ -22,7 +22,7 @@ export interface ConnectOptions {
   caCert?: Buffer;
   /**
    * Client certificate (PEM) for mTLS. Authenticates the CALLER, not just the
-   * server. The default local OpenShell gateway (Docker, VM, Homebrew, Linux
+   * server. The default local Ryno gateway (Docker, VM, Homebrew, Linux
    * package) requires this. Must be paired with clientKey.
    */
   clientCert?: Buffer;

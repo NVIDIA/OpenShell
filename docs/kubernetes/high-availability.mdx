@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "High Availability"
 sidebar-title: "High Availability"
-description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL and authenticated peer routing."
+description: "Run multiple Ryno gateway replicas on Kubernetes with shared PostgreSQL and authenticated peer routing."
 keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover"
 position: 3
 ---
 
-Run two or more gateway replicas when the OpenShell control plane must remain
+Run two or more gateway replicas when the Ryno control plane must remain
 available during a gateway pod failure or rolling update. Every replica can
 serve API requests. The replicas share persistent state through PostgreSQL and
 relay session-bound requests to the replica connected to each sandbox
@@ -26,7 +26,7 @@ An HA gateway deployment requires:
 
 - Two or more schedulable Kubernetes nodes or failure domains.
 - PostgreSQL reachable from every gateway pod.
-- A Kubernetes Secret in the OpenShell namespace with the PostgreSQL connection
+- A Kubernetes Secret in the Ryno namespace with the PostgreSQL connection
   URI in a key named `uri`.
 - `workload.kind: deployment`. The default StatefulSet and per-pod SQLite
   database are intended for a single gateway replica.
@@ -40,14 +40,14 @@ Deployment for the standard HA configuration.
 
 ## Create the PostgreSQL Secret
 
-Provision PostgreSQL outside the OpenShell chart, then create the connection
+Provision PostgreSQL outside the Ryno chart, then create the connection
 Secret. The chart does not install PostgreSQL.
 
 ```shell
-kubectl create namespace openshell
+kubectl create namespace ryno
 
-kubectl -n openshell create secret generic openshell-postgres \
-  --from-literal=uri='postgresql://openshell:<password>@<postgres-host>:5432/openshell'
+kubectl -n ryno create secret generic ryno-postgres \
+  --from-literal=uri='postgresql://ryno:<password>@<postgres-host>:5432/ryno'
 ```
 
 Use your PostgreSQL provider's required TLS parameters in the connection URI.
@@ -64,15 +64,15 @@ workload:
   kind: deployment
 
 server:
-  externalDbSecret: openshell-postgres
+  externalDbSecret: ryno-postgres
 
 affinity:
   podAntiAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
-            app.kubernetes.io/name: openshell
-            app.kubernetes.io/instance: openshell
+            app.kubernetes.io/name: ryno
+            app.kubernetes.io/instance: ryno
         topologyKey: kubernetes.io/hostname
 ```
 
@@ -83,13 +83,13 @@ required rule leaves a replica Pending when the cluster does not have enough
 matching failure domains; use preferred anti-affinity when scheduling the
 replica is more important than strict separation.
 
-Install or upgrade OpenShell:
+Install or upgrade Ryno:
 
 ```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade --install ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --values values-ha.yaml \
   --wait
 ```
@@ -103,9 +103,9 @@ create different copies of those Secrets for individual replicas.
 Wait for all gateway replicas to become ready:
 
 ```shell
-kubectl -n openshell rollout status deployment/openshell
-kubectl -n openshell get pods \
-  -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+kubectl -n ryno rollout status deployment/ryno
+kubectl -n ryno get pods \
+  -l app.kubernetes.io/name=ryno,app.kubernetes.io/instance=ryno \
   -o wide
 ```
 
@@ -113,11 +113,11 @@ Confirm that the client-facing Service and headless peer Service have ready
 endpoints:
 
 ```shell
-kubectl -n openshell get service openshell openshell-peer
-kubectl -n openshell get endpointslice \
-  -l app.kubernetes.io/service-name=openshell
-kubectl -n openshell get endpointslice \
-  -l app.kubernetes.io/service-name=openshell-peer
+kubectl -n ryno get service ryno ryno-peer
+kubectl -n ryno get endpointslice \
+  -l app.kubernetes.io/service-name=ryno
+kubectl -n ryno get endpointslice \
+  -l app.kubernetes.io/service-name=ryno-peer
 ```
 
 If you changed the chart's generated names with `nameOverride` or
@@ -126,8 +126,8 @@ If you changed the chart's generated names with `nameOverride` or
 After registering the gateway with the CLI, verify that requests succeed:
 
 ```shell
-openshell status
-openshell sandbox list
+ryno status
+ryno sandbox list
 ```
 
 ## Protect Voluntary Disruptions
@@ -139,17 +139,17 @@ does not evict every ready gateway pod at once:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: openshell
-  namespace: openshell
+  name: ryno
+  namespace: ryno
 spec:
   minAvailable: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: openshell
-      app.kubernetes.io/instance: openshell
+      app.kubernetes.io/name: ryno
+      app.kubernetes.io/instance: ryno
 ```
 
-Apply the manifest separately from the OpenShell chart. Match the namespace and
+Apply the manifest separately from the Ryno chart. Match the namespace and
 release labels to your installation. A PodDisruptionBudget controls voluntary
 evictions; it does not protect against an unavailable node or failure domain.
 
@@ -162,7 +162,7 @@ file-sync, service, and status traffic to the owner through the headless peer
 Service.
 
 Peer RPCs use a projected, pod-bound ServiceAccount token with the
-`openshell-gateway-peer` audience. The receiving gateway validates the token
+`ryno-gateway-peer` audience. The receiving gateway validates the token
 with the Kubernetes TokenReview API, verifies the live pod identity and release
 labels, and authorizes only peer methods. When gateway TLS is enabled, peer
 connections also use the chart's TLS materials.
@@ -191,10 +191,10 @@ client requests remain routable through peer relay.
 Change `replicaCount` in `values-ha.yaml`, then apply the release again:
 
 ```shell
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
+helm upgrade ryno \
+  oci://ghcr.io/nvidia/ryno/helm-chart \
   --version <version> \
-  --namespace openshell \
+  --namespace ryno \
   --values values-ha.yaml \
   --wait
 ```

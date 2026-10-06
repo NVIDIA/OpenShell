@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-supervisor"
+description = "Ryno policy and workload supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ryno-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false, features = ["jwt"] }
+ryno-extension-core = { path = "../ryno-extension-core" }
+ryno-isolation-interface = { path = "../ryno-isolation-interface" }
+ryno-sandbox-backend = { path = "../ryno-sandbox-backend" }
+ryno-ocsf = { path = "../ryno-ocsf" }
+ryno-policy = { path = "../ryno-policy" }
+ryno-supervisor-middleware = { path = "../ryno-supervisor-middleware" }
+ryno-supervisor-middleware-builtins = { path = "../ryno-supervisor-middleware-builtins" }
+ryno-supervisor-network = { path = "../ryno-supervisor-network", default-features = false }
+ryno-supervisor-process = { path = "../ryno-supervisor-process" }
+
+clap = { workspace = true }
+miette = { workspace = true }
+nix = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+rustls = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = ["telemetry", "bundled-ca-roots"]
+system-ca-roots = ["telemetry"]
+defaults-without-telemetry = ["bundled-ca-roots"]
+telemetry = ["ryno-core/telemetry"]
+bundled-ca-roots = ["ryno-supervisor-network/bundled-ca-roots"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }
+temp-env = "0.3"
+tokio-tungstenite = { workspace = true }
+
+[lints]
+workspace = true

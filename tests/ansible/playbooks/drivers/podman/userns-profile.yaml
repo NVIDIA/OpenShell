@@ -6,8 +6,8 @@
   hosts: all
   gather_facts: false
   vars:
-    podman_reference_image: "{{ openshell_podman_reference_image }}"
-    podman_reference_uid_map: /var/lib/openshell-test-inputs/podman/reference-uid-map
+    podman_reference_image: "{{ ryno_podman_reference_image }}"
+    podman_reference_uid_map: /var/lib/ryno-test-inputs/podman/reference-uid-map
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -38,17 +38,17 @@
     - name: Apply the Podman user-namespace fixture
       become: true
       ansible.builtin.blockinfile:
-        path: /etc/openshell/gateway.toml
-        marker: "# {mark} OpenShell Podman userns test fixture"
+        path: /etc/ryno/gateway.toml
+        marker: "# {mark} Ryno Podman userns test fixture"
         block: "{{ lookup('ansible.builtin.file', podman_userns_config) | trim }}"
 
-    - name: Restart OpenShell gateway with the Podman user-namespace fixture
+    - name: Restart Ryno gateway with the Podman user-namespace fixture
       become: true
       ansible.builtin.systemd_service:
-        name: openshell-gateway.service
+        name: ryno-gateway.service
         state: restarted
 
-    - name: Wait for the configured OpenShell gateway
+    - name: Wait for the configured Ryno gateway
       ansible.builtin.wait_for:
         host: 127.0.0.1
         port: 17670

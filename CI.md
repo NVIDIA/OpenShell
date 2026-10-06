@@ -1,6 +1,6 @@
 # CI
 
-This document describes how OpenShell's continuous integration works for pull requests, with a focus on what contributors need to do to get their PR tested.
+This document describes how Ryno's continuous integration works for pull requests, with a focus on what contributors need to do to get their PR tested.
 
 For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -15,7 +15,7 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
-Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
+Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `Ryno / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
 ### Protobuf API compatibility
 
@@ -92,17 +92,17 @@ Three opt-in labels enable the long-running E2E suites:
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
 When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
-The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
+The `Ryno / E2E` and `Ryno / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
-The GitHub ruleset should require the `OpenShell / ...` statuses published by
-`Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
+The GitHub ruleset should require the `Ryno / ...` statuses published by
+`Required CI Gates` plus the direct `Ryno / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
 ### K3s conformance version baseline
 
 The tmachine `ubuntu-k3s` conformance lane pins Agent Sandbox v0.5.0 as the
 compatibility baseline for the v1beta1 Sandbox API. It does not track the local
-K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
+K3s development default, currently v1.0.3. Ryno also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
 ### Run only the policy advisor conformance tests
@@ -241,7 +241,7 @@ publication continue. Stable publication currently requires the implemented
 Each qualification attempt writes its result to the Actions run summary and
 uploads `qualification-summary.json` as a 90-day workflow artifact. After the
 candidate release is published, the workflow publishes the same summary to
-`ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
+`ghcr.io/nvidia/ryno/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
 The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
@@ -274,9 +274,9 @@ stable automatically; set `allow_full_bootstrap: true` to permit a full scan whe
 no previous stable exists.
 
 Trivy accepts optional `images` and `charts`, one reference per line. Images can
-use tags or digests, such as `ghcr.io/nvidia/openshell/gateway:0.1.1-pre.1` or
-`ghcr.io/nvidia/openshell/gateway@sha256:<digest>`. Charts use versioned OCI
-references, such as `oci://ghcr.io/nvidia/openshell/helm-chart:0.1.1-pre.1`.
+use tags or digests, such as `ghcr.io/nvidia/ryno/gateway:0.1.1-pre.1` or
+`ghcr.io/nvidia/ryno/gateway@sha256:<digest>`. Charts use versioned OCI
+references, such as `oci://ghcr.io/nvidia/ryno/helm-chart:0.1.1-pre.1`.
 Artifacts must already be published and accessible to the workflow. The caller
 selects artifacts matching the candidate; the workflow does not verify that
 association. Without artifact inputs, Trivy scans only the candidate's deployment
@@ -291,11 +291,11 @@ and chart references. `Security Scan` calls it alongside the other independent
 scanners; release workflows can also call it directly.
 
 The scan job checks static deployment files (including Dockerfiles) once, both
-local charts with default values, the OpenShell `HELM_PROFILES` selected in
+local charts with default values, the Ryno `HELM_PROFILES` selected in
 `tasks/scripts/trivy-scan.sh`, requested packaged charts, and both Linux
 architectures of each requested image. The profile list includes development
 and E2E overlays for regression coverage, but excludes `values-spire-stack.yaml`,
-which belongs to the external SPIRE chart. A new OpenShell values fixture needs
+which belongs to the external SPIRE chart. A new Ryno values fixture needs
 an explicit entry in this list to receive Trivy coverage.
 
 Findings are informational by default, but scanner failures still fail the job
@@ -321,7 +321,7 @@ Run the scanner locally with:
 
 ```shell
 nix develop --command tasks/scripts/trivy-scan.sh config
-nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/openshell/gateway:dev
+nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/ryno/gateway:dev
 nix develop --command tasks/scripts/trivy-scan.sh gate
 nix develop --command tasks/scripts/trivy-scan.sh prepare-sarif
 ```
@@ -401,7 +401,7 @@ Flow:
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
 3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
-5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
+5. When the run finishes, the matching `Ryno / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
 7. When the PR is ready to merge, use **Add to merge queue** instead of merging directly. The queue validates the final integration state before updating `main`.
 
@@ -425,11 +425,11 @@ Important: if a PR requires manual admission, every new commit needs another `/o
 
 GitHub merge queue is required for `main`. Repository administrators must enable **Require merge queue** in the branch ruleset for `main` and keep these required status contexts aligned with the PR gates:
 
-- `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
-- `OpenShell / Helm Lint`
-- `OpenShell / Trivy Changes`
+- `Ryno / Branch Checks`
+- `Ryno / E2E`
+- `Ryno / GPU E2E`
+- `Ryno / Helm Lint`
+- `Ryno / Trivy Changes`
 
 `Required CI Gates` publishes the stable statuses for mirror-based workflows.
 `Trivy Changes` runs directly on pull requests and merge groups and publishes
@@ -441,7 +441,7 @@ Merge-group runs use the `merge_group` event. The event is distinct from `pull_r
 - `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
-- `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
+- `Required CI Gates` posts the same `Ryno / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
 
 Maintainers should add ready PRs to the queue rather than pressing a direct merge button. GitHub removes a PR from the queue if the merge-group checks fail or time out.
 
@@ -471,7 +471,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
-| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the Ryno Cachix cache, using read-only cache access when no authentication token is available. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
@@ -489,7 +489,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 
 | File | Role |
 |---|---|
-| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
+| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/ryno/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Protobuf, security, and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The Snap lanes verify a compatible system Docker lifecycle and `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive Snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
@@ -497,14 +497,14 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 
 Require these statuses in the branch ruleset for PR and merge-queue CI:
 
-- `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
-- `OpenShell / Helm Lint`
-- `OpenShell / Trivy Changes`
+- `Ryno / Branch Checks`
+- `Ryno / E2E`
+- `Ryno / GPU E2E`
+- `Ryno / Helm Lint`
+- `Ryno / Trivy Changes`
 
 For mirror-based workflows, require the statuses published by
-`Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
+`Required CI Gates`, not their underlying jobs. `Ryno / Trivy Changes` is
 the stable result job of the direct pull-request workflow. Together these
 contexts prove the expected checks completed for the commit GitHub is about to
 merge.

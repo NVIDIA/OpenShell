@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e")]
 
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 
 #[tokio::test]
 async fn sandbox_processes_disable_core_dumps() {

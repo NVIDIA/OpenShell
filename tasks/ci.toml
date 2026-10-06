@@ -30,9 +30,9 @@ hide = true
 ["build:rust:snap"]
 description = "Build release Rust binaries consumed by the hand-staged snap"
 run = [
-  "cargo build --release -p openshell-cli",
-  "cargo build --release -p openshell-gateway",
-  "cargo build --release -p openshell-sandbox",
+  "cargo build --release -p ryno-cli",
+  "cargo build --release -p ryno-gateway",
+  "cargo build --release -p ryno-sandbox",
 ]
 
 [check]

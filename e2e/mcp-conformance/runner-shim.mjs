@@ -5,8 +5,8 @@
 // runner container.
 //
 // Why this indirection exists: the conformance runner runs untrusted upstream
-// node off the host, so it deliberately has no openshell binary and no gateway
-// credentials. But the MCP client under test must run inside an OpenShell
+// node off the host, so it deliberately has no ryno binary and no gateway
+// credentials. But the MCP client under test must run inside an Ryno
 // sandbox so its traffic crosses the policy-enforced proxy (the whole point of
 // the e2e). This script bridges that gap without widening the runner's
 // privileges: instead of running the MCP client itself, it posts the test
@@ -63,7 +63,7 @@ if (!serverUrl) {
 }
 
 // POST the rewritten server URL to the host bridge, which runs the real MCP
-// client inside an OpenShell sandbox and returns its result. The runner is a
+// client inside an Ryno sandbox and returns its result. The runner is a
 // plain container with ordinary egress, so this is a direct HTTP call.
 function postJson(url, payload) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -82,7 +82,7 @@ function postJson(url, payload) {
       headers: {
         'content-type': 'application/json',
         'content-length': body.length,
-        'x-openshell-mcp-conformance-token': bridgeToken,
+        'x-ryno-mcp-conformance-token': bridgeToken,
       },
       agent: false,
     }, (response) => {

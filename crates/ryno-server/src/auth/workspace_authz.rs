@@ -1,0 +1,557 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Workspace-scoped authorization.
+//!
+//! Enforces membership and role requirements for workspace-scoped operations.
+//! Called by handlers after middleware authentication — the middleware validates
+//! auth mode + scope + global role; this module validates workspace membership
+//! and workspace-level role.
+
+use super::principal::Principal;
+use ryno_core::proto::{
+    WorkspaceRole as ProtoWorkspaceRole, WorkspaceSelector,
+    workspace_selector::Selection as WorkspaceSelection,
+};
+use tonic::Status;
+
+use crate::persistence::Store;
+
+fn shell_quote_for_hint(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Minimum workspace-level role required by a handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinWorkspaceRole {
+    /// Workspace User — the caller must be at least a member.
+    User,
+    /// Workspace Admin — the caller must be an admin member.
+    Admin,
+}
+
+impl MinWorkspaceRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// Result of a successful workspace authorization check.
+#[derive(Debug)]
+pub struct AuthorizedWorkspace {
+    /// Explicit workspace name selected by the caller.
+    pub workspace: String,
+    /// How the caller was authorized.
+    pub grant: AuthGrant,
+}
+
+/// How a caller was granted workspace access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthGrant {
+    /// Caller holds the platform admin OIDC role — bypasses membership.
+    PlatformAdmin,
+    /// Caller is a workspace member with the given role.
+    Member(ProtoWorkspaceRole),
+    /// Caller is a sandbox principal — scoped by JWT, no membership check.
+    Sandbox,
+}
+
+/// Authorized scope for a request that supports one workspace or all workspaces.
+#[derive(Debug)]
+pub enum AuthorizedWorkspaceScope {
+    /// One explicitly named workspace.
+    Workspace(AuthorizedWorkspace),
+    /// All workspaces, authorized for a platform administrator.
+    AllWorkspaces,
+}
+
+/// Authorize a selector on a request that explicitly supports all workspaces.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_list_workspace_selector(
+    store: &Store,
+    admin_role: &str,
+    principal: &Principal,
+    selector: Option<&WorkspaceSelector>,
+    min_role: MinWorkspaceRole,
+) -> Result<AuthorizedWorkspaceScope, Status> {
+    match selected_workspace(selector)? {
+        WorkspaceSelection::Workspace(workspace) => {
+            authorize_workspace(store, admin_role, principal, workspace, min_role)
+                .await
+                .map(AuthorizedWorkspaceScope::Workspace)
+        }
+        WorkspaceSelection::AllWorkspaces(_) => {
+            require_platform_admin(admin_role, principal)?;
+            Ok(AuthorizedWorkspaceScope::AllWorkspaces)
+        }
+    }
+}
+
+/// Return the explicitly selected workspace name, rejecting missing, empty,
+/// or all-workspaces selections.
+#[allow(clippy::result_large_err)]
+pub fn selected_workspace_name(selector: Option<&WorkspaceSelector>) -> Result<&str, Status> {
+    match selected_workspace(selector)? {
+        WorkspaceSelection::Workspace(workspace) => Ok(workspace),
+        WorkspaceSelection::AllWorkspaces(_) => Err(ryno_core::rpc_error::invalid_argument(
+            "workspace_scope",
+            "all_workspaces is not supported by this request",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn selected_workspace(selector: Option<&WorkspaceSelector>) -> Result<&WorkspaceSelection, Status> {
+    let selection = selector
+        .and_then(|selector| selector.selection.as_ref())
+        .ok_or_else(|| {
+            ryno_core::rpc_error::invalid_argument("workspace_scope", "workspace_scope is required")
+        })?;
+
+    if let WorkspaceSelection::Workspace(workspace) = selection {
+        crate::grpc::workspace::validate_workspace_name(workspace)?;
+    }
+
+    Ok(selection)
+}
+
+/// Authorize a workspace-scoped operation for a user principal.
+///
+/// Checks workspace membership and role. Platform admins (callers whose
+/// OIDC roles include `admin_role`) bypass the membership check entirely.
+///
+/// When `admin_role` is empty (auth-only mode / OIDC not configured), every
+/// authenticated user is treated as a platform admin — matching the existing
+/// behavior where empty role names skip RBAC.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_workspace(
+    store: &Store,
+    admin_role: &str,
+    principal: &Principal,
+    workspace: &str,
+    min_role: MinWorkspaceRole,
+) -> Result<AuthorizedWorkspace, Status> {
+    crate::grpc::workspace::validate_workspace_name(workspace)?;
+    let workspace = workspace.to_string();
+
+    match principal {
+        Principal::User(user) => {
+            if is_platform_admin(&user.identity.roles, admin_role) {
+                return Ok(AuthorizedWorkspace {
+                    workspace,
+                    grant: AuthGrant::PlatformAdmin,
+                });
+            }
+
+            let member = store
+                .get_message_by_name::<ryno_core::proto::WorkspaceMember>(
+                    &workspace,
+                    &user.identity.subject,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
+
+            let Some(member) = member else {
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                return Err(Status::permission_denied(format!(
+                    "not a member of workspace '{workspace}'; ask a platform admin to run: \
+                     ryno workspace member add --workspace {workspace_arg} \
+                     --subject {subject_arg} --role user"
+                )));
+            };
+
+            let member_role = ProtoWorkspaceRole::try_from(member.role)
+                .unwrap_or(ProtoWorkspaceRole::Unspecified);
+
+            if !role_satisfies(member_role, min_role) {
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                let role = min_role.as_str();
+                return Err(Status::permission_denied(format!(
+                    "workspace role '{role}' required in workspace '{workspace}'; ask a platform \
+                     admin to run: ryno workspace member add --workspace {workspace_arg} \
+                     --subject {subject_arg} --role {role}"
+                )));
+            }
+
+            Ok(AuthorizedWorkspace {
+                workspace,
+                grant: AuthGrant::Member(member_role),
+            })
+        }
+        Principal::Sandbox(_) => Ok(AuthorizedWorkspace {
+            workspace,
+            grant: AuthGrant::Sandbox,
+        }),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals cannot perform workspace operations",
+        )),
+        Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
+    }
+}
+
+/// Used by `ExecSandbox`, `ForwardTcp`, `WatchSandbox`, `CreateSshSession` — these
+/// RPCs identify a sandbox by its canonical name within an explicit workspace.
+/// User requests authorize that workspace before lookup; sandbox principals
+/// remain bound to the immutable ID from their authenticated identity.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_sandbox_workspace(
+    store: &Store,
+    admin_role: &str,
+    principal: &Principal,
+    sandbox_workspace: &str,
+    min_role: MinWorkspaceRole,
+) -> Result<AuthGrant, Status> {
+    let result =
+        authorize_workspace(store, admin_role, principal, sandbox_workspace, min_role).await?;
+    Ok(result.grant)
+}
+
+/// Require Platform Admin status. Used for cross-workspace operations like
+/// `list_*` with `all_workspaces: true`.
+#[allow(clippy::result_large_err)]
+pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result<(), Status> {
+    match principal {
+        Principal::User(user) if is_platform_admin(&user.identity.roles, admin_role) => Ok(()),
+        Principal::User(_) => Err(Status::permission_denied(
+            "platform admin role required for cross-workspace operations",
+        )),
+        Principal::Sandbox(_) => Err(Status::permission_denied(
+            "sandbox principals cannot perform cross-workspace operations",
+        )),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals cannot perform cross-workspace operations",
+        )),
+        Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
+    }
+}
+
+/// Check whether the caller's OIDC roles include the platform admin role.
+///
+/// When `admin_role` is empty (OIDC not configured), returns `true` —
+/// matching the existing behavior where empty role names skip RBAC.
+pub fn is_platform_admin_principal(identity_roles: &[String], admin_role: &str) -> bool {
+    is_platform_admin(identity_roles, admin_role)
+}
+
+fn is_platform_admin(identity_roles: &[String], admin_role: &str) -> bool {
+    admin_role.is_empty() || identity_roles.iter().any(|r| r == admin_role)
+}
+
+/// Check whether `member_role` satisfies the `min_role` requirement.
+fn role_satisfies(member_role: ProtoWorkspaceRole, min_role: MinWorkspaceRole) -> bool {
+    match min_role {
+        MinWorkspaceRole::User => matches!(
+            member_role,
+            ProtoWorkspaceRole::User | ProtoWorkspaceRole::Admin
+        ),
+        MinWorkspaceRole::Admin => member_role == ProtoWorkspaceRole::Admin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use ryno_core::proto::datamodel::v1::ObjectMeta;
+    use ryno_core::proto::{WorkspaceMember, WorkspaceRole as ProtoWorkspaceRole};
+    use std::collections::HashMap;
+
+    async fn test_store() -> Store {
+        crate::persistence::test_store().await
+    }
+
+    fn user_principal(subject: &str, roles: &[&str]) -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: roles.iter().map(|r| (*r).to_string()).collect(),
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    fn sandbox_principal() -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-a".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "ryno-gateway:test".to_string(),
+            },
+            trust_domain: Some("ryno".to_string()),
+        })
+    }
+
+    async fn add_member(store: &Store, workspace: &str, subject: &str, role: ProtoWorkspaceRole) {
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: subject.to_string(),
+                created_time: ryno_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: workspace.to_string(),
+                deletion_time: None,
+            }),
+            principal_subject: subject.to_string(),
+            role: role.into(),
+        };
+        store.put_message(&member).await.expect("add member");
+    }
+
+    #[tokio::test]
+    async fn platform_admin_bypasses_membership_check() {
+        let store = test_store().await;
+        let principal = user_principal("admin-user", &["ryno-admin", "ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "any-workspace",
+            MinWorkspaceRole::Admin,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().grant, AuthGrant::PlatformAdmin);
+    }
+
+    #[tokio::test]
+    async fn workspace_admin_member_passes_admin_check() {
+        let store = test_store().await;
+        add_member(&store, "default", "user-a", ProtoWorkspaceRole::Admin).await;
+        let principal = user_principal("user-a", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::Admin,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().grant,
+            AuthGrant::Member(ProtoWorkspaceRole::Admin)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_user_member_passes_user_check() {
+        let store = test_store().await;
+        add_member(&store, "default", "user-b", ProtoWorkspaceRole::User).await;
+        let principal = user_principal("user-b", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().grant,
+            AuthGrant::Member(ProtoWorkspaceRole::User)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_user_member_rejected_for_admin_check() {
+        let store = test_store().await;
+        add_member(&store, "default", "user-c", ProtoWorkspaceRole::User).await;
+        let principal = user_principal("user-c", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::Admin,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "workspace role 'admin' required in workspace 'default'; ask a platform admin to run: \
+             ryno workspace member add --workspace 'default' --subject 'user-c' --role admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_member_rejected() {
+        let store = test_store().await;
+        let principal = user_principal("stranger", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "not a member of workspace 'default'; ask a platform admin to run: \
+             ryno workspace member add --workspace 'default' --subject 'stranger' --role user"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_member_remediation_shell_quotes_untrusted_subject() {
+        let store = test_store().await;
+        let principal = user_principal("user'; echo pwned; '$(id)", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "team-a",
+            MinWorkspaceRole::User,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message()
+                .contains("--subject 'user'\"'\"'; echo pwned; '\"'\"'$(id)' --role user")
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_principal_rejected() {
+        let store = test_store().await;
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &Principal::Anonymous,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn sandbox_principal_passes_through() {
+        let store = test_store().await;
+        let principal = sandbox_principal();
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().grant, AuthGrant::Sandbox);
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_is_rejected() {
+        let store = test_store().await;
+        add_member(&store, "default", "user-d", ProtoWorkspaceRole::User).await;
+        let principal = user_principal("user-d", &["ryno-user"]);
+        let result =
+            authorize_workspace(&store, "ryno-admin", &principal, "", MinWorkspaceRole::User).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "workspace name is required");
+    }
+
+    #[test]
+    fn missing_and_unset_selectors_are_rejected() {
+        let missing = selected_workspace_name(None).unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+        assert_eq!(missing.message(), "workspace_scope is required");
+
+        let unset = selected_workspace_name(Some(&WorkspaceSelector::default())).unwrap_err();
+        assert_eq!(unset.code(), tonic::Code::InvalidArgument);
+        assert_eq!(unset.message(), "workspace_scope is required");
+    }
+
+    #[test]
+    fn all_workspaces_is_rejected_for_single_workspace_requests() {
+        let err = selected_workspace_name(Some(&ryno_core::proto::all_workspaces_selector()))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "all_workspaces is not supported by this request"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_workspaces_requires_platform_admin() {
+        let store = test_store().await;
+        let selector = ryno_core::proto::all_workspaces_selector();
+        let principal = user_principal("workspace-user", &["ryno-user"]);
+        let err = authorize_list_workspace_selector(
+            &store,
+            "ryno-admin",
+            &principal,
+            Some(&selector),
+            MinWorkspaceRole::User,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let admin = user_principal("platform-admin", &["ryno-admin"]);
+        let authorized = authorize_list_workspace_selector(
+            &store,
+            "ryno-admin",
+            &admin,
+            Some(&selector),
+            MinWorkspaceRole::User,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            authorized,
+            AuthorizedWorkspaceScope::AllWorkspaces
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_empty_admin_role_is_platform_admin() {
+        let store = test_store().await;
+        let principal = user_principal("any-user", &[]);
+        let result =
+            authorize_workspace(&store, "", &principal, "default", MinWorkspaceRole::Admin).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().grant, AuthGrant::PlatformAdmin);
+    }
+
+    #[tokio::test]
+    async fn workspace_admin_member_passes_user_check() {
+        let store = test_store().await;
+        add_member(&store, "default", "admin-member", ProtoWorkspaceRole::Admin).await;
+        let principal = user_principal("admin-member", &["ryno-user"]);
+        let result = authorize_workspace(
+            &store,
+            "ryno-admin",
+            &principal,
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().grant,
+            AuthGrant::Member(ProtoWorkspaceRole::Admin)
+        );
+    }
+}

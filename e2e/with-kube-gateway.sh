@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run an e2e command against a Helm-deployed OpenShell gateway in Kubernetes.
+# Run an e2e command against a Helm-deployed Ryno gateway in Kubernetes.
 #
 # Modes:
-#   - OPENSHELL_E2E_KUBE_CONTEXT set:
+#   - RYNO_E2E_KUBE_CONTEXT set:
 #       Target the named kubectl context, install the chart into an ephemeral
 #       namespace, and port-forward the gateway. Cluster lifecycle is the
 #       caller's responsibility (e.g. CI provisions kind via helm/kind-action).
-#   - OPENSHELL_E2E_KUBE_CONTEXT unset:
+#   - RYNO_E2E_KUBE_CONTEXT unset:
 #       Create a local k3d cluster via tasks/scripts/helm-k3s-local.sh, install
 #       the chart, port-forward, and tear the cluster down on exit.
 #
@@ -28,35 +28,35 @@
 # Every OpenShift-specific branch below is gated on OPENSHIFT_DETECTED, so the
 # vanilla-Kubernetes path stays exactly the same.
 #
-# Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
+# Set RYNO_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
 # Image source:
 #   - Ephemeral k3d mode builds local
-#     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
+#     `ryno/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
 #     mirrors the Skaffold local-dev path.
 #   - Existing-context mode pulls from
-#     ${OPENSHELL_REGISTRY}/{gateway,sandbox,supervisor}:${IMAGE_TAG}
-#     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
+#     ${RYNO_REGISTRY}/{gateway,sandbox,supervisor}:${IMAGE_TAG}
+#     (defaults: ghcr.io/nvidia/ryno, latest). CI sets IMAGE_TAG to the
 #     commit SHA and preloads or publishes the images before running this script.
 #
 # Database backend scenarios:
-#   Set OPENSHELL_E2E_KUBE_DB_SCENARIOS=1 to run the test command against
+#   Set RYNO_E2E_KUBE_DB_SCENARIOS=1 to run the test command against
 #   the supported database configurations: SQLite and external PostgreSQL
 #   with an existing Secret. When unset, the default single-install behavior
 #   is unchanged.
 #
 # External PostgreSQL fixture:
-#   Set OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET to create an ephemeral
+#   Set RYNO_E2E_KUBE_EXTERNAL_POSTGRES_SECRET to create an ephemeral
 #   PostgreSQL Deployment and a matching Secret with a `uri` key before
-#   installing OpenShell. This is used by HA CI so the gateway can run multiple
-#   replicas without requiring the OpenShell chart to own a database.
+#   installing Ryno. This is used by HA CI so the gateway can run multiple
+#   replicas without requiring the Ryno chart to own a database.
 #
 # Credential-driver fixture:
-#   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
-#   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
+#   Set RYNO_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
+#   backend. Set RYNO_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
 #   `vault`; the Rust `credential_drivers` e2e test validates the active
 #   backend. Vault mode installs a dev OpenBao fixture because it exposes the
 #   Vault-compatible API used by the driver.
@@ -82,13 +82,13 @@ e2e_align_docker_host_with_cli_context
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
-WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-kube.XXXXXX")"
+WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/ryno-e2e-kube.XXXXXX")"
 
 CLUSTER_CREATED_BY_US=0
 CLUSTER_NAME=""
 KUBE_CONTEXT=""
-NAMESPACE="openshell"
-RELEASE_NAME="openshell"
+NAMESPACE="ryno"
+RELEASE_NAME="ryno"
 PORTFORWARD_PID=""
 PORTFORWARD_LOG="${WORKDIR}/portforward.log"
 PORTFORWARD_HEALTH_PID=""
@@ -97,33 +97,33 @@ HELM_INSTALLED=0
 EXTERNAL_PG_FIXTURE_DEPLOYED=0
 EXTERNAL_PG_FIXTURE_SECRET=""
 EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
-EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
-EXTERNAL_PG_FIXTURE_USER="openshell"
-EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
-EXTERNAL_PG_FIXTURE_DATABASE="openshell"
-ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
-ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
-ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
-ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
+EXTERNAL_PG_FIXTURE_SERVICE="ryno-e2e-postgres"
+EXTERNAL_PG_FIXTURE_USER="ryno"
+EXTERNAL_PG_FIXTURE_PASSWORD="ryno-e2e-postgres"
+EXTERNAL_PG_FIXTURE_DATABASE="ryno"
+ENVOY_RELEASE_NAME="${RYNO_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
+ENVOY_NAMESPACE="${RYNO_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
+ENVOY_CHART_VERSION="${RYNO_E2E_ENVOY_VERSION:-v1.7.2}"
+ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-ryno.yaml"
 ENVOY_HELM_INSTALLED=0
 ENVOY_GATEWAY_CONFIG_APPLIED=0
 VAULT_FIXTURE_DEPLOYED=0
-VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
-VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
-VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
-VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
+VAULT_NAMESPACE="${RYNO_E2E_VAULT_NAMESPACE:-openbao}"
+VAULT_RELEASE_NAME="${RYNO_E2E_VAULT_RELEASE_NAME:-openbao}"
+VAULT_CHART_VERSION="${RYNO_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
+VAULT_DEV_ROOT_TOKEN="${RYNO_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 VAULT_CA_CONFIG_MAP="openbao-ca"
 VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
-CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
-CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
+CORPORATE_PROXY_FIXTURE_SECRET="ryno-e2e-proxy-auth"
+CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="ryno-e2e-proxy-ca"
 CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
-# Temp dir holding the client mTLS material extracted from openshell-client-tls
+# Temp dir holding the client mTLS material extracted from ryno-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
 OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
 
@@ -190,7 +190,7 @@ deploy_postgres_fixture() {
 }
 
 use_envoy_gateway() {
-  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
+  case "${RYNO_E2E_KUBE_USE_ENVOY:-0}" in
     1 | true | TRUE | yes | YES) return 0 ;;
     *) return 1 ;;
   esac
@@ -367,9 +367,9 @@ deploy_vault_fixture() {
 
   provision_vault_auth
 
-  export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
-  export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
-  export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
+  export RYNO_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
+  export RYNO_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
+  export RYNO_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
 }
 
 # Run a `bao` command in the fixture pod. Tolerates the "path is already in use"
@@ -389,7 +389,7 @@ openbao_exec() {
 
 # Provision the KV store, Kubernetes auth method, storage policy, and login role
 # the gateway's Vault credential driver uses, so every provider-creating test in
-# the suite can authenticate. The role binds ServiceAccount `openshell` in the
+# the suite can authenticate. The role binds ServiceAccount `ryno` in the
 # gateway namespace, matching ci/values-credential-driver-vault.yaml.
 provision_vault_auth() {
   echo "Provisioning OpenBao Kubernetes auth for the gateway service account..."
@@ -403,20 +403,20 @@ provision_vault_auth() {
     >/dev/null
 
   printf '%s\n' \
-    'path "secret/data/openshell/provider-credentials/*" {' \
+    'path "secret/data/ryno/provider-credentials/*" {' \
     '  capabilities = ["create", "read", "update", "delete"]' \
     '}' \
-    'path "secret/metadata/openshell/provider-credentials/*" {' \
+    'path "secret/metadata/ryno/provider-credentials/*" {' \
     '  capabilities = ["read", "delete", "list"]' \
     '}' \
     | kctl -n "${VAULT_NAMESPACE}" exec -i "${VAULT_RELEASE_NAME}-0" -- \
         env "BAO_TOKEN=${VAULT_DEV_ROOT_TOKEN}" \
-        bao policy write openshell-provider-storage - >/dev/null
+        bao policy write ryno-provider-storage - >/dev/null
 
-  openbao_exec write auth/kubernetes/role/openshell-gateway \
-    bound_service_account_names=openshell \
+  openbao_exec write auth/kubernetes/role/ryno-gateway \
+    bound_service_account_names=ryno \
     "bound_service_account_namespaces=${NAMESPACE}" \
-    policies=openshell-provider-storage \
+    policies=ryno-provider-storage \
     ttl=1h >/dev/null
 }
 
@@ -454,11 +454,11 @@ cleanup() {
       echo "=== Agent Sandbox resources ==="
       kctl -n "${NAMESPACE}" get sandboxes.agents.x-k8s.io -o yaml 2>&1 || true
       echo "=== gateway sandbox records ==="
-      "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
+      "${RYNO_BIN:-${ROOT}/target/debug/ryno}" \
         sandbox list --all-workspaces --output json 2>&1 || true
       echo "=== sandbox-runtime supervisor Pods ==="
       kctl -n "${NAMESPACE}" get pods \
-        -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
+        -l "ryno.ai/boundary-role=supervisor" -o yaml 2>&1 || true
       echo "=== sandbox-runtime supervisor logs (last 200 lines each) ==="
       while IFS= read -r supervisor_pod; do
         [ -n "${supervisor_pod}" ] || continue
@@ -469,7 +469,7 @@ cleanup() {
         kctl -n "${NAMESPACE}" logs "${supervisor_pod}" --previous \
           --all-containers --prefix --tail=200 2>&1 || true
       done < <(kctl -n "${NAMESPACE}" get pods \
-        -l "openshell.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
+        -l "ryno.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
       echo "=== gateway events ==="
       kctl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 \
         | tail -n 80 || true
@@ -509,7 +509,7 @@ cleanup() {
   if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     if command -v kubectl >/dev/null 2>&1; then
       kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
-        openshell-grpc-timeouts --ignore-not-found --wait=false \
+        ryno-grpc-timeouts --ignore-not-found --wait=false \
         >/dev/null 2>&1 || true
       kctl delete gatewayclass.gateway.networking.k8s.io eg \
         --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -530,7 +530,7 @@ cleanup() {
   if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
     oc adm policy remove-scc-from-user privileged \
       --context "${KUBE_CONTEXT}" \
-      -z openshell-sandbox -n "${NAMESPACE}" \
+      -z ryno-sandbox -n "${NAMESPACE}" \
       2>/dev/null || true
     OPENSHIFT_SANDBOX_SCC_GRANTED=0
   fi
@@ -544,8 +544,8 @@ cleanup() {
   # Sweep managed-mode and operator-mode workspace namespaces before
   # uninstalling the Helm release (ClusterRole still needed for deletion).
   if command -v kubectl >/dev/null 2>&1 && [ -n "${KUBE_CONTEXT}" ]; then
-    for label in "openshell.ai/managed-by=openshell" \
-                 "openshell.ai/e2e-operator-workspace=true"; do
+    for label in "ryno.ai/managed-by=ryno" \
+                 "ryno.ai/e2e-operator-workspace=true"; do
       ns_list="$(kctl get namespaces -l "${label}" -o name 2>/dev/null || true)"
       if [ -n "${ns_list}" ]; then
         echo "Cleaning up namespaces with label ${label}..."
@@ -594,7 +594,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
+# --- DB-scenario helpers (used only when RYNO_E2E_KUBE_DB_SCENARIOS=1) ---
 
 scenario_stop_portforward() {
   stop_gateway_portforward
@@ -648,10 +648,10 @@ run_scenario() {
   echo "==> Scenario: ${scenario_label}"
   echo "========================================"
 
-  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/ryno" \
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
-    --set "fullnameOverride=openshell" \
+    --set "fullnameOverride=ryno" \
     "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
     "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
@@ -674,7 +674,7 @@ run_scenario() {
       scenario_record_failure "${scenario_label}" "port-forward failed"
       return
     fi
-    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_NAME="ryno-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \
       "${XDG_CONFIG_HOME}" \
@@ -688,22 +688,22 @@ run_scenario() {
     return
   fi
 
-  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-  export OPENSHELL_E2E_DRIVER="kubernetes"
+  export RYNO_GATEWAY="${GATEWAY_NAME}"
+  export RYNO_E2E_DRIVER="kubernetes"
   # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
   # fixture containers must use the same Docker host so published ports and
   # cluster host-gateway aliases line up even on machines where Podman is also
   # installed.
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
-  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
-  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  export RYNO_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
+  export RYNO_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export RYNO_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
+  export RYNO_E2E_KUBE_NAMESPACE="${NAMESPACE}"
+  export RYNO_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
-    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
+    "${RYNO_BIN:-${ROOT}/target/debug/ryno}" "${ROOT}" || return 1
 
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: ${E2E_CMD[*]}"
   "${E2E_CMD[@]}" || scenario_exit=$?
@@ -759,12 +759,12 @@ openshift_register_route_gateway() {
   rm -rf "${pki_dir}"
   mkdir -p "${pki_dir}/client"
 
-  echo "Extracting client mTLS material from secret openshell-client-tls..."
-  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+  echo "Extracting client mTLS material from secret ryno-client-tls..."
+  kctl -n "${NAMESPACE}" get secret ryno-client-tls \
     -o jsonpath='{.data.ca\.crt}' | base64 -d >"${pki_dir}/ca.crt"
-  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+  kctl -n "${NAMESPACE}" get secret ryno-client-tls \
     -o jsonpath='{.data.tls\.crt}' | base64 -d >"${pki_dir}/client/tls.crt"
-  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+  kctl -n "${NAMESPACE}" get secret ryno-client-tls \
     -o jsonpath='{.data.tls\.key}' | base64 -d >"${pki_dir}/client/tls.key"
 
   # Wait until an mTLS request to the Route completes the TLS handshake. Helm
@@ -816,7 +816,7 @@ openshift_register_route_gateway() {
       ;;
   esac
 
-  GATEWAY_NAME="openshell-e2e-openshift"
+  GATEWAY_NAME="ryno-e2e-openshift"
   GATEWAY_ENDPOINT="https://${OPENSHIFT_ROUTE_HOST}"
   e2e_register_mtls_gateway \
     "${XDG_CONFIG_HOME}" \
@@ -826,14 +826,14 @@ openshift_register_route_gateway() {
     "${pki_dir}"
 }
 
-# Start `kubectl port-forward svc/openshell` for the gRPC endpoint and wait for
+# Start `kubectl port-forward svc/ryno` for the gRPC endpoint and wait for
 # it to accept TCP. Sets LOCAL_PORT and PORTFORWARD_PID. Prints the port-forward
 # log and returns non-zero on failure. Used for the vanilla-Kubernetes transport
 # (the OpenShift transport uses openshift_register_route_gateway instead).
 start_grpc_portforward() {
   LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
+  echo "Starting kubectl port-forward svc/ryno ${LOCAL_PORT}:8080..."
+  kctl -n "${NAMESPACE}" port-forward "svc/ryno" \
     "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
   PORTFORWARD_PID=$!
 
@@ -857,7 +857,7 @@ start_grpc_portforward() {
 
 # Start `kubectl port-forward` for the health endpoint and wait for /healthz.
 # Sets HEALTH_LOCAL_PORT and PORTFORWARD_HEALTH_PID and exports
-# OPENSHELL_E2E_HEALTH_PORT. Used on both cluster types: the OpenShift Route
+# RYNO_E2E_HEALTH_PORT. Used on both cluster types: the OpenShift Route
 # targets grpc only, and the health endpoint is not the SSH path so port-forward
 # is fine for it. Prints the log and returns non-zero on failure.
 start_health_portforward() {
@@ -877,7 +877,7 @@ start_health_portforward() {
       return 1
     fi
     if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
-      export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+      export RYNO_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
       return 0
     fi
     sleep 1
@@ -892,8 +892,8 @@ require_cmd helm
 require_cmd kubectl
 require_cmd curl
 
-if [ -n "${OPENSHELL_E2E_KUBE_CONTEXT:-}" ]; then
-  KUBE_CONTEXT="${OPENSHELL_E2E_KUBE_CONTEXT}"
+if [ -n "${RYNO_E2E_KUBE_CONTEXT:-}" ]; then
+  KUBE_CONTEXT="${RYNO_E2E_KUBE_CONTEXT}"
   echo "Using existing kubectl context: ${KUBE_CONTEXT}"
   if ! kctl cluster-info >/dev/null 2>&1; then
     echo "ERROR: kubectl context '${KUBE_CONTEXT}' is not reachable." >&2
@@ -903,7 +903,7 @@ else
   if ! command -v k3d >/dev/null 2>&1; then
     if [ "$(uname -s)" = "Linux" ]; then
       echo "ERROR: k3d is not installed by mise on Linux in this repo." >&2
-      echo "Set OPENSHELL_E2E_KUBE_CONTEXT to a kind/existing cluster, or install k3d explicitly." >&2
+      echo "Set RYNO_E2E_KUBE_CONTEXT to a kind/existing cluster, or install k3d explicitly." >&2
       exit 2
     fi
     require_cmd k3d
@@ -920,21 +920,21 @@ fi
 
 configure_fixture_container_engine
 
-if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
+if [ -z "${RYNO_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
-    OPENSHELL_E2E_KUBE_BUILD_IMAGES=1
+    RYNO_E2E_KUBE_BUILD_IMAGES=1
   else
-    OPENSHELL_E2E_KUBE_BUILD_IMAGES=0
+    RYNO_E2E_KUBE_BUILD_IMAGES=0
   fi
 fi
 
 reuse_sandbox_image=0
 reuse_supervisor_image=0
-if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
-  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
+if [ "${RYNO_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
+  REGISTRY_VALUE="${RYNO_REGISTRY:-ryno}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-e2e-${CLUSTER_NAME:-local}}"
 else
-  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+  REGISTRY_VALUE="${RYNO_REGISTRY:-ghcr.io/nvidia/ryno}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
@@ -953,11 +953,11 @@ SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
 # Docker containers with published ports). The Helm chart wires this into pod
-# hostAliases for host.openshell.internal / host.docker.internal — without it,
+# hostAliases for host.ryno.internal / host.docker.internal — without it,
 # every test that relies on the alias has to skip on the kube driver.
 #
 # Preference order:
-#   1. OPENSHELL_E2E_HOST_GATEWAY_IP — operator override (remote clusters where
+#   1. RYNO_E2E_HOST_GATEWAY_IP — operator override (remote clusters where
 #      auto-detection has no signal).
 #   2. k3d's CoreDNS host.k3d.internal entry. On Docker Desktop this is a
 #      host-routable address; the Docker network gateway is not.
@@ -965,7 +965,7 @@ SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e
 #      clusters, `kind` for kind clusters used in CI). Pods SNAT through their
 #      node to this IP, which lands on the host's bridge interface and reaches
 #      any 0.0.0.0-bound listener / published container port.
-HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:-}"
+HOST_GATEWAY_IP="${RYNO_E2E_HOST_GATEWAY_IP:-}"
 
 # k3d primes CoreDNS with `host.k3d.internal` pointing at the IP that pods can
 # use to reach the host (Docker Desktop's gvisor-net loopback on macOS/Windows,
@@ -1021,8 +1021,8 @@ if [ -z "${HOST_GATEWAY_IP}" ] \
 fi
 if [ -z "${HOST_GATEWAY_IP}" ]; then
   echo "WARNING: could not resolve a host gateway IP for the active cluster." >&2
-  echo "         Tests that require host.openshell.internal will be skipped." >&2
-  echo "         Set OPENSHELL_E2E_HOST_GATEWAY_IP to override." >&2
+  echo "         Tests that require host.ryno.internal will be skipped." >&2
+  echo "         Set RYNO_E2E_HOST_GATEWAY_IP to override." >&2
 fi
 
 # Import locally available gateway, sandbox, and supervisor images into the k3d cluster so
@@ -1039,22 +1039,22 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
     import_cluster_name="${candidate}"
   fi
 fi
-if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
+if [ "${RYNO_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
   echo "Building local Kubernetes e2e images (${BUILD_GATEWAY_IMAGE}, ${BUILD_SUPERVISOR_IMAGE})..."
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     if [ "$(uname -s)" != "Linux" ]; then
       echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
       exit 2
     fi
-    external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
-    external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
-    if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
-      cargo build -p openshell-gateway --bin openshell-gateway \
+    external_gateway="${RYNO_GATEWAY_BIN:-${ROOT}/target/debug/ryno-gateway}"
+    external_driver="${RYNO_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/ryno-driver-kubernetes}"
+    if [ -z "${RYNO_GATEWAY_BIN:-}" ]; then
+      cargo build -p ryno-gateway --bin ryno-gateway \
         --no-default-features --features telemetry,vendored-z3
     fi
-    if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
-      cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
+    if [ -z "${RYNO_EXTERNAL_DRIVER_BIN:-}" ]; then
+      cargo build -p ryno-driver-kubernetes --bin ryno-driver-kubernetes
     fi
     case "$(uname -m)" in
       x86_64) external_arch=amd64 ;;
@@ -1063,8 +1063,8 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     esac
     external_stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${external_arch}"
     mkdir -p "${external_stage}"
-    cp "${external_gateway}" "${external_stage}/openshell-gateway"
-    cp "${external_driver}" "${external_stage}/openshell-driver-kubernetes"
+    cp "${external_gateway}" "${external_stage}/ryno-gateway"
+    cp "${external_driver}" "${external_stage}/ryno-driver-kubernetes"
     docker build \
       --build-arg "TARGETARCH=${external_arch}" \
       --build-arg "SUPERVISOR_IMAGE=${BUILD_SUPERVISOR_IMAGE}" \
@@ -1078,11 +1078,11 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   fi
   sandbox_image="${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}"
   if [ "${GATEWAY_IMAGE}" != "${BUILD_GATEWAY_IMAGE}" ]; then
-    if e2e_image_reference_has_digest "${GATEWAY_IMAGE}"; then echo "ERROR: digest-pinned GATEWAY_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    if e2e_image_reference_has_digest "${GATEWAY_IMAGE}"; then echo "ERROR: digest-pinned GATEWAY_IMAGE requires RYNO_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
     docker tag "${BUILD_GATEWAY_IMAGE}" "${GATEWAY_IMAGE}"
   fi
   supervisor_image="${BUILD_SUPERVISOR_IMAGE}"
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
+  if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${sandbox_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
@@ -1092,12 +1092,12 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   fi
   if [ "${SANDBOX_RUNTIME_IMAGE}" != "${sandbox_image}" ]; then
     if e2e_image_reference_has_digest "${SANDBOX_RUNTIME_IMAGE}"; then
-      echo "ERROR: digest-pinned SANDBOX_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2
+      echo "ERROR: digest-pinned SANDBOX_IMAGE requires RYNO_E2E_KUBE_BUILD_IMAGES=0" >&2
       exit 2
     fi
     docker tag "${sandbox_image}" "${SANDBOX_RUNTIME_IMAGE}"
   fi
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
+  if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
@@ -1106,7 +1106,7 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     echo "Reusing existing supervisor image ${supervisor_image}"
   fi
   if [ "${SUPERVISOR_IMAGE}" != "${BUILD_SUPERVISOR_IMAGE}" ]; then
-    if e2e_image_reference_has_digest "${SUPERVISOR_IMAGE}"; then echo "ERROR: digest-pinned SUPERVISOR_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    if e2e_image_reference_has_digest "${SUPERVISOR_IMAGE}"; then echo "ERROR: digest-pinned SUPERVISOR_IMAGE requires RYNO_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
     docker tag "${BUILD_SUPERVISOR_IMAGE}" "${SUPERVISOR_IMAGE}"
   fi
 fi
@@ -1123,7 +1123,7 @@ if [ -n "${import_cluster_name}" ]; then
         --mode direct >/dev/null
     fi
   done
-elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
+elif [ "${RYNO_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
    && [[ "${KUBE_CONTEXT}" == kind-* ]] \
    && command -v kind >/dev/null 2>&1; then
   kind_cluster_name="${KUBE_CONTEXT#kind-}"
@@ -1162,40 +1162,40 @@ if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | 
   fi
 fi
 
-ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
-if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+ACTIVE_CREDENTIAL_DRIVER="${RYNO_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
+if [ "${RYNO_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
    && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
   deploy_vault_fixture
 fi
 
 helm_extra_args=()
 helm_post_renderer_args=()
-helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-  if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
-    echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
+helm_extra_args+=(--set "server.telemetryEnabled=${RYNO_TELEMETRY_ENABLED}")
+if [ "${RYNO_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  if [ "${RYNO_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
+    echo "ERROR: external Kubernetes driver e2e requires RYNO_E2E_KUBE_BUILD_IMAGES=1." >&2
     exit 2
   fi
   export HELM_PLUGINS="${ROOT}/e2e/helm-plugins"
   helm_post_renderer_args+=(
-    --post-renderer openshell-external-compute-driver
+    --post-renderer ryno-external-compute-driver
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
-helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+helm_values_args=(--values "${ROOT}/deploy/helm/ryno/ci/values-skaffold.yaml")
 if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   echo "OpenShift detected — applying SCC-compatible security context overrides."
-  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
+  helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-openshift-scc.yaml")
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
 
-  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
+  echo "Granting privileged SCC to ryno-sandbox in namespace ${NAMESPACE}..."
   oc adm policy add-scc-to-user privileged \
     --context "${KUBE_CONTEXT}" \
-    -z openshell-sandbox -n "${NAMESPACE}"
+    -z ryno-sandbox -n "${NAMESPACE}"
   OPENSHIFT_SANDBOX_SCC_GRANTED=1
 
   # Drive the gateway through a passthrough Route with mTLS instead of
@@ -1211,20 +1211,20 @@ if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   OPENSHIFT_ROUTE_HOST="${RELEASE_NAME}-${NAMESPACE}.${APPS_DOMAIN}"
   echo "Using OpenShift Route host ${OPENSHIFT_ROUTE_HOST}."
 
-  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-e2e.yaml")
+  helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-openshift-e2e.yaml")
   helm_extra_args+=(--set "openshiftRoute.host=${OPENSHIFT_ROUTE_HOST}")
   helm_extra_args+=(--set "pkiInitJob.serverDnsNames[0]=${OPENSHIFT_ROUTE_HOST}")
 fi
-if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
+if [ "${RYNO_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
   if [ -z "${HOST_GATEWAY_IP}" ]; then
-    echo "ERROR: corporate proxy e2e requires a host gateway IP for host.openshell.internal" >&2
+    echo "ERROR: corporate proxy e2e requires a host gateway IP for host.ryno.internal" >&2
     exit 2
   fi
   CORPORATE_PROXY_PORT="$(e2e_pick_port)"
-  CORPORATE_PROXY_MODE="${OPENSHELL_E2E_KUBE_CORPORATE_PROXY_MODE:-authenticated}"
+  CORPORATE_PROXY_MODE="${RYNO_E2E_KUBE_CORPORATE_PROXY_MODE:-authenticated}"
   CORPORATE_PROXY_UPSTREAM_PORT=""
   if [ "${CORPORATE_PROXY_MODE}" = "missing-secret" ] || [ "${CORPORATE_PROXY_MODE}" = "malformed" ]; then
-    export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
+    export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-45}"
   fi
   CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
   # `https-ca` terminates TLS on the proxy listener itself, so the supervisor
@@ -1235,12 +1235,12 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
   fi
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
 upstreamProxy:
-  url: ${CORPORATE_PROXY_SCHEME}://host.openshell.internal:${CORPORATE_PROXY_PORT}
+  url: ${CORPORATE_PROXY_SCHEME}://host.ryno.internal:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
     cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
-  noProxy: host.openshell.internal
+  noProxy: host.ryno.internal
 EOF
   fi
   case "${CORPORATE_PROXY_MODE}" in
@@ -1270,16 +1270,16 @@ EOF
       openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
         -keyout "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
         -out "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
-        -subj "/CN=OpenShell E2E Corporate Proxy CA" >/dev/null 2>&1
+        -subj "/CN=Ryno E2E Corporate Proxy CA" >/dev/null 2>&1
       openssl req -newkey rsa:2048 -nodes \
         -keyout "${CORPORATE_PROXY_TLS_DIR}/proxy.key" \
         -out "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
-        -subj "/CN=host.openshell.internal" >/dev/null 2>&1
+        -subj "/CN=host.ryno.internal" >/dev/null 2>&1
       cat >"${CORPORATE_PROXY_TLS_DIR}/leaf.ext" <<EXT
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=DNS:host.openshell.internal
+subjectAltName=DNS:host.ryno.internal
 EXT
       openssl x509 -req -days 1 \
         -in "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
@@ -1300,37 +1300,37 @@ EXT
   caBundle:
     configMapName: ${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}
 EOF
-      OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.crt")"
-      OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.key")"
-      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT
-      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY
+      RYNO_E2E_CORPORATE_PROXY_TLS_CERT="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.crt")"
+      RYNO_E2E_CORPORATE_PROXY_TLS_KEY="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.key")"
+      export RYNO_E2E_CORPORATE_PROXY_TLS_CERT
+      export RYNO_E2E_CORPORATE_PROXY_TLS_KEY
       ;;
     missing-secret) ;;
     *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;
   esac
-  export OPENSHELL_E2E_CORPORATE_PROXY_PORT="${CORPORATE_PROXY_PORT}"
-  export OPENSHELL_E2E_CORPORATE_PROXY_UPSTREAM_PORT="${CORPORATE_PROXY_UPSTREAM_PORT}"
-  export OPENSHELL_E2E_CORPORATE_PROXY_MODE="${CORPORATE_PROXY_MODE}"
-  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-corporate-proxy-e2e.yaml")
+  export RYNO_E2E_CORPORATE_PROXY_PORT="${CORPORATE_PROXY_PORT}"
+  export RYNO_E2E_CORPORATE_PROXY_UPSTREAM_PORT="${CORPORATE_PROXY_UPSTREAM_PORT}"
+  export RYNO_E2E_CORPORATE_PROXY_MODE="${CORPORATE_PROXY_MODE}"
+  helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-corporate-proxy-e2e.yaml")
   helm_values_args+=(--values "${CORPORATE_PROXY_VALUES}")
 fi
-if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
+if [ "${RYNO_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
   case "${ACTIVE_CREDENTIAL_DRIVER}" in
     kubernetes-secrets)
-      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-kubernetes-secrets.yaml")
+      helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-credential-driver-kubernetes-secrets.yaml")
       ;;
     vault)
-      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-vault.yaml")
+      helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-credential-driver-vault.yaml")
       ;;
     *)
-      echo "ERROR: OPENSHELL_E2E_CREDENTIAL_DRIVER must be kubernetes-secrets or vault, got '${ACTIVE_CREDENTIAL_DRIVER}'" >&2
+      echo "ERROR: RYNO_E2E_CREDENTIAL_DRIVER must be kubernetes-secrets or vault, got '${ACTIVE_CREDENTIAL_DRIVER}'" >&2
       exit 2
       ;;
   esac
-  export OPENSHELL_E2E_CREDENTIAL_DRIVER="${ACTIVE_CREDENTIAL_DRIVER}"
+  export RYNO_E2E_CREDENTIAL_DRIVER="${ACTIVE_CREDENTIAL_DRIVER}"
 fi
-if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
-  IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
+if [ -n "${RYNO_E2E_KUBE_EXTRA_VALUES:-}" ]; then
+  IFS=':' read -r -a extra_values_files <<< "${RYNO_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
     [ -n "${values_file}" ] || continue
     if [[ "${values_file}" != /* ]]; then
@@ -1340,11 +1340,11 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   done
 fi
 if use_envoy_gateway; then
-  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
+  helm_values_args+=(--values "${ROOT}/deploy/helm/ryno/ci/values-gateway.yaml")
   install_envoy_gateway
 fi
 
-if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
+if [ "${RYNO_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   # --- Multi-scenario mode: test all database backends ---
   DB_PASSED=0
   DB_FAILED=0
@@ -1376,15 +1376,15 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   fi
 else
   # --- Single-install mode (default, existing behavior) ---
-  if [ -n "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET:-}" ]; then
-    deploy_postgres_fixture "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET}"
+  if [ -n "${RYNO_E2E_KUBE_EXTERNAL_POSTGRES_SECRET:-}" ]; then
+    deploy_postgres_fixture "${RYNO_E2E_KUBE_EXTERNAL_POSTGRES_SECRET}"
   fi
 
   echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
-  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/ryno" \
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
-    --set "fullnameOverride=openshell" \
+    --set "fullnameOverride=ryno" \
     "${GLOBAL_HELM_IMAGE_ARGS[@]}" \
     "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
     "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
@@ -1394,15 +1394,15 @@ else
     --wait --timeout 5m
   HELM_INSTALLED=1
 
-  if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
+  if [ -n "${RYNO_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \
-      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      "${RYNO_E2E_KUBE_IMAGE_PULL_SECRET}" \
       --docker-server=registry.example.test \
       --docker-username=e2e-user \
       --docker-password=e2e-password
     kctl -n "${NAMESPACE}" label secret \
-      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
-      openshell.ai/sandbox-attachable=true
+      "${RYNO_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      ryno.ai/sandbox-attachable=true
   fi
 
   if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
@@ -1412,7 +1412,7 @@ else
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1
-    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_NAME="ryno-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \
       "${XDG_CONFIG_HOME}" \
@@ -1423,22 +1423,22 @@ else
 
   start_health_portforward || exit 1
 
-  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-  export OPENSHELL_E2E_DRIVER="kubernetes"
+  export RYNO_GATEWAY="${GATEWAY_NAME}"
+  export RYNO_E2E_DRIVER="kubernetes"
   # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
   # fixture containers must use the same Docker host so published ports and
   # cluster host-gateway aliases line up even on machines where Podman is also
   # installed.
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
-  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
-  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  export RYNO_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
+  export RYNO_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export RYNO_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
+  export RYNO_E2E_KUBE_NAMESPACE="${NAMESPACE}"
+  export RYNO_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export RYNO_PROVISION_TIMEOUT="${RYNO_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
-    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1
+    "${RYNO_BIN:-${ROOT}/target/debug/ryno}" "${ROOT}" || exit 1
 
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: $*"
   "$@"

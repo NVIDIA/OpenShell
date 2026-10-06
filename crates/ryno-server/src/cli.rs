@@ -1,0 +1,3384 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared CLI entrypoint for the gateway binaries.
+
+use clap::parser::ValueSource;
+use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
+use miette::{IntoDiagnostic, Result};
+use ryno_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+use crate::certgen;
+use crate::compute::driver_config::GuestTlsPaths;
+use crate::config_file::{self, ConfigFile, GatewayFileSection};
+use crate::defaults::{self, LocalTlsPaths};
+use crate::{ComputeDriverRegistry, ServerStartupConfig, run_server, tracing_bus::TracingLogBus};
+
+/// `Ryno` gateway process - gRPC and HTTP server with protocol multiplexing.
+///
+/// Top-level CLI. When invoked without a subcommand the binary runs the
+/// gateway server using `RunArgs`. The `generate-certs` subcommand is used by
+/// the Helm pre-install hook to bootstrap mTLS Secrets.
+#[derive(Parser, Debug)]
+#[command(version = ryno_core::VERSION)]
+#[command(about = "Ryno gRPC/HTTP server", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
+    GenerateCerts(certgen::CertgenArgs),
+    /// Inspect gateway configuration without starting the service.
+    Config(ConfigArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ConfigCommand {
+    /// Validate the selected configuration without modifying it or starting the gateway.
+    Preflight(ConfigPreflightArgs),
+}
+
+#[derive(clap::Args, Debug, Default)]
+struct ConfigPreflightArgs {
+    /// Explicit configuration path. Overrides `RYNO_GATEWAY_CONFIG` and XDG discovery.
+    #[arg(long, conflicts_with = "gateway_args")]
+    path: Option<PathBuf>,
+
+    /// Gateway daemon arguments to replay after `--`.
+    #[arg(last = true, allow_hyphen_values = true, value_name = "GATEWAY_ARGS")]
+    gateway_args: Vec<OsString>,
+}
+
+#[derive(clap::Args, Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct RunArgs {
+    /// Path to a TOML configuration file (see RFC 0003).
+    ///
+    /// When set, gateway-wide settings and per-driver tables are read from
+    /// the file. Gateway command-line flags and `RYNO_*` environment
+    /// variables continue to take precedence over gateway file values.
+    #[arg(long, env = "RYNO_GATEWAY_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Operator-assigned name for this gateway installation.
+    #[arg(
+        long = "name",
+        default_value = DEFAULT_GATEWAY_NAME,
+        env = "RYNO_GATEWAY_NAME"
+    )]
+    name: String,
+
+    /// IP address to bind the server, health, and metrics listeners to.
+    #[arg(long, default_value = "127.0.0.1", env = "RYNO_BIND_ADDRESS")]
+    bind_address: IpAddr,
+
+    /// Port to bind the server to.
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "RYNO_SERVER_PORT")]
+    port: u16,
+
+    /// Port for unauthenticated health endpoints (healthz, readyz).
+    /// Set to 0 to disable the dedicated health listener.
+    #[arg(long, default_value_t = 0, env = "RYNO_HEALTH_PORT")]
+    health_port: u16,
+
+    /// Port for the Prometheus metrics endpoint (/metrics).
+    /// Set to 0 to disable the dedicated metrics listener.
+    #[arg(long, default_value_t = 0, env = "RYNO_METRICS_PORT")]
+    metrics_port: u16,
+
+    /// Log level (trace, debug, info, warn, error).
+    #[arg(long, default_value = "info", env = "RYNO_LOG_LEVEL")]
+    log_level: String,
+
+    /// Path to TLS certificate file (required unless --disable-tls).
+    #[arg(long, env = "RYNO_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to TLS private key file (required unless --disable-tls).
+    #[arg(long, env = "RYNO_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// Path to CA certificate for client certificate verification (mTLS).
+    #[arg(long, env = "RYNO_TLS_CLIENT_CA")]
+    tls_client_ca: Option<PathBuf>,
+
+    /// Database URL for persistence.
+    ///
+    /// When unset, the gateway stores state under the `XDG` state
+    /// directory. Kept as an Option at the clap layer so the `generate-certs`
+    /// subcommand can run without gateway runtime defaults.
+    #[arg(long, env = "RYNO_DB_URL")]
+    db_url: Option<String>,
+
+    /// Compute driver configured for this gateway.
+    ///
+    /// Accepts one registered driver name. When unset, the gateway runs
+    /// detection probes supplied by the drivers compiled into the binary.
+    #[arg(
+        long = "compute-driver",
+        env = "RYNO_COMPUTE_DRIVER",
+        value_parser = parse_compute_driver
+    )]
+    compute_driver: Option<String>,
+
+    /// Path to a Unix domain socket served by a remote compute driver
+    /// implementing `compute_driver.proto`.
+    ///
+    /// When set, the socket is associated with the driver name supplied by
+    /// `--compute-driver` or `RYNO_COMPUTE_DRIVER` and replaces normal
+    /// construction for that selected name, including a compiled registration
+    /// with the same name. The gateway connects to this operator-provided
+    /// endpoint; it does not provision the remote driver.
+    #[arg(long, env = "RYNO_COMPUTE_DRIVER_SOCKET")]
+    compute_driver_socket: Option<PathBuf>,
+
+    /// Disable TLS entirely — listen on plaintext HTTP.
+    /// Use this when the gateway sits behind a reverse proxy or tunnel
+    /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
+    #[arg(long, env = "RYNO_DISABLE_TLS")]
+    disable_tls: bool,
+
+    /// OIDC issuer URL for JWT-based authentication.
+    /// When set, the server validates `authorization: Bearer` tokens on gRPC
+    /// requests against the issuer's JWKS endpoint.
+    #[arg(long, env = "RYNO_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// Development only: permit OIDC metadata and JWKS over HTTP when the
+    /// endpoint uses a numeric loopback address.
+    #[arg(
+        long,
+        env = "RYNO_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    oidc_dangerously_allow_insecure_http: bool,
+
+    /// Additional HTTPS origins allowed to serve the issuer's JWKS.
+    #[arg(long, env = "RYNO_OIDC_JWKS_ALLOWED_ORIGINS", value_delimiter = ',')]
+    oidc_jwks_allowed_origins: Vec<String>,
+
+    /// Enable mTLS client certificate authentication for gateway users.
+    ///
+    /// When unset, this defaults on when client certificate verification is
+    /// configured and no OIDC issuer is present.
+    #[arg(
+        long = "enable-mtls-auth",
+        env = "RYNO_ENABLE_MTLS_AUTH",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_mtls_auth: bool,
+
+    /// Expected OIDC audience claim (typically the client ID).
+    #[arg(long, env = "RYNO_OIDC_AUDIENCE", default_value = "ryno-cli")]
+    oidc_audience: String,
+
+    /// JWKS key cache TTL in seconds.
+    #[arg(long, env = "RYNO_OIDC_JWKS_TTL", default_value_t = 3600)]
+    oidc_jwks_ttl: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
+    #[arg(
+        long,
+        env = "RYNO_OIDC_ROLES_CLAIM",
+        default_value = "realm_access.roles"
+    )]
+    oidc_roles_claim: String,
+
+    /// Role name that grants admin access.
+    #[arg(long, env = "RYNO_OIDC_ADMIN_ROLE", default_value = "ryno-admin")]
+    oidc_admin_role: String,
+
+    /// Role name that grants standard user access.
+    #[arg(long, env = "RYNO_OIDC_USER_ROLE", default_value = "ryno-user")]
+    oidc_user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When set, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
+    #[arg(long, env = "RYNO_OIDC_SCOPES_CLAIM", default_value = "")]
+    oidc_scopes_claim: String,
+
+    /// Maximum gRPC requests allowed per rate-limit window. Set to 0 to disable.
+    #[arg(long, env = "RYNO_GRPC_RATE_LIMIT_REQUESTS")]
+    grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds. Set to 0 to disable.
+    #[arg(long, env = "RYNO_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
+    grpc_rate_limit_window_seconds: Option<u64>,
+
+    /// Subject Alternative Names configured on the gateway server certificate.
+    /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
+    #[arg(long = "server-san", env = "RYNO_SERVER_SAN", value_delimiter = ',')]
+    server_sans: Vec<String>,
+
+    /// Enable plaintext HTTP routing for loopback sandbox service URLs.
+    #[arg(
+        long,
+        env = "RYNO_ENABLE_LOOPBACK_SERVICE_HTTP",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    enable_loopback_service_http: bool,
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[arg(
+        long,
+        env = "RYNO_ENABLE_WEBSOCKET_TUNNEL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_websocket_tunnel: bool,
+}
+
+pub fn command() -> Command {
+    Cli::command().name("ryno-gateway").bin_name("ryno-gateway")
+}
+
+pub async fn run_cli() -> Result<()> {
+    run_cli_with_compute_drivers(ComputeDriverRegistry::new()).await
+}
+
+/// Run the gateway CLI with the compute drivers linked by the binary.
+pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry) -> Result<()> {
+    let matches = command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).expect("clap validated args");
+
+    match cli.command {
+        Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        Some(Commands::Config(args)) => match args.command {
+            ConfigCommand::Preflight(args) => {
+                let driver =
+                    run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)?;
+                for report in preflight_host_tools(driver).await? {
+                    println!("{report}");
+                }
+                Ok(())
+            }
+        },
+        None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
+    }
+}
+
+fn resolve_legacy_driver_selector_env(args: &mut RunArgs) -> Result<bool> {
+    let Some(raw) = std::env::var_os("RYNO_DRIVERS") else {
+        return Ok(false);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        miette::miette!(
+            "RYNO_DRIVERS contains an invalid compute driver name; expected ASCII letters, digits, '-' or '_'"
+        )
+    })?;
+    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(miette::miette!(
+            "RYNO_DRIVERS must contain exactly one non-empty compute driver name; comma-delimited lists are not supported"
+        ));
+    }
+    let legacy = ryno_core::config::normalize_compute_driver_name(values[0]).map_err(|_| {
+        miette::miette!(
+            "RYNO_DRIVERS contains an invalid compute driver name; expected ASCII letters, digits, '-' or '_'"
+        )
+    })?;
+
+    if let Some(canonical) = args.compute_driver.as_deref() {
+        let canonical = ryno_core::config::normalize_compute_driver_name(canonical)
+            .map_err(|error| miette::miette!("{error}"))?;
+        if canonical != legacy {
+            return Err(miette::miette!(
+                "RYNO_DRIVERS conflicts with the canonical compute-driver selection; remove RYNO_DRIVERS"
+            ));
+        }
+    } else {
+        args.compute_driver = Some(legacy);
+    }
+
+    Ok(true)
+}
+
+#[cfg(test)]
+fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<ServerStartupConfig> {
+    prepare_server_config_with_drivers(args, matches, &ComputeDriverRegistry::new())
+}
+
+fn prepare_server_config_with_drivers(
+    args: &mut RunArgs,
+    matches: &ArgMatches,
+    compute_drivers: &ComputeDriverRegistry,
+) -> Result<ServerStartupConfig> {
+    // Load TOML when explicitly requested, or from the default XDG location
+    // when that file exists. Missing default config is not an error: runtime
+    // defaults and RYNO_* env vars are enough for package-managed starts.
+    let config_path = resolve_config_path(args)?;
+    let file: Option<ConfigFile> = if let Some(path) = config_path {
+        Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
+    } else {
+        None
+    };
+    if let Some(file) = file.as_ref() {
+        merge_file_into_args(args, &file.ryno.gateway, matches);
+    }
+    let legacy_compute_driver_env_seen = resolve_legacy_driver_selector_env(args)?;
+    normalize_compute_driver_socket_args(args)?;
+    let compute_driver = compute_drivers
+        .select(args.compute_driver.as_deref())
+        .map_err(|error| miette::miette!("{error}"))?;
+    let local_tls = apply_runtime_defaults(args)?;
+    let guest_tls = GuestTlsPaths::resolve(
+        file.as_ref().map(|file| &file.ryno.gateway),
+        local_tls.as_ref(),
+        args.disable_tls,
+    )
+    .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
+    // Explicit signing configuration must not depend on an unrelated, partial
+    // local bundle left by a package-managed installation.
+    let explicit_jwt = file
+        .as_ref()
+        .and_then(|file| file.ryno.gateway.gateway_jwt.clone());
+    let gateway_jwt = match explicit_jwt {
+        Some(jwt) => Some(jwt),
+        None => defaults::complete_local_jwt_config()?,
+    };
+
+    let bind = SocketAddr::new(args.bind_address, args.port);
+
+    let has_client_ca = args.tls_client_ca.is_some();
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file.as_ref());
+
+    if args.disable_tls && has_client_ca {
+        return Err(miette::miette!(
+            "--disable-tls and --tls-client-ca are mutually exclusive. Client certificate verification requires that TLS be enabled."
+        ));
+    }
+    if mtls_auth_enabled && args.disable_tls {
+        return Err(miette::miette!(
+            "mTLS user authentication requires TLS. Remove --disable-tls or disable --enable-mtls-auth."
+        ));
+    }
+    if mtls_auth_enabled && !has_client_ca {
+        return Err(miette::miette!(
+            "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
+        ));
+    }
+    let tls = if args.disable_tls {
+        None
+    } else {
+        let cert_path = args.tls_cert.clone().ok_or_else(|| {
+            miette::miette!(
+                "--tls-cert is required when TLS is enabled (use --disable-tls to skip)"
+            )
+        })?;
+        let key_path = args.tls_key.clone().ok_or_else(|| {
+            miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
+        })?;
+        // External cert config (SNI-based dual cert) is only configurable
+        // via the TOML file, not CLI flags — it's a deployment-time setting.
+        let (ext_cert, ext_key, ext_names) = file
+            .as_ref()
+            .and_then(|f| f.ryno.gateway.tls.as_ref())
+            .map(|tls| {
+                (
+                    tls.external_cert_path.clone(),
+                    tls.external_key_path.clone(),
+                    tls.external_server_names.clone(),
+                )
+            })
+            .unwrap_or_default();
+        Some(ryno_core::TlsConfig {
+            cert_path,
+            key_path,
+            // Sandboxes authenticate at the application layer with bearer
+            // identity, so TLS must permit clients without certificates.
+            // When present, CLI certificates are still verified and may be
+            // promoted to users by the independently configured mTLS policy.
+            require_client_auth: false,
+            client_ca_path: args.tls_client_ca.clone(),
+            external_cert_path: ext_cert,
+            external_key_path: ext_key,
+            external_server_names: ext_names,
+        })
+    };
+
+    let db_url = args
+        .db_url
+        .clone()
+        .expect("runtime defaults populate db_url");
+
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err(miette::miette!("gateway name must not be empty"));
+    }
+
+    let mut config = ryno_core::Config::new(tls)
+        .with_name(name)
+        .with_bind_address(bind)
+        .with_log_level(&args.log_level);
+    if let Some(auth) = file.as_ref().and_then(|f| f.ryno.gateway.auth.clone()) {
+        config.auth = auth;
+    }
+    config.mtls_auth.enabled = mtls_auth_enabled;
+
+    // Listener addresses for the health and metrics endpoints. The file may
+    // pin a different interface than the main listener (e.g. health on
+    // 127.0.0.1 while gRPC binds 0.0.0.0); the full `SocketAddr` from the
+    // file is preserved unless CLI/env supplied an explicit `--health-port` /
+    // `--metrics-port`, in which case the port overrides the file value
+    // while the IP defaults to `args.bind_address`.
+    let file_gateway = file.as_ref().map(|f| &f.ryno.gateway);
+    let health_bind = resolve_aux_listener(
+        args.bind_address,
+        args.health_port,
+        matches,
+        "health_port",
+        || file_gateway.and_then(|g| g.health_bind_address),
+    );
+    let metrics_bind = resolve_aux_listener(
+        args.bind_address,
+        args.metrics_port,
+        matches,
+        "metrics_port",
+        || file_gateway.and_then(|g| g.metrics_bind_address),
+    );
+
+    if let Some(addr) = health_bind {
+        if args.port == addr.port() {
+            return Err(miette::miette!(
+                "--port and --health-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        config = config.with_health_bind_address(addr);
+    }
+
+    if let Some(addr) = metrics_bind {
+        if args.port == addr.port() {
+            return Err(miette::miette!(
+                "--port and --metrics-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        if let Some(health) = health_bind
+            && health.port() == addr.port()
+        {
+            return Err(miette::miette!(
+                "--health-port and --metrics-port must be different (both set to {})",
+                health.port()
+            ));
+        }
+        config = config.with_metrics_bind_address(addr);
+    }
+
+    config = config.with_database_url(db_url);
+    if let Some(driver) = &args.compute_driver {
+        config = config.with_compute_driver(driver);
+    }
+    config = config
+        .with_grpc_rate_limit(
+            args.grpc_rate_limit_requests,
+            args.grpc_rate_limit_window_seconds,
+        )
+        .with_gateway_interceptors(
+            file.as_ref()
+                .map(|f| f.ryno.gateway.interceptors.clone())
+                .unwrap_or_default(),
+        )
+        .with_server_sans(args.server_sans.clone())
+        .with_loopback_service_http(args.enable_loopback_service_http)
+        .with_websocket_tunnel(args.enable_websocket_tunnel);
+    if let Some(sources) = file
+        .as_ref()
+        .and_then(|file| file.ryno.gateway.provider_profile_sources.clone())
+    {
+        config = config.with_provider_profile_sources(sources);
+    }
+
+    if let Some(gateway_file) = file.as_ref().map(|f| &f.ryno.gateway) {
+        if let Some(drivers) = &gateway_file.credential_drivers {
+            config = config.with_credential_drivers(drivers.clone());
+        }
+        if let Some(default_driver) = &gateway_file.default_credential_driver {
+            config = config.with_default_credential_driver(Some(default_driver.clone()));
+        }
+    }
+    validate_grpc_rate_limit_args(
+        args.grpc_rate_limit_requests,
+        args.grpc_rate_limit_window_seconds,
+    )?;
+    if let Some(socket) = args.compute_driver_socket.clone() {
+        let driver = args
+            .compute_driver
+            .as_ref()
+            .expect("normalize_compute_driver_socket_args sets a driver for socket endpoints");
+        config = config.with_compute_driver_endpoint(driver.clone(), socket);
+    }
+
+    if let Some(ttl) = file
+        .as_ref()
+        .and_then(|f| f.ryno.gateway.ssh_session_ttl_secs)
+    {
+        config = config.with_ssh_session_ttl_secs(ttl);
+    }
+
+    if let Some(mode) = file
+        .as_ref()
+        .and_then(|f| f.ryno.gateway.policy_validation_failure_mode)
+    {
+        config.policy_validation_failure_mode = mode;
+    }
+
+    if let Some(seconds) = file
+        .as_ref()
+        .and_then(|f| f.ryno.gateway.image_preparation_timeout_seconds)
+    {
+        if !(1..=86_400).contains(&seconds) {
+            return Err(miette::miette!(
+                "image_preparation_timeout_seconds must be between 1 and 86400"
+            ));
+        }
+        config.image_preparation_timeout_seconds = seconds;
+    }
+
+    if let Some(issuer) = args.oidc_issuer.clone() {
+        config = config.with_oidc(ryno_core::OidcConfig {
+            issuer,
+            dangerously_allow_insecure_http: args.oidc_dangerously_allow_insecure_http,
+            jwks_allowed_origins: args.oidc_jwks_allowed_origins.clone(),
+            audience: args.oidc_audience.clone(),
+            jwks_ttl_secs: args.oidc_jwks_ttl,
+            roles_claim: args.oidc_roles_claim.clone(),
+            admin_role: args.oidc_admin_role.clone(),
+            user_role: args.oidc_user_role.clone(),
+            scopes_claim: args.oidc_scopes_claim.clone(),
+        });
+    }
+
+    // `gateway_jwt` is configured through TOML in cluster deployments. Local
+    // package-managed starts also auto-detect the JWT bundle written next to
+    // the generated TLS bundle so upgrades pick up sandbox auth without a
+    // user-authored config file.
+    config.gateway_jwt = gateway_jwt;
+
+    Ok(ServerStartupConfig {
+        config,
+        config_file: file,
+        guest_tls,
+        compute_driver,
+        legacy_compute_driver_env_seen,
+    })
+}
+
+async fn run_from_args(
+    mut args: RunArgs,
+    matches: ArgMatches,
+    compute_drivers: ComputeDriverRegistry,
+) -> Result<()> {
+    let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
+
+    // Initialize OCSF identity before tracing can emit gateway events.
+    let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
+        name: prepared.config.name.clone(),
+        hostname: crate::compute::lease::replica_id(),
+    };
+    if !crate::gateway_ocsf::set_identity(gateway_identity) {
+        tracing::debug!("gateway OCSF identity already initialized, keeping existing");
+    }
+
+    let tracing_log_bus = TracingLogBus::new();
+    let ocsf_log = prepared
+        .config_file
+        .as_ref()
+        .and_then(|file| file.ryno.gateway.ocsf_log.clone())
+        .map(crate::ocsf_log::OcsfLog::start)
+        .transpose()
+        .into_diagnostic()?;
+    let otlp_config = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.ryno.gateway.otlp.as_ref());
+    let gateway_resource = crate::otel_tracing::GatewayResourceAttributes::new(
+        Some(prepared.config.name.as_str()),
+        Some(prepared.compute_driver.name()),
+    );
+    let compute_driver_tracing = compute_drivers.in_process_tracing(
+        &prepared.compute_driver,
+        &prepared.config.compute_driver_endpoints,
+    );
+    let (tracing_handle, setup_error) = crate::tracing_setup::install(
+        &EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
+            .to_string(),
+        &tracing_log_bus,
+        ocsf_log.as_ref(),
+        otlp_config,
+        compute_driver_tracing,
+        gateway_resource,
+    );
+
+    if prepared.legacy_compute_driver_env_seen {
+        warn!("RYNO_DRIVERS is deprecated; migrate to RYNO_COMPUTE_DRIVER");
+    }
+
+    let has_client_ca = prepared
+        .config
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.client_ca_path.as_ref())
+        .is_some();
+    let has_oidc = prepared.config.oidc.is_some();
+
+    if prepared.config.tls.is_none() {
+        warn!("TLS disabled — listening on plaintext HTTP");
+    } else {
+        info!("TLS enabled — listening on encrypted HTTPS");
+    }
+
+    if has_client_ca {
+        info!("TLS client certificate verification enabled");
+    }
+    if prepared.config.mtls_auth.enabled {
+        info!("mTLS user authentication enabled");
+    }
+    if has_oidc {
+        info!("OIDC authentication enabled");
+    }
+    if let Some(err) = &setup_error {
+        error!(
+            error = %err,
+            "OTLP exporting is configured but could not be started; continuing without it"
+        );
+    } else if let Some(otlp) = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.ryno.gateway.otlp.as_ref())
+    {
+        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+    }
+    if prepared.config.auth.allow_unauthenticated_users {
+        warn!(
+            "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
+        );
+    }
+
+    if !prepared.config.auth.allow_unauthenticated_users
+        && !prepared.config.mtls_auth.enabled
+        && !has_oidc
+        && prepared.config.gateway_jwt.is_none()
+    {
+        warn!(
+            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
+             the gateway has no authentication mechanism"
+        );
+    }
+
+    info!(bind = %prepared.config.bind_address, "Starting Ryno server");
+
+    let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
+
+    tracing_handle.shutdown();
+
+    if let Some(log) = ocsf_log {
+        log.shutdown().await;
+    }
+
+    result.into_diagnostic()
+}
+
+fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
+    ryno_core::config::normalize_compute_driver_name(value)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct PreflightTestFactory;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::ComputeDriverFactory for PreflightTestFactory {
+    fn validate_config(
+        &self,
+        _context: crate::ComputeDriverConfigContext<'_>,
+    ) -> ryno_core::Result<()> {
+        Ok(())
+    }
+
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
+    async fn build(
+        &self,
+        _context: crate::ComputeDriverBuildContext<'_>,
+    ) -> ryno_core::Result<crate::ComputeDriverInstance> {
+        unreachable!("config preflight tests must not build drivers")
+    }
+}
+
+#[cfg(test)]
+fn detect_preflight_test_driver() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn run_config_preflight(
+    args: ConfigPreflightArgs,
+    run: RunArgs,
+    matches: &ArgMatches,
+) -> Result<()> {
+    let mut registry = ComputeDriverRegistry::new();
+    registry.install(crate::ComputeDriverRegistration::new(
+        "test",
+        100,
+        Some(detect_preflight_test_driver),
+        PreflightTestFactory,
+    )?)?;
+    run_config_preflight_with_drivers(args, run, matches, &registry).map(|_| ())
+}
+
+fn run_config_preflight_with_drivers(
+    args: ConfigPreflightArgs,
+    run: RunArgs,
+    matches: &ArgMatches,
+    compute_drivers: &ComputeDriverRegistry,
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
+    if args.gateway_args.is_empty() {
+        return run_effective_config_preflight(args.path, run, matches, compute_drivers);
+    }
+
+    let replay_matches = match command().try_get_matches_from(
+        std::iter::once(OsString::from("ryno-gateway")).chain(args.gateway_args),
+    ) {
+        Ok(matches) => matches,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(miette::miette!("{error}")),
+    };
+    let replay =
+        Cli::from_arg_matches(&replay_matches).map_err(|error| miette::miette!("{error}"))?;
+    if replay.command.is_some() {
+        // A valid non-daemon action does not consume gateway startup
+        // configuration. Let the immediately following invocation perform it.
+        return Ok(None);
+    }
+    run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
+}
+
+fn run_effective_config_preflight(
+    path_override: Option<PathBuf>,
+    mut run: RunArgs,
+    matches: &ArgMatches,
+    compute_drivers: &ComputeDriverRegistry,
+) -> Result<Option<crate::ConfiguredComputeDriver>> {
+    let path = if path_override.is_some() {
+        path_override
+    } else {
+        resolve_config_path(&run)?
+    };
+    let file = path
+        .as_ref()
+        .map(|path| config_file::preflight(path).map_err(|error| miette::miette!("{error}")))
+        .transpose()?;
+    if let Some(file) = file.as_ref() {
+        merge_file_into_args(&mut run, &file.ryno.gateway, matches);
+    }
+
+    let validation = (|| {
+        // These argument relationships are shared with daemon startup and
+        // remain transport-free. In particular, the deprecated selector must
+        // fail here exactly when the immediately following daemon invocation
+        // would fail.
+        resolve_legacy_driver_selector_env(&mut run)?;
+        normalize_compute_driver_socket_args(&mut run)?;
+
+        let selection = run
+            .compute_driver
+            .as_deref()
+            .map(|driver| compute_drivers.select(Some(driver)))
+            .transpose()
+            .map_err(|error| miette::miette!("{error}"))?;
+        let empty_file = ConfigFile::default();
+        let semantic_file = file.as_ref().unwrap_or(&empty_file);
+        validate_preflight_semantics(&run, matches, semantic_file)?;
+
+        let mut endpoint_overrides = BTreeMap::new();
+        if let Some(selection) = selection.as_ref()
+            && let Some(socket) = run.compute_driver_socket.clone()
+        {
+            endpoint_overrides.insert(selection.name().to_string(), socket);
+        }
+        let driver_startup = crate::compute::driver_config::DriverStartupContext {
+            file: file.as_ref(),
+            guest_tls: None,
+            gateway_port: run.port,
+            gateway_tls_enabled: !run.disable_tls,
+            endpoint_overrides: &endpoint_overrides,
+        };
+        let mut selected_driver = None;
+        if let Some(selection) = selection.as_ref() {
+            selected_driver = Some(crate::validate_compute_driver_config(
+                compute_drivers,
+                selection.name(),
+                run.name.trim(),
+                SocketAddr::new(run.bind_address, run.port),
+                &run.log_level,
+                driver_startup,
+                true,
+            )?);
+        } else if file.is_some() {
+            // Runtime auto-detection may connect local API sockets or launch a
+            // bounded discovery command. Preflight must not perform those
+            // side effects, so validate every configured table that could be
+            // auto-selected. This fails closed without deserializing unrelated
+            // opt-in or remote driver tables.
+            for driver_name in compute_drivers.auto_detectable_driver_names() {
+                if !semantic_file.ryno.drivers.contains_key(driver_name) {
+                    continue;
+                }
+                crate::validate_compute_driver_config(
+                    compute_drivers,
+                    driver_name,
+                    run.name.trim(),
+                    SocketAddr::new(run.bind_address, run.port),
+                    &run.log_level,
+                    driver_startup,
+                    true,
+                )?;
+            }
+        }
+        Ok(selected_driver)
+    })();
+
+    match (validation, path.as_ref()) {
+        (Ok(driver), _) => Ok(driver),
+        (Err(_), Some(path)) => Err(miette::miette!(
+            "{}",
+            config_file::ConfigPreflightError::invalid_current(path)
+        )),
+        (Err(error), None) => Err(error),
+    }
+}
+
+/// Run executable probes outside the pure configuration-validation context.
+async fn preflight_host_tools(
+    driver: Option<crate::ConfiguredComputeDriver>,
+) -> Result<Vec<String>> {
+    match driver {
+        Some(crate::ConfiguredComputeDriver::Registered(registration)) => {
+            let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                // Register before polling the hook: a probe owns a separate
+                // process group, so default CLI termination cannot clean it up.
+                let mut interrupt = signal(SignalKind::interrupt())
+                    .map_err(|error| miette::miette!("register preflight SIGINT: {error}"))?;
+                let mut terminate = signal(SignalKind::terminate())
+                    .map_err(|error| miette::miette!("register preflight SIGTERM: {error}"))?;
+                let check = registration.factory.preflight_host_tools(cancellation_rx);
+                tokio::pin!(check);
+                let reason = tokio::select! {
+                    biased;
+                    _ = interrupt.recv() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                    result = &mut check => return result.map_err(|error| miette::miette!("{error}")),
+                };
+                cancellation_tx.send_replace(true);
+                // The hook owns its children. Await its cancellation cleanup
+                // before the short-lived CLI shuts down the Tokio runtime.
+                let _ = check.await;
+                Err(miette::miette!(
+                    "host tool preflight interrupted by {reason}"
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                let _cancellation_tx = cancellation_tx;
+                registration
+                    .factory
+                    .preflight_host_tools(cancellation_rx)
+                    .await
+                    .map_err(|error| miette::miette!("{error}"))
+            }
+        }
+        Some(crate::ConfiguredComputeDriver::Remote { name }) => Ok(vec![format!(
+            "compute driver '{name}': host tool checks not performed for a remote endpoint; run preflight on the driver host with its service account and environment"
+        )]),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn validate_preflight_semantics(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: &ConfigFile,
+) -> Result<()> {
+    let gateway = &file.ryno.gateway;
+    validate_grpc_rate_limit_args(
+        args.grpc_rate_limit_requests,
+        args.grpc_rate_limit_window_seconds,
+    )?;
+    GuestTlsPaths::validate_configuration(Some(gateway), args.disable_tls)
+        .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
+
+    let has_client_ca = args.tls_client_ca.is_some();
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, Some(file));
+    if args.disable_tls && has_client_ca {
+        return Err(miette::miette!(
+            "--disable-tls and --tls-client-ca are mutually exclusive"
+        ));
+    }
+    if mtls_auth_enabled && args.disable_tls {
+        return Err(miette::miette!("mTLS user authentication requires TLS"));
+    }
+    if mtls_auth_enabled && !has_client_ca {
+        return Err(miette::miette!(
+            "mTLS user authentication requires --tls-client-ca"
+        ));
+    }
+    if !args.disable_tls && args.tls_cert.is_some() != args.tls_key.is_some() {
+        return Err(miette::miette!(
+            "gateway TLS requires both --tls-cert and --tls-key"
+        ));
+    }
+    if !args.disable_tls && has_client_ca && args.tls_cert.is_none() && args.tls_key.is_none() {
+        return Err(miette::miette!(
+            "an explicit --tls-client-ca requires --tls-cert and --tls-key"
+        ));
+    }
+    if !args.disable_tls
+        && let Some(tls) = gateway.tls.as_ref()
+    {
+        crate::tls::validate_external_cert_config(
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            &tls.external_server_names,
+        )
+        .map_err(|error| miette::miette!("{error}"))?;
+    }
+    ryno_gateway_interceptors::validate_configs(&gateway.interceptors)
+        .map_err(|error| miette::miette!("{error}"))?;
+    let mut middleware_names = std::collections::HashSet::new();
+    for middleware in &file.ryno.supervisor.middleware {
+        let registration = ryno_core::proto::SupervisorMiddlewareService::try_from(middleware)
+            .map_err(|error| miette::miette!("{error}"))?;
+        ryno_supervisor_middleware::validate_registration_config(&registration)?;
+        if !middleware_names.insert(registration.name) {
+            return Err(miette::miette!(
+                "duplicate supervisor middleware registration"
+            ));
+        }
+    }
+    if args.name.trim().is_empty() {
+        return Err(miette::miette!("gateway name must not be empty"));
+    }
+
+    let health_bind = resolve_aux_listener(
+        args.bind_address,
+        args.health_port,
+        matches,
+        "health_port",
+        || gateway.health_bind_address,
+    );
+    let metrics_bind = resolve_aux_listener(
+        args.bind_address,
+        args.metrics_port,
+        matches,
+        "metrics_port",
+        || gateway.metrics_bind_address,
+    );
+    if health_bind.is_some_and(|address| address.port() == args.port)
+        || metrics_bind.is_some_and(|address| address.port() == args.port)
+        || health_bind
+            .zip(metrics_bind)
+            .is_some_and(|(health, metrics)| health.port() == metrics.port())
+    {
+        return Err(miette::miette!("gateway listener ports must be distinct"));
+    }
+    Ok(())
+}
+
+fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
+    if let Some(path) = args.config.clone() {
+        return Ok(Some(path));
+    }
+
+    let default_path = defaults::default_gateway_config_path()?;
+    match std::fs::symlink_metadata(&default_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Fail closed when the path exists or cannot be inspected. Returning it
+        // lets the shared loader produce the same safe, path-specific error used
+        // for an explicit configuration instead of treating it as absent.
+        Ok(_) | Err(_) => Ok(Some(default_path)),
+    }
+}
+
+fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
+    let local_tls = if args.disable_tls {
+        None
+    } else {
+        defaults::complete_local_tls_paths()?
+    };
+
+    if args.db_url.is_none() {
+        args.db_url = Some(defaults::default_database_url()?);
+    }
+
+    if !args.disable_tls
+        && args.tls_cert.is_none()
+        && args.tls_key.is_none()
+        && args.tls_client_ca.is_none()
+        && let Some(paths) = &local_tls
+    {
+        args.tls_cert = Some(paths.server_cert.clone());
+        args.tls_key = Some(paths.server_key.clone());
+        args.tls_client_ca = Some(paths.ca.clone());
+    }
+
+    Ok(local_tls)
+}
+
+/// Returns `true` when an argument's value came from clap's built-in default
+/// (or was never supplied at all). When the predicate is `true`, the loader
+/// is free to replace the value with one read from the TOML config file.
+fn arg_defaulted(matches: &ArgMatches, id: &str) -> bool {
+    matches!(
+        matches.value_source(id),
+        None | Some(ValueSource::DefaultValue)
+    )
+}
+
+/// Resolve the bind address for an auxiliary listener (health / metrics).
+///
+/// The precedence is:
+///   1. CLI flag or `RYNO_*` env var explicitly set on the corresponding
+///      port argument → `bind_address:port` (port from CLI, IP from the main
+///      listener interface).
+///   2. Full `SocketAddr` from `[ryno.gateway].{health,metrics}_bind_address`
+///      → used as-is (this is how operators pin a loopback-only health port
+///      on a gateway whose gRPC listener is bound publicly).
+///   3. Otherwise the listener is disabled (returns `None`).
+fn resolve_aux_listener(
+    bind_ip: IpAddr,
+    port_arg: u16,
+    matches: &ArgMatches,
+    port_id: &str,
+    file_addr: impl FnOnce() -> Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    if !arg_defaulted(matches, port_id) {
+        if port_arg == 0 {
+            return None;
+        }
+        return Some(SocketAddr::new(bind_ip, port_arg));
+    }
+    if let Some(addr) = file_addr() {
+        return Some(addr);
+    }
+    if port_arg == 0 {
+        None
+    } else {
+        Some(SocketAddr::new(bind_ip, port_arg))
+    }
+}
+
+/// Apply gateway-wide values from `[ryno.gateway]` onto `RunArgs` for
+/// every argument that is still sourced from clap's built-in default.
+///
+/// The function intentionally does not touch `database_url` — that secret is
+/// env-only and the loader already rejected it when it appears in the file.
+fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: &ArgMatches) {
+    if let Some(name) = &file.name
+        && arg_defaulted(matches, "name")
+    {
+        args.name.clone_from(name);
+    }
+    if let Some(addr) = file.bind_address {
+        if arg_defaulted(matches, "bind_address") {
+            args.bind_address = addr.ip();
+        }
+        if arg_defaulted(matches, "port") {
+            args.port = addr.port();
+        }
+    }
+    // Note: file's full health_bind_address / metrics_bind_address are
+    // consumed in `run_from_args`'s listener-resolution block so the IP
+    // half of the SocketAddr is preserved. Copying only the port here
+    // would silently relocate a loopback-intended listener onto the
+    // public bind address.
+    if let Some(level) = &file.log_level
+        && arg_defaulted(matches, "log_level")
+    {
+        args.log_level.clone_from(level);
+    }
+    if let Some(driver) = &file.compute_driver
+        && arg_defaulted(matches, "compute_driver")
+    {
+        args.compute_driver = Some(driver.clone());
+    }
+    if let Some(sans) = &file.server_sans
+        && args.server_sans.is_empty()
+        && arg_defaulted(matches, "server_sans")
+    {
+        args.server_sans.clone_from(sans);
+    }
+    if let Some(enabled) = file.enable_loopback_service_http
+        && arg_defaulted(matches, "enable_loopback_service_http")
+    {
+        args.enable_loopback_service_http = enabled;
+    }
+    if let Some(enabled) = file.enable_websocket_tunnel
+        && arg_defaulted(matches, "enable_websocket_tunnel")
+    {
+        args.enable_websocket_tunnel = enabled;
+    }
+    if let Some(mtls_auth) = &file.mtls_auth
+        && arg_defaulted(matches, "enable_mtls_auth")
+    {
+        args.enable_mtls_auth = mtls_auth.enabled;
+    }
+    if let Some(disabled) = file.disable_tls
+        && arg_defaulted(matches, "disable_tls")
+    {
+        args.disable_tls = disabled;
+    }
+    // TLS gateway listener fields
+    if let Some(tls) = &file.tls {
+        if args.tls_cert.is_none() && arg_defaulted(matches, "tls_cert") {
+            args.tls_cert = Some(tls.cert_path.clone());
+        }
+        if args.tls_key.is_none() && arg_defaulted(matches, "tls_key") {
+            args.tls_key = Some(tls.key_path.clone());
+        }
+        if args.tls_client_ca.is_none() && arg_defaulted(matches, "tls_client_ca") {
+            args.tls_client_ca.clone_from(&tls.client_ca_path);
+        }
+    }
+    // OIDC fields
+    if let Some(oidc) = &file.oidc {
+        if args.oidc_issuer.is_none() && arg_defaulted(matches, "oidc_issuer") {
+            args.oidc_issuer = Some(oidc.issuer.clone());
+        }
+        if arg_defaulted(matches, "oidc_dangerously_allow_insecure_http") {
+            args.oidc_dangerously_allow_insecure_http = oidc.dangerously_allow_insecure_http;
+        }
+        if args.oidc_jwks_allowed_origins.is_empty()
+            && arg_defaulted(matches, "oidc_jwks_allowed_origins")
+        {
+            args.oidc_jwks_allowed_origins
+                .clone_from(&oidc.jwks_allowed_origins);
+        }
+        if arg_defaulted(matches, "oidc_audience") {
+            args.oidc_audience.clone_from(&oidc.audience);
+        }
+        if arg_defaulted(matches, "oidc_jwks_ttl") {
+            args.oidc_jwks_ttl = oidc.jwks_ttl_secs;
+        }
+        if arg_defaulted(matches, "oidc_roles_claim") {
+            args.oidc_roles_claim.clone_from(&oidc.roles_claim);
+        }
+        if arg_defaulted(matches, "oidc_admin_role") {
+            args.oidc_admin_role.clone_from(&oidc.admin_role);
+        }
+        if arg_defaulted(matches, "oidc_user_role") {
+            args.oidc_user_role.clone_from(&oidc.user_role);
+        }
+        if arg_defaulted(matches, "oidc_scopes_claim") {
+            args.oidc_scopes_claim.clone_from(&oidc.scopes_claim);
+        }
+    }
+    if let Some(requests) = file.grpc_rate_limit_requests
+        && args.grpc_rate_limit_requests.is_none()
+        && arg_defaulted(matches, "grpc_rate_limit_requests")
+    {
+        args.grpc_rate_limit_requests = Some(requests);
+    }
+    if let Some(window) = file.grpc_rate_limit_window_seconds
+        && args.grpc_rate_limit_window_seconds.is_none()
+        && arg_defaulted(matches, "grpc_rate_limit_window_seconds")
+    {
+        args.grpc_rate_limit_window_seconds = Some(window);
+    }
+}
+
+fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u64>) -> Result<()> {
+    let disabled = matches!(requests, Some(0)) || matches!(window_seconds, Some(0));
+    if disabled {
+        return Ok(());
+    }
+    if matches!(
+        (requests, window_seconds),
+        (Some(requests), None) if requests > 0
+    ) || matches!(
+        (requests, window_seconds),
+        (None, Some(window_seconds)) if window_seconds > 0
+    ) {
+        return Err(miette::miette!(
+            "gRPC rate limiting requires both --grpc-rate-limit-requests and --grpc-rate-limit-window-seconds (TOML keys grpc_rate_limit_requests and grpc_rate_limit_window_seconds) to be positive; set either value to 0 to disable"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_compute_driver_socket_args(args: &mut RunArgs) -> Result<()> {
+    let Some(socket) = args.compute_driver_socket.as_ref() else {
+        return Ok(());
+    };
+    if socket.as_os_str().is_empty() {
+        return Err(miette::miette!(
+            "--compute-driver-socket must not be an empty path"
+        ));
+    }
+    if args.compute_driver.is_none() {
+        return Err(miette::miette!(
+            "--compute-driver-socket requires --compute-driver <name> or RYNO_COMPUTE_DRIVER=<name>"
+        ));
+    }
+
+    let driver = args
+        .compute_driver
+        .as_deref()
+        .expect("explicit compute driver is required for socket endpoints");
+    args.compute_driver = Some(
+        ryno_core::config::normalize_compute_driver_name(driver)
+            .map_err(|err| miette::miette!("{err}"))?,
+    );
+    Ok(())
+}
+
+fn resolve_mtls_auth_enabled(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: Option<&ConfigFile>,
+) -> bool {
+    let file_configured = file
+        .and_then(|f| f.ryno.gateway.mtls_auth.as_ref())
+        .is_some();
+    if file_configured || !arg_defaulted(matches, "enable_mtls_auth") {
+        return args.enable_mtls_auth;
+    }
+
+    if args.disable_tls || args.tls_client_ca.is_none() || args.oidc_issuer.is_some() {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, command};
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
+    use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REGISTRY_DETECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static REJECTING_VALIDATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn detect_registered_local() -> bool {
+        REGISTRY_DETECTION_CALLS.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestFactory;
+
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for TestFactory {
+        fn validate_config(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> ryno_core::Result<()> {
+            Ok(())
+        }
+
+        fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> ryno_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("CLI metadata tests do not build drivers")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct LegacyFactory;
+
+    // Deliberately implements only the pre-preflight factory contract.
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for LegacyFactory {
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> ryno_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build a legacy driver")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RejectingValidationFactory;
+
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for RejectingValidationFactory {
+        fn validate_config(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> ryno_core::Result<()> {
+            REJECTING_VALIDATION_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(ryno_core::Error::config(
+                "selected driver validation hook invoked",
+            ))
+        }
+
+        fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> ryno_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build the selected driver")
+        }
+    }
+
+    fn test_registry(name: &str, singleplayer: bool) -> crate::ComputeDriverRegistry {
+        let mut registration =
+            crate::ComputeDriverRegistration::new(name, 100, None, TestFactory).unwrap();
+        if singleplayer {
+            registration = registration.with_local_singleplayer();
+        }
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry.install(registration).unwrap();
+        registry
+    }
+
+    fn detected_local_registry() -> crate::ComputeDriverRegistry {
+        let registration = crate::ComputeDriverRegistration::new(
+            "local",
+            100,
+            Some(detect_registered_local),
+            TestFactory,
+        )
+        .unwrap()
+        .with_local_singleplayer();
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry.install(registration).unwrap();
+        registry
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn command_uses_gateway_binary_name() {
+        let mut help = Vec::new();
+        command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("ryno-gateway"));
+    }
+
+    #[test]
+    fn command_exposes_version() {
+        let cmd = command();
+        let version = cmd.get_version().unwrap();
+        assert_eq!(version.to_string(), ryno_core::VERSION);
+    }
+
+    #[test]
+    fn command_defaults_bind_address_to_loopback() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_BIND_ADDRESS");
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn command_parses_bind_address() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_BIND_ADDRESS");
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--bind-address",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn command_reads_bind_address_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("RYNO_BIND_ADDRESS", "0.0.0.0");
+
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"])
+            .expect("env should provide bind address");
+
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn command_enables_loopback_service_http_by_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn websocket_tunnel_is_disabled_by_default_and_can_be_enabled_from_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_WEBSOCKET_TUNNEL");
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        assert!(!args.enable_websocket_tunnel);
+
+        let file = config_file_from_toml("[ryno.gateway]\nenable_websocket_tunnel = true\n");
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+        assert!(args.enable_websocket_tunnel);
+
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-websocket-tunnel=false",
+        ]);
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+        assert!(!args.enable_websocket_tunnel, "CLI flag must override file");
+    }
+
+    #[test]
+    fn command_disables_loopback_service_http_with_false_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-loopback-service-http=false",
+        ])
+        .unwrap();
+
+        assert!(!cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_reads_loopback_service_http_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("RYNO_ENABLE_LOOPBACK_SERVICE_HTTP", "false");
+
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(!cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_parses_oidc_insecure_http_acknowledgement_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--oidc-dangerously-allow-insecure-http",
+            "true",
+        ])
+        .expect("launcher-style boolean flag and value should parse");
+
+        assert!(cli.run.oidc_dangerously_allow_insecure_http);
+    }
+
+    #[test]
+    fn command_reads_server_san_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("RYNO_SERVER_SAN", "*.apps.example.com");
+
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert_eq!(cli.run.server_sans, vec!["*.apps.example.com".to_string()]);
+    }
+
+    #[test]
+    fn command_reads_mtls_auth_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("RYNO_ENABLE_MTLS_AUTH", "true");
+
+        let cli = Cli::try_parse_from(["ryno-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(cli.run.enable_mtls_auth);
+    }
+
+    #[test]
+    fn command_parses_grpc_rate_limit_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_GRPC_RATE_LIMIT_REQUESTS");
+        let _g2 = EnvVarGuard::remove("RYNO_GRPC_RATE_LIMIT_WINDOW_SECONDS");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--grpc-rate-limit-requests",
+            "120",
+            "--grpc-rate-limit-window-seconds",
+            "60",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.run.grpc_rate_limit_requests, Some(120));
+        assert_eq!(cli.run.grpc_rate_limit_window_seconds, Some(60));
+    }
+
+    #[test]
+    fn validate_grpc_rate_limit_args_requires_positive_pair() {
+        assert!(super::validate_grpc_rate_limit_args(None, None).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(0), None).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(None, Some(0)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(0), Some(60)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), Some(0)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), Some(60)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), None).is_err());
+        assert!(super::validate_grpc_rate_limit_args(None, Some(60)).is_err());
+    }
+
+    #[test]
+    fn command_rejects_removed_driver_flags() {
+        let err = command()
+            .try_get_matches_from([
+                "ryno-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--sandbox-image",
+                "example/sandbox:latest",
+            ])
+            .expect_err("driver implementation flags should not be accepted");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn command_rejects_legacy_compute_driver_flags() {
+        for flag in ["--driver", "--drivers"] {
+            let err = command()
+                .try_get_matches_from([
+                    "ryno-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    flag,
+                    "docker",
+                ])
+                .expect_err("legacy compute driver selector must be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_accepts_one_normalized_name() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "  PodMan  ");
+        let (mut args, _) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+
+        assert!(super::resolve_legacy_driver_selector_env(&mut args).unwrap());
+        assert_eq!(args.compute_driver.as_deref(), Some("podman"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_flows_through_server_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_path = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "podman");
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+        ]);
+        let registry = test_registry("podman", true);
+
+        let prepared =
+            super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+
+        assert_eq!(prepared.compute_driver.name(), "podman");
+        assert!(prepared.legacy_compute_driver_env_seen);
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_rejects_empty_plural_and_invalid_values() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+
+        for value in ["", " ", ",", "podman,", ",podman", "podman,docker"] {
+            let legacy = EnvVarGuard::set("RYNO_DRIVERS", value);
+            let (mut args, _) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+            let error = super::resolve_legacy_driver_selector_env(&mut args)
+                .expect_err("empty and plural legacy selectors must be rejected");
+            assert!(error.to_string().contains("exactly one non-empty"));
+            drop(legacy);
+        }
+
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "podman/path");
+        let (mut args, _) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let error = super::resolve_legacy_driver_selector_env(&mut args)
+            .expect_err("invalid legacy selector must be rejected");
+        assert!(error.to_string().contains("invalid compute driver name"));
+        assert!(!error.to_string().contains("podman/path"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_allows_equal_canonical_and_rejects_conflict() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "PODMAN");
+
+        let (mut equal, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+        ]);
+        assert!(super::resolve_legacy_driver_selector_env(&mut equal).unwrap());
+        assert_eq!(equal.compute_driver.as_deref(), Some("podman"));
+
+        let (mut conflict, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "docker",
+        ]);
+        let error = super::resolve_legacy_driver_selector_env(&mut conflict)
+            .expect_err("different canonical and legacy selectors must conflict");
+        assert!(error.to_string().contains("conflicts"));
+        assert!(!error.to_string().contains("podman"));
+        assert!(!error.to_string().contains("docker"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_supports_remote_driver_socket() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "kyma");
+        let _socket = EnvVarGuard::set("RYNO_COMPUTE_DRIVER_SOCKET", "/run/ryno/kyma.sock");
+        let (mut args, _) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+
+        assert!(super::resolve_legacy_driver_selector_env(&mut args).unwrap());
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(args.compute_driver.as_deref(), Some("kyma"));
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new("/run/ryno/kyma.sock"))
+        );
+    }
+
+    #[test]
+    fn command_rejects_removed_ssh_endpoint_flags() {
+        for flag in [
+            "--ssh-gateway-host",
+            "--ssh-gateway-port",
+            "--sandbox-ssh-port",
+        ] {
+            let err = command()
+                .try_get_matches_from(["ryno-gateway", "--db-url", "sqlite::memory:", flag, "x"])
+                .expect_err("SSH endpoint flags should not be accepted");
+
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn generate_certs_subcommand_parses_without_db_url() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "generate-certs",
+            "--namespace",
+            "ryno",
+            "--server-secret-name",
+            "ryno-server-tls",
+            "--client-secret-name",
+            "ryno-client-tls",
+            "--jwt-secret-name",
+            "ryno-jwt-keys",
+            "--server-san",
+            "ryno.example.com",
+            "--server-san",
+            "10.0.0.1",
+        ])
+        .expect("generate-certs should parse without --db-url");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn generate_certs_local_mode_parses_without_kube_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "generate-certs",
+            "--output-dir",
+            "/tmp/ryno-certgen",
+        ])
+        .expect("--output-dir should make namespace/secret-name flags optional");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn generate_certs_jwt_only_parses_without_tls_secret_names() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "generate-certs",
+            "--namespace",
+            "ryno",
+            "--jwt-only",
+            "--jwt-secret-name",
+            "ryno-jwt-keys",
+        ])
+        .expect("--jwt-only should make TLS secret-name flags optional");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn config_preflight_subcommand_parses_without_runtime_requirements() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _db = EnvVarGuard::remove("RYNO_DB_URL");
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "config",
+            "preflight",
+            "--path",
+            "/tmp/gateway.toml",
+        ])
+        .expect("config preflight should parse without runtime arguments");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Config(super::ConfigArgs {
+                command: super::ConfigCommand::Preflight(_)
+            }))
+        ));
+    }
+
+    #[test]
+    fn config_preflight_path_and_daemon_replay_are_mutually_exclusive() {
+        let error = command()
+            .try_get_matches_from([
+                "ryno-gateway",
+                "config",
+                "preflight",
+                "--path",
+                "/tmp/gateway.toml",
+                "--",
+                "--disable-tls",
+            ])
+            .expect_err("manual path and daemon replay must be mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn config_preflight_replay_validates_effective_daemon_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let _requests = EnvVarGuard::remove("RYNO_GRPC_RATE_LIMIT_REQUESTS");
+        let _window = EnvVarGuard::remove("RYNO_GRPC_RATE_LIMIT_WINDOW_SECONDS");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                gateway_args: ["--grpc-rate-limit-requests", "10"]
+                    .map(std::ffi::OsString::from)
+                    .to_vec(),
+                ..Default::default()
+            },
+            run.clone(),
+            &matches,
+        )
+        .expect_err("unpaired replayed rate limit must fail preflight");
+        assert!(error.to_string().contains("requires both"));
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                gateway_args: [
+                    "--grpc-rate-limit-requests",
+                    "10",
+                    "--grpc-rate-limit-window-seconds",
+                    "60",
+                ]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("paired replayed rate limit must pass preflight");
+    }
+
+    #[test]
+    fn config_preflight_matches_driver_selector_and_registry_semantics() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "podman,docker");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+        let registry = test_registry("podman", true);
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("plural legacy selector must fail preflight as it fails startup");
+        assert!(error.to_string().contains("exactly one non-empty"));
+    }
+
+    #[test]
+    fn config_preflight_validates_selected_driver_without_building_it() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) =
+            parse_with_args(&["ryno-gateway", "--compute-driver", "local", "--disable-tls"]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new(
+                    "local",
+                    100,
+                    None,
+                    RejectingValidationFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        REJECTING_VALIDATION_CALLS.store(0, Ordering::SeqCst);
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("selected driver validation hook must run");
+        assert!(error.to_string().contains("validation hook invoked"));
+        assert_eq!(REJECTING_VALIDATION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn config_preflight_rejects_factory_without_side_effect_free_validation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--compute-driver",
+            "legacy",
+            "--disable-tls",
+        ]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new("legacy", 100, None, LegacyFactory).unwrap(),
+            )
+            .unwrap();
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("unsupported source-free preflight must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support side-effect-free")
+        );
+    }
+
+    #[test]
+    fn config_preflight_validates_configured_auto_detectable_driver_without_probing() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            "[ryno]\nversion = 2\n[ryno.gateway]\ndisable_tls = true\n[ryno.drivers.local]\n",
+        )
+        .unwrap();
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new(
+                    "local",
+                    100,
+                    Some(detect_registered_local),
+                    RejectingValidationFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        REGISTRY_DETECTION_CALLS.store(0, Ordering::SeqCst);
+        REJECTING_VALIDATION_CALLS.store(0, Ordering::SeqCst);
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("auto-detectable driver table validation hook must run");
+
+        assert!(error.to_string().contains("category=malformed"));
+        assert!(!error.to_string().contains("validation hook invoked"));
+        assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(REJECTING_VALIDATION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn config_preflight_auto_validation_skips_absent_and_opt_in_driver_tables() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            "[ryno]\nversion = 2\n[ryno.gateway]\ndisable_tls = true\n[ryno.drivers.opt-in]\n",
+        )
+        .unwrap();
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        for registration in [
+            crate::ComputeDriverRegistration::new(
+                "local",
+                100,
+                Some(detect_registered_local),
+                RejectingValidationFactory,
+            )
+            .unwrap(),
+            crate::ComputeDriverRegistration::new("opt-in", 200, None, RejectingValidationFactory)
+                .unwrap(),
+        ] {
+            registry.install(registration).unwrap();
+        }
+
+        REGISTRY_DETECTION_CALLS.store(0, Ordering::SeqCst);
+        REJECTING_VALIDATION_CALLS.store(0, Ordering::SeqCst);
+        super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+            &registry,
+        )
+        .expect("unconfigured auto-detectable and configured opt-in drivers must be skipped");
+
+        assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(REJECTING_VALIDATION_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn config_preflight_allows_driver_independent_mtls() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--compute-driver",
+            "shared",
+            "--tls-cert",
+            "/tls/server.pem",
+            "--tls-key",
+            "/tls/server-key.pem",
+            "--tls-client-ca",
+            "/tls/ca.pem",
+            "--enable-mtls-auth",
+            "true",
+        ]);
+        let registry = test_registry("shared", false);
+
+        super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect("gateway mTLS authentication is independent of the selected driver");
+    }
+
+    #[test]
+    fn config_preflight_validates_explicit_remote_driver_endpoint() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--compute-driver",
+            "remote",
+            "--disable-tls",
+        ]);
+
+        let error =
+            super::run_config_preflight(super::ConfigPreflightArgs::default(), run, &matches)
+                .expect_err("remote driver without socket_path must fail preflight");
+        assert!(error.to_string().contains("requires socket_path"));
+    }
+
+    #[test]
+    fn config_preflight_validates_explicit_path_without_creating_state() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let state_parent = tempfile::tempdir().unwrap();
+        let state_home = state_parent.path().join("not-created");
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(&config, "[ryno]\nversion = 2\n").unwrap();
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state_home.to_str().unwrap());
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("valid explicit config passes preflight");
+
+        assert!(
+            !state_home.exists(),
+            "preflight must not create runtime state"
+        );
+    }
+
+    #[test]
+    fn config_preflight_explicit_path_overrides_environment_selection() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        let current = dir.path().join("current.toml");
+        std::fs::write(&legacy, "[ryno]\nversion = 1\n").unwrap();
+        std::fs::write(&current, "[ryno]\nversion = 2\n").unwrap();
+        let _config_env = EnvVarGuard::set("RYNO_GATEWAY_CONFIG", legacy.to_str().unwrap());
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs::default(),
+            run.clone(),
+            &matches,
+        )
+        .expect_err("environment-selected legacy config must fail");
+        assert!(error.to_string().contains("category=legacy_schema_v1"));
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(current),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("explicit preflight path must override environment selection");
+    }
+
+    #[test]
+    fn config_preflight_allows_absent_auto_discovery_but_rejects_explicit_absence() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+
+        super::run_config_preflight(super::ConfigPreflightArgs::default(), run.clone(), &matches)
+            .expect("absent auto-discovered config is optional");
+
+        let missing = config_home.path().join("missing.toml");
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(missing.clone()),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect_err("explicit missing config must fail");
+        assert!(error.to_string().contains("category=missing_path"));
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn config_preflight_rejects_effective_semantic_errors() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "driver-selector",
+                "[ryno]\nversion = 2\n[ryno.gateway]\ncompute_driver = 'secret-driver-marker'\ndisable_tls = true\n",
+            ),
+            (
+                "rate-limit",
+                "[ryno]\nversion = 2\n[ryno.gateway]\nname = 'secret-semantic-marker'\ngrpc_rate_limit_requests = 10\n",
+            ),
+            (
+                "guest-tls",
+                "[ryno]\nversion = 2\n[ryno.gateway]\nguest_tls_ca = '/tls/ca.pem'\ndisable_tls = true\n",
+            ),
+            (
+                "external-tls",
+                "[ryno]\nversion = 2\n[ryno.gateway.tls]\ncert_path = '/tls/server.pem'\nkey_path = '/tls/server-key.pem'\nexternal_cert_path = '/tls/external.pem'\nexternal_server_names = ['external.example']\n",
+            ),
+            (
+                "interceptor",
+                "[ryno]\nversion = 2\n[[ryno.gateway.interceptors]]\nname = ''\ngrpc_endpoint = 'https://interceptor.example'\n",
+            ),
+            (
+                "middleware",
+                "[ryno]\nversion = 2\n[[ryno.supervisor.middleware]]\nname = 'guard'\ngrpc_endpoint = 'http://127.0.0.1:50051'\nallow_insecure_transport = true\nmax_payload_bytes = 1024\ntimeout = 'invalid'\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, contents).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let (run, matches) = parse_with_args(&["ryno-gateway"]);
+            let result = super::run_config_preflight(
+                super::ConfigPreflightArgs {
+                    path: Some(path.clone()),
+                    ..Default::default()
+                },
+                run,
+                &matches,
+            );
+            let Err(error) = result else {
+                panic!("{name}: invalid effective configuration passed preflight");
+            };
+            assert!(error.to_string().contains("category=malformed"), "{name}");
+            assert!(error.to_string().contains("detected_version=2"), "{name}");
+            assert!(!error.to_string().contains("secret-"));
+            assert!(!format!("{error:?}").contains("secret-"));
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn config_preflight_matches_effective_tls_environment_semantics() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let partial_external = dir.path().join("partial-external.toml");
+        std::fs::write(
+            &partial_external,
+            "[ryno]\nversion = 2\n[ryno.gateway.tls]\ncert_path = '/tls/server.pem'\nkey_path = '/tls/server-key.pem'\nexternal_cert_path = '/tls/external.pem'\nexternal_server_names = ['external.example']\n",
+        )
+        .unwrap();
+        let disable_tls = EnvVarGuard::set("RYNO_DISABLE_TLS", "true");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(partial_external),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("inactive TLS table must not block an effective plaintext gateway");
+        drop(disable_tls);
+
+        let config = dir.path().join("client-ca-only.toml");
+        std::fs::write(&config, "[ryno]\nversion = 2\n").unwrap();
+        let _disable_tls = EnvVarGuard::remove("RYNO_DISABLE_TLS");
+        let _client_ca = EnvVarGuard::set("RYNO_TLS_CLIENT_CA", "/tls/ca.pem");
+        let _cert = EnvVarGuard::remove("RYNO_TLS_CERT");
+        let _key = EnvVarGuard::remove("RYNO_TLS_KEY");
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect_err("client CA without an explicit server pair must fail before cert generation");
+        assert!(error.to_string().contains("category=malformed"));
+    }
+
+    #[test]
+    fn config_preflight_allows_complete_future_generated_tls_paths() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            "[ryno]\nversion = 2\n[ryno.gateway]\nguest_tls_ca = '/future/ca.pem'\n",
+        )
+        .unwrap();
+        let (run, matches) = parse_with_args(&["ryno-gateway"]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(path),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("complete package-generated TLS paths may not exist before certificate generation");
+    }
+
+    #[test]
+    fn generate_certs_backend_ca_configmap_flags_parse() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "ryno-gateway",
+            "generate-certs",
+            "--namespace",
+            "ryno",
+            "--jwt-only",
+            "--jwt-secret-name",
+            "ryno-jwt-keys",
+            "--backend-ca-configmap-name",
+            "ryno-backend-ca",
+            "--backend-ca-source-secret",
+            "ryno-server-tls",
+        ])
+        .expect("backend CA ConfigMap flags should parse with --jwt-only");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn generate_certs_backend_ca_source_secret_requires_configmap_name() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let err = Cli::try_parse_from([
+            "ryno-gateway",
+            "generate-certs",
+            "--namespace",
+            "ryno",
+            "--jwt-only",
+            "--jwt-secret-name",
+            "ryno-jwt-keys",
+            "--backend-ca-source-secret",
+            "ryno-server-tls",
+        ])
+        .expect_err("--backend-ca-source-secret should require --backend-ca-configmap-name");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn bare_invocation_with_no_db_url_parses_for_runtime_defaults() {
+        // db_url is Option<String> at the clap level so subcommand parsing
+        // does not require it. The Run path fills a default URL from XDG
+        // state when neither CLI nor env supplied one.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("RYNO_DB_URL");
+
+        let cli = Cli::try_parse_from(["ryno-gateway"]).expect("parses without --db-url");
+        assert!(cli.command.is_none());
+        assert!(cli.run.db_url.is_none());
+    }
+
+    // ── Config-file merge tests ──────────────────────────────────────────
+    //
+    // `merge_file_into_args` is the bridge between `config_file::ConfigFile`
+    // and `RunArgs`. These cases lock in the precedence rule:
+    //
+    //   CLI flag  >  RYNO_* env var  >  TOML file  >  built-in default
+    //
+    // by exercising each combination on representative gateway fields.
+
+    use super::{ConfigFile, merge_file_into_args};
+    use clap::FromArgMatches;
+
+    fn parse_with_args(argv: &[&str]) -> (super::RunArgs, clap::ArgMatches) {
+        let matches = command().try_get_matches_from(argv).expect("parses");
+        let cli = Cli::from_arg_matches(&matches).expect("from arg matches");
+        (cli.run, matches)
+    }
+
+    fn config_file_from_toml(toml: &str) -> ConfigFile {
+        toml::from_str(toml).expect("valid TOML in test fixture")
+    }
+
+    #[test]
+    fn rejects_legacy_drivers_flag() {
+        let error = command()
+            .try_get_matches_from(["ryno-gateway", "--drivers", "docker"])
+            .expect_err("legacy --drivers flag must be rejected");
+        assert!(error.to_string().contains("--drivers"));
+    }
+
+    #[test]
+    fn default_config_path_is_loaded_only_when_present() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _g2 = EnvVarGuard::set("XDG_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let (args, _) = parse_with_args(&["ryno-gateway"]);
+        assert_eq!(super::resolve_config_path(&args).unwrap(), None);
+
+        let config = tmp.path().join("ryno").join("gateway.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[ryno]\nversion = 2\n").unwrap();
+
+        assert_eq!(super::resolve_config_path(&args).unwrap(), Some(config));
+    }
+
+    #[test]
+    fn explicit_config_path_is_returned_even_when_missing() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+
+        let (args, _) = parse_with_args(&["ryno-gateway", "--config", "/tmp/missing.toml"]);
+
+        assert_eq!(
+            super::resolve_config_path(&args).unwrap(),
+            Some(std::path::PathBuf::from("/tmp/missing.toml"))
+        );
+    }
+
+    #[test]
+    fn runtime_defaults_populate_database_url_from_xdg_state() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::set("XDG_STATE_HOME", tmp.path().to_str().unwrap());
+
+        let (mut args, _) = parse_with_args(&["ryno-gateway", "--disable-tls"]);
+        let local_tls = super::apply_runtime_defaults(&mut args).unwrap();
+
+        let expected = format!(
+            "sqlite:{}",
+            tmp.path()
+                .join("ryno")
+                .join("gateway")
+                .join("ryno.db")
+                .display()
+        );
+        assert!(local_tls.is_none());
+        assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
+        assert!(tmp.path().join("ryno").join("gateway").is_dir());
+    }
+
+    #[test]
+    fn runtime_defaults_use_complete_local_tls_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("RYNO_DB_URL");
+        let _g2 = EnvVarGuard::remove("RYNO_TLS_CERT");
+        let _g3 = EnvVarGuard::remove("RYNO_TLS_KEY");
+        let _g4 = EnvVarGuard::remove("RYNO_TLS_CLIENT_CA");
+        let _g5 = EnvVarGuard::remove("RYNO_DISABLE_TLS");
+        let _g6 = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _g7 = EnvVarGuard::set("RYNO_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+
+        std::fs::create_dir_all(tls.path().join("server")).unwrap();
+        std::fs::create_dir_all(tls.path().join("client")).unwrap();
+        for rel in [
+            "ca.crt",
+            "server/tls.crt",
+            "server/tls.key",
+            "client/tls.crt",
+            "client/tls.key",
+        ] {
+            std::fs::write(tls.path().join(rel), "pem").unwrap();
+        }
+
+        let (mut args, _) = parse_with_args(&["ryno-gateway"]);
+        let local_tls = super::apply_runtime_defaults(&mut args)
+            .unwrap()
+            .expect("complete bundle should be returned");
+
+        assert_eq!(args.tls_cert, Some(tls.path().join("server/tls.crt")));
+        assert_eq!(args.tls_key, Some(tls.path().join("server/tls.key")));
+        assert_eq!(args.tls_client_ca, Some(tls.path().join("ca.crt")));
+        assert_eq!(local_tls.client_cert, tls.path().join("client/tls.crt"));
+    }
+
+    #[test]
+    fn tls_accepts_bearer_clients_with_and_without_oidc() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_path = EnvVarGuard::remove("RYNO_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let registry = test_registry("shared", false);
+
+        for (oidc_issuer, expected) in [(None, false), (Some("https://idp.example.com"), false)] {
+            let mut startup_args = vec![
+                "ryno-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "shared",
+                "--tls-cert",
+                "/tls/server.crt",
+                "--tls-key",
+                "/tls/server.key",
+                "--tls-client-ca",
+                "/tls/ca.crt",
+            ];
+            if let Some(issuer) = oidc_issuer {
+                startup_args.extend(["--oidc-issuer", issuer]);
+            }
+            let (mut args, matches) = parse_with_args(&startup_args);
+            let prepared =
+                super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+
+            assert_eq!(
+                prepared.config.tls.as_ref().unwrap().require_client_auth,
+                expected,
+                "oidc issuer: {oidc_issuer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mtls_auth_auto_defaults_when_client_ca_is_configured() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_MTLS_AUTH");
+
+        let (args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "local",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
+    }
+
+    #[test]
+    fn registry_detection_drives_auth_defaults_once() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config.path().to_str().unwrap());
+        let _mtls = EnvVarGuard::remove("RYNO_ENABLE_MTLS_AUTH");
+        let _drivers = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        REGISTRY_DETECTION_CALLS.store(0, Ordering::SeqCst);
+
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+        let registry = detected_local_registry();
+
+        let prepared =
+            super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+
+        assert_eq!(prepared.compute_driver.name(), "local");
+        assert!(prepared.config.compute_driver.is_none());
+        assert!(prepared.config.mtls_auth.enabled);
+        assert!(
+            !prepared
+                .config
+                .tls
+                .as_ref()
+                .expect("TLS config")
+                .require_client_auth,
+            "sandbox bearer clients must be allowed through the TLS handshake"
+        );
+        assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mtls_auth_default_is_driver_independent() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_MTLS_AUTH");
+
+        let (args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "shared",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
+    }
+
+    #[test]
+    fn file_mtls_auth_value_overrides_local_auto_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("RYNO_ENABLE_MTLS_AUTH");
+
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "local",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway.mtls_auth]
+enabled = false
+",
+        );
+
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert!(!super::resolve_mtls_auth_enabled(
+            &args,
+            &matches,
+            Some(&file)
+        ));
+    }
+
+    #[test]
+    fn file_value_applies_when_cli_uses_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_BIND_ADDRESS");
+        let _g2 = EnvVarGuard::remove("RYNO_SERVER_PORT");
+        let _g3 = EnvVarGuard::remove("RYNO_LOG_LEVEL");
+        let _g4 = EnvVarGuard::remove("RYNO_GATEWAY_NAME");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+name = "production-us-west"
+bind_address = "0.0.0.0:9090"
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(args.port, 9090);
+        assert_eq!(args.log_level, "debug");
+        assert_eq!(args.name, "production-us-west");
+    }
+
+    #[test]
+    fn cli_flag_overrides_file_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_BIND_ADDRESS");
+        let _g2 = EnvVarGuard::remove("RYNO_LOG_LEVEL");
+        let _g3 = EnvVarGuard::remove("RYNO_GATEWAY_NAME");
+
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--log-level",
+            "warn",
+            "--name",
+            "cli-gateway",
+        ]);
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+name = "file-gateway"
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.log_level, "warn", "CLI flag must win over file");
+        assert_eq!(args.name, "cli-gateway");
+    }
+
+    #[test]
+    fn env_var_overrides_file_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::set("RYNO_LOG_LEVEL", "trace");
+        let _g2 = EnvVarGuard::set("RYNO_GATEWAY_NAME", "env-gateway");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+name = "file-gateway"
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.log_level, "trace", "env var must win over file");
+        assert_eq!(args.name, "env-gateway");
+    }
+
+    #[test]
+    fn compute_driver_file_value_and_cli_environment_precedence_are_explicit() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _legacy = EnvVarGuard::remove("RYNO_DRIVERS");
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+compute_driver = "podman"
+"#,
+        );
+
+        let canonical_guard = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let (mut file_args, file_matches) =
+            parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut file_args, &file.ryno.gateway, &file_matches);
+        assert_eq!(file_args.compute_driver.as_deref(), Some("podman"));
+
+        let (mut cli_args, cli_matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "docker",
+        ]);
+        merge_file_into_args(&mut cli_args, &file.ryno.gateway, &cli_matches);
+        assert_eq!(cli_args.compute_driver.as_deref(), Some("docker"));
+        drop(canonical_guard);
+
+        let _canonical = EnvVarGuard::set("RYNO_COMPUTE_DRIVER", "vm");
+        let (mut env_args, env_matches) =
+            parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut env_args, &file.ryno.gateway, &env_matches);
+        assert_eq!(env_args.compute_driver.as_deref(), Some("vm"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_conflicts_with_file_selection() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("RYNO_DRIVERS", "docker");
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+compute_driver = "podman"
+"#,
+        );
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        let error = super::resolve_legacy_driver_selector_env(&mut args)
+            .expect_err("different file and legacy selectors must conflict");
+        assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn file_oidc_block_populates_oidc_args() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_OIDC_ISSUER");
+        let _g2 = EnvVarGuard::remove("RYNO_OIDC_AUDIENCE");
+        let _g3 = EnvVarGuard::remove("RYNO_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP");
+        let _g4 = EnvVarGuard::remove("RYNO_OIDC_JWKS_ALLOWED_ORIGINS");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway.oidc]
+issuer = "https://idp.example.com"
+audience = "ryno-cli"
+dangerously_allow_insecure_http = true
+jwks_allowed_origins = ["https://keys.example.com"]
+"#,
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
+        assert_eq!(args.oidc_audience, "ryno-cli");
+        assert!(args.oidc_dangerously_allow_insecure_http);
+        assert_eq!(
+            args.oidc_jwks_allowed_origins,
+            ["https://keys.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_grpc_rate_limit_populates_args_when_cli_omits() {
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway]
+grpc_rate_limit_requests = 100
+grpc_rate_limit_window_seconds = 30
+",
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.grpc_rate_limit_requests, Some(100));
+        assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn cli_grpc_rate_limit_overrides_file_value() {
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--grpc-rate-limit-requests",
+            "20",
+        ]);
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway]
+grpc_rate_limit_requests = 100
+grpc_rate_limit_window_seconds = 30
+",
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.grpc_rate_limit_requests, Some(20));
+        assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn aux_listener_preserves_file_ip_against_public_bind() {
+        use std::net::SocketAddr;
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("RYNO_HEALTH_PORT");
+
+        let (_args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let resolved = super::resolve_aux_listener(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+            &matches,
+            "health_port",
+            || Some(file_addr),
+        );
+        assert_eq!(
+            resolved,
+            Some(file_addr),
+            "TOML health_bind_address 127.0.0.1:8081 must not be relocated to 0.0.0.0:8081"
+        );
+    }
+
+    #[test]
+    fn aux_listener_cli_port_overrides_file_addr() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("RYNO_HEALTH_PORT");
+
+        let (_args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--health-port",
+            "9999",
+        ]);
+        let file_addr: std::net::SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let resolved = super::resolve_aux_listener(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            9999,
+            &matches,
+            "health_port",
+            || Some(file_addr),
+        );
+        assert_eq!(
+            resolved,
+            Some("0.0.0.0:9999".parse().unwrap()),
+            "CLI flag must win over file value"
+        );
+    }
+
+    #[test]
+    fn file_disable_tls_applies() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("RYNO_DISABLE_TLS");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway]
+disable_tls = true
+",
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert!(args.disable_tls);
+    }
+
+    #[test]
+    fn file_ssh_session_ttl_secs_is_parsed() {
+        // The loader must accept and surface the documented key. The actual
+        // wiring into `Config` happens in `run_from_args` against the parsed
+        // file (not via `merge_file_into_args`, since there is no matching
+        // `RunArgs` field), so this test pins the schema half.
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway]
+ssh_session_ttl_secs = 1234
+",
+        );
+        assert_eq!(file.ryno.gateway.ssh_session_ttl_secs, Some(1234));
+    }
+
+    #[test]
+    fn compute_driver_socket_flag_uses_explicit_driver_name() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+
+        let (mut args, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "Kyma",
+            "--compute-driver-socket",
+            "/run/ryno/kyma.sock",
+        ]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new("/run/ryno/kyma.sock"))
+        );
+        assert_eq!(args.compute_driver.as_deref(), Some("kyma"));
+    }
+
+    #[test]
+    fn compute_driver_socket_requires_explicit_driver_name() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+
+        let (mut args, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver-socket",
+            "/run/ryno/kyma.sock",
+        ]);
+        let err = super::normalize_compute_driver_socket_args(&mut args).unwrap_err();
+
+        assert!(
+            err.to_string().contains("requires --compute-driver <name>"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_driver_socket_accepts_canonical_builtin_driver_name() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+
+        let (mut args, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "docker",
+            "--compute-driver-socket",
+            "/run/ryno/extension.sock",
+        ]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(args.compute_driver.as_deref(), Some("docker"));
+    }
+
+    #[test]
+    fn compute_driver_socket_accepts_vm_endpoint() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("RYNO_COMPUTE_DRIVER");
+
+        let (mut args, _) = parse_with_args(&[
+            "ryno-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "vm",
+            "--compute-driver-socket",
+            "/run/ryno/vm.sock",
+        ]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(args.compute_driver.as_deref(), Some("vm"));
+    }
+
+    #[test]
+    fn compute_driver_socket_reads_from_env_var() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::set("RYNO_COMPUTE_DRIVER_SOCKET", "/var/run/ryno/kyma.sock");
+        let _g2 = EnvVarGuard::set("RYNO_COMPUTE_DRIVER", "kyma");
+
+        let (mut args, _) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new("/var/run/ryno/kyma.sock"))
+        );
+        assert_eq!(args.compute_driver.as_deref(), Some("kyma"));
+    }
+
+    #[test]
+    fn file_populates_service_routing_fields() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("RYNO_SERVER_SAN");
+        let _g2 = EnvVarGuard::remove("RYNO_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[ryno.gateway]
+server_sans                  = ["gateway.local", "*.dev.ryno.localhost"]
+enable_loopback_service_http = false
+"#,
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(
+            args.server_sans,
+            vec![
+                "gateway.local".to_string(),
+                "*.dev.ryno.localhost".to_string()
+            ]
+        );
+        assert!(!args.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn env_var_overrides_file_loopback_service_http() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::set("RYNO_ENABLE_LOOPBACK_SERVICE_HTTP", "true");
+
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[ryno.gateway]
+enable_loopback_service_http = false
+",
+        );
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert!(
+            args.enable_loopback_service_http,
+            "env var must win over file"
+        );
+    }
+
+    #[test]
+    fn canonical_file_driver_selector_populates_cli_args() {
+        let (mut args, matches) = parse_with_args(&["ryno-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml("[ryno.gateway]\ncompute_driver = \"podman\"\n");
+
+        merge_file_into_args(&mut args, &file.ryno.gateway, &matches);
+
+        assert_eq!(args.compute_driver.as_deref(), Some("podman"));
+    }
+
+    #[test]
+    fn server_config_preparation_ignores_unselected_driver_tables() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let local_tls = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _g2 = EnvVarGuard::set("RYNO_LOCAL_TLS_DIR", local_tls.path().to_str().unwrap());
+        let config_path = state.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[ryno]
+version = 2
+
+[ryno.gateway]
+policy_validation_failure_mode = "retain_last_valid"
+image_preparation_timeout_seconds = 2400
+
+[ryno.drivers.docker]
+unknown_docker_key = true
+
+[ryno.drivers.vm]
+mem_mib = "not-a-number"
+"#,
+        )
+        .unwrap();
+
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+
+        let prepared =
+            super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
+
+        assert_eq!(prepared.config.compute_driver.as_deref(), Some("podman"));
+        assert_eq!(prepared.config.image_preparation_timeout_seconds, 2400);
+        assert_eq!(
+            prepared.config.policy_validation_failure_mode,
+            ryno_core::PolicyValidationFailureMode::RetainLastValid
+        );
+        let file = prepared.config_file.expect("config file is preserved");
+        assert!(file.ryno.drivers.contains_key("docker"));
+        assert!(file.ryno.drivers.contains_key("vm"));
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_image_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _tls = EnvVarGuard::set("RYNO_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+        let config_path = state.path().join("gateway.toml");
+        for seconds in [0, 86_401] {
+            std::fs::write(&config_path, format!(
+                "[ryno]\nversion = 2\n[ryno.gateway]\nimage_preparation_timeout_seconds = {seconds}\n"
+            )).unwrap();
+            let (mut args, matches) = parse_with_args(&[
+                "ryno-gateway",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "podman",
+                "--disable-tls",
+            ]);
+            let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                panic!("unbounded preparation must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("image_preparation_timeout_seconds must be between 1 and 86400")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_launch_signing_config_ignores_partial_local_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", directory.path().to_str().unwrap());
+        let _local = EnvVarGuard::set("RYNO_LOCAL_TLS_DIR", directory.path().to_str().unwrap());
+        std::fs::create_dir(directory.path().join("jwt")).unwrap();
+        std::fs::write(
+            directory.path().join("jwt/signing.pem"),
+            "incomplete local bundle",
+        )
+        .unwrap();
+        let config_path = directory.path().join("gateway.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[ryno]
+version = 2
+[ryno.gateway.gateway_jwt]
+signing_key_path = "/explicit/signing.pem"
+public_key_path = "/explicit/public.pem"
+kid_path = "/explicit/kid"
+gateway_id = "explicit-gateway"
+"#,
+        )
+        .unwrap();
+        let (mut args, matches) = parse_with_args(&[
+            "ryno-gateway",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+            "--disable-tls",
+        ]);
+        let prepared = super::prepare_server_config(&mut args, &matches).unwrap();
+        assert_eq!(
+            prepared.config.gateway_jwt.unwrap().gateway_id,
+            "explicit-gateway"
+        );
+    }
+}

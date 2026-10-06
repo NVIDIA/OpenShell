@@ -1,38 +1,38 @@
 ---
 name: gator-gate
-description: Validate and monitor OpenShell GitHub issues and PRs using the gator:* state machine. Use when asked to triage issues/PRs for project validity, gate PRs, run gator, validate submissions, or monitor PRs toward merge readiness.
+description: Validate and monitor Ryno GitHub issues and PRs using the gator:* state machine. Use when asked to triage issues/PRs for project validity, gate PRs, run gator, validate submissions, or monitor PRs toward merge readiness.
 ---
 
 # Gator Gate
 
-Validate OpenShell GitHub issues and pull requests for project fit, then monitor valid PRs until they are ready for maintainer approval.
+Validate Ryno GitHub issues and pull requests for project fit, then monitor valid PRs until they are ready for maintainer approval.
 
 This skill is a gating workflow. It can start from any issue or PR state, inspect the current `gator:*` label, and continue the correct next action.
 
 ## Skill Location
 
-Codex and other agent harnesses should load this skill from the repository path `scripts/agents/gator/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/NVIDIA/OpenShell/blob/main/scripts/agents/gator/skills/gator-gate/SKILL.md>.
+Codex and other agent harnesses should load this skill from the repository path `scripts/agents/gator/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/NVIDIA/Ryno/blob/main/scripts/agents/gator/skills/gator-gate/SKILL.md>.
 
 ## Prerequisites
 
 - The `gh` CLI must be able to call GitHub APIs (`gh api user --jq '.login'`)
-- You must be in the OpenShell repository root
+- You must be in the Ryno repository root
 - GitHub write permissions are required to apply labels, comment, close issues/PRs, or post `/ok to test`
 
-Do not use `gh auth status` as the authentication health check inside provider-backed sandboxes. Scoped provider tokens may be exposed as `openshell:resolve:env:*` placeholders and `gh auth status` probes endpoints outside the gator policy, causing false "token is invalid" reports even when allowed `gh api` and `gh pr` calls succeed. Use `gh api user --jq '.login'` and a repo-scoped probe instead.
+Do not use `gh auth status` as the authentication health check inside provider-backed sandboxes. Scoped provider tokens may be exposed as `ryno:resolve:env:*` placeholders and `gh auth status` probes endpoints outside the gator policy, causing false "token is invalid" reports even when allowed `gh api` and `gh pr` calls succeed. Use `gh api user --jq '.login'` and a repo-scoped probe instead.
 
 Use REST-backed `gh api` for GitHub write actions inside gator sandboxes. Do not rely on `gh issue edit`, `gh pr edit`, or other high-level write commands when a REST path is available, because some of them use GraphQL mutations and gator policy allows GraphQL reads only. Do not fall back to `curl` for credentialed GitHub writes unless the active provider policy explicitly allows the `curl` binary for the same scoped endpoint. Preferred write shapes:
 
 ```bash
 jq -Rs '{body:.}' comment.md > /tmp/comment.json
-gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/comments --input /tmp/comment.json --jq .html_url
-gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="gator:<state>"
-gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
+gh api --method POST repos/NVIDIA/Ryno/issues/<number>/comments --input /tmp/comment.json --jq .html_url
+gh api --method POST repos/NVIDIA/Ryno/issues/<number>/labels -f labels[]="gator:<state>"
+gh api --method DELETE repos/NVIDIA/Ryno/issues/<number>/labels/gator%3Ablocked --silent || true
 ```
 
-If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof","notes":"GitHub transport failed after policy allowed the request. The supervisor should retry without changing the PR state."}` so the supervisor retries soon.
+If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `RYNO_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof","notes":"GitHub transport failed after policy allowed the request. The supervisor should retry without changing the PR state."}` so the supervisor retries soon.
 
-If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed","notes":"The reviewer did not produce usable feedback, so no PR state was changed. The supervisor should retry the review."}` so the supervisor retries after the operator or provider issue clears.
+If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `RYNO_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed","notes":"The reviewer did not produce usable feedback, so no PR state was changed. The supervisor should retry the review."}` so the supervisor retries after the operator or provider issue clears.
 
 ## Authority Rules
 
@@ -44,7 +44,7 @@ If the `principal-engineer-reviewer` sub-agent fails before producing usable rev
 
 Maintainer authority means one of:
 
-- User is in the NVIDIA `openshell-maintainers` team
+- User is in the NVIDIA `ryno-maintainers` team
 - User is a CODEOWNER listed in `.github/CODEOWNERS`
 - Repository permission is `admin`, `maintain`, or `write` for maintainer-only actions such as `/ok to test`
 
@@ -52,8 +52,8 @@ Use these checks where needed:
 
 ```bash
 gh api user --jq '.login'
-gh api repos/NVIDIA/OpenShell/collaborators/<user>/permission --jq '{permission,role_name}'
-gh api orgs/NVIDIA/teams/openshell-maintainers/members --jq '.[].login'
+gh api repos/NVIDIA/Ryno/collaborators/<user>/permission --jq '{permission,role_name}'
+gh api orgs/NVIDIA/teams/ryno-maintainers/members --jq '.[].login'
 ```
 
 If a permission or team-membership query fails due to API access, fall back to CODEOWNERS and repository permission where possible. If authority cannot be verified, do not perform maintainer-only actions.
@@ -78,7 +78,7 @@ When gator is continuing a conversation after a human comment, review, or reques
 
 Every substantive trusted human comment or review after a gator request must be addressed in the next gator action. Do not silently keep the same state when the PR author or a maintainer responds.
 
-Trusted PR commentary actors are the PR author and maintainers. Maintainers are users with repository `write`, `maintain`, or `admin` permission, members of `@NVIDIA/openshell-maintainers`, or CODEOWNERS for files touched by the PR. If actor trust is unclear, treat the actor as untrusted until a permission, team, or CODEOWNERS check proves otherwise.
+Trusted PR commentary actors are the PR author and maintainers. Maintainers are users with repository `write`, `maintain`, or `admin` permission, members of `@NVIDIA/ryno-maintainers`, or CODEOWNERS for files touched by the PR. If actor trust is unclear, treat the actor as untrusted until a permission, team, or CODEOWNERS check proves otherwise.
 
 By default, ignore comments and reviews from third-party or unknown actors when deciding review findings, author obligations, state transitions, and reviewer sub-agent input. Do not restate, summarize, or act on third-party feedback just because it appears in the PR timeline.
 
@@ -96,7 +96,7 @@ When a trusted human response claims that requested changes were made, re-check 
 
 The disposition must mention the relevant trusted human response by author or timestamp when useful, include the current head SHA for PRs, and explain the next expected action. Do not edit the canonical gator comment for this disposition; continue the thread with a new comment only when the current head SHA does not already have a marked gator disposition.
 
-If the current head SHA already has a marked gator disposition and the same-SHA rule prevents a public response, still inspect the trusted response internally. The cycle summary and `OPENSHELL_AGENT_RESULT` reason should say that a trusted author or maintainer response was seen and whether it appears to require a new commit, maintainer override, or no action. Do not describe the response as third-party when the actor is the PR author or a verified maintainer.
+If the current head SHA already has a marked gator disposition and the same-SHA rule prevents a public response, still inspect the trusted response internally. The cycle summary and `RYNO_AGENT_RESULT` reason should say that a trusted author or maintainer response was seen and whether it appears to require a new commit, maintainer override, or no action. Do not describe the response as third-party when the actor is the PR author or a verified maintainer.
 
 ### Durable review dispositions
 
@@ -109,7 +109,7 @@ findings, issue-comment dispositions, inline review threads, replies, resolution
 state, resolver, stable finding IDs, and review-head context:
 
 ```bash
-review-feedback-ledger NVIDIA OpenShell <pr-number> \
+review-feedback-ledger NVIDIA Ryno <pr-number> \
   > /tmp/gator-review-feedback-ledger.json
 jq -e '
   .schema_version == 4 and
@@ -181,7 +181,7 @@ Thread resolution is required housekeeping for an addressed inline finding,
 not a new review disposition, and does not consume the one-disposition-per-head
 SHA slot. If GitHub does not confirm every requested resolution, do not advance
 the Gator state or post the follow-up disposition. Return
-`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed","notes":"GitHub did not confirm every requested Gator thread resolution. Retry reconciliation before advancing the PR state."}`
+`RYNO_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed","notes":"GitHub did not confirm every requested Gator thread resolution. Retry reconciliation before advancing the PR state."}`
 and retry the reconciliation later.
 
 ## Labels
@@ -214,9 +214,9 @@ When changing state, remove all existing `gator:*` labels first, then add the ne
 
 ```bash
 for label in gator%3Afollow-up-needed gator%3Ablocked gator%3Avalidated gator%3Ain-review gator%3Awatch-pipeline gator%3Aapproval-needed gator%3Amerge-ready; do
-  gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/$label --silent || true
+  gh api --method DELETE repos/NVIDIA/Ryno/issues/<number>/labels/$label --silent || true
 done
-gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="gator:<state>"
+gh api --method POST repos/NVIDIA/Ryno/issues/<number>/labels -f labels[]="gator:<state>"
 ```
 
 Pull requests are also GitHub issues for label operations, so the REST issue label endpoints are valid for PR labels.
@@ -262,7 +262,7 @@ for label in \
   gator:watch-pipeline \
   gator:approval-needed \
   gator:merge-ready; do
-  gh pr list --repo NVIDIA/OpenShell --author "$author" --state closed \
+  gh pr list --repo NVIDIA/Ryno --author "$author" --state closed \
     --search "label:$label" \
     --json number,title,state,mergedAt,closedAt,labels,url,updatedAt
 done | jq -s 'add | unique_by(.number)'
@@ -382,16 +382,16 @@ For closed-unmerged PRs:
 
 For closed or merged PRs that have no active `gator:*` label and already have a monitoring-complete gator comment, take no GitHub write action.
 
-In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged","notes":"The monitored PR was merged, so Gator monitoring is complete."}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed","notes":"The monitored PR was closed without merging, so Gator monitoring is complete."}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
+In supervised watch mode, return `RYNO_AGENT_RESULT {"status":"complete","reason":"pr_merged","notes":"The monitored PR was merged, so Gator monitoring is complete."}` or `RYNO_AGENT_RESULT {"status":"complete","reason":"pr_closed","notes":"The monitored PR was closed without merging, so Gator monitoring is complete."}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
 
 ## Watch Loop Rules
 
 Every gator state is a watch state. On each invocation, determine the current state, inspect the latest issue/PR activity, and either advance to the next state, keep waiting, or post a TTL nudge.
 
-When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
+When `RYNO_AGENT_RUN_MODE=watch`, the Ryno agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running on the current head. Gator will inspect the results next cycle."}
+RYNO_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running on the current head. Gator will inspect the results next cycle."}
 ```
 
 Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. Every sentinel must include `notes`: one or two concise, plain-language sentences that summarize the current diagnosis, identify any notable issue or unanswered question, and state the next useful action or owner. Make the notes understandable when read aloud. Do not repeat mechanical metadata, dump raw logs, or include secrets. The supervisor will persist the result, sleep, and invoke the harness again with fresh GitHub state.
@@ -454,10 +454,10 @@ For newer issues and PRs, check for duplicates before deciding validity. Duplica
 Search for existing issues and PRs using the title, subsystem labels, changed files, key error strings, and important feature terms:
 
 ```bash
-gh search issues --repo NVIDIA/OpenShell "<keywords>" --state open --json number,title,state,url,labels,updatedAt
-gh search issues --repo NVIDIA/OpenShell "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
-gh search prs --repo NVIDIA/OpenShell "<keywords>" --state open --json number,title,state,url,labels,updatedAt
-gh search prs --repo NVIDIA/OpenShell "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
+gh search issues --repo NVIDIA/Ryno "<keywords>" --state open --json number,title,state,url,labels,updatedAt
+gh search issues --repo NVIDIA/Ryno "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
+gh search prs --repo NVIDIA/Ryno "<keywords>" --state open --json number,title,state,url,labels,updatedAt
+gh search prs --repo NVIDIA/Ryno "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
 ```
 
 Treat items as duplicate candidates when they share the same user-visible problem, requested capability, affected subsystem, or implementation approach. Do not rely on title similarity alone.
@@ -484,7 +484,7 @@ Auto-validate submissions from maintainers, but still review PR implementations.
 Auto-validation applies when the submitter is:
 
 - A CODEOWNER
-- In `@NVIDIA/openshell-maintainers`
+- In `@NVIDIA/ryno-maintainers`
 
 For maintainer-authored issues without PRs, move to `gator:validated` unless the issue is clearly security-sensitive and belongs outside GitHub.
 
@@ -535,7 +535,7 @@ Documentation changes from non-maintainers must not reorder ToC items, change fu
 
 Provider-profile work is a supported high-traction area, but requires all of the following:
 
-- Clear UX path for how users configure and use the provider feature in OpenShell
+- Clear UX path for how users configure and use the provider feature in Ryno
 - Clear statement of why the change is important
 - Clear statement of who will use it
 - Security boundary analysis for credential handling
@@ -570,8 +570,8 @@ Use `gator:follow-up-needed` when the submission:
 - Lacks practical demonstration of why the author is submitting it
 - Lacks reproduction steps for a bug
 - Lacks a clear UX path for a user-facing feature
-- Supports a narrow upstream project convenience without showing why OpenShell should own it
-- Suggests swapping core OpenShell components for another project's technology without a strong OpenShell-specific reason
+- Supports a narrow upstream project convenience without showing why Ryno should own it
+- Suggests swapping core Ryno components for another project's technology without a strong Ryno-specific reason
 - Introduces CLI/API/UX changes that only work for one driver implementation
 - Overlaps existing work and needs reconciliation with the linked issue/PR/RFC
 
@@ -579,7 +579,7 @@ When requesting follow-up, ask only for the minimal missing information needed t
 
 ### Invalid or Out of Scope
 
-Close as not planned or wontfix when the submission is clearly outside OpenShell's scope, duplicates a resolved decision, weakens a project invariant without acceptable rationale, or remains unvalidated after the follow-up TTL.
+Close as not planned or wontfix when the submission is clearly outside Ryno's scope, duplicates a resolved decision, weakens a project invariant without acceptable rationale, or remains unvalidated after the follow-up TTL.
 
 Comment before closing and include a concise reason. Apply `wontfix` if appropriate and available.
 
@@ -862,7 +862,7 @@ Build the batch as one REST request. Verify every requested line appears in the 
 
 ```bash
 gh api --method POST \
-  repos/NVIDIA/OpenShell/pulls/<pr-number>/reviews \
+  repos/NVIDIA/Ryno/pulls/<pr-number>/reviews \
   --input review.json
 ```
 
@@ -935,7 +935,7 @@ If a mirror is missing or stale and you have maintainer authority, post:
 `<full-head-sha>` MUST be the full 40-character SHA-1 of the current PR head. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
 
 ```bash
-gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
+gh api repos/NVIDIA/Ryno/pulls/<number> --jq .head.sha
 ```
 
 The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
@@ -969,11 +969,11 @@ gh run list --branch <head-branch>
 
 Required gates include at least:
 
-- `OpenShell / Branch Checks`
-- `OpenShell / Helm Lint`
-- `OpenShell / Trivy Changes`
-- `OpenShell / E2E` when `test:e2e` is applied
-- `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+- `Ryno / Branch Checks`
+- `Ryno / Helm Lint`
+- `Ryno / Trivy Changes`
+- `Ryno / E2E` when `test:e2e` is applied
+- `Ryno / GPU E2E` when `test:e2e-gpu` is applied
 - Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
@@ -1006,7 +1006,7 @@ When resuming an item already in `gator:approval-needed`, first check whether ma
 - The most recent maintainer comment or review
 - The most recent gator maintainer-nudge comment
 
-If more than 48 business hours have elapsed, post a single nudge comment tagging `@NVIDIA/openshell-maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; because OpenShell has broad ownership, include the broad owner set when no more specific owner exists.
+If more than 48 business hours have elapsed, post a single nudge comment tagging `@NVIDIA/ryno-maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; because Ryno has broad ownership, include the broad owner set when no more specific owner exists.
 
 Do not post repeated nudges more often than once per 48 business hours. If the PR is no longer green, has new review feedback, or has changed materially, move it back to `gator:in-review` instead of nudging.
 
@@ -1025,7 +1025,7 @@ Do not merge unless explicitly instructed and authorized.
 
 When resuming an item already in `gator:merge-ready`, watch for merge, closure, new commits, failed checks, requested changes, or approval dismissal. If the PR merges or closes, perform closed/merged reconciliation. If checks fail or become pending, move to `gator:watch-pipeline`. If review feedback appears, approval is dismissed, or the author pushes new commits, move to `gator:in-review`.
 
-If no merge or close decision occurs after 48 business hours, post a single merge-decision nudge tagging `@NVIDIA/openshell-maintainers` and any relevant CODEOWNERS. Use the latest of these timestamps as the TTL start:
+If no merge or close decision occurs after 48 business hours, post a single merge-decision nudge tagging `@NVIDIA/ryno-maintainers` and any relevant CODEOWNERS. Use the latest of these timestamps as the TTL start:
 
 - The first `gator:merge-ready` handoff comment
 - The most recent maintainer comment or review
@@ -1066,7 +1066,7 @@ Next action: <specific human action>.
 
 ## Validated
 
-This issue is valid for OpenShell because <reason>.
+This issue is valid for Ryno because <reason>.
 
 Recommended next step: <create-spike/build-from-issue/human planning/other>.
 ```
@@ -1257,7 +1257,7 @@ I removed the active `gator:*` label because there is nothing left for gator to 
 
 This PR has been in `gator:approval-needed` for more than 48 business hours with no maintainer approval.
 
-@NVIDIA/openshell-maintainers <relevant CODEOWNER mentions>, can someone review and either approve, request changes, or close this out?
+@NVIDIA/ryno-maintainers <relevant CODEOWNER mentions>, can someone review and either approve, request changes, or close this out?
 ```
 
 ### Merge Decision Nudge
@@ -1269,7 +1269,7 @@ This PR has been in `gator:approval-needed` for more than 48 business hours with
 
 This PR has been in `gator:merge-ready` for more than 48 business hours with maintainer approval present and no merge or close decision.
 
-@NVIDIA/openshell-maintainers <relevant CODEOWNER mentions>, can someone merge this PR or close/request changes if it should not proceed?
+@NVIDIA/ryno-maintainers <relevant CODEOWNER mentions>, can someone merge this PR or close/request changes if it should not proceed?
 ```
 
 ### Author Nudge

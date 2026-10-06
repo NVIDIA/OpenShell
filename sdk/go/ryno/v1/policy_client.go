@@ -1,0 +1,192 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package v1
+
+import (
+	"context"
+
+	pb "github.com/NVIDIA/Ryno/sdk/go/proto/rynov1"
+	"github.com/NVIDIA/Ryno/sdk/go/ryno/v1/internal/converter"
+	"github.com/NVIDIA/Ryno/sdk/go/ryno/v1/types"
+	"google.golang.org/grpc"
+)
+
+type policyClient struct {
+	client pb.RynoClient
+}
+
+func newPolicyClient(conn grpc.ClientConnInterface) *policyClient {
+	return &policyClient{client: pb.NewRynoClient(conn)}
+}
+
+func (p *policyClient) GetDraft(ctx context.Context, workspace, sandboxName string, opts ...GetDraftOption) (*DraftPolicy, error) {
+	cfg := types.ApplyGetDraftOptions(opts)
+	resp, err := p.client.GetDraftPolicy(ctx, &pb.GetDraftPolicyRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		StatusFilter:   cfg.StatusFilter(),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.DraftPolicyFromProto(resp), nil
+}
+
+func (p *policyClient) ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reviewToken string) (*ApproveResult, error) {
+	resp, err := p.client.ApproveDraftChunk(ctx, &pb.ApproveDraftChunkRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
+		ReviewToken:    reviewToken,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.ApproveResultFromProto(resp), nil
+}
+
+func (p *policyClient) RejectDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reason string) error {
+	_, err := p.client.RejectDraftChunk(ctx, &pb.RejectDraftChunkRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
+		Reason:         reason,
+	})
+	if err != nil {
+		return converter.FromGRPCError(err)
+	}
+	return nil
+}
+
+func (p *policyClient) ApproveAllDraftChunks(ctx context.Context, workspace, sandboxName string, opts ...ApproveAllOption) (*ApproveAllResult, error) {
+	cfg := types.ApplyApproveAllOptions(opts)
+	approvals := make([]*pb.DraftChunkApproval, 0, len(cfg.Approvals()))
+	for _, approval := range cfg.Approvals() {
+		approvals = append(approvals, &pb.DraftChunkApproval{
+			ChunkId:     approval.ChunkID,
+			ReviewToken: approval.ReviewToken,
+		})
+	}
+	resp, err := p.client.ApproveAllDraftChunks(ctx, &pb.ApproveAllDraftChunksRequest{
+		IncludeSecurityFlagged: cfg.IncludeSecurityFlagged(),
+		Approvals:              approvals,
+		Sandbox:                sandboxName,
+		WorkspaceScope:         namedWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.ApproveAllResultFromProto(resp), nil
+}
+
+func (p *policyClient) ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error) {
+	resp, err := p.client.ClearDraftChunks(ctx, &pb.ClearDraftChunksRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.ClearResultFromProto(resp), nil
+}
+
+func (p *policyClient) GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error) {
+	resp, err := p.client.GetDraftHistory(ctx, &pb.GetDraftHistoryRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	entries := resp.GetEntries()
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	result := make([]DraftHistoryEntry, 0, len(entries))
+	for _, e := range entries {
+		if converted := converter.DraftHistoryEntryFromProto(e); converted != nil {
+			result = append(result, *converted)
+		}
+	}
+	return result, nil
+}
+
+func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error) {
+	cfg := types.ApplyGetStatusOptions(opts)
+	req := &pb.GetSandboxPolicyStatusRequest{
+		Version: cfg.Version(),
+		Global:  cfg.Global(),
+	}
+	if !cfg.Global() {
+		req.Sandbox = sandboxName
+		req.WorkspaceScope = namedWorkspaceScope(workspace)
+	}
+	resp, err := p.client.GetSandboxPolicyStatus(ctx, req)
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.PolicyStatusResultFromProto(resp), nil
+}
+
+func (p *policyClient) List(workspace, sandboxName string, opts ...ListPolicyOption) (*Pager[SandboxPolicyRevision], error) {
+	cfg := types.ApplyListPolicyOptions(opts)
+	if cfg.PageSize() < 0 {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "page size must not be negative"}
+	}
+	if !cfg.Global() && sandboxName == "" {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
+	}
+	return newPager(cfg.PageToken(), func(ctx context.Context, pageToken string) (*Page[SandboxPolicyRevision], error) {
+		req := &pb.ListSandboxPoliciesRequest{
+			Sandbox: sandboxName, PageSize: cfg.PageSize(), PageToken: pageToken, Global: cfg.Global(),
+		}
+		if !cfg.Global() {
+			req.WorkspaceScope = namedWorkspaceScope(workspace)
+		}
+		resp, err := p.client.ListSandboxPolicies(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		result := make([]SandboxPolicyRevision, 0, len(resp.GetRevisions()))
+		for _, revision := range resp.GetRevisions() {
+			if converted := converter.SandboxPolicyRevisionFromProto(revision); converted != nil {
+				result = append(result, *converted)
+			}
+		}
+		return &Page[SandboxPolicyRevision]{Items: result, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
+
+func (p *policyClient) ListAll(ctx context.Context, workspace, sandboxName string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
+	pager, err := p.List(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
+}
+
+func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error {
+	_, err := p.client.EditDraftChunk(ctx, &pb.EditDraftChunkRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
+		ProposedRule:   converter.NetworkPolicyRuleToProto(proposedRule),
+	})
+	if err != nil {
+		return converter.FromGRPCError(err)
+	}
+	return nil
+}
+
+func (p *policyClient) UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error) {
+	resp, err := p.client.UndoDraftChunk(ctx, &pb.UndoDraftChunkRequest{
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		ChunkId:        chunkID,
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.UndoResultFromProto(resp), nil
+}

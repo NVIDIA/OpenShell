@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Configure OpenShell gateway
+- name: Configure Ryno gateway
   hosts: all
   gather_facts: false
   roles:
-    - openshell_gateway
-    - openshell_client
+    - ryno_gateway
+    - ryno_client

@@ -1,10 +1,10 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Contributing to NVIDIA OpenShell Documentation"
+title: "Contributing to NVIDIA Ryno Documentation"
 description: ""
 ---
-This guide covers how to write, edit, and review documentation for NVIDIA OpenShell. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
+This guide covers how to write, edit, and review documentation for NVIDIA Ryno. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
 
 The published docs live in `docs/`, navigation is defined in `docs/index.yml`, and `fern/` contains the site config, components, and theme assets.
 
@@ -17,7 +17,7 @@ If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo inclu
 | `update-docs-from-commits` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
 | `build-from-issue` | Plans and implements work from a GitHub issue, including doc updates. | When working from an issue that has doc impact. |
 
-These contributor workflows live in `.agents/skills/` and follow the style guide below automatically. They are separate from the public skills in `skills/`, which help users operate OpenShell and can be installed without cloning the repository. To use a contributor skill, ask your repository-aware agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
+These contributor workflows live in `.agents/skills/` and follow the style guide below automatically. They are separate from the public skills in `skills/`, which help users operate Ryno and can be installed without cloning the repository. To use a contributor skill, ask your repository-aware agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
 
 ## When to Update Docs
 
@@ -117,7 +117,7 @@ These patterns are common in LLM-generated text and erode trust with technical r
 |---|---|---|
 | Unnecessary bold | "This is a **critical** step" on routine instructions. | Reserve bold for UI labels, parameter names, and genuine warnings. |
 | Em dashes everywhere | "The gateway — which runs in Docker — creates sandboxes." | Use commas or split into two sentences. Em dashes are fine sparingly but should not appear multiple times per paragraph. |
-| Superlatives | "OpenShell provides a powerful, robust, seamless experience." | Say what it does, not how great it is. |
+| Superlatives | "Ryno provides a powerful, robust, seamless experience." | Say what it does, not how great it is. |
 | Hedge words | "Simply run the command" or "You can easily configure..." | Drop the adverb. "Run the command." |
 | Emoji in prose | "🚀 Let's get started!" | No emoji in documentation prose. |
 | Rhetorical questions | "Want to secure your agents? Look no further!" | State the purpose directly. |
@@ -129,7 +129,7 @@ These patterns are common in LLM-generated text and erode trust with technical r
 - Use `shell` code blocks for copyable CLI examples. Do not prefix commands with `$`:
 
   ```shell
-  openshell gateway add http://127.0.0.1:18080 --local --name local
+  ryno gateway add http://127.0.0.1:18080 --local --name local
   ```
 
 - Use `text` code blocks for transcripts, log output, and examples that should not be copied verbatim.
@@ -151,7 +151,7 @@ Use these consistently:
 | CLI | cli, Cli |
 | API key | api key, API Key |
 | NVIDIA | Nvidia, nvidia |
-| OpenShell | Open Shell, openShell, Openshell, openshell |
+| Ryno | ryno, RYNO, RynO |
 | mTLS | MTLS, mtls |
 | YAML | yaml, Yaml |
 

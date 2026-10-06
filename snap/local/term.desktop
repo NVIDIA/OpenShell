@@ -1,7 +1,7 @@
 [Desktop Entry]
-Name=OpenShell
-Comment=OpenShell terminal UI for managing sandboxes and gateways
-Exec=openshell.term
+Name=Ryno
+Comment=Ryno terminal UI for managing sandboxes and gateways
+Exec=ryno.term
 Icon=${SNAP}/meta/gui/icon.png
 Terminal=true
 Type=Application

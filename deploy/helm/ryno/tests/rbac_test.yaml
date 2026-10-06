@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Gateway RBAC creation
+templates:
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/peer-role.yaml
+release:
+  name: ryno
+  namespace: my-namespace
+
+tests:
+  - it: creates the namespaced sandbox Role by default
+    template: templates/role.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: ryno-sandbox
+
+  - it: creates the namespaced sandbox RoleBinding by default
+    template: templates/rolebinding.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: ryno-sandbox
+
+  - it: creates the gateway peer Role and RoleBinding by default
+    template: templates/peer-role.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: ryno-peer
+
+  - it: keeps the namespaced RBAC when only cluster-scoped RBAC is disabled
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 1
+    template: templates/role.yaml
+
+  - it: keeps the peer RBAC when only cluster-scoped RBAC is disabled
+    template: templates/peer-role.yaml
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: omits the namespaced sandbox Role when chart-managed RBAC is disabled
+    template: templates/role.yaml
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the namespaced sandbox RoleBinding when chart-managed RBAC is disabled
+    template: templates/rolebinding.yaml
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the gateway peer Role and RoleBinding when chart-managed RBAC is disabled
+    template: templates/peer-role.yaml
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: creates the namespaced sandbox Role when legacy values omit the rbac block
+    template: templates/role.yaml
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: creates the peer Role and RoleBinding when legacy values omit the rbac block
+    template: templates/peer-role.yaml
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 2

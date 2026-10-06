@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.middleware.v1;
+package ryno.middleware.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/duration.proto";
@@ -28,7 +28,7 @@ service SupervisorMiddleware {
   // implementation supports client-to-upstream text messages at
   // PRE_CREDENTIALS; PRE_RETURN is reserved for upstream-to-client messages.
   // A request may go unanswered when the session terminates. For every opened
-  // stage stream, OpenShell attempts at most one session_end before closing the
+  // stage stream, Ryno attempts at most one session_end before closing the
   // stream when its transport is still writable.
   rpc EvaluateWebSocketSession(stream WebSocketSessionEvent)
       returns (stream WebSocketSessionEventResult);
@@ -37,11 +37,11 @@ service SupervisorMiddleware {
 message MiddlewareDescribeRequest {
   // Gateway or supervisor protocol metadata. Middleware must reject unmet
   // requirements before accepting traffic.
-  openshell.extension.v1.PeerMetadata gateway = 1;
+  ryno.extension.v1.PeerMetadata gateway = 1;
 }
 
 // HttpResponsePreReturn evaluates one response for one middleware stage before
-// OpenShell returns it to the sandbox.
+// Ryno returns it to the sandbox.
 service HttpResponsePreReturn {
   // Evaluate starts with preflight and may continue with selected body units
   // and trailers. A body unit marked end_of_stream ends body inspection, not
@@ -60,14 +60,14 @@ message MiddlewareManifest {
   string service_version = 2;
   // Bindings exposed by this middleware service.
   repeated MiddlewareBinding bindings = 3;
-  // Exact JWT audience this service verifies on inbound OpenShell calls.
-  // After authenticated Describe succeeds, OpenShell rejects the registration
+  // Exact JWT audience this service verifies on inbound Ryno calls.
+  // After authenticated Describe succeeds, Ryno rejects the registration
   // unless this matches the operator-configured audience. A strict verifier may
   // reject an incorrect audience before returning this manifest. Empty skips
   // this post-authentication consistency check.
   string expected_audience = 4;
   // Supervisor-middleware protocol metadata. Required for negotiation.
-  openshell.extension.v1.PeerMetadata extension = 5;
+  ryno.extension.v1.PeerMetadata extension = 5;
 }
 
 // MiddlewareBinding declares one operation and phase supported by a service.
@@ -117,7 +117,7 @@ message HttpRequestEvaluation {
   // Destination and HTTP request target.
   // The encoded target is limited to 32 KiB.
   HttpRequestTarget target = 4;
-  // HTTP request headers before OpenShell injects credentials, in wire
+  // HTTP request headers before Ryno injects credentials, in wire
   // order. Repeated header names are preserved as separate entries. Protected
   // credential, routing, framing, and hop-by-hop headers are omitted.
   // At most 128 lines and 64 KiB of encoded headers are included.
@@ -177,7 +177,7 @@ message HttpResponsePreflight {
   // Response headers after prior stages, in wire order. Repeated names remain
   // separate. Credential, routing, and hop-by-hop headers are omitted.
   // Content-Length, Content-Encoding, and Content-Range retain their read-only
-  // upstream values. OpenShell may recompute or remove Content-Length later.
+  // upstream values. Ryno may recompute or remove Content-Length later.
   // Limited to 128 lines and 64 KiB encoded.
   repeated HttpHeader headers = 4;
   // Built-in middleware name or operator-owned registration name.
@@ -188,7 +188,7 @@ message HttpResponsePreflight {
   // whole-body input/replacement and each stream input/replacement. Stream
   // inputs use at most min(64 KiB, max_payload_bytes).
   uint64 max_payload_bytes = 7;
-  // Modes derived independently for this stage. OpenShell first determines
+  // Modes derived independently for this stage. Ryno first determines
   // response-shape eligibility from the original final response head, then
   // applies this stage's effective max_payload_bytes. Different stages may
   // receive different lists. HEADERS_ONLY is always present and is the only
@@ -229,7 +229,7 @@ message HttpResponsePreflightResult {
 // Ends this stage successfully without body inspection.
 message HttpResponsePreflightSkip {}
 
-// Blocks delivery as a successful decision regardless of on_error. OpenShell
+// Blocks delivery as a successful decision regardless of on_error. Ryno
 // evaluates results in policy order. Once it accepts a valid block, it stops
 // later middleware evaluation and ends every still-writable opened stage with
 // MIDDLEWARE_DENIAL. A failure handled earlier may already have stopped
@@ -239,17 +239,17 @@ message HttpResponsePreflightSkip {}
 // request.
 //
 // Before response commitment, including at preflight and during
-// WHOLE_BODY_BYTES, OpenShell replaces the upstream response with the canonical
+// WHOLE_BODY_BYTES, Ryno replaces the upstream response with the canonical
 // 403 Forbidden middleware-denial response. Its JSON body has
 // error = "middleware_denied" and includes a validated reason_code when the
-// result supplies one. OpenShell never returns the free-form reason or writes it
-// to security logs. For HEAD, OpenShell sends the canonical response headers
+// result supplies one. Ryno never returns the free-form reason or writes it
+// to security logs. For HEAD, Ryno sends the canonical response headers
 // and Content-Length but no body. It closes the downstream connection after the
 // denial response.
 //
-// After response commitment, including during STREAM_BYTES, OpenShell aborts
+// After response commitment, including during STREAM_BYTES, Ryno aborts
 // downstream delivery. It does not inject an error body, a terminating chunk,
-// or an error trailer. OpenShell does not reuse the upstream connection.
+// or an error trailer. Ryno does not reuse the upstream connection.
 message HttpResponseBlockDelivery {}
 
 // Selects body inspection and response-header mutations.
@@ -296,7 +296,7 @@ message HttpResponseBodyUnit {
   }
   // Marks the final body unit. Every normally completed body inspection receives
   // exactly one. For a body-capable response with no body bytes, this is the
-  // empty sequence-1 unit. OpenShell does not read ahead, so it may send an empty
+  // empty sequence-1 unit. Ryno does not read ahead, so it may send an empty
   // final unit after the last nonempty unit. Trailers and session_end may
   // follow. A stage ended by skip_remaining, block, or failure receives no
   // later final unit.
@@ -306,9 +306,9 @@ message HttpResponseBodyUnit {
 // Result for one body unit. Units are processed in lockstep; V1 does not
 // support ownership transfer or cross-unit retention. Diagnostic fields apply
 // to every action. Invalid diagnostics make the entire result a middleware
-// failure handled according to on_error. OpenShell retains the current input
+// failure handled according to on_error. Ryno retains the current input
 // until it validates the result, so fail-open can continue from the last input
-// OpenShell still owns.
+// Ryno still owns.
 message HttpResponseBodyResult {
   // Must match the next unit. Zero, gaps, duplicates, and regressions fail.
   uint64 sequence = 1;
@@ -327,7 +327,7 @@ message HttpResponseBodyResult {
   // 4 KiB.
   string reason = 4;
   // Optional audit code using the HttpRequestResult.reason_code format and
-  // 64-byte maximum. When OpenShell accepts block_delivery before response
+  // 64-byte maximum. When Ryno accepts block_delivery before response
   // commitment, it includes this code in the canonical denial response. It is
   // never returned after commitment.
   string reason_code = 5;
@@ -397,7 +397,7 @@ message HttpResponseTrailersResult {
   map<string, string> metadata = 5;
 }
 
-// Stable reason OpenShell ended a middleware stage stream.
+// Stable reason Ryno ended a middleware stage stream.
 enum MiddlewareSessionEndReason {
   // Invalid reason.
   MIDDLEWARE_SESSION_END_REASON_UNSPECIFIED = 0;
@@ -479,7 +479,7 @@ message WebSocketSessionEvent {
   }
 }
 
-// WebSocketPreflight lets a service decline this upgrade before OpenShell
+// WebSocketPreflight lets a service decline this upgrade before Ryno
 // contacts upstream. It deliberately excludes query data, arbitrary request
 // headers, and message payloads.
 message WebSocketPreflight {
@@ -532,11 +532,11 @@ enum WebSocketPreflightAction {
 
 message WebSocketPreflightDecision {
   WebSocketPreflightAction action = 1;
-  // Free-form service diagnostic. OpenShell never exposes this to the
+  // Free-form service diagnostic. Ryno never exposes this to the
   // workload or security logs. Limited to 4 KiB before discarding.
   string reason = 2;
   // Optional stable machine-readable code for a deny decision. Because
-  // preflight runs before the HTTP upgrade completes, OpenShell may return
+  // preflight runs before the HTTP upgrade completes, Ryno may return
   // this code to the requester. Codes follow the same format and 64-byte
   // maximum as HttpRequestResult.reason_code.
   string reason_code = 3;
@@ -560,7 +560,7 @@ message WebSocketMessageResult {
     string text = 3;
     bytes binary = 4;
   }
-  // Free-form service diagnostic. OpenShell never exposes this to the
+  // Free-form service diagnostic. Ryno never exposes this to the
   // workload or security logs. Limited to 4 KiB before discarding.
   string reason = 5;
   // Optional stable machine-readable code for OCSF only. Unlike the HTTP
@@ -623,7 +623,7 @@ message Process {
   repeated string ancestors = 3;
 }
 
-// Decision controls whether OpenShell continues processing the current
+// Decision controls whether Ryno continues processing the current
 // evaluation unit.
 enum Decision {
   // Invalid response value handled according to the policy failure mode.
@@ -687,7 +687,7 @@ message HeaderMutation {
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Free-form service diagnostic. OpenShell does not relay this text into
+  // Free-form service diagnostic. Ryno does not relay this text into
   // denied responses or security logs. Limited to 4 KiB before discarding.
   string reason = 2;
   // Replacement request body when has_body is true. Limited to 4 MiB.
@@ -697,13 +697,13 @@ message HttpRequestResult {
   // Ordered request-header mutations applied before the next middleware and
   // before forwarding. Writes and removals may target visible end-to-end
   // request headers, but credential, routing, framing, and hop-by-hop headers
-  // are always protected. Written values cannot contain OpenShell credential
+  // are always protected. Written values cannot contain Ryno credential
   // placeholder syntax. A violating result is a middleware failure handled
   // according to the policy failure mode. At most 64 operations, 32 KiB of
   // validated name/value data, and 64 KiB encoded are accepted.
   repeated HeaderMutation header_mutations = 5;
   // Audit-safe findings produced during evaluation. For operator-run services,
-  // OpenShell logs platform-owned fields derived from the operator-owned
+  // Ryno logs platform-owned fields derived from the operator-owned
   // registration name rather than service-provided type, label, confidence,
   // or metadata text.
   // At most 32 findings of at most 4 KiB encoded each are accepted per stage.
@@ -715,6 +715,6 @@ message HttpRequestResult {
   // Optional stable machine-readable code for a deny decision. Codes must
   // start with a lowercase ASCII letter and contain only lowercase ASCII
   // letters, digits, and underscores, with a maximum length of 64 bytes.
-  // OpenShell may return this code to the requester, unlike free-form reason.
+  // Ryno may return this code to the requester, unlike free-form reason.
   string reason_code = 8;
 }

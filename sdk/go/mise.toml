@@ -10,7 +10,7 @@ buf = "1.72.0"
 
 [tasks.test]
 description = "Run unit tests with coverage"
-run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+run = "go test -coverprofile=coverage.out -coverpkg=./ryno/... -race ./..."
 
 [tasks."test:integration"]
 description = "Run integration tests"
@@ -43,7 +43,7 @@ SUMMARY="docs/src/SUMMARY.md"
 MISSING=0
 
 # Find all public packages with a doc.go (excluding internal, proto, types)
-for docfile in openshell/v1/*/doc.go; do
+for docfile in ryno/v1/*/doc.go; do
   pkg=$(basename "$(dirname "$docfile")")
 
   # Skip internal packages and types (no user-facing docs needed)
@@ -53,7 +53,7 @@ for docfile in openshell/v1/*/doc.go; do
 
   # Check for matching docs page
   if [ ! -f "$DOCS_DIR/$pkg.md" ]; then
-    echo "MISSING: $DOCS_DIR/$pkg.md (package openshell/v1/$pkg has doc.go but no docs page)"
+    echo "MISSING: $DOCS_DIR/$pkg.md (package ryno/v1/$pkg has doc.go but no docs page)"
     MISSING=$((MISSING + 1))
   fi
 

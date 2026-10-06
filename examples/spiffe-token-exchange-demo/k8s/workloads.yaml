@@ -30,7 +30,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-exchange-demo
+                  name: ryno-spiffe-token-exchange-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-exchange-issuer.default.svc.cluster.local
@@ -43,9 +43,9 @@ spec:
             - name: JWT_SVID_AUDIENCE
               value: http://token-exchange-issuer.default.svc.cluster.local
             - name: SUPERVISOR_TRUST_DOMAIN_PREFIX
-              value: spiffe://openshell.local/openshell/sandbox/
+              value: spiffe://ryno.local/ryno/sandbox/
             - name: GATEWAY_TRUST_DOMAIN_PREFIX
-              value: spiffe://openshell.local/ns/openshell/sa/
+              value: spiffe://ryno.local/ns/ryno/sa/
             - name: DEMO_USER_SUBJECT
               value: demo-user
           readinessProbe:
@@ -75,10 +75,10 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-exchange-demo-scripts
+            name: ryno-spiffe-token-exchange-demo-scripts
         - name: helper-config
           configMap:
-            name: openshell-spiffe-token-exchange-demo-helper
+            name: ryno-spiffe-token-exchange-demo-helper
         - name: spiffe-socket
           csi:
             driver: csi.spiffe.io
@@ -134,7 +134,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-exchange-demo
+                  name: ryno-spiffe-token-exchange-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-exchange-issuer.default.svc.cluster.local
@@ -149,7 +149,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-exchange-demo-scripts
+            name: ryno-spiffe-token-exchange-demo-scripts
 ---
 apiVersion: v1
 kind: Service
@@ -199,7 +199,7 @@ spec:
             - name: ACCESS_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: openshell-spiffe-token-exchange-demo
+                  name: ryno-spiffe-token-exchange-demo
                   key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-exchange-issuer.default.svc.cluster.local
@@ -214,7 +214,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: openshell-spiffe-token-exchange-demo-scripts
+            name: ryno-spiffe-token-exchange-demo-scripts
 ---
 apiVersion: v1
 kind: Service

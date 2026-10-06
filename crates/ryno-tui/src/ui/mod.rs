@@ -1,0 +1,814 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+pub mod create_provider;
+pub mod create_sandbox;
+mod dashboard;
+pub mod global_settings;
+pub mod providers;
+pub mod sandbox_detail;
+mod sandbox_draft;
+pub mod sandbox_logs;
+mod sandbox_policy;
+pub mod sandbox_settings;
+pub mod sandboxes;
+mod splash;
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+
+use crate::app::{self, App, Focus, InputMode, Screen, SettingEditState};
+use crate::theme::Theme;
+
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    // Splash screen is a full-screen takeover — no chrome.
+    if app.screen == Screen::Splash {
+        splash::draw(frame, frame.area(), &app.theme);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title bar
+            Constraint::Min(0),    // main content
+            Constraint::Length(1), // nav bar
+            Constraint::Length(1), // command bar
+        ])
+        .split(frame.area());
+
+    draw_title_bar(frame, app, chunks[0]);
+
+    match app.screen {
+        Screen::Splash => unreachable!(),
+        Screen::Dashboard => dashboard::draw(frame, app, chunks[1]),
+        Screen::Sandbox => draw_sandbox_screen(frame, app, chunks[1]),
+    }
+
+    draw_nav_bar(frame, app, chunks[2]);
+    draw_command_bar(frame, app, chunks[3]);
+
+    // Modal overlays (drawn last so they're on top).
+    if app.create_form.is_some() {
+        create_sandbox::draw(frame, app, frame.area());
+    }
+    if app.create_provider_form.is_some() {
+        create_provider::draw(frame, app, frame.area());
+    }
+    if app.provider_detail.is_some() {
+        create_provider::draw_detail(frame, app, frame.area());
+    }
+    if app.update_provider_form.is_some() {
+        create_provider::draw_update(frame, app, frame.area());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox full-screen
+// ---------------------------------------------------------------------------
+
+fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(sandbox_detail::required_height(app, area.width)), // metadata
+            Constraint::Min(0),                                                   // policy or logs
+        ])
+        .split(area);
+
+    sandbox_detail::draw(frame, app, chunks[0]);
+
+    match app.focus {
+        Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
+        Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
+        _ => match app.sandbox_policy_tab {
+            app::SandboxPolicyTab::Settings => sandbox_settings::draw(frame, app, chunks[1]),
+            app::SandboxPolicyTab::Policy => sandbox_policy::draw(frame, app, chunks[1]),
+        },
+    }
+
+    // Log detail popup renders over the full frame (not constrained to pane).
+    if app.focus == Focus::SandboxLogs
+        && let Some(detail_idx) = app.log_detail_index
+    {
+        let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
+        if let Some(log) = filtered.get(detail_idx) {
+            sandbox_logs::draw_detail_popup(frame, log, frame.area(), &app.theme);
+        }
+    }
+
+    // Draft detail popup renders over the full frame.
+    if app.focus == Focus::SandboxDraft && app.draft_detail_open {
+        let abs = app.draft_scroll + app.draft_selected;
+        let scroll = app.draft_detail_scroll;
+        let metrics = app.draft_chunks.get(abs).map(|chunk| {
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.area(), &app.theme, scroll)
+        });
+        if let Some(metrics) = metrics {
+            app.draft_detail_rows = metrics.total_rows;
+            app.draft_detail_body_height = metrics.body_height;
+        }
+    }
+
+    // Approve-all confirmation popup renders over everything.
+    if app.approve_all_confirm_open && !app.approve_all_confirm_chunks.is_empty() {
+        sandbox_draft::draw_approve_all_popup(
+            frame,
+            &app.approve_all_confirm_chunks,
+            frame.area(),
+            &app.theme,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome: title bar, nav bar, command bar
+// ---------------------------------------------------------------------------
+
+fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+    let status_span = match app.status_text.as_str() {
+        s if s.contains("Healthy") => Span::styled(&app.status_text, t.status_ok),
+        s if s.contains("Degraded") => Span::styled(&app.status_text, t.status_warn),
+        s if s.contains("Unhealthy") => Span::styled(&app.status_text, t.status_err),
+        _ => Span::styled(&app.status_text, t.muted),
+    };
+
+    let active_gateway_source = app
+        .gateways
+        .iter()
+        .find(|gateway| gateway.name == app.gateway_name)
+        .map_or("unknown", app::GatewayEntry::source_label);
+
+    let mut parts: Vec<Span<'_>> = title_bar_brand_spans(t);
+    parts.extend([
+        Span::styled("Current Gateway: ", t.text),
+        Span::styled(&app.gateway_name, t.heading),
+        Span::styled(" [", t.muted),
+        Span::styled(active_gateway_source, t.muted),
+        Span::styled("] (", t.muted),
+        status_span,
+        Span::styled(")", t.muted),
+        Span::styled(" | ", t.muted),
+    ]);
+
+    parts.push(Span::styled("Workspace: ", t.text));
+    parts.push(Span::styled(app.workspace_display(), t.heading));
+    parts.push(Span::styled(" | ", t.muted));
+
+    match app.screen {
+        Screen::Splash => unreachable!("splash handled before draw_title_bar"),
+        Screen::Dashboard => {
+            parts.push(Span::styled("Dashboard", t.text));
+        }
+        Screen::Sandbox => {
+            let name = app
+                .sandbox_names
+                .get(app.sandbox_selected)
+                .map_or("-", String::as_str);
+            parts.push(Span::styled("Sandbox: ", t.text));
+            parts.push(Span::styled(name, t.heading));
+        }
+    }
+
+    let title = Line::from(parts);
+    frame.render_widget(Paragraph::new(title).style(t.title_bar), area);
+}
+
+fn title_bar_brand_spans(theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(" >_ Ryno ", theme.accent_bold),
+        Span::styled(format!("v{}", ryno_core::VERSION), theme.muted),
+        Span::styled(" | ", theme.muted),
+    ]
+}
+
+fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+    let spans = match app.screen {
+        Screen::Splash => unreachable!("splash handled before draw_nav_bar"),
+        Screen::Dashboard => match app.focus {
+            Focus::Providers if app.middle_pane_tab == app::MiddlePaneTab::GlobalSettings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+            Focus::Providers => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Detail", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[c/u/d]", t.key_hint),
+                Span::styled(" Create/Update/Delete", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[w]", t.key_hint),
+                Span::styled(" Workspace", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+            Focus::Sandboxes => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Select", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[c]", t.key_hint),
+                Span::styled(" Create Sandbox", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[w]", t.key_hint),
+                Span::styled(" Workspace", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+            _ => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Select", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+        },
+        Screen::Sandbox => match app.focus {
+            Focus::SandboxLogs => {
+                if app.log_selection_anchor.is_some() {
+                    // Visual selection mode — reduced hint set.
+                    vec![
+                        Span::styled(" ", t.text),
+                        Span::styled("[j/k]", t.key_hint),
+                        Span::styled(" Extend", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[y]", t.key_hint),
+                        Span::styled(" Yank", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[g/G]", t.key_hint),
+                        Span::styled(" Top/Bottom", t.text),
+                        Span::styled("  |  ", t.border),
+                        Span::styled("[Esc]", t.muted),
+                        Span::styled(" Cancel", t.muted),
+                        Span::styled("  ", t.text),
+                        Span::styled("[q]", t.muted),
+                        Span::styled(" Quit", t.muted),
+                    ]
+                } else {
+                    // Normal log viewer mode.
+                    let filter_label = app.log_source_filter.label();
+                    let autoscroll_label = if app.log_autoscroll {
+                        " Autoscroll"
+                    } else {
+                        " Follow"
+                    };
+                    let autoscroll_style = if app.log_autoscroll {
+                        t.status_ok
+                    } else {
+                        t.text
+                    };
+                    vec![
+                        Span::styled(" ", t.text),
+                        Span::styled("[j/k]", t.key_hint),
+                        Span::styled(" Navigate", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[Enter]", t.key_hint),
+                        Span::styled(" Detail", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[g/G]", t.key_hint),
+                        Span::styled(" Top/Bottom", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[f]", t.key_hint),
+                        Span::styled(autoscroll_label, autoscroll_style),
+                        Span::styled("  ", t.text),
+                        Span::styled("[s]", t.key_hint),
+                        Span::styled(format!(" Source: {filter_label}"), t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[y]", t.key_hint),
+                        Span::styled(" Copy", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[Y]", t.key_hint),
+                        Span::styled(" Copy All", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[v]", t.key_hint),
+                        Span::styled(" Select", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[r]", t.key_hint),
+                        Span::styled(" Rules", t.text),
+                        Span::styled("  |  ", t.border),
+                        Span::styled("[Esc]", t.muted),
+                        Span::styled(" Policy", t.muted),
+                        Span::styled("  ", t.text),
+                        Span::styled("[q]", t.muted),
+                        Span::styled(" Quit", t.muted),
+                    ]
+                }
+            }
+            Focus::SandboxDraft => {
+                // Build state-aware action hints based on selected chunk.
+                let selected_status = app
+                    .draft_chunks
+                    .get(app.draft_scroll + app.draft_selected)
+                    .map_or("", |c| c.status.as_str());
+                let mut spans = vec![
+                    Span::styled(" ", t.text),
+                    Span::styled("[j/k]", t.key_hint),
+                    Span::styled(" Navigate", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[Enter]", t.key_hint),
+                    Span::styled(" Detail", t.text),
+                ];
+                match selected_status {
+                    "pending" => {
+                        spans.extend([
+                            Span::styled("  ", t.text),
+                            Span::styled("[a]", t.key_hint),
+                            Span::styled(" Approve", t.text),
+                            Span::styled("  ", t.text),
+                            Span::styled("[x]", t.key_hint),
+                            Span::styled(" Reject", t.text),
+                            Span::styled("  ", t.text),
+                            Span::styled("[A]", t.key_hint),
+                            Span::styled(" Approve All", t.text),
+                        ]);
+                    }
+                    "approved" => {
+                        spans.extend([
+                            Span::styled("  ", t.text),
+                            Span::styled("[x]", t.key_hint),
+                            Span::styled(" Revoke", t.text),
+                        ]);
+                    }
+                    "rejected" => {
+                        spans.extend([
+                            Span::styled("  ", t.text),
+                            Span::styled("[a]", t.key_hint),
+                            Span::styled(" Approve", t.text),
+                        ]);
+                    }
+                    _ => {}
+                }
+                spans.extend([
+                    Span::styled("  ", t.text),
+                    Span::styled("[p]", t.key_hint),
+                    Span::styled(" Policy", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[l]", t.key_hint),
+                    Span::styled(" Logs", t.text),
+                    Span::styled("  |  ", t.border),
+                    Span::styled("[Esc]", t.muted),
+                    Span::styled(" Back", t.muted),
+                    Span::styled("  ", t.text),
+                    Span::styled("[q]", t.muted),
+                    Span::styled(" Quit", t.muted),
+                ]);
+                spans
+            }
+            _ if app.sandbox_policy_tab == app::SandboxPolicyTab::Settings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+            _ => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[h]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Scroll", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[g/G]", t.key_hint),
+                Span::styled(" Top/Bottom", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[s]", t.key_hint),
+                Span::styled(" Shell", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[l]", t.key_hint),
+                Span::styled(" Logs", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[r]", t.key_hint),
+                Span::styled(" Rules", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
+        },
+    };
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+    let line = match app.input_mode {
+        InputMode::Command => Line::from(vec![
+            Span::styled(" :", t.accent_bold),
+            Span::styled(&app.command_input, t.text),
+            Span::styled("_", t.accent),
+        ]),
+        InputMode::Normal => Line::from(vec![Span::styled("", t.muted)]),
+    };
+
+    let bar = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
+    frame.render_widget(bar, area);
+}
+
+/// Render an empty-state message inside a bordered panel.
+///
+/// Calculates an inset [`Rect`] that clears the panel border and renders
+/// `text` with the given `style`.  Use this whenever a table or list has no
+/// rows to display.
+pub fn draw_empty_message(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(3),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), inner);
+}
+
+/// Center a popup rectangle within `area` using absolute width and height (in
+/// terminal columns/rows).
+pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((area.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(vert[1]);
+    horiz[1]
+}
+
+// ---------------------------------------------------------------------------
+// Shared setting-edit overlay (used by both global and sandbox settings panes)
+// ---------------------------------------------------------------------------
+
+/// Render the generic setting-edit text-input overlay.
+///
+/// Both the global-settings and sandbox-settings panes show the same editor
+/// overlay — an input box with the setting key/type in the title, an error
+/// line when validation fails, and `[Enter]`/`[Esc]` hints.  This function
+/// is the single implementation; each pane resolves its own entry and then
+/// delegates here.
+fn draw_setting_edit_overlay(
+    frame: &mut Frame<'_>,
+    key: &str,
+    kind: ryno_core::settings::SettingValueKind,
+    edit: &SettingEditState,
+    area: Rect,
+    theme: &Theme,
+) {
+    let t = theme;
+    let title = format!(" Edit: {} ({}) ", key, kind.as_str());
+    let mut lines = vec![
+        Line::from(Span::styled(&title, t.heading)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Value: ", t.muted),
+            Span::styled(&edit.input, t.text),
+            Span::styled("_", t.accent),
+        ]),
+    ];
+
+    if let Some(ref err) = edit.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(err.as_str(), t.status_err)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Confirm  ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
+    ]));
+
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(50, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(t.border_focused)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Draw a labeled text input field.
+///
+/// `cursor` is the cursor character shown when `focused` (e.g. `"█"` or `"_"`).
+/// `show_gap` appends an extra blank row below the input line.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_field(
+    frame: &mut Frame<'_>,
+    label: &str,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    area: Rect,
+    theme: &Theme,
+    cursor: &str,
+    show_gap: bool,
+) {
+    let t = theme;
+    let chunks = if show_gap {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+                Constraint::Length(1), // gap
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+            ])
+            .split(area)
+    };
+
+    let label_style = if focused { t.accent_bold } else { t.text };
+    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
+    if !placeholder.is_empty() {
+        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
+
+    let display = if value.is_empty() && !focused {
+        Line::from(Span::styled("  -", t.muted))
+    } else if focused {
+        Line::from(vec![
+            Span::styled(format!("  {value}"), t.accent),
+            Span::styled(cursor, t.accent),
+        ])
+    } else {
+        Line::from(Span::styled(format!("  {value}"), t.text))
+    };
+    frame.render_widget(Paragraph::new(display), chunks[1]);
+}
+
+/// Render a bordered confirmation popup centred on `area`.
+///
+/// `lines` is the popup body; height is derived from the line count.
+/// Use `t.border_focused` for confirmations and `t.status_err` for destructive
+/// actions.
+fn draw_confirm_popup(
+    frame: &mut Frame<'_>,
+    lines: Vec<Line<'_>>,
+    border_style: Style,
+    width: u16,
+    area: Rect,
+) {
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(width, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Center a popup rectangle within `area` using percentage-based width and
+/// an absolute height (in rows).
+pub fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Length(height),
+            Constraint::Percentage((100 - height.min(100)) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ryno_core::auth::EdgeAuthInterceptor;
+    use ryno_core::proto::ryno_client::RynoClient;
+
+    fn test_app() -> App {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RynoClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
+        let mut app = App::new(
+            client,
+            "test".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "default".to_string(),
+            Theme::dark(),
+        );
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Providers;
+        app
+    }
+
+    #[tokio::test]
+    async fn providers_navigation_advertises_workspace_shortcut() {
+        let app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(180, 1)).unwrap();
+
+        terminal
+            .draw(|frame| draw_nav_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("[w] Workspace"), "nav bar was: {text:?}");
+    }
+
+    #[test]
+    fn title_bar_brand_renders_resolved_version_without_alpha_badge() {
+        let expected = format!(" >_ Ryno v{} | ", ryno_core::VERSION);
+        let width = u16::try_from(expected.len()).unwrap();
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(Line::from(title_bar_brand_spans(&Theme::dark()))),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("ALPHA"));
+    }
+
+    #[tokio::test]
+    async fn configuration_notes_fit_dashboard_and_wrap_in_detail() {
+        let mut app = test_app();
+        app.sandbox_names = vec!["quarantined".into()];
+        app.sandbox_count = 1;
+        app.sandbox_notes = vec!["Invalid config".into()];
+        let diagnostic = "Invalid config: credentialed endpoint api.example.com:443 requires L7 inspection before the sandbox workload can start safely";
+        app.sandbox_detail_notes = vec![diagnostic.into()];
+        for width in [80, 100, 120] {
+            for all_workspaces in [false, true] {
+                app.all_workspaces = all_workspaces;
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        sandboxes::draw(frame, &app, frame.area(), true);
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                assert!(
+                    text.contains("Invalid config"),
+                    "dashboard at {width}: {text}"
+                );
+                assert!(!text.contains("credentialed endpoint"));
+            }
+            app.screen = Screen::Sandbox;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            let words = text
+                .replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(words.contains(diagnostic), "detail at {width}: {words}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_delete_confirmation_is_visible_in_standard_terminal() {
+        let mut app = test_app();
+        app.screen = Screen::Sandbox;
+        app.focus = Focus::SandboxPolicy;
+        app.sandbox_names = vec!["test-sandbox".to_string()];
+        app.sandbox_count = 1;
+        app.confirm_delete = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("Delete sandbox 'test-sandbox'?"),
+            "sandbox screen was: {text:?}"
+        );
+    }
+}

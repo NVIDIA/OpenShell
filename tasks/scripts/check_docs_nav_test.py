@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 FERN_CONFIG = """\
 instances:
-  - url: example.docs.buildwithfern.com/openshell
+  - url: example.docs.buildwithfern.com/ryno
 versions:
   - display-name: Dev
     path: ../docs/index.yml
@@ -46,7 +46,7 @@ def build(tmp_path: Path, nav: str, pages: dict[str, str], redirects: str = "") 
 
 def test_fern_slug_splits_camel_case() -> None:
     assert check_docs_nav.fern_slug("TypeScript") == "type-script"
-    assert check_docs_nav.fern_slug("Why OpenShell") == "why-open-shell"
+    assert check_docs_nav.fern_slug("Why Ryno") == "why-ryno"
     assert check_docs_nav.fern_slug("API Errors") == "api-errors"
     assert check_docs_nav.fern_slug("0.1.0") == "0-1-0"
 
@@ -213,11 +213,11 @@ def test_folder_pages_use_file_names_and_orphans_fail(tmp_path: Path) -> None:
     ("redirect", "expected"),
     [
         (
-            '  - source: "/openshell/dev/old"\n    destination: "/openshell/dev/missing"\n',
+            '  - source: "/ryno/dev/old"\n    destination: "/ryno/dev/missing"\n',
             "destination does not exist",
         ),
         (
-            '  - source: "/openshell/dev/guides/setup"\n    destination: "/openshell/dev/guides/setup"\n',
+            '  - source: "/ryno/dev/guides/setup"\n    destination: "/ryno/dev/guides/setup"\n',
             "is still a live page",
         ),
     ],

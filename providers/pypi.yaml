@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example provider profile. OpenShell does not load it; import it explicitly:
-#   openshell provider profile lint   -f providers/pypi.yaml
-#   openshell provider profile import -f providers/pypi.yaml --global
+# Example provider profile. Ryno does not load it; import it explicitly:
+#   ryno provider profile lint   -f providers/pypi.yaml
+#   ryno provider profile import -f providers/pypi.yaml --global
 #
 # Copy and edit this file rather than importing it unchanged. `binaries` is the
 # least-privilege control that decides which processes may reach the endpoints
@@ -17,7 +17,7 @@
 #                    (/usr/bin/python3, /usr/local/bin/python3, a venv
 #                    elsewhere). Edit `binaries` before importing or the
 #                    profile is inert.
-#                    OpenShell identifies a process by its executable, not its
+#                    Ryno identifies a process by its executable, not its
 #                    command line, so pip and other Python scripts match the
 #                    interpreter that runs them. List that interpreter, never
 #                    a script path such as .venv/bin/pip. Exact paths resolve
@@ -27,7 +27,7 @@
 #                    downloads.python.org for interpreters; github.com,
 #                    api.github.com and objects.githubusercontent.com for
 #                    sdists that build from a Git source.
-# Smoke test:        openshell sandbox create --provider <name> -- \
+# Smoke test:        ryno sandbox create --provider <name> -- \
 #                      python -m pip download --no-deps -d /tmp/wheels requests
 
 id: pypi

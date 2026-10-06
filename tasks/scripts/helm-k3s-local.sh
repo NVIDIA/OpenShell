@@ -8,7 +8,7 @@
 # Requires Docker running. Writes merged kubeconfig to HELM_K3S_KUBECONFIG or $KUBECONFIG or ./kubeconfig.
 #
 # Multi-worktree: the cluster name is derived from the last component of the current
-# git branch (e.g. branch "kube-support/local-dev/tmutch" → cluster "openshell-dev-tmutch").
+# git branch (e.g. branch "kube-support/local-dev/tmutch" → cluster "ryno-dev-tmutch").
 # Each worktree therefore gets its own isolated cluster and per-worktree kubeconfig.
 # Override with HELM_K3S_CLUSTER_NAME to force a specific name.
 
@@ -20,7 +20,7 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Derive a DNS-safe suffix from the last component of the current branch name.
 _branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)" || _branch=""
 _suffix="$(printf '%s' "${_branch##*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
-CLUSTER_NAME="${HELM_K3S_CLUSTER_NAME:-openshell-dev${_suffix:+-${_suffix}}}"
+CLUSTER_NAME="${HELM_K3S_CLUSTER_NAME:-ryno-dev${_suffix:+-${_suffix}}}"
 # k3d caps cluster names at 32 chars; validated in cmd_create so the operator
 # gets an actionable hint instead of a deep-stack k3d validation error.
 K3D_CLUSTER_NAME_MAX=32
@@ -46,7 +46,7 @@ COLLECTOR_HEALTH_TIMEOUT="${HELM_K3S_COLLECTOR_HEALTH_TIMEOUT:-120}"
 # Host endpoint registered for the Skaffold-deployed gateway. Derive the
 # gateway name from the worktree-specific cluster name so concurrent local
 # clusters do not overwrite each other's CLI metadata.
-GATEWAY_NAMESPACE="openshell"
+GATEWAY_NAMESPACE="ryno"
 GATEWAY_HOST_PORT="${HELM_K3S_GATEWAY_HOST_PORT:-8090}"
 GATEWAY_NAME="${HELM_K3S_GATEWAY_NAME:-${CLUSTER_NAME}}"
 FORWARD_PIDS=()
@@ -70,7 +70,7 @@ usage() {
 usage: $(basename "$0") <create|delete|start|stop|status|register|forward>
 
 Environment:
-  HELM_K3S_CLUSTER_NAME        k3d cluster name (default: openshell-dev-<branch-suffix>)
+  HELM_K3S_CLUSTER_NAME        k3d cluster name (default: ryno-dev-<branch-suffix>)
                                Each git worktree gets its own cluster derived from its branch name.
                                Override to share a single cluster across worktrees.
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
@@ -117,7 +117,7 @@ require_k3d() {
   if ! command -v k3d >/dev/null 2>&1; then
     if [[ "$(uname -s)" == "Linux" ]]; then
       echo "error: k3d not found. This repo no longer installs k3d through mise on Linux." >&2
-      echo "Install k3d explicitly, or use kind/an existing cluster and set OPENSHELL_E2E_KUBE_CONTEXT." >&2
+      echo "Install k3d explicitly, or use kind/an existing cluster and set RYNO_E2E_KUBE_CONTEXT." >&2
     else
       echo "error: k3d not found. Run: mise install" >&2
     fi
@@ -181,17 +181,17 @@ install_trace_collector() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: openshell-collector
+  name: ryno-collector
   namespace: ${OBSERVABILITY_NAMESPACE}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: openshell-collector
+      app: ryno-collector
   template:
     metadata:
       labels:
-        app: openshell-collector
+        app: ryno-collector
     spec:
       containers:
         - name: collector
@@ -221,11 +221,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: openshell-collector
+  name: ryno-collector
   namespace: ${OBSERVABILITY_NAMESPACE}
 spec:
   selector:
-    app: openshell-collector
+    app: ryno-collector
   ports:
     - name: otlp-grpc
       port: 4317
@@ -236,7 +236,7 @@ spec:
 EOF
 
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
-    rollout status deployment/openshell-collector \
+    rollout status deployment/ryno-collector \
     --namespace "${OBSERVABILITY_NAMESPACE}" \
     --timeout="${COLLECTOR_HEALTH_TIMEOUT}s"
 }
@@ -270,7 +270,7 @@ configure_agent_sandbox_tracing() {
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
     --namespace="${namespace}" \
     set env deployment/"${deployment}" \
-    OTEL_EXPORTER_OTLP_ENDPOINT="http://openshell-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://ryno-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317" \
     OTEL_EXPORTER_OTLP_INSECURE=true
 
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" \
@@ -365,7 +365,7 @@ preload_sandbox_image() {
 
   # Save without --platform: the platform-specific pull already constrained the
   # local image, and --platform fails on OCI index (multi-arch) manifests.
-  tmp="$(mktemp "${TMPDIR:-/tmp}/openshell-sandbox-image.XXXXXX")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ryno-sandbox-image.XXXXXX")"
   if ! docker image save -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
     echo "Pulling sandbox image for ${platform}..."
     docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
@@ -389,7 +389,7 @@ cmd_create() {
     cat >&2 <<EOF
 error: derived cluster name '${CLUSTER_NAME}' is ${#CLUSTER_NAME} chars; k3d caps at ${K3D_CLUSTER_NAME_MAX}.
 Set HELM_K3S_CLUSTER_NAME to a shorter name, e.g.:
-  HELM_K3S_CLUSTER_NAME=openshell-dev-${_suffix:0:$(( K3D_CLUSTER_NAME_MAX - 14 ))} mise run helm:k3s:create
+  HELM_K3S_CLUSTER_NAME=ryno-dev-${_suffix:0:$(( K3D_CLUSTER_NAME_MAX - 14 ))} mise run helm:k3s:create
 EOF
     exit 1
   fi
@@ -417,7 +417,7 @@ EOF
   echo "Active context: $(k3d_context_name)"
   echo "Kubeconfig: ${KUBECONFIG_TARGET}"
   echo "Envoy Gateway LoadBalancer (port 80):  http://127.0.0.1:${HOST_LB_PORT}"
-  echo "Trace collector endpoint: http://openshell-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317"
+  echo "Trace collector endpoint: http://ryno-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317"
   echo "Gateway and trace collector host access: mise run helm:k3s:forward"
 }
 
@@ -451,7 +451,7 @@ cmd_status() {
 }
 
 register_local_gateway() {
-  local config_home openshell_dir gateway_dir endpoint
+  local config_home ryno_dir gateway_dir endpoint
 
   if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "error: HELM_K3S_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
@@ -459,8 +459,8 @@ register_local_gateway() {
   fi
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  openshell_dir="${config_home}/openshell"
-  gateway_dir="${openshell_dir}/gateways/${GATEWAY_NAME}"
+  ryno_dir="${config_home}/ryno"
+  gateway_dir="${ryno_dir}/gateways/${GATEWAY_NAME}"
   endpoint="http://127.0.0.1:${GATEWAY_HOST_PORT}"
 
   mkdir -p "${gateway_dir}"
@@ -475,8 +475,8 @@ register_local_gateway() {
 }
 EOF
   chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
-  printf '%s' "${GATEWAY_NAME}" >"${openshell_dir}/active_gateway"
-  chmod 600 "${openshell_dir}/active_gateway" 2>/dev/null || true
+  printf '%s' "${GATEWAY_NAME}" >"${ryno_dir}/active_gateway"
+  chmod 600 "${ryno_dir}/active_gateway" 2>/dev/null || true
 
   echo "Registered and selected local gateway '${GATEWAY_NAME}' at ${endpoint}."
 }
@@ -500,7 +500,7 @@ cmd_forward() {
     --kubeconfig="${KUBECONFIG_TARGET}" \
     --context="$(k3d_context_name)" \
     --namespace="${OBSERVABILITY_NAMESPACE}" \
-    get service/openshell-collector >/dev/null
+    get service/ryno-collector >/dev/null
 
   echo "Forwarding collector OTLP/gRPC to http://127.0.0.1:4317"
   echo "Forwarding trace UI to http://127.0.0.1:18888"
@@ -513,13 +513,13 @@ cmd_forward() {
     --kubeconfig="${KUBECONFIG_TARGET}" \
     --context="$(k3d_context_name)" \
     --namespace="${GATEWAY_NAMESPACE}" \
-    get service/openshell >/dev/null 2>&1; then
+    get service/ryno >/dev/null 2>&1; then
     echo "Forwarding gateway to http://127.0.0.1:${GATEWAY_HOST_PORT}"
     kubectl \
       --kubeconfig="${KUBECONFIG_TARGET}" \
       --context="$(k3d_context_name)" \
       --namespace="${GATEWAY_NAMESPACE}" \
-      port-forward service/openshell "${GATEWAY_HOST_PORT}:8080" &
+      port-forward service/ryno "${GATEWAY_HOST_PORT}:8080" &
     FORWARD_PIDS+=("$!")
   else
     echo "No Kubernetes gateway service found; forwarding collector ports only."
@@ -529,7 +529,7 @@ cmd_forward() {
     --kubeconfig="${KUBECONFIG_TARGET}" \
     --context="$(k3d_context_name)" \
     --namespace="${OBSERVABILITY_NAMESPACE}" \
-    port-forward service/openshell-collector 4317:4317 18888:18888 &
+    port-forward service/ryno-collector 4317:4317 18888:18888 &
   FORWARD_PIDS+=("$!")
 
   echo "Press Ctrl-C to stop."

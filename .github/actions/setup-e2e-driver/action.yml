@@ -28,6 +28,6 @@ runs:
         driver="$GITHUB_WORKSPACE/.e2e/prebuilt-driver/${INPUTS_BINARY}"
         chmod +x "$driver"
         "$driver" --version
-        echo "OPENSHELL_EXTERNAL_DRIVER_BIN=$driver" >> "$GITHUB_ENV"
+        echo "RYNO_EXTERNAL_DRIVER_BIN=$driver" >> "$GITHUB_ENV"
       env:
         INPUTS_BINARY: ${{ inputs.binary }}

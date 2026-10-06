@@ -4,7 +4,7 @@
 id: gator
 payload_version: 9
 display_name: Gator Gate Agent
-description: Validate and monitor OpenShell GitHub issues and pull requests through the gator state machine.
+description: Validate and monitor Ryno GitHub issues and pull requests through the gator state machine.
 
 sandbox:
   name_prefix: gtr

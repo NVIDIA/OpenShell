@@ -32,7 +32,7 @@ cleanup() {
     trap - EXIT
     if [ "$status" -ne 0 ]; then
         echo "Keycloak logs from failed OIDC E2E run:" >&2
-        "$RUNTIME" logs --tail 80 openshell-keycloak >&2 2>/dev/null || true
+        "$RUNTIME" logs --tail 80 ryno-keycloak >&2 2>/dev/null || true
     fi
     if [ "$STARTED_KEYCLOAK" -eq 1 ]; then
         CONTAINER_RUNTIME="$RUNTIME" KEYCLOAK_PORT="$KEYCLOAK_PORT" \
@@ -49,9 +49,9 @@ if ! CONTAINER_RUNTIME="$RUNTIME" KEYCLOAK_PORT="$KEYCLOAK_PORT" \
         "$ROOT_DIR/scripts/keycloak-dev.sh" start
 fi
 
-export OPENSHELL_E2E_OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-http://127.0.0.1:${KEYCLOAK_PORT}/realms/openshell}"
-export OPENSHELL_E2E_OIDC_USERNAME="${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}"
-export OPENSHELL_E2E_OIDC_PASSWORD="${OPENSHELL_E2E_OIDC_PASSWORD:-admin}"
-export OPENSHELL_E2E_OIDC_ROLE="${OPENSHELL_E2E_OIDC_ROLE:-openshell-admin}"
+export RYNO_E2E_OIDC_ISSUER="${RYNO_E2E_OIDC_ISSUER:-http://127.0.0.1:${KEYCLOAK_PORT}/realms/ryno}"
+export RYNO_E2E_OIDC_USERNAME="${RYNO_E2E_OIDC_USERNAME:-admin@test}"
+export RYNO_E2E_OIDC_PASSWORD="${RYNO_E2E_OIDC_PASSWORD:-admin}"
+export RYNO_E2E_OIDC_ROLE="${RYNO_E2E_OIDC_ROLE:-ryno-admin}"
 
 "$@"

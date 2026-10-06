@@ -25,7 +25,7 @@
 //!    degrading to a direct dial.
 //!
 //! Fixtures run as host processes and are reached by the host supervisor.
-//! `host.openshell.internal` is normalized to host loopback for both libkrun
+//! `host.ryno.internal` is normalized to host loopback for both libkrun
 //! and QEMU guests because no workload networking leaves the VM.
 
 use std::fmt::Write as _;
@@ -34,15 +34,15 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::wait_for_healthy;
-use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::cli::wait_for_healthy;
+use ryno_e2e::harness::gateway::ManagedGateway;
+use ryno_e2e::harness::host_process::HostPythonFixture;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
 
-/// The OpenShell alias for the gateway host.
-const HOST_ALIAS: &str = "host.openshell.internal";
+/// The Ryno alias for the gateway host.
+const HOST_ALIAS: &str = "host.ryno.internal";
 const HOST_LOOPBACK_IP: &str = "127.0.0.1";
 
 const PROXY_USER: &str = "proxyuser";
@@ -494,7 +494,7 @@ network_policies:
 /// Appends corporate-proxy keys to the harness-generated gateway TOML and
 /// restores the original file when dropped.
 ///
-/// `[openshell.drivers.vm]` is the last table `e2e-vm.sh` writes, so appending
+/// `[ryno.drivers.vm]` is the last table `e2e-vm.sh` writes, so appending
 /// bare keys lands in that table without introducing a duplicate header.
 struct GatewayProxyConfig {
     config_path: PathBuf,
@@ -505,8 +505,8 @@ struct GatewayProxyConfig {
 impl GatewayProxyConfig {
     /// Locate the gateway's `--config` path from the wrapper's args file.
     fn config_path_from_args() -> Result<PathBuf, String> {
-        let args_file = std::env::var("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
-            .map_err(|_| "OPENSHELL_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
+        let args_file = std::env::var("RYNO_E2E_GATEWAY_ARGS_FILE")
+            .map_err(|_| "RYNO_E2E_GATEWAY_ARGS_FILE must be set".to_string())?;
         let raw = std::fs::read(&args_file)
             .map_err(|err| format!("read gateway args file '{args_file}': {err}"))?;
         let args: Vec<String> = raw
@@ -521,7 +521,7 @@ impl GatewayProxyConfig {
             .ok_or_else(|| format!("no --config argument in gateway args file '{args_file}'"))
     }
 
-    /// Append raw TOML lines to `[openshell.drivers.vm]` and restart the
+    /// Append raw TOML lines to `[ryno.drivers.vm]` and restart the
     /// gateway, without waiting for it to become healthy.
     ///
     /// Used directly by the fail-closed case, which expects the gateway *not*
@@ -617,16 +617,16 @@ impl Drop for GatewayProxyConfig {
 
 /// Skip unless this run owns a VM gateway it can reconfigure.
 ///
-/// The external-driver lane launches `openshell-driver-vm` from the shell
+/// The external-driver lane launches `ryno-driver-vm` from the shell
 /// wrapper rather than from the gateway, so gateway config changes never reach
 /// the driver and the test would assert against a driver that has no proxy
 /// settings at all.
 fn should_run(label: &str) -> bool {
-    if std::env::var("OPENSHELL_E2E_DRIVER").as_deref() != Ok("vm") {
+    if std::env::var("RYNO_E2E_DRIVER").as_deref() != Ok("vm") {
         eprintln!("Skipping {label}: e2e driver is not vm");
         return false;
     }
-    if std::env::var("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
+    if std::env::var("RYNO_E2E_EXTERNAL_COMPUTE_DRIVER").as_deref() == Ok("1") {
         eprintln!("Skipping {label}: the external VM driver is not configured by the gateway");
         return false;
     }
@@ -867,10 +867,10 @@ async fn vm_corporate_proxy_rejects_incoherent_configuration() {
     let health = wait_for_healthy(Duration::from_secs(20)).await;
     assert!(
         health.is_err(),
-        "gateway must not serve traffic with an incoherent [openshell.drivers.vm] proxy table"
+        "gateway must not serve traffic with an incoherent [ryno.drivers.vm] proxy table"
     );
 
-    let log_path = std::env::var("OPENSHELL_E2E_GATEWAY_LOG").expect("gateway log path");
+    let log_path = std::env::var("RYNO_E2E_GATEWAY_LOG").expect("gateway log path");
     let log = std::fs::read_to_string(&log_path).expect("read gateway log");
     // The message must name the offending key rather than surfacing as an
     // opaque driver-readiness timeout. Matched loosely on the key names so

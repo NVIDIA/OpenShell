@@ -41,13 +41,13 @@ prebuilt_arches() {
 required_prebuilt_binaries() {
 	case "$1" in
 		gateway)
-			echo "openshell-gateway"
+			echo "ryno-gateway"
 			;;
 		sandbox)
-			echo "openshell-sandbox"
+			echo "ryno-sandbox"
 			;;
 		supervisor|supervisor-sideload|supervisor-output)
-			echo "openshell-supervisor"
+			echo "ryno-supervisor"
 			;;
 	esac
 }
@@ -105,26 +105,26 @@ DOCKERFILE=""
 case "${TARGET}" in
   gateway)
     IS_FINAL_IMAGE=1
-    IMAGE_NAME="openshell/gateway"
+    IMAGE_NAME="ryno/gateway"
     DOCKER_TARGET="gateway"
     DOCKERFILE="deploy/docker/Dockerfile.gateway"
     ;;
   sandbox)
     IS_FINAL_IMAGE=1
-    IMAGE_NAME="openshell/sandbox"
+    IMAGE_NAME="ryno/sandbox"
     DOCKER_TARGET="sandbox"
     DOCKERFILE="deploy/docker/Dockerfile.sandbox"
     ;;
   supervisor)
     IS_FINAL_IMAGE=1
-    IMAGE_NAME="openshell/supervisor"
+    IMAGE_NAME="ryno/supervisor"
     DOCKER_TARGET="supervisor"
     DOCKERFILE="deploy/docker/Dockerfile.supervisor"
     ;;
   supervisor-output)
     # Backward-compat alias: same as "supervisor".
     IS_FINAL_IMAGE=1
-    IMAGE_NAME="openshell/supervisor"
+    IMAGE_NAME="ryno/supervisor"
     DOCKER_TARGET="supervisor"
     DOCKERFILE="deploy/docker/Dockerfile.supervisor"
     ;;
@@ -140,7 +140,7 @@ if [[ ! -f "${DOCKERFILE}" ]]; then
 fi
 
 if [[ -n "${IMAGE_REGISTRY:-}" && "${IS_FINAL_IMAGE}" == "1" ]]; then
-	IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#openshell/}"
+	IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#ryno/}"
 fi
 
 IMAGE_TAG=${IMAGE_TAG:-dev}

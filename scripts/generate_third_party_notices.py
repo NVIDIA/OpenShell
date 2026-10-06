@@ -26,21 +26,21 @@ from pathlib import Path
 # Our own workspace crates and packages — excluded from notices.
 WORKSPACE_CRATES = frozenset(
     {
-        "openshell-bootstrap",
-        "openshell-cli",
-        "openshell-core",
-        "openshell-policy",
-        "openshell-providers",
-        "openshell-sandbox",
-        "openshell-server",
-        "openshell-tui",
-        "openshell-e2e",
+        "ryno-bootstrap",
+        "ryno-cli",
+        "ryno-core",
+        "ryno-policy",
+        "ryno-providers",
+        "ryno-sandbox",
+        "ryno-server",
+        "ryno-tui",
+        "ryno-e2e",
     }
 )
 
 OWN_PYTHON_PACKAGES = frozenset(
     {
-        "openshell",
+        "ryno",
     }
 )
 

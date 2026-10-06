@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.internal.pagination.v1;
+package ryno.internal.pagination.v1;
 
 // Private, versioned state carried by an opaque public page token.
 //

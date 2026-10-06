@@ -29,8 +29,8 @@ syft dir:. \
   --exclude './.github/**' \
   --exclude './.venv/**' \
   --exclude './.cache/**' \
-  --output "cyclonedx-json=$OUTPUT_DIR/openshell-source-${VERSION}.cdx.json" \
-  --source-name openshell \
+  --output "cyclonedx-json=$OUTPUT_DIR/ryno-source-${VERSION}.cdx.json" \
+  --source-name ryno \
   --source-version "$VERSION"
 
 echo ""

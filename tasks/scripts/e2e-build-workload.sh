@@ -8,5 +8,5 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/tasks/scripts/container-engine.sh"
 ce_build --load --file "${ROOT}/e2e/python/Dockerfile.workload" \
   --build-arg "PYTHON_VERSION=$(cat "${ROOT}/.python-version")" \
-  --tag openshell/e2e-python:dev \
+  --tag ryno/e2e-python:dev \
   "${ROOT}/e2e/python"

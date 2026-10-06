@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    name: openshell-driver-vm (${{ matrix.triple }})
+    name: ryno-driver-vm (${{ matrix.triple }})
     strategy:
       matrix:
         include:
@@ -39,7 +39,7 @@ jobs:
           - arch: aarch64
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
-            entitlements-file: crates/openshell-driver-vm/entitlements.plist
+            entitlements-file: crates/ryno-driver-vm/entitlements.plist
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -56,30 +56,30 @@ jobs:
           prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Download openshell-sandbox
+      - name: Download ryno-sandbox
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
+          name: ryno-sandbox-${{ matrix.arch }}-unknown-linux-musl
           path: sandbox
 
-      - name: Download openshell-supervisor
+      - name: Download ryno-supervisor
         if: endsWith(matrix.triple, '-unknown-linux-gnu')
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-supervisor-${{ matrix.arch }}-unknown-linux-gnu
+          name: ryno-supervisor-${{ matrix.arch }}-unknown-linux-gnu
           path: supervisor
 
       - name: Download native macOS host supervisor
         if: endsWith(matrix.triple, '-apple-darwin')
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-supervisor-aarch64-apple-darwin
+          name: ryno-supervisor-aarch64-apple-darwin
           path: host-supervisor
 
       - name: Download VM guest init
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-vm-init-${{ matrix.arch }}-unknown-linux-musl
+          name: ryno-vm-init-${{ matrix.arch }}-unknown-linux-musl
           path: vm-init
 
       - name: Build VM runtime
@@ -90,23 +90,23 @@ jobs:
       - name: Assemble compressed VM runtime
         run: |
           compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
-          host_supervisor="supervisor/openshell-supervisor"
+          host_supervisor="supervisor/ryno-supervisor"
           if [[ "${{ matrix.triple }}" == *-apple-darwin ]]; then
-            host_supervisor="host-supervisor/openshell-supervisor"
+            host_supervisor="host-supervisor/ryno-supervisor"
           fi
           install -d "$compressed_dir"
           cp result/compressed/*.zst "$compressed_dir/"
-          zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
-          zstd -19 -T1 "$host_supervisor" -o "$compressed_dir/openshell-supervisor.zst"
-          zstd -19 -T1 vm-init/openshell-vm-init -o "$compressed_dir/openshell-vm-init.zst"
+          zstd -19 -T1 sandbox/ryno-sandbox -o "$compressed_dir/ryno-sandbox.zst"
+          zstd -19 -T1 "$host_supervisor" -o "$compressed_dir/ryno-supervisor.zst"
+          zstd -19 -T1 vm-init/ryno-vm-init -o "$compressed_dir/ryno-vm-init.zst"
 
-      - name: Build openshell-driver-vm
+      - name: Build ryno-driver-vm
         uses: ./.github/actions/build-rust-binary
         env:
-          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
+          RYNO_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
         with:
-          package: openshell-driver-vm
-          binary: openshell-driver-vm
+          package: ryno-driver-vm
+          binary: ryno-driver-vm
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}

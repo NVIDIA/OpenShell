@@ -8,7 +8,7 @@ generatorOptions:
   disableNameSuffixHash: true
 
 configMapGenerator:
-  - name: openshell-spiffe-token-demo-scripts
+  - name: ryno-spiffe-token-demo-scripts
     files:
       - token-issuer.js
       - protected-service.js

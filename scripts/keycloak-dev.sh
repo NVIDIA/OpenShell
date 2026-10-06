@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-CONTAINER_NAME="openshell-keycloak"
+CONTAINER_NAME="ryno-keycloak"
 KEYCLOAK_IMAGE="quay.io/keycloak/keycloak:24.0"
 KEYCLOAK_PORT="${KEYCLOAK_PORT:-8180}"
 REALM_FILE="$(cd "$(dirname "$0")" && pwd)/keycloak-realm.json"
@@ -104,7 +104,7 @@ cmd_start() {
     local elapsed=0
     while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
         if curl -sf \
-            "http://127.0.0.1:${KEYCLOAK_PORT}/realms/openshell/.well-known/openid-configuration" \
+            "http://127.0.0.1:${KEYCLOAK_PORT}/realms/ryno/.well-known/openid-configuration" \
             >/dev/null 2>&1; then
             echo "Keycloak is ready."
             print_info
@@ -146,20 +146,20 @@ cmd_status() {
 }
 
 print_info() {
-    local issuer="http://127.0.0.1:${KEYCLOAK_PORT}/realms/openshell"
+    local issuer="http://127.0.0.1:${KEYCLOAK_PORT}/realms/ryno"
     echo ""
     echo "  Issuer URL:     $issuer"
     echo "  Discovery:      ${issuer}/.well-known/openid-configuration"
     echo "  Admin console:  http://localhost:${KEYCLOAK_PORT}/admin  (admin/admin)"
     echo ""
     echo "  Test users:"
-    echo "    admin@test / admin  (role: openshell-admin)"
-    echo "    user@test  / user   (role: openshell-user)"
-    echo "    user-b@test / user-b (role: openshell-user)"
+    echo "    admin@test / admin  (role: ryno-admin)"
+    echo "    user@test  / user   (role: ryno-user)"
+    echo "    user-b@test / user-b (role: ryno-user)"
     echo ""
     echo "  Get a token:"
     echo "    curl -s -X POST ${issuer}/protocol/openid-connect/token \\"
-    echo "      -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \\"
+    echo "      -d 'grant_type=password&client_id=ryno-cli&username=admin@test&password=admin' \\"
     echo "      | jq -r .access_token"
     echo ""
 }

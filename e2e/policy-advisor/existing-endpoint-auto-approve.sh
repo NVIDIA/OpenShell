@@ -12,7 +12,7 @@ export NO_COLOR=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-OPENSHELL_BIN="${OPENSHELL_BIN:-${REPO_ROOT}/target/debug/openshell}"
+RYNO_BIN="${RYNO_BIN:-${REPO_ROOT}/target/debug/ryno}"
 RUN_ID="${RUN_ID:-$(date +%H%M%S)}"
 SANDBOX="${SANDBOX:-advisor-2821-${RUN_ID}}"
 FLUSH_WAIT="${FLUSH_WAIT:-45}"
@@ -23,7 +23,7 @@ strip_ansi() {
 }
 
 cleanup() {
-    "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
+    "$RYNO_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -43,7 +43,7 @@ network_policies:
       - path: /usr/bin/cargo
 EOF
 
-"$OPENSHELL_BIN" sandbox create \
+"$RYNO_BIN" sandbox create \
     --name "$SANDBOX" \
     --policy "${TMP_DIR}/policy.yaml" \
     --approval-mode auto \
@@ -53,7 +53,7 @@ EOF
     -- sh -c "exec sleep infinity" >/dev/null
 
 set +e
-DENY_OUTPUT="$($OPENSHELL_BIN sandbox exec --name "$SANDBOX" -- \
+DENY_OUTPUT="$($RYNO_BIN sandbox exec --name "$SANDBOX" -- \
     /usr/bin/curl -fsS --max-time 10 https://index.crates.io/config.json 2>&1)"
 DENY_STATUS=$?
 set -e
@@ -65,7 +65,7 @@ printf '%s\n' "$DENY_OUTPUT"
 
 RULE_OUTPUT=""
 for _attempt in $(seq 1 "$((FLUSH_WAIT / 5))"); do
-    RULE_OUTPUT="$($OPENSHELL_BIN rule get "$SANDBOX" 2>&1 | strip_ansi)"
+    RULE_OUTPUT="$($RYNO_BIN rule get "$SANDBOX" 2>&1 | strip_ansi)"
     grep -q "Status: approved" <<<"$RULE_OUTPUT" && break
     sleep 5
 done
@@ -79,14 +79,14 @@ if grep -q "Application:" <<<"$RULE_OUTPUT"; then
     exit 1
 fi
 
-POLICY_OUTPUT="$($OPENSHELL_BIN policy get "$SANDBOX" --full 2>&1 | strip_ansi)"
+POLICY_OUTPUT="$($RYNO_BIN policy get "$SANDBOX" --full 2>&1 | strip_ansi)"
 grep -q "protocol: rest" <<<"$POLICY_OUTPUT"
 grep -q "access: read-only" <<<"$POLICY_OUTPUT"
 grep -q "/usr/bin/cargo" <<<"$POLICY_OUTPUT"
 grep -q "/usr/bin/curl" <<<"$POLICY_OUTPUT"
 
 for _attempt in $(seq 1 15); do
-    if "$OPENSHELL_BIN" sandbox exec --name "$SANDBOX" -- \
+    if "$RYNO_BIN" sandbox exec --name "$SANDBOX" -- \
         /usr/bin/curl -fsS --max-time 15 https://index.crates.io/config.json \
         >/dev/null 2>&1; then
         echo "#2821 existing-endpoint auto-approval regression passed"

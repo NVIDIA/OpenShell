@@ -5,11 +5,11 @@
 
 Run the full agent-driven policy loop end-to-end:
 
-1. A Codex agent inside an OpenShell sandbox tries to write a markdown file to
+1. A Codex agent inside an Ryno sandbox tries to write a markdown file to
    GitHub via the Contents API.
-2. OpenShell denies the request with a structured `policy_denied` 403 because
+2. Ryno denies the request with a structured `policy_denied` 403 because
    the initial policy only allows read-only access to `api.github.com`.
-3. The agent reads `/etc/openshell/skills/policy_advisor.md`, drafts the
+3. The agent reads `/etc/ryno/skills/policy_advisor.md`, drafts the
    narrowest rule needed, and submits it to `http://policy.local/v1/proposals`.
    It saves the returned `chunk_id`.
 4. The gateway merges the proposed rule with the current sandbox policy, runs
@@ -20,7 +20,7 @@ Run the full agent-driven policy loop end-to-end:
    This is the load-bearing UX point: the agent burns zero LLM tokens while
    it waits; it's literally sleeping on a socket.
 6. You approve the proposal from the host with one keystroke after seeing the
-   exact rule and the prover verdict in `openshell rule get`.
+   exact rule and the prover verdict in `ryno rule get`.
 7. The agent's `/wait` returns within ~1 second of the approval. The sandbox
    has hot-reloaded the merged policy; the agent retries the original PUT
    once and exits.
@@ -31,7 +31,7 @@ the policy round-trip itself.
 
 ## Prerequisites
 
-- An active OpenShell gateway (`openshell gateway start`).
+- An active Ryno gateway (`ryno gateway start`).
 - `gh auth login` (or a `GITHUB_TOKEN` env var with contents-write on a
   scratch repo).
 - `codex login` on the host.
@@ -39,9 +39,9 @@ the policy round-trip itself.
   If you don't have one yet:
 
   ```shell
-  gh repo create "$(gh api user --jq .login)/openshell-policy-demo" \
+  gh repo create "$(gh api user --jq .login)/ryno-policy-demo" \
       --private --add-readme \
-      --description "OpenShell policy advisor demo scratch repo"
+      --description "Ryno policy advisor demo scratch repo"
   ```
 
 ## Run it
@@ -51,8 +51,8 @@ bash examples/agent-driven-policy-management/demo.sh
 ```
 
 That's the whole thing. The demo resolves your GitHub handle from `gh`, picks
-`openshell-policy-demo` as the repo, and writes one timestamped markdown file
-under `openshell-policy-advisor-demo/` per run.
+`ryno-policy-demo` as the repo, and writes one timestamped markdown file
+under `ryno-policy-advisor-demo/` per run.
 
 ## Driving it manually (real-session UX)
 
@@ -75,7 +75,7 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | Env var | Default |
 |---|---|
 | `DEMO_GITHUB_OWNER` | `gh api user --jq .login` |
-| `DEMO_GITHUB_REPO` | `openshell-policy-demo` |
+| `DEMO_GITHUB_REPO` | `ryno-policy-demo` |
 | `DEMO_BRANCH` | `main` |
 | `DEMO_RUN_ID` | timestamp |
 | `DEMO_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` |
@@ -84,7 +84,7 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
 | `DEMO_CODEX_MODEL` | `gpt-5.4-mini` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
 | `DEMO_CODEX_REASONING` | `low` (the demo task is mechanical; `medium`/`high` slow it down without changing outcomes) |
-| `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
+| `RYNO_BIN` | `target/debug/ryno` if present, else `ryno` on `PATH` |
 
 ## What the agent sees
 
@@ -105,8 +105,8 @@ with three parts, each with a different trust level:
 | `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0002](../../rfc/0002-agent-driven-policy-management/README.md)) |
 
 The MVP today shows the structured rule plus the agent's rationale in
-`openshell rule get` and the TUI inbox panel. With prover validation wired
-into the gateway, `openshell rule get` also shows a `Validation:` line for
+`ryno rule get` and the TUI inbox panel. With prover validation wired
+into the gateway, `ryno rule get` also shows a `Validation:` line for
 agent-authored chunks. The value is the prover's verdict in OCSF-shorthand
 style — one short, scannable string per chunk:
 
@@ -125,7 +125,7 @@ issue — surfaces in the gateway log, not as proposal failure), `merge failed:
 (merged policy fails the structural safety check).
 
 Read the structured rule (Endpoints + Binary). Read the Validation line.
-Approve if both look right. The demo's `openshell rule approve-all`
+Approve if both look right. The demo's `ryno rule approve-all`
 auto-approves to keep the loop short; in a real session a developer makes
 that judgment per chunk before pressing `a`.
 

@@ -75,25 +75,25 @@ jobs:
       - name: Download CLI artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-${{ inputs.cli-target }}
+          name: ryno-${{ inputs.cli-target }}
           path: package-binaries/
 
       - name: Download gateway artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-gateway-${{ inputs.gateway-target }}
+          name: ryno-gateway-${{ inputs.gateway-target }}
           path: package-binaries/
 
       - name: Download prover artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-prover-${{ inputs.prover-target }}
+          name: ryno-prover-${{ inputs.prover-target }}
           path: package-binaries/
 
       - name: Configure package inputs
         run: |
           set -euo pipefail
-          chmod +x package-binaries/openshell{,-gateway,-prover}
+          chmod +x package-binaries/ryno{,-gateway,-prover}
           ls -lah package-binaries
 
       - name: Mark workspace safe for git
@@ -104,10 +104,10 @@ jobs:
 
       - name: Build RPMs via Packit
         env:
-          OPENSHELL_RPM_VERSION: ${{ inputs.rpm-version }}
-          OPENSHELL_RPM_RELEASE: ${{ inputs.rpm-release }}
-          OPENSHELL_CARGO_VERSION: ${{ inputs.cargo-version }}
-          OPENSHELL_PREBUILT_BINARIES_DIR: ${{ github.workspace }}/package-binaries
+          RYNO_RPM_VERSION: ${{ inputs.rpm-version }}
+          RYNO_RPM_RELEASE: ${{ inputs.rpm-release }}
+          RYNO_CARGO_VERSION: ${{ inputs.cargo-version }}
+          RYNO_PREBUILT_BINARIES_DIR: ${{ github.workspace }}/package-binaries
         run: packit build locally
 
       - name: Collect RPM artifacts

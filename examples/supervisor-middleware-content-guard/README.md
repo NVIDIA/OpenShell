@@ -61,15 +61,15 @@ cargo run -- --bind 0.0.0.0:50051
 Add the service registration to your local gateway TOML:
 
 ```toml
-[[openshell.supervisor.middleware]]
+[[ryno.supervisor.middleware]]
 name = "content-guard-example"
-grpc_endpoint = "http://host.openshell.internal:50051"
+grpc_endpoint = "http://host.ryno.internal:50051"
 allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.openshell.internal` is not the shared host address for your local driver.
+The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.ryno.internal` is not the shared host address for your local driver.
 
 The `http://` gRPC endpoint uses plaintext without peer authentication.
 
@@ -82,7 +82,7 @@ The `network_middlewares` map key `prototype-content-guard` is the stable policy
 The included policy allows `curl` to POST to `https://httpbin.org/anything` and `https://httpbingo.org/anything`. Only `httpbin.org` matches the middleware selector, where the content guard replaces `prototype-secret` or `internal-only` in the request body:
 
 ```shell
-openshell sandbox create --policy examples/supervisor-middleware-content-guard/policy.yaml
+ryno sandbox create --policy examples/supervisor-middleware-content-guard/policy.yaml
 ```
 
 From the sandbox, send a matching request:
@@ -104,7 +104,7 @@ uv run --no-project python examples/supervisor-middleware-content-guard/upstream
 ```
 
 The policy permits `GET /clean` and `GET /sensitive` on
-`http://host.openshell.internal:18081`. The first returns ordinary public text.
+`http://host.ryno.internal:18081`. The first returns ordinary public text.
 The second contains both configured terms. Redact mode returns
 `contains [FILTERED] and [FILTERED]`. Deny mode returns typed `BlockDelivery`
 with reason code `content_match`, which produces the canonical 403 response
@@ -125,9 +125,9 @@ normalize Unicode, scan response headers, retain stream units, or spool bodies.
 
 ## WebSocket behavior
 
-For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and OpenShell closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
+For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and Ryno closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
 
-The service advertises a 256 KiB limit for complete WebSocket text messages. OpenShell does not send binary messages, control frames, or upstream-to-client messages to this binding. The smoke script exercises the HTTP path; the example's unit tests cover the WebSocket lifecycle and both redact and deny results.
+The service advertises a 256 KiB limit for complete WebSocket text messages. Ryno does not send binary messages, control frames, or upstream-to-client messages to this binding. The smoke script exercises the HTTP path; the example's unit tests cover the WebSocket lifecycle and both redact and deny results.
 
 ## Configuration
 

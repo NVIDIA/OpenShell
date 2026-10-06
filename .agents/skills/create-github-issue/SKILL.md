@@ -19,7 +19,7 @@ This project uses YAML form issue templates. When creating issues, match the tem
 
 ### Bug Reports
 
-Do not add a type label automatically. Confirm that the human operator personally uses OpenShell and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of OpenShell. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, and **Acceptance Criteria**, followed by bug-specific reproduction steps using only OpenShell deployments and environment details. Do not install third-party tools to demonstrate reproducibility. Logs are optional and must be concise and redacted. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
+Do not add a type label automatically. Confirm that the human operator personally uses Ryno and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of Ryno. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, and **Acceptance Criteria**, followed by bug-specific reproduction steps using only Ryno deployments and environment details. Do not install third-party tools to demonstrate reproducibility. Logs are optional and must be concise and redacted. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
 
 ```bash
 gh issue create \
@@ -27,11 +27,11 @@ gh issue create \
   --body "$(cat <<'EOF'
 ## User Story
 
-I use OpenShell for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
+I use Ryno for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
 
 ## Problem Statement
 
-<Summarize what is broken or missing in OpenShell's current behavior and when the issue occurs>
+<Summarize what is broken or missing in Ryno's current behavior and when the issue occurs>
 
 ## Impact / Why This Matters
 
@@ -48,13 +48,13 @@ I use OpenShell for <specific use case>. I directly encountered or need <specifi
 
 ## Environment
 
-- OpenShell: <version>
+- Ryno: <version>
 - OS: <os>
 - Runtime, deployment, or integration: <relevant details>
 
 ## Suggested UX (if applicable)
 
-<Notional OpenShell CLI, configuration, SDK, or other interaction>
+<Notional Ryno CLI, configuration, SDK, or other interaction>
 
 ## Logs
 
@@ -65,7 +65,7 @@ EOF
 
 ### Feature Requests
 
-Do not add a type label automatically. Confirm that the human operator personally uses OpenShell and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of OpenShell. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, **Proposed Design**, **Acceptance Criteria**, and **Alternatives Considered**. The proposed design should define the user-facing workflow and externally observable behavior without prescribing internal implementation. Agent investigation is optional. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
+Do not add a type label automatically. Confirm that the human operator personally uses Ryno and directly encountered the problem or needs the feature for a specific use case. If that first-hand attestation or concrete use case is missing, ask for it before creating the issue. Frame the issue entirely in terms of Ryno. The body must include a **User Story**, **Problem Statement**, **Impact / Why This Matters**, **Proposed Design**, **Acceptance Criteria**, and **Alternatives Considered**. The proposed design should define the user-facing workflow and externally observable behavior without prescribing internal implementation. Agent investigation is optional. If the issue suggests a change to configuration, CLI, SDK, or other user experience, include a notional example of the proposed interaction for human review. Inspect current repository labels before applying any; use only labels whose meaning is clear.
 
 ```bash
 gh issue create \
@@ -73,11 +73,11 @@ gh issue create \
   --body "$(cat <<'EOF'
 ## User Story
 
-I use OpenShell for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
+I use Ryno for <specific use case>. I directly encountered or need <specific behavior> so that <outcome>.
 
 ## Problem Statement
 
-<Summarize the capability or behavior missing from OpenShell today>
+<Summarize the capability or behavior missing from Ryno today>
 
 ## Impact / Why This Matters
 
@@ -89,7 +89,7 @@ I use OpenShell for <specific use case>. I directly encountered or need <specifi
 
 ## Suggested UX (if applicable)
 
-<Notional OpenShell CLI, configuration, SDK, or other interaction>
+<Notional Ryno CLI, configuration, SDK, or other interaction>
 
 ## Acceptance Criteria
 
@@ -97,7 +97,7 @@ I use OpenShell for <specific use case>. I directly encountered or need <specifi
 
 ## Alternatives Considered
 
-<Other OpenShell workflows considered, including relevant middleware, interceptors, providers, or other extension points, and why the proposal better serves the use case. Prefer an applicable extension when it satisfies the use case; running another service alone is not a reason to dismiss it.>
+<Other Ryno workflows considered, including relevant middleware, interceptors, providers, or other extension points, and why the proposal better serves the use case. Prefer an applicable extension when it satisfies the use case; running another service alone is not a reason to dismiss it.>
 
 ## Agent Investigation
 
@@ -108,7 +108,7 @@ EOF
 
 ### Tasks
 
-For internal tasks that do not fit bug/feature templates, still obtain the operator's first-hand OpenShell use case before creating the issue:
+For internal tasks that do not fit bug/feature templates, still obtain the operator's first-hand Ryno use case before creating the issue:
 
 ```bash
 gh issue create \
@@ -116,7 +116,7 @@ gh issue create \
   --body "$(cat <<'EOF'
 ## User Story
 
-<I personally use OpenShell for this specific case and directly need this work because...>
+<I personally use Ryno for this specific case and directly need this work because...>
 
 ## Description
 

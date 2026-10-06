@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build OpenShell from source and install the resulting Debian package
+# Build Ryno from source and install the resulting Debian package
 # locally for testing. Intended for developers iterating on the deb itself
 # or on the gateway-as-a-service flow.
 #
@@ -16,26 +16,26 @@
 #   mise run package:deb:install
 #
 # Optional env:
-#   OPENSHELL_DEB_VERSION   override the package version (default: 0.0.0-local)
-#   OPENSHELL_DEB_ARCH      override the deb architecture (default: host)
-#   OPENSHELL_OUTPUT_DIR    override the artifact directory (default: artifacts)
+#   RYNO_DEB_VERSION   override the package version (default: 0.0.0-local)
+#   RYNO_DEB_ARCH      override the deb architecture (default: host)
+#   RYNO_OUTPUT_DIR    override the artifact directory (default: artifacts)
 
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$repo_root"
 
-VERSION="${OPENSHELL_DEB_VERSION:-0.0.0-local}"
-OUTPUT_DIR="${OPENSHELL_OUTPUT_DIR:-artifacts}"
-ARCH="${OPENSHELL_DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
-GATEWAY_NAME="openshell"
+VERSION="${RYNO_DEB_VERSION:-0.0.0-local}"
+OUTPUT_DIR="${RYNO_OUTPUT_DIR:-artifacts}"
+ARCH="${RYNO_DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
+GATEWAY_NAME="ryno"
 GATEWAY_ENDPOINT="https://127.0.0.1:17670"
 
 remove_existing_gateway_registration() {
 	local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-	local openshell_config_dir="${config_home}/openshell"
-	local gateway_dir="${openshell_config_dir}/gateways/${GATEWAY_NAME}"
-	local active_gateway_path="${openshell_config_dir}/active_gateway"
+	local ryno_config_dir="${config_home}/ryno"
+	local gateway_dir="${ryno_config_dir}/gateways/${GATEWAY_NAME}"
+	local active_gateway_path="${ryno_config_dir}/active_gateway"
 
 	if [ ! -f "${gateway_dir}/metadata.json" ]; then
 		return
@@ -55,22 +55,22 @@ remove_existing_gateway_registration() {
 
 echo "==> Building release binaries"
 cargo build --release \
-	-p openshell-cli \
-	-p openshell-gateway \
-	-p openshell-prover-cli \
-	-p openshell-driver-vm
+	-p ryno-cli \
+	-p ryno-gateway \
+	-p ryno-prover-cli \
+	-p ryno-driver-vm
 
 echo "==> Building Debian package"
-OPENSHELL_CLI_BINARY="${repo_root}/target/release/openshell" \
-	OPENSHELL_GATEWAY_BINARY="${repo_root}/target/release/openshell-gateway" \
-	OPENSHELL_PROVER_BINARY="${repo_root}/target/release/openshell-prover" \
-	OPENSHELL_DRIVER_VM_BINARY="${repo_root}/target/release/openshell-driver-vm" \
-	OPENSHELL_DEB_VERSION="$VERSION" \
-	OPENSHELL_DEB_ARCH="$ARCH" \
-	OPENSHELL_OUTPUT_DIR="$OUTPUT_DIR" \
+RYNO_CLI_BINARY="${repo_root}/target/release/ryno" \
+	RYNO_GATEWAY_BINARY="${repo_root}/target/release/ryno-gateway" \
+	RYNO_PROVER_BINARY="${repo_root}/target/release/ryno-prover" \
+	RYNO_DRIVER_VM_BINARY="${repo_root}/target/release/ryno-driver-vm" \
+	RYNO_DEB_VERSION="$VERSION" \
+	RYNO_DEB_ARCH="$ARCH" \
+	RYNO_OUTPUT_DIR="$OUTPUT_DIR" \
 	"${repo_root}/tasks/scripts/package-deb.sh"
 
-deb_path="${OUTPUT_DIR}/openshell_${VERSION}_${ARCH}.deb"
+deb_path="${OUTPUT_DIR}/ryno_${VERSION}_${ARCH}.deb"
 case "$deb_path" in
 /*) ;;
 *) deb_path="${repo_root}/${deb_path}" ;;
@@ -79,15 +79,15 @@ esac
 echo "==> Installing ${deb_path}"
 sudo dpkg -i "$deb_path"
 
-openshell --version
-openshell-gateway --version
-openshell-prover --version
+ryno --version
+ryno-gateway --version
+ryno-prover --version
 
 echo "==> Starting user gateway service"
 systemctl --user daemon-reload
-systemctl --user enable --now openshell-gateway
-systemctl --user is-active --quiet openshell-gateway
+systemctl --user enable --now ryno-gateway
+systemctl --user is-active --quiet ryno-gateway
 
 echo "==> Registering local gateway"
 remove_existing_gateway_registration
-openshell gateway add "$GATEWAY_ENDPOINT" --local --name "$GATEWAY_NAME"
+ryno gateway add "$GATEWAY_ENDPOINT" --local --name "$GATEWAY_NAME"

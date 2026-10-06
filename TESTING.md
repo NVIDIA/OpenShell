@@ -13,7 +13,7 @@ mise run ci            # Everything: lint, compile checks, and tests
 ```text
 crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
-python/openshell/      # Python unit tests (*_test.py suffix)
+python/ryno/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 ```
@@ -68,7 +68,7 @@ Use a checkout with LF text files when running Unix-shell fixture checks.
 ## Python Unit Tests
 
 Python unit tests use the `*_test.py` suffix convention (not `test_*` prefix)
-and live alongside the source in `python/openshell/`. They use mock-based
+and live alongside the source in `python/ryno/`. They use mock-based
 patterns with fake gRPC stubs:
 
 ```python
@@ -94,10 +94,10 @@ mise run test:python   # uv run pytest python/
 E2E tests run against a live gateway. By default, `mise run e2e` starts an
 ephemeral standalone gateway with the Docker compute driver, runs the suite,
 and cleans it up afterward. To run the suite against an existing plaintext
-gateway, set `OPENSHELL_GATEWAY_ENDPOINT`:
+gateway, set `RYNO_GATEWAY_ENDPOINT`:
 
 ```bash
-OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
+RYNO_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
 ```
 
 Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
@@ -109,7 +109,7 @@ driver configuration boundary.
 
 ### Python E2E (`e2e/python/`)
 
-`mise run e2e:python` builds `openshell/e2e-python:dev` from
+`mise run e2e:python` builds `ryno/e2e-python:dev` from
 `e2e/python/Dockerfile.workload` and selects it only for the test gateway.
 This Noble-based fixture supplies the `sandbox` user, Python tooling, Git,
 and a writable `/sandbox/.venv`. Its Python version comes from `.python-version`
@@ -177,21 +177,21 @@ def test_multiply(sandbox):
 
 ### Rust CLI E2E (`e2e/rust/`)
 
-Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
-They live in the `openshell-e2e` crate and use a shared harness for sandbox
+Rust-based e2e tests that exercise the `ryno` CLI binary as a subprocess.
+They live in the `ryno-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
 Exposed service URLs use virtual hostnames for gateway routing. Host-side tests
 must connect the TCP socket directly to a reachable gateway listener address,
 normally loopback, and send the service URL authority in the HTTP `Host`
-header. Do not resolve `*.openshell.localhost`; resolver support for arbitrary
+header. Do not resolve `*.ryno.localhost`; resolver support for arbitrary
 `.localhost` subdomains varies across local and CI environments.
 
 Treat the advertised service URL scheme as authoritative. For HTTPS, use the
 virtual service hostname for TLS SNI and the configured gateway trust roots.
 When the listener requires mTLS, present the active gateway client identity;
 the local e2e wrappers register these materials under
-`$XDG_CONFIG_HOME/openshell/gateways/$OPENSHELL_GATEWAY/mtls/`. Do not downgrade
+`$XDG_CONFIG_HOME/ryno/gateways/$RYNO_GATEWAY/mtls/`. Do not downgrade
 an HTTPS service URL to plaintext when dialing loopback. Parse the URL and load
 TLS material before entering a readiness loop so permanent configuration
 errors fail immediately. Retry only transient connection failures and
@@ -203,7 +203,7 @@ CI-equivalent HTTPS mode:
 
 ```shell
 mise run e2e:rust
-OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false mise run e2e:rust
+RYNO_ENABLE_LOOPBACK_SERVICE_HTTP=false mise run e2e:rust
 ```
 
 When more than one test needs this behavior, put the transport in the shared
@@ -213,7 +213,7 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
+- CLI conformance (`ryno-conformance`) - named scenarios for lifecycle,
   mechanistic drafts, and the sandbox-local API, including agent-authored
   permission requests. Driver E2E wrappers run every scenario. The
   installed-artifact conformance suite runs all scenarios and offers a focused
@@ -226,10 +226,10 @@ Suites:
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
-GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
+GPU device-selection tests compare Ryno sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
 defaults to the image used by the `gateway` stage in
-`deploy/docker/Dockerfile.images`; set `OPENSHELL_E2E_GPU_PROBE_IMAGE` to
+`deploy/docker/Dockerfile.images`; set `RYNO_E2E_GPU_PROBE_IMAGE` to
 override it. Per-device checks run only for NVIDIA CDI device IDs reported by
 the runtime's discovered devices list, so WSL2 hosts that expose only
 `nvidia.com/gpu=all` skip the index-based cases. Exact CDI device selection is
@@ -243,7 +243,7 @@ mise run e2e:docker
 ```
 
 Run the minimal portable CLI conformance profile against the gateway selected
-in your OpenShell CLI configuration:
+in your Ryno CLI configuration:
 
 ```shell
 mise run e2e:cli-conformance
@@ -251,7 +251,7 @@ mise run e2e:cli-conformance
 
 The gateway must already be installed, reachable, and selected before the task
 starts. The task does not provision a gateway or select a compute driver. Set
-`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
+`RYNO_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
 the current checkout.
 
 The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
@@ -274,8 +274,8 @@ process is interrupted before cleanup, locate leftovers without touching
 unrelated gateway state:
 
 ```shell
-openshell sandbox list --output json
-openshell sandbox delete <sandbox-name>
+ryno sandbox list --output json
+ryno sandbox delete <sandbox-name>
 ```
 
 Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
@@ -302,7 +302,7 @@ nix run .#generate-podman-e2e-ci-tests
 
 The `e2e-podman` testsuite runs a nextest archive built with the corresponding
 Rust feature and preloads its Python workload image into the rootless Podman
-store. The separate `driver-podman` testsuite compares OpenShell and direct
+store. The separate `driver-podman` testsuite compares Ryno and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, host fixtures, missing guest tools, or nondeterministic relay
@@ -327,7 +327,7 @@ mise run e2e:kubernetes:credential-drivers
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 
-Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
+Kubernetes e2e tests deploy an Ryno gateway into a real Kubernetes cluster
 via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
 reaches the gateway through `kubectl port-forward`; on OpenShift it instead uses a
 passthrough Route secured with mandatory mTLS (see the OpenShift note below).
@@ -341,18 +341,18 @@ mise run e2e:kubernetes
 Target an existing cluster (kind, k3d, or OpenShift):
 
 ```shell
-OPENSHELL_E2E_KUBE_CONTEXT=my-context mise run e2e:kubernetes
+RYNO_E2E_KUBE_CONTEXT=my-context mise run e2e:kubernetes
 ```
 
 Scope to a single test for local debugging:
 
 ```shell
-OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
+RYNO_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
 group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
+the required SCCs (`privileged` to `ryno-sandbox`, and `anyuid` to the
 PostgreSQL fixture for DB scenarios), and drives the gateway through a
 passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
 needed, but `oc` must be installed and authenticated against the target cluster
@@ -361,17 +361,17 @@ harness exits early if `oc` is missing. The SCC grants and extracted client
 mTLS material are removed during cleanup, including on failure or interrupt.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
-on the sandbox-side `host.openshell.internal` alias reaching the machine running
+on the sandbox-side `host.ryno.internal` alias reaching the machine running
 the tests, which is unreachable from pods on a remote cluster, so they fail.
 Left enabled, the `host_gateway_alias` suite fails because
-`host.openshell.internal` does not resolve inside the pod, so the gateway
+`host.ryno.internal` does not resolve inside the pod, so the gateway
 SSRF-denies the request (`DNS resolution failed` / `ssrf_denied`) — a networking
 property of remote pods, not a gateway or transport fault. Override
-`OPENSHELL_E2E_KUBERNETES_FEATURES` to exclude it:
+`RYNO_E2E_KUBERNETES_FEATURES` to exclude it:
 
 ```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
+RYNO_E2E_KUBE_CONTEXT=$(oc config current-context) \
+  RYNO_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
   mise run e2e:kubernetes
 ```
 
@@ -393,8 +393,8 @@ The `latest` tag lags to the last semver release, so it is often older than
   without a `v` prefix also exist but only for released versions):
 
 ```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
+RYNO_E2E_KUBE_CONTEXT=$(oc config current-context) \
+  RYNO_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
   IMAGE_TAG=$(git rev-parse "$(git merge-base HEAD upstream/main)") \
   mise run e2e:kubernetes
 ```
@@ -403,8 +403,8 @@ To pin a specific released version, use its semver tag without a `v` prefix
 (`0.0.115`, not `v0.0.115`):
 
 ```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
+RYNO_E2E_KUBE_CONTEXT=$(oc config current-context) \
+  RYNO_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
   IMAGE_TAG=0.0.115 \
   mise run e2e:kubernetes
 ```
@@ -416,13 +416,13 @@ Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use)
 
 ```shell
 TAG=0.0.115
-skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
+skopeo inspect "docker://ghcr.io/nvidia/ryno/gateway:${TAG}"
 ```
 
 `IMAGE_TAG` sets the default tag for the gateway/supervisor image pair; the CLI
 under test is always built from your branch. To validate against images from
 your exact commit instead, build and push them and point
-`OPENSHELL_REGISTRY`/`IMAGE_TAG` at them.
+`RYNO_REGISTRY`/`IMAGE_TAG` at them.
 
 Test wrappers accept independent image overrides:
 
@@ -436,19 +436,19 @@ mise run e2e:kubernetes
 `GATEWAY_IMAGE` applies to the Kubernetes gateway container. `SUPERVISOR_IMAGE`
 applies to the trusted supervisor image selected by the Kubernetes, Docker, and
 Podman wrappers. `SANDBOX_IMAGE` applies to the trusted workload-side runtime
-image that stages the `openshell-sandbox` binary. A repository-only value
+image that stages the `ryno-sandbox` binary. A repository-only value
 inherits `IMAGE_TAG`; a value with an explicit tag or `@sha256:` digest is used
-as-is. When these variables are unset, the existing `OPENSHELL_REGISTRY` plus
+as-is. When these variables are unset, the existing `RYNO_REGISTRY` plus
 `IMAGE_TAG` behavior is retained.
 The Docker and Podman wrappers continue to give
-`OPENSHELL_DOCKER_SUPERVISOR_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE` precedence
+`RYNO_DOCKER_SUPERVISOR_IMAGE` and `RYNO_SUPERVISOR_IMAGE` precedence
 over `SUPERVISOR_IMAGE`.
 
 Digest-pinned Kubernetes overrides require disabling local image builds, because
 Docker cannot tag a locally built image with a digest reference:
 
 ```shell
-OPENSHELL_E2E_KUBE_BUILD_IMAGES=0 \
+RYNO_E2E_KUBE_BUILD_IMAGES=0 \
 GATEWAY_IMAGE=registry.example.com/custom/gateway@sha256:<digest> \
 SUPERVISOR_IMAGE=registry.example.com/custom/supervisor@sha256:<digest> \
 mise run e2e:kubernetes
@@ -471,14 +471,14 @@ Kubernetes e2e environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
-| `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
-| `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
-| `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
+| `RYNO_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
+| `RYNO_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
+| `RYNO_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
+| `RYNO_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
 | `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
-| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
-| `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
-| `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `OPENSHELL_E2E_KUBE_BUILD_IMAGES=0` |
+| `RYNO_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/ryno`) |
+| `GATEWAY_IMAGE` | Kubernetes gateway image repository or complete tagged/digest-pinned image reference; digests require `RYNO_E2E_KUBE_BUILD_IMAGES=0` |
+| `SUPERVISOR_IMAGE` | Gateway/supervisor image repository or complete tagged/digest-pinned image reference; Kubernetes digests require `RYNO_E2E_KUBE_BUILD_IMAGES=0` |
 | `SANDBOX_IMAGE` | Trusted sandbox runtime image repository or complete tagged/digest-pinned image reference |
 
 Run a single test directly with cargo:
@@ -497,7 +497,7 @@ The harness (`e2e/rust/src/harness/`) provides:
 
 | Module | Purpose |
 |---|---|
-| `binary` | Builds and resolves the `openshell` binary from the workspace |
+| `binary` | Builds and resolves the `ryno` binary from the workspace |
 | `container` | Container-engine selection and support containers for proxy tests |
 | `gateway` | Managed gateway restart controls for gateway-owned e2e runs |
 | `sandbox` | `SandboxGuard` RAII type — creates sandboxes and deletes them on drop |
@@ -508,9 +508,9 @@ The harness (`e2e/rust/src/harness/`) provides:
 
 | Variable | Purpose |
 |---|---|
-| `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
-| `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
-| `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
-| `OPENSHELL_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |
-| `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for Kubernetes e2e (skips ephemeral k3d) |
-| `OPENSHELL_E2E_KUBE_TEST` | Scope Kubernetes e2e to a single test by name |
+| `RYNO_GATEWAY` | Override active gateway name for E2E tests |
+| `RYNO_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
+| `RYNO_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
+| `RYNO_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |
+| `RYNO_E2E_KUBE_CONTEXT` | kubectl context for Kubernetes e2e (skips ephemeral k3d) |
+| `RYNO_E2E_KUBE_TEST` | Scope Kubernetes e2e to a single test by name |

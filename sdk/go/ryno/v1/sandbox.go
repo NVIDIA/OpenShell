@@ -1,0 +1,97 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package v1
+
+import (
+	"context"
+
+	"github.com/NVIDIA/Ryno/sdk/go/ryno/v1/types"
+)
+
+// Sandbox represents a sandbox instance.
+type Sandbox = types.Sandbox
+
+// SandboxSpec holds the desired state of a sandbox.
+type SandboxSpec = types.SandboxSpec
+
+// SandboxTemplate defines the container template for a sandbox.
+type SandboxTemplate = types.SandboxTemplate
+
+// SandboxStatus holds the observed state of a sandbox.
+type SandboxStatus = types.SandboxStatus
+
+// SandboxCondition describes an observed condition of a sandbox.
+type SandboxCondition = types.SandboxCondition
+
+// EndpointStatus holds a configured tool endpoint and its last accepted network result.
+type EndpointStatus = types.EndpointStatus
+
+// EndpointResult classifies the last accepted network result for a tool endpoint.
+type EndpointResult = types.EndpointResult
+
+// EndpointResult values describe passive observations of actual traffic.
+const (
+	EndpointUnspecified           = types.EndpointUnspecified
+	EndpointNoObservedExchange    = types.EndpointNoObservedExchange
+	EndpointHTTPResponseReceived  = types.EndpointHTTPResponseReceived
+	EndpointPolicyDenied          = types.EndpointPolicyDenied
+	EndpointCredentialUnavailable = types.EndpointCredentialUnavailable
+	EndpointTLSFailed             = types.EndpointTLSFailed
+	EndpointTransportFailed       = types.EndpointTransportFailed
+	EndpointUpstreamRejected      = types.EndpointUpstreamRejected
+)
+
+// AttachProviderResult holds the result of attaching a provider to a sandbox.
+type AttachProviderResult = types.AttachProviderResult
+
+// DetachProviderResult holds the result of detaching a provider from a sandbox.
+type DetachProviderResult = types.DetachProviderResult
+
+// LogLine represents a single log entry from a sandbox.
+type LogLine = types.LogLine
+
+// LogResult contains the result of a GetLogs call.
+type LogResult = types.LogResult
+
+// LogOption configures a GetLogs call.
+type LogOption = types.LogOption
+
+// WithLogLines sets the maximum number of log lines to return.
+var WithLogLines = types.WithLogLines
+
+// WithLogSince filters logs to entries at or after the given time.
+var WithLogSince = types.WithLogSince
+
+// WithLogSources filters logs by source (e.g., "gateway", "sandbox").
+var WithLogSources = types.WithLogSources
+
+// WithLogMinLevel sets the minimum log level to include.
+var WithLogMinLevel = types.WithLogMinLevel
+
+// SandboxInterface defines lifecycle operations on sandboxes.
+type SandboxInterface interface {
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
+	List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error)
+	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
+	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
+	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
+	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
+	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
+	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
+	// ListProviders returns a lazy pager over providers attached to a sandbox.
+	ListProviders(workspace, sandboxName string, opts ...ListOptions) (*Pager[*Provider], error)
+	// ListAllProviders exhausts ListProviders for callers that need every provider.
+	ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*Provider, error)
+	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
+	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
+	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
+	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
+}
+
+// SandboxTemplateCreateInterface defines additive sandbox creation from named
+// workload templates without widening SandboxInterface.
+type SandboxTemplateCreateInterface interface {
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+}

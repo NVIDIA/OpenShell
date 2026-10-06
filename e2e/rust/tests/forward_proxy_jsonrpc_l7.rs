@@ -3,7 +3,7 @@
 
 //! E2E tests for JSON-RPC L7 inspection through transparent interception.
 //!
-//! The upstream server deliberately does not implement JSON-RPC. `OpenShell`
+//! The upstream server deliberately does not implement JSON-RPC. `Ryno`
 //! parses and enforces JSON-RPC before forwarding, so any HTTP server that
 //! accepts POST /rpc is enough to prove allowed requests reach upstream
 //! and denied requests are stopped by the sandbox proxy.
@@ -12,12 +12,12 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::container::ContainerHttpServer;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ContainerHttpServer;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const RULES_TEST_SERVER_ALIAS: &str = "jsonrpc-l7-rules.openshell.test";
-const AUDIT_TEST_SERVER_ALIAS: &str = "jsonrpc-l7-audit.openshell.test";
+const RULES_TEST_SERVER_ALIAS: &str = "jsonrpc-l7-rules.ryno.test";
+const AUDIT_TEST_SERVER_ALIAS: &str = "jsonrpc-l7-audit.ryno.test";
 
 async fn start_test_server(alias: &str) -> Result<ContainerHttpServer, String> {
     let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer

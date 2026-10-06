@@ -1,9 +1,9 @@
 name: Release VM Kernel
 
 # Build custom libkrunfw (kernel firmware) + libkrun (VMM) for all
-# supported openshell-driver-vm platforms. Artifacts are uploaded to the
+# supported ryno-driver-vm platforms. Artifacts are uploaded to the
 # rolling "vm-runtime" GitHub Release and consumed by normal dev/tag release
-# workflows when building the openshell-driver-vm binary.
+# workflows when building the ryno-driver-vm binary.
 #
 # The Linux kernel is compiled once on aarch64 Linux.  The resulting kernel.c
 # (a C source file containing the kernel as a byte array) is shared with the
@@ -39,7 +39,7 @@ jobs:
     runs-on: linux-arm64-cpu8
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -89,7 +89,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -231,19 +231,19 @@ jobs:
       - name: Create / update vm-runtime GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          name: OpenShell VM Runtime
+          name: Ryno VM Runtime
           prerelease: true
           tag_name: vm-runtime
           target_commitish: ${{ github.sha }}
           body: |
-            Build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
+            Build of the Ryno VM runtime artifacts used by `ryno-driver-vm`.
 
             > **NOTE**: This is a development build.
 
             ### Kernel Runtime Artifacts
 
             Pre-built kernel runtime (libkrunfw + libkrun + umoci) for embedding
-            into the `openshell-driver-vm` binary. These are rebuilt on demand when the
+            into the `ryno-driver-vm` binary. These are rebuilt on demand when the
             kernel config or pinned dependency versions change.
 
             | Platform | Artifact |
@@ -255,8 +255,8 @@ jobs:
             ### Verify
 
             ```bash
-            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
-            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
+            gh release download vm-runtime -R NVIDIA/Ryno -p vm-runtime-linux-x86_64.tar.zst
+            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/Ryno
             ```
 
           files: |

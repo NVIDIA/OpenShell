@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Logging"
 sidebar-title: "Logging"
-description: "How OpenShell logs sandbox activity using standard tracing and OCSF structured events."
+description: "How Ryno logs sandbox activity using standard tracing and OCSF structured events."
 keywords: "Generative AI, Cybersecurity, Logging, OCSF, Observability"
 ---
 
-Every OpenShell sandbox produces a log that records network connections, process lifecycle events, filesystem policy decisions, and configuration changes. The log uses two formats depending on the type of event.
+Every Ryno sandbox produces a log that records network connections, process lifecycle events, filesystem policy decisions, and configuration changes. The log uses two formats depending on the type of event.
 
 ## Log Formats
 
@@ -16,22 +16,22 @@ Every OpenShell sandbox produces a log that records network connections, process
 Internal operational events use Rust's `tracing` framework with a conventional format:
 
 ```text
-2026-04-01T03:28:39.160Z INFO openshell_sandbox: Fetching sandbox policy via gRPC
-2026-04-01T03:28:39.175Z INFO openshell_sandbox: Creating OPA engine from proto policy data
+2026-04-01T03:28:39.160Z INFO ryno_sandbox: Fetching sandbox policy via gRPC
+2026-04-01T03:28:39.175Z INFO ryno_sandbox: Creating OPA engine from proto policy data
 ```
 
 These events cover startup plumbing, gRPC communication, and internal state transitions that are useful for debugging but do not represent security-relevant decisions.
 
 ### OCSF structured events
 
-Network, process, filesystem, configuration, and API activity events use the [Open Cybersecurity Schema Framework (OCSF)](https://ocsf.io) format. OCSF is an open standard for normalizing security telemetry across tools and platforms. OpenShell maps sandbox events to OCSF v1.8.0 event classes.
+Network, process, filesystem, configuration, and API activity events use the [Open Cybersecurity Schema Framework (OCSF)](https://ocsf.io) format. OCSF is an open standard for normalizing security telemetry across tools and platforms. Ryno maps sandbox events to OCSF v1.8.0 event classes.
 
 In the log file, OCSF events appear in a shorthand format with an `OCSF` level label, designed for quick human and agent scanning:
 
 ```text
-2026-04-01T04:04:13.058Z INFO openshell_sandbox: Starting sandbox
+2026-04-01T04:04:13.058Z INFO ryno_sandbox: Starting sandbox
 2026-04-01T04:04:13.065Z OCSF CONFIG:DISCOVERY [INFO] Server returned no policy; attempting local discovery
-2026-04-01T04:04:13.074Z INFO openshell_sandbox: Creating OPA engine from proto policy data
+2026-04-01T04:04:13.074Z INFO ryno_sandbox: Creating OPA engine from proto policy data
 2026-04-01T04:04:13.078Z OCSF CONFIG:VALIDATED [INFO] Validated 'sandbox' user exists in image
 2026-04-01T04:04:32.118Z OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
 2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api engine:opa]
@@ -45,12 +45,12 @@ When viewed through the CLI or TUI, which receive logs through gRPC, the same di
 ```text
 [1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
 [1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa] [reason:no matching policy]
-[1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
+[1775014113.058] [sandbox] [INFO ] [ryno_sandbox] Starting sandbox
 ```
 
 ## OCSF Event Classes
 
-OpenShell maps sandbox events to these OCSF classes:
+Ryno maps sandbox events to these OCSF classes:
 
 | Shorthand prefix | OCSF class | Class UID | What it covers |
 |---|---|---|---|
@@ -145,17 +145,17 @@ OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match
 WebSocket middleware emits one safe event per preflight, session-start, or client text-message decision. The event includes the policy-local config, registered implementation, sequence, byte counts, transformation flag, and validated reason code. It never includes the message payload or service-provided free-form reason:
 
 ```text
-OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE allow config=api-redactor implementation=openshell/regex sequence=3 input_bytes=128 replacement_bytes=96 transformed=true reason_code=-
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE allow config=api-redactor implementation=ryno/regex sequence=3 input_bytes=128 replacement_bytes=96 transformed=true reason_code=-
 ```
 
 Coverage events are separate from invocation decisions. `binding_not_selected` means a host-matched attachment did not advertise the WebSocket operation. `unsupported_message_type` means an active WebSocket stage encountered a binary message, which V1 passes through without inspection. Both are informational, do not apply `on_error`, and never claim the traffic was inspected:
 
 ```text
 OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected config=http-dlp implementation=example/http-dlp sequence=- message_type=- input_bytes=0
-OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type config=api-redactor implementation=openshell/regex sequence=4 message_type=binary input_bytes=512
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type config=api-redactor implementation=ryno/regex sequence=4 message_type=binary input_bytes=512
 ```
 
-A fail-open stream error emits both a middleware failure and `openshell.middleware.websocket_stage_disabled`. The latter records that OpenShell will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content. When both active capacity and the bounded wait queue are full, HTTP work is rejected before its payload is buffered, returns `503 Service Unavailable`, and emits `openshell.middleware.admission_exhausted`.
+A fail-open stream error emits both a middleware failure and `ryno.middleware.websocket_stage_disabled`. The latter records that Ryno will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content. When both active capacity and the bounded wait queue are full, HTTP work is rejected before its payload is buffered, returns `503 Service Unavailable`, and emits `ryno.middleware.admission_exhausted`.
 
 Proxy and SSH servers ready:
 
@@ -187,7 +187,7 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
 
-For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. OpenShell does not copy per-request service text or WebSocket message content into logs.
+For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. Ryno does not copy per-request service text or WebSocket message content into logs.
 
 Common reason phrases emitted by the sandbox include:
 
@@ -230,7 +230,7 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 
 The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`, `unsupported_l7_protocol`). The `detail` field is a human-readable explanation suitable for display in an agent transcript. The optional `reason` field, when present, provides the specific denial cause from the policy engine (for example, which binary was not allowed or which rule was missing).
 
-For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When the policy advisor is enabled, the body also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
+For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When the policy advisor is enabled, the body also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/ryno/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
 
 ## Filesystem Sandbox Logs
 
@@ -258,8 +258,8 @@ Inside the sandbox, logs are written to `/var/log/`:
 
 | File | Format | Rotation |
 |---|---|---|
-| `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
-| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily, 3 files max |
+| `ryno.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily, 3 files max |
+| `ryno-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily, 3 files max |
 
 Both files rotate daily and retain the 3 most recent files to bound disk usage.
 

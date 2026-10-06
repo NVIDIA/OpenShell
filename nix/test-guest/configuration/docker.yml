@@ -56,7 +56,7 @@
 
     - name: Add the test user to the Docker group
       ansible.builtin.user:
-        name: openshell
+        name: ryno
         groups:
           - docker
         append: true

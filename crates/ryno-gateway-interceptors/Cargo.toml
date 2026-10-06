@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ryno-gateway-interceptors"
+description = "Gateway interceptor framework for Ryno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ryno-core = { path = "../ryno-core", default-features = false }
+ryno-extension-core = { path = "../ryno-extension-core" }
+
+json-patch = "1.4"
+metrics = { workspace = true }
+prost = { workspace = true }
+prost-reflect = { workspace = true }
+prost-types = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

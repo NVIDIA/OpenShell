@@ -7,7 +7,7 @@ body:
       value: |
         ## Design-First Feature Proposals
 
-        OpenShell feature requests must include a user story and workflow-level design proposal. Describe who needs the feature, the problem it solves, why the current gap matters, the desired user-facing workflow, and the observable criteria for success. Leave implementation choices to the people building the feature. New features start here, not as RFC pull requests. If maintainers decide an RFC is necessary, they will request one from this issue and assign the RFC number.
+        Ryno feature requests must include a user story and workflow-level design proposal. Describe who needs the feature, the problem it solves, why the current gap matters, the desired user-facing workflow, and the observable criteria for success. Leave implementation choices to the people building the feature. New features start here, not as RFC pull requests. If maintainers decide an RFC is necessary, they will request one from this issue and assign the RFC number.
 
         If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
 
@@ -15,9 +15,9 @@ body:
     id: user-story
     attributes:
       label: User Story
-      description: Attest that you personally use OpenShell. Describe the specific use case and behavior you directly encountered or need.
+      description: Attest that you personally use Ryno. Describe the specific use case and behavior you directly encountered or need.
       placeholder: |
-        I use OpenShell for <specific use case>.
+        I use Ryno for <specific use case>.
         I directly encountered or need <specific behavior>.
         This affects <outcome>.
     validations:
@@ -27,7 +27,7 @@ body:
     id: problem
     attributes:
       label: Problem Statement
-      description: Summarize the capability or behavior missing from OpenShell today. Focus on the gap itself; describe its consequences and current workarounds in Impact / Why This Matters.
+      description: Summarize the capability or behavior missing from Ryno today. Focus on the gap itself; describe its consequences and current workarounds in Impact / Why This Matters.
     validations:
       required: true
 
@@ -49,7 +49,7 @@ body:
     attributes:
       label: Proposed Design
       description: |
-        How should this work from the user's perspective? Describe the desired workflow and externally observable behavior. For configuration, CLI, SDK, or other UX changes, include a notional OpenShell example for review. Avoid prescribing internal components unless they are essential constraints.
+        How should this work from the user's perspective? Describe the desired workflow and externally observable behavior. For configuration, CLI, SDK, or other UX changes, include a notional Ryno example for review. Avoid prescribing internal components unless they are essential constraints.
     validations:
       required: true
 
@@ -68,7 +68,7 @@ body:
     id: alternatives
     attributes:
       label: Alternatives Considered
-      description: Consider relevant OpenShell extension points, including middleware, interceptors, and providers. Explain why the proposal best serves your use case. Prefer an applicable extension when it satisfies the use case. Running another service alone does not rule it out.
+      description: Consider relevant Ryno extension points, including middleware, interceptors, and providers. Explain why the proposal best serves your use case. Prefer an applicable extension when it satisfies the use case. Running another service alone does not rule it out.
     validations:
       required: true
 
@@ -81,7 +81,7 @@ body:
       placeholder: |
         Example:
         - Used `create-spike` to investigate existing provider infrastructure
-        - Found that `crates/openshell-providers/` already supports a plugin pattern
+        - Found that `crates/ryno-providers/` already supports a plugin pattern
         - Proposed design extends the existing trait rather than adding a new abstraction
     validations:
       required: false

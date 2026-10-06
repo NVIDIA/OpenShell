@@ -1,6 +1,6 @@
 ---
 name: sbom
-description: Generate and manage Software Bill of Materials (SBOMs) for the OpenShell project. Covers SBOM generation with Syft, license resolution via public registries, and CSV export for compliance review. Trigger keywords - SBOM, sbom, bill of materials, license audit, license resolution, generate sbom, sbom csv, dependency license, supply chain, license scan.
+description: Generate and manage Software Bill of Materials (SBOMs) for the Ryno project. Covers SBOM generation with Syft, license resolution via public registries, and CSV export for compliance review. Trigger keywords - SBOM, sbom, bill of materials, license audit, license resolution, generate sbom, sbom csv, dependency license, supply chain, license scan.
 metadata:
   internal: true
 ---
@@ -11,7 +11,7 @@ Generate CycloneDX SBOMs, resolve missing licenses, and export to CSV for compli
 
 ## Overview
 
-The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
+The Ryno SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
@@ -27,14 +27,14 @@ Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SL
 BuildKit uses its default Syft scanner and attaches one SPDX document per platform. Read one without pulling the image:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest \
+docker buildx imagetools inspect ghcr.io/nvidia/ryno/gateway:latest \
   --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
 ```
 
 Validate the final attestation, requiring a Cargo package for an auditable image:
 
 ```bash
-tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --require-cargo
+tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/ryno/gateway:latest --require-cargo
 ```
 
 ## Inspecting an Auditable Image Binary
@@ -42,7 +42,7 @@ tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --req
 Opt into auditable metadata when staging a local image binary:
 
 ```bash
-OPENSHELL_AUDITABLE=1 PREBUILT_ARCH=amd64 \
+RYNO_AUDITABLE=1 PREBUILT_ARCH=amd64 \
   tasks/scripts/stage-prebuilt-binaries.sh gateway
 ```
 
@@ -50,7 +50,7 @@ Scan the staged binary rather than the source tree:
 
 ```bash
 mise x -- syft \
-  "file:deploy/docker/.build/prebuilt-binaries/amd64/openshell-gateway" \
+  "file:deploy/docker/.build/prebuilt-binaries/amd64/ryno-gateway" \
   -o cyclonedx-json
 ```
 
@@ -120,8 +120,8 @@ Components from private registries (e.g., `@openclaw/*` npm packages) are not re
 
 | Pattern | Description |
 |---------|-------------|
-| `deploy/sbom/output/openshell-source-{version}.cdx.json` | CycloneDX JSON SBOM |
-| `deploy/sbom/output/openshell-source-{version}.csv` | CSV export (name, version, type, purl, licenses, bom-ref) |
+| `deploy/sbom/output/ryno-source-{version}.cdx.json` | CycloneDX JSON SBOM |
+| `deploy/sbom/output/ryno-source-{version}.csv` | CSV export (name, version, type, purl, licenses, bom-ref) |
 
 ## Key Files
 

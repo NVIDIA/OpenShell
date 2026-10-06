@@ -43,7 +43,7 @@ runs:
           uidmap
         # Hosted runners can place newer binaries under /usr/local. Select the
         # distro CLI and use Podman's supported final conmon-path override.
-        podman_config="${RUNNER_TEMP}/openshell-containers.conf"
+        podman_config="${RUNNER_TEMP}/ryno-containers.conf"
         printf '%s\n' \
           '[engine]' \
           'conmon_path = ["/usr/bin/conmon"]' \
@@ -115,12 +115,12 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        probe="$RUNNER_TEMP/openshell-capbset-probe"
+        probe="$RUNNER_TEMP/ryno-capbset-probe"
         cc -static -O2 -Wall -Wextra -Werror \
           e2e/support/capbset-probe.c \
           -o "$probe"
         podman run --rm \
           --cap-add=SETPCAP \
-          --volume "$probe:/openshell-capbset-probe:ro" \
+          --volume "$probe:/ryno-capbset-probe:ro" \
           nvcr.io/nvidia/base/ubuntu:24.04 \
-          /openshell-capbset-probe
+          /ryno-capbset-probe

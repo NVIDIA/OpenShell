@@ -3,19 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Network Rules"
 sidebar-title: "Network Rules"
-description: "Understand how OpenShell evaluates network rules, and adapt examples for REST APIs, package registries, internal services, WebSocket, GraphQL, MCP, and native TCP."
+description: "Understand how Ryno evaluates network rules, and adapt examples for REST APIs, package registries, internal services, WebSocket, GraphQL, MCP, and native TCP."
 keywords: "Generative AI, Cybersecurity, Policy, Network, REST, TCP, WebSocket, GraphQL, MCP, PyPI, npm"
 position: 2
 ---
 
 Network rules control which destinations each binary in a sandbox can reach, and
 which requests it can send. They make up most of a typical policy. This page
-explains how OpenShell evaluates network rules, then gives example rules for
+explains how Ryno evaluates network rules, then gives example rules for
 common services and protocols that you can adapt.
 
 ## How Network Rules Work
 
-OpenShell checks every outbound connection from a sandbox against the
+Ryno checks every outbound connection from a sandbox against the
 `network_policies` section of its policy, and denies any connection that no rule
 allows.
 
@@ -61,10 +61,10 @@ connection. This is not always the command you run. For example, `pip` is a
 Python script, so the process that connects to PyPI is the Python interpreter,
 and a rule for `pip install` must list the interpreter, not `/usr/bin/pip`.
 
-OpenShell identifies each process by the real path of its executable, as the
+Ryno identifies each process by the real path of its executable, as the
 kernel reports it, so list real paths rather than symlinks. For example, on
 Ubuntu 24.04, `/usr/bin/python3` is a symlink to `/usr/bin/python3.12`. To find
-the real path, run `readlink -f` on the path inside the sandbox. When OpenShell
+the real path, run `readlink -f` on the path inside the sandbox. When Ryno
 denies a connection, the sandbox log shows the path it identified. [Allow PyPI
 Downloads](#allow-pypi-downloads) and [Allow npm Installs](#allow-npm-installs)
 show rules that list interpreters.
@@ -73,26 +73,26 @@ A rule also applies to processes that a listed binary starts. For example, if a
 rule lists an agent's executable, tools that the agent launches can use the rule
 too. A rule with an empty `binaries` list matches no binary and allows nothing.
 
-OpenShell records a hash of each executable the first time it takes part in a
+Ryno records a hash of each executable the first time it takes part in a
 connection, and denies later connections if the file at that path changes.
 
 ### Connection and Request Checks
 
-OpenShell checks network traffic in two stages:
+Ryno checks network traffic in two stages:
 
-1. When a binary opens a connection, OpenShell checks the destination host and
-   port and the binary against your rules. If no rule matches, OpenShell denies
+1. When a binary opens a connection, Ryno checks the destination host and
+   port and the binary against your rules. If no rule matches, Ryno denies
    the connection.
-2. If the matching endpoint sets a request protocol, such as `rest`, OpenShell
+2. If the matching endpoint sets a request protocol, such as `rest`, Ryno
    also reads each request sent over the connection and checks it against the
    endpoint's request rules.
    For example, with `protocol: rest`, a rule can allow `GET` requests to an API
    while blocking `POST` and `DELETE` requests.
 
 The second stage is called request inspection, and an endpoint that uses it is
-an inspected endpoint. The `protocol` field selects what OpenShell inspects:
+an inspected endpoint. The `protocol` field selects what Ryno inspects:
 
-| `protocol` | What OpenShell checks in each request | Example |
+| `protocol` | What Ryno checks in each request | Example |
 |---|---|---|
 | `rest` | HTTP method, path, and query parameters. | [REST](#allow-read-only-api-access) |
 | `websocket` | The WebSocket upgrade request and each text message the client sends. | [WebSocket](#allow-websocket-messages) |
@@ -102,7 +102,7 @@ an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 | `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
 | Omitted | No request rules. | -- |
 
-When `protocol` is omitted, OpenShell allows any method and path. Unless the
+When `protocol` is omitted, Ryno allows any method and path. Unless the
 endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
 that are addressed to another host or have malformed paths, such as paths that
 contain `%2F`. It relays traffic that is neither TLS nor HTTP without inspecting
@@ -117,11 +117,11 @@ determines the risk, such as allowing reads but not writes on an API.
 The `enforcement` field on an inspected endpoint decides what happens when a
 request breaks the endpoint's request rules:
 
-- `enforce` blocks the request. An HTTP client receives an OpenShell
+- `enforce` blocks the request. An HTTP client receives an Ryno
   `policy_denied` response.
 - `audit` allows the request and logs the violation. This is the default.
 
-Audit mode applies only to the endpoint's allow and deny rules. OpenShell still
+Audit mode applies only to the endpoint's allow and deny rules. Ryno still
 rejects requests that it cannot process safely, such as malformed requests and
 requests addressed to another host.
 
@@ -130,7 +130,7 @@ rule with `enforcement: audit`, run your workload, then look for violation
 events in the sandbox log:
 
 ```shell
-openshell logs my-sandbox --since 5m --source sandbox
+ryno logs my-sandbox --since 5m --source sandbox
 ```
 
 Do not filter this log with `--level warn`, which hides policy events. When the
@@ -143,12 +143,12 @@ Network rules are not an ordered firewall list. Several rules can match the same
 connection or request, and every matching rule adds the access it allows. A
 matching deny rule takes precedence over any allow, regardless of where either
 appears in the file. If one matching rule inspects requests and another does
-not, OpenShell inspects the connection, and the rule without `protocol` adds no
+not, Ryno inspects the connection, and the rule without `protocol` adds no
 request access. Endpoints that can match the same host and port must also agree
-on settings such as `tls` and `allowed_ips`, or OpenShell rejects the policy.
+on settings such as `tls` and `allowed_ips`, or Ryno rejects the policy.
 
 For example, suppose one rule allows `GET /repos/**` on a host and another rule
-for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
+for the same host, port, and binary denies `GET /repos/private/**`. Ryno
 denies requests under `/repos/private/`. When you restrict access, review every
 rule that could allow the request, including rules that providers contribute.
 [Allow Specific Methods and Paths](#allow-specific-methods-and-paths) shows a
@@ -156,8 +156,8 @@ deny rule.
 
 ### Network Access and Credentials
 
-A network rule that allows traffic to a destination does not allow OpenShell to
-send provider credentials there. OpenShell supplies a provider's credentials
+A network rule that allows traffic to a destination does not allow Ryno to
+send provider credentials there. Ryno supplies a provider's credentials
 only to the destinations that the provider's profile or an explicit credential
 binding allows. When a request fails a credential check, correct the provider
 binding instead of widening the network rule. Refer to [Provider
@@ -171,9 +171,9 @@ The following rules cover common services and protocols. Replace the example
 hosts, paths, and binaries with your own values, and make sure the sandbox
 contains the client executable.
 
-When a single `openshell policy update` command can create a rule, the example
+When a single `ryno policy update` command can create a rule, the example
 shows it. Otherwise, add the YAML under the `network_policies` section of a
-complete policy file and apply it with `openshell policy set`, as described in
+complete policy file and apply it with `ryno policy set`, as described in
 [Replace the Complete
 Policy](/how-it-works/policies/manage-policies#replace-the-complete-policy).
 After you apply a rule, [verify the
@@ -189,7 +189,7 @@ anything. The `read-only` preset permits `GET`, `HEAD`, and `OPTIONS`.
 <Tab title="CLI">
 
 ```shell
-openshell policy update my-sandbox \
+ryno policy update my-sandbox \
   --rule-name github_readonly \
   --binary /usr/bin/curl \
   --add-endpoint api.github.com:443:read-only:rest:enforce \
@@ -217,15 +217,15 @@ github_readonly:
 Verify an allowed `GET` and a denied `POST`:
 
 ```shell
-openshell sandbox exec -n my-sandbox --no-login-shell -- \
+ryno sandbox exec -n my-sandbox --no-login-shell -- \
   /usr/bin/curl --silent --show-error --fail \
   https://api.github.com/zen
-openshell sandbox exec -n my-sandbox --no-login-shell -- \
+ryno sandbox exec -n my-sandbox --no-login-shell -- \
   /usr/bin/curl --silent --show-error \
   --request POST https://api.github.com/zen
 ```
 
-The `POST` must return an OpenShell `policy_denied` response. `read-only` is an
+The `POST` must return an Ryno `policy_denied` response. `read-only` is an
 HTTP method preset, not a guarantee that an upstream `GET` has no side effect.
 
 ### Allow Specific Methods and Paths
@@ -264,14 +264,14 @@ list the webhooks path and everything under it separately for the same reason.
 The allow rule grants every HTTP method under the repository path, including
 writes, so narrow it if the agent needs only specific operations. It does not
 cover Git transport or GraphQL requests. To add a deny rule to an existing rule
-without a complete policy file, use `openshell policy update` with `--add-deny`,
+without a complete policy file, use `ryno policy update` with `--add-deny`,
 as described in [Add or Remove Network
 Access](/how-it-works/policies/manage-policies#add-or-remove-network-access).
 
 Apply the rule with a GitHub provider attached. Its profile must permit
 credential use at `api.github.com`, and the token must authorize the repository
 operations. Verify that `gh api repos/<org>/<repo>/issues` succeeds and that
-`gh api repos/<org>/<repo>/hooks` returns an OpenShell denial. For a complete
+`gh api repos/<org>/<repo>/hooks` returns an Ryno denial. For a complete
 Git push example, see [Grant GitHub Push Access to a Sandboxed
 Agent](/tutorials/github-push-access).
 
@@ -309,7 +309,7 @@ index, replace the hosts with your index's hosts.
 For a sandbox with `pip` installed, verify that a download succeeds:
 
 ```shell
-openshell sandbox exec -n my-sandbox --no-login-shell -- \
+ryno sandbox exec -n my-sandbox --no-login-shell -- \
   /usr/bin/python3 -m pip download --no-deps --dest /tmp/pypi-check requests
 ```
 
@@ -334,7 +334,7 @@ npm_registry:
 ```
 
 npm requests scoped packages, such as `@types/node`, with an encoded slash in
-the path. OpenShell rejects `%2F` in request paths unless the endpoint sets
+the path. Ryno rejects `%2F` in request paths unless the endpoint sets
 `allow_encoded_slash: true`. npm also sends its security audit as a `POST`
 request, which the read-only preset denies. Run `npm install --no-audit`, or
 replace `access: read-only` with explicit rules that also allow the audit's
@@ -343,13 +343,13 @@ replace `access: read-only` with explicit rules that also allow the audit's
 Verify that a scoped package lookup succeeds:
 
 ```shell
-openshell sandbox exec -n my-sandbox --no-login-shell -- \
+ryno sandbox exec -n my-sandbox --no-login-shell -- \
   /usr/bin/npm view @types/node version
 ```
 
 ### Restrict Destination Addresses
 
-OpenShell blocks connections to private network addresses by default to prevent
+Ryno blocks connections to private network addresses by default to prevent
 server-side request forgery (SSRF). An endpoint with an exact hostname can still
 reach the private addresses that its hostname resolves to, unless the endpoint
 comes from an approved [policy advisor](/how-it-works/policies/advisor)
@@ -367,7 +367,7 @@ allows read-only access to an internal API only at addresses in `10.20.0.0/16`:
 <Tab title="CLI">
 
 ```shell
-openshell policy update my-sandbox \
+ryno policy update my-sandbox \
   --rule-name internal_api \
   --binary /usr/bin/curl \
   --add-endpoint 'api.internal.example:443:read-only:rest:enforce:allowed-ip=10.20.0.0/16' \
@@ -435,15 +435,15 @@ Use your Node client to test a successful upgrade and text message on
 `/v1/realtime`, and a denied upgrade or message on `/v1/admin/**`. The path on a
 `WEBSOCKET_TEXT` rule is the original upgrade path, not text-frame content.
 
-OpenShell inspects complete client text messages. It does not inspect binary
+Ryno inspects complete client text messages. It does not inspect binary
 frames or messages from the server. If the endpoint carries provider
-credentials, OpenShell closes the connection with close code `1008` when the
+credentials, Ryno closes the connection with close code `1008` when the
 client sends a binary frame, because it cannot check the frame for credentials.
 Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
 `websocket_credential_rewrite: true` only when client text messages contain
-OpenShell credential placeholders that must be resolved.
+Ryno credential placeholders that must be resolved.
 
-When new network rules take effect, OpenShell closes open WebSocket connections,
+When new network rules take effect, Ryno closes open WebSocket connections,
 so the client must reconnect. The client might receive close code `1012`, or the
 connection might close without a close frame.
 
@@ -479,7 +479,7 @@ github_api:
     - path: /usr/bin/gh
 ```
 
-OpenShell selects the endpoint whose `path` most specifically matches the
+Ryno selects the endpoint whose `path` most specifically matches the
 request, so requests to `/graphql` use the GraphQL rules and all other paths use
 the REST rules. An endpoint without `path` matches all paths. Endpoints that
 share a host and port must agree on `tls` and `allowed_ips`.
@@ -494,7 +494,7 @@ GraphQL endpoints refuse requests that carry an `Upgrade` header with `403 Forbi
 
 With a GitHub provider attached, verify a REST read with `gh api zen` and a
 query with `gh api graphql -f query='{ viewer { login } }'`, then confirm that a
-mutation other than `createIssue` returns an OpenShell denial.
+mutation other than `createIssue` returns an Ryno denial.
 
 ### Allow MCP Tools
 
@@ -539,7 +539,7 @@ described in [MCP Version
 Selection](/how-it-works/policies/schema#mcp-version-selection). Server
 responses and SSE messages are relayed without MCP policy parsing. Do not put an
 MCP endpoint on the same host and port as an endpoint that uses a different
-protocol. `openshell policy update` rejects this combination.
+protocol. `ryno policy update` rejects this combination.
 
 A server that uses the sessionless `2026-07-28` revision has no initialization
 step. Its clients send their protocol version and capabilities with every
@@ -568,16 +568,16 @@ mcp_server:
     - path: /usr/bin/python3.12
 ```
 
-OpenShell rejects a `2026-07-28` request that lacks a required
+Ryno rejects a `2026-07-28` request that lacks a required
 `MCP-Protocol-Version`, `Mcp-Method`, or `Mcp-Name` header, or whose headers do
 not match its body. Refer to [Sessionless MCP
 Requests](/how-it-works/policies/schema#sessionless-mcp-requests) for the
 complete request checks. To serve clients of both revisions on one endpoint,
-list both revisions and combine the rules from the two examples. OpenShell
+list both revisions and combine the rules from the two examples. Ryno
 inspects each request under the revision that the request selects.
 
 MCP and JSON-RPC endpoints carry only HTTP requests, because their rules apply
-to each request. OpenShell answers a request to these endpoints that carries an
+to each request. Ryno answers a request to these endpoints that carries an
 `Upgrade` header, such as a WebSocket upgrade, with `403 Forbidden` before it
 reaches the server, in both `enforce` and `audit` mode. If the server also
 accepts WebSocket connections, allow them with a separate
@@ -589,7 +589,7 @@ WebSocket endpoint that uses a different `path`.
 ### Allow Native TCP
 
 Use `protocol: tcp` for a client that speaks a protocol other than HTTP, such
-as a database client. OpenShell checks the hostname, port, and executable but
+as a database client. Ryno checks the hostname, port, and executable but
 applies no request rules, so prefer an inspected protocol whenever the client
 supports one.
 
@@ -601,7 +601,7 @@ glob:
 <Tab title="CLI">
 
 ```shell
-openshell policy update my-sandbox \
+ryno policy update my-sandbox \
   --rule-name postgres \
   --binary '/usr/lib/postgresql/*/bin/psql' \
   --add-endpoint db.internal.example:5432::tcp \
@@ -631,10 +631,10 @@ command that fails before application authentication when the rule is absent. A
 database authentication error can show that the TCP connection reached the
 server, but it does not prove that database credentials are correct.
 
-OpenShell prepares DNS and TCP handling when the sandbox starts, so you can add
+Ryno prepares DNS and TCP handling when the sandbox starts, so you can add
 a TCP endpoint to a running sandbox without recreating it.
 
-Set `tls: skip` so that OpenShell relays the connection without examining it
+Set `tls: skip` so that Ryno relays the connection without examining it
 when the client starts TLS as soon as it connects, when the client must complete
 TLS itself, for example to present a client certificate, or when the server
 sends first, as with SMTP, IMAP, and MySQL. Clients that send first and
@@ -644,15 +644,15 @@ negotiate TLS within their protocol, such as `psql`, do not need it. Refer to
 Prefer exact hostnames. A wildcard authorizes DNS queries for every matching
 name, which can expose a DNS-label exfiltration channel. An allowed hostname on
 shared infrastructure can also reach other tenants or virtual services behind
-the same connection, because OpenShell cannot check which service a non-HTTP
+the same connection, because Ryno cannot check which service a non-HTTP
 payload addresses.
 
-OpenShell answers DNS queries for the hosts in your rules with placeholder
+Ryno answers DNS queries for the hosts in your rules with placeholder
 addresses whose TTL is at most 30 seconds. This applies to every endpoint, not
 only `protocol: tcp`. The sandbox applies no DNS search domains, so request each
 hostname exactly as your rules name it. Clients must resolve the hostname again
 before reconnecting. A client that caches an address indefinitely can fail
-after it expires, even while the endpoint remains allowed. OpenShell returns an
+after it expires, even while the endpoint remains allowed. Ryno returns an
 empty answer to AAAA queries, so dual-stack clients must fall back to the A
 record.
 

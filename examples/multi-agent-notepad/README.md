@@ -3,7 +3,7 @@
 
 # Multi-Agent Shared Notepad Demo
 
-Run multiple Codex coding agents in parallel OpenShell sandboxes, with a
+Run multiple Codex coding agents in parallel Ryno sandboxes, with a
 GitHub repository as the durable shared notepad they coordinate through.
 
 ## Why GitHub as a shared notepad?
@@ -45,7 +45,7 @@ runs/<run-id>/summary.md         ← synthesis agent writes
 Each worker gets a different research angle on the same topic. Workers share
 neither filesystem nor container — only the GitHub repository.
 
-The demo also exercises two OpenShell features:
+The demo also exercises two Ryno features:
 
 - **Provider-backed credentials.** Sandboxes get placeholders, not the real
   Codex OAuth tokens or the GitHub token. The proxy resolves them at the
@@ -68,9 +68,9 @@ The demo also exercises two OpenShell features:
 
 ## Prerequisites
 
-- OpenShell CLI from current `main` (or set `OPENSHELL_BIN` to the binary
+- Ryno CLI from current `main` (or set `RYNO_BIN` to the binary
   path)
-- A running OpenShell gateway: `mise run gateway:docker` for local development
+- A running Ryno gateway: `mise run gateway:docker` for local development
 - Local Codex sign-in on the host: `codex login`
 - `gh` (GitHub CLI) signed in, **or** a GitHub PAT with `contents:write`
 - `jq` on the host
@@ -126,12 +126,12 @@ sandboxes after the run; temporary providers are still removed.
 ## How credential protection works
 
 The host script reads your local Codex sign-in and creates a temporary
-OpenShell provider for the OAuth tokens. It also creates a temporary
+Ryno provider for the OAuth tokens. It also creates a temporary
 provider for the GitHub token. Sandboxes receive provider placeholders, not
 the real credential values.
 
 When `codex` or `curl` inside a sandbox sends an authorized request, the
-OpenShell proxy resolves the placeholder at the network boundary and
+Ryno proxy resolves the placeholder at the network boundary and
 forwards the request upstream with the real credential. The credential
 values never sit in the sandbox filesystem.
 

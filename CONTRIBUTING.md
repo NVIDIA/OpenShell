@@ -1,6 +1,6 @@
-# Contributing to OpenShell
+# Contributing to Ryno
 
-OpenShell is built agent-first. We use agents to design and implement systems, while humans manage product decisions and the project roadmap.
+Ryno is built agent-first. We use agents to design and implement systems, while humans manage product decisions and the project roadmap.
 
 ## The Critical Rule
 
@@ -10,7 +10,7 @@ Submitting agent-generated code without understanding it — regardless of how c
 
 ## AI Usage
 
-OpenShell is agent-first, not agent-only. The distinction matters:
+Ryno is agent-first, not agent-only. The distinction matters:
 
 - **Do** use agents to explore the codebase, run diagnostics, generate code, and iterate on implementations.
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
@@ -22,7 +22,7 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 
 We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
 
-1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
+1. Open a [Vouch Request](https://github.com/NVIDIA/Ryno/discussions/new?category=vouch-request) discussion.
 2. Describe what you want to change and why.
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
@@ -33,7 +33,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 ### Finding Work
 
-Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/NVIDIA/Ryno/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 An open issue is not necessarily accepted or ready for implementation. Inspect the repository’s current `state:*` labels and ask a maintainer when its status is unclear. A direct user request authorizes an agent to perform the requested phase without changing the issue’s disposition.
 
@@ -41,25 +41,25 @@ An open issue is not necessarily accepted or ready for implementation. Inspect t
 
 Search open and closed issues for the same need. Bug reports and feature requests must include:
 
-1. **User Story:** attest that you personally use OpenShell and describe the specific use case and behavior you directly encountered or need. Agents must ask the human operator for this first-hand context before filing if it is missing.
+1. **User Story:** attest that you personally use Ryno and describe the specific use case and behavior you directly encountered or need. Agents must ask the human operator for this first-hand context before filing if it is missing.
 2. **Problem Statement:** a concise summary of what is broken or missing in the current behavior.
 3. **Impact / Why This Matters:** the consequences of the current behavior, the current workaround, and why that workaround is insufficient.
 4. **Acceptance Criteria:** specific, observable outcomes that define success.
 
-Feature requests must also propose a user-facing workflow and describe alternatives considered, including relevant OpenShell extension points. When an existing middleware, interceptor, provider, or other extension can satisfy the use case, prefer that path. Running another service alone is not grounds to dismiss it. For changes to configuration, CLI, SDK, or other user experience, include notional examples for human review. Bug reports must include reproduction steps using only an OpenShell deployment, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior. Do not install third-party tools solely to demonstrate reproducibility. Frame every issue entirely in terms of OpenShell.
+Feature requests must also propose a user-facing workflow and describe alternatives considered, including relevant Ryno extension points. When an existing middleware, interceptor, provider, or other extension can satisfy the use case, prefer that path. Running another service alone is not grounds to dismiss it. For changes to configuration, CLI, SDK, or other user experience, include notional examples for human review. Bug reports must include reproduction steps using only an Ryno deployment, the Ryno version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior. Do not install third-party tools solely to demonstrate reproducibility. Frame every issue entirely in terms of Ryno.
 
-The project includes optional [agent skills](#agent-skills) for using OpenShell and contributing to the repository. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
+The project includes optional [agent skills](#agent-skills) for using Ryno and contributing to the repository. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
 
 ### When to Open an Issue
 
 - A workflow behaves differently from what you need or reasonably expect.
-- OpenShell does not support an outcome that matters to your workflow.
+- Ryno does not support an outcome that matters to your workflow.
 - The available documentation or configuration does not explain how to complete a supported workflow.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
 ### When NOT to Open an Issue
 
-- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions).
+- General questions or open-ended discussion — use [GitHub Discussions](https://github.com/NVIDIA/Ryno/discussions).
 - Security vulnerabilities — follow [SECURITY.md](SECURITY.md) instead.
 
 ## Before You Submit a Change
@@ -70,20 +70,20 @@ Use agents and the repository skills as needed to understand the affected code, 
 
 ## Agent Skills
 
-OpenShell keeps skills for using the product separate from skills for developing the repository.
+Ryno keeps skills for using the product separate from skills for developing the repository.
 
-### Skills for Using OpenShell
+### Skills for Using Ryno
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an Ryno source checkout. Install them with `npx skills add NVIDIA/Ryno`.
 
 | Skill | Purpose |
 | --- | --- |
-| `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
-| `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
+| `ryno-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
+| `debug-ryno-cluster` | Diagnose gateway deployment and health issues |
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
-Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
+Public skills use `ryno --help` for installed command syntax and published Ryno documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
 ### Agent Skills for Contributors
 
@@ -100,12 +100,12 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
 | Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
-| Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
+| Reviewing       | `launch-ryno-gator`  | Launch and supervise Ryno gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
-| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
+| Platform        | `build-ryno-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
@@ -150,10 +150,10 @@ Project requirements:
 
 ### Z3 installation
 
-The `openshell-prover` crate and standalone `openshell-prover-cli` binary link
-directly against Z3. The `openshell-server` crate depends on the prover, and
-the `openshell-gateway` binary crate depends on `openshell-server` in turn.
-The `openshell-cli` crate does not depend on Z3. The Nix development shell
+The `ryno-prover` crate and standalone `ryno-prover-cli` binary link
+directly against Z3. The `ryno-server` crate depends on the prover, and
+the `ryno-gateway` binary crate depends on `ryno-server` in turn.
+The `ryno-cli` crate does not depend on Z3. The Nix development shell
 supplies Z3. For builds outside that shell on macOS and Linux, install the
 system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 The linker uses the installed static or shared library. The Nix development
@@ -174,8 +174,8 @@ To build Z3 from source instead, enable `vendored-z3` (requires CMake and a C++
 compiler):
 
 ```bash
-cargo build -p openshell-prover --features vendored-z3
-cargo build -p openshell-prover-cli --features vendored-z3
+cargo build -p ryno-prover --features vendored-z3
+cargo build -p ryno-prover-cli --features vendored-z3
 ```
 
 Local gateway image and E2E builds enable `vendored-z3` so their
@@ -195,17 +195,17 @@ For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
   The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
   is set.
 
-`openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
+`ryno-prover` itself has no `bindgen`/`libclang` dependency, so building
 just this crate does not require `LIBCLANG_PATH`:
 
 ```powershell
-cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
+cargo build -p ryno-prover --target x86_64-pc-windows-msvc --features prebuilt-z3
 ```
 
 ### Windows full build
 
-To build the full set of Windows binaries, including `openshell-gateway.exe`
-and `openshell.exe`, use the `windows:build:x64` mise task instead of a
+To build the full set of Windows binaries, including `ryno-gateway.exe`
+and `ryno.exe`, use the `windows:build:x64` mise task instead of a
 single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
 full build also compiles crates that use `bindgen` (e.g. the MXC driver on
 Windows), so it requires `libclang.dll`; if LLVM is not on the default search
@@ -243,37 +243,37 @@ mise trust
 mise run gateway
 ```
 
-## Building the `openshell` CLI
+## Building the `ryno` CLI
 
-Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
+Inside this repository, `ryno` is a local shortcut script at `scripts/bin/ryno`. The script will
 
-1. Build `openshell-cli` if needed.
-2. Run the local debug CLI binary under `target/debug/openshell`.
+1. Build `ryno-cli` if needed.
+2. Run the local debug CLI binary under `target/debug/ryno`.
 
-Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `openshell` directly from the repo.
+Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `ryno` directly from the repo.
 
 ```bash
-openshell --help
-openshell sandbox create -- codex
+ryno --help
+ryno sandbox create -- codex
 ```
 
 ### Rust build cache
 
 Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
-to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
+to store compiler cache entries. When `SCCACHE_DIR` is unset, Ryno uses
 the worktree-local `.cache/sccache` directory. To make cache entries available
 to multiple worktrees on a workstation, set the variable to a user-level
 directory before activating mise. For example:
 
 ```shell
-export SCCACHE_DIR="$HOME/.cache/openshell/sccache"
+export SCCACHE_DIR="$HOME/.cache/ryno/sccache"
 ```
 
 CI can select a different directory or configure a remote sccache backend
 without changing the workstation setting. Cargo output remains in each
 worktree's `target/` directory.
 
-OpenShell does not set `SCCACHE_BASEDIRS`. Sccache loads base directories when
+Ryno does not set `SCCACHE_BASEDIRS`. Sccache loads base directories when
 its machine-local daemon starts, but the correct workspace root differs for
 each worktree. Cache reuse therefore depends on the compiler inputs: outputs
 that embed absolute paths, including Rust dependencies in some builds, can
@@ -299,8 +299,8 @@ These are the primary `mise` tasks for day-to-day development:
 | Path            | Purpose                                       |
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
-| `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
-| `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
+| `crates/ryno-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/ryno-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
@@ -311,7 +311,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `fern/`         | Fern site config, components, and theme assets |
 | `plans/`        | Local plans (git-ignored)                     |
 | `rfc/`          | Request for Comments proposals                |
-| `skills/`       | Public skills for using and operating OpenShell |
+| `skills/`       | Public skills for using and operating Ryno |
 | `.agents/`      | Contributor skills and persona definitions    |
 
 ## RFCs
@@ -396,7 +396,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 **Examples:**
 
 ```text
-feat(cli): add --verbose flag to openshell run
+feat(cli): add --verbose flag to ryno run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
 chore(deps): bump tokio to 1.40

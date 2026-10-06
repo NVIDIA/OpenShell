@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Protobuf API conventions
 
-This directory defines OpenShell's gRPC contracts. These conventions are the
+This directory defines Ryno's gRPC contracts. These conventions are the
 source of truth for public protobuf API design. Apply them to new APIs and when
 changing existing APIs; generated SDK naming follows from these definitions.
 
@@ -26,12 +26,12 @@ For example:
 
 ```proto
 message GetSandboxRequest {
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  ryno.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string name = 1;
 }
 
 message ExposeServiceRequest {
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  ryno.datamodel.v1.WorkspaceSelector workspace_scope = 5;
   string sandbox = 1;
   string name = 2;
 }
@@ -47,7 +47,7 @@ identifies the service being exposed.
   other field. Existing wire field numbers do not need to follow declaration
   order.
 - Type `workspace_scope` as
-  `openshell.datamodel.v1.WorkspaceSelector`.
+  `ryno.datamodel.v1.WorkspaceSelector`.
 - Requests operating in one workspace require a non-empty canonical
   `WorkspaceSelector.workspace`. The `default` workspace is an explicit name,
   not an omitted-value fallback.
@@ -81,7 +81,7 @@ identifies the service being exposed.
   not reuse either for a different meaning.
 - Review changes against both the public descriptor closure and durable stored
   protobuf closure. The `public_and_durable_schema_inventories_are_complete`
-  test in `openshell-server` owns both inventories.
+  test in `ryno-server` owns both inventories.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.

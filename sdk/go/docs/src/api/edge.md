@@ -1,8 +1,8 @@
 # Edge
 
-Package: `openshell/v1/edge`
+Package: `ryno/v1/edge`
 
-The edge package provides utilities for connecting to OpenShell gateways
+The edge package provides utilities for connecting to Ryno gateways
 through edge proxies such as Cloudflare Access. It includes auth wrappers
 for edge proxy headers and a WebSocket tunnel proxy for gRPC transport
 through HTTP/1.1-only proxies.
@@ -13,7 +13,7 @@ Wrap any `AuthProvider` with Cloudflare Access headers
 (`cf-access-jwt-assertion` and `CF_Authorization` cookie):
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/edge"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/edge"
 
 base := v1.StaticToken("my-gateway-token")
 auth, err := edge.CloudflareAccess(base, os.Getenv("CF_ACCESS_TOKEN"))

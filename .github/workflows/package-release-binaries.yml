@@ -24,53 +24,53 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact: openshell-x86_64-unknown-linux-musl
-            binary: openshell
+          - artifact: ryno-x86_64-unknown-linux-musl
+            binary: ryno
             package: cli-linux-amd64
-          - artifact: openshell-aarch64-unknown-linux-musl
-            binary: openshell
+          - artifact: ryno-aarch64-unknown-linux-musl
+            binary: ryno
             package: cli-linux-arm64
-          - artifact: openshell-aarch64-apple-darwin
-            binary: openshell
+          - artifact: ryno-aarch64-apple-darwin
+            binary: ryno
             package: cli-macos
-          - artifact: openshell-gateway-x86_64-unknown-linux-gnu
-            binary: openshell-gateway
+          - artifact: ryno-gateway-x86_64-unknown-linux-gnu
+            binary: ryno-gateway
             package: gateway-binary-linux-amd64
-          - artifact: openshell-gateway-aarch64-unknown-linux-gnu
-            binary: openshell-gateway
+          - artifact: ryno-gateway-aarch64-unknown-linux-gnu
+            binary: ryno-gateway
             package: gateway-binary-linux-arm64
-          - artifact: openshell-gateway-aarch64-apple-darwin
-            binary: openshell-gateway
+          - artifact: ryno-gateway-aarch64-apple-darwin
+            binary: ryno-gateway
             package: gateway-binary-macos
-          - artifact: openshell-sandbox-x86_64-unknown-linux-musl
-            binary: openshell-sandbox
+          - artifact: ryno-sandbox-x86_64-unknown-linux-musl
+            binary: ryno-sandbox
             package: sandbox-binary-linux-amd64
-          - artifact: openshell-sandbox-aarch64-unknown-linux-musl
-            binary: openshell-sandbox
+          - artifact: ryno-sandbox-aarch64-unknown-linux-musl
+            binary: ryno-sandbox
             package: sandbox-binary-linux-arm64
-          - artifact: openshell-supervisor-x86_64-unknown-linux-gnu
-            binary: openshell-supervisor
+          - artifact: ryno-supervisor-x86_64-unknown-linux-gnu
+            binary: ryno-supervisor
             package: supervisor-binary-linux-amd64
-          - artifact: openshell-supervisor-aarch64-unknown-linux-gnu
-            binary: openshell-supervisor
+          - artifact: ryno-supervisor-aarch64-unknown-linux-gnu
+            binary: ryno-supervisor
             package: supervisor-binary-linux-arm64
-          - artifact: openshell-driver-vm-x86_64-unknown-linux-gnu
-            binary: openshell-driver-vm
+          - artifact: ryno-driver-vm-x86_64-unknown-linux-gnu
+            binary: ryno-driver-vm
             package: driver-vm-linux-amd64
-          - artifact: openshell-driver-vm-aarch64-unknown-linux-gnu
-            binary: openshell-driver-vm
+          - artifact: ryno-driver-vm-aarch64-unknown-linux-gnu
+            binary: ryno-driver-vm
             package: driver-vm-linux-arm64
-          - artifact: openshell-driver-vm-aarch64-apple-darwin
-            binary: openshell-driver-vm
+          - artifact: ryno-driver-vm-aarch64-apple-darwin
+            binary: ryno-driver-vm
             package: driver-vm-macos
-          - artifact: openshell-prover-x86_64-unknown-linux-musl
-            binary: openshell-prover
+          - artifact: ryno-prover-x86_64-unknown-linux-musl
+            binary: ryno-prover
             package: prover-binary-linux-amd64
-          - artifact: openshell-prover-aarch64-unknown-linux-musl
-            binary: openshell-prover
+          - artifact: ryno-prover-aarch64-unknown-linux-musl
+            binary: ryno-prover
             package: prover-binary-linux-arm64
-          - artifact: openshell-prover-aarch64-apple-darwin
-            binary: openshell-prover
+          - artifact: ryno-prover-aarch64-apple-darwin
+            binary: ryno-prover
             package: prover-binary-macos
     steps:
       - name: Download ${{ matrix.artifact }}
@@ -131,27 +131,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir extracted
-          tar -xzf "package/openshell-prover-${TRIPLE}.tar.gz" -C extracted
+          tar -xzf "package/ryno-prover-${TRIPLE}.tar.gz" -C extracted
           test "$(find extracted -type f | wc -l | tr -d ' ')" = 1
-          test -x extracted/openshell-prover
+          test -x extracted/ryno-prover
           if [ "${RUNNER_OS}" = "Linux" ]; then
-            tasks/scripts/verify-static-binary.sh extracted/openshell-prover
+            tasks/scripts/verify-static-binary.sh extracted/ryno-prover
           else
-            otool -L extracted/openshell-prover | tee linkage.txt
+            otool -L extracted/ryno-prover | tee linkage.txt
             if grep -Eiq 'libz3|/nix/store' linkage.txt; then
               echo "ERROR: packaged prover has a non-portable native dependency" >&2
               exit 1
             fi
           fi
-          extracted/openshell-prover check \
-            crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
-            --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \
+          extracted/ryno-prover check \
+            crates/ryno-prover-cli/tests/fixtures/candidate-contained.yaml \
+            --boundary crates/ryno-prover-cli/tests/fixtures/boundary.yaml \
             --output json > result.json
           grep -q '"result"[[:space:]]*:[[:space:]]*"within_boundary"' result.json
 
-          if extracted/openshell-prover check \
-            crates/openshell-prover-cli/tests/fixtures/candidate-underscore-host.yaml \
-            --boundary crates/openshell-prover-cli/tests/fixtures/boundary-empty.yaml \
+          if extracted/ryno-prover check \
+            crates/ryno-prover-cli/tests/fixtures/candidate-underscore-host.yaml \
+            --boundary crates/ryno-prover-cli/tests/fixtures/boundary-empty.yaml \
             --output json > underscore.json; then
             echo "ERROR: underscore host unexpectedly stayed within an empty boundary" >&2
             exit 1
@@ -161,9 +161,9 @@ jobs:
           grep -q '"result"[[:space:]]*:[[:space:]]*"exceeds_boundary"' underscore.json
           grep -q '"host"[[:space:]]*:[[:space:]]*"api_internal.example.com"' underscore.json
 
-          if extracted/openshell-prover check \
-            crates/openshell-prover-cli/tests/fixtures/candidate-unicode-network-selector.yaml \
-            --boundary crates/openshell-prover-cli/tests/fixtures/boundary-empty.yaml \
+          if extracted/ryno-prover check \
+            crates/ryno-prover-cli/tests/fixtures/candidate-unicode-network-selector.yaml \
+            --boundary crates/ryno-prover-cli/tests/fixtures/boundary-empty.yaml \
             --output json > unicode.json; then
             echo "ERROR: non-ASCII network selector unexpectedly produced a definitive result" >&2
             exit 1
@@ -190,14 +190,14 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum openshell-prover-*.tar.gz > openshell-prover-checksums-sha256.txt
-          test "$(awk 'END { print NR }' openshell-prover-checksums-sha256.txt)" = 3
-          sha256sum --check openshell-prover-checksums-sha256.txt
+          sha256sum ryno-prover-*.tar.gz > ryno-prover-checksums-sha256.txt
+          test "$(awk 'END { print NR }' ryno-prover-checksums-sha256.txt)" = 3
+          sha256sum --check ryno-prover-checksums-sha256.txt
 
       - name: Upload prover checksums
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: prover-checksums
-          path: release/openshell-prover-checksums-sha256.txt
+          path: release/ryno-prover-checksums-sha256.txt
           retention-days: 5
           if-no-files-found: error

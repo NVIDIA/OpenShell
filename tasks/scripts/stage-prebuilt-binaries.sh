@@ -106,18 +106,18 @@ components_for_target() {
 resolve_component() {
   case "$1" in
     gateway)
-      crate=openshell-gateway
-      binary=openshell-gateway
+      crate=ryno-gateway
+      binary=ryno-gateway
       target_libc=gnu
       ;;
     sandbox)
-      crate=openshell-sandbox
-      binary=openshell-sandbox
+      crate=ryno-sandbox
+      binary=ryno-sandbox
       target_libc=musl
       ;;
     supervisor)
-      crate=openshell-supervisor
-      binary=openshell-supervisor
+      crate=ryno-supervisor
+      binary=ryno-supervisor
       target_libc=gnu
       ;;
     *)
@@ -128,7 +128,7 @@ resolve_component() {
 }
 
 patch_workspace_version() {
-  if [[ -z "${OPENSHELL_CARGO_VERSION:-}" ]]; then
+  if [[ -z "${RYNO_CARGO_VERSION:-}" ]]; then
     return
   fi
 
@@ -136,7 +136,7 @@ patch_workspace_version() {
   cargo_toml_backup="$(mktemp)"
   cp "$cargo_toml" "$cargo_toml_backup"
   restore_cargo_toml=1
-  sed -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' \
+  sed -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${RYNO_CARGO_VERSION}"'"/}' \
     "$cargo_toml" >"${cargo_toml}.updated"
   mv "${cargo_toml}.updated" "$cargo_toml"
 }
@@ -199,7 +199,7 @@ build_component_for_arch() {
     fi
   fi
 
-  if [[ "${OPENSHELL_AUDITABLE:-0}" == "1" ]]; then
+  if [[ "${RYNO_AUDITABLE:-0}" == "1" ]]; then
     cargo_subcommand=("${cargo_subcommand[0]}" auditable "${cargo_subcommand[@]:1}")
     # mise.toml injects RUSTC_WRAPPER=sccache. Unset it after mise constructs
     # the environment so it cannot wrap cargo-auditable's workspace wrapper.
@@ -224,7 +224,7 @@ build_component_for_arch() {
     if [[ "$target_libc" == "gnu" ]]; then
       eval "$("$SCRIPT_DIR/setup-zig-cc-wrapper.sh" "$build_target" "$build_target" "$ROOT/target/zig-gnu-wrapper/$arch")"
     fi
-    if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
+    if [[ -n "${RYNO_CARGO_VERSION:-}" ]]; then
       export GIT_DIR=/nonexistent
     fi
     if [[ -n "$build_rustflags" ]]; then
@@ -255,10 +255,10 @@ if [[ "$#" -gt 0 ]]; then
   exit 1
 fi
 
-case "${OPENSHELL_AUDITABLE:-0}" in
+case "${RYNO_AUDITABLE:-0}" in
   0|1) ;;
   *)
-    echo "unsupported OPENSHELL_AUDITABLE: ${OPENSHELL_AUDITABLE} (expected 0 or 1)" >&2
+    echo "unsupported RYNO_AUDITABLE: ${RYNO_AUDITABLE} (expected 0 or 1)" >&2
     exit 1
     ;;
 esac

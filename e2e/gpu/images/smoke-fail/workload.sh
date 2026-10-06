@@ -5,5 +5,5 @@
 
 set -euo pipefail
 
-echo "OPENSHELL_GPU_WORKLOAD_FAILURE smoke-fail intentional failure" >&2
+echo "RYNO_GPU_WORKLOAD_FAILURE smoke-fail intentional failure" >&2
 exit 42

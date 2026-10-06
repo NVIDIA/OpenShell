@@ -1057,110 +1057,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-core"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "base64",
- "glob",
- "ipnet",
- "miette",
- "nix",
- "openshell-extension-core",
- "openshell-policy-schema",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "rustix",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tonic-types",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "openshell-extension-core"
-version = "0.0.0"
-dependencies = [
- "hyper-util",
- "serde",
- "thiserror",
- "tokio",
- "tonic",
- "tower",
-]
-
-[[package]]
-name = "openshell-governance-interceptor-example"
-version = "0.0.0"
-dependencies = [
- "jsonwebtoken",
- "noyalib",
- "openshell-core",
- "openshell-policy",
- "openshell-providers",
- "prost",
- "prost-reflect",
- "prost-types",
- "rcgen",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tonic",
-]
-
-[[package]]
-name = "openshell-policy"
-version = "0.0.0"
-dependencies = [
- "hickory-proto",
- "miette",
- "openshell-core",
- "openshell-policy-schema",
- "prost-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "openshell-policy-schema"
-version = "0.0.0"
-dependencies = [
- "miette",
- "noyalib",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "openshell-providers"
-version = "0.0.0"
-dependencies = [
- "glob",
- "noyalib",
- "openshell-core",
- "openshell-policy",
- "prost-types",
- "serde",
- "serde_json",
- "thiserror",
- "url",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1655,6 +1551,110 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryno-core"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "glob",
+ "ipnet",
+ "miette",
+ "nix",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rustix",
+ "rustls",
+ "rustls-pemfile",
+ "ryno-extension-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tonic-types",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "ryno-extension-core"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower",
+]
+
+[[package]]
+name = "ryno-governance-interceptor-example"
+version = "0.0.0"
+dependencies = [
+ "jsonwebtoken",
+ "noyalib",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "rcgen",
+ "ryno-core",
+ "ryno-policy",
+ "ryno-providers",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "ryno-policy"
+version = "0.0.0"
+dependencies = [
+ "hickory-proto",
+ "miette",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ryno-policy-schema"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "noyalib",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "ryno-providers"
+version = "0.0.0"
+dependencies = [
+ "glob",
+ "noyalib",
+ "prost-types",
+ "ryno-core",
+ "ryno-policy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
+]
 
 [[package]]
 name = "same-file"

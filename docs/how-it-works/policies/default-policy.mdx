@@ -3,21 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Default Policy and Baseline Paths"
 sidebar-title: "Default Policy"
-description: "The restrictive fallback policy used when a sandbox has no explicit or embedded policy, and the baseline paths OpenShell adds to sandbox policies."
+description: "The restrictive fallback policy used when a sandbox has no explicit or embedded policy, and the baseline paths Ryno adds to sandbox policies."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy, Landlock, Filesystem"
 position: 6
 ---
 
-This reference describes the restrictive policy OpenShell uses when a sandbox
-has no other policy, and the filesystem paths that OpenShell adds to sandbox
+This reference describes the restrictive policy Ryno uses when a sandbox
+has no other policy, and the filesystem paths that Ryno adds to sandbox
 policies at runtime.
 
 ## When the Default Applies
 
-OpenShell uses the restrictive default only when no global policy is active, the
+Ryno uses the restrictive default only when no global policy is active, the
 sandbox has no saved policy, and its image contains no policy. Creating a
 sandbox without `--policy` does not by itself mean the default is active,
-because the image or `OPENSHELL_SANDBOX_POLICY` can supply one. An invalid image
+because the image or `RYNO_SANDBOX_POLICY` can supply one. An invalid image
 policy keeps the workload from starting until you repair it. It does not select
 the default. Refer to [Where the Active Policy Comes
 From](/how-it-works/policies/overview#where-the-active-policy-comes-from) for
@@ -59,7 +59,7 @@ configured for their driver.
 
 Sandbox processes that use the network need system paths for shared libraries,
 DNS resolution, and CA certificates. When the effective policy contains at least
-one network rule, including a provider-contributed rule, OpenShell adds these
+one network rule, including a provider-contributed rule, Ryno adds these
 baseline paths to the sandbox's filesystem policy at startup:
 
 | Access | Paths |
@@ -67,22 +67,22 @@ baseline paths to the sandbox's filesystem policy at startup:
 | Read-only | `/usr`, `/lib`, `/etc`, `/app`, `/var/log`, `/proc`, `/dev/urandom` |
 | Read-write | `/tmp`, `/dev/null` |
 
-OpenShell adds a baseline path only when it is available and your policy does
+Ryno adds a baseline path only when it is available and your policy does
 not already list it, so list the paths your workload needs, such as `/app`, in
-your policy. OpenShell never changes the access of a path you list, so a
+your policy. Ryno never changes the access of a path you list, so a
 baseline read-write path that you list as read-only stays read-only. If the
-policy has no `filesystem_policy` section, OpenShell creates one with
+policy has no `filesystem_policy` section, Ryno creates one with
 `include_workdir: true`.
 
 The sandbox saves the enriched filesystem policy as a new revision, so the
-added paths appear in `openshell policy get --base`. While a global policy is
+added paths appear in `ryno policy get --base`. While a global policy is
 active, the sandbox adds the paths without saving a revision, so they do not
-appear in the policy views. OpenShell can reject a
+appear in the policy views. Ryno can reject a
 replacement policy that removes filesystem paths, so keep the added paths when
 you replace the complete policy.
 
 The runtime also grants the workload read-only access to the sandbox's TLS CA
-certificates under `/run/openshell-supervisor-ca`. This grant is not saved in
+certificates under `/run/ryno-supervisor-ca`. This grant is not saved in
 the sandbox's policy.
 
 ### GPU Sandboxes
@@ -96,16 +96,16 @@ additional paths when the corresponding GPU device is present:
 | Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes, and `/proc` |
 
 CUDA writes thread names under `/proc` during initialization, so GPU enrichment
-moves `/proc` from read-only to read-write. OpenShell adds each path only when
+moves `/proc` from read-only to read-write. Ryno adds each path only when
 it exists in the workload. These paths apply at runtime and are not saved in
 the sandbox's policy.
 
 ### Protected Paths
 
 On Docker, Podman, Kubernetes, and VM sandboxes, a mandatory Landlock baseline
-protects the private `/.openshell` directory and requires Landlock ABI v3. Your
+protects the private `/.ryno` directory and requires Landlock ABI v3. Your
 filesystem policy is applied on top of that baseline and can narrow access, but
-it cannot expose `/.openshell`. The `best_effort` compatibility setting does not
+it cannot expose `/.ryno`. The `best_effort` compatibility setting does not
 disable this protection or allow a kernel without ABI v3.
 
 ## Inspect the Selected Policy
@@ -114,11 +114,11 @@ To see which policy a sandbox uses, print its base and effective policies.
 While a global policy is active, both commands show the global policy:
 
 ```shell
-openshell policy get <sandbox> --base
-openshell policy get <sandbox> --full
+ryno policy get <sandbox> --base
+ryno policy get <sandbox> --full
 ```
 
-Neither view includes the paths that OpenShell grants only at runtime, such as
+Neither view includes the paths that Ryno grants only at runtime, such as
 the CA certificate and GPU paths. To confirm what a running sandbox enforces,
-check the revision status with `openshell policy list <sandbox>` and test
+check the revision status with `ryno policy list <sandbox>` and test
 requests.

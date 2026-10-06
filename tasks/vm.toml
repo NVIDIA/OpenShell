@@ -6,11 +6,11 @@
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
 #   mise run vm:supervisor     # build the bundled sandbox supervisor
-#   mise run gateway:vm        # start openshell-gateway with the VM driver
+#   mise run gateway:vm        # start ryno-gateway with the VM driver
 #                              # (defined in tasks/gateway.toml)
 #
 # See tasks/gateway.toml for `gateway:vm`,
-# crates/openshell-driver-vm/README.md for the VM driver workflow.
+# crates/ryno-driver-vm/README.md for the VM driver workflow.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Commands
@@ -21,7 +21,7 @@ description = "One-time setup: download (or build) the VM driver runtime"
 run = "tasks/scripts/vm/vm-setup.sh"
 
 ["vm:supervisor"]
-description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
+description = "Build the bundled ryno-sandbox supervisor for ryno-driver-vm"
 run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 
 ["vm:smoke:orphan-cleanup"]

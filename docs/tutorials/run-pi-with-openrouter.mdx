@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Run Pi with OpenRouter"
-description: "Build a Pi coding-agent image, configure OpenRouter access, and run Pi inside an OpenShell sandbox."
+description: "Build a Pi coding-agent image, configure OpenRouter access, and run Pi inside an Ryno sandbox."
 keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, OpenRouter, Sandbox, Provider Profile"
 ---
 
 In this tutorial, we'll run [Pi](https://pi.dev), a terminal coding agent,
-inside an OpenShell sandbox. Pi works with many model providers out of the box,
+inside an Ryno sandbox. Pi works with many model providers out of the box,
 including [OpenRouter](https://openrouter.ai), which we use here.
 
 We'll build a Pi image, give the sandbox access to OpenRouter, and start Pi.
@@ -18,7 +18,7 @@ never sees your real API key.
 
 You'll need:
 
-- A working OpenShell installation with an active gateway. Refer to
+- A working Ryno installation with an active gateway. Refer to
   [Installation](/about/installation).
 - Docker or Podman to build the image.
 - An OpenRouter API key.
@@ -76,7 +76,7 @@ use that image reference with `--from`.
 
 A sandbox has no network access until you grant it. To let Pi reach
 OpenRouter, we'll create a provider, which stores your API key and opens access
-to the service. Pi only ever sees a placeholder for the key. OpenShell swaps in
+to the service. Pi only ever sees a placeholder for the key. Ryno swaps in
 the real key only when Pi calls OpenRouter.
 
 A provider is built from a provider profile, which describes the service. Save
@@ -117,7 +117,7 @@ Here's what the main sections do:
 
 - `credentials` declares the API key. Pi finds the placeholder in
   `OPENROUTER_API_KEY`.
-- `endpoints` allows only `openrouter.ai`, and OpenShell sends the key nowhere
+- `endpoints` allows only `openrouter.ai`, and Ryno sends the key nowhere
   else.
 - `binaries` allows only `node` to use this access. Pi runs on Node.js, so
   that includes Pi.
@@ -125,11 +125,11 @@ Here's what the main sections do:
 Check the profile, import it, and create a provider named `openrouter`:
 
 ```shell
-openshell profile lint -f provider-openrouter.yaml
-openshell profile import -f provider-openrouter.yaml
+ryno profile lint -f provider-openrouter.yaml
+ryno profile import -f provider-openrouter.yaml
 
 OPENROUTER_API_KEY=your-key \
-  openshell provider create \
+  ryno provider create \
     --name openrouter \
     --type openrouter \
     --from-existing
@@ -137,14 +137,14 @@ OPENROUTER_API_KEY=your-key \
 
 Replace `your-key` with your OpenRouter API key, or drop that prefix if
 `OPENROUTER_API_KEY` is already set in your shell. `--from-existing` tells
-OpenShell to read the key from that variable.
+Ryno to read the key from that variable.
 
 ## Start Pi in a Sandbox
 
 Next, create a sandbox from the image, attach the provider, and start Pi:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name pi \
   --from pi-agent:local \
   --provider openrouter \
@@ -173,13 +173,13 @@ While Pi is running, open another terminal and take a look at the sandbox's
 status, access, providers, and logs:
 
 ```shell
-openshell sandbox list
-openshell policy get pi --full
-openshell sandbox provider list pi
-openshell logs pi --tail
+ryno sandbox list
+ryno policy get pi --full
+ryno sandbox provider list pi
+ryno logs pi --tail
 ```
 
-`openshell logs` streams the sandbox's activity, including any connections it
+`ryno logs` streams the sandbox's activity, including any connections it
 blocks. When you're done, type `/quit` in Pi to exit.
 
 ## Work on a Local Project
@@ -189,7 +189,7 @@ copies the directory into the sandbox before Pi starts, skipping anything
 `.gitignore` excludes.
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name pi-project \
   --from pi-agent:local \
   --provider openrouter \
@@ -198,7 +198,7 @@ openshell sandbox create \
 ```
 
 Pi's changes stay inside the sandbox. To copy them back, run
-`openshell sandbox download` from another terminal while Pi is still running.
+`ryno sandbox download` from another terminal while Pi is still running.
 Refer to [Transfer Files](/how-it-works/sandboxes/overview#transfer-files).
 
 ## Clean Up
@@ -206,7 +206,7 @@ Refer to [Transfer Files](/how-it-works/sandboxes/overview#transfer-files).
 When you're finished, delete both sandboxes:
 
 ```shell
-openshell sandbox delete pi pi-project
+ryno sandbox delete pi pi-project
 ```
 
 </Steps>
@@ -226,7 +226,7 @@ openshell sandbox delete pi pi-project
   registries, source hosts, or other services, grant access with a
   [sandbox policy](/how-it-works/policies/overview).
 - To use a different model service, write a provider profile for it. The
-  [`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers)
+  [`providers/`](https://github.com/NVIDIA/Ryno/tree/main/providers)
   directory has examples, and [Profiles](/how-it-works/providers/profiles)
   describes each field.
 - To learn about images, resources, file transfer, and the sandbox lifecycle,

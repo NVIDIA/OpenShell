@@ -6,7 +6,7 @@ import { timestampFromDate } from '@bufbuild/protobuf/wkt';
 import { createRouterTransport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
 import { SandboxClient } from './index.js';
-import { EndpointResult, type EndpointStatusSchema, OpenShell, SandboxPhase } from './raw.js';
+import { EndpointResult, type EndpointStatusSchema, Ryno, SandboxPhase } from './raw.js';
 
 describe('raw sandbox endpoint status', () => {
   it.each([true, false])(
@@ -23,7 +23,7 @@ describe('raw sandbox endpoint status', () => {
       const sandbox = new SandboxClient(
         createRouterTransport(
           (router) => {
-            router.service(OpenShell, {
+            router.service(Ryno, {
               getSandbox: (request) => {
                 expect(request.name).toBe('tool-sandbox');
                 expect(request.workspaceScope?.selection.value).toBe('tool-workspace');

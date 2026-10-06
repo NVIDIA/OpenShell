@@ -37,7 +37,7 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
     $TargetDir = Join-Path $RepoRoot "target"
 }
 
-$BuildJobsValue = $env:OPENSHELL_WINDOWS_BUILD_JOBS
+$BuildJobsValue = $env:RYNO_WINDOWS_BUILD_JOBS
 if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
     $BuildJobsValue = $env:CARGO_BUILD_JOBS
 }
@@ -46,15 +46,15 @@ if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
 }
 [int] $WindowsBuildJobs = 0
 if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsBuildJobs -lt 1) {
-    throw "OPENSHELL_WINDOWS_BUILD_JOBS or CARGO_BUILD_JOBS must be a positive integer."
+    throw "RYNO_WINDOWS_BUILD_JOBS or CARGO_BUILD_JOBS must be a positive integer."
 }
-$WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
+$WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\RynoWindowsMsvcCargo")
 
-$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-supervisor --exclude openshell-supervisor-process --exclude openshell-vfio"
+$UnsupportedDriverPackageExcludes = "--exclude ryno-driver-docker --exclude ryno-driver-kubernetes --exclude ryno-driver-kubernetes-secrets --exclude ryno-driver-podman --exclude ryno-driver-vault --exclude ryno-driver-vm --exclude ryno-sandbox --exclude ryno-supervisor --exclude ryno-supervisor-process --exclude ryno-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
-$PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
-$PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
+$PrebuiltZ3WorkspaceFeatures = "--features ryno-prover/prebuilt-z3"
+$PrebuiltZ3ServerFeatures = "--features ryno-server/prebuilt-z3,ryno-prover/prebuilt-z3"
 $PrebuiltZ3Version = "5.1.0"
 $Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
 $Z3ServerFeatures = $PrebuiltZ3ServerFeatures
@@ -153,8 +153,8 @@ function Test-VsInstanceSupportsTarget([string] $VsInstallRoot, [string] $RustTa
 }
 
 function Resolve-VsDevCmd([string] $RustTarget) {
-    if ($env:OPENSHELL_VSDEVCMD -and (Test-Path $env:OPENSHELL_VSDEVCMD)) {
-        return (Resolve-Path $env:OPENSHELL_VSDEVCMD).Path
+    if ($env:RYNO_VSDEVCMD -and (Test-Path $env:RYNO_VSDEVCMD)) {
+        return (Resolve-Path $env:RYNO_VSDEVCMD).Path
     }
 
     $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
@@ -192,9 +192,9 @@ function Resolve-VsDevCmd([string] $RustTarget) {
     }
 
     if ($RustTarget -eq "aarch64-pc-windows-msvc") {
-        throw "Could not find a Visual Studio instance with the ARM64 compiler and ARM64 Spectre-mitigated libraries. Install Microsoft.VisualStudio.Component.VC.Tools.ARM64 and Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre, or set OPENSHELL_VSDEVCMD."
+        throw "Could not find a Visual Studio instance with the ARM64 compiler and ARM64 Spectre-mitigated libraries. Install Microsoft.VisualStudio.Component.VC.Tools.ARM64 and Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre, or set RYNO_VSDEVCMD."
     }
-    throw "Could not find a Visual Studio instance with the x64 compiler. Install Microsoft.VisualStudio.Component.VC.Tools.x86.x64, or set OPENSHELL_VSDEVCMD."
+    throw "Could not find a Visual Studio instance with the x64 compiler. Install Microsoft.VisualStudio.Component.VC.Tools.x86.x64, or set RYNO_VSDEVCMD."
 }
 
 function Get-LibclangBinSubdir {
@@ -328,7 +328,7 @@ function Get-SelectedTargets([string] $RequestedTarget) {
     }
     if ($RequestedTarget -eq "all") {
         $targets = @("x86_64-pc-windows-msvc")
-        if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
+        if ($env:RYNO_MXC_SKIP_ARM64 -ne "1") {
             $targets += "aarch64-pc-windows-msvc"
         }
         return $targets
@@ -481,13 +481,13 @@ function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
     $logName = "build-$RustTarget-driver-tree.log"
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo tree -p openshell-gateway --target $RustTarget --prefix none" `
+        -CargoArgs "cargo tree -p ryno-gateway --target $RustTarget --prefix none" `
         -LogName $logName
 
     $logPath = Join-Path $LogDir $logName
     $unexpected = @(Select-String `
         -Path $logPath `
-        -Pattern '^openshell-driver-(docker|kubernetes|podman|vm)\s')
+        -Pattern '^ryno-driver-(docker|kubernetes|podman|vm)\s')
     if ($unexpected.Count -gt 0) {
         $packages = ($unexpected.Line | Sort-Object -Unique) -join ", "
         throw "Unsupported driver crates entered the Windows gateway dependency graph: $packages"
@@ -512,7 +512,7 @@ function Invoke-Lint([string] $RustTarget) {
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin ryno-gateway --bin ryno $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-release.log"
 }
 
@@ -528,7 +528,7 @@ function Invoke-PreCommitTest([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features openshell-server/test-support $Z3ServerFeatures" `
+        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features ryno-server/test-support $Z3ServerFeatures" `
         -LogName "test-$RustTarget-precommit.log"
 }
 
@@ -542,7 +542,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p ryno-gateway --target $RustTarget $test $Z3ServerFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 
@@ -551,7 +551,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p ryno-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
 }
@@ -573,7 +573,7 @@ function Get-Sha256([string] $Path) {
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
-        foreach ($binary in @("openshell-gateway.exe", "openshell.exe")) {
+        foreach ($binary in @("ryno-gateway.exe", "ryno.exe")) {
             $path = Join-Path $TargetDir "$rustTarget\release\$binary"
             if (-not (Test-Path $path)) {
                 continue

@@ -3,7 +3,7 @@
 
 //! Doctor Docker preflight e2e tests.
 //!
-//! These tests verify that `openshell doctor check` reports actionable guidance
+//! These tests verify that `ryno doctor check` reports actionable guidance
 //! when Docker is not available.
 //!
 //! The tests do NOT require a running gateway or Docker — they intentionally
@@ -17,10 +17,10 @@ use std::{env, fs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::output::strip_ansi;
+use ryno_e2e::harness::binary::ryno_cmd;
+use ryno_e2e::harness::output::strip_ansi;
 
-/// Run `openshell <args>` in an isolated environment where Docker is
+/// Run `ryno <args>` in an isolated environment where Docker is
 /// guaranteed to be unreachable.
 ///
 /// Sets `DOCKER_HOST` to a non-existent socket so the preflight check
@@ -45,18 +45,18 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
     let path = format!("{}:{old_path}", bin_dir.display());
     let start = Instant::now();
 
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env("PATH", path)
-        .env("DOCKER_HOST", "unix:///tmp/openshell-e2e-nonexistent.sock")
-        .env_remove("OPENSHELL_GATEWAY")
-        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .env("DOCKER_HOST", "unix:///tmp/ryno-e2e-nonexistent.sock")
+        .env_remove("RYNO_GATEWAY")
+        .env_remove("RYNO_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell");
+    let output = cmd.output().await.expect("spawn ryno");
     let elapsed = start.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -69,7 +69,7 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
 // doctor check: validates system prerequisites
 // -------------------------------------------------------------------
 
-/// `openshell doctor check` with Docker unavailable should fail fast
+/// `ryno doctor check` with Docker unavailable should fail fast
 /// and report the Docker check as FAILED.
 #[tokio::test]
 async fn doctor_check_fails_without_docker() {
@@ -93,7 +93,7 @@ async fn doctor_check_fails_without_docker() {
     );
 }
 
-/// `openshell doctor check` output should include the check label
+/// `ryno doctor check` output should include the check label
 /// so the user knows what was tested.
 #[tokio::test]
 async fn doctor_check_output_shows_docker_label() {
@@ -106,7 +106,7 @@ async fn doctor_check_output_shows_docker_label() {
     );
 }
 
-/// `openshell doctor check` with Docker unavailable should include
+/// `ryno doctor check` with Docker unavailable should include
 /// actionable guidance in the error output.
 #[tokio::test]
 async fn doctor_check_error_includes_guidance() {
@@ -125,7 +125,7 @@ async fn doctor_check_error_includes_guidance() {
     );
 }
 
-/// When Docker IS available, `openshell doctor check` should pass and
+/// When Docker IS available, `ryno doctor check` should pass and
 /// report the version.
 ///
 /// This test only runs when Docker is actually reachable on the host
@@ -140,16 +140,16 @@ async fn doctor_check_passes_with_docker() {
     }
 
     let tmpdir = tempfile::tempdir().expect("create isolated config dir");
-    let mut cmd = openshell_cmd();
+    let mut cmd = ryno_cmd();
     cmd.args(["doctor", "check"])
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("OPENSHELL_GATEWAY")
-        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .env_remove("RYNO_GATEWAY")
+        .env_remove("RYNO_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell");
+    let output = cmd.output().await.expect("spawn ryno");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");

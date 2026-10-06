@@ -12,7 +12,7 @@ Creates a new sandbox with the given name, spec, and labels.
 ```go
 sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
     Template: &v1.SandboxTemplate{
-        Image: "nvcr.io/nvidia/openshell:latest",
+        Image: "nvcr.io/nvidia/ryno:latest",
     },
     Providers: []string{"openai"},
 }, map[string]string{
@@ -66,7 +66,7 @@ fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 
 ### Tool server connections
 
-`sb.Status.EndpointStatuses` shows each configured tool server endpoint and its last accepted network result in one record. A sandbox can be `Ready` while a tool server connection fails; endpoint results do not change lifecycle readiness. OpenShell currently observes endpoints configured for MCP over HTTP.
+`sb.Status.EndpointStatuses` shows each configured tool server endpoint and its last accepted network result in one record. A sandbox can be `Ready` while a tool server connection fails; endpoint results do not change lifecycle readiness. Ryno currently observes endpoints configured for MCP over HTTP.
 
 ```go
 for _, endpoint := range sb.Status.EndpointStatuses {
@@ -78,7 +78,7 @@ for _, endpoint := range sb.Status.EndpointStatuses {
 
 `LastResult` is a typed `v1.EndpointResult`. For example, `v1.EndpointTransportFailed` means the transport failed before an HTTP response arrived. `v1.EndpointHTTPResponseReceived` means the server returned an HTTP status below 400; its body can still contain a tool error. Neither result establishes current availability.
 
-OpenShell observes real traffic passively and does not expire idle observations. Keep `LastReportedAt` visible when displaying a result: it records when the gateway accepted the observation, not when the request happened. Retained evidence can be accepted after a reset. `v1.EndpointNoObservedExchange` has an empty timestamp and retains the configured address, so the endpoint remains identifiable before traffic is observed or after evidence is invalidated.
+Ryno observes real traffic passively and does not expire idle observations. Keep `LastReportedAt` visible when displaying a result: it records when the gateway accepted the observation, not when the request happened. Retained evidence can be accepted after a reset. `v1.EndpointNoObservedExchange` has an empty timestamp and retains the configured address, so the endpoint remains identifiable before traffic is observed or after evidence is invalidated.
 
 ## List
 

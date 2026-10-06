@@ -5,5 +5,5 @@
 - import_playbook: userns-profile.yaml
   vars:
     podman_userns_profile: auto
-    podman_userns_config: "{{ openshell_podman_userns_auto_config }}"
+    podman_userns_config: "{{ ryno_podman_userns_auto_config }}"
     podman_userns_reference_args: [--userns, auto]

@@ -34,13 +34,13 @@ set -euo pipefail
 
 printf '%s\n' "$*" >> "$MOCK_GH_LOG"
 
-if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865" ]]; then
+if [[ "$1" == "api" && "$2" == "repos/NVIDIA/Ryno/pulls/1865" ]]; then
     [[ "$MOCK_LOOKUP_FAILURE" != "pull" ]] || exit 1
     jq -n --arg sha '0e4d7af7722fbedce2307d571b0c937a1eb3250f' --argjson draft "$MOCK_CURRENT_IS_DRAFT" '{head:{sha:$sha},draft:$draft}'
     exit 0
 fi
 
-if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/issues/1865/comments" ]]; then
+if [[ "$1" == "api" && "$2" == "repos/NVIDIA/Ryno/issues/1865/comments" ]]; then
     [[ "$MOCK_LOOKUP_FAILURE" != "comments" ]] || exit 1
     if [[ -n "$MOCK_EXISTING_BODY" ]]; then
         jq -Rn --arg body "$MOCK_EXISTING_BODY" '$body'
@@ -48,17 +48,17 @@ if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/issues/1865/comments" ]];
     exit 0
 fi
 
-if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865/reviews" ]]; then
+if [[ "$1" == "api" && "$2" == "repos/NVIDIA/Ryno/pulls/1865/reviews" ]]; then
     [[ "$MOCK_LOOKUP_FAILURE" != "reviews" ]] || exit 1
     exit 0
 fi
 
-if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/OpenShell/pulls/1865/reviews"* ]]; then
+if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/Ryno/pulls/1865/reviews"* ]]; then
     printf '%s\n' 'review posted'
     exit 0
 fi
 
-if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/OpenShell/issues/1865/comments"* ]]; then
+if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/Ryno/issues/1865/comments"* ]]; then
     printf '%s\n' 'posted'
     exit 0
 fi
@@ -86,7 +86,7 @@ run_case() {
     printf '{"body":%s}\n' "$(jq -Rn --arg body "$post_body" '$body')" > "$tmp/body.json"
 
     set +e
-    OPENSHELL_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/OpenShell/issues/1865/comments --input "$tmp/body.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
+    RYNO_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/Ryno/issues/1865/comments --input "$tmp/body.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
     local status=$?
     set -e
 
@@ -135,7 +135,7 @@ The review is ready for author follow-up.
         }' > "$tmp/review.json"
 
     set +e
-    OPENSHELL_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/OpenShell/pulls/1865/reviews --input "$tmp/review.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
+    RYNO_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/Ryno/pulls/1865/reviews --input "$tmp/review.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
     local status=$?
     set -e
 

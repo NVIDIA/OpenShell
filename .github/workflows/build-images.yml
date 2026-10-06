@@ -23,7 +23,7 @@ jobs:
   gateway:
     env:
       COMPONENT: gateway
-      BINARY: openshell-gateway
+      BINARY: ryno-gateway
       TARGET_SUFFIX: unknown-linux-gnu
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
@@ -44,7 +44,7 @@ jobs:
   sandbox:
     env:
       COMPONENT: sandbox
-      BINARY: openshell-sandbox
+      BINARY: ryno-sandbox
       TARGET_SUFFIX: unknown-linux-musl
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
@@ -53,7 +53,7 @@ jobs:
   supervisor:
     env:
       COMPONENT: supervisor
-      BINARY: openshell-supervisor
+      BINARY: ryno-supervisor
       TARGET_SUFFIX: unknown-linux-gnu
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20

@@ -3,14 +3,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start a standalone openshell-gateway using the detected compute driver.
+# Start a standalone ryno-gateway using the detected compute driver.
 #
 # Auto-detection follows the gateway's runtime order:
 #   Kubernetes -> Podman -> Docker
 #
 # VM/MicroVM is intentionally explicit-only because it requires runtime setup.
 # Use either:
-#   OPENSHELL_COMPUTE_DRIVER=vm mise run gateway
+#   RYNO_COMPUTE_DRIVER=vm mise run gateway
 #   mise run gateway:vm
 
 set -euo pipefail
@@ -18,13 +18,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
-GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
+GATEWAY_BIN="${RYNO_GATEWAY_BIN:-${ROOT}/target/debug/ryno-gateway}"
 
 usage() {
   cat <<'EOF'
 Usage: mise run gateway [-- --driver DRIVER]
 
-Start a local OpenShell gateway with the detected compute driver.
+Start a local Ryno gateway with the detected compute driver.
 
 Driver detection order:
   kubernetes -> podman -> docker
@@ -35,11 +35,11 @@ Options:
   -h, --help       Show this help.
 
 Environment:
-  OPENSHELL_COMPUTE_DRIVER       Driver override used by openshell-gateway.
-  OPENSHELL_GATEWAY_NAME  Gateway name for delegated or Kubernetes runs.
-  OPENSHELL_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1,
+  RYNO_COMPUTE_DRIVER       Driver override used by ryno-gateway.
+  RYNO_GATEWAY_NAME  Gateway name for delegated or Kubernetes runs.
+  RYNO_BIND_ADDRESS  Gateway listener address. Defaults to 127.0.0.1,
                           or ::1 for Podman Machine on macOS.
-  OPENSHELL_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
+  RYNO_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
                           18080 for Podman/Docker, and 18081 for VM.
 Docker, Podman, and VM runs delegate to their gateway:<driver> setup scripts.
 EOF
@@ -106,7 +106,7 @@ detect_driver() {
   fi
 
   echo "ERROR: no compute driver detected." >&2
-  echo "       Start Podman or Docker, run inside Kubernetes, or set OPENSHELL_COMPUTE_DRIVER." >&2
+  echo "       Start Podman or Docker, run inside Kubernetes, or set RYNO_COMPUTE_DRIVER." >&2
   exit 2
 }
 
@@ -130,7 +130,7 @@ register_gateway_metadata() {
   local config_home gateway_dir
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
+  gateway_dir="${config_home}/ryno/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
   cat >"${gateway_dir}/metadata.json" <<EOF
@@ -142,7 +142,7 @@ register_gateway_metadata() {
   "auth_mode": "plaintext"
 }
 EOF
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+  printf '%s' "${name}" >"${config_home}/ryno/active_gateway"
 }
 
 explicit_driver=""
@@ -173,57 +173,57 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -n "${explicit_driver}" && -n "${OPENSHELL_COMPUTE_DRIVER:-}" ]]; then
-  echo "ERROR: use either --driver or OPENSHELL_COMPUTE_DRIVER, not both" >&2
+if [[ -n "${explicit_driver}" && -n "${RYNO_COMPUTE_DRIVER:-}" ]]; then
+  echo "ERROR: use either --driver or RYNO_COMPUTE_DRIVER, not both" >&2
   exit 2
 fi
 
-if [[ -z "${explicit_driver}" && -n "${OPENSHELL_COMPUTE_DRIVER:-}" ]]; then
-  if [[ "${OPENSHELL_COMPUTE_DRIVER}" == *,* ]]; then
-    echo "ERROR: mise run gateway supports one driver; got OPENSHELL_COMPUTE_DRIVER=${OPENSHELL_COMPUTE_DRIVER}" >&2
+if [[ -z "${explicit_driver}" && -n "${RYNO_COMPUTE_DRIVER:-}" ]]; then
+  if [[ "${RYNO_COMPUTE_DRIVER}" == *,* ]]; then
+    echo "ERROR: mise run gateway supports one driver; got RYNO_COMPUTE_DRIVER=${RYNO_COMPUTE_DRIVER}" >&2
     exit 2
   fi
-  explicit_driver="$(normalize_driver "${OPENSHELL_COMPUTE_DRIVER}")"
+  explicit_driver="$(normalize_driver "${RYNO_COMPUTE_DRIVER}")"
 fi
 
 DRIVER="${explicit_driver:-$(detect_driver)}"
 
 case "${DRIVER}" in
   docker)
-    export OPENSHELL_DOCKER_GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-${OPENSHELL_GATEWAY_NAME:-docker-dev}}"
+    export RYNO_DOCKER_GATEWAY_NAME="${RYNO_DOCKER_GATEWAY_NAME:-${RYNO_GATEWAY_NAME:-docker-dev}}"
     exec bash "${ROOT}/tasks/scripts/gateway-docker.sh"
     ;;
   podman)
-    export OPENSHELL_PODMAN_GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-${OPENSHELL_GATEWAY_NAME:-podman-dev}}"
+    export RYNO_PODMAN_GATEWAY_NAME="${RYNO_PODMAN_GATEWAY_NAME:-${RYNO_GATEWAY_NAME:-podman-dev}}"
     exec bash "${ROOT}/tasks/scripts/gateway-podman.sh"
     ;;
   vm)
-    export OPENSHELL_VM_GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-${OPENSHELL_GATEWAY_NAME:-vm-dev}}"
+    export RYNO_VM_GATEWAY_NAME="${RYNO_VM_GATEWAY_NAME:-${RYNO_GATEWAY_NAME:-vm-dev}}"
     exec bash "${ROOT}/tasks/scripts/gateway-vm.sh"
     ;;
 esac
 
-PORT="${OPENSHELL_SERVER_PORT:-8080}"
-GATEWAY_NAME="${OPENSHELL_GATEWAY_NAME:-${DRIVER}-dev}"
-STATE_DIR="${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-${DRIVER}}"
-SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-${DRIVER}-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
-SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
-LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
-PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
+PORT="${RYNO_SERVER_PORT:-8080}"
+GATEWAY_NAME="${RYNO_GATEWAY_NAME:-${DRIVER}-dev}"
+STATE_DIR="${RYNO_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-${DRIVER}}"
+SANDBOX_NAMESPACE="${RYNO_SANDBOX_NAMESPACE:-${DRIVER}-dev}"
+SANDBOX_IMAGE="${RYNO_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${RYNO_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
+GRPC_ENDPOINT="${RYNO_GRPC_ENDPOINT:-}"
+LOG_LEVEL="${RYNO_LOG_LEVEL:-info}"
+PRIMARY_BIND_IP="${RYNO_BIND_ADDRESS:-127.0.0.1}"
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+  echo "ERROR: RYNO_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
 fi
 
 if port_is_in_use "${PORT}"; then
-  echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
+  echo "ERROR: port ${PORT} is already in use; free it or set RYNO_SERVER_PORT" >&2
   exit 2
 fi
 
-echo "Building openshell-gateway..."
+echo "Building ryno-gateway..."
 run_mise_task build:gateway
 
 if [[ ! -x "${GATEWAY_BIN}" ]]; then
@@ -237,7 +237,7 @@ echo "Generating local gateway credentials..."
   --output-dir "${TLS_DIR}" \
   --server-san "127.0.0.1" \
   --server-san "localhost" \
-  --server-san "host.openshell.internal"
+  --server-san "host.ryno.internal"
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
@@ -254,21 +254,21 @@ if [[ "${DRIVER}" == "kubernetes" ]]; then
 fi
 
 cat >"${CONFIG_PATH}" <<EOF
-[openshell]
+[ryno]
 version = 2
 
-[openshell.gateway]
+[ryno.gateway]
 name = "${GATEWAY_NAME}"
 compute_driver = "${DRIVER}"
 disable_tls = true
 
-[openshell.gateway.otlp]
+[ryno.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
 
-[openshell.gateway.auth]
+[ryno.gateway.auth]
 allow_unauthenticated_users = true
 
-[openshell.gateway.gateway_jwt]
+[ryno.gateway.gateway_jwt]
 signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
@@ -278,7 +278,7 @@ EOF
 
 cat >>"${CONFIG_PATH}" <<EOF
 
-[openshell.drivers.kubernetes]
+[ryno.drivers.kubernetes]
 namespace = "${SANDBOX_NAMESPACE}"
 default_image = "${SANDBOX_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"

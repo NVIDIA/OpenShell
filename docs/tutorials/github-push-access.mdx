@@ -20,7 +20,7 @@ paths needed by their providers.
 
 You need:
 
-- A working OpenShell installation and active gateway.
+- A working Ryno installation and active gateway.
 - An OCI image you built with Claude Code, `git`, and the GitHub CLI installed.
 - An Anthropic API key.
 - A GitHub fine-grained personal access token with read and write access to the
@@ -34,15 +34,15 @@ and updates policy.
 
 ## Import the Provider Profiles
 
-Review the [Claude Code profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml)
-and [GitHub profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/github.yaml).
+Review the [Claude Code profile](https://github.com/NVIDIA/Ryno/blob/main/providers/claude-code.yaml)
+and [GitHub profile](https://github.com/NVIDIA/Ryno/blob/main/providers/github.yaml).
 Confirm that their `binaries` paths match the executables in your image, then
 import them directly. If a path or endpoint grant needs to change, edit a local
 copy and import it with `-f` instead.
 
 ```shell
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml --global
-openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml --global
+ryno profile import --url https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/claude-code.yaml --global
+ryno profile import --url https://raw.githubusercontent.com/NVIDIA/Ryno/main/providers/github.yaml --global
 ```
 
 The gateway contains no built-in profiles. Import each profile once per gateway
@@ -55,13 +55,13 @@ credential on the same command line exports it only to that command:
 
 ```shell
 ANTHROPIC_API_KEY=<your-anthropic-key> \
-  openshell provider create --name my-claude --type claude-code --from-existing
+  ryno provider create --name my-claude --type claude-code --from-existing
 
 GITHUB_TOKEN=<your-github-token> \
-  openshell provider create --name my-github --type github --from-existing
+  ryno provider create --name my-github --type github --from-existing
 ```
 
-OpenShell stores the credentials through the configured credential driver. The
+Ryno stores the credentials through the configured credential driver. The
 agent receives opaque placeholders; the sandbox proxy resolves them only for
 endpoints allowed by the corresponding profile.
 
@@ -70,7 +70,7 @@ endpoints allowed by the corresponding profile.
 In terminal 1, start Claude Code from your image and attach both providers:
 
 ```shell
-openshell sandbox create \
+ryno sandbox create \
   --name github-demo \
   --from registry.example.com/your-org/claude-agent:latest \
   --provider my-claude \
@@ -82,9 +82,9 @@ To use an existing sandbox, attach the providers from a host terminal, then
 start a new agent process so it receives the provider environment variables:
 
 ```shell
-openshell sandbox provider attach <sandbox-name> my-claude
-openshell sandbox provider attach <sandbox-name> my-github
-openshell sandbox connect <sandbox-name>
+ryno sandbox provider attach <sandbox-name> my-claude
+ryno sandbox provider attach <sandbox-name> my-github
+ryno sandbox connect <sandbox-name>
 ```
 
 ## Attempt a Push
@@ -108,7 +108,7 @@ not grant the missing network authority.
 In terminal 2, inspect recent sandbox logs:
 
 ```shell
-openshell logs github-demo --since 5m --source sandbox
+ryno logs github-demo --since 5m --source sandbox
 ```
 
 You should see a denial for a request resembling this one:
@@ -117,11 +117,11 @@ You should see a denial for a request resembling this one:
 [1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://github.com:443/<org>/<repo>.git/git-receive-pack [policy:_provider_my_github engine:l7] [reason:L7_REQUEST deny POST github.com:443/<org>/<repo>.git/git-receive-pack reason=POST /<org>/<repo>.git/git-receive-pack not permitted by policy]
 ```
 
-`_provider_my_github` is the rule that OpenShell composes from the attached
+`_provider_my_github` is the rule that Ryno composes from the attached
 `my-github` provider. Policy events are INFO-level log records, so do not filter
 them out with `--level warn`.
 
-You can also run `openshell term` to inspect policy decisions in the terminal
+You can also run `ryno term` to inspect policy decisions in the terminal
 dashboard.
 
 ## Create a Repository-Scoped Policy
@@ -130,12 +130,12 @@ dashboard.
 current one. In terminal 2, print it:
 
 ```shell
-openshell policy get github-demo --base
+ryno policy get github-demo --base
 ```
 
 The command prints revision details followed by the policy. Save only the policy
 YAML as `github-push.yaml`. Keep its filesystem, Landlock, and process settings
-unchanged, because OpenShell rejects removed filesystem paths and changed
+unchanged, because Ryno rejects removed filesystem paths and changed
 Landlock or process settings on a running sandbox.
 
 Add these entries under `network_policies`, creating the section if it is
@@ -191,7 +191,7 @@ placement and its broader read-only rules.
 Apply the policy and wait for the new revision to load:
 
 ```shell
-openshell policy set github-demo --policy github-push.yaml --wait
+ryno policy set github-demo --policy github-push.yaml --wait
 ```
 
 Network policy changes hot-reload without recreating the sandbox. Provider
@@ -203,8 +203,8 @@ Ask the agent to retry the push. Then confirm that the proxy allowed the scoped
 request:
 
 ```shell
-openshell logs github-demo --since 5m
-openshell policy get github-demo --full
+ryno logs github-demo --since 5m
+ryno policy get github-demo --full
 ```
 
 The push succeeds for the selected repository. Requests to push to another
@@ -215,7 +215,7 @@ repository remain denied.
 Delete the sandbox when you are finished:
 
 ```shell
-openshell sandbox delete github-demo
+ryno sandbox delete github-demo
 ```
 
 </Steps>

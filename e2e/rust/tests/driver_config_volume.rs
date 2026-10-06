@@ -18,9 +18,9 @@ use bollard::query_parameters::{
 };
 use futures_util::TryStreamExt;
 #[cfg(feature = "e2e-docker")]
-use openshell_e2e::harness::container::ImageGuard;
-use openshell_e2e::harness::container::e2e_driver;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use ryno_e2e::harness::container::ImageGuard;
+use ryno_e2e::harness::container::e2e_driver;
+use ryno_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 
 const TEST_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
@@ -79,7 +79,7 @@ impl Drop for VolumeGuard {
 
 #[tokio::test]
 async fn sandbox_mounts_existing_driver_config_volume() {
-    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
+    let driver = e2e_driver().expect("RYNO_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
         matches!(driver.as_str(), "docker" | "podman"),
         "driver_config volume e2e requires docker or podman, got {driver}"
@@ -121,7 +121,7 @@ async fn sandbox_mounts_existing_driver_config_volume() {
 #[tokio::test]
 #[cfg(feature = "e2e-docker")]
 async fn oci_workspace_preparation_skips_nested_volume_ownership() {
-    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
+    let driver = e2e_driver().expect("RYNO_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
         driver == "docker",
         "OCI workspace mount e2e requires docker, got {driver}"
@@ -191,7 +191,7 @@ async fn oci_workspace_preparation_skips_nested_volume_ownership() {
 
 #[tokio::test]
 async fn sandbox_mounts_enabled_driver_config_bind() {
-    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
+    let driver = e2e_driver().expect("RYNO_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
         matches!(driver.as_str(), "docker" | "podman"),
         "driver_config bind e2e requires docker or podman, got {driver}"
@@ -199,7 +199,7 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
 
     let cwd = std::env::current_dir().expect("resolve current dir");
     let host_dir = tempfile::Builder::new()
-        .prefix("openshell-e2e-driver-config-bind-")
+        .prefix("ryno-e2e-driver-config-bind-")
         .tempdir_in(cwd)
         .expect("create bind mount host dir");
     fs::set_permissions(host_dir.path(), fs::Permissions::from_mode(0o777))
@@ -491,8 +491,8 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
 }
 
 fn podman_socket_path() -> Result<PathBuf, String> {
-    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET").ok_or_else(|| {
-        "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string()
+    let path = std::env::var_os("RYNO_PODMAN_SOCKET").ok_or_else(|| {
+        "RYNO_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string()
     })?;
     Ok(PathBuf::from(path))
 }
@@ -504,7 +504,7 @@ fn unique_volume_name(driver: &str) -> String {
         .as_nanos();
     let sequence = NEXT_VOLUME_ID.fetch_add(1, Ordering::Relaxed);
     format!(
-        "openshell-e2e-driver-config-volume-{driver}-{}-{nanos}-{sequence}",
+        "ryno-e2e-driver-config-volume-{driver}-{}-{nanos}-{sequence}",
         std::process::id()
     )
 }

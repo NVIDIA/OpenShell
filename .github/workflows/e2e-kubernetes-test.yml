@@ -33,7 +33,7 @@ on:
         type: string
         default: ""
       agent-sandbox-version:
-        description: "Agent Sandbox release to install before OpenShell"
+        description: "Agent Sandbox release to install before Ryno"
         required: false
         type: string
         default: "v1.0.3"
@@ -43,7 +43,7 @@ on:
         type: string
         default: "e2e:kubernetes"
       test-name:
-        description: "Rust e2e test target to run (sets OPENSHELL_E2E_KUBE_TEST)"
+        description: "Rust e2e test target to run (sets RYNO_E2E_KUBE_TEST)"
         required: false
         type: string
         default: ""
@@ -110,12 +110,12 @@ jobs:
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
-      - name: Use prebuilt OpenShell CLI
+      - name: Use prebuilt Ryno CLI
         uses: ./.github/actions/setup-e2e-cli
         with:
           conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
-      - name: Use prebuilt OpenShell gateway
+      - name: Use prebuilt Ryno gateway
         if: inputs.gateway-artifact != ''
         uses: ./.github/actions/setup-e2e-gateway
         with:
@@ -140,13 +140,13 @@ jobs:
       - name: Run Kubernetes E2E
         env:
           AGENT_SANDBOX_VERSION: ${{ inputs.agent-sandbox-version }}
-          OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
-          OPENSHELL_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
-          OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET: ${{ inputs.external-postgres-secret }}
-          OPENSHELL_E2E_KUBE_TEST: ${{ inputs.test-name }}
-          OPENSHELL_E2E_KUBERNETES_FEATURES: ${{ inputs.kubernetes-features }}
-          OPENSHELL_E2E_KUBE_USE_ENVOY: ${{ inputs.use-envoy-gateway && '1' || '0' }}
+          RYNO_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
+          RYNO_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
+          RYNO_E2E_KUBE_EXTERNAL_POSTGRES_SECRET: ${{ inputs.external-postgres-secret }}
+          RYNO_E2E_KUBE_TEST: ${{ inputs.test-name }}
+          RYNO_E2E_KUBERNETES_FEATURES: ${{ inputs.kubernetes-features }}
+          RYNO_E2E_KUBE_USE_ENVOY: ${{ inputs.use-envoy-gateway && '1' || '0' }}
           IMAGE_TAG: ${{ inputs.image-tag }}
-          OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+          RYNO_REGISTRY: ghcr.io/nvidia/ryno
           E2E_TASK: ${{ inputs.e2e-task }}
         run: mise run --no-deps --skip-deps "$E2E_TASK"

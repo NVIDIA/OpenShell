@@ -10,7 +10,7 @@ from pathlib import Path
 
 def _load_release_module():
     path = Path(__file__).resolve().parents[1] / "tasks/scripts/release.py"
-    spec = importlib.util.spec_from_file_location("openshell_release_tooling", path)
+    spec = importlib.util.spec_from_file_location("ryno_release_tooling", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)

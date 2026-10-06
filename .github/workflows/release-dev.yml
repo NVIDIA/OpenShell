@@ -22,7 +22,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -159,7 +159,7 @@ jobs:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]
@@ -170,7 +170,7 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
+      conformance-artifact-prefix: ryno-conformance
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
@@ -186,7 +186,7 @@ jobs:
       - name: Tag images as dev
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
+          REGISTRY="ghcr.io/nvidia/ryno"
           for component in gateway sandbox supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
@@ -201,13 +201,13 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      image: ghcr.io/nvidia/ryno/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: ${{ needs.compute-versions.outputs.python_version }}
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RYNO: ${{ needs.compute-versions.outputs.python_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -383,12 +383,12 @@ jobs:
             mv "${matches[0]}" "release/${dest}"
           }
 
-          move_one openshell-dev-amd64.deb release/openshell_*_amd64.deb
-          move_one openshell-dev-arm64.deb release/openshell_*_arm64.deb
-          move_one openshell-dev-x86_64.rpm release/openshell-[0-9]*.x86_64.rpm
-          move_one openshell-dev-aarch64.rpm release/openshell-[0-9]*.aarch64.rpm
-          move_one openshell-gateway-dev-x86_64.rpm release/openshell-gateway-[0-9]*.x86_64.rpm
-          move_one openshell-gateway-dev-aarch64.rpm release/openshell-gateway-[0-9]*.aarch64.rpm
+          move_one ryno-dev-amd64.deb release/ryno_*_amd64.deb
+          move_one ryno-dev-arm64.deb release/ryno_*_arm64.deb
+          move_one ryno-dev-x86_64.rpm release/ryno-[0-9]*.x86_64.rpm
+          move_one ryno-dev-aarch64.rpm release/ryno-[0-9]*.aarch64.rpm
+          move_one ryno-gateway-dev-x86_64.rpm release/ryno-gateway-[0-9]*.x86_64.rpm
+          move_one ryno-gateway-dev-aarch64.rpm release/ryno-gateway-[0-9]*.aarch64.rpm
 
           ls -la release/
 
@@ -410,29 +410,29 @@ jobs:
           set -euo pipefail
           cd release
           sha256sum -- \
-            openshell-x86_64-unknown-linux-musl.tar.gz \
-            openshell-aarch64-unknown-linux-musl.tar.gz \
-            openshell-aarch64-apple-darwin.tar.gz \
-            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
-            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            ryno-x86_64-unknown-linux-musl.tar.gz \
+            ryno-aarch64-unknown-linux-musl.tar.gz \
+            ryno-aarch64-apple-darwin.tar.gz \
+            ryno-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            ryno-driver-vm-aarch64-apple-darwin.tar.gz \
             *.deb \
-            openshell-*.rpm \
-            *.whl > openshell-checksums-sha256.txt
-          cat openshell-checksums-sha256.txt
+            ryno-*.rpm \
+            *.whl > ryno-checksums-sha256.txt
+          cat ryno-checksums-sha256.txt
           sha256sum -- \
-            openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
-            openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
-          cat openshell-gateway-checksums-sha256.txt
+            ryno-gateway-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-gateway-aarch64-unknown-linux-gnu.tar.gz \
+            ryno-gateway-aarch64-apple-darwin.tar.gz > ryno-gateway-checksums-sha256.txt
+          cat ryno-gateway-checksums-sha256.txt
           sha256sum -- \
-            openshell-sandbox-x86_64-unknown-linux-musl.tar.gz \
-            openshell-sandbox-aarch64-unknown-linux-musl.tar.gz > openshell-sandbox-checksums-sha256.txt
-          cat openshell-sandbox-checksums-sha256.txt
+            ryno-sandbox-x86_64-unknown-linux-musl.tar.gz \
+            ryno-sandbox-aarch64-unknown-linux-musl.tar.gz > ryno-sandbox-checksums-sha256.txt
+          cat ryno-sandbox-checksums-sha256.txt
           sha256sum -- \
-            openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz > openshell-supervisor-checksums-sha256.txt
-          cat openshell-supervisor-checksums-sha256.txt
+            ryno-supervisor-x86_64-unknown-linux-gnu.tar.gz \
+            ryno-supervisor-aarch64-unknown-linux-gnu.tar.gz > ryno-supervisor-checksums-sha256.txt
+          cat ryno-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
         run: |
@@ -440,16 +440,16 @@ jobs:
           python3 tasks/scripts/release.py generate-homebrew-formula \
             --release-tag dev \
             --release-dir release \
-            --output release/openshell.rb
-          cat release/openshell.rb
+            --output release/ryno.rb
+          cat release/ryno.rb
 
       - name: Attest VM driver artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
-            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/ryno-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-apple-darwin.tar.gz
 
       - name: Prune managed assets from dev release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
@@ -476,7 +476,7 @@ jobs:
             }
 
             const managed = (name) => (
-              name.startsWith('openshell') &&
+              name.startsWith('ryno') &&
               (
                 name.endsWith('.tar.gz') ||
                 name.endsWith('.txt') ||
@@ -510,7 +510,7 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          name: OpenShell Development Build
+          name: Ryno Development Build
           prerelease: true
           tag_name: dev
           target_commitish: ${{ github.sha }}
@@ -522,37 +522,37 @@ jobs:
             ### Quick install
 
             ```
-            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=dev sh
+            curl -LsSf https://raw.githubusercontent.com/NVIDIA/Ryno/main/install.sh | RYNO_VERSION=dev sh
             ```
 
           files: |
-            release/openshell-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-aarch64-apple-darwin.tar.gz
-            release/openshell-dev-amd64.deb
-            release/openshell-dev-arm64.deb
-            release/openshell-*.rpm
+            release/ryno-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-aarch64-apple-darwin.tar.gz
+            release/ryno-dev-amd64.deb
+            release/ryno-dev-arm64.deb
+            release/ryno-*.rpm
             release/*.snap
-            release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-gateway-aarch64-apple-darwin.tar.gz
-            release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
-            release/openshell-prover-x86_64-unknown-linux-musl.tar.gz
-            release/openshell-prover-aarch64-unknown-linux-musl.tar.gz
-            release/openshell-prover-aarch64-apple-darwin.tar.gz
+            release/ryno-gateway-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-gateway-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-gateway-aarch64-apple-darwin.tar.gz
+            release/ryno-sandbox-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-sandbox-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-supervisor-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/ryno-driver-vm-aarch64-apple-darwin.tar.gz
+            release/ryno-prover-x86_64-unknown-linux-musl.tar.gz
+            release/ryno-prover-aarch64-unknown-linux-musl.tar.gz
+            release/ryno-prover-aarch64-apple-darwin.tar.gz
             release/*.whl
-            release/openshell.rb
-            release/openshell-checksums-sha256.txt
-            release/openshell-gateway-checksums-sha256.txt
-            release/openshell-sandbox-checksums-sha256.txt
-            release/openshell-supervisor-checksums-sha256.txt
-            release/openshell-prover-checksums-sha256.txt
+            release/ryno.rb
+            release/ryno-checksums-sha256.txt
+            release/ryno-gateway-checksums-sha256.txt
+            release/ryno-sandbox-checksums-sha256.txt
+            release/ryno-supervisor-checksums-sha256.txt
+            release/ryno-prover-checksums-sha256.txt
 
   release-helm:
     name: Release Helm Chart (OCI, dev)

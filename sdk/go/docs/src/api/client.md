@@ -31,7 +31,7 @@ Sub-client hierarchy: `Providers()` has two nested accessors:
 ## Creating a Client
 
 ```go
-import v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+import v1 "github.com/NVIDIA/Ryno/sdk/go/ryno/v1"
 
 client, err := v1.NewClient(v1.Config{
     Address: "gateway.example.com:443",
@@ -67,7 +67,7 @@ Authentication providers:
 For unit tests, use the fake client instead of a real connection:
 
 ```go
-import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/fake"
+import "github.com/NVIDIA/Ryno/sdk/go/ryno/v1/fake"
 
 client := fake.NewClient()
 defer client.Close()

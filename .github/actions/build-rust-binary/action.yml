@@ -51,7 +51,7 @@ runs:
       shell: nix develop -c bash -euo pipefail {0}
       env:
         GIT_DIR: /nonexistent
-        OPENSHELL_IMAGE_TAG: ${{ inputs.supervisor-image-tag }}
+        RYNO_IMAGE_TAG: ${{ inputs.supervisor-image-tag }}
         INPUTS_PACKAGE: ${{ inputs.package }}
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
