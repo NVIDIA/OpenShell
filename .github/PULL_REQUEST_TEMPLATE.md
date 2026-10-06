@@ -2,7 +2,7 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Every PR must close an existing issue covering its scope. Use Closes #NNN. -->
+<!-- Every PR must close an existing issue covering its scope, except automated dependency updates. Use Closes #NNN; see CONTRIBUTING.md for the exception. -->
 
 ## Changes
 <!-- Bullet list of key changes -->

@@ -511,6 +511,41 @@ name and load the chart CA plus client identity from
 the `peer-client-tls` volume exists, those files are readable, and the server
 certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
 
+To check per-replica capacity on a multi-replica gateway, read each gateway
+pod's metrics and the autoscaler:
+
+```bash
+for pod in $(kubectl -n openshell get pod \
+    -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
+  echo "${pod}"
+  kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+done
+kubectl -n openshell get hpa
+kubectl -n openshell describe hpa openshell
+```
+
+The JSONPath filter keeps only pods whose first container is the gateway
+(`openshell-gateway`). It skips certificate hook Job pods, which older charts
+labeled like gateway pods. The metrics port is `service.metricsPort` (default
+`9090`).
+
+The API server proxy connects to each pod from the control plane. A
+NetworkPolicy that accepts the metrics port only from a monitoring namespace
+blocks it unless the policy also allows the control plane. In that case,
+read one pod at a time through `kubectl port-forward`, which reaches the pod
+through the kubelet and is not blocked by NetworkPolicy:
+
+```bash
+kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
+pf_pid=$!
+sleep 2
+curl -s http://localhost:9090/metrics \
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+kill "${pf_pid}"
+```
+
 Check required Helm deployment secrets:
 
 ```bash
@@ -962,6 +997,9 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
+| One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |

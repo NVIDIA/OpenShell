@@ -73,6 +73,19 @@ oc -n openshell rollout status statefulset/openshell
 
 If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
 
+## Managed workspace namespaces
+
+In managed workspace mode, the Kubernetes driver creates one namespace per
+workspace. On OpenShift, the driver leaves SCC annotations unset so the cluster's
+namespace allocator can assign each workspace its own MCS, UID range, and
+supplemental-group range. The driver waits for those annotations before it
+provisions the workspace ServiceAccount or sandbox Pods.
+
+Namespaces created by an earlier version may have a UID range but no MCS
+annotation. OpenShift does not allocate a new MCS for a namespace that already
+has a UID range, so preserve any needed workspace data and recreate that
+workspace namespace before retrying sandbox creation.
+
 ## Connect to the Gateway
 
 Forward the gateway port for local evaluation:

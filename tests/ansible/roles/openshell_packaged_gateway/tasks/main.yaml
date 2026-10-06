@@ -21,26 +21,6 @@
     name: openshell_gateway
     tasks_from: "{{ openshell_gateway_driver }}.yaml"
 
-# Package defaults select published images. Keep candidate image overrides
-# separate from the operator-owned gateway.toml in both installers.
-- name: Create qualification configuration directory
-  become: true
-  ansible.builtin.file:
-    path: /var/lib/openshell-qualification
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Configure candidate runtime images for qualification
-  become: true
-  ansible.builtin.template:
-    src: gateway.toml.j2
-    dest: /var/lib/openshell-qualification/gateway.toml
-    owner: root
-    group: root
-    mode: "0644"
-
 - name: Create packaged gateway environment directory
   become: true
   ansible.builtin.file:
@@ -50,7 +30,10 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0700"
 
-- name: Select qualification gateway configuration
+# Exercise the package-owned service's environment-file mechanism without
+# generating operator-owned gateway TOML. Preflight and startup must resolve
+# the same candidate runtime images.
+- name: Configure candidate runtime images for qualification
   become: true
   ansible.builtin.copy:
     dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"
@@ -58,7 +41,9 @@
     group: "{{ openshell_gateway_user }}"
     mode: "0600"
     content: |
-      OPENSHELL_GATEWAY_CONFIG=/var/lib/openshell-qualification/gateway.toml
+      OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
+      OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 
 - name: Start gateway user manager
   ansible.builtin.include_role:

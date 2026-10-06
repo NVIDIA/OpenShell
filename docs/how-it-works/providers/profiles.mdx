@@ -558,7 +558,45 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 ### Dynamic Token Grants
 
-`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credential, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
+
+```yaml
+id: protected-api
+display_name: Protected API
+category: data
+credentials:
+  - name: service_access
+    required: true
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://service-issuer.example.com/token
+      audience: https://api.example.com
+      scopes: [resource.read]
+      cache_ttl: 60s
+  - name: workload_identity
+    required: true
+    auth_style: header
+    header_name: x-workload-jwt
+    token_grant:
+      token_endpoint: https://identity-issuer.example.com/token
+      jwt_svid_audience: identity-proxy
+      cache_ttl: 45s
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+    protocol: rest
+    access: full
+```
+
+The custom header carries the identity issuer's returned access token. To carry a JWT-SVID there, that issuer must return the JWT-SVID as its access token. Neither granted value is placed in the sandbox environment.
+
+The supervisor chooses the most-specific matching binding independently for each destination header. Bindings that target the same header are alternatives; equal-specificity matches from different credentials are rejected. Header names are case-insensitive. Omitting both `auth_style` and `header_name` selects `Authorization`; an explicit `bearer` or `header` style requires `header_name`. A more-specific audience override for one credential does not suppress grants for other headers.
+
+All selected grants must succeed and return valid header values before the request is rewritten. A failed grant returns HTTP 502 without forwarding the request. An earlier successful grant may remain in its own cache for a later attempt. Injection replaces every agent-supplied instance of each selected header, including any static credential placeholder in that header, and preserves unrelated headers. Issuer error descriptions are excluded from grant-failure logs and client errors because they may contain credentials.
 
 OpenShell supports two dynamic grant types:
 
@@ -1099,7 +1137,7 @@ For a static provider, the sequence is attach, wait, then launch client A; updat
 
 An acknowledged detachment removes its provider policy layer from the active effective policy, revokes future resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove strings from already-running process environments or undo requests already forwarded upstream.
 
-OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
+OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets whose dynamic token grants target the same header at equal host/path specificity. Grants for distinct headers can share an endpoint. Use provider-specific credential names and make one same-header selector more specific when the bindings are intended as alternatives.
 
 ## Next Steps
 

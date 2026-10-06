@@ -16,6 +16,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
+mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
@@ -28,7 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
 
@@ -637,6 +638,87 @@ pub async fn run_sandbox(
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
 ) -> Result<i32> {
+    // Shared startup retains policy and networking state; box it to keep callers' futures small.
+    Box::pin(run_sandbox_with_backend(
+        &backend_setup::OpenShellBackendSetup,
+        SandboxRunConfig {
+            command,
+            workdir,
+            timeout_secs,
+            interactive,
+            await_main_process_attachment,
+            sandbox_id,
+            sandbox,
+            openshell_endpoint,
+            policy_rules,
+            policy_data,
+            ssh_socket_path,
+            health_socket_path,
+            health_port,
+            ocsf_enabled,
+            ocsf_schema_version,
+            upstream_proxy_args,
+            backend_descriptor,
+            auth_bundle,
+            admitted_isolation_backend,
+            main_exit_marker,
+        },
+    ))
+    .await
+}
+
+struct SandboxRunConfig {
+    command: Vec<String>,
+    workdir: Option<String>,
+    timeout_secs: u64,
+    interactive: bool,
+    await_main_process_attachment: bool,
+    sandbox_id: Option<String>,
+    sandbox: Option<String>,
+    openshell_endpoint: Option<String>,
+    policy_rules: Option<String>,
+    policy_data: Option<String>,
+    ssh_socket_path: Option<String>,
+    health_socket_path: Option<std::path::PathBuf>,
+    health_port: Option<u16>,
+    ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
+    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
+    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
+    admitted_isolation_backend: Option<String>,
+    main_exit_marker: Option<std::path::PathBuf>,
+}
+
+/// Trusted composition chooses the setup before shared admission, policy, and
+/// lifecycle handling. Payload contents never select a backend implementation.
+#[allow(clippy::similar_names)]
+async fn run_sandbox_with_backend(
+    backend_setup: &dyn backend_setup::BackendSetup,
+    config: SandboxRunConfig,
+) -> Result<i32> {
+    let SandboxRunConfig {
+        command,
+        workdir,
+        timeout_secs,
+        interactive,
+        await_main_process_attachment,
+        sandbox_id,
+        sandbox,
+        openshell_endpoint,
+        policy_rules,
+        policy_data,
+        ssh_socket_path,
+        health_socket_path,
+        health_port,
+        ocsf_enabled,
+        ocsf_schema_version,
+        upstream_proxy_args,
+        backend_descriptor,
+        auth_bundle,
+        admitted_isolation_backend,
+        main_exit_marker,
+    } = config;
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -674,22 +756,27 @@ pub async fn run_sandbox(
     // and the policy poll loop that rotates them stay the same objects.
     let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
 
-    let runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
-        serde_json::from_slice(&backend_descriptor.payload)
-            .map_err(|error| miette::miette!("decode sandbox runtime descriptor: {error}"))?;
-    if auth_bundle.runtime_generation.as_str() != runtime_descriptor.generation {
-        return Err(miette::miette!(
-            "supervisor authentication bundle does not match runtime generation"
-        ));
-    }
+    let selected_backend = backend_setup::SelectedBackend::select(
+        backend_setup,
+        backend_descriptor,
+        admitted_isolation_backend.as_deref(),
+        sandbox_id.as_deref(),
+        &auth_bundle,
+    )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
-    let (image_yaml, invalid_image) =
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
-            runtime_descriptor.clone(),
-            sandbox_bearer.clone(),
-        )
-        .await
-        .map_err(|error| miette::miette!("discover workload image policy: {error}"))?;
+    // Startup joins the trace that created the sandbox when the driver passes
+    // one, and ends once the access plane is up.
+    let startup = tracing::info_span!(
+        "supervisor.startup",
+        sandbox.id = sandbox_id.as_deref().unwrap_or_default(),
+        otel.status_code = tracing::field::Empty,
+    );
+    openshell_otel::set_parent_from_environment(&startup);
+    let startup_status = startup.in_scope(openshell_otel::ErrorStatusGuard::current);
+    let (image_yaml, invalid_image) = selected_backend
+        .discover_policy(sandbox_bearer.clone())
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.discover_policy"))
+        .await?;
     let image_discovery = if invalid_image {
         ImagePolicyDiscovery::Invalid
     } else if let Some(yaml) = image_yaml {
@@ -701,13 +788,7 @@ pub async fn run_sandbox(
         ImagePolicyDiscovery::Missing
     };
 
-    let vm_policy_identity = runtime_descriptor
-        .resource_claims
-        .contains_key("vm.generation")
-        .then_some(VmPolicyIdentity {
-            uid: runtime_descriptor.workload_identity.uid,
-            gid: runtime_descriptor.workload_identity.gid,
-        });
+    let vm_policy_identity = selected_backend.vm_policy_identity();
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
@@ -735,6 +816,7 @@ pub async fn run_sandbox(
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
         },
     )
+    .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
     .await?;
 
     // Normalize the active driver's identity contract once, while both the
@@ -753,7 +835,10 @@ pub async fn run_sandbox(
         // This is done after loading the policy so the sandbox can still start
         // even if provider env fetch fails (graceful degradation).
         let environment = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id)
+                .instrument(startup.clone())
+                .await
+            {
                 Ok(result) => {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -823,44 +908,29 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    // The sandbox runtime uses the shared authenticated boundary protocol.
-    // The admitted backend name is resolved independently of the protected
-    // descriptor, and generic supervisor code never imports a driver crate.
-    let admitted_backend_name = admitted_isolation_backend.ok_or_else(|| {
-        miette::miette!("runtime descriptor supplied without an admitted isolation backend")
-    })?;
-    let session_id = runtime_descriptor.session_id;
+    // Construct the selected client only after shared policy and credential
+    // setup has completed. Keep live credentials and later CA publication in
+    // supervisor-owned handles shared with the backend.
+    let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let backend: Arc<dyn openshell_isolation_interface::contract::IsolationBackend> =
-        Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-            ca_file_paths.clone(),
-            provider_credentials.clone(),
-            sandbox_bearer,
-        ));
-    let mut registry = openshell_isolation_interface::contract::BackendRegistry::new();
-    registry
-        .register(backend)
-        .map_err(|error| miette::miette!(error.to_string()))?;
-    let (backend, verified) = registry
-        .resolve(backend_descriptor, &admitted_backend_name)
-        .map_err(|error| miette::miette!(error.to_string()))?;
-    let context = openshell_isolation_interface::contract::SandboxContext {
-        sandbox_id: sandbox_id.clone().unwrap_or_default(),
-        session_id,
-        policy: policy.clone(),
-        agent: openshell_isolation_interface::AgentSpec {
-            program,
-            args,
-            workdir: workspace,
-            timeout_secs,
-            interactive,
-        },
-        identity: runtime_descriptor.workload_identity,
-    };
-    let bound = backend
-        .attach(verified, context)
-        .await
-        .map_err(|error| miette::miette!(error.to_string()))?;
+    let bound = selected_backend
+        .attach(
+            backend_setup::BackendServices {
+                ca_file_paths: ca_file_paths.clone(),
+                provider_credentials: provider_credentials.clone(),
+                sandbox_bearer,
+            },
+            policy.clone(),
+            openshell_isolation_interface::AgentSpec {
+                program,
+                args,
+                workdir: workspace,
+                timeout_secs,
+                interactive,
+            },
+        )
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
+        .await?;
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
@@ -933,6 +1003,7 @@ pub async fn run_sandbox(
         let (bound, backend_name, ca_file_paths) = remote_boundary;
         let ready = bound
             .confirm()
+            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
@@ -1161,6 +1232,7 @@ pub async fn run_sandbox(
         let running = confirmed
             .into_boundary()
             .start_agent()
+            .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         workload_started_tx.send_replace(true);
@@ -1179,8 +1251,11 @@ pub async fn run_sandbox(
             agent.clone(),
             Some(supervisor_session_updates),
         )
+        .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
+        startup_status.finish(Ok::<_, ()>(())).ok();
+        drop(startup);
         let _provider_reporter =
             sandbox_id
                 .as_ref()
@@ -5014,6 +5089,60 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Admission must reject this input before any backend decodes its payload
+    /// or contacts a workload. Keep this fixture independent of setup helpers
+    /// so it can also reproduce the ordering defect on earlier revisions.
+    #[tokio::test]
+    async fn startup_rejects_missing_admission_before_decoding_payload() {
+        let auth_bundle = openshell_core::jwt::SupervisorAuthBundle {
+            session_id: openshell_core::SandboxSessionId::new(),
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "generation-1",
+            )
+            .expect("generation"),
+            session_rotation: openshell_core::jwt::SessionRotation::new(1).expect("rotation"),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("epoch"),
+            gateway_token: openshell_core::jwt::SecretJwt::parse("test-gateway-token")
+                .expect("token"),
+            gateway_expires_at: 0,
+            sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token")
+                .expect("token"),
+            sandbox_expires_at: 0,
+        };
+        let error = run_sandbox(
+            vec!["true".to_string()],
+            None,
+            0,
+            false,
+            false,
+            Some("sandbox-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(String::new())),
+            openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            openshell_isolation_interface::contract::BackendDescriptor {
+                backend_name: "in-process-test".to_string(),
+                payload: b"in-process-only-launch-data".to_vec(),
+            },
+            auth_bundle,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing admission cannot authorize startup");
+
+        assert_eq!(
+            error.to_string(),
+            "runtime descriptor supplied without an admitted isolation backend"
+        );
+    }
 
     fn effective_bool(value: bool) -> openshell_core::proto::EffectiveSetting {
         openshell_core::proto::EffectiveSetting {

@@ -20,6 +20,37 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
 
+### Trusted runtime image overrides
+
+Docker, Podman, and Kubernetes consume two gateway-owned trusted runtime
+images. Set complete tagged or digest-pinned OCI references for the gateway
+process when you need to qualify exact artifacts or use a registry mirror:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor:1.2.3
+```
+
+These settings follow the gateway's normal environment-over-file precedence:
+
+```text
+process environment > [openshell.drivers.<selected>] TOML > compiled release default
+```
+
+`openshell-gateway config preflight` and gateway startup use the same effective
+references. Environment values are handled exactly like the corresponding TOML
+fields and passed to the selected container runtime; this feature does not add
+separate OCI-reference validation. Configure registry credentials in Docker,
+Podman, or Kubernetes image-pull secrets instead of embedding them in a
+reference.
+
+The variables affect only the built-in Docker, Podman, and Kubernetes drivers.
+They do not affect VM, MXC, or extension drivers. They are trusted gateway
+operator inputs and are never accepted from sandbox create requests. For
+Debian and RPM user services, place them in
+`~/.config/openshell/gateway.env`; the service supplies that file to both
+preflight and gateway startup.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -343,6 +374,10 @@ The OpenTelemetry SDK logs export failures after startup. Spans in a failed batc
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Compute-driver operations appear as child spans. Internal reconciliation and driver-watch loops create operation roots because no inbound request supplies a parent, and credential refresh creates one only when a credential is due or needs cleanup. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Store operation spans, health endpoint spans, and spans for RPCs that sandbox supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`, including its peer-forwarded form) use DEBUG level. The default INFO filter does not export them. Set the gateway log level to `debug` to include them.
 
 The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
+
+Sandbox supervisors export spans to the same collector, so the endpoint must also be reachable from sandboxes.
+
+Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. Set the gateway or sandbox log level to `debug` to include them.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;

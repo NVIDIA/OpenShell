@@ -19,6 +19,12 @@ the release cycle. Use a stable release for production deployments.
 | Pre-release | Built nightly when `main` has changed and normal CI passes. Versions use the form `X.Y.Z-pre.N`. | Validating the immutable artifact set proposed for the next stable release. Pre-releases use the stable feature set but may not have passed qualification. |
 | Stable | Promoted from a pre-release that passes conformance, upgrade, API compatibility, artifact, and security checks. Versions use the form `X.Y.Z`. | Production use within this support matrix. |
 
+The tagged release pipeline publishes pre-release and stable artifacts only
+after its current qualification profile passes. Failed candidates retain build
+artifacts and qualification evidence in CI storage. The current profile covers
+part of the complete release qualification policy; passing it does not establish
+full RFC 0014 coverage.
+
 Tagged stable releases generally go out every week. OpenShell targets Tuesday
 publication when there are changes and every blocking qualification check
 passes. A security release may ship sooner.

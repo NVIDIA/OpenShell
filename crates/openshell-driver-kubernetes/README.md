@@ -17,8 +17,12 @@ workspace namespace modes via `workspace_mode`:
 - **Shared** (default): All sandboxes render into a single static namespace.
   Resource names use `{workspace}--{name}` for collision avoidance.
 - **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
-  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
-  and copies OpenShift SCC annotations from the gateway namespace when present.
+  (`openshell-{gateway_id}-{workspace_name}`) and creates a ServiceAccount in
+  each. On OpenShift, it leaves SCC annotations to the namespace allocator and
+  waits for the namespace's own MCS, UID-range, and supplemental-group
+  annotations before provisioning sandbox resources. An existing namespace with
+  a UID range but no MCS must be recreated so OpenShift can allocate a complete
+  set of SCC annotations.
 - **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
@@ -74,6 +78,12 @@ when the runtime blocks the required seccomp or Landlock operations.
 The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
+
+When the gateway exports OTLP traces, the driver sets
+`OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
+`TRACEPARENT` to the trace context of the operation that created the Pod. The
+supervisor exports its spans there and parents its startup span on that
+context. The endpoint is not configurable in driver TOML.
 
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
