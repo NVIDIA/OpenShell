@@ -33,7 +33,7 @@ e2e_run_openshell_conformance() {
   echo "==> Running CLI conformance tests against the ${gateway_label} gateway"
   cargo test \
     --locked \
-    --manifest-path "${root}/tests/suites/conformance/Cargo.toml" \
+    --manifest-path "${root}/e2e/suites/conformance/Cargo.toml" \
     --package openshell-test-conformance-cli \
     --no-fail-fast \
     -- \

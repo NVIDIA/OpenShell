@@ -12,6 +12,8 @@ description = "Check all Rust crates for errors"
 depends = ["rust:lockfiles:check"]
 run = [
   "cargo check --workspace",
+  "cargo check --locked --manifest-path e2e/support/rust/Cargo.toml --workspace --all-targets",
+  "cargo check --locked --manifest-path e2e/suites/conformance/Cargo.toml --workspace --all-targets",
   "cargo check -p openshell-sandbox --all-targets --features perf-harness",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check native"
@@ -28,6 +30,8 @@ description = "Lint Rust code with Clippy (deny warnings)"
 depends = ["rust:lockfiles:check"]
 run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --locked --manifest-path e2e/support/rust/Cargo.toml --workspace --all-targets -- -D warnings",
+  "cargo clippy --locked --manifest-path e2e/suites/conformance/Cargo.toml --workspace --all-targets -- -D warnings",
   "cargo clippy -p openshell-sandbox --all-targets --features perf-harness -- -D warnings",
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings",
@@ -40,6 +44,8 @@ hide = true
 description = "Format Rust code"
 run = [
   "cargo fmt --all",
+  "cargo fmt --manifest-path e2e/support/rust/Cargo.toml --all",
+  "cargo fmt --manifest-path e2e/suites/conformance/Cargo.toml --all",
   "cargo fmt --manifest-path e2e/rust/Cargo.toml --all",
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all",
@@ -50,6 +56,8 @@ hide = true
 description = "Check Rust formatting"
 run = [
   "cargo fmt --all -- --check",
+  "cargo fmt --manifest-path e2e/support/rust/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path e2e/suites/conformance/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check",

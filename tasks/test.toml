@@ -103,6 +103,8 @@ run = [
   # with test-only helpers enabled.
   "cargo test --workspace --exclude openshell-server",
   "cargo test -p openshell-server --features test-support",
+  "cargo test --locked --manifest-path e2e/support/rust/Cargo.toml",
+  "cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml --package openshell-test-conformance-cli --test policy_advisor draft_assertion::tests::",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
