@@ -4,20 +4,10 @@
 //! Retained I/O multiplexer for the canonical sandbox process.
 
 use std::collections::VecDeque;
-#[cfg(unix)]
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-#[cfg(unix)]
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-#[cfg(unix)]
-use nix::pty::Winsize;
-#[cfg(unix)]
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
@@ -27,17 +17,6 @@ use openshell_isolation_interface::contract::{
 };
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
-
-/// Canonical-process I/O retained by the supervisor session multiplexer.
-#[cfg(unix)]
-pub enum ProcessIo {
-    Pty(std::fs::File),
-    Pipes {
-        stdin: tokio::process::ChildStdin,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-    },
-}
 
 #[derive(Clone, Debug)]
 pub enum MainOutput {
@@ -197,15 +176,11 @@ impl MainOutputCursor {
 }
 
 pub struct MainSession {
-    #[cfg(unix)]
-    pid: u32,
     terminal: bool,
     input: tokio::sync::mpsc::Sender<Vec<u8>>,
     output: Arc<OutputLog>,
     input_owner: Mutex<Option<u64>>,
     next_owner: AtomicU64,
-    #[cfg(unix)]
-    pty_master: Option<Arc<std::fs::File>>,
     boundary_process: Option<Arc<dyn BoundaryProcess>>,
     boundary_terminal: Option<Arc<dyn BoundaryTerminal>>,
     readers_remaining: AtomicUsize,
@@ -226,15 +201,11 @@ impl MainSession {
     pub fn inert_with_input() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let (input, input_rx) = tokio::sync::mpsc::channel(64);
         let session = Arc::new(Self {
-            #[cfg(unix)]
-            pid: 1,
             terminal: false,
             input,
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
-            #[cfg(unix)]
-            pty_master: None,
             boundary_process: None,
             boundary_terminal: None,
             readers_remaining: AtomicUsize::new(0),
@@ -248,63 +219,6 @@ impl MainSession {
             terminal_attachments_done: Notify::new(),
         });
         (session, input_rx)
-    }
-
-    #[cfg(all(test, unix))]
-    pub fn terminal_for_test() -> (Arc<Self>, std::fs::File) {
-        let pty = nix::pty::openpty(None, None).expect("open test PTY");
-        let slave = std::fs::File::from(pty.slave);
-        (
-            Self::new(ProcessIo::Pty(std::fs::File::from(pty.master)), 1),
-            slave,
-        )
-    }
-
-    #[cfg(all(test, unix))]
-    #[allow(unsafe_code)]
-    pub fn terminal_size_for_test(&self) -> (u16, u16) {
-        let master = self.pty_master.as_ref().expect("terminal PTY master");
-        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut winsize) };
-        assert_eq!(result, 0, "read terminal dimensions");
-        (winsize.ws_col, winsize.ws_row)
-    }
-
-    #[must_use]
-    #[cfg(unix)]
-    pub fn new(io: ProcessIo, pid: u32) -> Arc<Self> {
-        let terminal = matches!(io, ProcessIo::Pty(_));
-        let (input, input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let pty_master = match &io {
-            ProcessIo::Pty(master) => {
-                set_nonblocking(master).expect("set canonical PTY master nonblocking");
-                master.try_clone().ok().map(Arc::new)
-            }
-            ProcessIo::Pipes { .. } => None,
-        };
-        let session = Arc::new(Self {
-            pid,
-            terminal,
-            input,
-            output: OutputLog::new(),
-            input_owner: Mutex::new(None),
-            next_owner: AtomicU64::new(1),
-            #[cfg(unix)]
-            pty_master,
-            boundary_process: None,
-            boundary_terminal: None,
-            readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
-            readers_done: Notify::new(),
-            finished: std::sync::atomic::AtomicBool::new(false),
-            terminal_attachments: Mutex::new(TerminalAttachmentState {
-                active: 0,
-                process_finished: false,
-                expectation: AttachmentExpectation::None,
-            }),
-            terminal_attachments_done: Notify::new(),
-        });
-        Self::start_io(&session, io, input_rx);
-        session
     }
 
     /// Build the control-side multiplexer around a boundary-owned admitted
@@ -324,15 +238,11 @@ impl MainSession {
         let terminal_mode = terminal.is_some();
         let (input, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let session = Arc::new(Self {
-            #[cfg(unix)]
-            pid: 0,
             terminal: terminal_mode,
             input,
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
-            #[cfg(unix)]
-            pty_master: None,
             boundary_process: Some(process),
             boundary_terminal: terminal,
             readers_remaining: AtomicUsize::new(if terminal_mode { 1 } else { 2 }),
@@ -384,100 +294,9 @@ impl MainSession {
         session
     }
 
-    #[cfg(unix)]
-    fn start_io(
-        this: &Arc<Self>,
-        io: ProcessIo,
-        mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    ) {
-        match io {
-            ProcessIo::Pty(master) => {
-                let master = Arc::new(AsyncFd::new(master).expect("register canonical PTY master"));
-                let reader = Arc::clone(&master);
-                let output = Arc::clone(this);
-                tokio::spawn(async move {
-                    let mut buffer = [0u8; 4096];
-                    loop {
-                        let Ok(mut ready) = reader.readable().await else {
-                            break;
-                        };
-                        match ready.try_io(|inner| {
-                            let mut file = inner.get_ref();
-                            file.read(&mut buffer)
-                        }) {
-                            Ok(Ok(0) | Err(_)) => break,
-                            Ok(Ok(read)) => output.publish(MainOutput::Stdout(
-                                Bytes::copy_from_slice(&buffer[..read]),
-                            )),
-                            Err(_would_block) => {}
-                        }
-                    }
-                    output.reader_finished();
-                });
-                tokio::spawn(async move {
-                    while let Some(data) = input_rx.recv().await {
-                        let mut remaining = data.as_slice();
-                        while !remaining.is_empty() {
-                            let Ok(mut ready) = master.writable().await else {
-                                return;
-                            };
-                            match ready.try_io(|inner| {
-                                let mut file = inner.get_ref();
-                                file.write(remaining)
-                            }) {
-                                Ok(Ok(0) | Err(_)) => return,
-                                Ok(Ok(written)) => remaining = &remaining[written..],
-                                Err(_would_block) => {}
-                            }
-                        }
-                    }
-                });
-            }
-            ProcessIo::Pipes {
-                mut stdin,
-                mut stdout,
-                mut stderr,
-            } => {
-                let stdout_session = Arc::clone(this);
-                tokio::spawn(async move {
-                    let mut buffer = [0u8; 4096];
-                    loop {
-                        match stdout.read(&mut buffer).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(read) => {
-                                stdout_session.publish(MainOutput::Stdout(Bytes::copy_from_slice(
-                                    &buffer[..read],
-                                )));
-                            }
-                        }
-                    }
-                    stdout_session.reader_finished();
-                });
-                let stderr_session = Arc::clone(this);
-                tokio::spawn(async move {
-                    let mut buffer = [0u8; 4096];
-                    loop {
-                        match stderr.read(&mut buffer).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(read) => {
-                                stderr_session.publish(MainOutput::Stderr(Bytes::copy_from_slice(
-                                    &buffer[..read],
-                                )));
-                            }
-                        }
-                    }
-                    stderr_session.reader_finished();
-                });
-                tokio::spawn(async move {
-                    while let Some(data) = input_rx.recv().await {
-                        if stdin.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = stdin.flush().await;
-                    }
-                });
-            }
-        }
+    #[cfg(all(test, unix))]
+    pub(crate) fn publish_test_output(&self, data: &'static [u8]) {
+        self.publish(MainOutput::Stdout(Bytes::from_static(data)));
     }
 
     fn publish(&self, event: MainOutput) {
@@ -660,7 +479,7 @@ impl MainSession {
         }
     }
 
-    pub async fn resize(&self, columns: u32, rows: u32, pixel_width: u32, pixel_height: u32) {
+    pub async fn resize(&self, columns: u32, rows: u32, _pixel_width: u32, _pixel_height: u32) {
         if let Some(terminal) = self.boundary_terminal.as_ref() {
             let _ = terminal
                 .resize(
@@ -668,67 +487,19 @@ impl MainSession {
                     u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
                 )
                 .await;
-            return;
-        }
-        #[cfg(not(unix))]
-        let _ = (columns, rows, pixel_width, pixel_height);
-        #[cfg(unix)]
-        {
-            let Some(master) = self.pty_master.as_ref() else {
-                return;
-            };
-            let winsize = Winsize {
-                ws_row: u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
-                ws_col: u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
-                ws_xpixel: u16::try_from(pixel_width).unwrap_or(u16::MAX),
-                ws_ypixel: u16::try_from(pixel_height).unwrap_or(u16::MAX),
-            };
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
-            }
         }
     }
 
-    /// Preserve the local Unix signal surface, including SIGQUIT.
-    #[cfg(unix)]
-    pub async fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
-        if self.boundary_process.is_some() {
-            let boundary_signal = match signal {
-                nix::sys::signal::Signal::SIGHUP => BoundarySignal::Hup,
-                nix::sys::signal::Signal::SIGINT => BoundarySignal::Int,
-                nix::sys::signal::Signal::SIGKILL => BoundarySignal::Kill,
-                nix::sys::signal::Signal::SIGTERM => BoundarySignal::Term,
-                other => return Err(format!("boundary signal {other:?} is unsupported")),
-            };
-            return self.signal_boundary_group(boundary_signal).await;
-        }
-        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
-            .map_err(|error| error.to_string())
-    }
-
+    /// Delegate process-group signaling to the isolation backend.
     pub async fn signal_boundary_group(&self, signal: BoundarySignal) -> Result<(), String> {
-        if let Some(process) = self.boundary_process.as_ref() {
-            return process
-                .signal(signal)
-                .await
-                .map_err(|error| error.to_string());
-        }
-        #[cfg(unix)]
-        {
-            let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
-            let signal = match signal {
-                BoundarySignal::Hup => nix::sys::signal::Signal::SIGHUP,
-                BoundarySignal::Int => nix::sys::signal::Signal::SIGINT,
-                BoundarySignal::Kill => nix::sys::signal::Signal::SIGKILL,
-                BoundarySignal::Term => nix::sys::signal::Signal::SIGTERM,
-            };
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
-                .map_err(|error| error.to_string())
-        }
-        #[cfg(not(unix))]
-        Err("local process-group signaling is unsupported on Windows".to_string())
+        let process = self
+            .boundary_process
+            .as_ref()
+            .ok_or_else(|| "no boundary process is attached".to_string())?;
+        process
+            .signal(signal)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[must_use]
@@ -740,17 +511,6 @@ impl MainSession {
     pub fn finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
-}
-
-#[cfg(unix)]
-fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
-    let flags = fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)?;
-    let flags = OFlag::from_bits_truncate(flags);
-    fcntl(
-        file.as_raw_fd(),
-        FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -998,45 +758,15 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn terminal_pump_reads_output_and_writes_input() {
-        let (session, mut slave) = MainSession::terminal_for_test();
-        set_nonblocking(&slave).expect("set test PTY slave nonblocking");
-        let mut output = session.subscribe();
-
-        slave
-            .write_all(b"process output")
-            .expect("write PTY output");
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
-            .await
-            .expect("PTY output timed out")
-            .expect("PTY output was retained");
-        assert!(matches!(
-            event,
-            MainOutput::Stdout(data) if data == b"process output"[..]
-        ));
-
-        let (owner, input) = session.acquire_input().expect("acquire PTY input");
-        input
-            .send(b"client input\n".to_vec())
-            .await
-            .expect("queue PTY input");
-        let mut received = [0; 64];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                match slave.read(&mut received) {
-                    Ok(read) => break read,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("read PTY input: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("PTY input timed out");
-        assert_eq!(&received[..read], b"client input\n");
-        session.release_input(owner);
+    async fn signaling_without_boundary_is_rejected() {
+        let session = MainSession::inert();
+        assert_eq!(
+            session
+                .signal_boundary_group(BoundarySignal::Term)
+                .await
+                .unwrap_err(),
+            "no boundary process is attached"
+        );
     }
 }

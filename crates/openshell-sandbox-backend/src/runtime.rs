@@ -70,9 +70,20 @@ fn begin_recovery_window(
     *deadline.get_or_insert(failure_time + CONNECT_RETRY_TIMEOUT)
 }
 
+/// Backend-owned raw transport establishment; shared code still authenticates
+/// the resulting stream with generation-pinned TLS and Sandbox Protocol JWTs.
+#[async_trait]
+pub trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
+    async fn connect(
+        &self,
+        descriptor: &SandboxRuntimeDescriptor,
+    ) -> Result<BoundaryDuplexStream, BackendError>;
+}
+
 /// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
+    connector: Option<Arc<dyn BoundaryTransportConnector>>,
     audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
@@ -85,7 +96,16 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
-        let client = BoundaryClient::new(descriptor, bearer);
+        Self::discover_policy_with_connector(descriptor, bearer, None).await
+    }
+
+    pub async fn discover_policy_with_connector(
+        descriptor: SandboxRuntimeDescriptor,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        connector: Option<Arc<dyn BoundaryTransportConnector>>,
+    ) -> Result<(Option<String>, bool), BackendError> {
+        let mut client = BoundaryClient::new(descriptor, bearer);
+        client.connector = connector;
         match client.call_idempotent(Request::DiscoverPolicy).await? {
             Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
             _ => Err(BackendError::Descriptor(
@@ -100,11 +120,21 @@ impl OpenShellRuntimeBackend {
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
+            connector: None,
             audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
         }
+    }
+
+    #[must_use]
+    pub fn with_transport_connector(
+        mut self,
+        connector: Arc<dyn BoundaryTransportConnector>,
+    ) -> Self {
+        self.connector = Some(connector);
+        self
     }
 
     /// Select the backend implementation that validates opaque audit evidence.
@@ -139,10 +169,9 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
         let outer_fence = runtime_descriptor.outer_fence.clone();
-        let client = Arc::new(BoundaryClient::new(
-            runtime_descriptor,
-            self.sandbox_bearer.clone(),
-        ));
+        let mut client = BoundaryClient::new(runtime_descriptor, self.sandbox_bearer.clone());
+        client.connector = self.connector.clone();
+        let client = Arc::new(client);
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
@@ -1096,6 +1125,7 @@ async fn dispatch_client_mediation_frame(
 }
 
 struct BoundaryClient {
+    connector: Option<Arc<dyn BoundaryTransportConnector>>,
     runtime_descriptor: SandboxRuntimeDescriptor,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -1259,6 +1289,7 @@ impl BoundaryClient {
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
         Self {
+            connector: None,
             runtime_descriptor,
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
@@ -1880,6 +1911,7 @@ impl BoundaryClient {
         &self,
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
+        let connector = self.connector.clone();
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
         let endpoint =
@@ -1893,6 +1925,7 @@ impl BoundaryClient {
         let channel = endpoint
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let runtime_descriptor = runtime_descriptor.clone();
+                let connector = connector.clone();
                 let abort = connector_transport.clone();
                 async move {
                     // A channel is one authenticated connection. Never let it
@@ -1900,7 +1933,7 @@ impl BoundaryClient {
                     if abort.is_aborted() || abort.connected.swap(true, Ordering::AcqRel) {
                         return Err(AbortableTransport::aborted_error());
                     }
-                    connect_boundary_with_retry(&runtime_descriptor)
+                    connect_boundary_with_retry(&runtime_descriptor, connector.clone())
                         .await
                         .map(|inner| TokioIo::new(AbortableTransport { inner, abort }))
                         .map_err(|error| std::io::Error::other(error.to_string()))
@@ -1921,10 +1954,11 @@ impl BoundaryClient {
 
 async fn connect_boundary_with_retry(
     runtime_descriptor: &SandboxRuntimeDescriptor,
+    connector: Option<Arc<dyn BoundaryTransportConnector>>,
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
     loop {
-        match connect_boundary_once(runtime_descriptor).await {
+        match connect_boundary_using_connector(runtime_descriptor, connector.as_deref()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
@@ -1932,41 +1966,53 @@ async fn connect_boundary_with_retry(
     }
 }
 
+#[cfg(test)]
 async fn connect_boundary_once(
     runtime_descriptor: &SandboxRuntimeDescriptor,
 ) -> Result<BoundaryDuplexStream, BackendError> {
-    let stream: BoundaryDuplexStream = match &runtime_descriptor.transport {
-        #[cfg(unix)]
-        SandboxTransport::Unix { socket_path } => {
-            let stream = UnixStream::connect(socket_path).await.map_err(|error| {
-                BackendError::Unavailable(format!(
-                    "connect to mapped boundary control socket {}: {error}",
-                    socket_path.display()
-                ))
-            })?;
-            Box::new(stream)
-        }
-        #[cfg(not(unix))]
-        SandboxTransport::Unix { .. } => {
-            return Err(BackendError::Unavailable(
-                "Unix boundary transport requires a Unix host".to_string(),
-            ));
-        }
-        SandboxTransport::Tcp {
-            authority,
-            addresses,
-        } => {
-            let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addresses)
-                .await
-                .map_err(|error| {
+    connect_boundary_using_connector(runtime_descriptor, None).await
+}
+
+async fn connect_boundary_using_connector(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+    connector: Option<&dyn BoundaryTransportConnector>,
+) -> Result<BoundaryDuplexStream, BackendError> {
+    let stream: BoundaryDuplexStream = if let Some(connector) = connector {
+        connector.connect(runtime_descriptor).await?
+    } else {
+        match &runtime_descriptor.transport {
+            #[cfg(unix)]
+            SandboxTransport::Unix { socket_path } => {
+                let stream = UnixStream::connect(socket_path).await.map_err(|error| {
                     BackendError::Unavailable(format!(
-                        "connect to boundary TLS endpoint {authority}: {error}"
+                        "connect to mapped boundary control socket {}: {error}",
+                        socket_path.display()
                     ))
                 })?;
-            enable_boundary_tcp_keepalive(&stream);
-            Box::new(stream)
+                Box::new(stream)
+            }
+            #[cfg(not(unix))]
+            SandboxTransport::Unix { .. } => {
+                return Err(BackendError::Unavailable(
+                    "Unix boundary transport requires a Unix host".to_string(),
+                ));
+            }
+            SandboxTransport::Tcp {
+                authority,
+                addresses,
+            } => {
+                let stream = openshell_core::net::connect_tcp_nodelay_best_effort(addresses)
+                    .await
+                    .map_err(|error| {
+                        BackendError::Unavailable(format!(
+                            "connect to boundary TLS endpoint {authority}: {error}"
+                        ))
+                    })?;
+                enable_boundary_tcp_keepalive(&stream);
+                Box::new(stream)
+            }
+            SandboxTransport::Vsock { guest_cid, port } => connect_host_vsock(*guest_cid, *port)?,
         }
-        SandboxTransport::Vsock { guest_cid, port } => connect_host_vsock(*guest_cid, *port)?,
     };
     let tls = &runtime_descriptor.tls;
     let server_name =
@@ -3161,6 +3207,83 @@ mod tests {
             }
         );
         server.abort();
+    }
+
+    #[derive(Debug)]
+    struct ReverseTestConnector(tokio::net::TcpListener);
+
+    #[async_trait]
+    impl BoundaryTransportConnector for ReverseTestConnector {
+        async fn connect(
+            &self,
+            _: &SandboxRuntimeDescriptor,
+        ) -> Result<BoundaryDuplexStream, BackendError> {
+            let (stream, _) = self
+                .0
+                .accept()
+                .await
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            Ok(Box::new(stream))
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_reverse_transport_preserves_tls_and_bearer_authentication() {
+        let certificate = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = Arc::new(ReverseTestConnector(listener));
+        let server = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            serve_test_grpc(Box::new(stream), "a".repeat(32)).await;
+        });
+        let mut client = BoundaryClient::new(
+            tls_runtime_descriptor(address, certificate.client_tls),
+            test_bearer(&"a".repeat(32)),
+        );
+        client.connector = Some(connector);
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), client.exchange(Request::Confirm))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            response,
+            Response::Confirmed {
+                confirmation: Box::new(test_confirmation())
+            }
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_transport_cannot_bypass_tls_peer_verification() {
+        let server_certificate = test_certificate();
+        let different_trust = test_certificate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = ReverseTestConnector(listener);
+        let server = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(server_certificate.server_config)
+                .accept(stream)
+                .await;
+        });
+        let descriptor = tls_runtime_descriptor(address, different_trust.client_tls);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_boundary_using_connector(&descriptor, Some(&connector))
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

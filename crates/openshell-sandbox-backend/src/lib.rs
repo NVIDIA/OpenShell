@@ -14,7 +14,7 @@ pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
 
-pub use runtime::OpenShellRuntimeBackend;
+pub use runtime::{BoundaryTransportConnector, OpenShellRuntimeBackend};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = "openshell-sandbox";

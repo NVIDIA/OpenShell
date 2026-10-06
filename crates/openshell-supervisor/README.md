@@ -34,8 +34,10 @@ readiness guard closes the listener. A requested Unix readiness endpoint fails
 explicitly on unsupported hosts, even before session acceptance.
 
 The optional Unix SSH adapter remains separate from boundary-based process I/O.
-Local Unix process signaling retains its existing signal surface, including
-`SIGQUIT`. Remote signals use the backend-neutral `BoundarySignal` contract.
+The process-access multiplexer consumes boundary-provided streams and delegates
+terminal resizing and signals through the existing isolation contract. It does
+not own local PIDs, PTYs, or process-group signaling; native process operations
+belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
