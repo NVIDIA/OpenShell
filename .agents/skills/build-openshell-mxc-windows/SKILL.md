@@ -26,6 +26,10 @@ checks and tests. Their gateway session, boundary attachment, and TCP readiness
 are portable; only the optional Unix SSH/readiness socket adapters are gated.
 This is compile and control-plane coverage, not Windows isolation qualification.
 Preserve readiness gating on authenticated gateway acceptance and reconnection.
+The supervisor process-access multiplexer consumes boundary-provided streams;
+do not restore local PID, PTY, or process-group operations there. Native process
+mechanics belong to the sandbox or isolation backend. Keep the optional Unix
+SSH access adapter separate from portable session orchestration.
 Shared Sandbox Protocol audit validation defaults to strict Linux evidence;
 concrete platform validators must be selected by the implementing backend.
 

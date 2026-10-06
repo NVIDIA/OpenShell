@@ -5136,7 +5136,6 @@ dependencies = [
  "hex",
  "libc",
  "miette",
- "nix 0.29.0",
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
