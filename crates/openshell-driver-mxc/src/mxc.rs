@@ -266,6 +266,18 @@ impl WxcExecInvoker {
         self.mock
     }
 
+    fn real_command(&self) -> Command {
+        let mut command = Command::new(&self.exec_path);
+        command
+            // Both processes in the runtime pair must die if their monitor is
+            // cancelled, not only when it takes the explicit shutdown branch.
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
     /// Launch the real boundary runtime without OS isolation for wiring tests.
     /// Filesystem denial must be tested with real MXC, not this mock.
     fn mock_spawn_with_grants(
@@ -368,13 +380,8 @@ impl WxcExecInvoker {
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
-        let mut cmd = Command::new(&self.exec_path);
-        cmd.arg("--config-base64")
-            .arg(&b64)
-            // Retain child output so the gateway can surface sandbox logs.
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        let mut cmd = self.real_command();
+        cmd.arg("--config-base64").arg(&b64);
         if self.debug {
             cmd.arg("--debug");
         }
@@ -390,6 +397,43 @@ impl WxcExecInvoker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[allow(unsafe_code)] // Native synchronization handle verifies cancellation.
+    async fn real_launcher_command_terminates_on_drop() {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // Exercise the real launcher's command construction with a native,
+        // long-lived process. This is not an MXC enforcement test or mock E2E.
+        let powershell = PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let invoker = WxcExecInvoker::new(powershell, false);
+        let child = invoker
+            .real_command()
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
+            .spawn()
+            .expect("launch long-lived PowerShell process");
+        // SAFETY: OpenProcess supplies a synchronization-only handle for the
+        // child, retained through termination and closed exactly once below.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, false, child.id().unwrap())
+                .expect("open child synchronization handle");
+            assert_eq!(WaitForSingleObject(handle, 0), WAIT_TIMEOUT);
+            drop(child);
+            let exited = WaitForSingleObject(handle, 5_000);
+            CloseHandle(handle).expect("close child handle");
+            assert_eq!(exited, WAIT_OBJECT_0, "cancelled launcher must terminate");
+        }
+    }
 
     #[test]
     fn oneshot_processcontainer_config_json_shape() {

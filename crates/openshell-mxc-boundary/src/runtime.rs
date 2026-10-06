@@ -46,6 +46,7 @@ const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_REPLAY_ENTRIES: usize = 4096;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run_boundary(config_path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(config_path)
@@ -176,14 +177,15 @@ async fn serve_grpc(
     connection_id: SandboxConnectionId,
 ) -> Result<(), String> {
     let (connection_shutdown, mut connection_closed) = tokio::sync::watch::channel(());
+    let connection_expiry = Arc::new(ConnectionExpiry::new(connection_shutdown.clone()));
     runtime.register_connection(connection_id, connection_shutdown.clone());
     let incoming = tokio_stream::StreamExt::chain(
         tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
             stream,
-            _connection_alive: connection_shutdown,
             _disconnect: DisconnectGuard {
                 runtime: Arc::downgrade(&runtime),
                 connection_id,
+                connection_shutdown,
             },
         })]),
         tokio_stream::pending(),
@@ -194,6 +196,8 @@ async fn serve_grpc(
         .add_service(IsolationBoundaryServer::new(GrpcBoundaryService {
             runtime: runtime.clone(),
             connection_id,
+            connection_expiry,
+            connection_closed: connection_closed.clone(),
         }))
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = connection_closed.changed().await;
@@ -205,17 +209,21 @@ async fn serve_grpc(
 
 struct GrpcServerIo {
     stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
-    _connection_alive: tokio::sync::watch::Sender<()>,
     _disconnect: DisconnectGuard,
 }
 
 struct DisconnectGuard {
     runtime: std::sync::Weak<BoundaryRuntime>,
     connection_id: SandboxConnectionId,
+    connection_shutdown: tokio::sync::watch::Sender<()>,
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
+        // Expiry owns a sender too, so dropping the physical socket alone no
+        // longer closes the watch channel. Wake the server and every exchange
+        // explicitly, including a discovery connection before attachment.
+        let _ = self.connection_shutdown.send(());
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.transport_disconnected(self.connection_id);
         }
@@ -259,9 +267,64 @@ impl tonic::transport::server::Connected for GrpcServerIo {
 struct GrpcBoundaryService {
     runtime: Arc<BoundaryRuntime>,
     connection_id: SandboxConnectionId,
+    connection_expiry: Arc<ConnectionExpiry>,
+    connection_closed: tokio::sync::watch::Receiver<()>,
 }
 
 type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
+
+// Match the Linux boundary: renewed RPC credentials update the physical
+// connection deadline, and expiry cancels every open exchange on it.
+struct ConnectionExpiry {
+    deadline: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
+    worker: tokio::task::AbortHandle,
+}
+
+impl ConnectionExpiry {
+    fn new(connection_shutdown: tokio::sync::watch::Sender<()>) -> Self {
+        let (deadline, mut updates) = tokio::sync::watch::channel(None);
+        let worker = tokio::spawn(async move {
+            loop {
+                let deadline = *updates.borrow_and_update();
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(deadline) => {
+                            let _ = connection_shutdown.send(());
+                            return;
+                        }
+                        result = updates.changed() => {
+                            if result.is_err() { return; }
+                        }
+                    }
+                } else if updates.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .abort_handle();
+        Self { deadline, worker }
+    }
+
+    fn update(&self, expires_at: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        self.deadline.send_replace((expires_at != 0).then(|| {
+            tokio::time::Instant::now()
+                + Duration::from_secs(
+                    u64::try_from(expires_at)
+                        .unwrap_or_default()
+                        .saturating_sub(now),
+                )
+        }));
+    }
+}
+
+impl Drop for ConnectionExpiry {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
 
 #[tonic::async_trait]
 impl IsolationBoundary for GrpcBoundaryService {
@@ -275,11 +338,21 @@ impl IsolationBoundary for GrpcBoundaryService {
         let principal = self
             .runtime
             .authenticate_request(self.connection_id, request.metadata())?;
-        let (stream, response) = bridge_grpc_stream(request.into_inner());
+        self.connection_expiry
+            .update(principal.session().expires_at);
+        let (stream, response) =
+            bridge_grpc_stream(request.into_inner(), self.connection_closed.clone());
         let runtime = self.runtime.clone();
+        let mut connection_closed = self.connection_closed.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_one(stream, runtime, principal).await {
-                tracing::warn!(%error, "MXC Sandbox Protocol exchange failed");
+            tokio::select! {
+                biased;
+                _ = connection_closed.changed() => {}
+                result = serve_one(stream, runtime, principal) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "MXC Sandbox Protocol exchange failed");
+                    }
+                }
             }
         });
         Ok(tonic::Response::new(response))
@@ -299,39 +372,57 @@ impl IsolationBoundary for GrpcBoundaryService {
 }
 
 fn bridge_grpc_stream(
-    mut inbound: tonic::Streaming<BoundaryChunk>,
+    mut inbound: impl tokio_stream::Stream<Item = Result<BoundaryChunk, tonic::Status>>
+    + Send
+    + Unpin
+    + 'static,
+    connection_closed: tokio::sync::watch::Receiver<()>,
 ) -> (tokio::io::DuplexStream, GrpcResponseStream) {
     let (application, bridge) = tokio::io::duplex(256 * 1024);
     let (mut reader, mut writer) = tokio::io::split(bridge);
     let (outbound, outbound_rx) = tokio::sync::mpsc::channel(64);
+    let mut inbound_closed = connection_closed.clone();
     tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(chunk)) if writer.write_all(&chunk.data).await.is_ok() => {}
-                Ok(Some(_)) | Err(_) => return,
-                Ok(None) => {
-                    let _ = writer.shutdown().await;
-                    return;
+        tokio::select! {
+            biased;
+            _ = inbound_closed.changed() => {}
+            () = async {
+                loop {
+                    match tokio_stream::StreamExt::next(&mut inbound).await {
+                        Some(Ok(chunk)) if writer.write_all(&chunk.data).await.is_ok() => {}
+                        Some(Ok(_) | Err(_)) => return,
+                        None => {
+                            let _ = writer.shutdown().await;
+                            return;
+                        }
+                    }
                 }
-            }
+            } => {}
         }
     });
+    let mut outbound_closed = connection_closed;
     tokio::spawn(async move {
-        let mut buffer = vec![0_u8; 16 * 1024];
-        loop {
-            let Ok(read) = reader.read(&mut buffer).await else {
-                return;
-            };
-            if read == 0
-                || outbound
-                    .send(Ok(BoundaryChunk {
-                        data: buffer[..read].to_vec(),
-                    }))
-                    .await
-                    .is_err()
-            {
-                return;
-            }
+        tokio::select! {
+            biased;
+            _ = outbound_closed.changed() => {}
+            () = async {
+                let mut buffer = vec![0_u8; 16 * 1024];
+                loop {
+                    let Ok(read) = reader.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0
+                        || outbound
+                            .send(Ok(BoundaryChunk {
+                                data: buffer[..read].to_vec(),
+                            }))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            } => {}
         }
     });
     (application, ReceiverStream::new(outbound_rx))
@@ -363,6 +454,7 @@ struct BoundaryRuntime {
     processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
     main_process: Mutex<Option<String>>,
     provider_environment: Mutex<(u64, HashMap<String, String>, u64)>,
+    ca_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     replay: Mutex<HashMap<String, ReplayRecord>>,
     replay_order: Mutex<VecDeque<String>>,
     exec_requests: Mutex<HashSet<String>>,
@@ -406,6 +498,7 @@ impl BoundaryRuntime {
             processes: Mutex::new(HashMap::new()),
             main_process: Mutex::new(None),
             provider_environment: Mutex::new((0, HashMap::new(), 0)),
+            ca_paths: Mutex::new(None),
             replay: Mutex::new(HashMap::new()),
             replay_order: Mutex::new(VecDeque::new()),
             exec_requests: Mutex::new(HashSet::new()),
@@ -736,26 +829,21 @@ impl BoundaryRuntime {
                 return guest_error(BoundaryErrorKind::Denied, "MXC start policy changed");
             }
         }
-        let mut environment = self.config.child_env.clone();
-        environment.extend(provider_env.clone());
-        if let Some(proxy_url) = &self.config.direct_proxy_url {
-            for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
-                environment.insert(key.to_string(), proxy_url.clone());
-            }
-            environment.insert("NO_PROXY".to_string(), String::new());
-            environment.insert("no_proxy".to_string(), String::new());
-        }
-        match install_ca_material(
+        let ca_paths = match install_ca_material(
             &self.config.generation,
             ca_cert.as_deref().map(str::as_bytes),
             ca_bundle.as_deref().map(str::as_bytes),
         ) {
-            Ok(Some((certificate, bundle))) => {
-                install_ca_environment(&mut environment, &certificate, &bundle);
-            }
-            Ok(None) => {}
+            Ok(paths) => paths,
             Err(error) => return guest_error(BoundaryErrorKind::Process, error),
-        }
+        };
+        let environment = workload_environment(
+            &self.config.child_env,
+            provider_env,
+            &[],
+            &self.proxy_url,
+            ca_paths.as_ref(),
+        );
         let process_id = format!("{}:main:0", self.config.generation);
         let (program, args) = agent_command(spec.clone());
         let process = match ManagedProcess::spawn(
@@ -773,6 +861,7 @@ impl BoundaryRuntime {
         };
         lock(&self.processes).insert(process_id.clone(), process);
         *lock(&self.main_process) = Some(process_id.clone());
+        *lock(&self.ca_paths) = ca_paths;
         *lock(&self.provider_environment) = (*provider_env_revision, provider_env.clone(), 0);
         *lock(&self.lifecycle) = Lifecycle::Running;
         let response = Response::Started {
@@ -811,9 +900,13 @@ impl BoundaryRuntime {
             self.config.generation,
             self.next_exec.fetch_add(1, Ordering::Relaxed)
         );
-        let mut environment = self.config.child_env.clone();
-        environment.extend(lock(&self.provider_environment).1.clone());
-        environment.extend(spec.env.iter().cloned());
+        let environment = workload_environment(
+            &self.config.child_env,
+            &lock(&self.provider_environment).1,
+            &spec.env,
+            &self.proxy_url,
+            lock(&self.ca_paths).as_ref(),
+        );
         let process = match ManagedProcess::spawn(
             id.clone(),
             ProcessKindWire::Exec,
@@ -1097,6 +1190,31 @@ fn install_ca_environment(
     }
 }
 
+fn workload_environment(
+    child: &HashMap<String, String>,
+    providers: &HashMap<String, String>,
+    overrides: &[(String, String)],
+    proxy_url: &str,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+) -> HashMap<String, String> {
+    let mut environment = child.clone();
+    environment.extend(providers.clone());
+    environment.extend(overrides.iter().cloned());
+    for (key, value) in [
+        ("HTTP_PROXY", proxy_url),
+        ("HTTPS_PROXY", proxy_url),
+        ("NO_PROXY", ""),
+    ] {
+        environment.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        environment.insert(key.to_string(), value.to_string());
+        environment.insert(key.to_ascii_lowercase(), value.to_string());
+    }
+    if let Some((certificate, bundle)) = ca_paths {
+        install_ca_environment(&mut environment, certificate, bundle);
+    }
+    environment
+}
+
 fn install_ca_material(
     generation: &str,
     certificate: Option<&[u8]>,
@@ -1125,6 +1243,27 @@ struct ManagedProcess {
     output: Arc<OutputLog>,
     exit: tokio::sync::watch::Receiver<Option<ExitStatusWire>>,
     attached: Arc<AtomicBool>,
+}
+
+async fn drain_output(readers: &mut [tokio::task::JoinHandle<()>; 2]) {
+    // A descendant can inherit the pipes after its parent exits. Bound the
+    // drain, then stop readers before publishing EXIT so no data follows it.
+    let drained = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+        for reader in readers.iter_mut() {
+            let _ = reader.await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        for reader in readers.iter() {
+            reader.abort();
+        }
+        for reader in readers.iter_mut() {
+            if !reader.is_finished() {
+                let _ = reader.await;
+            }
+        }
+    }
 }
 
 impl ManagedProcess {
@@ -1162,8 +1301,10 @@ impl ManagedProcess {
             .take()
             .ok_or_else(|| "MXC workload stderr pipe is unavailable".to_string())?;
         let output = OutputLog::new();
-        output.spawn_reader(stdout, STREAM_STDOUT);
-        output.spawn_reader(stderr, STREAM_STDERR);
+        let readers = [
+            output.spawn_reader(stdout, STREAM_STDOUT),
+            output.spawn_reader(stderr, STREAM_STDERR),
+        ];
         let (exit_tx, exit) = tokio::sync::watch::channel(None);
         let process = Self {
             id,
@@ -1174,11 +1315,15 @@ impl ManagedProcess {
             exit,
             attached: Arc::new(AtomicBool::new(false)),
         };
-        process.start_monitor(exit_tx);
+        process.start_monitor(exit_tx, readers);
         Ok(process)
     }
 
-    fn start_monitor(&self, exit_tx: tokio::sync::watch::Sender<Option<ExitStatusWire>>) {
+    fn start_monitor(
+        &self,
+        exit_tx: tokio::sync::watch::Sender<Option<ExitStatusWire>>,
+        mut readers: [tokio::task::JoinHandle<()>; 2],
+    ) {
         let child = self.child.clone();
         let output = self.output.clone();
         tokio::spawn(async move {
@@ -1190,6 +1335,7 @@ impl ManagedProcess {
                 match result {
                     Ok(Some(status)) => {
                         let status = ExitStatusWire::Exited(status.code().unwrap_or(1));
+                        drain_output(&mut readers).await;
                         output.publish_exit(status);
                         exit_tx.send_replace(Some(status));
                         return;
@@ -1197,6 +1343,7 @@ impl ManagedProcess {
                     Ok(None) => tokio::time::sleep(Duration::from_millis(25)).await,
                     Err(_) => {
                         let status = ExitStatusWire::Exited(1);
+                        drain_output(&mut readers).await;
                         output.publish_exit(status);
                         exit_tx.send_replace(Some(status));
                         return;
@@ -1295,7 +1442,7 @@ impl OutputLog {
         self: &Arc<Self>,
         mut reader: impl tokio::io::AsyncRead + Send + Unpin + 'static,
         channel: u8,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let output = self.clone();
         tokio::spawn(async move {
             let mut buffer = vec![0_u8; 16 * 1024];
@@ -1305,7 +1452,7 @@ impl OutputLog {
                     Ok(read) => output.publish(channel, buffer[..read].to_vec()),
                 }
             }
-        });
+        })
     }
 
     fn publish_exit(&self, status: ExitStatusWire) {
@@ -1405,7 +1552,7 @@ async fn bridge_process(
     let _guard = process.acquire_attachment()?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let input_process = process.clone();
-    let mut input = tokio::spawn(async move {
+    let input = async move {
         while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
             match channel {
                 STREAM_STDIN => {
@@ -1428,14 +1575,13 @@ async fn bridge_process(
             }
         }
         Ok::<(), io::Error>(())
-    });
+    };
+    tokio::pin!(input);
     let mut cursor = process.output.cursor();
     loop {
         tokio::select! {
             result = &mut input => {
-                return result
-                    .map_err(|error| format!("join MXC process input: {error}"))?
-                    .map_err(|error| format!("read MXC process input: {error}"));
+                return result.map_err(|error| format!("read MXC process input: {error}"));
             }
             event = cursor.recv() => {
                 let Some(event) = event else { return Ok(()) };
@@ -1485,6 +1631,117 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_environment_keeps_proxy_and_ca_with_refreshed_providers() {
+        let ca_paths = (
+            PathBuf::from(r"C:\trusted\ca.pem"),
+            PathBuf::from(r"C:\trusted\bundle.pem"),
+        );
+        let child = HashMap::from([("BASE".into(), "bootstrap".into())]);
+        let providers = HashMap::from([("TOKEN".into(), "refreshed".into())]);
+        let overrides = vec![
+            ("OTHER".into(), "exec".into()),
+            ("Https_Proxy".into(), "http://untrusted".into()),
+            ("ssl_cert_file".into(), "untrusted-ca".into()),
+        ];
+        let proxy = "http://user:secret@127.0.0.1:3128";
+        let environment =
+            workload_environment(&child, &providers, &overrides, proxy, Some(&ca_paths));
+        for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            assert_eq!(environment[key], proxy);
+        }
+        assert_eq!(environment["NO_PROXY"], "");
+        assert_eq!(
+            environment["SSL_CERT_FILE"],
+            ca_paths.1.display().to_string()
+        );
+        assert_eq!(
+            environment["NODE_EXTRA_CA_CERTS"],
+            ca_paths.0.display().to_string()
+        );
+        assert!(!environment.contains_key("Https_Proxy"));
+        assert!(!environment.contains_key("ssl_cert_file"));
+        assert_eq!(environment["TOKEN"], "refreshed");
+        assert_eq!(environment["BASE"], "bootstrap");
+        assert_eq!(environment["OTHER"], "exec");
+        assert!(
+            !workload_environment(&child, &HashMap::new(), &[], proxy, Some(&ca_paths))
+                .contains_key("TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_expiry_closes_the_authenticated_connection() {
+        let (shutdown, mut closed) = tokio::sync::watch::channel(());
+        let expiry = ConnectionExpiry::new(shutdown);
+        expiry.update(1); // Already expired: terminate immediately.
+        tokio::time::timeout(Duration::from_secs(2), closed.changed())
+            .await
+            .expect("expiry fires")
+            .expect("shutdown notification");
+    }
+
+    #[tokio::test]
+    async fn expired_connection_cancels_idle_exchange_streams() {
+        let (shutdown, closed) = tokio::sync::watch::channel(());
+        let expiry = ConnectionExpiry::new(shutdown);
+        let (inbound, inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (mut application, mut response) =
+            bridge_grpc_stream(ReceiverStream::new(inbound_rx), closed);
+        expiry.update(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut byte = [0];
+            assert_eq!(application.read(&mut byte).await.unwrap(), 0);
+            assert!(tokio_stream::StreamExt::next(&mut response).await.is_none());
+            assert!(
+                inbound
+                    .send(Ok(BoundaryChunk { data: vec![1] }))
+                    .await
+                    .is_err()
+            );
+        })
+        .await
+        .expect("expired exchanges must close without client activity");
+    }
+
+    #[tokio::test]
+    async fn physical_disconnect_closes_discovery_even_with_an_expiry_worker() {
+        let (shutdown, mut closed) = tokio::sync::watch::channel(());
+        let _expiry = ConnectionExpiry::new(shutdown.clone());
+        let guard = DisconnectGuard {
+            runtime: std::sync::Weak::new(),
+            connection_id: SandboxConnectionId::new(),
+            connection_shutdown: shutdown,
+        };
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), closed.changed())
+            .await
+            .expect("disconnected discovery must not wait for JWT expiry")
+            .expect("explicit disconnect notification");
+    }
+
+    #[tokio::test]
+    async fn renewed_credentials_replace_the_connection_deadline() {
+        let (shutdown, mut closed) = tokio::sync::watch::channel(());
+        let expiry = ConnectionExpiry::new(shutdown);
+        expiry.deadline.send_replace(Some(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        ));
+        expiry
+            .deadline
+            .send_replace(Some(tokio::time::Instant::now() + Duration::from_mins(1)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), closed.changed())
+                .await
+                .is_err()
+        );
+        expiry.update(1);
+        tokio::time::timeout(Duration::from_secs(2), closed.changed())
+            .await
+            .expect("new deadline fires")
+            .expect("shutdown notification");
+    }
 
     #[test]
     fn installed_ca_replaces_case_insensitive_trust_overrides() {
@@ -1636,7 +1893,7 @@ mod tests {
             .await
             .expect("process exits");
         assert!(matches!(status, ExitStatusWire::Exited(0)));
-        // Drain stdout independently: exit notification can precede the reader.
+        // Production attachments stop at EXIT; all output must precede it.
         let mut cursor = process.output.cursor();
         let output = tokio::time::timeout(Duration::from_secs(10), async {
             let mut output = Vec::new();
@@ -1644,15 +1901,60 @@ mod tests {
                 let event = cursor.recv().await.expect("retained output event");
                 if event.channel == STREAM_STDOUT {
                     output.extend(event.payload);
-                    if String::from_utf8_lossy(&output).contains("relay-free launch") {
-                        return output;
-                    }
+                }
+                if event.channel == STREAM_EXIT {
+                    return output;
                 }
             }
         })
         .await
         .expect("stdout is retained");
         assert!(String::from_utf8_lossy(&output).contains("relay-free launch"));
+    }
+
+    #[tokio::test]
+    async fn process_bridge_drains_stdout_and_stderr_before_exit() {
+        let process = Arc::new(
+            ManagedProcess::spawn(
+                "drain-test".into(),
+                ProcessKindWire::Exec,
+                std::env::var("COMSPEC").unwrap(),
+                vec![
+                    "/D".into(),
+                    "/C".into(),
+                    "(for /L %i in (1,1,2000) do @echo output-line) & echo last-error 1>&2".into(),
+                ],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("launch real command"),
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        let bridge = tokio::spawn(bridge_process(server, process));
+        let (stdout, stderr) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            while let Some((channel, payload)) = read_stream_frame(&mut client).await.unwrap() {
+                match channel {
+                    STREAM_STDOUT => stdout.extend(payload),
+                    STREAM_STDERR => stderr.extend(payload),
+                    STREAM_EXIT => break,
+                    _ => panic!("unexpected output channel"),
+                }
+            }
+            (stdout, stderr)
+        })
+        .await
+        .expect("attachment finishes");
+        bridge.await.unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&stdout)
+                .matches("output-line")
+                .count(),
+            2000
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("last-error"));
     }
 
     #[test]

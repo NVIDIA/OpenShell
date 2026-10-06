@@ -1227,6 +1227,12 @@ The driver assigns distinct Sandbox Protocol and proxy listeners plus fresh cred
 
 Attached provider credentials use the ordinary live supervisor refresh path. Static values stay in the host supervisor's endpoint-bound resolver and are injected only for matching requests. Dynamic token grants remain request-time operations in the host proxy.
 
+Main launch and raw exec receive the authenticated proxy and installed CA
+environment. Exec uses the latest provider environment. The proxy identity
+uses the canonical workload command when supplied, falling back to the MXC
+driver command. Expired control credentials close open process and forwarding
+streams; renewed credentials update the connection deadline.
+
 ### MicroVM
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
