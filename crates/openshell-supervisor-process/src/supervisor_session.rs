@@ -450,6 +450,7 @@ pub fn spawn_with_readiness(
         config_apply_tx: runtime.config_apply_tx,
         ready_tx,
         runtime_ready: Arc::new(AtomicBool::new(true)),
+        config_apply_updates: None,
     };
     (tokio::spawn(run_session_loop(config, None)), ready_rx)
 }
@@ -464,17 +465,35 @@ pub async fn prepare(
     image_policy_discovery: ImagePolicyDiscovery,
     prepare_policy: impl FnOnce(SandboxPolicy) -> Result<Option<SandboxPolicy>, String> + Send + 'static,
 ) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
-    let prepared = tokio::time::timeout(
-        SESSION_PREPARE_TIMEOUT,
-        open_session(
-            endpoint,
-            sandbox_id,
-            instance_id,
-            1,
-            Some(image_policy_discovery),
-            Some(Box::new(prepare_policy)),
-        ),
-    )
+    let prepared = tokio::time::timeout(SESSION_PREPARE_TIMEOUT, async {
+        let mut prepare_policy: Option<StartupPolicyPreparer> = Some(Box::new(prepare_policy));
+        let mut backoff = INITIAL_BACKOFF;
+        let mut connection_epoch = 1;
+        loop {
+            match open_session(
+                endpoint.clone(),
+                sandbox_id.clone(),
+                instance_id.clone(),
+                connection_epoch,
+                Some(image_policy_discovery.clone()),
+                prepare_policy.take(),
+            )
+            .await
+            {
+                Ok(prepared) => return Ok(prepared),
+                // Retry only failures before the gateway saw this hello, so
+                // the startup preparer is still unused.
+                Err(OpenSessionError::Connect(error, preparer)) => {
+                    warn!(error = %error, "supervisor session: startup connection failed; retrying");
+                    prepare_policy = preparer;
+                    connection_epoch += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+                Err(OpenSessionError::Session(error)) => return Err(error),
+            }
+        }
+    })
     .await
     .map_err(|_| "timed out waiting for supervisor session bootstrap")??;
     if prepared.config_apply_enabled && prepared.bootstrap.is_none() {
@@ -495,6 +514,7 @@ pub fn spawn_prepared(
     terminating: Arc<AtomicBool>,
     config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    config_apply_updates: watch::Sender<bool>,
 ) -> (
     tokio::task::JoinHandle<()>,
     watch::Receiver<bool>,
@@ -516,6 +536,7 @@ pub fn spawn_prepared(
         session_id_updates,
         ready_tx,
         runtime_ready: runtime_ready.clone(),
+        config_apply_updates: Some(config_apply_updates),
     };
     let task = tokio::spawn(run_session_loop(config, Some((prepared, bootstrap_result))));
     (task, ready_rx, outbound, runtime_ready)
@@ -534,6 +555,10 @@ struct SessionConfig {
     session_id_updates: Option<watch::Sender<Option<String>>>,
     ready_tx: watch::Sender<bool>,
     runtime_ready: Arc<AtomicBool>,
+    /// Publishes whether the current session delivers configuration
+    /// authoritatively, so a stream-started runtime resumes polling when a
+    /// reconnect lands on a gateway that does not enable apply.
+    config_apply_updates: Option<watch::Sender<bool>>,
 }
 
 async fn run_session_loop(
@@ -593,8 +618,43 @@ async fn run_single_session(
         None,
         None,
     )
-    .await?;
+    .await
+    .map_err(OpenSessionError::into_error)?;
     run_prepared_session(config, prepared, None).await
+}
+
+type SessionError = Box<dyn std::error::Error + Send + Sync>;
+
+enum OpenSessionError {
+    /// The gateway never received the hello; the preparer is returned unused.
+    Connect(SessionError, Option<StartupPolicyPreparer>),
+    Session(SessionError),
+}
+
+impl OpenSessionError {
+    fn into_error(self) -> SessionError {
+        match self {
+            Self::Connect(error, _) | Self::Session(error) => error,
+        }
+    }
+}
+
+impl From<SessionError> for OpenSessionError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+impl From<&'static str> for OpenSessionError {
+    fn from(error: &'static str) -> Self {
+        Self::Session(error.into())
+    }
+}
+
+impl From<String> for OpenSessionError {
+    fn from(error: String) -> Self {
+        Self::Session(error.into())
+    }
 }
 
 async fn open_session(
@@ -604,12 +664,18 @@ async fn open_session(
     connection_epoch: u64,
     image_policy_discovery: Option<ImagePolicyDiscovery>,
     mut prepare_policy: Option<StartupPolicyPreparer>,
-) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PreparedSupervisorSession, OpenSessionError> {
     // The same authenticated channel carries the long-lived control stream
     // and all data-plane RelayStream calls.
-    let channel = grpc_client::connect_channel_pub(&endpoint)
-        .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+    let channel = match grpc_client::connect_channel_pub(&endpoint).await {
+        Ok(channel) => channel,
+        Err(e) => {
+            return Err(OpenSessionError::Connect(
+                format!("connect failed: {e}").into(),
+                prepare_policy,
+            ));
+        }
+    };
     let mut client = OpenShellClient::new(channel.clone());
 
     // Create the outbound message stream.
@@ -631,11 +697,18 @@ async fn open_session(
     .await
     .map_err(|_| "failed to queue hello")?;
 
-    // Open the bidirectional stream.
-    let response = client
-        .connect_supervisor(outbound)
-        .await
-        .map_err(|e| format!("connect_supervisor RPC failed: {e}"))?;
+    // Open the bidirectional stream. An unavailable gateway rejects the call
+    // before it reads the hello, so the preparer is still unused.
+    let response = match client.connect_supervisor(outbound).await {
+        Ok(response) => response,
+        Err(e) if e.code() == tonic::Code::Unavailable => {
+            return Err(OpenSessionError::Connect(
+                format!("connect_supervisor RPC failed: {e}").into(),
+                prepare_policy,
+            ));
+        }
+        Err(e) => return Err(format!("connect_supervisor RPC failed: {e}").into()),
+    };
     let mut inbound = response.into_inner();
 
     // The gateway may ask the initial supervisor to prepare its selected
@@ -765,8 +838,22 @@ async fn run_prepared_session(
         .map_err(|_| "failed to queue configuration bootstrap result")?;
     }
     let config_sequences = Arc::new(Mutex::new(ConfigSequenceWatermarks::default()));
+    if let Some(updates) = &config.config_apply_updates {
+        updates.send_replace(prepared.config_apply_enabled);
+    }
     if !prepared.config_apply_enabled {
         config.ready_tx.send_replace(true);
+        // Without streamed admission the gateway learns readiness only from
+        // this report. A reconnect after the runtime started repeats it.
+        if config.runtime_ready.load(Ordering::Acquire) {
+            tx.send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::RuntimeReady(
+                    openshell_core::proto::SupervisorRuntimeReady {},
+                )),
+            })
+            .await
+            .map_err(|_| "failed to queue runtime readiness")?;
+        }
     }
 
     // Main loop: receive gateway messages + send heartbeats.

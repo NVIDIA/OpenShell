@@ -58,6 +58,19 @@ const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_POLICY_REPAIR_TIMEOUT: Duration = Duration::from_mins(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How a supervisor session takes part in configuration delivery and readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionMode {
+    /// Predates streamed apply. Ready as soon as the session is accepted.
+    Legacy,
+    /// Can apply streamed configuration but polls on this gateway. Ready after
+    /// `SupervisorRuntimeReady`, since it connects before its workload starts.
+    ReportsReadiness,
+    /// Applies and acknowledges streamed configuration. Ready after
+    /// `SupervisorRuntimeReady` with an accepted admission.
+    ConfigApply,
+}
+
 /// How long a streamed-apply session holds newer updates for a component
 /// while waiting for the supervisor to acknowledge the one it already has.
 const CONFIG_ACK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -725,14 +738,20 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        self.register_with_config_slots(sandbox_id, session_id, tx, shutdown, None, false)
+        self.register_with_config_slots(
+            sandbox_id,
+            session_id,
+            tx,
+            shutdown,
+            None,
+            SessionMode::Legacy,
+        )
     }
 
     /// Register a session that may receive pushed configuration.
     ///
-    /// A `config_apply` session acknowledges each update before the next one
-    /// for that component is released, and is not runtime-ready until the
-    /// supervisor sends `SupervisorRuntimeReady`.
+    /// A `ConfigApply` session acknowledges each update before the next one
+    /// for that component is released.
     pub(crate) fn register_with_config_slots(
         &self,
         sandbox_id: String,
@@ -740,7 +759,7 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
         config_slots: Option<Arc<ConfigSlots>>,
-        config_apply: bool,
+        mode: SessionMode,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -752,7 +771,7 @@ impl SupervisorSessionRegistry {
                 config_slots,
                 tx,
                 config_sequences: ConfigSequences {
-                    acknowledged: config_apply,
+                    acknowledged: mode == SessionMode::ConfigApply,
                     ..ConfigSequences::default()
                 },
                 shutdown,
@@ -760,7 +779,7 @@ impl SupervisorSessionRegistry {
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
-                runtime_ready: !config_apply,
+                runtime_ready: mode == SessionMode::Legacy,
                 connected_at: Instant::now(),
                 _gauge_slot: GaugeSlot::supervisor_session(),
             },
@@ -919,16 +938,17 @@ impl SupervisorSessionRegistry {
                 &mut session.config_sequences.provider_environment
             }
         };
+        let fingerprint = config_message_fingerprint(&message);
+        // A shadow session never acknowledges, so its last delivered snapshot
+        // stands in for the acknowledged one. A newly committed operation needs
+        // a result even when the session already has the identical snapshot.
+        if !require_acknowledgement
+            && delivery_state.in_flight.is_none()
+            && delivery_state.last_acknowledged_fingerprint.as_ref() == Some(&fingerprint)
+        {
+            return DeliveryDisposition::SuppressedUnchanged;
+        }
         if config_apply {
-            // A newly committed operation needs a result even when this
-            // session already acknowledged the identical snapshot.
-            if !require_acknowledgement
-                && delivery_state.in_flight.is_none()
-                && delivery_state.last_acknowledged_fingerprint.as_ref()
-                    == Some(&config_message_fingerprint(&message))
-            {
-                return DeliveryDisposition::SuppressedUnchanged;
-            }
             // Hold the component until the supervisor acknowledges the update
             // it already has, bounded so a lost result cannot stall it.
             if delivery_state
@@ -950,6 +970,8 @@ impl SupervisorSessionRegistry {
         }
         if config_apply {
             delivery_state.in_flight = Some(in_flight);
+        } else {
+            delivery_state.last_acknowledged_fingerprint = Some(fingerprint);
         }
         drop(sessions);
 
@@ -2572,7 +2594,7 @@ struct SessionSetup {
     sandbox_id: String,
     instance_id: String,
     connection_epoch: u64,
-    stream_applies_config: bool,
+    mode: SessionMode,
     bootstrap: Option<ConfigBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
     config_push: Option<ConfigPushSetup>,
@@ -2588,7 +2610,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         sandbox_id,
         instance_id,
         connection_epoch,
-        stream_applies_config,
+        mode,
         bootstrap,
         provider_readiness,
         config_push,
@@ -2597,6 +2619,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         mut inbound,
         session_lifetime,
     } = setup;
+    let stream_applies_config = mode == SessionMode::ConfigApply;
     let expected_bootstrap_admission = bootstrap
         .as_ref()
         .and_then(|bootstrap| bootstrap.sandbox_config.as_ref())
@@ -2670,7 +2693,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_tx.clone(),
         shutdown_tx,
         config_slots,
-        stream_applies_config,
+        mode,
     );
     if superseded {
         info!(
@@ -2728,9 +2751,9 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
 
     // Do not expose SessionAccepted to the supervisor when the gateway could
     // not durably record the connection. Dropping the buffered response forces
-    // a reconnect, which gives the state transition a fresh chance. A
-    // streamed-apply session becomes ready only after SupervisorRuntimeReady.
-    if !stream_applies_config
+    // a reconnect, which gives the state transition a fresh chance. Other
+    // sessions become ready only after SupervisorRuntimeReady.
+    if mode == SessionMode::Legacy
         && !mark_supervisor_initialized(&state, &sandbox_id, &session_id, &instance_id, false).await
     {
         state
@@ -3043,6 +3066,13 @@ pub async fn handle_connect_supervisor(
     // The stock supervisor includes discovery only on its first connection.
     // Reconnects from the same process omit it and proceed directly to the
     // current authoritative bootstrap.
+    let mode = if stream_applies_config {
+        SessionMode::ConfigApply
+    } else if hello.supports_config_apply {
+        SessionMode::ReportsReadiness
+    } else {
+        SessionMode::Legacy
+    };
     let prepares_startup_policy = stream_applies_config && hello.image_policy_discovery.is_some();
     let image_policy_admission = if stream_applies_config {
         image_policy_admission(&hello)?
@@ -3091,7 +3121,7 @@ pub async fn handle_connect_supervisor(
             sandbox_id,
             instance_id: hello.instance_id,
             connection_epoch: hello.connection_epoch,
-            stream_applies_config,
+            mode,
             bootstrap,
             provider_readiness,
             config_push,
@@ -3225,7 +3255,7 @@ pub async fn handle_connect_supervisor(
                 sandbox_id: sandbox_id.clone(),
                 instance_id: hello.instance_id,
                 connection_epoch: hello.connection_epoch,
-                stream_applies_config,
+                mode,
                 bootstrap: Some(bootstrap),
                 provider_readiness,
                 config_push,
@@ -3691,14 +3721,15 @@ async fn handle_supervisor_message(
             }
         }
         Some(supervisor_message::Payload::RuntimeReady(_)) => {
-            if !stream_applies_config {
-                debug!(
-                    sandbox_id,
-                    session_id, "ignored runtime-ready from compatibility supervisor"
-                );
-                return;
-            }
-            if !mark_supervisor_initialized(state, sandbox_id, session_id, instance_id, true).await
+            // A polling session has no streamed admission to require.
+            if !mark_supervisor_initialized(
+                state,
+                sandbox_id,
+                session_id,
+                instance_id,
+                stream_applies_config,
+            )
+            .await
             {
                 warn!(
                     sandbox_id,
@@ -4157,7 +4188,7 @@ mod tests {
             tx.clone(),
             make_shutdown(),
             Some(Arc::clone(&slots)),
-            false,
+            SessionMode::Legacy,
         );
         (tx, SessionOutbound::new(rx, slots))
     }
@@ -4199,19 +4230,40 @@ mod tests {
         let router = LocalSupervisorConfigRouter::new(Arc::clone(&registry));
         let (_tx, mut outbound) = register_push_session(&registry, "sb-1", "session-1");
 
-        for expected in [DeliveryDisposition::Queued, DeliveryDisposition::Replaced] {
+        for (config_revision, expected) in [
+            (1, DeliveryDisposition::Queued),
+            (2, DeliveryDisposition::Replaced),
+        ] {
             assert_eq!(
                 router
                     .deliver(
                         "sb-1",
                         "session-1",
-                        SupervisorConfigMessage::SandboxConfig(Box::default()),
+                        SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
+                            config_revision,
+                            ..Default::default()
+                        })),
                         false,
                     )
                     .await,
                 expected
             );
         }
+        // An identical snapshot is not sent again.
+        assert_eq!(
+            router
+                .deliver(
+                    "sb-1",
+                    "session-1",
+                    SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
+                        config_revision: 2,
+                        ..Default::default()
+                    })),
+                    false,
+                )
+                .await,
+            DeliveryDisposition::SuppressedUnchanged
+        );
         assert_eq!(
             router
                 .deliver(
@@ -4344,7 +4396,7 @@ mod tests {
             tx,
             make_shutdown(),
             Some(Arc::clone(&slots)),
-            true,
+            SessionMode::ConfigApply,
         );
         slots
     }
@@ -6751,7 +6803,7 @@ mod tests {
             tx.clone(),
             shutdown_tx,
             Some(Arc::clone(&slots)),
-            true,
+            SessionMode::ConfigApply,
         );
         let snapshot = SandboxConfigSnapshot {
             configuration_instance_id: "configuration-1".into(),
@@ -7085,7 +7137,7 @@ mod tests {
             tx.clone(),
             shutdown_tx,
             Some(Arc::clone(&slots)),
-            true,
+            SessionMode::ConfigApply,
         );
         let snapshot = ProviderEnvironmentSnapshot {
             provider_env_revision: 11,
@@ -7426,7 +7478,7 @@ mod tests {
             tx,
             make_shutdown(),
             Some(Arc::clone(&slots)),
-            false,
+            SessionMode::Legacy,
         );
         let update = |revision| {
             SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
@@ -7483,6 +7535,26 @@ mod tests {
         };
         assert!(!accepted.config_apply_enabled);
         assert!(accepted.bootstrap.is_none());
+
+        // This supervisor connects before its workload starts, so acceptance
+        // alone must not report it ready.
+        assert!(!state.supervisor_sessions.is_runtime_ready("sb-poll-apply"));
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::RuntimeReady(
+                    openshell_core::proto::SupervisorRuntimeReady {},
+                )),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.supervisor_sessions.is_runtime_ready("sb-poll-apply") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime readiness marks the polling session ready");
     }
 
     #[tokio::test]

@@ -962,7 +962,11 @@ fn register_test_session(
         control.clone(),
         tokio::sync::oneshot::channel().0,
         Some(Arc::clone(&slots)),
-        config_apply,
+        if config_apply {
+            crate::supervisor_session::SessionMode::ConfigApply
+        } else {
+            crate::supervisor_session::SessionMode::Legacy
+        },
     );
     register_session(
         state,
@@ -1014,16 +1018,28 @@ fn record_delivery(component: ConfigComponentKind, outcome: &'static str) {
     .increment(1);
 }
 
-/// Periodically rebuild current snapshots for every locally routable session.
-/// Unchanged snapshots are suppressed per session, so this only repairs missed
-/// publications. Dormant in poll mode.
+/// Periodically rebuild current snapshots for this replica's sessions.
+/// Streamed-apply sessions suppress unchanged snapshots, so this only repairs
+/// missed publications. Every replica runs its own pass, so it never hints
+/// peers. Dormant in poll mode.
 pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         timer.tick().await;
         loop {
             timer.tick().await;
-            publish_all_connected(&state, ConfigComponents::ALL);
+            if !push_enabled(&state) {
+                continue;
+            }
+            state.config_delivery.with_scheduler(|scheduler| {
+                scheduler.publish_fanout(
+                    &FanoutScope::AllConnected,
+                    ConfigComponents::ALL,
+                    false,
+                    Instant::now(),
+                );
+            });
+            kick(&state);
         }
     });
 }

@@ -4848,11 +4848,6 @@ impl ComputeRuntime {
                     |sandbox| {
                         if connected {
                             let status = sandbox.status.get_or_insert_with(Default::default);
-                            let same_instance =
-                                Some(status.main_process_instance_id.as_str()) == instance_id;
-                            status.main_process_instance_id =
-                                instance_id.unwrap_or_default().to_string();
-                            status.exit_code = None;
                             if let Some(admission) = admission {
                                 status.configuration_admission = Some(admission.clone());
                                 status.configuration_activated = Some(
@@ -4860,7 +4855,14 @@ impl ComputeRuntime {
                                         == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted),
                                 );
                             }
+                            // An admission-only update leaves restart state to
+                            // the instance that last reported runtime readiness.
                             if runtime_ready {
+                                let same_instance =
+                                    Some(status.main_process_instance_id.as_str()) == instance_id;
+                                status.main_process_instance_id =
+                                    instance_id.unwrap_or_default().to_string();
+                                status.exit_code = None;
                                 set_next_restart_at_ms(status, 0);
                                 if !same_instance || main_process_started_at_ms(status) == 0 {
                                     set_main_process_started_at_ms(
@@ -13865,9 +13867,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(repaired.phase(), SandboxPhase::Provisioning as i32);
-        assert_eq!(
-            repaired.status.as_ref().unwrap().main_process_instance_id,
-            "supervisor-1"
+        // Admission alone leaves restart bookkeeping to runtime readiness.
+        assert!(
+            repaired
+                .status
+                .as_ref()
+                .unwrap()
+                .main_process_instance_id
+                .is_empty()
         );
         assert_eq!(
             repaired.status.as_ref().unwrap().configuration_activated,
@@ -13885,6 +13892,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(
+            ready.status.as_ref().unwrap().main_process_instance_id,
+            "supervisor-1"
+        );
     }
 
     #[tokio::test]

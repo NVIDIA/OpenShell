@@ -829,6 +829,12 @@ async fn run_sandbox_with_backend(
     let uses_stream_configuration = prepared_supervisor_session.as_ref().is_some_and(
         openshell_supervisor_process::supervisor_session::PreparedSupervisorSession::uses_stream_configuration,
     );
+    // A gateway that keeps polling authoritative must not see this session
+    // until the workload is running. Close it and reconnect after startup, as
+    // polling supervisors always have.
+    if !uses_stream_configuration {
+        prepared_supervisor_session = None;
+    }
 
     if stream_bootstrap
         .as_ref()
@@ -1125,6 +1131,7 @@ async fn run_sandbox_with_backend(
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let (config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(16);
     let mut config_apply_rx = Some(config_apply_rx);
+    let (config_apply_updates, config_apply_enabled) = tokio::sync::watch::channel(true);
 
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
@@ -1328,6 +1335,7 @@ async fn run_sandbox_with_backend(
                 .as_ref()
                 .and_then(|bootstrap| bootstrap.sandbox_config.clone())
                 .map(Into::into),
+            config_apply_enabled: Some(config_apply_enabled),
             endpoint_observation_tx,
             endpoint_status_rx,
             endpoint_policy: poll_endpoint_policy,
@@ -1378,6 +1386,7 @@ async fn run_sandbox_with_backend(
                 ssh_socket_path.as_deref(),
                 config_apply_tx.clone(),
                 Some(supervisor_session_updates.clone()),
+                config_apply_updates,
             )
             .await?,
         ),
@@ -4024,6 +4033,9 @@ struct PolicyPollLoopContext {
     /// runtime state, so this seeds equality tracking and disables fetch-based
     /// reconciliation for the current protocol.
     initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
+    /// Whether the current supervisor session delivers configuration
+    /// authoritatively. A stream-started runtime polls while it is false.
+    config_apply_enabled: Option<tokio::sync::watch::Receiver<bool>>,
     /// Producer shared with network enforcement and policy installation.
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
     /// Single FIFO consumed by the endpoint status reporter.
@@ -5316,7 +5328,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     }
 
     let initial_stream_snapshot = ctx.initial_stream_snapshot.take();
-    let stream_authoritative = initial_stream_snapshot.is_some();
+    let stream_started = initial_stream_snapshot.is_some();
+    // A stream-started runtime stays stream-authoritative only while its
+    // current session applies configuration. A reconnect to a gateway that
+    // does not enable apply, such as after a rollback to poll mode, resumes
+    // polling. Keep the last value if the session task ends.
+    let mut config_apply_updates = ctx.config_apply_enabled.take();
+    let mut config_apply_enabled = config_apply_updates
+        .as_ref()
+        .is_none_or(|updates| *updates.borrow());
     let mut current_config_revision: u64 = initial_stream_snapshot
         .as_ref()
         .map_or(0, |snapshot| snapshot.config_revision);
@@ -5498,9 +5518,22 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
     let interval = Duration::from_secs(ctx.interval_secs);
     loop {
-        if stream_authoritative {
+        if let Some(updates) = config_apply_updates.as_ref() {
+            config_apply_enabled = *updates.borrow();
+        }
+        if stream_started && config_apply_enabled {
             let delay = next_poll_delay(&ctx.extension_credentials, interval);
             tokio::select! {
+                changed = async {
+                    match config_apply_updates.as_mut() {
+                        Some(updates) => updates.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !changed {
+                        config_apply_updates = None;
+                    }
+                }
                 request = receive_config_apply(&mut config_apply_rx) => {
                     let Some(request) = request else {
                         return Err(miette::miette!("stream configuration apply channel closed"));
@@ -9205,6 +9238,7 @@ network_policies:
             transparent_tcp: TransparentTcpReloadState::default(),
             config_apply_rx: None,
             initial_stream_snapshot: None,
+            config_apply_enabled: None,
             endpoint_observation_tx: None,
             endpoint_status_rx: None,
             endpoint_policy: None,
@@ -10975,6 +11009,47 @@ network_policies:
             .expect("stream update responder stopped");
 
         assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_started_runtime_polls_when_session_stops_applying() {
+        let initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.initial_stream_snapshot = Some(initial);
+        let (_config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(1);
+        ctx.config_apply_rx = Some(config_apply_rx);
+        let (apply_enabled_tx, apply_enabled_rx) = tokio::sync::watch::channel(true);
+        ctx.config_apply_enabled = Some(apply_enabled_rx);
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let poll_calls = Arc::clone(&client.poll_calls);
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+
+        // A reconnect lands on a gateway that keeps polling authoritative.
+        apply_enabled_tx.send_replace(false);
+        timeout(Duration::from_secs(5), async {
+            while poll_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a session without apply must resume polling");
         handle.abort();
     }
 
