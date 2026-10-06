@@ -4,8 +4,11 @@
 //! Driver-agnostic sandbox file-transfer conformance tests.
 
 use openshell_conformance::{
-    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, OpenShellRunner, Scenario,
+    FILE_TRANSFER_CREATE_UPLOAD_DIRECTORY_SCENARIO, FILE_TRANSFER_CREATE_UPLOAD_FILE_SCENARIO,
+    FILE_TRANSFER_CREATE_UPLOAD_MULTIPLE_SCENARIO,
+    FILE_TRANSFER_GIT_FILTERING_SCENARIO,
+    FILE_TRANSFER_PATH_SAFETY_SCENARIO, FILE_TRANSFER_ROUND_TRIP_SCENARIO, OpenShellRunner,
+    Scenario,
 };
 
 /// Exercise file and directory round trips through the candidate CLI.
@@ -24,6 +27,24 @@ async fn git_filtering() {
 #[tokio::test]
 async fn path_safety() {
     run(FILE_TRANSFER_PATH_SAFETY_SCENARIO).await;
+}
+
+/// Exercise directory-basename preservation for `sandbox create --upload`.
+#[tokio::test]
+async fn create_upload_directory() {
+    run(FILE_TRANSFER_CREATE_UPLOAD_DIRECTORY_SCENARIO).await;
+}
+
+/// Exercise several `--upload` flags on one `sandbox create`.
+#[tokio::test]
+async fn create_upload_multiple() {
+    run(FILE_TRANSFER_CREATE_UPLOAD_MULTIPLE_SCENARIO).await;
+}
+
+/// Exercise single-file `sandbox create --upload` pre-loading.
+#[tokio::test]
+async fn create_upload_file() {
+    run(FILE_TRANSFER_CREATE_UPLOAD_FILE_SCENARIO).await;
 }
 
 async fn run(scenario: Scenario) {
