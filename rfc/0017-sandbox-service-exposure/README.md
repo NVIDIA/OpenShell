@@ -4,6 +4,7 @@ authors:
 state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4266
+  - https://github.com/NVIDIA/OpenShell/pull/4267
   - https://github.com/NVIDIA/OpenShell/issues/994
   - https://github.com/NVIDIA/OpenShell/issues/1791
   - https://github.com/NVIDIA/OpenShell/issues/4210
