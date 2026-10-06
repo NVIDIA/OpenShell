@@ -722,6 +722,12 @@ kubectl -n openshell get svc openshell -o wide
 kubectl -n openshell get endpoints openshell
 ```
 
+For a NodePort deployment, connect to a reachable node IP and the Service's
+named gateway `nodePort`. Inspect the Service and ready EndpointSlices when
+the gateway is unreachable. NodePort routing may have no userspace listening
+socket, so an empty `ss` result alone does not indicate failure. Use the CLI's
+connection status to verify the endpoint.
+
 For local port-forward testing:
 
 ```bash

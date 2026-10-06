@@ -105,6 +105,27 @@ compatibility baseline for the v1beta1 Sandbox API. It does not track the local
 K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
 its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
 
+The tmachine K3s client connects directly to the gateway Service using the
+guest node's IPv4 InternalIP and NodePort 30080. The lane does not run
+`kubectl port-forward` or expose a gateway port through QEMU. Sandbox callbacks
+continue to use the in-cluster Service URL.
+
+Installation and each automated test VM boot check the K3s API, node and gateway
+StatefulSet, discover the named gRPC NodePort, and refresh the `tmachine` client
+registration when its endpoint changes. A bounded CLI status check must report
+the expected connected gateway before scenarios run. Interactive shell suites
+skip boot preparation so a failed gateway remains accessible for debugging.
+
+Installation, readiness and conformance failures fetch bounded diagnostics
+before the VM exits. These include K3s journals, node addresses, Service ports
+and routing rules, endpoints, events and current/previous gateway logs. A
+NodePort need not have a userspace listening socket; use the functional CLI
+probe and Service routing evidence rather than `ss` to judge availability.
+The collector omits Secrets, kubeconfigs, environment dumps and full Pod
+specifications and redacts common credential fields. Local files are saved in
+`artifacts/tmachine-diagnostics`; CI uploads `tmachine-diagnostics-*` artifacts
+even when the test step fails.
+
 ### Run only the policy advisor conformance tests
 
 Manually dispatch `Integration Tests` on the candidate branch with an

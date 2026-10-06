@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Wait for the installed K3s gateway
+  block:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+    - name: Wait for the K3s API
+      become: true
+      ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=5s get --raw=/readyz
+      register: k3s_api_ready
+      changed_when: false
+      until: k3s_api_ready.rc == 0
+      retries: 30
+      delay: 2
+
+    - name: Wait for K3s nodes
+      become: true
+      ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=130s wait nodes --all --for=condition=Ready --timeout=120s
+      changed_when: false
+
+    - name: Wait for the gateway StatefulSet
+      become: true
+      ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=190s --namespace openshell rollout status statefulset/openshell --timeout=180s
+      changed_when: false
+
+    - name: Discover K3s nodes
+      become: true
+      ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=10s get nodes --output=json
+      register: k3s_nodes
+      changed_when: false
+
+    - name: Discover the gateway Service
+      become: true
+      ansible.builtin.command: /usr/local/bin/k3s kubectl --request-timeout=10s --namespace openshell get service openshell --output=json
+      register: k3s_gateway_service
+      changed_when: false
+
+    - name: Require a single K3s node and a NodePort gateway
+      ansible.builtin.assert:
+        that:
+          - (k3s_nodes.stdout | from_json)['items'] | length == 1
+          - (k3s_gateway_service.stdout | from_json).spec.type == 'NodePort'
+        fail_msg: The tmachine K3s lane requires one node and a NodePort gateway Service
+
+    - name: Resolve the node address and named gateway port
+      ansible.builtin.set_fact:
+        k3s_node_addresses: >-
+          {{ (k3s_nodes.stdout | from_json)['items'][0].status.addresses |
+             selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') |
+             select('match', '^(?:[0-9]{1,3}[.]){3}[0-9]{1,3}$') | list }}
+        k3s_gateway_ports: >-
+          {{ (k3s_gateway_service.stdout | from_json).spec.ports |
+             selectattr('name', 'equalto', 'grpc') | list }}
+
+    - name: Require the expected direct gateway endpoint
+      ansible.builtin.assert:
+        that:
+          - k3s_node_addresses | length == 1
+          - k3s_gateway_ports | length == 1
+          - k3s_gateway_ports[0].nodePort | default(0) == 30080
+        fail_msg: Expected one IPv4 node InternalIP and the grpc NodePort 30080
+
+    - name: Set the direct gateway endpoint
+      ansible.builtin.set_fact:
+        k3s_gateway_endpoint: "http://{{ k3s_node_addresses[0] }}:{{ k3s_gateway_ports[0].nodePort }}"
+
+    - name: Read test client gateway registrations
+      become: true
+      become_user: tmachine
+      ansible.builtin.command: openshell gateway list --output json
+      register: k3s_client_gateways
+      changed_when: false
+
+    - name: Find the test gateway registration
+      ansible.builtin.set_fact:
+        k3s_registered_gateways: >-
+          {{ k3s_client_gateways.stdout | from_json |
+             selectattr('name', 'equalto', 'tmachine') | list }}
+
+    - name: Remove a stale test gateway registration
+      become: true
+      become_user: tmachine
+      ansible.builtin.command: openshell gateway remove tmachine
+      when:
+        - k3s_registered_gateways | length > 0
+        - k3s_registered_gateways[0].endpoint != k3s_gateway_endpoint
+
+    - name: Register the direct gateway for test clients
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [openshell, gateway, add, "{{ k3s_gateway_endpoint }}", --local, --name, tmachine]
+      when: k3s_registered_gateways | length == 0 or k3s_registered_gateways[0].endpoint != k3s_gateway_endpoint
+
+    - name: Select the existing test gateway
+      become: true
+      become_user: tmachine
+      ansible.builtin.command: openshell gateway select tmachine
+      when:
+        - k3s_registered_gateways | length > 0
+        - k3s_registered_gateways[0].endpoint == k3s_gateway_endpoint
+        - not k3s_registered_gateways[0].active
+
+    # Rollout readiness does not prove that Service routing has recovered.
+    - name: Wait for the registered gateway to answer the CLI
+      become: true
+      become_user: tmachine
+      ansible.builtin.command: timeout 10s openshell status --output json
+      register: k3s_gateway_ready
+      changed_when: false
+      until: >-
+        k3s_gateway_ready.rc == 0 and
+        (k3s_gateway_ready.stdout | from_json).status == 'connected' and
+        (k3s_gateway_ready.stdout | from_json).gateway == 'tmachine' and
+        (k3s_gateway_ready.stdout | from_json).server == k3s_gateway_endpoint
+      retries: 24
+      delay: 5
+  rescue:
+    - name: Collect K3s readiness diagnostics
+      ansible.builtin.include_role:
+        name: openshell_k3s_diagnostics
+
+    - name: Fail K3s boot preparation
+      ansible.builtin.fail:
+        msg: OpenShell K3s gateway did not become ready before conformance; see K3s diagnostics

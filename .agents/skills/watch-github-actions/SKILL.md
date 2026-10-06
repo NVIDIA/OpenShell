@@ -154,6 +154,14 @@ storage for diagnosis. Source-SHA images are staging inputs for qualification.
 Snap builds run in parallel with qualification, but tagged stable Store uploads
 consume those built artifacts only after qualification passes.
 
+For tmachine K3s failures, download the job's `tmachine-diagnostics-*` artifact
+alongside its Ansible log. The guest CLI uses the node InternalIP and gRPC
+NodePort 30080 directly. Inspect Service ports/routing, ready endpoints and
+gateway logs; an absent userspace listening socket does not mean NodePort is
+unavailable. A preparation failure prevents scenarios from running. Preserve
+first-failure evidence before rerunning, and distinguish readiness polling from
+test/job reruns.
+
 View logs for a specific run:
 
 ```bash
