@@ -78,7 +78,7 @@ The gateway merges the log and platform event sources before emitting, so events
 
 ## Direct Filesystem Access
 
-The supervisor writes shorthand logs to `/var/log/openshell.YYYY-MM-DD.log` and, when enabled, OCSF JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.log` in its own filesystem. `openshell sandbox exec` runs in the workload and does not give access to the supervisor's files.
+The supervisor writes shorthand logs to `/var/log/openshell.YYYY-MM-DD.log` and, when enabled, OCSF JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` in its own filesystem. `openshell sandbox exec` runs in the workload and does not give access to the supervisor's files.
 
 | Compute driver | Supervisor log location | Local storage lifetime |
 |---|---|---|
